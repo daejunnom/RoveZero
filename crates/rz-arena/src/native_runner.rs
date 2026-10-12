@@ -252,6 +252,10 @@ pub struct NativePairReceipt<A = NativeProviderSessionAudit> {
     pub contract_revision: String,
     pub runner_source_commit: String,
     pub runner_binary_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_resources: Option<rz_experiments::MatchResourcePlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ponder_enabled: Option<bool>,
     pub process: ProcessReceipt,
     pub snapshots: Vec<NativeSnapshotReceipt>,
     pub snapshot_cache_hints: Vec<SnapshotCacheHint>,
@@ -997,8 +1001,9 @@ pub(crate) mod linux {
                 &owner.snapshot.pins,
                 crate::native_launch::linux::ExternalArgumentMode::Preflight(&runtime_root),
             )?;
-            let requested = e
-                .requested_options
+            let requested = owner
+                .spec
+                .external_options(role)?
                 .iter()
                 .map(|(k, v)| {
                     crate::external_uci::resolve_asset_tokens(v, &e, &owner.snapshot.pins)
@@ -1028,6 +1033,13 @@ pub(crate) mod linux {
                 args,
                 e.environment.as_ref(),
                 variables.as_ref(),
+                &owner.snapshot.pins,
+            )?;
+            let launch = crate::engine_environment::place(
+                launch,
+                owner.spec.match_execution(),
+                role,
+                e.environment.is_some(),
                 &owner.snapshot.pins,
             )?;
             let limits = crate::ProcessLimits {
@@ -1304,7 +1316,12 @@ pub(crate) mod linux {
             .filter(|n| *n > 0)
             .ok_or_else(|| invalid("V2 prelaunch consumed whole pair runtime budget"))?;
         let process = crate::process::supervise_tree_observed(
-            &s.pins[s.runner_index].file,
+            &if let Some(execution) = owner.spec.match_execution() {
+                crate::native_launch::linux::pin(&s.pins, &execution.executor)?
+            } else {
+                &s.pins[s.runner_index]
+            }
+            .file,
             &s.invocation.args,
             &s.cwd,
             limits,
@@ -1338,6 +1355,8 @@ pub(crate) mod linux {
             contract_revision: owner.spec.contract_revision().into(),
             runner_source_commit: owner.spec.view().runner.source_commit.clone(),
             runner_binary_sha256: owner.spec.view().runner.binary.sha256.clone(),
+            match_resources: owner.spec.match_execution().map(|e| e.plan()).transpose()?,
+            ponder_enabled: owner.spec.match_execution().map(|e| e.ponder),
             process: process.receipt.clone(),
             snapshots: owner.snapshot.receipts.clone(),
             snapshot_cache_hints: cache_hints,
@@ -1476,8 +1495,9 @@ pub(crate) mod linux {
                             continue;
                         }
                         if let Some(e) = owner.spec.engine_view(role)?.external {
-                            let options = e
-                                .requested_options
+                            let options = owner
+                                .spec
+                                .external_options(role)?
                                 .iter()
                                 .map(|(k, v)| {
                                     crate::external_uci::resolve_asset_tokens(

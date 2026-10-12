@@ -333,6 +333,60 @@ fn assert_legal(position: &Position, text: &str) {
 }
 
 #[test]
+fn actual_binary_ponder_hit_and_miss_keep_single_legal_output() {
+    let mut engine = Engine::spawn(&["--cpu-mock", "--mock-delay-ms=0"]);
+    engine.handshake();
+    assert!(
+        engine
+            .protocol
+            .iter()
+            .any(|s| s == "option name Ponder type check default false")
+    );
+    engine.send("setoption name Ponder value true");
+    let after = engine.mark();
+    engine.send("go nodes 1");
+    let line = engine.wait_line(after, |s| s.starts_with("bestmove "));
+    let fields: Vec<_> = line.split_whitespace().collect();
+    assert_eq!(fields.len(), 4);
+    assert_eq!(fields[2], "ponder");
+    let mut predicted = Position::startpos();
+    assert_legal(&predicted, fields[1]);
+    predicted
+        .make_move(BoardMove::from_uci(fields[1]).unwrap())
+        .unwrap();
+    assert_legal(&predicted, fields[3]);
+    predicted
+        .make_move(BoardMove::from_uci(fields[3]).unwrap())
+        .unwrap();
+    engine.send(&format!(
+        "position startpos moves {} {}",
+        fields[1], fields[3]
+    ));
+    engine.send("go ponder wtime 1000 btime 1000");
+    engine.ready();
+    engine.quiet_bestmoves(1);
+    let after = engine.mark();
+    engine.send("ponderhit");
+    let reply = engine.wait_line(after, |s| s.starts_with("bestmove "));
+    assert_legal(&predicted, reply.split_whitespace().nth(1).unwrap());
+    engine.send("ponderhit");
+    engine.quiet_bestmoves(2);
+    engine.send("position startpos");
+    engine.send("go ponder");
+    engine.ready();
+    engine.quiet_bestmoves(2);
+    let after = engine.mark();
+    engine.send("stop");
+    let canceled = engine.wait_line(after, |s| s.starts_with("bestmove "));
+    assert_legal(
+        &Position::startpos(),
+        canceled.split_whitespace().nth(1).unwrap(),
+    );
+    engine.quit();
+    assert_eq!(engine.bestmove_count(), 3);
+}
+
+#[test]
 fn actual_binary_handshake_and_one_simulation_return_a_rules_legal_move() {
     let mut engine = Engine::spawn(&["--cpu-mock", "--mock-delay-ms=0"]);
     engine.handshake();

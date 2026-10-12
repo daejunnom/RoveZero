@@ -58,6 +58,7 @@ pub struct GoLimits {
     pub moves_to_go: Option<u32>,
     pub nodes: Option<u64>,
     pub infinite: bool,
+    pub ponder: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +72,7 @@ pub enum Command {
     Position(PositionSpec),
     Go(GoLimits),
     Stop,
+    PonderHit,
     Quit,
     NewGame,
     /// Unknown commands are diagnosed and ignored by the session.
@@ -126,7 +128,7 @@ pub fn parse(line: &str, limits: ParserLimits) -> Result<Command, ParseError> {
         "setoption" => parse_option(line, limits),
         "position" => parse_position(tail, limits),
         "go" => parse_go(tail),
-        "ponderhit" => Err(ParseError::Unsupported(head.to_owned())),
+        "ponderhit" => no_args(tail, Command::PonderHit),
         _ => Ok(Command::Unknown(head.to_owned())),
     }
 }
@@ -302,6 +304,14 @@ fn parse_go(fields: &[&str]) -> Result<Command, ParseError> {
     let mut i = 0;
     while i < fields.len() {
         let field = fields[i];
+        if field == "ponder" {
+            if limits.ponder {
+                return Err(ParseError::Malformed("duplicate go field"));
+            }
+            limits.ponder = true;
+            i += 1;
+            continue;
+        }
         if field == "infinite" {
             if limits.infinite {
                 return Err(ParseError::Malformed("duplicate go field"));
@@ -356,12 +366,19 @@ fn parse_go(fields: &[&str]) -> Result<Command, ParseError> {
             "movetime and clock modes are distinct",
         ));
     }
-    if limits.infinite && (limits.movetime_ms.is_some() || has_clock || limits.nodes.is_some()) {
+    if limits.infinite
+        && (limits.ponder || limits.movetime_ms.is_some() || has_clock || limits.nodes.is_some())
+    {
         return Err(ParseError::Malformed(
             "infinite cannot be combined with finite limits",
         ));
     }
-    if !limits.infinite && limits.movetime_ms.is_none() && !has_clock && limits.nodes.is_none() {
+    if !limits.infinite
+        && !limits.ponder
+        && limits.movetime_ms.is_none()
+        && !has_clock
+        && limits.nodes.is_none()
+    {
         return Err(ParseError::Malformed(
             "go requires a finite limit or infinite",
         ));

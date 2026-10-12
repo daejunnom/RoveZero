@@ -60,6 +60,9 @@ fn unsupported() -> ArenaError {
 }
 impl crate::native_launch::sealed::Sealed for LockedManifestV2 {}
 impl NativeLaunchDeclaration for LockedManifestV2 {
+    fn match_execution(&self) -> Option<&rz_experiments::MatchExecutionV1> {
+        self.input().match_execution.as_ref()
+    }
     fn rove_tree_max_edges(&self) -> Option<u32> {
         Some(self.input().rove_tree_max_edges)
     }
@@ -135,6 +138,9 @@ impl NativeLaunchDeclaration for LockedManifestV2 {
     }
     fn validate_execution(&self) -> Result<(), ArenaError> {
         self.input().validate()?;
+        if let Some(execution) = &self.input().match_execution {
+            crate::validate_match_host(execution)?;
+        }
         if !matches!(self.expected_provider_sessions(), 2 | 4) {
             return Err(unsupported());
         }
@@ -245,6 +251,17 @@ impl NativeProviderDeclaration for LockedManifestV2 {
         stdout: &[u8],
         pgn: &crate::PairPgnAudit,
     ) -> Result<Option<crate::NativePilotClockAudit>, ArenaError> {
+        if self
+            .input()
+            .match_execution
+            .as_ref()
+            .is_some_and(|e| e.ponder)
+        {
+            crate::audit_ponder_protocol(
+                stdout,
+                [self.input().engines[0].id(), self.input().engines[1].id()],
+            )?;
+        }
         crate::native_pilot::validate_pilot_clock_trace(
             stdout,
             pgn,

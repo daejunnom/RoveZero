@@ -170,8 +170,15 @@ H2D/D2H, GPU 완료, selection/backup과 출력 비용이 모두 들어간다. `
 
 loading·compile·일반 warm-up은 양쪽 동일 정책을 적용한다. warm-up 입력은 평가
 opening과 분리하고 생성 원칙·횟수·시간·메모리와 이후 cache reset을 기록한다.
-평가 포지션·후속 수를 사전 분석하지 않는다. Ponder와 상대 차례의 helper·신경망
-평가·speculation은 끈다. 온라인 가중치 변경과 게임 간 결과·상대 학습 유입을 금지한다.
+평가 포지션·후속 수를 사전 분석하지 않는다. 기본 대조는 Ponder와 상대 차례의
+helper·신경망 평가·speculation을 끈다. 사용자 지정 폰더링 대조에서는 V2의
+`match_execution.ponder=true`와 실제 가용 CPU core/SMT·GPU UUID·엔진 종류·배분을
+실행 전에 잠근다. CPU/GPU/Hybrid 가중 자동 배분은 성능 측정이 아니며 호출자의 직접
+지정이 우선한다. isolated는 물리 CPU core/SMT와 GPU를 분리하고, shared는 CPU thread
+합계·GPU별 VRAM 예약을 제한하되 GPU 계산 quota/메모리 cap을 설치한 것으로 표시하지
+않는다. 예측 hit는 `ponderhit`, miss와 대국 종료는 bounded `stop`/응답·물리 drain으로
+연결한다. 폰더링 on/off 결과를 합치거나 on 결과를 기존 off 조건의 강도로 보고하지 않는다.
+온라인 가중치 변경과 게임 간 결과·상대 학습 유입을 금지한다.
 게임 안 history/correction은 manifest에 켠 경우 자기 시간에만 갱신하고
 `ucinewgame`에서 초기화한다. raw eval cache와 검색 correction을 구별한다.
 

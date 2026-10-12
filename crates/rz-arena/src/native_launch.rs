@@ -95,6 +95,31 @@ pub trait NativeLaunchDeclaration: sealed::Sealed + Clone + fmt::Debug + Send + 
     fn rove_tree_max_edges(&self) -> Option<u32> {
         None
     }
+    fn match_execution(&self) -> Option<&rz_experiments::MatchExecutionV1> {
+        None
+    }
+    fn external_options(
+        &self,
+        role: rz_experiments::NativeEngineRole,
+    ) -> Result<std::collections::BTreeMap<String, String>, ArenaError> {
+        let view = self.engine_view(role)?;
+        let mut options = view
+            .external
+            .map(|e| e.requested_options.clone())
+            .unwrap_or_default();
+        if let Some(execution) = self.match_execution() {
+            let plan = execution.plan()?;
+            let allocation = plan
+                .engines
+                .iter()
+                .find(|a| a.role == role)
+                .expect("validated role");
+            // These values are locked by the resource policy and checked against advertisement.
+            options.insert("Ponder".into(), execution.ponder.to_string());
+            options.insert("Threads".into(), allocation.threads.to_string());
+        }
+        Ok(options)
+    }
     fn validate_execution(&self) -> Result<(), ArenaError> {
         Ok(())
     }
@@ -1196,6 +1221,9 @@ pub(crate) mod linux {
                 .attempted_snapshot_relative_paths
                 .push(format!("inputs/{name}"));
             let executable = artifact == &input.runner.binary
+                || spec
+                    .match_execution()
+                    .is_some_and(|e| &e.executor == artifact)
                 || [NativeEngineRole::Baseline, NativeEngineRole::Candidate]
                     .into_iter()
                     .any(|role| {
@@ -1498,6 +1526,13 @@ pub(crate) mod linux {
                     variables.as_ref(),
                     pins,
                 )?;
+                let launch = crate::engine_environment::place(
+                    launch,
+                    spec.match_execution(),
+                    role,
+                    engine.environment.is_some(),
+                    pins,
+                )?;
                 args.extend([
                     OsString::from("-engine"),
                     key_path("cmd=", &launch.program.path)?,
@@ -1510,8 +1545,8 @@ pub(crate) mod linux {
                         spec.argument_limit(),
                     )?);
                 }
-                for (name, value) in &external.requested_options {
-                    let value = crate::external_uci::resolve_asset_tokens(value, external, pins)?;
+                for (name, value) in spec.external_options(role)? {
+                    let value = crate::external_uci::resolve_asset_tokens(&value, external, pins)?;
                     args.push(format!("option.{name}={value}").into());
                 }
                 continue;
@@ -1575,6 +1610,13 @@ pub(crate) mod linux {
             }
             let launch =
                 crate::engine_environment::prepare(binary, tokens, engine.environment, None, pins)?;
+            let launch = crate::engine_environment::place(
+                launch,
+                spec.match_execution(),
+                role,
+                engine.environment.is_some(),
+                pins,
+            )?;
             args.extend([
                 OsString::from("-engine"),
                 key_path("cmd=", &launch.program.path)?,
@@ -1582,6 +1624,9 @@ pub(crate) mod linux {
                 format!("name={}", engine.engine_id).into(),
                 encode_fastchess_native_args_with_limit(&launch.arguments, spec.argument_limit())?,
             ]);
+            if let Some(execution) = spec.match_execution() {
+                args.push(format!("option.Ponder={}", execution.ponder).into());
+            }
         }
         let opening = &pin(pins, input.opening_artifact)?.path;
         args.extend([
@@ -1653,6 +1698,23 @@ pub(crate) mod linux {
                 .expect("closed log argument");
             args.insert(index, "-strict".into());
         }
+        if let Some(execution) = spec.match_execution() {
+            let plan = execution.plan()?;
+            let cpus = plan
+                .runner_cpu_ids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut placed = vec![
+                "engine-exec".into(),
+                cpus.into(),
+                "-".into(),
+                pin(pins, &input.runner.binary)?.path.as_os_str().to_owned(),
+            ];
+            placed.extend(args);
+            args = placed;
+        }
         let mut limitations=[
             "NN integration only; execution_ready=false; strength_eligible=false; same weights and search in both roles",
             "private input copies use separate inodes and closed writers; Unix readonly is an ownership convention, not a same-UID sandbox or immutable seal",
@@ -1686,6 +1748,11 @@ pub(crate) mod linux {
         }
         if spec.provider_name() == "CUDA" {
             limitations.push("CUDA device0/FP32/TF32off/selected arena is requested admission metadata, not measured VRAM, aggregate GPU allocation or a kernel-enforced hard cap".into());
+        }
+        if let Some(execution) = spec.match_execution() {
+            limitations[0] = "V2 locked CPU/GPU/Hybrid paired execution; execution_ready=false; strength_eligible=false; comparisons follow the declared model/search/resource identities".into();
+            limitations[6] = "same-PID executor installs and reads back runner/engine CPU affinity; aggregate RAM still requires recorded inherited enforcement".into();
+            limitations.push(format!("Ponder={}; sharing={:?}; CUDA visibility is trusted-engine placement; GPU memory reservations and compute sharing are not hard allocator/compute quotas", execution.ponder, execution.sharing));
         }
         spec.amend_execution_limitations(&mut limitations);
         Ok(FastchessInvocation { args, limitations })

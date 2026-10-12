@@ -692,6 +692,9 @@ struct Owner {
     workers: Vec<Worker>,
     pending_failures: VecDeque<(SearchTicket, SearchCompletion)>,
     pending_bestmove: Option<PendingBestMove>,
+    ponder: Option<(crate::contracts::SessionScope, Option<u64>)>,
+    held_ponder_bestmove: Option<HeldPonderBestMove>,
+    admitted_ponder_report: Option<AdmittedPonderReport>,
     pending_close: Option<Event>,
     fence_failure: Option<EngineError>,
     diagnostics: Arc<Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>>,
@@ -702,12 +705,232 @@ struct PendingBestMove {
     until: Instant,
     from_driver_report: bool,
 }
+struct HeldPonderBestMove {
+    scope: crate::contracts::SessionScope,
+    line: String,
+    from_driver_report: bool,
+}
+struct AdmittedPonderReport {
+    ticket: SearchTicket,
+    scope: crate::contracts::SessionScope,
+    bestmove: String,
+}
 impl PendingBestMove {
     fn matches_scope(&self, scope: crate::contracts::SessionScope) -> bool {
         self.scope == scope
     }
 }
 impl Owner {
+    fn command_line(
+        &mut self,
+        session: &mut Session<RulesUciPort>,
+        line: &str,
+    ) -> (SessionResult<RulesSearchPosition>, bool) {
+        let parsed = parse(line, session.parser_limits());
+        let enabled = matches!(
+            session.option_values().get("Ponder"),
+            Some(OptionValue::Check(true))
+        );
+        let mut out = SessionResult::default();
+        let mut from_driver_report = false;
+        match &parsed {
+            Ok(Command::Go(limits)) if limits.ponder => {
+                if !enabled || limits.nodes.is_some_and(|n| n > 4096) {
+                    out.accepted = false;
+                    out.diagnostics.push(Diagnostic {
+                        code: "PonderRejected",
+                        message:
+                            "Ponder must be enabled and the node limit must fit the engine envelope"
+                                .into(),
+                    });
+                    return (out, false);
+                }
+                // The opponent's elapsed time is never debited from the supplied own clock.
+                // A finite resource wall and simulation ceiling still bound speculative work.
+                append_contract_result(
+                    &mut out,
+                    self.session_owner.handle_line(session, "go infinite", |s| {
+                        Ok(s.state.snapshot().side_to_move())
+                    }),
+                );
+                if out.accepted {
+                    self.held_ponder_bestmove = None;
+                    self.admitted_ponder_report = None;
+                    self.ponder = Some((self.session_owner.lifecycle_scope(), limits.nodes));
+                }
+            }
+            Ok(Command::PonderHit) => {
+                if !self
+                    .ponder
+                    .as_ref()
+                    .is_some_and(|(scope, _)| *scope == self.session_owner.lifecycle_scope())
+                {
+                    out.accepted = false;
+                    out.diagnostics.push(Diagnostic {
+                        code: "StalePonderHit",
+                        message: "no current predicted-root search".into(),
+                    });
+                    return (out, false);
+                }
+                self.ponder = None;
+                let ticket = session.active_ticket();
+                // This baseline finishes the precomputed candidate on hit. It does not
+                // restart, spend the opponent's time, or reopen an expired request.
+                append_contract_result(
+                    &mut out,
+                    self.session_owner
+                        .handle_line(session, "stop", |s| Ok(s.state.snapshot().side_to_move())),
+                );
+                from_driver_report = self.release_ponder_output(ticket.as_ref(), &mut out);
+            }
+            Ok(Command::SetOption { name, .. })
+                if name.eq_ignore_ascii_case("Ponder")
+                    && (session.active_ticket().is_some() || self.ponder.is_some()) =>
+            {
+                out.accepted = false;
+                out.diagnostics.push(Diagnostic {
+                    code: "PonderRejected",
+                    message: "change Ponder while idle".into(),
+                });
+            }
+            _ => {
+                let ticket = session.active_ticket();
+                append_contract_result(
+                    &mut out,
+                    self.session_owner
+                        .handle_line(session, line, |s| Ok(s.state.snapshot().side_to_move())),
+                );
+                if out.accepted && matches!(parsed, Ok(Command::Stop)) {
+                    from_driver_report = self.release_ponder_output(ticket.as_ref(), &mut out);
+                }
+                if out.accepted
+                    && matches!(
+                        parsed,
+                        Ok(Command::Go(_)
+                            | Command::Position(_)
+                            | Command::NewGame
+                            | Command::Stop
+                            | Command::Quit)
+                    )
+                {
+                    self.ponder = None;
+                    self.held_ponder_bestmove = None;
+                    self.admitted_ponder_report = None;
+                }
+            }
+        }
+        (out, from_driver_report)
+    }
+    fn release_ponder_output(
+        &mut self,
+        ticket: Option<&SearchTicket>,
+        out: &mut SessionResult<RulesSearchPosition>,
+    ) -> bool {
+        // Successful infinite work stays in Session until stop/hit. Only its
+        // exact admitted ticket, scope and move can acknowledge that report;
+        // a coincident fallback after an earlier stop is not report consumption.
+        let from_passive_report = self.admitted_ponder_report.take().is_some_and(|report| {
+            ticket == Some(&report.ticket)
+                && report.scope == self.session_owner.lifecycle_scope()
+                && out.protocol.iter().any(|line| {
+                    line.strip_prefix("bestmove ")
+                        .and_then(|text| text.split_ascii_whitespace().next())
+                        == Some(report.bestmove.as_str())
+                })
+        });
+        let Some(held) = self.held_ponder_bestmove.take() else {
+            return from_passive_report;
+        };
+        if held.scope != self.session_owner.lifecycle_scope() {
+            out.diagnostics.push(Diagnostic {
+                code: "StalePonderOutput",
+                message: "held predicted-root move has lost its publication authority".into(),
+            });
+            return from_passive_report;
+        }
+        out.protocol.push(held.line);
+        held.from_driver_report || from_passive_report
+    }
+    fn annotate_ponder(
+        &self,
+        session: &Session<RulesUciPort>,
+        out: &mut SessionResult<RulesSearchPosition>,
+    ) {
+        if !matches!(
+            session.option_values().get("Ponder"),
+            Some(OptionValue::Check(true))
+        ) {
+            return;
+        }
+        for line in &mut out.protocol {
+            let Some(text) = line
+                .strip_prefix("bestmove ")
+                .filter(|s| *s != "0000" && !s.contains(' '))
+            else {
+                continue;
+            };
+            let prediction = (|| -> Result<Option<String>, contract::ContractError> {
+                let movement = contract::Move::try_from(BoardMove::from_uci(text)?)?;
+                let child = CheckedPosition::play(session.snapshot(), &movement)?;
+                if child.state.terminal_wdl().is_some() {
+                    return Ok(None);
+                }
+                child
+                    .state
+                    .legal_moves()
+                    .moves()
+                    .first()
+                    .copied()
+                    .map(move_text)
+                    .transpose()
+            })();
+            match prediction {
+                Ok(Some(prediction)) => {
+                    line.push_str(" ponder ");
+                    line.push_str(&prediction);
+                }
+                Ok(None) => {}
+                Err(error) => out.diagnostics.push(Diagnostic {
+                    code: "PonderPredictionFailed",
+                    message: format!("{error:?}"),
+                }),
+            }
+        }
+    }
+    fn hold_ponder_output(
+        &mut self,
+        session: &Session<RulesUciPort>,
+        out: &mut SessionResult<RulesSearchPosition>,
+        from_driver_report: bool,
+    ) {
+        if session.is_closed() {
+            self.ponder = None;
+            self.held_ponder_bestmove = None;
+            self.admitted_ponder_report = None;
+            return;
+        }
+        if self.ponder.is_none() {
+            return;
+        }
+        for line in std::mem::take(&mut out.protocol) {
+            if !line.starts_with("bestmove ") {
+                out.protocol.push(line);
+                continue;
+            }
+            if self.held_ponder_bestmove.is_some() {
+                out.diagnostics.push(Diagnostic {
+                    code: "DuplicatePonderOutput",
+                    message: "retained first completed predicted-root move".into(),
+                });
+            } else {
+                self.held_ponder_bestmove = Some(HeldPonderBestMove {
+                    scope: self.session_owner.lifecycle_scope(),
+                    line,
+                    from_driver_report,
+                });
+            }
+        }
+    }
     fn deadline_ticket(
         &self,
         delivered: Option<&SearchTicket>,
@@ -800,6 +1023,16 @@ impl Owner {
             } => Some((ticket.clone(), completion.clone())),
             _ => None,
         };
+        let passive_report = match &event {
+            Event::Complete {
+                ticket,
+                completion:
+                    SearchCompletion::Completed {
+                        bestmove: Some(bestmove),
+                    },
+            } => Some((ticket.clone(), bestmove.clone())),
+            _ => None,
+        };
         match self.diagnostics.lock() {
             Ok(mut receipts) => {
                 for (error, count) in std::mem::take(&mut *receipts) {
@@ -825,26 +1058,21 @@ impl Owner {
                 self.session_owner
                     .handle_event(session, Event::Complete { ticket, completion }),
             );
+            self.annotate_ponder(session, &mut failed);
+            self.hold_ponder_output(session, &mut failed, false);
             self.defer_bestmove(session, &mut failed, false);
             append_result(&mut out, failed);
         }
-        let mut next = match event {
+        let (mut next, held_driver_report) = match event {
             Event::RejectedInput {
                 code: "OwnerWake", ..
-            } => SessionResult::default(),
-            Event::Line(line) => {
-                let next = self.session_owner.handle_line(session, &line, |snapshot| {
-                    Ok(snapshot.state.snapshot().side_to_move())
-                });
-                let mut out = SessionResult::default();
-                append_contract_result(&mut out, next);
-                out
-            }
+            } => (SessionResult::default(), false),
+            Event::Line(line) => self.command_line(session, &line),
             event => {
                 let next = self.session_owner.handle_event(session, event);
                 let mut out = SessionResult::default();
                 append_contract_result(&mut out, next);
-                out
+                (out, false)
             }
         };
         // Enqueueing is not consumption. A typed failed publication stays with
@@ -909,7 +1137,24 @@ impl Owner {
         // A Completed event can be rejected by the common hard-deadline guard
         // and replaced with a frozen fallback. Only the actual admitted
         // completion outcome may acknowledge consumption of a CPU report.
-        let admitted_driver_report = from_driver_report && next.accepted;
+        let admitted_driver_report = (from_driver_report && next.accepted) || held_driver_report;
+        if from_driver_report
+            && next.accepted
+            && let Some((ticket, bestmove)) = passive_report
+            && session.active_ticket().as_ref() == Some(&ticket)
+            && self
+                .ponder
+                .as_ref()
+                .is_some_and(|(scope, _)| *scope == self.session_owner.lifecycle_scope())
+        {
+            self.admitted_ponder_report = Some(AdmittedPonderReport {
+                ticket,
+                scope: self.session_owner.lifecycle_scope(),
+                bestmove,
+            });
+        }
+        self.annotate_ponder(session, &mut next);
+        self.hold_ponder_output(session, &mut next, admitted_driver_report);
         self.defer_bestmove(session, &mut next, admitted_driver_report);
         append_result(&mut out, next);
         self.finish_physical_output(session, &mut out);
@@ -1006,7 +1251,11 @@ impl Owner {
             if let (Some(driver), crate::contracts::SessionScope::Search(authority)) =
                 (&self.driver, pending.scope)
             {
-                let bestmove = pending.line.strip_prefix("bestmove ").unwrap_or("");
+                let bestmove = pending
+                    .line
+                    .strip_prefix("bestmove ")
+                    .and_then(|text| text.split_ascii_whitespace().next())
+                    .unwrap_or("");
                 if let Err(error) =
                     driver.accept_uci_output(authority, bestmove, pending.from_driver_report)
                 {
@@ -1028,6 +1277,9 @@ impl Owner {
     ) {
         self.pending_bestmove = None;
         self.pending_close = None;
+        self.ponder = None;
+        self.held_ponder_bestmove = None;
+        self.admitted_ponder_report = None;
         out.protocol.retain(|line| !line.starts_with("bestmove "));
         out.diagnostics.push(Diagnostic {
             code: "PhysicalFenceFailure",
@@ -1151,12 +1403,15 @@ impl Owner {
                     );
                     return Ok(());
                 }
-                let control = self.session_owner.control().cloned().ok_or_else(|| {
+                let mut control = self.session_owner.control().cloned().ok_or_else(|| {
                     failure(
                         contract::ErrorCode::IdentityMismatch,
                         "UCI start has no checked B control",
                     )
                 })?;
+                if let Some((_, Some(nodes))) = self.ponder {
+                    control.max_simulations = control.max_simulations.min(nodes);
+                }
                 let token = self
                     .session_owner
                     .cancellation()
@@ -1508,6 +1763,7 @@ impl Owner {
                     failure: publication,
                 });
             }
+            Effect::OptionChanged { name, .. } if name.eq_ignore_ascii_case("Ponder") => {}
             Effect::OptionChanged { .. } | Effect::Button { .. } => {
                 return Err(failure(
                     contract::ErrorCode::UnsupportedContract,
@@ -1891,6 +2147,9 @@ pub fn serve<O: Write, D: Write>(
         workers: Vec::new(),
         pending_failures: VecDeque::new(),
         pending_bestmove: None,
+        ponder: None,
+        held_ponder_bestmove: None,
+        admitted_ponder_report: None,
         pending_close: None,
         fence_failure: None,
         diagnostics: Arc::new(Mutex::new(Vec::new())),
@@ -1898,7 +2157,10 @@ pub fn serve<O: Write, D: Write>(
     let mut session = Session::new(
         RulesUciPort::new(owners, settings.position),
         identity,
-        Vec::new(),
+        vec![OptionSpec {
+            name: "Ponder".into(),
+            kind: OptionKind::Check { default: false },
+        }],
         settings.parser,
     )
     .map_err(EngineError::Session)?;
@@ -2151,9 +2413,10 @@ mod tests {
         fn accept_uci_output(
             &self,
             _: contract::pals::SearchAuthority,
-            _: &str,
+            bestmove: &str,
             from_report: bool,
         ) -> Result<(), contract::ContractError> {
+            BoardMove::from_uci(bestmove).expect("only the move token reaches the driver");
             self.0.lock().unwrap().push(from_report);
             Ok(())
         }
@@ -2269,6 +2532,10 @@ mod tests {
         owner.evaluation_scope = None;
         owner.factory = None;
         owner.driver = Some(driver);
+        owner.handle(
+            &mut session,
+            Event::Line("setoption name Ponder value true".into()),
+        );
         let started = owner.handle(&mut session, Event::Line("go movetime 20".into()));
         let ticket = started
             .effects
@@ -2519,6 +2786,9 @@ mod tests {
             workers: Vec::new(),
             pending_failures: VecDeque::new(),
             pending_bestmove: None,
+            ponder: None,
+            held_ponder_bestmove: None,
+            admitted_ponder_report: None,
             pending_close: None,
             fence_failure: None,
             diagnostics: Arc::new(Mutex::new(Vec::new())),
@@ -2529,7 +2799,10 @@ mod tests {
                 name: "actual Rules refusal fixture".into(),
                 author: "test".into(),
             },
-            Vec::new(),
+            vec![OptionSpec {
+                name: "Ponder".into(),
+                kind: OptionKind::Check { default: false },
+            }],
             settings.parser,
         )
         .unwrap();
@@ -4030,6 +4303,531 @@ mod tests {
     }
 
     #[test]
+    fn pondering_is_explicit_and_keeps_the_normal_search_root_on_rejection() {
+        let (mut owner, mut session) = fixture();
+        let scope = owner.session_owner.scope();
+        let rejected = owner.handle(
+            &mut session,
+            Event::Line("go ponder wtime 1000 btime 1000".into()),
+        );
+        assert!(!rejected.accepted && rejected.effects.is_empty());
+        assert_eq!(owner.session_owner.scope().root, scope.root);
+        assert!(session.active_ticket().is_none());
+        owner.handle(
+            &mut session,
+            Event::Line("setoption name Ponder value true".into()),
+        );
+        let started = owner.handle(&mut session, Event::Line("go ponder nodes 1".into()));
+        assert!(started.accepted);
+        assert!(started.protocol.is_empty());
+        assert_eq!(owner.ponder.unwrap().1, Some(1));
+        assert!(owner.session_owner.control().unwrap().deadline > Instant::now());
+    }
+
+    type DriverOutputAcks = Arc<Mutex<Vec<(contract::pals::SearchAuthority, String, bool)>>>;
+
+    struct DriverOutputProbe {
+        inner: Arc<dyn crate::search_driver::SearchSessionDriver>,
+        acknowledgments: DriverOutputAcks,
+    }
+    impl crate::search_driver::SearchSessionDriver for DriverOutputProbe {
+        fn kind(&self) -> crate::search_driver::SearchKind {
+            self.inner.kind()
+        }
+        fn implementation(&self) -> contract::Digest {
+            self.inner.implementation()
+        }
+        fn identity(&self) -> EngineIdentity {
+            self.inner.identity()
+        }
+        fn reset_game(&self) -> Result<(), contract::ContractError> {
+            self.inner.reset_game()
+        }
+        fn run(
+            &self,
+            position: &Position,
+            context: &crate::search_driver::SearchSessionContext,
+            progress: &mut dyn FnMut(BoardMove),
+        ) -> Result<
+            crate::search_driver::SearchSessionReport,
+            crate::search_driver::SearchSessionFailure,
+        > {
+            self.inner.run(position, context, progress)
+        }
+        fn accept_uci_output(
+            &self,
+            authority: contract::pals::SearchAuthority,
+            bestmove: &str,
+            from_report: bool,
+        ) -> Result<(), contract::ContractError> {
+            BoardMove::from_uci(bestmove)
+                .expect("annotated output must retain one legal move token");
+            self.inner
+                .accept_uci_output(authority, bestmove, from_report)?;
+            self.acknowledgments
+                .lock()
+                .unwrap()
+                .push((authority, bestmove.into(), from_report));
+            Ok(())
+        }
+    }
+
+    fn search_driver_output_fixture(
+        pals: bool,
+    ) -> (Owner, Session<RulesUciPort>, DriverOutputAcks) {
+        let (mut owner, session) = fixture();
+        let cpu = rz_search::cpu::CpuConfig {
+            tt_entries: 0,
+            max_depth: 1,
+            ..rz_search::cpu::CpuConfig::default()
+        };
+        let inner: Arc<dyn crate::search_driver::SearchSessionDriver> = if pals {
+            Arc::new(
+                crate::search_driver::PalsSessionDriver::new(
+                    rz_search::pals::engine::PalsConfig::default(),
+                    rz_search::pals::engine::LegalOrderRoleMock,
+                    cpu,
+                    1,
+                    8,
+                    1,
+                    EngineIdentity {
+                        name: "PALS ponder CPU/mock fixture".into(),
+                        author: "test".into(),
+                    },
+                )
+                .unwrap(),
+            )
+        } else {
+            Arc::new(crate::search_driver::CpuSessionDriver::new(cpu, 8).unwrap())
+        };
+        let scope = crate::contracts::SessionScope::Search(contract::pals::SearchAuthority {
+            epoch: owner.clock.epoch(),
+            game: contract::GameGeneration(1),
+            root: contract::RootGeneration(0),
+            implementation: inner.implementation(),
+        });
+        let acknowledgments = Arc::new(Mutex::new(Vec::new()));
+        owner.session_owner = crate::contracts::ContractSessionOwner::new_scope(
+            scope,
+            owner.clock.epoch(),
+            owner.clock.b_clock(),
+            owner.settings.search,
+        )
+        .unwrap();
+        owner.scope = Arc::new(Mutex::new(scope));
+        owner.evaluation_scope = None;
+        owner.factory = None;
+        owner.driver = Some(Arc::new(DriverOutputProbe {
+            inner,
+            acknowledgments: Arc::clone(&acknowledgments),
+        }));
+        (owner, session, acknowledgments)
+    }
+
+    fn completed_driver_search(
+        owner: &mut Owner,
+        session: &mut Session<RulesUciPort>,
+        ponder: bool,
+    ) -> SessionResult<RulesSearchPosition> {
+        if ponder {
+            assert!(
+                owner
+                    .handle(
+                        session,
+                        Event::Line("setoption name Ponder value true".into()),
+                    )
+                    .accepted
+            );
+        }
+        let start = owner.handle(
+            session,
+            Event::Line(
+                if ponder {
+                    "go ponder nodes 1"
+                } else {
+                    "go nodes 1"
+                }
+                .into(),
+            ),
+        );
+        assert!(start.accepted);
+        let (sender, events) = event_channel();
+        for effect in start.effects {
+            owner.dispatch(effect, &sender).unwrap();
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut out = SessionResult::default();
+        loop {
+            let event = events
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+                .expect("finite actual CPU/mock driver completion");
+            let terminal = matches!(&event, Event::Complete { .. });
+            append_result(&mut out, owner.handle(session, event));
+            if terminal {
+                break;
+            }
+            assert!(Instant::now() < until);
+        }
+        while owner.workers.iter().any(|worker| !worker.is_finished()) {
+            assert!(
+                Instant::now() < until,
+                "physical worker must finish finitely"
+            );
+            thread::yield_now();
+        }
+        if !ponder {
+            append_result(
+                &mut out,
+                owner.handle(
+                    session,
+                    Event::RejectedInput {
+                        code: "OwnerWake",
+                        message: String::new(),
+                    },
+                ),
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn own_cpu_and_pals_ponder_hit_stop_preserve_the_admitted_report_after_physical_join() {
+        for pals in [false, true] {
+            for release in ["ponderhit", "stop"] {
+                let (mut owner, mut session, acknowledgments) = search_driver_output_fixture(pals);
+                let complete = completed_driver_search(&mut owner, &mut session, true);
+                assert!(complete.protocol.is_empty());
+                assert!(owner.held_ponder_bestmove.is_none());
+                let report = owner.admitted_ponder_report.as_ref().unwrap();
+                assert_eq!(Some(&report.ticket), session.active_ticket().as_ref());
+                assert_eq!(report.scope, owner.session_owner.lifecycle_scope());
+                assert!(acknowledgments.lock().unwrap().is_empty());
+                let released = owner.handle(&mut session, Event::Line(release.into()));
+                assert_eq!(released.protocol.len(), 1);
+                let bestmove = released.protocol[0]
+                    .strip_prefix("bestmove ")
+                    .unwrap()
+                    .split_ascii_whitespace()
+                    .next()
+                    .unwrap();
+                assert!(released.protocol[0].contains(" ponder "));
+                let crate::contracts::SessionScope::Search(authority) =
+                    owner.session_owner.lifecycle_scope()
+                else {
+                    panic!("actual CPU/PALS search authority");
+                };
+                assert_eq!(
+                    *acknowledgments.lock().unwrap(),
+                    vec![(authority, bestmove.into(), true)]
+                );
+                assert!(owner.workers.is_empty());
+                assert!(owner.held_ponder_bestmove.is_none());
+                assert!(owner.admitted_ponder_report.is_none());
+                assert!(
+                    owner
+                        .handle(&mut session, Event::Line(release.into()))
+                        .protocol
+                        .is_empty()
+                );
+                assert_eq!(acknowledgments.lock().unwrap().len(), 1);
+            }
+            let (mut owner, mut session, acknowledgments) = search_driver_output_fixture(pals);
+            let normal = completed_driver_search(&mut owner, &mut session, false);
+            assert_eq!(normal.protocol.len(), 1);
+            assert!(!normal.protocol[0].contains(" ponder "));
+            assert!(owner.ponder.is_none() && owner.held_ponder_bestmove.is_none());
+            assert!(owner.admitted_ponder_report.is_none());
+            assert_eq!(acknowledgments.lock().unwrap().len(), 1);
+            assert!(acknowledgments.lock().unwrap()[0].2);
+        }
+    }
+
+    #[test]
+    fn own_cpu_and_pals_root_newgame_revoke_held_ponder_report_authority() {
+        for pals in [false, true] {
+            for replacement in ["position startpos moves e2e4", "ucinewgame"] {
+                let (mut owner, mut session, acknowledgments) = search_driver_output_fixture(pals);
+                completed_driver_search(&mut owner, &mut session, true);
+                let prior = owner.session_owner.lifecycle_scope();
+                let replaced = owner.handle(&mut session, Event::Line(replacement.into()));
+                assert!(replaced.accepted && replaced.protocol.is_empty());
+                assert_ne!(owner.session_owner.lifecycle_scope(), prior);
+                assert!(owner.ponder.is_none() && owner.held_ponder_bestmove.is_none());
+                assert!(owner.admitted_ponder_report.is_none());
+                let (sender, _events) = event_channel();
+                for effect in replaced.effects {
+                    owner.dispatch(effect, &sender).unwrap();
+                }
+                let stale = owner.handle(&mut session, Event::Line("ponderhit".into()));
+                assert!(!stale.accepted && stale.protocol.is_empty());
+                assert!(acknowledgments.lock().unwrap().is_empty());
+                owner.reap_workers(true).unwrap();
+                assert!(owner.workers.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn own_cpu_and_pals_physical_unknown_discards_held_ponder_without_output_ack() {
+        for pals in [false, true] {
+            let (mut owner, mut session, acknowledgments) = search_driver_output_fixture(pals);
+            completed_driver_search(&mut owner, &mut session, true);
+            let ticket = owner.active.as_ref().unwrap().ticket.clone();
+            let error = crate::search_driver::SearchSessionFailure::physical_completion_unknown();
+            *owner.workers[0].failure.lock().unwrap() = Some(Box::new(UndeliveredWorkerFailure {
+                ticket,
+                completion: SearchCompletion::Failed {
+                    code: error.code.into(),
+                    message: error.detail.clone(),
+                },
+                source: WorkerFailureSource::Driver(error),
+            }));
+            let stopped = owner.handle(&mut session, Event::Line("ponderhit".into()));
+            assert!(stopped.protocol.is_empty());
+            assert!(session.is_closed() && owner.fence_failure.is_some());
+            assert!(owner.ponder.is_none() && owner.held_ponder_bestmove.is_none());
+            assert!(owner.admitted_ponder_report.is_none());
+            assert!(owner.pending_bestmove.is_none());
+            assert!(acknowledgments.lock().unwrap().is_empty());
+            assert!(
+                stopped
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code == "PhysicalFenceFailure")
+            );
+            owner.reap_workers(true).unwrap();
+        }
+    }
+
+    #[test]
+    fn own_cpu_and_pals_admitted_ponder_report_survives_the_passive_resource_deadline() {
+        for pals in [false, true] {
+            let (mut owner, mut session, acknowledgments) = search_driver_output_fixture(pals);
+            completed_driver_search(&mut owner, &mut session, true);
+            let ticket = session.active_ticket().unwrap();
+            let deadline = owner.session_owner.control().unwrap().deadline;
+            let token = owner.session_owner.cancellation().unwrap().token();
+            let expired = owner.session_owner.handle_event_at(
+                &mut session,
+                Event::Deadline(ticket),
+                deadline + Duration::from_millis(1),
+            );
+            assert!(expired.errors.is_empty());
+            assert!(expired.session.protocol.is_empty());
+            assert!(token.is_canceled());
+            assert!(owner.admitted_ponder_report.is_some());
+            let hit = owner.handle(&mut session, Event::Line("ponderhit".into()));
+            assert_eq!(hit.protocol.len(), 1);
+            assert_eq!(acknowledgments.lock().unwrap().len(), 1);
+            assert!(acknowledgments.lock().unwrap()[0].2);
+            assert!(owner.workers.is_empty());
+            assert!(owner.admitted_ponder_report.is_none());
+        }
+    }
+
+    #[test]
+    fn own_cpu_and_pals_ponder_stop_before_late_completion_keeps_fallback_provenance() {
+        for pals in [false, true] {
+            let (mut owner, mut session, acknowledgments) = search_driver_output_fixture(pals);
+            owner.handle(
+                &mut session,
+                Event::Line("setoption name Ponder value true".into()),
+            );
+            owner.handle(&mut session, Event::Line("go ponder nodes 1".into()));
+            let ticket = session.active_ticket().unwrap();
+            owner.active = Some(ActiveBinding {
+                ticket: ticket.clone(),
+                control: owner.session_owner.control().unwrap().clone(),
+                authority: None,
+            });
+            owner.handle(
+                &mut session,
+                Event::Progress {
+                    ticket: ticket.clone(),
+                    bestmove: "e2e4".into(),
+                },
+            );
+            let (release, waiting) = mpsc::channel();
+            owner.workers.push(Worker {
+                handle: thread::spawn(move || {
+                    waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+                    Ok(())
+                }),
+                failure: Arc::new(Mutex::new(None)),
+            });
+            let stopped = owner.handle(&mut session, Event::Line("stop".into()));
+            assert!(stopped.protocol.is_empty());
+            assert!(!owner.pending_bestmove.as_ref().unwrap().from_driver_report);
+            let late = owner.handle(
+                &mut session,
+                Event::Complete {
+                    ticket,
+                    completion: SearchCompletion::Completed {
+                        bestmove: Some("e2e4".into()),
+                    },
+                },
+            );
+            assert!(!late.accepted && late.protocol.is_empty());
+            assert!(owner.admitted_ponder_report.is_none());
+            assert!(!owner.pending_bestmove.as_ref().unwrap().from_driver_report);
+            release.send(()).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while !owner.workers[0].is_finished() {
+                assert!(Instant::now() < until);
+                thread::yield_now();
+            }
+            let finished = owner.handle(
+                &mut session,
+                Event::RejectedInput {
+                    code: "OwnerWake",
+                    message: String::new(),
+                },
+            );
+            assert!(finished.protocol[0].starts_with("bestmove e2e4 ponder "));
+            assert_eq!(acknowledgments.lock().unwrap().len(), 1);
+            assert!(!acknowledgments.lock().unwrap()[0].2);
+            assert!(owner.workers.is_empty());
+        }
+    }
+
+    #[test]
+    fn completed_ponder_waits_for_hit_and_returns_the_candidate_exactly_once() {
+        let (mut owner, mut session) = fixture();
+        owner.handle(
+            &mut session,
+            Event::Line("setoption name Ponder value true".into()),
+        );
+        owner.handle(
+            &mut session,
+            Event::Line("go ponder wtime 1 btime 1".into()),
+        );
+        let ticket = session.active_ticket().unwrap();
+        let token = owner.session_owner.cancellation().unwrap().token();
+        let complete = owner.handle(
+            &mut session,
+            Event::Complete {
+                ticket: ticket.clone(),
+                completion: SearchCompletion::Completed {
+                    bestmove: Some("e2e4".into()),
+                },
+            },
+        );
+        assert!(complete.protocol.is_empty());
+        assert_eq!(
+            owner
+                .handle(&mut session, Event::Line("isready".into()))
+                .protocol,
+            ["readyok"]
+        );
+        let hit = owner.handle(&mut session, Event::Line("ponderhit".into()));
+        assert!(hit.accepted);
+        assert!(hit.protocol[0].starts_with("bestmove e2e4 ponder "));
+        assert!(token.is_canceled());
+        assert!(session.active_ticket().is_none());
+        assert!(
+            owner
+                .handle(&mut session, Event::Line("ponderhit".into()))
+                .protocol
+                .is_empty()
+        );
+        assert!(
+            owner
+                .handle(
+                    &mut session,
+                    Event::Complete {
+                        ticket,
+                        completion: SearchCompletion::Completed {
+                            bestmove: Some("d2d4".into())
+                        }
+                    }
+                )
+                .protocol
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_ponder_preserves_diagnostics_and_holds_fallback_until_stop() {
+        let (mut owner, mut session) = fixture();
+        owner.handle(
+            &mut session,
+            Event::Line("setoption name Ponder value true".into()),
+        );
+        owner.handle(&mut session, Event::Line("go ponder".into()));
+        let ticket = session.active_ticket().unwrap();
+        let failed = owner.handle(
+            &mut session,
+            Event::Complete {
+                ticket,
+                completion: SearchCompletion::Failed {
+                    code: "InjectedPonderFailure".into(),
+                    message: "original source".into(),
+                },
+            },
+        );
+        assert!(failed.protocol.is_empty());
+        assert!(
+            failed
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("original source"))
+        );
+        let stop = owner.handle(&mut session, Event::Line("stop".into()));
+        assert_eq!(
+            stop.protocol
+                .iter()
+                .filter(|s| s.starts_with("bestmove "))
+                .count(),
+            1
+        );
+        assert!(
+            owner
+                .handle(&mut session, Event::Line("stop".into()))
+                .protocol
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn accepted_position_replacement_suppresses_an_old_held_ponder_failure() {
+        let (mut owner, mut session) = fixture();
+        owner.handle(
+            &mut session,
+            Event::Line("setoption name Ponder value true".into()),
+        );
+        owner.handle(&mut session, Event::Line("go ponder".into()));
+        let ticket = session.active_ticket().unwrap();
+        owner.handle(
+            &mut session,
+            Event::Complete {
+                ticket,
+                completion: SearchCompletion::Failed {
+                    code: "Injected".into(),
+                    message: "retained".into(),
+                },
+            },
+        );
+        assert!(owner.held_ponder_bestmove.is_some());
+        let bad = owner.handle(
+            &mut session,
+            Event::Line("position startpos moves e2e5".into()),
+        );
+        assert!(!bad.accepted && owner.held_ponder_bestmove.is_some());
+        let good = owner.handle(
+            &mut session,
+            Event::Line("position startpos moves e2e4".into()),
+        );
+        assert!(good.accepted && good.protocol.is_empty());
+        assert!(owner.ponder.is_none() && owner.held_ponder_bestmove.is_none());
+        assert!(
+            owner
+                .handle(&mut session, Event::Line("ponderhit".into()))
+                .protocol
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn injected_identity_reaches_uci_and_newline_identity_is_rejected_before_output() {
         let run = |name: &str| {
             let (owner, session) = fixture();
@@ -4065,6 +4863,7 @@ mod tests {
             [
                 "id name RoveZero native CPU identity fixture",
                 "id author RoveZero identity fixture",
+                "option name Ponder type check default false",
                 "uciok",
             ]
         );
