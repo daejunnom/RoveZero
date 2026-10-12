@@ -4063,8 +4063,15 @@ mod tests {
         };
         let render = |pids: [[u32; 2]; 2]| {
             let mut rows = vec![];
-            for game in 0..2 {
-                let white = &lock.input.semantic_lock.manifest.pilot.white_order[game];
+            for (game, white) in lock
+                .input
+                .semantic_lock
+                .manifest
+                .pilot
+                .white_order
+                .iter()
+                .enumerate()
+            {
                 let white_role = lock
                     .input
                     .semantic_lock
@@ -4103,9 +4110,8 @@ mod tests {
         let exited = crate::native_exit::validate_endpoint_exit_trace(&stdout, &[], 4).unwrap();
         assert_eq!(mapped, pids);
         let mut owners = BTreeSet::new();
-        for role in 0..2 {
-            for game in 0..2 {
-                let pid = mapped[role][game];
+        for role_pids in &mapped {
+            for &pid in role_pids {
                 assert!(exited.contains(&pid));
                 let owner =
                     cleanup_game_owner_v4(60000, pid, &lock.sha256, Some(pid), Some(pid)).unwrap();
