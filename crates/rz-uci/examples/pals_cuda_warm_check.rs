@@ -124,6 +124,9 @@ mod check {
     const COST_LANE_CALLS: usize = COST_PREPARATION_CALLS + COST_MEASURED_CALLS;
     const COST_EXTRA_ROLE_FORWARDS: u64 = COST_LANE_CALLS as u64 * 2 + STARTUP_ROLE_FORWARDS;
     const COST_WALL: Duration = Duration::from_secs(45);
+    // DEFAULT cost includes two sequential owners' loading, readiness, samples
+    // and physical joins. This opt-in bound changes no NN or sample budget.
+    const COST_CONV_DEFAULT_WALL: Duration = Duration::from_secs(150);
     const COST_DEVICE_BYTES_MAX: u64 = 397_312;
 
     #[derive(Clone)]
@@ -2179,7 +2182,11 @@ mod check {
 
     fn cost_work_wall(args: &Args) -> Duration {
         if args.cost_same_seed_context {
-            COST_WALL
+            if args.cost_conv_default {
+                COST_CONV_DEFAULT_WALL
+            } else {
+                COST_WALL
+            }
         } else {
             WALL
         }
@@ -2706,7 +2713,8 @@ mod check {
             "cudnn_execution_diagnostic": report["startup_receipt"]["execution"]["cudnn_conv_search_diagnostic"],
             "cost_execution_boundary": "resident_repair_actual_search_progress_before_later_P_publication",
             "execution_checks_passed": complete, "benchmark_validation_complete": false,
-            "wall_limit_ms": COST_WALL.as_millis(), "cleanup_limit_ms": CLEANUP.as_millis(),
+            "wall_limit_ms": cost_work_wall(args).as_millis(), "cleanup_limit_ms": CLEANUP.as_millis(),
+            "whole_limit_ms": (cost_work_wall(args) + CLEANUP).as_millis(),
             "preparation_calls_per_lane": COST_PREPARATION_CALLS,
             "measured_calls_per_lane": COST_MEASURED_CALLS,
             "extra_role_forward_reservation_including_fresh_startup": COST_EXTRA_ROLE_FORWARDS,
@@ -3520,6 +3528,20 @@ mod check {
             _ => false,
         }
     }
+    fn cost_declared_bound_matches_capture(capture: &Value) -> bool {
+        let cost = &capture["cost_same_seed_context"];
+        let wall = match cost.get("cost_profile").and_then(Value::as_str) {
+            None | Some("same-seed-legacy/v1") => COST_WALL,
+            Some("same-seed-conv-default-env0/v1") => COST_CONV_DEFAULT_WALL,
+            _ => return false,
+        };
+        cost["wall_limit_ms"].as_u64() == u64::try_from(wall.as_millis()).ok()
+            && capture["wall_limit_ms"] == cost["wall_limit_ms"]
+            && cost["cleanup_limit_ms"].as_u64() == u64::try_from(CLEANUP.as_millis()).ok()
+            && capture["cleanup_limit_ms"] == cost["cleanup_limit_ms"]
+            && cost["whole_limit_ms"].as_u64() == u64::try_from((wall + CLEANUP).as_millis()).ok()
+            && capture["whole_limit_ms"] == cost["whole_limit_ms"]
+    }
     fn cost_sample_origin(
         cost: &Value,
         lane: &Value,
@@ -3555,6 +3577,15 @@ mod check {
     ) -> Result<Value, Failure> {
         let cost = &capture["cost_same_seed_context"];
         let independent = &reference["cost_same_seed_context"];
+        let same_harness_source = capture["harness_source_sha256_hex"]
+            == hex(&Sha256::digest(include_bytes!("pals_cuda_warm_check.rs")));
+        // Historical records retain their original numerical verification path.
+        // They are not admissions under this source's new DEFAULT time bound.
+        require(
+            !same_harness_source || cost_declared_bound_matches_capture(capture),
+            "cost_reference",
+            "same_harness_declared_time_bound_differs",
+        )?;
         let originals = capture["calls"]
             .as_array()
             .ok_or(fail("cost_reference", "original_calls_missing"))?;
@@ -3630,6 +3661,15 @@ mod check {
             "comparison_status": "not_comparable", "warm_over_fresh_api_wall_ratio": null,
             "physical_nn_graph_inputs_per_sample": null, "public_cache_counts_per_sample": null,
             "benchmark_validation_complete": false, "fresh_vs_warm_output_equality_required": false});
+        result["declared_time_bound_checked"] = json!(same_harness_source);
+        result["time_bound_check_scope"] = json!(if same_harness_source {
+            "same_harness_declared_work_and_cleanup_bounds"
+        } else {
+            "historical_capture_numeric_only;_no_current_time_bound_admission"
+        });
+        for name in ["wall_limit_ms", "cleanup_limit_ms", "whole_limit_ms"] {
+            result[name] = cost[name].clone();
+        }
         if let Some(profile) = cost.get("cost_profile") {
             result["cost_profile"] = profile.clone();
             result["tf32_requested"] = cost["tf32_requested"].clone();
@@ -4811,6 +4851,52 @@ mod check {
             assert_eq!(cost_work_wall(&args), Duration::from_secs(60));
             args.cost_same_seed_context = true;
             assert_eq!(cost_work_wall(&args), Duration::from_secs(45));
+            args.cost_conv_default = true;
+            assert_eq!(cost_work_wall(&args), Duration::from_secs(150));
+            assert_eq!(cost_work_wall(&args) + CLEANUP, Duration::from_secs(180));
+            args.cost_same_seed_context = false;
+            assert_eq!(cost_work_wall(&args), Duration::from_secs(60));
+        }
+
+        #[test]
+        fn cost_time_receipts_reject_mixed_deadline_namespaces() {
+            let sample = |profile: &str, wall: u64| {
+                json!({"wall_limit_ms": wall, "cleanup_limit_ms": 30_000,
+                    "whole_limit_ms": wall + 30_000,
+                    "cost_same_seed_context": {"cost_profile": profile,
+                        "wall_limit_ms": wall, "cleanup_limit_ms": 30_000,
+                        "whole_limit_ms": wall + 30_000}})
+            };
+            assert!(cost_declared_bound_matches_capture(&sample(
+                "same-seed-legacy/v1",
+                45_000,
+            )));
+            let default = sample("same-seed-conv-default-env0/v1", 150_000);
+            assert!(cost_declared_bound_matches_capture(&default));
+            assert!(!cost_declared_bound_matches_capture(&sample(
+                "same-seed-conv-default-env0/v1",
+                45_000,
+            )));
+            assert!(!cost_declared_bound_matches_capture(&sample(
+                "same-seed-legacy/v1",
+                150_000,
+            )));
+            assert!(!cost_declared_bound_matches_capture(&sample(
+                "unknown/v1",
+                150_000,
+            )));
+            for scope in ["capture", "cost"] {
+                for field in ["wall_limit_ms", "cleanup_limit_ms", "whole_limit_ms"] {
+                    let mut mixed = default.clone();
+                    let target = if scope == "capture" {
+                        &mut mixed
+                    } else {
+                        &mut mixed["cost_same_seed_context"]
+                    };
+                    target[field] = json!(1);
+                    assert!(!cost_declared_bound_matches_capture(&mixed));
+                }
+            }
         }
         #[test]
         fn progress_replay_selects_exact_resident_repair_after_cpu_c_chain() {
