@@ -223,8 +223,9 @@ session 각각의 join/drain과 PGN 2판을 인수한다. 실제 비용·실패�
 이번 계약의 인수에 포함하지 않는다.
 실제 검사 코드 baseline555의 CPU fmt·Warm example32·native feature·strict Clippy와
 Build14 actual은 [최신 구현 기록](PALS-IMPLEMENTATION.md#2026-10-12-후속-구현과-실행-관측)에 연결한다.
-코드555·검증-only8b·이전 문서e43d와 문서 기준1ecf의 exact CI 네 job 성공은 각각 원 HEAD의
-관측이다. 문서 기준1ecf730c17900870ef3945e14ee4ec9a0cd70470과 실행 코드555를 구분한다.
+코드555·검증-only8b·이전 문서e43d/1ecf와 문서 기준bf1cc6a의 exact CI 네 job 성공은
+각각 원 HEAD의 관측이다. 문서 기준bf1cc6a44dca4b5619b3540e71cfe4a548b87921과 실행
+코드555·실제 native c3/Build13을 구분하며 새 assembly 패치의 실행 성공으로 세지 않는다.
 PR23 OPEN/Draft develop·미해결 review thread0은 이전 e43d의 총괄 관측이다.
 361행 component proof의358동일·세 변경, native c3/Build13 기능·pilot 기준과
 검증-only8b overlay·비용 native555/Build14를 구분한다. Build14 repair/pair-prepare의
@@ -242,6 +243,10 @@ Colab-observed·strict-local/performance false와 actual TF32/plan/retry·전체
 유지한다. V10 metadata PASS 뒤 export identity 실패는 snapshot·child·NN·게임 이전이다.
 한 manifest wire-schema leaf 교정 후 V12는 derived artifact file budget guard에서 pre-child
 중단했다. snapshot/copy·owner retained 가능성과 native physical unknown을 보존하고
-outer tree gone을 native shutdown 인수로 세지 않는다. V13은 선언·합산 bound 준비이며
-product guard를 유지한다. E06 실제 pair·E07 후속 v7 문서 tip·CI·PR 인수는 pending이며
+outer tree gone을 native shutdown 인수로 세지 않는다. V13은 watcher1071·depth9 통과 뒤
+자체 DEFAULT identification preflight의 output-root/launch-sha256/endpoint-id 누락으로
+execute exit1이었다. preflight child는 실행됐지만 NN·게임 이전의 실패이며 원 자료와
+native physical unknown을 보존한다. inventory 존재만으로 세 receipt 인자를 대신하지
+않는다. product guard를 유지한 새 assembly source·frozen 등록·빌드와 V14 actual 실행,
+E06 실제 pair·E07 후속 v8 문서 tip·CI·PR 인수는 pending이며
 전체45 최종 판정은 총괄 입력 전까지 null이다. 과거 actual receipt는 원 source·binary·설정으로 보존한다.
