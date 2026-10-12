@@ -129,35 +129,38 @@ request/execution/bank/ordinal과 accepted seed의 실제 join, 마지막 physic
 
 ### 2026-10-12 후속 구현과 실행 관측
 
-현재 소스 tip은 `555a913c3ec813c083c5f185ba71f79e710d5f96`다. 기능·수치·
-정상 resident Warm의 실제 native 소스·빌드와 paired pilot 준비 기준은
+실제 검사 코드 baseline은 `555a913c3ec813c083c5f185ba71f79e710d5f96`이며,
+이번 후속 문서의 기준 commit은 `e43d2b57b454ac07f71b3587665f32562e135718`이다.
+문서 commit을 새 native·모델 실행으로 세지 않는다. 기능·수치·정상 resident Warm의
+실제 native 소스·빌드와 paired pilot 준비 기준은
 `c3b035e4ed43e6756c843372e40ebef60dc9e082`·Build13으로 보존한다.
 독립 reference의 typed FP32 입력 admission overlay는
 `8b4970d6b5a9807a8a054d144da04fc6e7bd922f`이며 수학·허용오차·seed guard를
 바꾸지 않는다. 아직 미실행인 pilot을 빌드 등록이나 UCI preflight로 인수하지 않는다.
 
-c3→현재 tip의 명시적 Rust·Cargo·선정 Python source 361행을 대조한 결과는
-358행 동일, Warm example·typed FP32 validator·검사 세 파일 변경이다. 이 코호트의
-component 재사용 근거이며 저장소 전체나 모든 바이너리의 동일성 선언이 아니다.
-Warm example은 DEFAULT 비용 work 150초·cleanup 30초, legacy 45초·normal 60초와
-동일 source의 receipt admission을 명시한다. 모델·탐색·seed·role NN 예산 64를
-바꾸지 않으며 기존 actual receipt의 source나 실패 판정을 덮어쓰지 않는다.
+c3→검사 코드555의 명시적 Rust·Cargo·선정 Python source 361행은 358행 동일,
+Warm example·typed FP32 validator·검사 세 파일 변경이다. component 재사용 근거이며
+저장소 전체나 모든 바이너리의 동일성 선언이 아니다. Warm example은 DEFAULT 비용
+work 150초·cleanup 30초, legacy 45초·normal 60초와 동일 source의 receipt admission을
+명시한다. 모델·탐색·seed·role NN 예산 64와 기존 actual receipt의 source·판정은 보존한다.
 
-현재 tip의 CPU 검사는 fmt·Warm example 32개·native feature compile·strict Clippy를
+검사 코드555의 CPU 검사는 fmt·Warm example 32개·native feature compile·strict Clippy를
 통과했고 source before/after를 확인했다. c3의 탐색 357개(별도 ignored 2개)·Warm 31개
 통합 검사와 validator의 순수 검사 35개·actual 62call 입력 admission은 각각 원 source의
 근거다. [기존 검증 overlay CI](https://github.com/daejunnom/RoveZero/actions/runs/38186946426)의
 네 job 성공은 exact 8b source에 한정한다.
-[현재555 CI](https://github.com/daejunnom/RoveZero/actions/runs/38193484338)의 Linux·Windows·
-bindings·PALS model 네 job도 exact 현재 source에서 완료·성공을 확인했다.
-PR23은 develop 대상 OPEN/Draft이며 문서 적용 이후 최종 tip의 CI·PR 인수는 별도다.
+[검사 코드555 CI](https://github.com/daejunnom/RoveZero/actions/runs/38193484338)와
+[문서 기준e43d CI](https://github.com/daejunnom/RoveZero/actions/runs/38196321224)의 Linux·Windows·
+bindings·PALS model 네 job 성공은 각각의 exact HEAD에서 별도로 관측했다.
+총괄은 e43d의 PR23이 develop 대상 OPEN/Draft이며 미해결 review thread가 0개인 것도
+확인했다. 후속 v5 문서 commit의 exact CI·PR 기록과 E07 최종 인수는 별도다.
 
-Build14는 현재555에서 offline/locked release jobs2로 실제 292.3731초·exit 0·owned tree
+Build14는 검사 코드555에서 offline/locked release jobs2로 실제 292.3731초·exit 0·owned tree
 정리와 다섯 ELF의 GLIBC 2.34 범위를 확인했다. checker·UCI의 byte digest는 Build13과
 같고 Warm은 바뀌었다. repair·pair-prepare도 실제 byte digest가 달라 원 pin을 보존한다.
 같은 source라는 이유로 이 바이너리들을 bit-identical이라고 하지 않는다. 비용용 native는
 555/Build14로 별도 등록하며 정상 기능·pilot의 c3/Build13 actual 근거와 구분한다.
-새 비용 실행·독립 비교의 실제 결과는 pending이며 빌드 성공으로 대신하지 않는다.
+아래 Label5의 actual capture·독립 reference와 Label6의 실제 Rust verify를 별도로 연결한다.
 
 | 후속 관측 | 확인한 범위와 남은 인수 |
 |---|---|
@@ -168,8 +171,9 @@ Build14는 현재555에서 offline/locked release jobs2로 실제 292.3731초·e
 | 직접 CPU 비용 | Legacy/input-only/head-only/both 공통6 비용을 실제 측정했다. queue 원 wrapper 실패 뒤 기존 실행의 후처리 비용은 5개 모두 not_comparable이고 ratio null이다. stack의 실제 작업량이 달라 speedup 비교를 하지 않는다. Signed192는 공개 API 진단 비용이며 private limb-only·전체 탐색 개선은 미측정이다. |
 | 직접 DEFAULT GPU 비용 | Legacy·FullLine 공통6 직접 모델 API 비용의 원시 15파일을 회수·digest 대조했다. 각 profile은 ready 2+warmup 36+측정 60=98 role 호출, public 50+role 98=148 NN 입력이며 50 public 입력을 포함한다. outer 87.4068초·native exit 0·외부 group 정리를 확인했다. 원 첫 export guard 실패는 보존하고 engine이 소비한 NN 입력 수·VRAM peak·실제 cuDNN plan·TF32 kernel/retry는 unknown이다. |
 | GQA CPU 진단 비용 | 원시 3파일과 분석의 digest를 대조했다. CPU0/1·FP32 합성 tensor 6case, warmup 3회·측정 5회, outer 5.5193초·exit 0·물리 정리만의 관측이다. weights·모델 NN·GPU 실행은 없었다. repeat_interleave의 저장·할당 payload와 attention 호출 비용을 구분하며 whole-worker HWM을 operator 물리 peak로 바꾸거나 현재 모델·전체 엔진의 병목·speedup으로 보고하지 않는다. Warm 비용 및 최종 load/ready/transfer/cache/drain/peak 연결은 별도다. |
-| DEFAULT Warm 비용 Label4 실패 | 원 c3/Build13 비용 실행은 실패로 보존한다. role 호출 54와 public을 포함한 전체 NN 94는 다른 counter이며 role 예산 64 초과·CUDA·seed 실패의 근거가 없다. 첫 owner는 worker join·backend drop·buffer release·lease active/quarantine 0으로 종료했다. 이어진 fresh_load는 original_deadline_or_cancel로 거부되어 새 owner·Fresh 호출이 없다. 비교는 not_comparable·ratio null이고 원 실패 세션의 physical completion/tree gone unknown을 첫 owner 종료로 치환하지 않는다. 현재555/Build14의 새 비용 실행은 별도 pending이다. |
-| V4 paired pilot | Stockfish19 UCI preflight만 확인했다. 같은 own checker·ModelWdlRestricted, optional 기능 off, 120+1·최대256 ply·흑백 교환 2게임과 네 native PALS session의 실제 PGN·수명 인수는 pending이다. |
+| DEFAULT Warm 비용 Label4 실패 | 원 c3/Build13 비용 실행은 실패로 보존한다. role 호출 54와 public을 포함한 전체 NN 94는 다른 counter이며 role 예산 64 초과·CUDA·seed 실패의 근거가 없다. 첫 owner는 worker join·backend drop·buffer release·lease active/quarantine 0으로 종료했다. 이어진 fresh_load는 original_deadline_or_cancel로 거부되어 새 owner·Fresh 호출이 없다. 비교는 not_comparable·ratio null이고 원 실패 세션의 physical completion/tree gone unknown을 첫 owner 종료로 치환하지 않는다. 후속555/Build14의 Label5·6 실제 자료는 아래 별도 관측이다. |
+| DEFAULT Warm 비용 Label5·6 | Label5 capture·독립 reference는 실제 완료했지만 후처리 wrapper FAIL을 원 판정으로 보존한다. 같은 실제 입력·seed 자료를 재실행하지 않고 Label6 Rust verify가 exit 0·0.702166초·physical confirmed·tree gone으로 통과했다. 총괄은 E04 비용 정확성·물리 회수를 functional 인수했다. 비교 not_comparable·ratio null과 benchmark_validation_complete=false는 유지한다. |
+| V4 paired pilot | Stockfish19 UCI preflight는 원 근거다. 총괄이 관측한 V8·V9 metadata 실패는 게임·NN 이전의 실패이며, V9의 native 19파일 해시 통과도 실제 대국으로 세지 않는다. 같은 own checker·ModelWdlRestricted, optional 기능 off, 120+1·최대256 ply·흑백 교환 2게임과 네 native PALS session의 실제 PGN·수명 인수는 pending이다. |
 
 #### DEFAULT 공통6 API 비용의 관측 범위
 
@@ -213,10 +217,46 @@ false로 유지하며 CPU·메모리·swap 선언을 실제 readback으로 대�
 Windows commit 여유 6GiB의 진입·지속 stop 조건은 최신 사용자 지시로 제거했다.
 나머지 CPU·유한 시간·worker·출력·물리 종료와 원 실패 보존 계약은 유지한다.
 
-기존 39조건에 대한 총괄의 인수 판정은 유지한다. 후속 C02/P06/W04 functional 인수는
-명시 source와 단계 합성의 실제 근거로 별도 연결한다. E04의 Warm 비용·E06 pilot·E07의
-최종 문서 tip·CI·PR 기록은 pending이며 전체 45조건의 최종 판정 필드는 총괄 입력 전까지
-null이다. 본격 학습·learned V의 실제 유용성·기력·PR 병합 완료로 확대하지 않는다.
+#### DEFAULT resident Warm/Fresh 비용의 정확성·물리 인수
+
+비용 capture의 native는555/Build14이고 정상 기능의 c3/Build13 capture와 구분한다.
+독립 reference는 c3의 수학과 검증-only8b overlay를 사용하며 actual typed FP32 입력·
+Warm의 accepted6144 seed bit와 Fresh의 zero seed를 각각 대조했다. Warm/Fresh 출력이
+서로 같아야 하는 검사는 아니다. 새 비용 consumer는 search42+followup2=44이며
+정상 capture의62와 섞지 않는다. DEFAULT·env0·Eager 비용 profile은 work150초·cleanup30초다.
+
+Label5 native capture81.2972초와 독립 reference10.6324초는 실제 exit0·tree gone이었다.
+원 wrapper의 reference admission 실패는 원 FAIL로 유지한다.
+당시 저장 raw 분석의 Rust verify 미관측 표시도 그대로 보존한다. 이후 Label6는 같은
+capture/reference를 재실행하지 않고 별도 Rust verify를0.702166초·exit0으로 통과했다.
+verify session 전체2.261843초와 verify child 비용을 구분한다. 실제44 consumer·Warm8·
+Fresh8의 정확성, same-seed reference, shutdown·join·drop·buffer release와 물리 회수를
+확인했으며 총괄은 이 E04 functional 범위를 인수했다.
+
+| lane·단계 | 표본 수 | API wall P50(ms) |
+|---|---:|---:|
+| Warm 준비 | 3 | 5.251202 |
+| Warm 측정 | 5 | 5.273885 |
+| Fresh 준비 | 3 | 6.241549 |
+| Fresh 측정 | 5 | 5.170519 |
+
+원16표본에서 유도한 median이며 kernel 시간이나 전체 엔진 비용이 아니다. 두 owner는
+순차 실행되었고 Warm role54+public40=NN94, Fresh role10+public2=NN12다. 합계 role64·
+public42·NN106은 startup·search·followup까지 포함한 owner 전체 계수이며 표본 분모가
+아니다. 각 비용 출력은 물리 완료되었지만 search consume0·accepted=false·seed publication
+false다. 각 표본의 전체 NN·public cache 작업량은 unknown이므로 동등 작업 비교를 인수하지
+않는다. raw의 not_comparable·ratio null·benchmark_validation_complete=false를 보존한다.
+
+Colab-observed 범위이며 strict-local admission·performance eligibility는 false다. 실제
+TF32 kernel·retry·cuDNN plan과 weight sharing·host/VRAM peak는 unknown이다. Warm172032B·
+Fresh77824B는 owner의 명시 private CUDA KV payload peak이고 전체 VRAM·ORT arena·workspace
+peak가 아니다. 새 비용과 정상 기능의 source·예산·seed·단계 기준을 섞어 speedup이나 기력
+개선으로 보고하지 않는다.
+
+기존 39조건에 대한 총괄의 인수 판정은 유지한다. C02/P06/W04와 E04 비용 정확성·물리
+회수의 functional 인수는 원 source와 실제 단계별 근거로 별도 연결한다. E06 실제 pilot·
+E07의 후속 문서 tip·CI·PR 최종 인수는 pending이며 전체45조건의 최종 판정 필드는 총괄
+입력 전까지 null이다. 본격 학습·learned V 유용성·기력·PR 병합 완료로 확대하지 않는다.
 
 #### 초기 준비 시점의 기록
 

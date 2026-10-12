@@ -24,7 +24,7 @@ PR 병합은 이 범위에 포함하지 않는다. 아래 BT4/F02/F03의 선행 
 | 실패와 누적 비용 | 앞선 실행의 1회와 8회 update 실패 자료를 보존한다. 성공한 24회와 합한 실제 누적 소비는 33회다. 실패·재시도와 checkpoint 자료를 실제 누적 비용 기록에 연결한다. |
 | 현재 source 재사용 | 영향 source 8개를 직접 대조하여 이전 diagnostic 결과의 재사용을 확인했다. 이전 실제 실행과 현재 재사용 확인은 별도 근거이며 이번 새 optimizer update는 0회다. noNN/fixture consumer 검사를 새 학습 실행으로 세지 않는다. |
 | 실제 target·learned V | 실제 학습 target을 사용한 update는 0회다. diagnostic label/coverage는 실제 수집·권한·unknown mask 검증을 통과한 target coverage와 별도다. V-private tensor의 update/resume 검사는 learned V utility/action의 실제 유용성·기력 근거를 충족하지 않으며 누락 target의 mask를 유지한다. |
-| 새 실행 인수 | 현재555의 CPU·exact CI·Build14, 기존8b CI와 c3/Build13의 actual 수치·capture·독립 actual-input/seed Warm reference 및 직접 비용은 [최신 후속 인수 기록](PALS-IMPLEMENTATION.md#2026-10-12-후속-구현과-실행-관측)에 단계별로 연결한다. 361행 component 재사용과 검증-only8b overlay를 명시하고 source 동일성을 전체 binary 동일성으로 확대하지 않는다. 새555 Warm 비용·paired pilot·문서 적용 이후 최종 tip 인수는 pending이다. 이 자료는 새 optimizer update·actual target 학습·learned V 유용성·기력의 근거가 아니다. |
+| 새 실행 인수 | 검사 코드555의 CPU·exact CI·Build14와 문서 기준e43d의 별도 exact CI, 기존8b CI·c3/Build13 actual 수치·Warm을 [최신 후속 인수 기록](PALS-IMPLEMENTATION.md#2026-10-12-후속-구현과-실행-관측)에 연결한다. 361행 component 재사용·검증-only8b overlay·비용555/Build14를 구분한다. 총괄은 Label5 actual capture/reference와 별도 Label6 Rust verify의 E04 정확성·물리 회수를 functional 인수했다. 원 wrapper FAIL·not_comparable·ratio null·performance false는 유지한다. E06 실제 pair·E07 후속 문서 tip 인수·전체45 최종 판정은 pending이다. 새 optimizer update·actual target 학습·learned V 유용성·기력 근거로 확대하지 않는다. |
 
 P/C는 공유 tensor와 해당 role의 private tensor만, V는 private V tensor만 갱신한다.
 Repair는 P 경로의 검사에 포함한다. 기존 zero-step

@@ -221,17 +221,23 @@ session 각각의 join/drain과 PGN 2판을 인수한다. 실제 비용·실패�
 
 구현/검사 완료 상태는 후속 소스·PR 기록에 추가한다. 본격 학습·learned V 기력·병합은
 이번 계약의 인수에 포함하지 않는다.
-현재555의 CPU fmt·Warm example32·native feature·strict Clippy 및 Build14 실제 성공은
-[최신 구현 기록](PALS-IMPLEMENTATION.md#2026-10-12-후속-구현과-실행-관측)에 연결한다.
-기존8b overlay CI와 현재555 exact CI의 네 job 성공을 각각 원 source로 기록한다.
-현재555 PR23은 develop 대상 OPEN/Draft이며 문서 적용 이후 최종 source/CI/PR 인수는 별도다.
-361행 component proof의 358동일·세 변경, native c3/Build13 기능·pilot 기준과
-검증-only8b overlay 및 비용 native555/Build14를 구분한다. Build14 repair/pair-prepare의
+실제 검사 코드 baseline555의 CPU fmt·Warm example32·native feature·strict Clippy와
+Build14 actual은 [최신 구현 기록](PALS-IMPLEMENTATION.md#2026-10-12-후속-구현과-실행-관측)에 연결한다.
+코드555·검증-only8b·문서 기준e43d의 exact CI 네 job 성공은 각각 원 HEAD의 관측이다.
+e43d2b57b454ac07f71b3587665f32562e135718 문서 commit과 실행 코드555를 구분한다.
+총괄은 문서 기준e43d의 OPEN/Draft develop PR23·미해결 review thread0을 확인했다.
+361행 component proof의358동일·세 변경, native c3/Build13 기능·pilot 기준과
+검증-only8b overlay·비용 native555/Build14를 구분한다. Build14 repair/pair-prepare의
 byte 차이를 보존하고 source 동일성을 전체 binary 동일성으로 확대하지 않는다.
-총괄이 인수한 C02의 외부 counter 한 Repair→C/Fresh 연결과 P06/W04 source·seed·physical
-functional 근거는 원 source와 실제 단계 합성으로 보존한다. 연속 pipeline elapsed는
-null이며 원 serde FAIL·budget FAIL·causal HOLD·join 오류·export/wrapper 실패를 덮지 않는다.
-Label4 비용 실패는 첫 owner의 물리 종료와 Fresh load deadline/cancel 거부를 나눠 기록한다.
-role54·public 포함 NN94·role예산64를 혼동하지 않으며 not_comparable·ratio null과
-원 전체 session physical/tree unknown을 유지한다. 새555 비용 실행·paired pilot·최종 문서
-source/CI/PR 인수는 pending이다. 과거 actual receipt는 원 source·binary·설정으로 보존한다.
+총괄이 인수한 C02 한 causal chain·P06/W04의 source·seed·physical functional 근거는
+원 source와 실제 단계 합성으로 보존한다. 연속 pipeline elapsed는 null이며 원 serde
+FAIL·budget FAIL·causal HOLD·join 오류·export/wrapper 실패를 덮지 않는다.
+Label4 첫 owner 종료·Fresh load deadline/cancel 거부와 원 전체 session physical/tree
+unknown을 유지한다. Label5 wrapper FAIL과 분석 당시 Rust verify 미관측도 보존한다.
+새555/Build14 capture·독립 reference를 재실행하지 않고 Label6 Rust verify가 실제
+통과했고 총괄은 E04 비용 정확성·물리 회수를 functional 인수했다. consumer44와 각lane
+준비3+측정5, 전체 role64/public42/NN106은 별도 계수다. 개별표본 전체 NN/cache는
+unknown이므로 not_comparable·ratio null·benchmark_validation_complete=false를 유지한다.
+Colab-observed·strict-local/performance false와 actual TF32/plan/retry·전체 peak unknown도
+유지한다. E06 실제 pair와 E07 후속 문서 tip·CI·PR 인수는 pending이며 전체45 최종
+판정 필드는 총괄 입력 전까지 null이다. 과거 actual receipt는 원 source·binary·설정으로 보존한다.
