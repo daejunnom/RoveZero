@@ -2680,6 +2680,9 @@ fn observed_output_bytes(
     }
     Ok(Some(total))
 }
+#[cfg(any(target_os = "linux", test))]
+const MODEL_OBSERVATION_METHOD_V4: &str = "loaded profile/config/epoch, registered semantics and compiled model SHA checked against pinned manifest; original graph/runtime/checkpoint/export bytes verified; diagnostic export rejected before spawn";
+
 #[cfg(target_os = "linux")]
 fn observed<T>(value: T, method: &str) -> PalsObservedV3<T> {
     PalsObservedV3::Observed {
@@ -2855,7 +2858,7 @@ fn endpoint_v4_receipt(
                     model,
                     specification,
                 },
-                "loaded backend profile/configuration/epoch plus actual registered semantics and compiled model boundary SHA getters compared with independently pinned manifest; original graph/runtime/checkpoint/export bytes validated; diagnostic export rejected before spawn",
+                MODEL_OBSERVATION_METHOD_V4,
             );
         }
     }
@@ -3981,6 +3984,60 @@ mod tests {
             budget: old.budget,
             followup_execution: None,
             resource_profile: None,
+        }
+    }
+    #[test]
+    fn v4_model_observation_method_passes_shared_receipt_validation() {
+        // No model/game is executed. The public incomplete-receipt reader uses
+        // the same generic observation gate as PalsRuntimeChecksV4::model.
+        let lock = fixture().semantic_lock;
+        let mut receipt = PalsRunReceiptV4 {
+            schema_version: 4,
+            domain: PALS_RECEIPT_V4_DOMAIN.into(),
+            run_id: lock.manifest.run_id.clone(),
+            pair_id: lock.manifest.pair_id.clone(),
+            lock_sha256: lock.canonical_sha256.clone(),
+            training_executed: false,
+            training: PalsObservedV3::Unknown,
+            output_bytes: PalsObservedV3::Observed {
+                value: 0,
+                method: MODEL_OBSERVATION_METHOD_V4.into(),
+            },
+            wall_time_ms: 1,
+            cleanup_time_ms: 1,
+            pair_eligible: false,
+            failures: BTreeSet::new(),
+            policy_failures: BTreeSet::new(),
+            games: vec![],
+        };
+        assert!(receipt.validate_against(&lock).is_ok());
+        let old = "loaded backend profile/configuration/epoch plus actual registered semantics and compiled model boundary SHA getters compared with independently pinned manifest; original graph/runtime/checkpoint/export bytes validated; diagnostic export rejected before spawn";
+        assert_eq!(old.len(), 258);
+        for invalid in [
+            old.to_string(),
+            "readyok".into(),
+            "ReAdYoK".into(),
+            "x".repeat(257),
+            "é".repeat(129),
+            "independent\nmethod".into(),
+        ] {
+            receipt.output_bytes = PalsObservedV3::Observed {
+                value: 0,
+                method: invalid,
+            };
+            let error = receipt.validate_against(&lock).unwrap_err();
+            assert!(
+                error.to_string().contains(
+                    "observation requires an independent measurement method, not readyok"
+                )
+            );
+        }
+        for boundary in ["x".repeat(256), "é".repeat(128)] {
+            receipt.output_bytes = PalsObservedV3::Observed {
+                value: 0,
+                method: boundary,
+            };
+            assert!(receipt.validate_against(&lock).is_ok());
         }
     }
     pub(super) fn colab_fixture() -> PalsArenaLaunchV4 {
