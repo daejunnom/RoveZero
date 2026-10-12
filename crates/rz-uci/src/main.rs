@@ -329,6 +329,8 @@ fn run_pals(
             if native.startup_probe_timeout_ms.replace(value).is_some() {
                 return Err("duplicate PALS startup probe timeout".into());
             }
+        } else if let Some(value) = argument.strip_prefix("--pals-shutdown-timeout-ms=") {
+            take_pals_shutdown_timeout(&mut native, value)?;
         } else if let Some(value) = argument.strip_prefix("--pals-cudnn-conv-search=") {
             if native.cudnn_conv_search.replace(value.to_owned()).is_some() {
                 return Err("duplicate PALS cuDNN convolution diagnostic selection".into());
@@ -762,6 +764,7 @@ struct PalsNativeOptions {
     cuda_loading_profile_hash: Option<String>,
     cudnn_conv_search: Option<String>,
     startup_probe_timeout_ms: Option<u64>,
+    shutdown_timeout_ms: Option<u64>,
     cuda_record_pages: PalsCudaRecordPagesOptions,
 }
 
@@ -1629,7 +1632,44 @@ impl PalsNativeOptions {
             || self.cuda_loading_profile_hash.is_some()
             || self.cudnn_conv_search.is_some()
             || self.startup_probe_timeout_ms.is_some()
+            || self.shutdown_timeout_ms.is_some()
             || self.cuda_record_pages.any()
+    }
+}
+
+fn take_pals_shutdown_timeout(
+    native: &mut PalsNativeOptions,
+    value: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| "invalid PALS shutdown timeout")?;
+    if !(1..=30_000).contains(&value) {
+        return Err("PALS shutdown timeout must be 1..30000 milliseconds".into());
+    }
+    if native.shutdown_timeout_ms.is_some() {
+        return Err("duplicate PALS shutdown timeout".into());
+    }
+    native.shutdown_timeout_ms = Some(value);
+    Ok(())
+}
+
+#[cfg(test)]
+mod pals_shutdown_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_native_cleanup_budget_is_finite_and_duplicate_safe() {
+        let mut native = PalsNativeOptions::default();
+        for invalid in ["0", "30001", "-1", "invalid", "18446744073709551616"] {
+            assert!(take_pals_shutdown_timeout(&mut native, invalid).is_err());
+            assert!(native.shutdown_timeout_ms.is_none());
+        }
+        take_pals_shutdown_timeout(&mut native, "15000").unwrap();
+        assert!(native.any());
+        assert_eq!(native.shutdown_timeout_ms, Some(15_000));
+        assert!(take_pals_shutdown_timeout(&mut native, "1").is_err());
+        assert_eq!(native.shutdown_timeout_ms, Some(15_000));
     }
 }
 
@@ -1880,6 +1920,12 @@ fn run_native_pals(
     };
     let mut settings = EngineSettings::default();
     settings.search.max_simulations = cpu_nodes;
+    if let Some(milliseconds) = native.shutdown_timeout_ms {
+        // The arena's finite cleanup reservation must reach the actual native
+        // owner. Final origin/Stats controls still require their physical ack;
+        // expiry retains unknown ownership and never fabricates a fence.
+        settings.shutdown_limit = Duration::from_millis(milliseconds);
+    }
     let owner_options = rz_uci::pals_native::NativeOwnerOptions {
         drain_limit: settings.shutdown_limit,
         host_record_pages: native.host_record_pages.unwrap_or(false).then_some(

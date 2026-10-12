@@ -856,6 +856,11 @@ impl PalsArenaLaunchV4 {
                 let e = &v4.base;
                 let n = recipe.native_model().expect("native pattern selected");
                 let cuda = recipe.cuda_model();
+                let shutdown_ms = m.pilot.cleanup_max_ms.div_ceil(2);
+                require(
+                    (1..=30_000).contains(&shutdown_ms),
+                    "PALS native shutdown requires half the finite cleanup reservation within 1..30000 milliseconds",
+                )?;
                 require(
                     e.model.backend
                         == if cuda.is_some() {
@@ -919,6 +924,7 @@ impl PalsArenaLaunchV4 {
                 validate_search(e, &n.search, m.pilot.wall_time_max_ms)?;
                 let mut args = pals_search_arguments(&n.search, "onnx");
                 args.extend([
+                    format!("--pals-shutdown-timeout-ms={shutdown_ms}"),
                     format!(
                         "--pals-provider={}",
                         if cuda.is_some() { "cuda" } else { "cpu" }
@@ -1879,7 +1885,7 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV4 {
                 handshake_ms: p.handshake_max_ms,
                 runtime_ms: p.wall_time_max_ms,
                 drain_ms: p.cleanup_max_ms,
-                shutdown_ms: p.cleanup_max_ms / 2,
+                shutdown_ms: p.cleanup_max_ms.div_ceil(2),
             },
             budget: self.input.budget,
         }
@@ -4435,6 +4441,16 @@ mod tests {
             assert!(lock.preflight_arguments(role, &game).is_err());
             let preflight = lock.preflight_arguments(role, &probe).unwrap();
             let actual = lock.runtime_arguments(role, &game).unwrap();
+            let shutdown = OsString::from(format!(
+                "--pals-shutdown-timeout-ms={}",
+                lock.input
+                    .semantic_lock
+                    .manifest
+                    .pilot
+                    .cleanup_max_ms
+                    .div_ceil(2)
+            ));
+            assert!(preflight.contains(&shutdown) && actual.contains(&shutdown));
             let receipt_flags = [
                 format!("--pals-output-root={}", probe.display()),
                 format!("--pals-launch-sha256={}", lock.sha256()),
