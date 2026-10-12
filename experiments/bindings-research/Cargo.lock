@@ -308,6 +308,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rz-platform"
+version = "0.1.0"
+
+[[package]]
 name = "rz-position"
 version = "0.1.0"
 dependencies = [
@@ -320,6 +324,7 @@ name = "rz-runtime"
 version = "0.1.0"
 dependencies = [
  "rz-contracts",
+ "rz-platform",
  "rz-telemetry",
 ]
 
@@ -330,6 +335,7 @@ dependencies = [
  "nix",
  "rz-contracts",
  "rz-position",
+ "rz-runtime",
  "rz-telemetry",
  "serde",
  "serde_json",
