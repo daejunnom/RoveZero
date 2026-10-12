@@ -34,6 +34,12 @@ impl ContractSystemClock {
         }
     }
 
+    /// Worker adapters must reuse this origin with the declared domain. Creating
+    /// another Instant for the same epoch would give deadlines different meaning.
+    pub fn origin(&self) -> Instant {
+        *self.origin
+    }
+
     pub fn try_now(&self) -> Result<MonotonicTick, ContractError> {
         u64::try_from(self.origin.elapsed().as_nanos())
             .map(MonotonicTick)

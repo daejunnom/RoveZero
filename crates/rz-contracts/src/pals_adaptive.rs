@@ -21,6 +21,80 @@ pub struct CpuJobId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct CpuWorkerId(pub u16);
 
+/// External UCI work has reported-node hints, never a fabricated native credit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalCpuJobEnvelope {
+    pub id: CpuJobId,
+    pub state_identity: StateIdentity,
+    pub question: Digest,
+    pub root_restriction: Digest,
+    pub evaluation_namespace: Digest,
+    pub search_conditions: Digest,
+    pub requested_reported_node_hint: u64,
+    pub hard_deadline: Deadline,
+}
+
+impl ExternalCpuJobEnvelope {
+    pub fn validate(&self, clock: ClockDomain, now: MonotonicTick) -> Result<(), ContractError> {
+        if self.id.sequence == 0
+            || self.requested_reported_node_hint == 0
+            || self.requested_reported_node_hint > 65_536
+        {
+            return Err(invalid(
+                "external job requires a bounded reported-node hint",
+            ));
+        }
+        if self.hard_deadline.clock.0 != self.id.authority.epoch {
+            return Err(identity(
+                "external job deadline and authority epochs differ",
+            ));
+        }
+        self.hard_deadline.accepts(clock, now)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalSliceGrant {
+    pub job: CpuJobId,
+    pub execution: ExecutionId,
+    pub owner: CpuWorkerId,
+    pub requested_reported_node_hint: u64,
+    pub soft_quantum: Duration,
+    pub control_sequence: u64,
+}
+
+impl ExternalSliceGrant {
+    pub fn validate(
+        &self,
+        job: &ExternalCpuJobEnvelope,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), ContractError> {
+        job.validate(clock, now)?;
+        if self.job != job.id || self.execution.epoch != job.id.authority.epoch {
+            return Err(identity("external grant is bound to another job or epoch"));
+        }
+        if self.execution.sequence == 0
+            || self.control_sequence == 0
+            || self.requested_reported_node_hint == 0
+            || self.requested_reported_node_hint > job.requested_reported_node_hint
+            || self.soft_quantum < Duration::from_millis(100)
+        {
+            return Err(invalid("invalid external quantum or reported-node hint"));
+        }
+        let required = self
+            .soft_quantum
+            .checked_add(Duration::from_millis(500))
+            .ok_or_else(|| invalid("external stop/drain reserve overflow"))?;
+        if required.as_nanos() > u128::from(job.hard_deadline.at.0 - now.0) {
+            return Err(invalid(
+                "external quantum leaves no original-deadline stop reserve",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The question, cumulative credit and hard deadline never change on resume.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuJobEnvelope {
@@ -228,6 +302,59 @@ mod tests {
             .validate(&original, clock, MonotonicTick(19_000_000))
             .is_err());
         assert_eq!(original.total_native_node_credit, 8192);
+    }
+
+    #[test]
+    fn external_quantum_preserves_reported_hint_and_original_drain_reserve() {
+        let native = job();
+        let external = ExternalCpuJobEnvelope {
+            id: native.id,
+            state_identity: native.state_identity,
+            question: native.question,
+            root_restriction: native.root_restriction,
+            evaluation_namespace: native.evaluation_namespace,
+            search_conditions: native.search_conditions,
+            requested_reported_node_hint: 65_536,
+            hard_deadline: Deadline {
+                clock: native.hard_deadline.clock,
+                at: MonotonicTick(600_000_000),
+            },
+        };
+        let grant = ExternalSliceGrant {
+            job: external.id,
+            execution: ExecutionId::new(external.id.authority.epoch, 1),
+            owner: CpuWorkerId(0),
+            requested_reported_node_hint: 65_536,
+            soft_quantum: Duration::from_millis(100),
+            control_sequence: 1,
+        };
+        grant
+            .validate(&external, external.hard_deadline.clock, MonotonicTick(0))
+            .unwrap();
+        assert!(grant
+            .validate(&external, external.hard_deadline.clock, MonotonicTick(1))
+            .is_err());
+        let mut wrong = grant;
+        wrong.job.sequence += 1;
+        assert_eq!(
+            wrong
+                .validate(&external, external.hard_deadline.clock, MonotonicTick(0))
+                .unwrap_err()
+                .code,
+            ErrorCode::IdentityMismatch
+        );
+        wrong = grant;
+        wrong.soft_quantum = Duration::from_millis(99);
+        assert!(wrong
+            .validate(&external, external.hard_deadline.clock, MonotonicTick(0))
+            .is_err());
+        let mut over_hint = external;
+        over_hint.requested_reported_node_hint += 1;
+        assert!(over_hint
+            .validate(external.hard_deadline.clock, MonotonicTick(0))
+            .is_err());
+        assert_eq!(external.requested_reported_node_hint, 65_536);
+        assert_eq!(external.hard_deadline.at, MonotonicTick(600_000_000));
     }
 
     #[test]
