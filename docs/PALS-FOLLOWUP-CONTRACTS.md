@@ -223,9 +223,9 @@ session 각각의 join/drain과 PGN 2판을 인수한다. 실제 비용·실패�
 이번 계약의 인수에 포함하지 않는다.
 실제 검사 코드 baseline555의 CPU fmt·Warm example32·native feature·strict Clippy와
 Build14 actual은 [최신 구현 기록](PALS-IMPLEMENTATION.md#2026-10-12-후속-구현과-실행-관측)에 연결한다.
-코드555·검증-only8b·문서 기준e43d의 exact CI 네 job 성공은 각각 원 HEAD의 관측이다.
-e43d2b57b454ac07f71b3587665f32562e135718 문서 commit과 실행 코드555를 구분한다.
-총괄은 문서 기준e43d의 OPEN/Draft develop PR23·미해결 review thread0을 확인했다.
+코드555·검증-only8b·이전 문서e43d와 문서 기준1ecf의 exact CI 네 job 성공은 각각 원 HEAD의
+관측이다. 문서 기준1ecf730c17900870ef3945e14ee4ec9a0cd70470과 실행 코드555를 구분한다.
+PR23 OPEN/Draft develop·미해결 review thread0은 이전 e43d의 총괄 관측이다.
 361행 component proof의358동일·세 변경, native c3/Build13 기능·pilot 기준과
 검증-only8b overlay·비용 native555/Build14를 구분한다. Build14 repair/pair-prepare의
 byte 차이를 보존하고 source 동일성을 전체 binary 동일성으로 확대하지 않는다.
@@ -239,5 +239,9 @@ unknown을 유지한다. Label5 wrapper FAIL과 분석 당시 Rust verify 미관
 준비3+측정5, 전체 role64/public42/NN106은 별도 계수다. 개별표본 전체 NN/cache는
 unknown이므로 not_comparable·ratio null·benchmark_validation_complete=false를 유지한다.
 Colab-observed·strict-local/performance false와 actual TF32/plan/retry·전체 peak unknown도
-유지한다. E06 실제 pair와 E07 후속 문서 tip·CI·PR 인수는 pending이며 전체45 최종
-판정 필드는 총괄 입력 전까지 null이다. 과거 actual receipt는 원 source·binary·설정으로 보존한다.
+유지한다. V10 metadata PASS 뒤 export identity 실패는 snapshot·child·NN·게임 이전이다.
+한 manifest wire-schema leaf 교정 후 V12는 derived artifact file budget guard에서 pre-child
+중단했다. snapshot/copy·owner retained 가능성과 native physical unknown을 보존하고
+outer tree gone을 native shutdown 인수로 세지 않는다. V13은 선언·합산 bound 준비이며
+product guard를 유지한다. E06 실제 pair·E07 후속 v7 문서 tip·CI·PR 인수는 pending이며
+전체45 최종 판정은 총괄 입력 전까지 null이다. 과거 actual receipt는 원 source·binary·설정으로 보존한다.

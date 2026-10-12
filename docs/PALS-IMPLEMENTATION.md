@@ -130,7 +130,7 @@ request/execution/bank/ordinal과 accepted seed의 실제 join, 마지막 physic
 ### 2026-10-12 후속 구현과 실행 관측
 
 실제 검사 코드 baseline은 `555a913c3ec813c083c5f185ba71f79e710d5f96`이며,
-이번 후속 문서의 기준 commit은 `e43d2b57b454ac07f71b3587665f32562e135718`이다.
+이번 후속 문서의 기준 commit은 `1ecf730c17900870ef3945e14ee4ec9a0cd70470`이다.
 문서 commit을 새 native·모델 실행으로 세지 않는다. 기능·수치·정상 resident Warm의
 실제 native 소스·빌드와 paired pilot 준비 기준은
 `c3b035e4ed43e6756c843372e40ebef60dc9e082`·Build13으로 보존한다.
@@ -150,10 +150,11 @@ work 150초·cleanup 30초, legacy 45초·normal 60초와 동일 source의 recei
 근거다. [기존 검증 overlay CI](https://github.com/daejunnom/RoveZero/actions/runs/38186946426)의
 네 job 성공은 exact 8b source에 한정한다.
 [검사 코드555 CI](https://github.com/daejunnom/RoveZero/actions/runs/38193484338)와
-[문서 기준e43d CI](https://github.com/daejunnom/RoveZero/actions/runs/38196321224)의 Linux·Windows·
-bindings·PALS model 네 job 성공은 각각의 exact HEAD에서 별도로 관측했다.
-총괄은 e43d의 PR23이 develop 대상 OPEN/Draft이며 미해결 review thread가 0개인 것도
-확인했다. 후속 v5 문서 commit의 exact CI·PR 기록과 E07 최종 인수는 별도다.
+[이전 문서e43d CI](https://github.com/daejunnom/RoveZero/actions/runs/38196321224)와
+[문서 기준1ecf CI](https://github.com/daejunnom/RoveZero/actions/runs/38200814877)의 Linux·Windows·
+bindings·PALS model 네 job 성공은 각각의 exact HEAD에서 총괄이 별도로 관측했다.
+PR23 OPEN/Draft develop·미해결 review thread0은 이전 e43d의 관측이다. 후속 v7 문서
+commit의 exact CI·PR 기록과 E07 최종 인수는 별도다.
 
 Build14는 검사 코드555에서 offline/locked release jobs2로 실제 292.3731초·exit 0·owned tree
 정리와 다섯 ELF의 GLIBC 2.34 범위를 확인했다. checker·UCI의 byte digest는 Build13과
@@ -173,7 +174,16 @@ Build14는 검사 코드555에서 offline/locked release jobs2로 실제 292.373
 | GQA CPU 진단 비용 | 원시 3파일과 분석의 digest를 대조했다. CPU0/1·FP32 합성 tensor 6case, warmup 3회·측정 5회, outer 5.5193초·exit 0·물리 정리만의 관측이다. weights·모델 NN·GPU 실행은 없었다. repeat_interleave의 저장·할당 payload와 attention 호출 비용을 구분하며 whole-worker HWM을 operator 물리 peak로 바꾸거나 현재 모델·전체 엔진의 병목·speedup으로 보고하지 않는다. Warm 비용 및 최종 load/ready/transfer/cache/drain/peak 연결은 별도다. |
 | DEFAULT Warm 비용 Label4 실패 | 원 c3/Build13 비용 실행은 실패로 보존한다. role 호출 54와 public을 포함한 전체 NN 94는 다른 counter이며 role 예산 64 초과·CUDA·seed 실패의 근거가 없다. 첫 owner는 worker join·backend drop·buffer release·lease active/quarantine 0으로 종료했다. 이어진 fresh_load는 original_deadline_or_cancel로 거부되어 새 owner·Fresh 호출이 없다. 비교는 not_comparable·ratio null이고 원 실패 세션의 physical completion/tree gone unknown을 첫 owner 종료로 치환하지 않는다. 후속555/Build14의 Label5·6 실제 자료는 아래 별도 관측이다. |
 | DEFAULT Warm 비용 Label5·6 | Label5 capture·독립 reference는 실제 완료했지만 후처리 wrapper FAIL을 원 판정으로 보존한다. 같은 실제 입력·seed 자료를 재실행하지 않고 Label6 Rust verify가 exit 0·0.702166초·physical confirmed·tree gone으로 통과했다. 총괄은 E04 비용 정확성·물리 회수를 functional 인수했다. 비교 not_comparable·ratio null과 benchmark_validation_complete=false는 유지한다. |
-| V4 paired pilot | Stockfish19 UCI preflight는 원 근거다. 총괄이 관측한 V8·V9 metadata 실패는 게임·NN 이전의 실패이며, V9의 native 19파일 해시 통과도 실제 대국으로 세지 않는다. 같은 own checker·ModelWdlRestricted, optional 기능 off, 120+1·최대256 ply·흑백 교환 2게임과 네 native PALS session의 실제 PGN·수명 인수는 pending이다. |
+| V4 paired pilot | Stockfish19 UCI preflight와 V8/V9 원 FAIL은 보존한다. V10 metadata/native19 핀 PASS 뒤 execute는 P/C export identity admission에서 snapshot·child·NN 이전 exit1로 실패했다. 실제 export JSON·config와 대조한 한 manifest wire-schema leaf 교정은 legacy 수학 의미와 product guard를 보존한다. V11 실행0이다. V12는 이 identity 검사를 통과했지만 derived artifact file budget guard에서 child·NN·게임 이전 exit1로 중단했다. outer tree gone을 native receipt·shutdown·cleanup 인수로 승격하지 않는다. V13은 준비 검사를 통과하여 총괄이 실행을 시작했고 실제 결과는 대기 중이다. 120+1·최대256ply·900+30·공통 ModelWDL·optional off·2게임·네 native PALS session의 실제PGN/수명 인수는 pending이다. |
+
+V12 선언의 runtime files4096은 [native launch](../crates/rz-arena/src/native_launch.rs)의
+`max_files = runtime_files + pins + input_subdirectories + 8` 합산 뒤 4096을 넘는다.
+[artifact watch guard](../crates/rz-arena/src/process.rs)의 `1..=4096` 상한을 유지하면
+이 선언으로는 인수할 수 없다. 실제 필요 파일·부모 수를 고려한 선언 축소와 합산 검사는
+V13의 별도 실행 준비에서 고쳤으며 product guard를 완화하지 않는다.
+V13 등록 상한은 runtime files1024 + 입력34 + 부모5 + 관리예약8 = watcher1071이다.
+prepared 한도이며 실제 file count/peak는 unknown이다. 동일 byte·시계·모델과 초과 시 실패 정책을 유지한다. snapshot/copy가 생겼을 가능성과
+original owner retained를 보존하고, 실제 provider0·게임0·native physical unknown을 기록한다.
 
 #### DEFAULT 공통6 API 비용의 관측 범위
 
@@ -255,8 +265,9 @@ peak가 아니다. 새 비용과 정상 기능의 source·예산·seed·단계 �
 
 기존 39조건에 대한 총괄의 인수 판정은 유지한다. C02/P06/W04와 E04 비용 정확성·물리
 회수의 functional 인수는 원 source와 실제 단계별 근거로 별도 연결한다. E06 실제 pilot·
-E07의 후속 문서 tip·CI·PR 최종 인수는 pending이며 전체45조건의 최종 판정 필드는 총괄
-입력 전까지 null이다. 본격 학습·learned V 유용성·기력·PR 병합 완료로 확대하지 않는다.
+E07의 후속 v7 문서 tip·CI·PR 최종 인수는 pending이며 전체45조건의 최종 판정 필드는
+총괄 입력 전까지 null이다. 1ecf 문서 CI 성공이나 metadata 통과를 실제 pair·최종 완료로 세지 않는다.
+본격 학습·learned V 유용성·기력·PR 병합 완료로 확대하지 않는다.
 
 #### 초기 준비 시점의 기록
 
