@@ -19,7 +19,7 @@ use rz_eval::{
     asset::AssetMetadata,
     native_runtime_bridge::NativeWorkerOrigin,
     onnx::{OnnxBackend, OrtRuntime, Provider},
-    runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole},
+    runtime_pin::RuntimeBundleFileRole,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -183,10 +183,11 @@ impl CudaProfileV1 {
         let files = runtime.bundle_files().ok_or(NativeBootstrapError::Config(
             "loaded CUDA runtime has no exact pinned bundle files",
         ))?;
-        let spec = CudaRuntimeBundleSpec {
-            schema_version: 1,
-            files: files.to_vec(),
-        };
+        // Keep the loader-alias declaration in the digest. Reconstructing a
+        // schema-1 spec from filenames alone would discard schema-2 identity.
+        let spec = runtime.bundle_spec().ok_or(NativeBootstrapError::Config(
+            "loaded CUDA runtime has no pinned bundle specification",
+        ))?;
         if files.len() != 19
             || spec.digest()? != bundle_digest
             || backend.runtime_bundle_digest() != Some(bundle_digest)

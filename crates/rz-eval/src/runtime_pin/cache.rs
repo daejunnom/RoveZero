@@ -188,7 +188,8 @@ impl RuntimeCache {
     }
 
     /// The canonical bundle digest binds all 19 filenames, roles, sizes and
-    /// hashes. Every hit rechecks the complete immutable directory and all pins.
+    /// hashes. V2 aliases use a separate key namespace; a V1 entry is never
+    /// repaired or extended. Every hit rechecks the directory, pins and aliases.
     pub fn cuda_bundle(
         &self,
         source_root: &Path,
@@ -198,7 +199,12 @@ impl RuntimeCache {
         let key = spec.digest()?;
         #[cfg(target_os = "linux")]
         {
-            let entry = self.root.join(format!("cuda-{}", hex(key)));
+            let prefix = if spec.schema_version == 2 {
+                "cuda-alias-v2"
+            } else {
+                "cuda"
+            };
+            let entry = self.root.join(format!("{prefix}-{}", hex(key)));
             let read = |origin| read_cuda(&entry, spec, key, origin);
             if exists(&entry)? {
                 return read(RuntimeStorageOrigin::CacheReused);
@@ -214,7 +220,15 @@ impl RuntimeCache {
             if exists(&entry)? {
                 return read(RuntimeStorageOrigin::CacheReused);
             }
-            self.check_budget(spec.files.iter().map(|file| file.bytes).sum())?;
+            let incoming = spec.files.iter().map(|file| file.bytes).sum::<u64>()
+                + spec
+                    .loader_aliases
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|alias| alias.target.len() as u64)
+                    .sum::<u64>();
+            self.check_budget(incoming)?;
             let pin = RuntimeLibraryPin::copy_cuda_bundle(source_root, &self.root, spec)?;
             let stage = Unpublished::from_pin(&pin)?;
             drop(pin);
@@ -274,6 +288,7 @@ impl RuntimeCache {
                 .ok_or_else(|| io_error("runtime cache contains an unknown entry"))?;
             let key = name
                 .strip_prefix("cpu-")
+                .or_else(|| name.strip_prefix("cuda-alias-v2-"))
                 .or_else(|| name.strip_prefix("cuda-"));
             if !key.is_some_and(|key| {
                 key.len() == 64
@@ -296,13 +311,44 @@ impl RuntimeCache {
                 if files > MAX_BUNDLE_FILES {
                     return Err(capacity());
                 }
-                let metadata = fs::symlink_metadata(
-                    file.map_err(|error| cache_io("runtime cache file metadata failed", &error))?
-                        .path(),
-                )
-                .map_err(|error| cache_io("runtime cache file metadata failed", &error))?;
-                if !metadata.is_file() || is_link(&metadata) {
+                let file =
+                    file.map_err(|error| cache_io("runtime cache file metadata failed", &error))?;
+                let metadata = fs::symlink_metadata(file.path())
+                    .map_err(|error| cache_io("runtime cache file metadata failed", &error))?;
+                if is_link(&metadata) {
+                    #[cfg(target_os = "linux")]
+                    {
+                        if !name.starts_with("cuda-alias-v2-") {
+                            return Err(identity("runtime cache contains an unexpected file type"));
+                        }
+                        let basename = file.file_name();
+                        let basename = basename
+                            .to_str()
+                            .ok_or_else(|| identity("runtime cache alias basename is invalid"))?;
+                        aliases::verify_cached_name(&entry.path(), basename)?;
+                    }
+                    #[cfg(not(target_os = "linux"))]
                     return Err(identity("runtime cache contains an unexpected file type"));
+                } else if !metadata.is_file() {
+                    return Err(identity("runtime cache contains an unexpected file type"));
+                }
+                if name.starts_with("cuda-alias-v2-") && metadata.is_file() {
+                    let basename = file.file_name();
+                    if !basename
+                        .to_str()
+                        .is_some_and(aliases::allowed_original_basename)
+                    {
+                        return Err(identity(
+                            "runtime alias cache contains an undeclared regular file",
+                        ));
+                    }
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.nlink() != 1 {
+                        return Err(identity("runtime cache contains a hard-linked file"));
+                    }
                 }
                 bytes = bytes.checked_add(metadata.len()).ok_or_else(capacity)?;
                 if bytes > self.max_bytes {
@@ -432,13 +478,23 @@ impl Unpublished {
             .parent()
             .ok_or_else(|| io_error("runtime staging copy lacks its directory"))?
             .to_owned();
-        let filenames = match pin.bundle_files() {
+        let mut filenames: Vec<_> = match pin.bundle_files() {
             Some(files) => files
                 .iter()
                 .map(|file| directory.join(&file.filename))
                 .collect(),
             None => vec![pin.path().to_owned()],
         };
+        if let Some(bundle) = &pin.0.bundle {
+            filenames.extend(
+                bundle
+                    .loader_aliases
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|alias| directory.join(&alias.filename)),
+            );
+        }
         Ok(Self {
             directory,
             filenames,
@@ -622,6 +678,13 @@ fn read_cuda(
             .files
             .iter()
             .map(|file| file.filename.as_str())
+            .chain(
+                spec.loader_aliases
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|alias| alias.filename.as_str()),
+            )
             .collect::<Vec<_>>(),
     )?;
     let mut files = spec.files.clone();
@@ -638,6 +701,7 @@ fn read_cuda(
             pins.push(pin);
         }
     }
+    aliases::verify(entry, spec.loader_aliases.as_deref().unwrap_or(&[]), &files)?;
     let (path, digest, pin) =
         core.ok_or_else(|| bundle_error("cached CUDA core pin is missing"))?;
     Ok(RuntimeLibraryPin(Arc::new(OwnedCopy {
@@ -646,7 +710,9 @@ fn read_cuda(
         _pin: pin,
         bundle: Some(OwnedCudaBundle {
             digest: key,
+            schema_version: spec.schema_version,
             files,
+            loader_aliases: spec.loader_aliases.clone(),
             _pins: pins,
         }),
         storage: RuntimeStorage {

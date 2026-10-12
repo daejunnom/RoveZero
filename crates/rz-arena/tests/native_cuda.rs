@@ -126,6 +126,8 @@ fn artifact(path: &str, digest: &str, bytes: u64) -> ArtifactRef {
 }
 fn fixture() -> (CudaNativeLaunchSpecV1, Value, Value) {
     let mut bundle = CudaBundleBindingV1 {
+        schema_version: None,
+        loader_aliases: None,
         manifest: artifact("runtime/bundle.json", &"f".repeat(64), 1),
         canonical_sha256: "f".repeat(64),
         files: CUDA_BUNDLE_FILENAMES

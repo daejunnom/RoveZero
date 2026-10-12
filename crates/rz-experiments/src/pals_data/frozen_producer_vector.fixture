@@ -1,0 +1,14 @@
+{
+  "roster_body": {
+    "version": "rz-pals-producer-roster/1",
+    "game_producers": [{
+      "game_id": "경기",
+      "producer_id": "cpu",
+      "registration_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "source": {"kind": "own_cpu", "cpu_binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "evaluator_configuration_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "model_weights_sha256": null},
+      "frozen_epoch": 9007199254740993,
+      "encoding_policy": {"kind": "native_exact", "encoding_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "encoder_source_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "native_model_epoch": {"kind": "encoding_only_zero"}}
+    }]
+  },
+  "canonical_roster": "[\"rz-pals-producer-roster/1\",{\"game_producers\":[{\"encoding_policy\":{\"encoder_source_sha256\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"encoding_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"kind\":\"native_exact\",\"native_model_epoch\":{\"kind\":\"encoding_only_zero\"}},\"frozen_epoch\":9007199254740993,\"game_id\":\"경기\",\"producer_id\":\"cpu\",\"registration_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"source\":{\"cpu_binary_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"evaluator_configuration_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"kind\":\"own_cpu\",\"model_weights_sha256\":null}}],\"version\":\"rz-pals-producer-roster/1\"}]"
+}

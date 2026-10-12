@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rovezero-pals-model"
+version = "0.1.0"
+description = "PALS neural forward, untrained initialization and V-free export tooling"
+requires-python = ">=3.11,<3.14"
+license = "MIT"
+dependencies = ["torch==2.8.0", "numpy==2.2.6", "onnx==1.19.0"]
+
+[project.optional-dependencies]
+reference = ["onnxruntime==1.22.0"]
+
+[project.scripts]
+rz-pals-model = "rz_pals_model.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

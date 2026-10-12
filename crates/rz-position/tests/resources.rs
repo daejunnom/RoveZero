@@ -1,4 +1,4 @@
-use rz_position::{Position, PositionError, PositionLimits};
+use rz_position::{Position, PositionError, PositionLimits, MAX_UCI_REPLAY_PLIES};
 
 #[test]
 fn explicit_input_history_and_perft_budgets_fail_without_mutation() {
@@ -82,6 +82,16 @@ fn persistent_history_releases_iteratively_and_preserves_shared_prefixes() {
             for index in 0..8_000 {
                 p.make_uci(["g1f3", "g8f6", "f3g1", "f6g8"][index % 4])
                     .unwrap();
+                if index + 1 == MAX_UCI_REPLAY_PLIES {
+                    let replay = p.snapshot().uci_replay(usize::MAX).unwrap();
+                    assert_eq!(replay.moves.len(), MAX_UCI_REPLAY_PLIES);
+                }
+                if index + 1 == MAX_UCI_REPLAY_PLIES + 1 {
+                    assert_eq!(
+                        p.snapshot().uci_replay(usize::MAX).unwrap_err(),
+                        PositionError::ResourceLimit("UCI replay plies")
+                    );
+                }
             }
             let history = p.snapshot();
             assert_eq!(history.known_history_len(), 8_001);

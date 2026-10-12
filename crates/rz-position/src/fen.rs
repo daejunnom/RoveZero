@@ -287,12 +287,10 @@ pub(crate) fn format(state: &CoreState) -> String {
     s
 }
 
-/// Reuse one buffer for the canonical digest frames. The longest representation
+/// Reuse one buffer for canonical rule frames. The longest representation
 /// is 64 pieces + seven '/' + side/rights/EP + two ten-digit u32 counters.
-#[cfg(feature = "experimental-history-digest")]
 pub(crate) const MAX_CANONICAL_FEN_BYTES: usize = 103;
 
-#[cfg(feature = "experimental-history-digest")]
 pub(crate) fn format_into(state: &CoreState, buffer: &mut String) {
     use std::fmt::Write;
     buffer.clear();

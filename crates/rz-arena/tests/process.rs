@@ -88,6 +88,12 @@ fn native_runner_exit_preserves_both_outputs_and_closed_stdin() {
     assert_eq!(result.receipt.exit_code, Some(0));
     assert_eq!(result.receipt.exit_signal, None);
     assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone);
+    let cleanup_ns = result
+        .receipt
+        .cleanup_elapsed_ns
+        .expect("normal cleanup interval observed");
+    assert!(cleanup_ns > 0 && cleanup_ns <= result.receipt.elapsed_ns);
+    assert!(result.receipt.cleanup_timing_unavailable_reason.is_none());
     assert!(result.receipt.errors.is_empty());
     assert!(result.pending_child.is_none());
     assert_eq!(result.receipt.watched_artifact_bytes, None);
@@ -634,6 +640,19 @@ fn wall_limit_kills_a_runner_with_term_blocked_and_drains() {
     assert_eq!(result.receipt.stop, ProcessStop::WallLimit);
     assert_eq!(result.receipt.exit_signal, Some(Signal::SIGKILL as i32));
     assert_eq!(result.receipt.group_cleanup, CleanupStatus::Gone);
+    let cleanup_ns = result
+        .receipt
+        .cleanup_elapsed_ns
+        .expect("bounded kill/drain interval observed");
+    assert!(
+        cleanup_ns >= 50_000_000,
+        "cleanup must include the observed TERM grace before SIGKILL"
+    );
+    assert!(
+        cleanup_ns < result.receipt.elapsed_ns,
+        "engine time must remain outside cleanup time"
+    );
+    assert!(result.receipt.cleanup_timing_unavailable_reason.is_none());
     assert!(result.receipt.elapsed_ns < 1_000_000_000);
 }
 

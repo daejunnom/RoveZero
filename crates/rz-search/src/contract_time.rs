@@ -124,7 +124,7 @@ impl ContractDeadlines {
         // The shared origin must precede go/start; resetting it after preparation
         // cannot silently exclude that preparation cost even if deadlines are future.
         clock.tick_at(budget.start)?;
-        let convert = |instant| {
+        let convert = |instant| -> Result<Deadline, ContractError> {
             Ok(Deadline {
                 clock: clock.domain(),
                 at: clock.tick_at(instant)?,

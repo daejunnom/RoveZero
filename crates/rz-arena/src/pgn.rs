@@ -82,6 +82,20 @@ pub struct GamePgnAudit {
     pub loser_engine: Option<String>,
     pub terminal_reason: Option<String>,
     pub engine_failure: Option<EngineFailureKind>,
+    /// A pinned runner may record a late reply without applying it to its board.
+    /// This evidence retains that reply separately from the committed game moves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_evidence: Option<PgnFailureEvidence>,
+}
+
+/// PGN failure accounting only; independent clock evidence remains required.
+#[derive(Clone, Debug, Serialize)]
+pub struct PgnFailureEvidence {
+    pub profile: String,
+    pub unplayed_uci_reply: String,
+    /// The runner counts its recorded, unplayed reply in this original header.
+    pub declared_ply_count: u32,
+    pub overrun_ms: u64,
 }
 
 fn invalid(reason: impl Into<String>) -> ArenaError {
@@ -147,11 +161,17 @@ fn make(
     state: &ContractState,
     mv: BoardMove,
 ) -> Result<(), ArenaError> {
+    make_with_undo(position, state, mv).map(|_| ())
+}
+fn make_with_undo(
+    position: &mut ContractPosition,
+    state: &ContractState,
+    mv: BoardMove,
+) -> Result<rz_position::UndoToken, ArenaError> {
     let shared = rz_contracts::Move::try_from(mv).map_err(ArenaError::Contract)?;
     position
         .make_from_view(state, shared)
-        .map_err(ArenaError::Contract)?;
-    Ok(())
+        .map_err(ArenaError::Contract)
 }
 fn digest(state: &ContractState) -> String {
     state
@@ -176,7 +196,7 @@ fn piece_letter(piece: PieceKind) -> char {
 
 /// Format one already legal move. Disambiguation and check suffix inspect A's
 /// board/legal array/checked preview; this code has no attack or move generator.
-fn san(position: &Position, mv: BoardMove) -> Result<String, ArenaError> {
+pub(crate) fn san(position: &Position, mv: BoardMove) -> Result<String, ArenaError> {
     let legal = position.legal_moves();
     if !legal.contains(&mv) {
         return Err(invalid("cannot serialize illegal opening move"));
@@ -597,6 +617,19 @@ fn exact_reason_suffix<'a>(comment: &'a str, marker: &str) -> Option<&'a str> {
         .and_then(|(_, reason)| reason.strip_prefix(marker))
 }
 
+fn pinned_timeout_reason(comment: &str) -> Option<(Color, u64)> {
+    [(Color::White, "White"), (Color::Black, "Black")]
+        .into_iter()
+        .find_map(|(side, color)| {
+            let marker = format!("{color} loses on time (");
+            let overrun = exact_reason_suffix(comment, &marker)?.strip_suffix("ms overrun)")?;
+            if overrun.is_empty() || !overrun.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            Some((side, overrun.parse().ok()?))
+        })
+}
+
 fn classify_outcome(
     live: &ContractPosition,
     game: &GameSpec,
@@ -723,12 +756,7 @@ fn classify_outcome(
                     EngineFailureKind::Crash
                 }
                 "time forfeit" => {
-                    let marker = format!("{color} loses on time (");
-                    let overrun = exact_reason_suffix(final_comment, &marker)
-                        .and_then(|suffix| suffix.strip_suffix("ms overrun)"));
-                    if !overrun.is_some_and(|text| {
-                        !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
-                    }) {
+                    if pinned_timeout_reason(final_comment).map(|(loser, _)| loser) != Some(side) {
                         return Err(invalid("PGN timeout lacks pinned Fastchess reason text"));
                     }
                     EngineFailureKind::Timeout
@@ -911,6 +939,7 @@ pub fn audit_pair_pgn_for_spec(
         let termination = require_tag(&tags, "Termination")?.to_owned();
         let mut live = contract(initial_position(&pair.opening, limits.max_plies)?)?;
         let mut uci_moves = Vec::new();
+        let mut last_move_undo = None;
         let mut final_comment = "";
         let mut result_seen = false;
         let mut pending_number = false;
@@ -956,7 +985,7 @@ pub fn audit_pair_pgn_for_spec(
                         return Err(invalid("PGN omitted or changed the literal opening prefix"));
                     }
                     let state = export(&live)?;
-                    make(&mut live, &state, mv)?;
+                    last_move_undo = Some(make_with_undo(&mut live, &state, mv)?);
                     uci_moves.push(input);
                     final_comment = "";
                     pending_number = false;
@@ -972,15 +1001,56 @@ pub fn audit_pair_pgn_for_spec(
         if !result_seen || uci_moves.len() < pair.opening.moves.len() {
             return Err(invalid("missing game result or opening prefix"));
         }
-        if let Some(count) = tags.get("PlyCount") {
-            let count: usize = count.parse().map_err(|_| invalid("invalid PGN PlyCount"))?;
+        let declared_ply_count = tags
+            .get("PlyCount")
+            .map(|count| {
+                count
+                    .parse::<u32>()
+                    .map_err(|_| invalid("invalid PGN PlyCount"))
+            })
+            .transpose()?;
+        if let Some(count) = declared_ply_count {
             // Fastchess includes an unplayed illegal reply in PlyCount.
             let expected = uci_moves.len() + usize::from(termination == "illegal move");
-            if count != expected {
+            if count as usize != expected {
                 return Err(invalid(
                     "PGN PlyCount disagrees with parsed legal moves/failure profile",
                 ));
             }
+        }
+        let mut failure_evidence = None;
+        if termination == "time forfeit"
+            && let Some((loser, overrun_ms)) = pinned_timeout_reason(final_comment)
+            && loser != live.position().side_to_move()
+        {
+            // Fastchess f618e345 records best_move in addMoveData before checking
+            // the charged clock. On timeout it returns before board.makeMove.
+            // Its final reply is A-legal but was never a committed game move.
+            // Require the exact reason and recorded-ply header for this profile;
+            // a no-reply timeout retains the current A state instead.
+            let declared_ply_count = declared_ply_count.ok_or_else(|| {
+                invalid("recorded timeout reply requires pinned Fastchess PlyCount")
+            })?;
+            if uci_moves.len() <= pair.opening.moves.len() {
+                return Err(invalid("timeout cannot unplay the declared opening prefix"));
+            }
+            let undo = last_move_undo
+                .take()
+                .ok_or_else(|| invalid("recorded timeout reply lacks an A undo proof"))?;
+            live.unmake(undo).map_err(ArenaError::Contract)?;
+            if live.position().side_to_move() != loser {
+                return Err(invalid(
+                    "recorded timeout reply does not belong to the A loser",
+                ));
+            }
+            failure_evidence = Some(PgnFailureEvidence {
+                profile: "fastchess_recorded_unplayed_timeout_reply_v1".into(),
+                unplayed_uci_reply: uci_moves
+                    .pop()
+                    .ok_or_else(|| invalid("recorded timeout reply is missing"))?,
+                declared_ply_count,
+                overrun_ms,
+            });
         }
         let outcome = classify_outcome(
             &live,
@@ -1005,6 +1075,7 @@ pub fn audit_pair_pgn_for_spec(
             loser_engine: outcome.loser_engine,
             terminal_reason: outcome.terminal_reason,
             engine_failure: outcome.engine_failure,
+            failure_evidence,
         });
     }
     if !matches!(parser.token()?, Token::End) {

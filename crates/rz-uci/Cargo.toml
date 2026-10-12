@@ -17,6 +17,14 @@ required-features = ["onnx-cpu"]
 name = "mock_adapter_check"
 required-features = ["onnx-cpu"]
 
+[[example]]
+name = "pals_cpu_task"
+required-features = ["search-work-receipts"]
+
+[[example]]
+name = "pals_private_warm_cpu_check"
+required-features = ["onnx-cpu"]
+
 [features]
 experimental-batch = ["rz-search/experimental-batch", "rz-eval/experimental-batch"]
 experimental-io-buffers = ["rz-eval/experimental-io-buffers"]
@@ -33,9 +41,9 @@ default = []
 experimental-best-move = []
 experimental-raw-cache = ["rz-eval/experimental-raw-cache"]
 onnx-cpu = [
-    "rz-eval/onnx", "dep:serde", "dep:serde_json", "dep:sha2",
-    "dep:cap-std", "dep:cap-fs-ext",
+    "rz-eval/onnx", "search-work-receipts",
 ]
+search-work-receipts = ["dep:serde", "dep:serde_json", "dep:cap-std", "dep:cap-fs-ext", "dep:nix"]
 onnx-cuda = ["onnx-cpu"]
 
 [dependencies]
@@ -48,6 +56,10 @@ rz-encoding.workspace = true
 rz-telemetry.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
+sha2.workspace = true
 cap-std = { workspace = true, optional = true }
 cap-fs-ext = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Safe Linux proc/cgroup filesystem checks and nonblocking observer opens.
+nix = { workspace = true, optional = true }

@@ -428,7 +428,9 @@ dependencies = [
  "rz-contracts",
  "rz-eval",
  "rz-experiments",
+ "rz-native-loader",
  "rz-position",
+ "rz-search",
  "rz-uci",
  "serde",
  "serde_json",
@@ -502,8 +504,13 @@ dependencies = [
 name = "rz-search"
 version = "0.1.0"
 dependencies = [
+ "nix",
  "rz-contracts",
+ "rz-position",
  "rz-telemetry",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -516,6 +523,7 @@ version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "nix",
  "rz-contracts",
  "rz-encoding",
  "rz-eval",

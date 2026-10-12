@@ -18,4 +18,11 @@ experimental-backup-scratch = []
 
 [dependencies]
 rz-contracts.workspace = true
+rz-position.workspace = true
 rz-telemetry.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, features = ["fs", "signal", "process"] }

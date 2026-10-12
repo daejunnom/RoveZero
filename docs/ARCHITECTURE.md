@@ -188,6 +188,44 @@ deadline·상주 메모리를 먼저 정의한다. model 구조·history 입력�
 
 ## 구현·연구의 진행 축
 
+PALS 독자 엔진의 실제 연결·책임 경계와 남은 인수는
+[PALS 구현·인수 요약](PALS-IMPLEMENTATION.md)과
+[이전 상세 실행 이력](research/PALS-IMPLEMENTATION.md)을 참고한다. PR23의 추가 범위와
+계층별 기본값은 [후속 계약](PALS-FOLLOWUP-CONTRACTS.md)을 따른다. 이전의 비학습 목표와
+당시 CPU/CI/GPU 자료는 보존하며 새 V4/FullLineInteractionV2 기준의 인수로 승격하지 않는다.
+
+### PR23 후속의 책임과 수명
+
+새 모델 init·제품 profile 생략은 `FullLineInteractionV2`가 기본이다. input-only
+`full_line_v2`, head-only `interaction_head_v2`, explicit legacy `legacy_summary_v1`을
+독립 대조로 보존한다. 새 후속 등록은 V4 manifest/lock을 명시하고 child에 V4 wire를
+전달한다. 일반 CLI의 wire 생략은 기존 호환 동작이며, 모델 profile 기본과 wire 선택을
+같은 접점으로 해석하지 않는다. 기존 `baseline()`·V1/V2/V3 codec·digest의 의미를 유지한다.
+
+| 소유 경계 | 이번 후속의 계약과 구현·인수 한계 |
+|---|---|
+| Rules·자체 CPU | Rules가 exact position/history·make/unmake를 소유한다. optional `PausedStack`은 실제 root/PVS/negamax/qsearch/SEE 미완료 frame·accumulator와 TT/ordering owner를 유지한다. 한 실제 paused task·8MiB·일회 token이며 기본은 `CompletedIteration`이다. stale pause의 소비 비용·역사는 보존한다. orphan/logical cancel의 실제 frame 폐기·token/bytes 0·complete snapshot 확인 전에는 논리 pause를 retire하지 않는다. GPU 물리 lease는 CPU cleanup의 책임 밖이다. |
+| checker·resolver·Fresh | checker와 `ResolverPolicy`를 독립 선택한다. own raw namespace는 자체 CPU만, model WDL은 own/외부 checker를 지원한다. 외부 제품 실행은 현재 Linux native ELF의 binary/argv/UCI 검증 범위다. frozen Fresh의 두 끝점은 같은 모델·정밀도·공개 문맥 revision·관점이며 mixed/unknown은 unresolved다. 외부 CP/mate·bound를 Rules 사실이나 own raw로 전환하지 않는다. |
+| 결론·반복 queue | `ContextWdl` raw 관측 두 개와 dependency를 가진 conditional WDL의 namespace/revision을 유지한다. 실제 새 C continuation·Fresh 새 P 관측과 엄격한 개선만 Repair의 supersedes/RepairedBy 근거가 된다. queue는 명시적 `IterativeFrozenModelWdlV2`의 S 정책이며 원래 first move와 새 증거를 보존한다. 재검토 기본은 `Disabled`다. 기존 CPU interleave는 `ReplaceOnFresh`이며 별도 `ResumeAfterAcceptedRepairC` opt-in만 iterative queue·PausedStack owner를 요구한다. 같은 root/first-move의 accepted Repair/C tail을 다른 P 게시와 원 task 재개 앞에 drain하고 일반 FIFO·다른 pending 순서는 유지한다. |
+| bounded hot/cold 저장소 | Store·Engine은 controlled allocation·hot 80% 회수·최대1회 Capacity 재시도를 원래 deadline/byte와 resident/temporary·active/paused/dependency 핀 안에서 연결한다. commit·무결성 확인 뒤 회수하고 typed 실패를 보존하며 Node를 compact하지 않는다. 새 게임의 독립 owner는 원래 session write ledger를 승계한다. Native→Arena는 owner/session 실제 비용·close·partial/unknown을 검증하며 선언을 실행 사실로 바꾸지 않는다. |
+| host/CUDA Warm·물리 완료 | 서로 다른 capability이며 기본 off다. 같은 accepted role·모델/epoch·Rules/history/query에서만 seed를 재사용하고 public record revision만 변경 가능하다. Value/V는 Fresh다. 실제 request/execution/bank/ordinal join과 물리 완료를 확인한다. cancel/physical unknown의 owner·input/output/seed/workspace와 근거는 물리 완료 전 보존·격리하며 논리 취소나 root 전이로 재사용하지 않는다. |
+| 진단 학습·실행 인수 | historical 연속·재개24 update PASS, 이전1+8 실패·누적33·actual target0, source8 대조 재사용·새 optimizer0을 구분한다. 실제 learned V utility/action 근거는 부족하다. 검사 코드555 CPU·exact CI·Build14, 문서 기준bf1cc6a의 exact CI 네 job 성공과 이전1ecf/e43d CI, 기존8b CI·native c3/Build13 기능 근거를 각각 원 source·binary로 연결한다. 361행 component 재사용·validator overlay·비용 example deadline 변경은 전체 binary 동일성 선언이 아니다. 총괄은 비용555/Build14의 Label5 capture/reference·Label6 Rust verify에 따른 E04 정확성·물리 회수를 functional 인수했다. 원 wrapper FAIL·not_comparable·ratio null과 sample NN/cache·actual TF32/plan/retry·전체 peak unknown을 보존한다. V10 metadata 통과 후 export identity guard의 pre-child/NN 실패를 보존한다. 준비 materializer leaf 교정은 product guard·수학·weights·graph를 바꾸지 않는다. V12 identity 통과 뒤 derived file budget pre-child FAIL·original owner retained 가능성·native physical unknown을 outer tree gone과 구분한다. V13 watcher1071·depth9 통과 뒤 자체 DEFAULT preflight child가 receipt 연결 인자 세 개 누락으로 exit1이었다. NN·게임 이전 실패와 원 stderr/resource·native physical unknown을 유지한다. V4 producer의 external CPU_R 전용 receipt argv 분기와 DEFAULT guard의 세 인자 요구를 구분한다. product guard를 유지한 새 assembly source·frozen 등록·빌드·V14 actual과 E06 실제 pair·E07 후속 v8 문서·전체45 최종 판정은 pending이다. 문서 CI 성공을 새 native 실행으로 세지 않는다. 비용·본격 학습·기력·유료 자원·병합은 각각 별도다. |
+| DEFAULT 접점 수정 후속 | 수정 source21fad37의 CPU wire12·arena lib123(새 검사5 포함)와 Build15 actual을 추가로 연결한다. Build15 315.3177초·일곱 명령 exit0/tree gone·다섯 ELF GLIBC 상한2.34와 문서 기준95e7184의 [exact CPU CI 네 성공](https://github.com/daejunnom/RoveZero/actions/runs/38208720665)을 구분한다. checker·UCI 등록 bytes/digest만 Build13과 같고 repair·Warm·pair-prepare는 달라 각 pin을 보존한다. 원 numeric/Warm c3/Build13·비용555/Build14를 새 source로 재라벨하지 않으며 component 재사용은 별도 검증 대기다. 새 arena의 실제 pair·E06/E07와 전체45 최종 인수는 pending/null이다. |
+| CUDA 종료 예산·loaded identity 후속 | sourcea617/Build17의 9개 감독 명령·다섯 ELF와 [CPU CI 네 성공](https://github.com/daejunnom/RoveZero/actions/runs/38232021780)을 별도 등록한다. V17 실제 baseline probe 두 개는 CUDA startup NN3씩·exit0·최종 mapping·physical shutdown·buffers released를 확인했고 search 소비는0이다. 이어진 guard는 선언 model identity의 CUDA device/arena 접미사 누락을 거부했다. 원 execute FAIL·게임/PGN0을 보존한다. V18 metadata leaf 교정과 E06의 후보 probe·네 game session·두 PGN 인수는 [최신 구현 기록](PALS-IMPLEMENTATION.md#cuda-종료-예산과-실행-명세의-모델-식별)에서 구분한다. |
+| V4 native encoding 경계 후속 | V18은 baseline 두 probe의 정상 물리 회수 뒤 Fresh/Rules recipe namespace 혼동으로 execute FAIL·게임/PGN0이다. 제품 ae36/Build18은 V3 recipe를 보존하고 V4 native receipt만 모델 Fresh encoding과 대조한다. Rules/loader·epoch/export/adapter/trained·물리 fence는 그대로다. 실제11감독 명령과 exact CPU CI 네 성공은 새 대국 인수가 아니다. [수정과 인수 기록](PALS-IMPLEMENTATION.md#v4-native-영수증의-fresh-인코딩-경계)을 따른다. |
+
+소스 책임은 [CPU stack](../crates/rz-search/src/cpu/stack.rs),
+[CPU lifecycle](../crates/rz-search/src/pals/engine/cpu_lifecycle.rs),
+[checker](../crates/rz-search/src/cpu_checker.rs),
+[frozen recheck](../crates/rz-search/src/pals/engine/frozen_recheck.rs),
+[store archive](../crates/rz-search/src/pals/store/archive.rs),
+[archive lifecycle](../crates/rz-search/src/pals/engine/archive_lifecycle.rs),
+[CUDA Warm](../crates/rz-eval/src/pals_onnx/warm/cuda.rs)에 연결한다. 소스 준비·CPU/mock,
+actual NN·GPU 수명·학습 smoke·대국을 각각 인수한다. 새 diagnostic 범위의 제한은
+[TRAINING-PLAN](TRAINING-PLAN.md#2026-10-10-pals-diagnostic-학습-smoke)을 따른다.
+모델 입력/head·queue·stack·Warm 및 구현별 비용은 각각 고정 조건으로 비교한다.
+모델·탐색의 A/S 변경에 의미 보존 E 최적화의 전역 5% gate를 추가하지 않는다.
+
 20개 TASK의 실제 순서와 병렬 의존성은 [구현 지시서](IMPLEMENTATION-DIRECTIVES.md)를
 따른다. 총괄의 최소 공통 계약 → A/B/C01/D01/E/F01 mock 병렬 → 독립 규칙·UCI·
 CPU/mock 인수 → 단일 가중치의 실제 Rust 추론 → 종단 계측 → 한 검색/런타임
@@ -207,6 +245,30 @@ R6 증분 특징·검색·평가·정밀도의 CPU 비교군, R7 검증한 요�
 fork로 해석하지 않는다. 초기 Rust CPU/mock 병렬 작업은 모든 연구 gate의 실측
 완료를 기다리지 않으며 실제 후보 인수는 필요한 선행 근거와 유한 자원·실험 계약을
 충족한 뒤 수행한다.
+
+### PALS 게임별 정리 producer와 검사 소스의 경계
+
+현재 제품 등록 소스 `4fef868`과 검사 전용 tip `ee6322f`를 분리한다. `4fef868`에는 게임별 cleanup provenance producer 수정이 포함되며, `ee6322f`는 cfg(test) fixture의 clippy 지적을 고친 후속 검사 소스다. 제품 빌드·실제 NN·물리 종료 자료를 검사 tip으로 다시 이름 붙이지 않는다. 두 검사 루프를 원래 표현으로 되돌린 정확 역변환과 제품 prefix 동일 근거는 CI 소스 재사용의 경계다. `ee6322f`의 CI 네 job 성공은 해당 검사 tip의 결과로 연결하며, 제품 `4fef868`의 새 빌드·물리 수명 인수는 별도로 유지한다.
+
+source-proof21은 `ae36afc`에서 `4fef868`까지 선택 소스 322개 중 319개 동일·3개 차이와 해당 구간의 수학 소스 128개 동일을 기록한다. `f75a739`에서 `4fef868`까지는 320개 동일·2개 차이와 해당 구간의 수학 소스 129개 동일이다. 모델 공통 소스 5개와 후자의 native adapter 소스는 같지만 이 구간별 개수를 전체 변경 이력의 동일성으로 확대하지 않는다. 원래 numeric·Warm 근거의 소스와 바이너리 식별은 보존하고, 새 arena producer와 실제 수명은 새 빌드·영수증에서 연결한다.
+
+게임별 actual PID와 공유 정리 비용의 계약은 [후속 계약](PALS-FOLLOWUP-CONTRACTS.md#게임별-종료-소유자와-공유-정리-비용),
+실제 대국과 남은 Build22·Pilot23 인수는 [현재 실행 기록](PALS-IMPLEMENTATION.md#2026-10-12-게임별-종료-소유자-수정과-현재-인수)을 따른다.
+
+### 2026-10-13 게임별 producer의 실제 실행 연결
+
+제품 `4fef868`/Build22의 Pilot23은 새 producer의 typed Core, preflight/game의 별개
+owner와 네 game session의 물리 종료를 실제 실행 자료에 연결했다. 두 엔진은 각
+판 재시작했고, Legacy/new 구성의 색 교환·Rules/시계/PGN·owned tree 종료를 함께
+관측했다. 기존 단일 worker와 physical lease의 책임은 유지되며, 논리 취소를
+물리 완료로 바꾸거나 종료 불명 buffer를 재사용하는 예외를 추가하지 않는다.
+
+원 numeric/Warm cohort와 component 재사용 확인, 검사 전용 tip의 CPU CI, 새 제품의
+실제 실행은 서로 다른 근거다. 원 V22의 typed Core null·owner 중복 실패를 보존하고
+새 자료를 이전 owner의 재조립으로 취급하지 않는다. Colab-observed 기능 결과는
+strict-local 자원 인수나 성능·기력 개선을 뜻하지 않는다. 실제 TF32·새 Warm의
+현재 바이너리 실행 효과와 전체 peak의 미관측 범위는 그대로 둔다.
+상세 숫자·계수·원 실패는 [Build22와 Pilot23 실제 기능 관측](PALS-IMPLEMENTATION.md#2026-10-13-build22와-pilot23-실제-기능-관측)에 연결한다.
 
 ## 복구와 검증 경계
 
