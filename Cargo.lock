@@ -507,6 +507,7 @@ dependencies = [
  "nix",
  "rz-contracts",
  "rz-position",
+ "rz-runtime",
  "rz-telemetry",
  "serde",
  "serde_json",
