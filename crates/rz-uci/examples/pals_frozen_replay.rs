@@ -3031,7 +3031,11 @@ mod cpu_cli {
                 drop(error);
                 drop(progress);
                 let stop = Instant::now() + Duration::from_secs(5);
-                while weak.upgrade().is_some() && Instant::now() < stop {
+                // A zero strong count forbids Weak::upgrade before the value's
+                // destructor has finished. Observe the exact cause drop too.
+                while (weak.upgrade().is_some() || drops.load(Ordering::Acquire) == 0)
+                    && Instant::now() < stop
+                {
                     std::thread::yield_now();
                 }
                 assert!(weak.upgrade().is_none());
