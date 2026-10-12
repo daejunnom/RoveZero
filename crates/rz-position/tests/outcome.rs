@@ -30,6 +30,41 @@ fn moves(position: &mut Position, line: &[&str]) {
 const KNIGHT_CYCLE: [&str; 4] = ["g1f3", "g8f6", "f3g1", "f6g8"];
 
 #[test]
+fn search_play_status_agrees_with_full_classification_and_rejects_stale_view() {
+    // Search needs automatic outcomes, while full classification also previews
+    // intended draw claims. The cheap path must preserve their shared meaning.
+    for fen in [
+        "7k/6Q1/5K2/8/8/8/8/8 b - - 150 1", // mate before 75-move rule
+        "7k/5K2/6Q1/8/8/8/8/8 b - - 0 1",   // stalemate
+        "7k/8/8/8/8/8/8/K7 w - - 0 1",      // proven dead material
+        "7k/8/8/8/8/8/P7/KR6 w - - 100 1",  // claim, still ongoing
+        "7k/8/8/8/8/8/P7/KR6 w - - 150 1",  // automatic draw
+    ] {
+        let position = Position::from_fen(fen).unwrap();
+        let view = position.ordered_legal_moves();
+        assert_eq!(
+            position.play_status_from_view(&view).unwrap(),
+            position.classify_position().unwrap().play_status,
+            "{fen}"
+        );
+    }
+    let mut position = Position::startpos();
+    for cycles in 0..=4 {
+        let view = position.ordered_legal_moves();
+        assert_eq!(
+            position.play_status_from_view(&view).unwrap(),
+            position.classify_position().unwrap().play_status
+        );
+        if cycles < 4 {
+            moves(&mut position, &KNIGHT_CYCLE);
+        }
+    }
+    let stale = position.ordered_legal_moves();
+    position.make_uci("e2e4").unwrap();
+    assert!(position.play_status_from_view(&stale).is_err());
+}
+
+#[test]
 fn threefold_claim_before_and_after_the_intended_move_is_not_automatic() {
     let mut position = Position::startpos();
     moves(&mut position, &KNIGHT_CYCLE);

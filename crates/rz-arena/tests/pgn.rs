@@ -466,6 +466,251 @@ fn arbitrary_adjudication_timeout_text_and_ambiguous_abandoned_are_not_losses() 
         timeout.games[0].engine_failure,
         Some(rz_arena::EngineFailureKind::Timeout)
     );
+    assert!(timeout.games[0].failure_evidence.is_none());
+    assert!(
+        serde_json::to_value(&timeout.games[0])
+            .unwrap()
+            .get("failure_evidence")
+            .is_none()
+    );
+}
+
+fn rules_fen(moves: &[&str]) -> String {
+    let mut position = rz_position::Position::startpos();
+    for mv in moves {
+        position.make_uci(mv).unwrap();
+    }
+    position.to_fen()
+}
+
+#[test]
+fn recorded_timeout_reply_is_retained_but_not_applied_to_the_a_game_state() {
+    let p = plan(input());
+    for (moves, result, count, committed, reply, overrun, white_lost) in [
+        (
+            "1. e4 e5 2. Nf3 {0.00/0 1.015s, White loses on time (5ms overrun)}",
+            "0-1",
+            3,
+            vec!["e2e4", "e7e5"],
+            "g1f3",
+            5,
+            true,
+        ),
+        (
+            "1. e4 e5 2. Nf3 Nf6 {0.00/0 1.018s, Black loses on time (7ms overrun)}",
+            "1-0",
+            4,
+            vec!["e2e4", "e7e5", "g1f3"],
+            "g8f6",
+            7,
+            false,
+        ),
+    ] {
+        let raw = pair_pgn(
+            &p,
+            moves,
+            result,
+            "time forfeit",
+            &format!("[PlyCount \"{count}\"]\n"),
+        );
+        let audited = audit(&p, &raw).unwrap();
+        for game in &audited.games {
+            assert_eq!(game.classification, "engine_loss");
+            assert_eq!(
+                game.engine_failure,
+                Some(rz_arena::EngineFailureKind::Timeout)
+            );
+            assert_eq!(game.uci_moves, committed);
+            assert_eq!(game.final_fen, rules_fen(&committed));
+            assert_eq!(
+                game.loser_engine.as_ref(),
+                Some(if white_lost {
+                    &game.white_engine
+                } else {
+                    &game.black_engine
+                })
+            );
+            let failure = game.failure_evidence.as_ref().unwrap();
+            assert_eq!(
+                failure.profile,
+                "fastchess_recorded_unplayed_timeout_reply_v1"
+            );
+            assert_eq!(failure.unplayed_uci_reply, reply);
+            assert_eq!(failure.declared_ply_count, count);
+            assert_eq!(failure.overrun_ms, overrun);
+            let serialized = serde_json::to_value(game).unwrap();
+            assert_eq!(serialized["failure_evidence"]["unplayed_uci_reply"], reply);
+            assert_eq!(serialized["failure_evidence"]["declared_ply_count"], count);
+        }
+    }
+}
+
+#[test]
+fn a_mating_timeout_candidate_cannot_replace_the_prior_failure_boundary() {
+    let mut i = input();
+    i.input.openings[0].moves.clear();
+    let p = plan(i);
+    for (moves, result, count, committed, reply) in [
+        (
+            "1. e4 e5 2. Qh5 Nc6 3. Bc4 Nf6 4. Qxf7# {White loses on time (5ms overrun)}",
+            "0-1",
+            7,
+            vec!["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6"],
+            "h5f7",
+        ),
+        (
+            "1. f3 e5 2. g4 Qh4# {Black loses on time (7ms overrun)}",
+            "1-0",
+            4,
+            vec!["f2f3", "e7e5", "g2g4"],
+            "d8h4",
+        ),
+    ] {
+        let raw = pair_pgn(
+            &p,
+            moves,
+            result,
+            "time forfeit",
+            &format!("[PlyCount \"{count}\"]\n"),
+        );
+        let audited = audit(&p, &raw).unwrap();
+        for game in &audited.games {
+            assert_eq!(game.classification, "engine_loss");
+            assert_eq!(game.terminal_reason, None);
+            assert_eq!(game.uci_moves, committed);
+            assert_eq!(game.final_fen, rules_fen(&committed));
+            assert_eq!(
+                game.failure_evidence.as_ref().unwrap().unplayed_uci_reply,
+                reply
+            );
+        }
+        // The candidate's hypothetical mate winner cannot override the timeout.
+        let inverted = if result == "0-1" { "1-0" } else { "0-1" };
+        let contradictory = raw
+            .replace(
+                &format!("[Result \"{result}\"]"),
+                &format!("[Result \"{inverted}\"]"),
+            )
+            .replace(&format!("}} {result}"), &format!("}} {inverted}"));
+        assert!(audit(&p, &contradictory).is_err());
+    }
+}
+
+#[test]
+fn recorded_timeout_reply_requires_the_exact_failure_profile_and_original_ply_count() {
+    let p = plan(input());
+    let raw = pair_pgn(
+        &p,
+        "1. e4 e5 2. Nf3 {0.00/0 1.015s, White loses on time (5ms overrun)}",
+        "0-1",
+        "time forfeit",
+        "[PlyCount \"3\"]\n",
+    );
+    for invalid in [
+        raw.replace("[PlyCount \"3\"]\n", ""),
+        raw.replace("[PlyCount \"3\"]", "[PlyCount \"2\"]"),
+        raw.replace("[PlyCount \"3\"]", "[PlyCount \"4\"]"),
+        raw.replace("White loses", "Black loses"),
+        raw.replace("White loses", "white loses"),
+        raw.replace("5ms overrun", "-5ms overrun"),
+        raw.replace("5ms overrun", "5ms overrun extra"),
+        raw.replace("5ms overrun", "18446744073709551616ms overrun"),
+        raw.replace("Nf3", "e2e5"),
+        raw.replace("time forfeit", "abandoned"),
+        raw.replace("time forfeit", "normal"),
+        raw.replace("[Result \"0-1\"]", "[Result \"1-0\"]")
+            .replace("} 0-1", "} 1-0"),
+    ] {
+        assert!(audit(&p, &invalid).is_err());
+    }
+    let opening_reply = pair_pgn(
+        &p,
+        "1. e4 e5 {Black loses on time (7ms overrun)}",
+        "1-0",
+        "time forfeit",
+        "[PlyCount \"2\"]\n",
+    );
+    assert!(audit(&p, &opening_reply).is_err());
+    let terminal_before_failure = pair_pgn(
+        &p,
+        &format!("{MATE_MOVES} {{Black loses on time (7ms overrun)}}"),
+        "1-0",
+        "time forfeit",
+        "[PlyCount \"7\"]\n",
+    );
+    assert!(audit(&p, &terminal_before_failure).is_err());
+}
+
+#[test]
+fn no_reply_timeout_preserves_the_current_a_turn_for_both_colors() {
+    let p = plan(input());
+    for (moves, result, count, committed) in [
+        (
+            "1. e4 e5 {White loses on time (12ms overrun)}",
+            "0-1",
+            2,
+            vec!["e2e4", "e7e5"],
+        ),
+        (
+            "1. e4 e5 2. Nf3 {Black loses on time (12ms overrun)}",
+            "1-0",
+            3,
+            vec!["e2e4", "e7e5", "g1f3"],
+        ),
+    ] {
+        let audited = audit(
+            &p,
+            &pair_pgn(
+                &p,
+                moves,
+                result,
+                "time forfeit",
+                &format!("[PlyCount \"{count}\"]\n"),
+            ),
+        )
+        .unwrap();
+        for game in &audited.games {
+            assert_eq!(game.classification, "engine_loss");
+            assert_eq!(game.uci_moves, committed);
+            assert_eq!(game.final_fen, rules_fen(&committed));
+            assert!(game.failure_evidence.is_none());
+        }
+    }
+}
+
+#[test]
+fn the_recorded_timeout_candidate_still_consumes_the_movetext_ply_budget() {
+    let p = plan(input());
+    let raw = pair_pgn(
+        &p,
+        "1. e4 e5 2. Nf3 {White loses on time (5ms overrun)}",
+        "0-1",
+        "time forfeit",
+        "[PlyCount \"3\"]\n",
+    );
+    for (max_plies, accepted) in [(2, false), (3, true)] {
+        let result = audit_pair_pgn(
+            &p,
+            &p.pairs()[0].id,
+            &raw,
+            PgnLimits {
+                max_bytes: 1048576,
+                max_plies,
+            },
+        );
+        assert_eq!(result.is_ok(), accepted);
+        if let Ok(audited) = result {
+            assert_eq!(audited.games[0].uci_moves, ["e2e4", "e7e5"]);
+            assert_eq!(
+                audited.games[0]
+                    .failure_evidence
+                    .as_ref()
+                    .unwrap()
+                    .declared_ply_count,
+                3
+            );
+        }
+    }
 }
 
 #[test]

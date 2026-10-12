@@ -27,7 +27,7 @@ pub(crate) fn validate_endpoint_exit_trace(
     const MAX_LINES: usize = 131_072;
     const MAX_LINE_BYTES: usize = 4096;
     let fail = |reason: &str| ArenaError::Integrity(reason.into());
-    if !(1..=4).contains(&expected_pids.len())
+    if expected_pids.len() > 4
         || expected_pids.len() + external_count != 4
         || expected_pids
             .iter()
@@ -38,7 +38,7 @@ pub(crate) fn validate_endpoint_exit_trace(
             .any(|(index, pid)| expected_pids[..index].contains(pid))
     {
         return Err(fail(
-            "CUDA exit trace requires exactly four distinct native PIDs",
+            "endpoint exit trace requires four distinct native or external PIDs",
         ));
     }
     if stdout.is_empty() || stdout.len() > MAX_BYTES || !stdout.ends_with(b"\n") {
@@ -158,6 +158,36 @@ pub(crate) fn native_runner_message<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cpu_pair_requires_four_external_zero_exits_without_native_sessions() {
+        let trace = [101, 102, 201, 202]
+            .into_iter()
+            .map(|pid| format!("[TRACE ] [10:51:44.181984] <     137433152747200> fastchess --- Process with pid: {pid} terminated with status: 0\n"))
+            .collect::<String>();
+        assert_eq!(
+            validate_endpoint_exit_trace(trace.as_bytes(), &[], 4).unwrap(),
+            [101, 102, 201, 202]
+        );
+        assert!(validate_endpoint_exit_trace(trace.as_bytes(), &[], 3).is_err());
+        assert!(
+            validate_endpoint_exit_trace(trace.replace("pid: 202", "pid: 102").as_bytes(), &[], 4)
+                .is_err()
+        );
+        assert!(
+            validate_endpoint_exit_trace(
+                trace
+                    .replace(
+                        "202 terminated with status: 0",
+                        "202 terminated with status: 256"
+                    )
+                    .as_bytes(),
+                &[],
+                4
+            )
+            .is_err()
+        );
+        assert!(validate_native_cuda_process_exit_trace(trace.as_bytes(), &[]).is_err());
+    }
     #[test]
     fn heterogeneous_pair_requires_two_native_and_two_external_zero_exits() {
         let trace=[101,102,201,202].into_iter().map(|pid|format!("[TRACE ] [10:51:44.181984] <     137433152747200> fastchess --- Process with pid: {pid} terminated with status: 0\n")).collect::<String>();

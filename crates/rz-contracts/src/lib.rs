@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 mod evaluation;
+pub mod pals;
 mod primitives;
 mod state;
 

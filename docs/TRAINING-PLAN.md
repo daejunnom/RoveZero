@@ -9,7 +9,59 @@
 linear fixture lifecycle 범위는 [F TRAINING](../experiments/model-research/TRAINING.md),
 실제 모델/추론과 선행 인수는 [INTEGRATION-STATUS](INTEGRATION-STATUS.md)를 따른다.
 
+## 2026-10-10 PALS diagnostic 학습 smoke
+
+이전 PALS 목표는 실제 optimizer 학습을 제외한 구현·인수였다. 그 이력과 zero-step
+checkpoint/export 자료는 [PALS 구현 기록](PALS-IMPLEMENTATION.md)에 보존한다.
+이번 PR23 후속에서 사용자가 추가한 범위는 **diagnostic fixture를 사용한 작은 nonzero
+학습 smoke**다. 본격 학습, 실제 target을 사용한 학습, 제품 learned V의 연결·전략·기력 인수와
+PR 병합은 이 범위에 포함하지 않는다. 아래 BT4/F02/F03의 선행 권리·데이터·대조 인수도
+이 smoke로 충족한 것으로 처리하지 않는다.
+
+| 구분 | 실제 확인한 범위와 남은 인수 |
+|---|---|
+| nonzero 진단 비교 | 이전 세 번째 실행에서 P/C/V 각각 연속 4회와 2회+checkpoint/resume+2회를 비교했다. 역할별 8회, 총 24회 actual update에서 모델·AdamW state/step·scheduler·RNG·sampler가 일치했고, 의도한 parameter membership·동결·유한값 검사가 PASS했다. |
+| 실패와 누적 비용 | 앞선 실행의 1회와 8회 update 실패 자료를 보존한다. 성공한 24회와 합한 실제 누적 소비는 33회다. 실패·재시도와 checkpoint 자료를 실제 누적 비용 기록에 연결한다. |
+| 현재 source 재사용 | 영향 source 8개를 직접 대조하여 이전 diagnostic 결과의 재사용을 확인했다. 이전 실제 실행과 현재 재사용 확인은 별도 근거이며 이번 새 optimizer update는 0회다. noNN/fixture consumer 검사를 새 학습 실행으로 세지 않는다. |
+| 실제 target·learned V | 실제 학습 target을 사용한 update는 0회다. diagnostic label/coverage는 실제 수집·권한·unknown mask 검증을 통과한 target coverage와 별도다. V-private tensor의 update/resume 검사는 learned V utility/action의 실제 유용성·기력 근거를 충족하지 않으며 누락 target의 mask를 유지한다. |
+| 새 실행 인수 | 검사 코드555의 CPU·exact CI·Build14와 문서 기준bf1cc6a의 exact CI 네 job 성공과 이전1ecf/e43d CI, 기존8b CI·c3/Build13 actual 수치·Warm을 [최신 후속 인수 기록](PALS-IMPLEMENTATION.md#2026-10-12-후속-구현과-실행-관측)에 연결한다. 361행 component 재사용·검증-only8b overlay·비용555/Build14를 구분한다. 총괄은 Label5 actual capture/reference와 별도 Label6 Rust verify의 E04 정확성·물리 회수를 functional 인수했다. 원 wrapper FAIL·not_comparable·ratio null·performance false는 유지한다. V10 export identity admission FAIL은 snapshot·child·NN 이전이며 준비 manifest leaf 교정은 모델·학습 변경이 아니다. V12는 identity 통과 후 derived file budget guard의 pre-child FAIL이며 게임/provider0·native physical unknown을 보존한다. V13은 watcher1071·depth9 통과 뒤 자체 DEFAULT preflight child의 receipt 연결 인자 세 개 누락으로 execute exit1·NN/게임 이전 실패다. 원 stderr·resource와 native physical unknown을 보존한다. 새 assembly source·frozen 등록·빌드·V14 actual, E06 실제 pair·E07 후속 v8 문서 tip·전체45 최종 판정은 pending이다. 문서 exact CI를 새 소스·모델·대국 실행으로 세지 않는다. 새 optimizer update·actual target 학습·learned V 유용성·기력 근거로 확대하지 않는다. |
+| DEFAULT 접점 수정 후속 | 수정 source21fad37의 CPU wire12·arena lib123(새 검사5 포함)와 Build15 actual 315.3177초·일곱 명령 exit0/tree gone·다섯 ELF GLIBC 상한2.34, 문서 기준95e7184의 [exact CPU CI 네 성공](https://github.com/daejunnom/RoveZero/actions/runs/38208720665)을 추가로 연결한다. 원 수치·정상 Warm c3/Build13·비용555/Build14 출처는 보존하고 새 source component 재사용 검증은 대기다. 새 arena의 두 게임/네 session은 미실행이며 E06/E07·전체45 최종 인수는 pending/null이다. 모델·학습·기력 근거로 확대하지 않는다. |
+| CUDA 종료·모델 명세 후속 | sourcea617/Build17·CPU CI 네 성공과 실제 V17 baseline probe 두 개의 CUDA startup/물리 종료 근거를 [구현 기록](PALS-IMPLEMENTATION.md#cuda-종료-예산과-실행-명세의-모델-식별)에 연결한다. loaded identity guard의 metadata 불일치로 실제 게임은0이며 V18 준비 교정은 모델·학습 변경이 아니다. 과거 작은 nonzero 24 update와 실패9의 누적33은 유지하고 이번 새 optimizer update는0이다. 실제 학습 target·learned V 유용성·기력 인수는 별도 후속이다. |
+
+P/C는 공유 tensor와 해당 role의 private tensor만, V는 private V tensor만 갱신한다.
+Repair는 P 경로의 검사에 포함한다. 기존 zero-step
+`rz-pals-python-preparation-checkpoint/1` 형식을 유지한다. nonzero
+`rz-pals-python-nonzero-checkpoint/1`은 별도 domain이며 실제 AdamW moments/steps·
+parameter membership·freeze·scheduler·RNG·sampler와 원래 비용을 복원한다.
+invalid load는 검증 전에 model/state를 바꾸지 않는다. CPU FP32,
+batch/accumulation 1, AdamW lr 1e-4·betas 0.9/0.999·eps 1e-8·decay 0.01,
+clip norm 1·constant schedule의 비교를 사용했다.
+
+구현 접점은 [nonzero trainer](../experiments/model-research/pals/src/rz_pals_model/nonzero_training.py),
+[training 계약](../experiments/model-research/pals/src/rz_pals_model/training.py)과
+[target coverage](../experiments/model-research/pals/src/rz_pals_model/target_coverage.py)다.
+
+2026-10-10 사용자는 실패와 재시도를 합친 **총 update 한도**를 해제했다. 실행별
+CPU 2·15분+정리 30초·출력 2GiB 상한과 actual dispatch/completion·실패·checkpoint
+기록은 유지한다. 총 한도 해제는 본격 학습이나 새 유료 자원 사용의 승인이 아니다.
+진단 자산은 arena 승격 불가로 유지한다. 후속 계약과 기본값은
+[PR23 후속 계약](PALS-FOLLOWUP-CONTRACTS.md), 구현·검사·미실행 구분은
+[이번 후속 범위](PALS-IMPLEMENTATION.md#2026-10-10-pr23-후속-범위)를 따른다.
+
+## 2026-10-12 frozen 실행과 학습 증거의 구분
+
+기존 작은 학습 smoke의 24회 성공과 이전 실패 9회, 누적 update 33회의 실행 이력과 checkpoint 근거를 보존한다. 이후의 제품 빌드, CPU 계약 검사, CI와 frozen 모델 대국 자료는 학습 update나 learned V의 일반화 근거로 합산하지 않는다. source-proof21과 검사 전용 소스 역변환은 학습·모델 실행을 다시 수행한 자료가 아니다.
+
+V22의 두 판과 개별 물리 종료 자료는 typed Core 생성 실패를 포함한 실제 자료로 남기며, 현재 Build22·Pilot23과 최종 인수는 대기 중이다. Colab에서 관측한 기능 자료는 strict-local 자원 인수, 성능·기력·Elo 또는 모델 승격을 증명하지 않는다. 본격적인 학습, learned V의 일반화와 선택 기능의 현재 바이너리 효과 검증은 해당 예산과 통제 비교를 갖춘 후속 작업으로 남긴다.
+
+이번 새 실행 창에서 실제 optimizer update는 0이다. 네 차례 capacity 실패로 새 Build22·NN·게임 실행은 시작되지 않았으며, 기존 33회 학습 이력과 V22의 실제 NN·대국 자료를 모두 보존한다.
+
+제품·검사 소스와 현재 대국 인수는 [현재 실행 기록](PALS-IMPLEMENTATION.md#2026-10-12-게임별-종료-소유자-수정과-현재-인수)에 연결한다.
+
 ## 0. 2026-10-04 강도용 모델 전환의 우선순위
+
+이 절의 실행·미실행은 2026-10-04 BT4 전환 당시 범위다. 위 PALS diagnostic 후속과
+별도 이력으로 보존하며, BT4/F02/F03의 본격 학습 인수를 추가하지 않는다.
 
 사용자는 Maia 강도 한계 조사 후 **BT4-it332 실제 적용·LC0/RoveZero 벤치마크**를
 지정했다. [로컬 모델 기록](research/LOCAL-MODEL-BASELINE.md)의 BT4 Rust CPU/CUDA

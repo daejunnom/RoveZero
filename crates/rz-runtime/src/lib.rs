@@ -14,6 +14,8 @@ pub use notification::CompletionSignal;
 
 #[cfg(feature = "contracts")]
 pub mod contracts;
+#[cfg(feature = "contracts")]
+pub mod pals;
 
 pub use boundary::*;
 pub use observation::*;

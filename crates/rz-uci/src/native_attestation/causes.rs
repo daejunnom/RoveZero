@@ -583,6 +583,21 @@ impl Budget {
     fn diagnostic(&mut self, receipt: &WorkerDiagnosticReceipt, depth: u8) -> Projection {
         self.enter(depth)?;
         Ok(match receipt {
+            // V1 belongs to the unchanged LC0 evaluation path. Search-driver
+            // accounting is retained by its owner and has its own receipt;
+            // projecting it as NN/evaluation work would fabricate evidence.
+            WorkerDiagnosticReceipt::DriverWork { .. } => CauseNodeV1::WorkerBoundary {
+                original: self.link(|budget| {
+                    budget.contract(
+                        &ContractError::new(
+                            ContractCode::UnsupportedContract,
+                            ContractStage::Output,
+                            "search-driver work cannot be represented by LC0 native receipt V1",
+                        ),
+                        depth + 1,
+                    )
+                }),
+            },
             WorkerDiagnosticReceipt::Boundary(error) => CauseNodeV1::WorkerBoundary {
                 original: self.link(|budget| budget.contract(error, depth + 1)),
             },
@@ -606,6 +621,18 @@ impl Budget {
     fn worker_source(&mut self, source: &WorkerFailureSource, depth: u8) -> Projection {
         self.enter(depth)?;
         Ok(match source {
+            WorkerFailureSource::Driver(_) => CauseNodeV1::WorkerBoundary {
+                original: self.link(|budget| {
+                    budget.contract(
+                        &ContractError::new(
+                            ContractCode::UnsupportedContract,
+                            ContractStage::Output,
+                            "search-driver failure retains a separate typed owner receipt",
+                        ),
+                        depth + 1,
+                    )
+                }),
+            },
             WorkerFailureSource::Factory(error) => CauseNodeV1::WorkerFactory {
                 original: self.link(|budget| budget.contract(error, depth + 1)),
             },
