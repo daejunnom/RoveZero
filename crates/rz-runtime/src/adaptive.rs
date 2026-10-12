@@ -8,8 +8,10 @@ mod controller;
 mod cost;
 mod mailbox;
 mod ready;
+mod topology;
 
 pub use controller::*;
 pub use cost::*;
 pub use mailbox::*;
 pub use ready::*;
+pub use topology::*;

@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 rz-telemetry.workspace = true
+rz-platform.workspace = true
 rz-contracts = { workspace = true, optional = true }
 
 [features]

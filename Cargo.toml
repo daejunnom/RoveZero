@@ -4,6 +4,7 @@ members = [
     "crates/rz-encoding", "crates/rz-eval", "crates/rz-runtime", "crates/rz-telemetry",
     "crates/rz-experiments", "crates/rz-arena",
     "crates/rz-native-loader",
+    "crates/rz-platform",
 ]
 resolver = "2"
 
@@ -30,6 +31,7 @@ rz-eval = { path = "crates/rz-eval", version = "0.1.0" }
 rz-encoding = { path = "crates/rz-encoding", version = "0.1.0" }
 rz-experiments = { path = "crates/rz-experiments", version = "0.1.0" }
 rz-native-loader = { path = "crates/rz-native-loader", version = "0.1.0" }
+rz-platform = { path = "crates/rz-platform", version = "0.1.0" }
 libloading = "=0.8.9"
 sha2 = "=0.10.9"
 serde = { version = "=1.0.228", features = ["derive"] }
