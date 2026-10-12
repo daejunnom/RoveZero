@@ -2682,6 +2682,8 @@ fn observed_output_bytes(
 }
 #[cfg(any(target_os = "linux", test))]
 const MODEL_OBSERVATION_METHOD_V4: &str = "loaded profile/config/epoch, registered semantics and compiled model SHA checked against pinned manifest; original graph/runtime/checkpoint/export bytes verified; diagnostic export rejected before spawn";
+#[cfg(target_os = "linux")]
+const PROCESS_CLEANUP_METHOD_V4: &str = "exact renderer/normal-exit game PID matches work/native owner; supervisor group Gone/reaped and readers joined; shared pair streams charged once to first baseline game, other zero charges are not per-child measurements; interval is whole-pair cleanup";
 
 #[cfg(target_os = "linux")]
 fn observed<T>(value: T, method: &str) -> PalsObservedV3<T> {
@@ -2720,6 +2722,45 @@ fn endpoint_admitted(e: &PalsEndpointReceiptV4) -> bool {
         }
 }
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct PalsGameCleanupScopeV4 {
+    // Comes from the exact renderer/color/normal-exit mapping, never a game
+    // ordinal or the shared Fastchess supervisor PID.
+    process_id: u32,
+    // The retained pair streams are shared and must be charged only once.
+    charge_pair_streams: bool,
+}
+#[cfg(target_os = "linux")]
+fn cleanup_game_owner_v4(
+    supervisor_pid: u32,
+    game_pid: u32,
+    launch_sha256: &str,
+    work_pid: Option<u32>,
+    native_pid: Option<u32>,
+) -> Result<String, ArenaError> {
+    require(
+        game_pid > 0
+            && game_pid <= i32::MAX as u32
+            && game_pid != supervisor_pid
+            && work_pid.is_none_or(|pid| pid == game_pid)
+            && native_pid.is_none_or(|pid| pid == game_pid),
+        "V4 cleanup game PID differs from audited renderer/work/native owner",
+    )?;
+    Ok(format!("arena-game-process-{game_pid}-{launch_sha256}"))
+}
+#[cfg(target_os = "linux")]
+fn cleanup_stream_bytes_v4(
+    scope: PalsGameCleanupScopeV4,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+) -> (u64, u64) {
+    if scope.charge_pair_streams {
+        (stdout_bytes, stderr_bytes)
+    } else {
+        (0, 0)
+    }
+}
+#[cfg(target_os = "linux")]
 fn endpoint_v4_receipt(
     output: &PalsObservedPairOutputV4,
     role: NativeEngineRole,
@@ -2727,6 +2768,7 @@ fn endpoint_v4_receipt(
     native: Option<&PalsNativeSessionAuditV3>,
     preflight: &crate::ExternalUciPreflight,
     cleanup_ms: u64,
+    game_scope: PalsGameCleanupScopeV4,
 ) -> Result<PalsEndpointReceiptV4, ArenaError> {
     let owner = output.native.launch_owner();
     let lock = owner.spec();
@@ -2872,22 +2914,31 @@ fn endpoint_v4_receipt(
         exited,
         "V4 supervisor/game-process ownership cleanup incomplete",
     )?;
+    let owner_identity = cleanup_game_owner_v4(
+        process.pid,
+        game_scope.process_id,
+        &lock.sha256,
+        work.map(|w| w.process_id),
+        native.map(|n| n.process_id),
+    )?;
+    let (stdout_bytes, stderr_bytes) =
+        cleanup_stream_bytes_v4(game_scope, process.stdout_bytes, process.stderr_bytes);
     out.process_cleanup = observed(
         PalsProcessCleanupV4 {
-            owner_identity: format!("arena-process-group-{}-{}", process.pid, lock.sha256),
+            owner_identity,
             process_exited: true,
             exit_code: process.exit_code,
             exit_signal: process.exit_signal,
             child_processes_remaining: 0,
             stdout_drained: true,
             stderr_drained: true,
-            stdout_bytes: process.stdout_bytes,
-            stderr_bytes: process.stderr_bytes,
+            stdout_bytes,
+            stderr_bytes,
             elapsed_ms: cleanup_ms,
             cleanup_complete: true,
             ownership_lost: false,
         },
-        "supervisor-owned process-group Gone/reaped normal exit with joined stdout/stderr reader completion; each game PID separately checked against exact renderer/exits and native shutdown; interval scoped to whole pair owner",
+        PROCESS_CLEANUP_METHOD_V4,
     );
     #[cfg(any(feature = "pals-collection-onnx", feature = "native-cuda"))]
     if let Some(work) = work {
@@ -3736,7 +3787,18 @@ pub fn assemble_pals_core_receipt_v4(
                     .iter()
                     .find(|p| p.engine_id == id)
                     .ok_or_else(|| invalid("pinned UCI preflight absent"))?;
-                let endpoint = endpoint_v4_receipt(output, role, work, nn, preflight, cleanup)?;
+                let endpoint = endpoint_v4_receipt(
+                    output,
+                    role,
+                    work,
+                    nn,
+                    preflight,
+                    cleanup,
+                    PalsGameCleanupScopeV4 {
+                        process_id: pid,
+                        charge_pair_streams: index == 0 && ri == 0,
+                    },
+                )?;
                 record_endpoint_search_failure(&endpoint.base, &mut failures);
                 engines.push(endpoint);
             }
@@ -3985,6 +4047,117 @@ mod tests {
             followup_execution: None,
             resource_profile: None,
         }
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn v4_cleanup_owner_uses_four_audited_game_pids_and_rejects_reuse() {
+        // Authored CPU fixture only: the same production renderer/exit reader
+        // binds PID to endpoint and restarted game before receipt projection.
+        let lock = fixture().lock().unwrap();
+        let pids = [[62406_u32, 63287], [62556_u32, 63437]];
+        let trace = |message: String| {
+            format!(
+                "[TRACE ] [12:34:56.123456] <{:>20}> fastchess --- {message}",
+                1
+            )
+        };
+        let render = |pids: [[u32; 2]; 2]| {
+            let mut rows = vec![];
+            for game in 0..2 {
+                let white = &lock.input.semantic_lock.manifest.pilot.white_order[game];
+                let white_role = lock
+                    .input
+                    .semantic_lock
+                    .manifest
+                    .engines
+                    .iter()
+                    .position(|engine| engine.id() == white)
+                    .unwrap();
+                let black = lock.input.semantic_lock.manifest.engines[1 - white_role].id();
+                let number = game + 1;
+                rows.extend([
+                    trace(format!(
+                        "Game {number} between {white} and {black} starting"
+                    )),
+                    format!("Started game {number} of 2 ({white} vs {black})"),
+                    trace(format!(
+                        "Game {number} between {white} and {black} finished"
+                    )),
+                    trace(format!("Game {number} finished with result 1/2-1/2")),
+                    format!("Finished game {number} ({white} vs {black}): 1/2-1/2 {{Draw}}"),
+                    trace(format!(
+                        "Process with pid: {} terminated with status: 0",
+                        pids[white_role][game]
+                    )),
+                    trace(format!(
+                        "Process with pid: {} terminated with status: 0",
+                        pids[1 - white_role][game]
+                    )),
+                ]);
+            }
+            format!("{}\n", rows.join("\n")).into_bytes()
+        };
+        let known = pids.map(BTreeSet::from);
+        let stdout = render(pids);
+        let mapped = validate_pals_game_process_trace_context(&lock, &stdout, &known).unwrap();
+        let exited = crate::native_exit::validate_endpoint_exit_trace(&stdout, &[], 4).unwrap();
+        assert_eq!(mapped, pids);
+        let mut owners = BTreeSet::new();
+        for role in 0..2 {
+            for game in 0..2 {
+                let pid = mapped[role][game];
+                assert!(exited.contains(&pid));
+                let owner =
+                    cleanup_game_owner_v4(60000, pid, &lock.sha256, Some(pid), Some(pid)).unwrap();
+                assert!(owners.insert(owner.clone()));
+                // ReferenceUci has no invented work/native envelope: it still
+                // receives this exact renderer/normal-exit PID from the caller.
+                assert_eq!(
+                    owner,
+                    cleanup_game_owner_v4(60000, pid, &lock.sha256, None, None).unwrap()
+                );
+            }
+        }
+        assert_eq!(owners.len(), 4);
+        let mut duplicate = pids;
+        duplicate[0][1] = duplicate[0][0];
+        assert!(
+            validate_pals_game_process_trace_context(&lock, &render(duplicate), &known).is_err()
+        );
+        for (pid, work, native) in [
+            (0, None, None),
+            (60000, None, None),
+            (i32::MAX as u32 + 1, None, None),
+            (62406, Some(62556), Some(62406)),
+            (62406, Some(62406), Some(62556)),
+        ] {
+            assert!(cleanup_game_owner_v4(60000, pid, &lock.sha256, work, native).is_err());
+        }
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn v4_cleanup_shared_pair_streams_are_charged_once() {
+        let mut observed = (0_u64, 0_u64);
+        for game in 0..2 {
+            for role in 0..2 {
+                let charged = cleanup_stream_bytes_v4(
+                    PalsGameCleanupScopeV4 {
+                        process_id: 100 + (game * 2 + role) as u32,
+                        charge_pair_streams: game == 0 && role == 0,
+                    },
+                    100_777,
+                    13,
+                );
+                observed.0 += charged.0;
+                observed.1 += charged.1;
+                if game != 0 || role != 0 {
+                    assert_eq!(charged, (0, 0));
+                }
+            }
+        }
+        assert_eq!(observed, (100_777, 13));
+        assert!(PROCESS_CLEANUP_METHOD_V4.len() <= 256);
+        assert!(!PROCESS_CLEANUP_METHOD_V4.contains('\n'));
     }
     #[test]
     fn v4_model_observation_method_passes_shared_receipt_validation() {
