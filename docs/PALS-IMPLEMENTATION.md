@@ -231,6 +231,35 @@ V13 원 실행의 NN counter와 provider 물리 종료는 직접 관측되지 �
 bindings·PALS model 네 job이 실제 성공했다. 이는 새 Build15 등록 및 이전 실행 근거와
 별도인 CPU CI 관측이다. E06 실제 pair·E07 총괄 최종 인수와 전체45 최종 판정은 pending/null이다.
 
+#### CUDA 종료 예산과 실행 명세의 모델 식별
+
+후속 제품 기준은 `a617af595a82a3b983d473548fc90d5f4bb29342`다. native owner의
+shutdown 예산을 UCI 설정과 연결하고, V4 arena는 정리 30초 중 15초를 owner drain에
+명시한다. 선택하지 않은 기존 실행의 2초 기본값과 물리 완료·버퍼 해제·격리 guard는
+유지한다. 초기 fixture 실패와 후속 수정은 각각 원 커밋에 보존한다.
+[이 기준의 CPU CI](https://github.com/daejunnom/RoveZero/actions/runs/38232021780)는
+Linux·Windows·bindings·PALS model 네 job 모두 성공했다.
+
+Colab Build17은 같은 기준의 실제 offline/locked 빌드다. 감독한 명령 9개가 exit0으로
+끝났으며 다섯 ELF의 GLIBC 상한 2.34와 owned tree 정리를 확인했다. 전체 빌드 시간은
+387.836초다. 선택 소스 322개를 이전 기준과 대조하여 320개 불변·Rust 종료 연결 두
+변경을 구분했다. model checker만 byte 동일하며 다른 바이너리의 실제 digest는 별도
+등록한다. 원 수치·Warm 근거, 원 V15 strict gate와 새 source/build 대조를 함께 요구한다.
+
+V17은 이 Build17을 실제 CUDA에서 실행했다. baseline identification·readiness의 서로
+다른 PID 두 개는 각각 startup NN 입력 3개 완료, 정상 exit0·프로세스 그룹 종료,
+최종 runtime mapping 확인, 물리 shutdown·버퍼 해제, in-flight 0·quarantine false를
+남겼다. 이 startup NN 합계 6개를 탐색 소비나 대국 평가량으로 세지 않는다.
+그다음 guard는 manifest의 `configuration.model_v2.model_identity`와 실제 CUDA identity
+차이를 거부했다. backend는 이미 `ort_cuda`였지만 선언에 device/arena 접미사가 빠졌다.
+execute exit1, 게임·PGN 0개와 원시 파일 38개의 해시·경로 역대조 자료를 보존한다.
+전체 E06 인수는 두 probe의 정상 종료만으로 완료되지 않는다.
+
+V18 준비에서는 선언한 CUDA device와 session arena로 두 endpoint의 identity leaf만
+교정한다. 모델·인코딩·checkpoint와 native identity guard는 유지하고 원 materializer와
+실패 자료를 별도 pin으로 보존한다. 후보 probe 두 개와 game session 네 개, PGN 두 판,
+시계·필수 종료·전체45 최종 인수는 실제 자료가 확보될 때까지 pending/null이다.
+
 #### DEFAULT 공통6 API 비용의 관측 범위
 
 각 case/lane의 준비 호출은 3회, 측정은 5회이며 아래는 nearest-rank P50(ms)다.

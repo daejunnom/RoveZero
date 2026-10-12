@@ -219,6 +219,19 @@ paired pilot은 같은 own checker·`ModelWdlRestricted`, 120초+1초·256 ply·
 1 pair/2 games·15분+정리30초, 선택 기능 off다. 각 판 두 엔진을 재시작하여 네 PALS
 session 각각의 join/drain과 PGN 2판을 인수한다. 실제 비용·실패는 보존한다.
 
+native UCI의 선택 인수 `--pals-shutdown-timeout-ms`는 1~30,000ms를 받으며,
+미지정 실행의 기존 2초 기본값을 유지한다. V4 arena는 전체 cleanup 예산 안에서
+owner drain과 감독 회수 시간을 나누고, 30초 정리에서는 owner에 15초를 전달한다.
+명시한 시간이 지났다는 사실은 물리 완료 확인을 대신하지 않는다. startup·termination·
+실제 ProcessReceipt와 provider 완료·버퍼 해제·격리 조건을 별도로 대조한다.
+
+V4 producer는 `configuration.model_v2.model_identity`를 실제 native namespace와
+일치시킨다. CUDA에서 모델 export 식별 뒤에 선언한 device/session arena 식별이
+붙으며, 선택 Warm은 별도 namespace다. CPU 형식의 identity를 CUDA 선언에 넣거나
+누락된 값을 임의 기본값으로 채워 인수하지 않는다. metadata 교정은 정확한 leaf와
+원·수정 materializer pin으로 한정하며 source·model·checkpoint와 native guard를
+변경한 것처럼 취급하지 않는다. 실제 loaded identity는 별도 실행 증거로 검증한다.
+
 구현/검사 완료 상태는 후속 소스·PR 기록에 추가한다. 본격 학습·learned V 기력·병합은
 이번 계약의 인수에 포함하지 않는다.
 실제 검사 코드 baseline555의 CPU fmt·Warm example32·native feature·strict Clippy와
