@@ -2,7 +2,7 @@
 import argparse
 import json
 
-from .config import DEFAULT_INIT_PROFILE, PROFILES, ModelConfig, ROLES, matmul_flops
+from .config import DEFAULT_INIT_PROFILE, REGISTERED_PROFILES, ModelConfig, ROLES, matmul_flops
 
 
 def main(argv=None):
@@ -11,12 +11,12 @@ def main(argv=None):
     init = commands.add_parser("init")
     init.add_argument("--output", required=True)
     init.add_argument("--seed", type=int, default=1)
-    init.add_argument("--profile", choices=PROFILES, default=DEFAULT_INIT_PROFILE)
+    init.add_argument("--profile", choices=REGISTERED_PROFILES, default=DEFAULT_INIT_PROFILE)
     export = commands.add_parser("export")
     export.add_argument("--checkpoint", required=True)
     export.add_argument("--output", required=True)
     export.add_argument("--include-validator", action="store_true")
-    export.add_argument("--layout", choices=("separate_pc", "shared_pc_if"), default="separate_pc")
+    export.add_argument("--layout", choices=("separate_pc", "shared_pc_if", "virtual_review_shared_pc_if_v1"), default="separate_pc")
     export.add_argument("--rules-profile-json")
     check = commands.add_parser("numeric-check")
     check.add_argument("--checkpoint", required=True)
@@ -31,17 +31,34 @@ def main(argv=None):
     flops.add_argument("--candidates", type=int, default=32)
     flops.add_argument("--divergences", type=int, default=0)
     flops.add_argument("--batch", type=int, default=1)
-    flops.add_argument("--profile", choices=PROFILES, default="legacy_summary_v1")
+    flops.add_argument("--profile", choices=REGISTERED_PROFILES, default="legacy_summary_v1")
     # Parser registration must remain usable on hosts without Torch/NumPy.
     smoke = commands.add_parser("train-step-smoke", help="finite diagnostic CPU optimizer/resume check")
     smoke.add_argument("--output", required=True)
     smoke.add_argument("--seed", type=int, default=17)
+    # Diagnostic V1/V2 smoke stays separate from actual generation V3 training.
+    from .config import PROFILES
     smoke.add_argument("--profile", choices=PROFILES, default=DEFAULT_INIT_PROFILE)
     smoke.add_argument("--coverage-collection")
     smoke.add_argument("--coverage-receipt-sha256")
     smoke.add_argument("--producer-registration-set")
     smoke.add_argument("--producer-registration-set-sha256")
+    generation = commands.add_parser("train-generation", help="validate actual-generation data and recipe without updates")
+    generation.add_argument("--spec", required=True)
+    generation.add_argument("--dataset", required=True)
+    generation.add_argument("--phase", choices=("pc", "v"), required=True)
+    generation.add_argument("--frozen-pc-sha256")
+    generation.add_argument("--model-epoch", type=int)
     args = parser.parse_args(argv)
+    if args.command == "train-generation":
+        # This branch remains usable without importing Torch or any optimizer.
+        from .generation_training import main as validate_generation
+        forwarded = ["--spec", args.spec, "--dataset", args.dataset, "--phase", args.phase]
+        if args.frozen_pc_sha256 is not None:
+            forwarded += ["--frozen-pc-sha256", args.frozen_pc_sha256]
+        if args.model_epoch is not None:
+            forwarded += ["--model-epoch", str(args.model_epoch)]
+        return validate_generation(forwarded)
     if args.command == "flops":
         result = matmul_flops(ModelConfig.for_profile(args.profile), args.role, args.records, args.candidates, args.divergences, args.batch)
     else:

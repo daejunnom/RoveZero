@@ -4,7 +4,13 @@ from dataclasses import asdict, dataclass
 SCHEMA = "rovezero.pals-model.v1"
 MODEL_SEMANTICS_V2 = "rovezero.pals-model-semantics.v2"
 ENCODING_V2 = "rovezero.pals-board-records.v2"
+MODEL_SCHEMA_V3 = "rovezero.pals-model.v3"
+MODEL_SEMANTICS_V3 = "rovezero.pals-model-semantics.v3"
+ENCODING_V3 = "rovezero.pals-virtual-review.v1"
+VIRTUAL_REVIEW_PROFILE = "virtual_review_v1"
+# Historical controlled V2 comparisons keep their original four-profile set.
 PROFILES = ("legacy_summary_v1", "full_line_v2", "interaction_head_v2", "full_line_interaction_v2")
+REGISTERED_PROFILES = (*PROFILES, VIRTUAL_REVIEW_PROFILE)
 DEFAULT_INIT_PROFILE = "full_line_interaction_v2"
 MAX_LINE_PLIES = 256
 LINE_WIDTH = 64
@@ -32,7 +38,8 @@ class ModelConfig:
     profile: str = "legacy_summary_v1"
 
     def validate(self):
-        if any(type(value) is not int for key, value in asdict(self).items() if key != "profile") or self.profile not in PROFILES or self != ModelConfig(profile=self.profile):
+        expected = ModelConfig(profile=self.profile, max_records=64 if self.virtual_review else 128)
+        if any(type(value) is not int for key, value in asdict(self).items() if key != "profile") or self.profile not in REGISTERED_PROFILES or self != expected:
             raise ValueError("requires registered width384 configuration/profile; no automatic resizing")
 
     @classmethod
@@ -42,7 +49,7 @@ class ModelConfig:
 
     @classmethod
     def for_profile(cls, profile):
-        result = cls(profile=profile)
+        result = cls(profile=profile, max_records=64 if profile == VIRTUAL_REVIEW_PROFILE else 128)
         result.validate()
         return result
 
@@ -52,14 +59,22 @@ class ModelConfig:
 
     @property
     def interaction_head(self):
-        return self.profile in ("interaction_head_v2", "full_line_interaction_v2")
+        return self.profile in ("interaction_head_v2", "full_line_interaction_v2", VIRTUAL_REVIEW_PROFILE)
+
+    @property
+    def virtual_review(self):
+        return self.profile == VIRTUAL_REVIEW_PROFILE
 
     @property
     def model_semantics(self):
+        if self.virtual_review:
+            return MODEL_SEMANTICS_V3
         return SCHEMA if self.profile == "legacy_summary_v1" else MODEL_SEMANTICS_V2
 
     @property
     def encoding(self):
+        if self.virtual_review:
+            return ENCODING_V3
         return "rovezero.pals-board-records.v1" if self.profile == "legacy_summary_v1" else ENCODING_V2
 
     def to_dict(self):
@@ -70,6 +85,9 @@ class ModelConfig:
 
 
 def public_tensor_names(config):
+    if config.virtual_review:
+        return ["anchor_board", "anchor_metadata", "anchor_mask", "records", "record_anchor",
+                "record_line_tokens", "record_line_mask", "record_mask"]
     names = ["board", "metadata", "records", "record_mask"]
     if config.full_line:
         names += ["record_line_tokens", "record_line_mask"]
@@ -80,12 +98,14 @@ def role_tensor_names(config):
     """Complete Torch/feed argument order; unused heads may prune ONNX inputs."""
     names = ["memory_key", "memory_value", "memory_mask", "candidates", "candidate_mask",
              "divergence_features", "divergence_mask", "query"]
+    if config.virtual_review:
+        return names + ["anchor_context", "query_anchor", "query_line_tokens", "query_line_mask", "record_relations"]
     if config.full_line:
         names += ["query_line_tokens", "query_line_mask", "record_relations"]
     return names
 
 
-def matmul_flops(config, role, records, candidates, divergences=0, batch=1):
+def matmul_flops(config, role, records, candidates, divergences=0, batch=1, *, line_bucket=None, anchors=1):
     """FMA=2 analytic GEMM and attention products, not a runtime/VRAM claim.
 
     Bias, RMSNorm, softmax, activation, mask, pooling, lookup, data movement and
@@ -112,6 +132,17 @@ def matmul_flops(config, role, records, candidates, divergences=0, batch=1):
         private += 2 * physical_divergences * 8 * w + 2 * physical_divergences * w
     if role == "validator":
         private += 2 * w * len(TASKS)
+    if config.virtual_review:
+        if line_bucket not in (8, 16, 32, 64, 128, 256) or type(anchors) is not int or not 1 <= anchors <= 4:
+            raise ValueError("virtual review FLOPs requires actual registered L bucket/anchor count")
+        # Anchor boards run through one shared bank, not one session per anchor.
+        public += (anchors - 1) * (2 * 16 * 2 * w + config.board_blocks * (self_attn(66) + ffn(66)))
+        public -= physical_records * 2 * 8 * w  # four fields shrink 4 -> 2.
+        line = 2 * line_bucket * (3 * LINE_WIDTH * LINE_WIDTH + 2 * 3 * LINE_WIDTH * LINE_WIDTH + LINE_WIDTH)
+        public += physical_records * (line + 2 * LINE_WIDTH * w + 2 * w * w)
+        private -= 2 * 8 * w  # query 16 -> 8.
+        private += 3 * line + 2 * 3 * LINE_WIDTH * w + 2 * 3 * w * w
+        private += physical_records * (2 * 3 * 2 * kv * INTERACTION_WIDTH + 2 * INTERACTION_WIDTH * w)
     if config.full_line:
         # Registered physical 256-ply tensors execute both temporal Conv blocks
         # even when semantically empty; embedding/pooling stays excluded.

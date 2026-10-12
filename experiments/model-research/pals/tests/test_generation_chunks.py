@@ -1,0 +1,437 @@
+"""Pure JSONL/index checks; no model, optimizer or native NN execution."""
+import copy
+import hashlib
+import json
+from pathlib import Path
+import struct
+import tempfile
+from unittest import mock
+
+from test_generation_contract import SourceOnlyTests, row, policy
+from rz_pals_model import generation_data as data
+from rz_pals_model import generation_training as train
+from rz_pals_model import generation_chunks as chunks
+
+
+def record(game="g1", opening="o1", *, distinct_state=False):
+    result = row()
+    snapshot = result["input"]
+    snapshot.update(game_id=game, opening_id=opening, line_genealogy_id="line-" + game,
+                    transposition_sha256=hashlib.sha256(game.encode()).hexdigest(), question_id=hashlib.sha256(("question-" + game).encode()).hexdigest())
+    if distinct_state:
+        snapshot["rules_anchor"]["rules_state_sha256"] = hashlib.sha256((game + "-state").encode()).hexdigest()
+        snapshot["view_sha256"] = data.view_digest(snapshot["selected_view"])
+    result["input_sha256"] = data.seal_input(snapshot)
+    return result
+
+
+def write_corpus(root, records, *, splits=None, evidence=None, trajectories=None, record_groups=None, native=True):
+    """Small contract fixtures only: never manufacture admission sample quotas."""
+    splits = splits or {r["input"]["opening_id"]: "train" for r in records}
+    evidence, trajectories = copy.deepcopy(evidence or {}), trajectories or {}
+    if native:
+        for unique in {r["input_sha256"]: r for r in records}.values():
+            add_native_chain(unique, evidence)
+    producer = {"schema": "rz-pals-actual-collection-authority/2", "source_kind": data.ACTUAL_SOURCE,
+                "source_sha256": "1" * 64, "model_sha256": "4" * 64, "runtime_sha256": "5" * 64,
+                "teacher_binary_sha256": "6" * 64, "teacher_profile_sha256": "7" * 64,
+                "opening_split_sha256": data.digest("rz-pals-opening-split/1", splits), "registered_before_outcomes": True,
+                "actual_game_ids": sorted({r["input"]["game_id"] for r in records})}
+    manifest = {"schema": chunks.MANIFEST_DOMAIN, "source_kind": data.ACTUAL_SOURCE, "producer": producer,
+                "opening_splits": splits, "chunks": [], "total_bytes": 0, "total_records": len(records)}
+    groups = [("inputs", [{"input_sha256": seal} for seal in sorted({r["input_sha256"] for r in records})])]
+    groups += [("evidence", [{"sha256": key, "receipt": value} for key, value in evidence.items()])]
+    groups += [("trajectories", [{"sha256": key, "trajectory": value} for key, value in trajectories.items()])]
+    groups += [("records", values) for values in (record_groups or [records])]
+    for kind, values in groups:
+        if not values:
+            continue
+        index = len(manifest["chunks"])
+        relative = f"{kind}-{index:06d}.jsonl"
+        raw = b"".join(json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode() + b"\n" for value in values)
+        (root / relative).write_bytes(raw)
+        manifest["chunks"].append({"index": index, "kind": kind, "path": relative,
+                                    "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw), "rows": len(values)})
+        manifest["total_bytes"] += len(raw)
+    return manifest
+
+
+def add_native_chain(record, receipts):
+    """Schema fixture only; never executed and never fills real admission quota."""
+    from rz_pals_model.virtual_review import input_digest
+    ticket = {"epoch": 0, "request_sequence": 1, "game": 1, "root": 1, "question_sha256": record["input"]["question_id"],
+              "source_view_sha256": "c" * 64, "view_sequence": 1, "context_policy_sha256": "c" * 64,
+              "representation_input_sha256": "8" * 64, "representation_history_sha256": "b" * 64,
+              "representation_model_sha256": "4" * 64, "representation_encoding_sha256": "7" * 64,
+              "frozen_epoch": 0, "record_revision": 10, "deadline_tick": 1000}
+    submission = {"schema": chunks.NATIVE_DOMAINS[0], "input_sha256": record["input_sha256"], "ticket": ticket,
+                  "source_view_seal_sha256": ticket["source_view_sha256"], "physical_nn_admitted": False,
+                  "native_input_sha256": input_digest(record["input"]["encoded_model_input"]), "native_model_epoch_sha256": "4" * 64,
+                  "native_backend_sha256": "5" * 64, "native_anchor_history_sha256": ["9" * 64] * len(record["input"]["selected_view"]["anchors"]),
+                  "generation_view_sha256": record["input"]["view_sha256"],
+                  **{name: record["input"][name] for name in ("game_id", "opening_id", "role", "model_epoch", "context_epoch", "capture_sequence", "worker_id", "job_id", "slice_id")},
+                  "actual_root_anchor": record["input"]["selected_view"]["anchors"][0], "query_anchor": record["input"]["rules_anchor"],
+                  "source_view_content_sha256": "a" * 64, "native_endpoint_history_sha256": ticket["representation_history_sha256"]}
+    submission_sha = data.digest(submission["schema"], submission)
+    completion = {"schema": chunks.NATIVE_DOMAINS[1], "input_sha256": record["input_sha256"], "submission_sha256": submission_sha,
+                  "ticket": ticket, "physical_completion": "confirmed", "execution": {"epoch": 0, "sequence": 1},
+                  "completed_nn_inputs": 2, "measurement_complete": True, "physical_fresh": True,
+                  "invocation_key_sha256": "d" * 64, "accepted_seed_sha256": None,
+                  "output": {"kind": "proposal", "candidate_logits_f32": ["00000000"] * len(record["input"]["legal_moves"]),
+                             "wdl_f32": ["3e4ccccd", "3e99999a", "3f000000"]}, "admissible_actual_nn": True}
+    completion_sha = data.digest(completion["schema"], completion)
+    retirement = {"schema": chunks.NATIVE_DOMAINS[2], "input_sha256": record["input_sha256"], "submission_sha256": submission_sha,
+                  "completion_sha256": completion_sha, "ticket": ticket, "accepted": True}
+    for value in (submission, completion, retirement):
+        receipts[data.digest(value["schema"], value)] = value
+    return submission, completion, retirement
+
+
+def add_policy(record, receipts):
+    target = policy(record)
+    receipt = {"schema": "rz-pals-generation-head-evidence/1", "input_sha256": record["input_sha256"],
+               "head": "policy", "target": {k: v for k, v in target.items() if k != "raw_evidence_sha256"}}
+    target["raw_evidence_sha256"] = data.digest(receipt["schema"], receipt)
+    receipts[target["raw_evidence_sha256"]] = receipt
+    record["future_targets"]["policy"] = target
+
+
+class ChunkTests(SourceOnlyTests):
+    def setUp(self):
+        super().setUp()
+        self.temporary = tempfile.TemporaryDirectory(prefix="rz-generation-chunk-tests-")
+        self.root = Path(self.temporary.name)
+        self.corpus = self.root / "corpus"
+        self.index_root = self.root / "index"
+        self.corpus.mkdir()
+        self.index_root.mkdir()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+        super().tearDown()
+
+    def opened(self, manifest, **kwargs):
+        return chunks.ChunkGenerationDataset(self.corpus, manifest, expected_manifest_sha256=chunks.validate_manifest(manifest),
+                                              index_root=self.index_root, **kwargs)
+
+    def test_lazy_rows_and_role_sampler_preserve_checkpoint_without_nn(self):
+        records = [record("g1", distinct_state=True), record("g2", distinct_state=True)]
+        records[1]["input"]["encoded_model_input"]["anchors"][0]["metadata"][0] = 0.25
+        records[1]["input_sha256"] = data.seal_input(records[1]["input"])
+        manifest = write_corpus(self.corpus, records)
+        with self.opened(manifest) as dataset:
+            rows = dataset.rows("train", optimization=True)
+            self.assertIsInstance(rows, chunks.ChunkRows)
+            sampler = train.GenerationSampler(rows, "proposer")
+            self.assertIs(sampler.records, rows)
+            self.assertEqual(sampler.algorithm, "python-mt19937-generation-chunk-role-v1")
+            indices, pool = rows.role_pool("proposer")
+            self.assertEqual(indices, [0, 1])
+            self.assertEqual(pool, data.digest("rz-pals-generation-chunk-sampler-pool/1", [dataset.sha256, [r["input_sha256"] for r in records]]))
+            sampler.next_accumulation()
+            resumed = train.GenerationSampler(rows, "proposer", state=sampler.state())
+            self.assertEqual(sampler.next_accumulation(), resumed.next_accumulation())
+            with self.assertRaises(TypeError):
+                rows[:]
+            with self.assertRaisesRegex(ValueError, "optimization"):
+                dataset.rows("holdout", optimization=True)
+            self.assertLessEqual(dataset._cache_bytes, chunks.MAX_CACHE_BYTES)
+            self.assertFalse(hasattr(dataset, "_records"))
+            with self.assertRaisesRegex(ValueError, "InsufficientValidTargets"):
+                dataset.admit("pc")
+        self.assertEqual(list(self.index_root.iterdir()), [])
+        with self.assertRaisesRegex(ValueError, "closed"):
+            rows[0]
+
+    def test_chunk_bytes_corruption_and_replacement_fail_immutable_read(self):
+        manifest = write_corpus(self.corpus, [record()])
+        with self.opened(manifest) as dataset:
+            rows = dataset.rows("train")
+            path = self.corpus / manifest["chunks"][-1]["path"]
+            raw = path.read_bytes()
+            path.write_bytes(raw.replace(b"g1", b"g9", 1))
+            with self.assertRaisesRegex(ValueError, "hash"):
+                rows[0]
+        path.write_bytes(raw)
+        with self.opened(manifest) as dataset:
+            replacement = self.corpus / "replacement.jsonl"
+            replacement.write_bytes(raw)
+            replacement.replace(path)
+            with self.assertRaisesRegex(ValueError, "replaced"):
+                dataset.sha256
+
+    def test_reordering_changed_pins_missing_or_duplicate_chunks_refused(self):
+        manifest = write_corpus(self.corpus, [record()])
+        registered = chunks.validate_manifest(manifest)
+        modified = copy.deepcopy(manifest)
+        modified["chunks"].reverse()
+        with self.assertRaisesRegex(ValueError, "reordered"):
+            chunks.validate_manifest(modified)
+        for index, entry in enumerate(modified["chunks"]):
+            entry["index"] = index
+        with self.assertRaisesRegex(ValueError, "externally"):
+            chunks.ChunkGenerationDataset(self.corpus, modified, expected_manifest_sha256=registered, index_root=self.index_root)
+        modified = copy.deepcopy(manifest)
+        modified["producer"]["source_sha256"] = "9" * 64
+        with self.assertRaisesRegex(ValueError, "externally"):
+            chunks.ChunkGenerationDataset(self.corpus, modified, expected_manifest_sha256=registered, index_root=self.index_root)
+        modified = copy.deepcopy(manifest)
+        modified["chunks"][1]["path"] = modified["chunks"][0]["path"]
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            chunks.validate_manifest(modified)
+        (self.corpus / manifest["chunks"][0]["path"]).unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.opened(manifest)
+
+    def test_duplicate_rows_count_once_and_conflicting_targets_are_rejected(self):
+        original = record()
+        manifest = write_corpus(self.corpus, [original, copy.deepcopy(original)])
+        with self.opened(manifest) as dataset:
+            self.assertEqual(len(dataset.rows("train")), 1)
+            self.assertEqual(dataset.exclusions["duplicate_inputs_excluded"], 1)
+        receipts = {}
+        conflict = copy.deepcopy(original)
+        add_policy(conflict, receipts)
+        manifest = write_corpus(self.corpus, [original, conflict], evidence=receipts)
+        with self.assertRaisesRegex(ValueError, "conflicting"):
+            self.opened(manifest)
+
+    def test_global_crosssplit_leak_found_in_final_chunk_excludes_both(self):
+        first, last = record("g1", "o1"), record("g2", "o2")
+        manifest = write_corpus(self.corpus, [first, last], splits={"o1": "train", "o2": "holdout"}, record_groups=[[first], [last]])
+        with self.opened(manifest) as dataset:
+            self.assertEqual(len(dataset.rows("train")), 0)
+            self.assertEqual(len(dataset.rows("holdout")), 0)
+            self.assertEqual(dataset.exclusions["cross_split_records_excluded"], 2)
+            self.assertEqual(dataset.exclusions["cross_split_identities"], 2)
+
+    def test_unknown_origin_and_unpublished_input_are_rejected(self):
+        manifest = write_corpus(self.corpus, [record()])
+        manifest["source_kind"] = "diagnostic"
+        with self.assertRaisesRegex(ValueError, "origin"):
+            chunks.validate_manifest(manifest)
+        manifest = write_corpus(self.corpus, [record()])
+        input_chunk = manifest["chunks"][0]
+        raw = json.dumps({"input_sha256": "f" * 64}).encode() + b"\n"
+        (self.corpus / input_chunk["path"]).write_bytes(raw)
+        manifest["total_bytes"] += len(raw) - input_chunk["bytes"]
+        input_chunk.update(sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw))
+        with self.assertRaisesRegex(ValueError, "publication"):
+            self.opened(manifest)
+
+    def test_full_receipt_join_is_preserved_without_all_evidence_dictionary(self):
+        r, receipts = record(), {}
+        add_policy(r, receipts)
+        manifest = write_corpus(self.corpus, [r], evidence=receipts)
+        with self.opened(manifest) as dataset:
+            self.assertEqual(data.coverage(dataset.rows("train"))["proposer_policy_valid"], 1)
+            self.assertFalse(hasattr(dataset, "_evidence"))
+        receipts[next(iter(receipts))]["target"]["completed_depth"] = 99
+        manifest = write_corpus(self.corpus, [r], evidence=receipts)
+        with self.assertRaisesRegex(ValueError, "receipt seal"):
+            self.opened(manifest)
+
+    def test_paths_row_count_storage_and_index_caps_do_not_fallback(self):
+        manifest = write_corpus(self.corpus, [record()])
+        for invalid in ("../escape.jsonl", "/escape.jsonl", "C:/escape.jsonl", "a\\escape.jsonl"):
+            modified = copy.deepcopy(manifest)
+            modified["chunks"][0]["path"] = invalid
+            with self.assertRaises(ValueError):
+                self.opened(modified)
+        modified = copy.deepcopy(manifest)
+        modified["chunks"][0]["rows"] = 2
+        with self.assertRaisesRegex(ValueError, "row count"):
+            self.opened(modified)
+        modified = copy.deepcopy(manifest)
+        modified["chunks"][0]["bytes"] = chunks.MAX_CHUNK_BYTES + 1
+        with self.assertRaises(ValueError):
+            chunks.validate_manifest(modified)
+        with self.assertRaisesRegex(ValueError, "capacity|Capacity"):
+            self.opened(manifest, max_index_bytes=32768)
+        self.assertEqual(list(self.index_root.iterdir()), [])
+
+    def test_input_seal_normalizes_f32_bits_without_mutating_payload(self):
+        r = record()
+        snapshot = r["input"]
+        value = 1.0 / 16384
+        snapshot["encoded_model_input"]["anchors"][0]["metadata"][0] = value
+        expected = copy.deepcopy(snapshot)
+        for anchor in expected["encoded_model_input"]["anchors"]:
+            anchor["metadata"] = [struct.pack(">f", float(v)).hex() for v in anchor["metadata"]]
+        self.assertEqual(data.seal_input(snapshot), data.digest(data.INPUT_DOMAIN, expected))
+        self.assertEqual(snapshot["encoded_model_input"]["anchors"][0]["metadata"][0], value)
+
+    def test_native_completed_and_accepted_chain_is_required(self):
+        r = record()
+        manifest = write_corpus(self.corpus, [r], native=False)
+        with self.assertRaisesRegex(ValueError, "retirement"):
+            self.opened(manifest)
+        for field, bad in (("physical_completion", "unknown"), ("completed_nn_inputs", 0),
+                           ("measurement_complete", False), ("execution", None), ("invocation_key_sha256", None)):
+            receipts = {}
+            submission, completion, retirement = add_native_chain(r, receipts)
+            completion[field] = bad
+            retirement["completion_sha256"] = data.digest(completion["schema"], completion)
+            receipts = {data.digest(v["schema"], v): v for v in (submission, completion, retirement)}
+            manifest = write_corpus(self.corpus, [r], evidence=receipts, native=False)
+            with self.assertRaises(ValueError):
+                self.opened(manifest)
+
+    def test_unsubmitted_retirement_keeps_only_complete_null_tuple_as_raw_evidence(self):
+        r, receipts = record(), {}
+        _, _, retired = add_native_chain(r, receipts)
+        cancelled = copy.deepcopy(retired)
+        cancelled.update(input_sha256=None, submission_sha256=None, completion_sha256=None, accepted=False)
+        self.assertFalse(chunks._native_retirement(cancelled))
+        receipts[data.digest(cancelled["schema"], cancelled)] = cancelled
+        manifest = write_corpus(self.corpus, [r], evidence=receipts, native=False)
+        with self.opened(manifest) as corpus:
+            self.assertEqual(len(corpus.rows("train", optimization=True)), 1)
+        mutations = (
+            lambda x: x.update(submission_sha256="a" * 64),
+            lambda x: x.update(completion_sha256="a" * 64),
+            lambda x: x.update(accepted=True),
+            lambda x: x.update(accepted=0),
+            lambda x: x.update(extra="unknown"),
+            lambda x: x["ticket"].update(request_sequence=True),
+            lambda x: x["ticket"].update(epoch=-1),
+            lambda x: x["ticket"].update(deadline_tick=2**64),
+            lambda x: x["ticket"].update(question_sha256="unknown"),
+        )
+        for mutation in mutations:
+            malformed = copy.deepcopy(cancelled)
+            mutation(malformed)
+            evidence = copy.deepcopy(receipts)
+            evidence[data.digest(malformed["schema"], malformed)] = malformed
+            manifest = write_corpus(self.corpus, [r], evidence=evidence, native=False)
+            with self.subTest(retirement=malformed):
+                with self.assertRaises(ValueError):
+                    self.opened(manifest)
+
+    def test_request_ids_do_not_manufacture_unique_semantic_training_samples(self):
+        masked, first, later = record("g1"), record("g2"), record("g3")
+        receipts = {}
+        add_policy(first, receipts)
+        add_policy(later, receipts)
+        # All three raw input seals differ; actual NN input/history/model/role
+        # are identical. Keep the earliest genuinely supervised publication.
+        manifest = write_corpus(self.corpus, [masked, first, later], evidence=receipts)
+        with self.opened(manifest) as corpus:
+            rows = corpus.rows("train", optimization=True)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["input_sha256"], first["input_sha256"])
+            self.assertEqual(corpus.exclusions["duplicate_semantic_inputs_excluded"], 2)
+            self.assertEqual(corpus._db.execute("SELECT COUNT(*) FROM records").fetchone()[0], 3)
+            self.assertEqual(data.coverage(rows)["proposer_valid_samples"], 1)
+            with self.assertRaisesRegex(ValueError, "InsufficientValidTargets"):
+                corpus.admit("pc")
+        # A meaningful tensor change has its own identity; a request ID does
+        # not. The source input seals and raw chunks are never rewritten.
+        a, b, c = (add_native_chain(value, {})[0] for value in (masked, first, later))
+        self.assertEqual(chunks.semantic_sample_seal(masked, a), chunks.semantic_sample_seal(first, b))
+        b["ticket"]["representation_history_sha256"] = "d" * 64
+        self.assertNotEqual(chunks.semantic_sample_seal(masked, a), chunks.semantic_sample_seal(first, b))
+
+    def test_raw_runtime_audit_is_bounded_strict_metadata_without_label_authority(self):
+        receipt = {"schema": "rz-pals-generation-runtime-audit-evidence/1", "witness_json": '{"status":"not_executed"}'}
+        self.assertEqual(data.validate_evidence_receipt(data.digest(receipt["schema"], receipt), receipt), receipt)
+        for witness in ('{"key":1,"key":2}', '{"x":NaN}', '[]', '"text"', '{', " " * (1024 * 1024 + 1)):
+            invalid = dict(receipt, witness_json=witness)
+            with self.subTest(witness=witness[:40]):
+                with self.assertRaises(ValueError):
+                    data.validate_evidence_receipt(data.digest(invalid["schema"], invalid), invalid)
+
+    def test_warm_seed_records_stay_raw_and_cannot_enter_fresh_training_pool(self):
+        warm = record("g1")
+        receipts = {}
+        add_policy(warm, receipts)
+        submission, completion, retirement = add_native_chain(warm, {})
+        completion.update(physical_fresh=False, accepted_seed_sha256="d" * 64)
+        retirement["completion_sha256"] = data.digest(completion["schema"], completion)
+        receipts.update({data.digest(v["schema"], v): v for v in (submission, completion, retirement)})
+        manifest = write_corpus(self.corpus, [warm], evidence=receipts, native=False)
+        with self.opened(manifest) as corpus:
+            self.assertEqual(len(corpus.rows("train", optimization=True)), 0)
+            self.assertEqual(corpus.exclusions["warm_seed_inputs_excluded"], 1)
+            self.assertEqual(corpus.exclusion_reasons["warm_seed_inputs_excluded"], "UnsupportedWarmTrainingNamespace")
+            self.assertEqual(corpus._db.execute("SELECT COUNT(*) FROM records WHERE physical_fresh=0").fetchone()[0], 1)
+            with self.assertRaisesRegex(ValueError, "UnsupportedWarmTrainingNamespace"):
+                corpus.admit("pc")
+        # A later real Fresh execution of the same logical context is usable;
+        # the earlier Warm publication is not transformed or substituted.
+        fresh = record("g2")
+        add_policy(fresh, receipts)
+        add_native_chain(fresh, receipts)
+        manifest = write_corpus(self.corpus, [warm, fresh], evidence=receipts, native=False)
+        with self.opened(manifest) as corpus:
+            rows = corpus.rows("train", optimization=True)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["input_sha256"], fresh["input_sha256"])
+            self.assertEqual(corpus.exclusions["warm_seed_inputs_excluded"], 1)
+            self.assertEqual(corpus.exclusions["duplicate_semantic_inputs_excluded"], 0)
+            self.assertEqual(corpus._db.execute("SELECT COUNT(*) FROM records").fetchone()[0], 2)
+
+    def test_legacy_whole_bundle_cannot_be_actual_training_admission(self):
+        # Preserve old parsing, but native three-stage authority is required
+        # for every actual optimizer/export entry, regardless of claimed counts.
+        with self.assertRaisesRegex(ValueError, "native-chain"):
+            train.generation_admission(train.generation_spec(generation_id="g1", source_sha256="1" * 64,
+                dataset_sha256="2" * 64, split_sha256="3" * 64, model_sha256="4" * 64, runtime_sha256="5" * 64),
+                object.__new__(data.GenerationDataset), "pc")
+
+    def test_final_link_rejected_on_windows_without_relying_on_o_nofollow(self):
+        manifest = write_corpus(self.corpus, [record()])
+        final = self.corpus / manifest["chunks"][-1]["path"]
+        original = Path.is_symlink
+        with mock.patch.object(Path, "is_symlink", lambda path: path == final or original(path)):
+            with self.assertRaisesRegex(ValueError, "linked"):
+                self.opened(manifest)
+
+    def test_invalid_manifest_is_not_copied_before_capacity_validation(self):
+        manifest = write_corpus(self.corpus, [record()])
+        manifest["unexpected"] = ["large untrusted field"]
+        with mock.patch.object(chunks.copy, "deepcopy", side_effect=AssertionError("copy before strict validation")):
+            with self.assertRaisesRegex(ValueError, "fields"):
+                self.opened(manifest)
+
+    def test_cleanup_failure_clears_cache_and_preserves_owned_retry(self):
+        manifest = write_corpus(self.corpus, [record()])
+        dataset = self.opened(manifest)
+        dataset.rows("train")[0]
+        temporary = dataset._temporary
+        with mock.patch.object(temporary, "cleanup", side_effect=PermissionError("test owned index lock")):
+            with self.assertRaisesRegex(ValueError, "CleanupFailed"):
+                dataset.close()
+        self.assertEqual(dataset._cache_bytes, 0)
+        self.assertEqual(dataset.cleanup_failure["error_type"], "PermissionError")
+        self.assertTrue(Path(dataset.cleanup_failure["owned_index_root"]).is_relative_to(self.index_root))
+        dataset.close()
+        self.assertEqual(list(self.index_root.iterdir()), [])
+
+    def test_changed_manifest_cannot_resume_old_role_pool(self):
+        records = [record()]
+        manifest = write_corpus(self.corpus, records)
+        with self.opened(manifest) as dataset:
+            old = train.GenerationSampler(dataset.rows("train"), "proposer").state()
+        modified = copy.deepcopy(manifest)
+        modified["producer"]["source_sha256"] = "9" * 64
+        with self.opened(modified) as dataset:
+            with self.assertRaisesRegex(ValueError, "pool"):
+                train.GenerationSampler(dataset.rows("train"), "proposer", state=old)
+
+    def test_head_rules_endpoint_is_separate_from_public_root_anchor(self):
+        r = record()
+        snapshot, view = r["input"], r["input"]["selected_view"]
+        endpoint = copy.deepcopy(snapshot["rules_anchor"])
+        endpoint.update(rules_state_sha256="1" * 64, rules_history_sha256="2" * 64,
+                        board_fen="8/8/8/8/8/8/8/K6k b - - 1 1", white_to_move=False)
+        snapshot["rules_anchor"] = endpoint
+        view["query"].update(prefix=[64], white_to_move=False)
+        snapshot["encoded_model_input"]["query"].update(prefix=[[0, 1, 0]], perspective=-1)
+        snapshot["view_sha256"] = data.view_digest(view)
+        r["input_sha256"] = data.seal_input(snapshot)
+        data.validate_record(r)
+        self.assertNotEqual(snapshot["rules_anchor"], view["anchors"][0])
+        view["query"]["white_to_move"] = True
+        with self.assertRaisesRegex(ValueError, "viewpoint"):
+            data.view_digest(view)
