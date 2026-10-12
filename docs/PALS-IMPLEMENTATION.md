@@ -216,10 +216,20 @@ gate 앞에 보존하되 정상 종료 조건을 완화하지 않는다.
 wire fixture12와 arena lib123(새 검사5 포함)의 성공 및 managed child 정리를 확인했다.
 이 결과는 CPU/mock 검사이며 새 GPU·두 게임 실행 인수가 아니다. 기존 c3/Build13 및
 555/Build14 신경망 자료의 실제 실행 source/build는 유지한다. 새 source에 재사용할 때는
-영향 component와 build 환경의 동일성 근거를 따로 검증한다. Build15 호환 빌드와 V14
-실제 preflight·두 게임·PGN·물리 종료는 후속 인수다. V13 원 실행의 NN counter와
-provider 물리 종료는 직접 관측되지 않았으며, guard 위치에 따른 NN 이전 단계라는
-소스 해석을 실제 counter 0 또는 native 종료 확인으로 치환하지 않는다.
+영향 component와 build 환경의 동일성 근거를 따로 검증한다. 위 수정 소스의 Build15는
+offline/locked release jobs2로 실제 315.3177초에 완료했고 일곱 명령의 exit0·owned tree
+정리와 다섯 ELF의 GLIBC 상한 2.34를 확인했다. 등록된 checker·UCI의 bytes·digest는
+Build13과 같으며 repair·Warm·pair-prepare는 달라 각 실제 pin을 보존한다. cache 재사용을
+빌드 성공 증거로 세지 않는다. 새 arena의 실제 paired 실행은 아직 미실행이다. 기존 수치·
+정상 Warm은 원 c3/Build13, 비용은555/Build14로 유지하며 새 source의 component 재사용은
+별도 검증 대기다. V14 실제 preflight·두 게임·네 session·PGN·물리 종료는 후속 인수다.
+V13 원 실행의 NN counter와 provider 물리 종료는 직접 관측되지 않았으며, guard 위치에
+따른 NN 이전 단계라는 소스 해석을 실제 counter0 또는 native 종료 확인으로 치환하지 않는다.
+
+이번 추가 관측의 문서 기준은 `95e7184943570a7aa60fafdf84a7c7487f06210f`이며
+[exact95 CI](https://github.com/daejunnom/RoveZero/actions/runs/38208720665)의 Linux·Windows·
+bindings·PALS model 네 job이 실제 성공했다. 이는 새 Build15 등록 및 이전 실행 근거와
+별도인 CPU CI 관측이다. E06 실제 pair·E07 총괄 최종 인수와 전체45 최종 판정은 pending/null이다.
 
 #### DEFAULT 공통6 API 비용의 관측 범위
 
