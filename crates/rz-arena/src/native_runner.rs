@@ -1066,6 +1066,16 @@ pub(crate) mod linux {
                 &process.stderr,
                 256 * 1024,
             )?;
+            // Save the actual bounded process receipt before the success
+            // gate. Failure evidence changes no cleanup/admission requirement.
+            let identification_process = process.receipt.clone();
+            put(
+                owner,
+                &format!("external-{tag}-identification-process.v2.json"),
+                &serde_json::to_vec_pretty(&process.receipt)
+                    .map_err(|_| invalid("preflight process receipt encoding failed"))?,
+                64 * 1024,
+            )?;
             let clean = |p: &ProcessOutput| {
                 p.receipt.stop == ProcessStop::Exited
                     && p.receipt.exit_code == Some(0)
@@ -1080,14 +1090,6 @@ pub(crate) mod linux {
             }
             root_recheck?;
             preflight_runtime_totals(owner)?;
-            let identification_process = process.receipt.clone();
-            put(
-                owner,
-                &format!("external-{tag}-identification-process.v2.json"),
-                &serde_json::to_vec_pretty(&process.receipt)
-                    .map_err(|_| invalid("preflight process receipt encoding failed"))?,
-                64 * 1024,
-            )?;
             let advertisement = crate::parse_uci_advertisement(&process.stdout)?;
             crate::validate_uci_options(&advertisement, &e.expected_uci_name, &requested)?;
             let commands = crate::uci_preflight_commands(&requested, e.family == "stockfish")?;

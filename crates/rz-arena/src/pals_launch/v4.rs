@@ -1457,6 +1457,17 @@ impl LockedPalsArenaLaunchV4 {
             "control inventory is not the pinned public/shared-P/C graph pair",
         )
     }
+    /// Only the V4 own DEFAULT lane requires native probe receipts; legacy
+    /// implicit CUDA and the shared external-helper selector remain unchanged.
+    fn uses_owned_default_preflight(&self, role: NativeEngineRole) -> bool {
+        matches!(
+            &self.input.semantic_lock.manifest.engines[role_index(role)],
+            PalsEngineV4::Pals(e) if e.base.cpu_r.is_own()
+        ) && self.input.endpoints[role_index(role)]
+            .cuda_model()
+            .and_then(cudnn_conv_binding)
+            .is_some()
+    }
     fn cuda_profile_argument(
         &self,
         role: NativeEngineRole,
@@ -1469,18 +1480,371 @@ impl LockedPalsArenaLaunchV4 {
         {
             return Ok(None);
         }
-        let path = runtime_root
+        let profile_parent = if self.uses_owned_default_preflight(role) {
+            let (game, preflight) = match role {
+                NativeEngineRole::Baseline => {
+                    ("baseline-runtime", "external-baseline-preflight-runtime")
+                }
+                NativeEngineRole::Candidate => {
+                    ("candidate-runtime", "external-candidate-preflight-runtime")
+                }
+            };
+            match runtime_root.file_name().and_then(|name| name.to_str()) {
+                Some(name) if name == preflight => runtime_root.to_path_buf(),
+                Some(name) if name == game => runtime_root
+                    .parent()
+                    .ok_or_else(|| invalid("DEFAULT owner runtime parent absent"))?
+                    .join(preflight),
+                _ => {
+                    return Err(invalid(
+                        "DEFAULT profile parent must be the owner-selected role root",
+                    ));
+                }
+            }
+        } else {
+            runtime_root.to_path_buf()
+        };
+        let path = profile_parent
             .to_str()
             .ok_or_else(|| invalid("CUDA profile parent is not UTF-8"))?;
         require(
-            runtime_root.is_absolute() && path.len() <= 4096 && !path.chars().any(char::is_control),
+            runtime_root.is_absolute()
+                && profile_parent.is_absolute()
+                && path.len() <= 4096
+                && !path.chars().any(char::is_control),
             "CUDA profile parent must be a bounded owned absolute runtime root",
         )?;
+        // DEFAULT profiles from probe/game PIDs share only this separately
+        // owner-created/pinned role root. Game receipt roots remain exclusive
+        // to their two game process slots; profiles receive exact PID/nonce,
+        // inode/ownership, producer-file and witness-digest validation.
         // Fastchess reuses argv between games. The UCI child derives an
         // exclusive PID+nonce directory here for each preflight/game process.
         Ok(Some(format!("--pals-cuda-profile-parent={path}").into()))
     }
 }
+#[cfg(target_os = "linux")]
+fn default_control_profile_pid(name: &str) -> Result<u32, ArenaError> {
+    let rest = name
+        .strip_prefix("pals-cuda-profile-")
+        .ok_or_else(|| invalid("DEFAULT CUDA profile name is not producer-scoped"))?;
+    let (pid, nonce) = rest
+        .split_once('-')
+        .ok_or_else(|| invalid("DEFAULT CUDA profile PID/nonce absent"))?;
+    require(
+        !pid.is_empty()
+            && pid.bytes().all(|b| b.is_ascii_digit())
+            && nonce.len() == 16
+            && nonce
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "DEFAULT CUDA profile PID/nonce is not the exact producer format",
+    )?;
+    let pid: u32 = pid
+        .parse()
+        .map_err(|_| invalid("DEFAULT CUDA profile PID invalid"))?;
+    require(
+        pid > 0 && pid <= i32::MAX as u32 && name == format!("pals-cuda-profile-{pid}-{nonce}"),
+        "DEFAULT CUDA profile PID is not canonical or supervised",
+    )?;
+    Ok(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn default_control_directory_pin(
+    directory: &cap_std::fs::Dir,
+) -> Result<std::fs::File, ArenaError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsExt, OpenOptionsFollowExt};
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    directory
+        .open_with(".", &options)
+        .map(cap_std::fs::File::into_std)
+        .map_err(|_| invalid("DEFAULT CUDA profile directory capability pin unavailable"))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_owned_default_profile_slots(
+    root: &cap_std::fs::Dir,
+    audits: &[PalsNativeSessionAuditV3],
+    native_slots: &BTreeSet<String>,
+    entry_limit: u32,
+) -> Result<(), ArenaError> {
+    use cap_fs_ext::DirExt;
+    use std::os::unix::fs::MetadataExt;
+    let root_pin = default_control_directory_pin(root)?;
+    let root_meta = root_pin
+        .metadata()
+        .map_err(|_| invalid("DEFAULT CUDA profile parent pin metadata unavailable"))?;
+    require(
+        root_meta.is_dir() && root_meta.mode() & 0o7777 == 0o700,
+        "DEFAULT CUDA profile parent is not the owner-created private root",
+    )?;
+    let mut expected = BTreeMap::new();
+    for audit in audits {
+        require(
+            audit.process_id > 0
+                && audit.physical_shutdown_confirmed
+                && audit.native_buffers_released
+                && audit.external_cpu_r_session.is_none()
+                && audit.cuda_placement.is_some()
+                && expected.insert(audit.process_id, audit).is_none(),
+            "DEFAULT CUDA profile requires distinct already-validated physical owners",
+        )?;
+    }
+    require(
+        (2..=4).contains(&expected.len()),
+        "DEFAULT role profile scope must be two probes and optional two games",
+    )?;
+    let mut actual_profiles = BTreeSet::new();
+    let mut actual_native = BTreeSet::new();
+    for (index, entry) in root
+        .entries()
+        .map_err(|e| ArenaError::Io(e.to_string()))?
+        .enumerate()
+    {
+        require(
+            index < entry_limit as usize,
+            "DEFAULT profile root entry cap exceeded",
+        )?;
+        let name = entry
+            .map_err(|e| ArenaError::Io(e.to_string()))?
+            .file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| invalid("DEFAULT profile slot is not UTF-8"))?;
+        if native_slots.contains(name) {
+            require(
+                actual_native.insert(name.to_owned()),
+                "DEFAULT native slot duplicated",
+            )?;
+            root.open_dir_nofollow(name)
+                .map_err(|_| invalid("DEFAULT native slot is not an owned real directory"))?;
+            continue;
+        }
+        let pid = default_control_profile_pid(name)?;
+        let audit = expected
+            .get(&pid)
+            .ok_or_else(|| invalid("DEFAULT CUDA profile PID was not independently supervised"))?;
+        require(
+            actual_profiles.insert(pid),
+            "DEFAULT CUDA profile PID/nonce slot repeated",
+        )?;
+        let profile = root
+            .open_dir_nofollow(name)
+            .map_err(|_| invalid("DEFAULT CUDA profile slot is not an owned real directory"))?;
+        let profile_pin = default_control_directory_pin(&profile)?;
+        let before = profile_pin
+            .metadata()
+            .map_err(|_| invalid("DEFAULT profile inode pin metadata unavailable"))?;
+        require(
+            before.is_dir() && before.uid() == root_meta.uid() && before.mode() & 0o022 == 0,
+            "DEFAULT profile directory owner/type/write permissions differ",
+        )?;
+        let placement = audit
+            .cuda_placement
+            .as_ref()
+            .expect("validated placement above");
+        let mut seen = BTreeSet::new();
+        for (file_index, entry) in profile
+            .entries()
+            .map_err(|e| ArenaError::Io(e.to_string()))?
+            .enumerate()
+        {
+            require(file_index < 4, "DEFAULT CUDA profile has excess files")?;
+            let filename = entry
+                .map_err(|e| ArenaError::Io(e.to_string()))?
+                .file_name();
+            let filename = filename
+                .to_str()
+                .ok_or_else(|| invalid("DEFAULT CUDA profile filename is not UTF-8"))?;
+            require(
+                filename.len() <= 128
+                    && filename
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
+                "DEFAULT CUDA profile filename is not a bounded basename",
+            )?;
+            let (role, kernel, cap) = if filename == "public-initial-placement.json" {
+                ("public", false, 4 * 1024 * 1024)
+            } else if filename == "shared_pc-initial-placement.json" {
+                ("shared_pc", false, 4 * 1024 * 1024)
+            } else if filename.starts_with("pals-public-kernels_") && filename.ends_with(".json") {
+                ("public", true, 4 * 1024 * 1024)
+            } else if filename.starts_with("pals-shared_pc-kernels_") && filename.ends_with(".json")
+            {
+                ("shared_pc", true, 4 * 1024 * 1024)
+            } else {
+                return Err(invalid(
+                    "DEFAULT CUDA profile contains an undeclared producer file",
+                ));
+            };
+            require(
+                seen.insert((role, kernel)),
+                "DEFAULT CUDA profile role/file duplicated",
+            )?;
+            let bytes = crate::native_runner::linux::read_file(&profile, filename, cap)?;
+            if kernel {
+                let expected_digest = if role == "public" {
+                    &placement.public_profile_sha256
+                } else {
+                    &placement.shared_pc_profile_sha256
+                };
+                require(
+                    digest(&bytes) == *expected_digest,
+                    "DEFAULT actual kernel profile differs from the validated startup witness",
+                )?;
+            } else {
+                let value = json(&bytes)?;
+                require(
+                    value["schema"] == "rovezero.pals-initial-placement.v2"
+                        && value["source"]
+                            == "ort-1.22-finalize-recursive-plus-memcpy-origin-metadata"
+                        && value["optimization"] == "disable"
+                        && value["role"] == role
+                        && value["session_created"] == true
+                        && value["before_first_neural_run"] == true
+                        && value["gate"] == "passed"
+                        && value["gate_detail"].is_null()
+                        && value["collector_overflow"] == false,
+                    "DEFAULT initial placement producer scope or pre-Run gate differs",
+                )?;
+            }
+        }
+        require(
+            seen.len() == 4,
+            "DEFAULT CUDA profile lacks one of four bounded producer files",
+        )?;
+        let named = root
+            .open_dir_nofollow(name)
+            .map_err(|_| invalid("DEFAULT profile pathname changed after verification"))?;
+        let named_pin = default_control_directory_pin(&named)?;
+        let after = profile_pin
+            .metadata()
+            .map_err(|_| invalid("DEFAULT profile held inode recheck unavailable"))?;
+        let named_after = named_pin
+            .metadata()
+            .map_err(|_| invalid("DEFAULT profile named inode recheck unavailable"))?;
+        for metadata in [&after, &named_after] {
+            require(
+                metadata.is_dir()
+                    && (
+                        metadata.dev(),
+                        metadata.ino(),
+                        metadata.uid(),
+                        metadata.mode(),
+                    ) == (before.dev(), before.ino(), before.uid(), before.mode()),
+                "DEFAULT profile capability/name/inode changed during verification",
+            )?;
+        }
+    }
+    require(
+        actual_native == *native_slots
+            && actual_profiles == expected.keys().copied().collect::<BTreeSet<_>>(),
+        "DEFAULT exact native/profile process set is incomplete",
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn audit_owned_default_preflight(
+    lock: &LockedPalsArenaLaunchV4,
+    role: NativeEngineRole,
+    preflight: &crate::ExternalUciPreflight,
+    root: &cap_std::fs::Dir,
+    games: &[PalsNativeSessionAuditV3],
+) -> Result<PalsPreflightHelperEvidence, ArenaError> {
+    use cap_fs_ext::DirExt;
+    require(
+        lock.uses_owned_default_preflight(role)
+            && lock
+                .input
+                .external_cpu_r_binding(role_index(role))?
+                .is_none()
+            && preflight.engine_id == lock.endpoint_views[role_index(role)].id,
+        "DEFAULT own preflight requires the exact registered V4 role",
+    )?;
+    let mut native_slots = BTreeSet::new();
+    let mut result = PalsPreflightHelperEvidence {
+        sessions: vec![],
+        artifacts: vec![],
+    };
+    for process in [
+        &preflight.identification_process,
+        &preflight.readiness_process,
+    ] {
+        require(
+            process.pid > 0
+                && native_slots.insert(format!("native-process-{}", process.pid))
+                && process.stop == crate::ProcessStop::Exited
+                && process.exit_code == Some(0)
+                && process.exit_signal.is_none()
+                && process.group_cleanup == crate::CleanupStatus::Gone
+                && process.errors.is_empty(),
+            "DEFAULT preflight requires two independently supervised normal exits",
+        )?;
+        let name = format!("native-process-{}", process.pid);
+        let directory = root.open_dir_nofollow(&name).map_err(|_| {
+            invalid("DEFAULT preflight receipt slot is not an owned real directory")
+        })?;
+        let actual = directory
+            .entries()
+            .map_err(|e| ArenaError::Io(e.to_string()))?
+            .take(3)
+            .map(|entry| {
+                entry
+                    .map(|e| e.file_name())
+                    .map_err(|e| ArenaError::Io(e.to_string()))
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        require(
+            actual
+                == BTreeSet::from([
+                    OsString::from(lock.native_wire_filenames().0),
+                    OsString::from(lock.native_wire_filenames().1),
+                ]),
+            "DEFAULT preflight requires exactly startup/termination receipt files",
+        )?;
+        let start = read_work_file(&directory, lock.native_wire_filenames().0)?;
+        let end = read_work_file(&directory, lock.native_wire_filenames().1)?;
+        let (audit, pid) =
+            validate_pals_native_records_inner(lock, role, &start, &end, &name, None, false)?;
+        require(
+            pid == process.pid,
+            "DEFAULT physical receipt PID differs from its supervised probe",
+        )?;
+        result.sessions.push(audit);
+        result
+            .artifacts
+            .push((format!("{name}/{}", lock.native_wire_filenames().0), start));
+        result
+            .artifacts
+            .push((format!("{name}/{}", lock.native_wire_filenames().1), end));
+    }
+    let mut profiles = result.sessions.clone();
+    for game in games {
+        require(
+            game.endpoint_id == lock.endpoint_views[role_index(role)].id
+                && game.external_cpu_r_session.is_none(),
+            "DEFAULT game profile endpoint/helper origin differs",
+        )?;
+        profiles.push(game.clone());
+    }
+    require(
+        games.is_empty() || games.len() == 2,
+        "DEFAULT profile scope must contain exactly two game owners",
+    )?;
+    validate_owned_default_profile_slots(
+        root,
+        &profiles,
+        &native_slots,
+        lock.input.budget.max_runtime_files,
+    )?;
+    Ok(result)
+}
+
 impl crate::native_launch::sealed::Sealed for LockedPalsArenaLaunchV4 {}
 impl NativeLaunchDeclaration for LockedPalsArenaLaunchV4 {
     fn argument_limit(&self) -> usize {
@@ -1633,7 +1997,8 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV4 {
         Ok(self
             .input
             .external_cpu_r_binding(role_index(role))?
-            .is_some())
+            .is_some()
+            || self.uses_owned_default_preflight(role))
     }
     fn preflight_arguments(
         &self,
@@ -1650,10 +2015,7 @@ impl NativeLaunchDeclaration for LockedPalsArenaLaunchV4 {
             runtime_root.is_absolute(),
             "preflight cache root must be absolute",
         )?;
-        let isolated = self
-            .input
-            .external_cpu_r_binding(role_index(role))?
-            .is_some();
+        let isolated = self.uses_separate_preflight_runtime_root(role)?;
         // The Native capability owner creates and pins this exact root. Do not
         // derive an unowned sibling from a game path at the argv boundary.
         if isolated {
@@ -1719,6 +2081,16 @@ impl NativeProviderDeclaration for LockedPalsArenaLaunchV4 {
         runtime_directory: &cap_std::fs::Dir,
         inputs: &crate::native_runner::NativeProviderInputContext<'_>,
     ) -> Result<Vec<(String, Vec<u8>)>, ArenaError> {
+        if self.uses_owned_default_preflight(role) {
+            return Ok(audit_owned_default_preflight(
+                self,
+                role,
+                preflight,
+                runtime_directory,
+                &[],
+            )?
+            .artifacts);
+        }
         Ok(
             audit_pals_helper_preflight(self, role, preflight, runtime_directory, inputs)?
                 .artifacts,
@@ -1795,6 +2167,73 @@ impl NativeProviderDeclaration for LockedPalsArenaLaunchV4 {
         supervisor_stdout: &[u8],
         artifacts: &[ArtifactRef],
     ) -> Result<(), ArenaError> {
+        // The historical helper branch below is unchanged. The DEFAULT own
+        // branch binds probe originals again after all four game owners close.
+        if [NativeEngineRole::Baseline, NativeEngineRole::Candidate]
+            .into_iter()
+            .any(|role| self.uses_owned_default_preflight(role))
+        {
+            use cap_fs_ext::DirExt;
+            let mut leaders = BTreeSet::new();
+            for game in sessions {
+                require(
+                    game.process_id > 0 && leaders.insert(game.process_id),
+                    "DEFAULT game PID reused",
+                )?;
+            }
+            for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+                if !self.uses_owned_default_preflight(role) {
+                    continue;
+                }
+                let index = role_index(role);
+                let mut matching = preflight
+                    .iter()
+                    .filter(|p| p.engine_id == self.endpoint_views[index].id);
+                let receipt = matching
+                    .next()
+                    .ok_or_else(|| invalid("DEFAULT preflight receipt absent"))?;
+                require(
+                    matching.next().is_none(),
+                    "DEFAULT preflight receipt duplicated",
+                )?;
+                for process in [&receipt.identification_process, &receipt.readiness_process] {
+                    require(leaders.insert(process.pid), "DEFAULT probe/game PID reused")?;
+                }
+                let games: Vec<_> = sessions
+                    .iter()
+                    .filter(|s| s.endpoint_id == self.endpoint_views[index].id)
+                    .cloned()
+                    .collect();
+                require(
+                    games.len() == 2,
+                    "DEFAULT requires exactly two restarted game owners per role",
+                )?;
+                let name = if index == 0 {
+                    "external-baseline-preflight-runtime"
+                } else {
+                    "external-candidate-preflight-runtime"
+                };
+                let root = runtime_root
+                    .open_dir_nofollow(name)
+                    .map_err(|_| invalid("DEFAULT owner preflight root absent"))?;
+                let evidence = audit_owned_default_preflight(self, role, receipt, &root, &games)?;
+                for (relative, bytes) in evidence.artifacts {
+                    let suffix = format!("/{name}/{relative}");
+                    require(
+                        artifacts
+                            .iter()
+                            .filter(|a| {
+                                a.path.ends_with(&suffix)
+                                    && a.sha256 == digest(&bytes)
+                                    && a.bytes == bytes.len() as u64
+                            })
+                            .count()
+                            == 1,
+                        "DEFAULT probe evidence changed from its retained original",
+                    )?;
+                }
+            }
+        }
         let mut has_external = false;
         for index in 0..2 {
             has_external |= self.input.external_cpu_r_binding(index)?.is_some();
@@ -3974,5 +4413,319 @@ mod tests {
                     .is_err()
             );
         }
+    }
+    #[cfg(all(target_os = "linux", feature = "native-cuda"))]
+    #[test]
+    fn own_default_preflight_uses_exact_receipts_and_owner_roots() {
+        let lock = cudnn_conv_pilot_fixture().lock().unwrap();
+        assert_eq!(lock.expected_provider_sessions(), 4);
+        for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+            let (game_name, probe_name) = match role {
+                NativeEngineRole::Baseline => {
+                    ("baseline-runtime", "external-baseline-preflight-runtime")
+                }
+                NativeEngineRole::Candidate => {
+                    ("candidate-runtime", "external-candidate-preflight-runtime")
+                }
+            };
+            let game = Path::new("/owned/attempt").join(game_name);
+            let probe = Path::new("/owned/attempt").join(probe_name);
+            assert!(lock.uses_owned_default_preflight(role));
+            assert!(lock.uses_separate_preflight_runtime_root(role).unwrap());
+            assert!(lock.preflight_arguments(role, &game).is_err());
+            let preflight = lock.preflight_arguments(role, &probe).unwrap();
+            let actual = lock.runtime_arguments(role, &game).unwrap();
+            let receipt_flags = [
+                format!("--pals-output-root={}", probe.display()),
+                format!("--pals-launch-sha256={}", lock.sha256()),
+                format!(
+                    "--pals-endpoint-id={}",
+                    lock.endpoint_views[role_index(role)].id
+                ),
+            ];
+            for flag in receipt_flags {
+                assert!(preflight.contains(&OsString::from(flag)));
+            }
+            let profile = OsString::from(format!("--pals-cuda-profile-parent={}", probe.display()));
+            assert!(preflight.contains(&profile) && actual.contains(&profile));
+            assert!(actual.contains(&OsString::from(format!(
+                "--pals-output-root={}",
+                game.display()
+            ))));
+            assert!(!game.exists() && !probe.exists()); // argv preparation creates no unowned directory
+            let wrong = Path::new("/owned/attempt").join(if role == NativeEngineRole::Baseline {
+                "candidate-runtime"
+            } else {
+                "baseline-runtime"
+            });
+            assert!(lock.cuda_profile_argument(role, &wrong).is_err());
+        }
+        let historical_mock = fixture().lock().unwrap();
+        assert!(!historical_mock.uses_owned_default_preflight(NativeEngineRole::Baseline));
+        let mut non_default = cudnn_conv_pilot_fixture();
+        for endpoint in &mut non_default.endpoints {
+            let PalsEndpointLaunchV3::OnnxCuda(cuda) = endpoint else {
+                unreachable!()
+            };
+            cuda.cuda_control.as_mut().unwrap().cudnn_conv_search = None;
+        }
+        let non_default = non_default.lock().unwrap();
+        let game = Path::new("/owned/attempt/baseline-runtime");
+        assert!(!non_default.uses_owned_default_preflight(NativeEngineRole::Baseline));
+        assert!(
+            !non_default
+                .uses_separate_preflight_runtime_root(NativeEngineRole::Baseline)
+                .unwrap()
+        );
+        let args = non_default
+            .preflight_arguments(NativeEngineRole::Baseline, game)
+            .unwrap();
+        assert_eq!(args.len(), 2); // unchanged shared-cache + existing explicit inventory profile argv
+        assert_eq!(
+            args.last(),
+            Some(&OsString::from(
+                "--pals-cuda-profile-parent=/owned/attempt/baseline-runtime"
+            ))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_profile_pid_nonce_is_closed_and_canonical() {
+        assert_eq!(
+            default_control_profile_pid("pals-cuda-profile-10-0000000000000001").unwrap(),
+            10
+        );
+        assert_eq!(
+            default_control_profile_pid("pals-cuda-profile-2147483647-ffffffffffffffff").unwrap(),
+            2147483647
+        );
+        for value in [
+            "pals-cuda-profile-0-0000000000000001",
+            "pals-cuda-profile-010-0000000000000001",
+            "pals-cuda-profile-2147483648-0000000000000001",
+            "pals-cuda-profile-4294967296-0000000000000001",
+            "pals-cuda-profile--10-0000000000000001",
+            "pals-cuda-profile-10-1",
+            "pals-cuda-profile-10-FFFFFFFFFFFFFFFF",
+            "pals-cuda-profile-10-000000000000000g",
+            "pals-cuda-profile-10-0000000000000001-extra",
+            "pals-cuda-profile-10-0000000000000001/child",
+            "native-process-10",
+        ] {
+            assert!(default_control_profile_pid(value).is_err(), "{value}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct DefaultProfileCpuFixture {
+        root: std::path::PathBuf,
+        native_slots: BTreeSet<String>,
+        audits: Vec<PalsNativeSessionAuditV3>,
+    }
+    #[cfg(target_os = "linux")]
+    impl DefaultProfileCpuFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "rovezero-own-default-cpu-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let native_slots =
+                BTreeSet::from(["native-process-10".into(), "native-process-12".into()]);
+            for slot in &native_slots {
+                std::fs::create_dir(root.join(slot)).unwrap();
+            }
+            let mut fixture = Self {
+                root,
+                native_slots,
+                audits: vec![],
+            };
+            fixture.add_profile(10);
+            fixture.add_profile(12);
+            fixture
+        }
+        fn profile(&self, pid: u32) -> std::path::PathBuf {
+            self.root
+                .join(format!("pals-cuda-profile-{pid}-0000000000000001"))
+        }
+        fn add_profile(&mut self, pid: u32) {
+            // Tiny authored wire/file fixture; never a claim of a CUDA run or physical fence.
+            let profile = self.profile(pid);
+            std::fs::create_dir(&profile).unwrap();
+            let public = format!("authored-public-kernels-{pid}").into_bytes();
+            let pc = format!("authored-shared-pc-kernels-{pid}").into_bytes();
+            std::fs::write(
+                profile.join("pals-public-kernels_2026-10-12_00-00-00.json"),
+                &public,
+            )
+            .unwrap();
+            std::fs::write(
+                profile.join("pals-shared_pc-kernels_2026-10-12_00-00-00.json"),
+                &pc,
+            )
+            .unwrap();
+            for role in ["public", "shared_pc"] {
+                let value = serde_json::json!({
+                    "schema":"rovezero.pals-initial-placement.v2",
+                    "source":"ort-1.22-finalize-recursive-plus-memcpy-origin-metadata",
+                    "optimization":"disable","role":role,"session_created":true,
+                    "before_first_neural_run":true,"gate":"passed","gate_detail":null,
+                    "collector_overflow":false
+                });
+                std::fs::write(
+                    profile.join(format!("{role}-initial-placement.json")),
+                    serde_json::to_vec(&value).unwrap(),
+                )
+                .unwrap();
+            }
+            self.audits.push(PalsNativeSessionAuditV3 {
+                endpoint_id: "authored-default-profile-only".into(),
+                process_id: pid,
+                launch_sha256: "a".repeat(64),
+                startup_sha256: "b".repeat(64),
+                termination_sha256: "c".repeat(64),
+                external_cpu_r_session: None,
+                completed_role_inputs: 0,
+                search_consumed_role_inputs: 0,
+                completed_new_game_resets: 0,
+                physical_shutdown_confirmed: true,
+                native_buffers_released: true,
+                startup_nn_inputs_completed: 0,
+                startup_nn_calls_completed: 0,
+                startup_role_inputs_completed: 0,
+                startup_probe_timeout_ms: None,
+                startup_probe: None,
+                execution: None,
+                cuda_placement: Some(PalsCudaPlacementAuditV3 {
+                    inventory_sha256: "d".repeat(64),
+                    public_profile_sha256: digest(&public),
+                    shared_pc_profile_sha256: digest(&pc),
+                    public_neural_kernels: 0,
+                    proposer_private_kernels: 0,
+                    critic_private_kernels: 0,
+                    device_id: 0,
+                }),
+                cuda_loading: None,
+                cuda_record_pages: None,
+                raw_native: serde_json::Value::Null,
+                raw_search_work: serde_json::Value::Null,
+            });
+        }
+        fn validate(&self, audits: &[PalsNativeSessionAuditV3]) -> Result<(), ArenaError> {
+            let directory =
+                cap_std::fs::Dir::open_ambient_dir(&self.root, cap_std::ambient_authority())
+                    .unwrap();
+            validate_owned_default_profile_slots(&directory, audits, &self.native_slots, 2048)
+        }
+    }
+    #[cfg(target_os = "linux")]
+    impl Drop for DefaultProfileCpuFixture {
+        fn drop(&mut self) {
+            // Only this newly created, test-owned regular subtree is disposable.
+            assert_eq!(self.root.parent(), Some(std::env::temp_dir().as_path()));
+            assert!(
+                self.root
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("rovezero-own-default-cpu-")
+            );
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_profile_scope_rejects_foreign_pid_duplicate_nonce_and_digest() {
+        let fixture = DefaultProfileCpuFixture::new();
+        fixture.validate(&fixture.audits).unwrap();
+        let foreign = fixture.root.join("pals-cuda-profile-99-0000000000000001");
+        std::fs::create_dir(&foreign).unwrap();
+        assert!(fixture.validate(&fixture.audits).is_err());
+        std::fs::remove_dir(foreign).unwrap();
+        let repeated = fixture.root.join("pals-cuda-profile-10-0000000000000002");
+        std::fs::create_dir(&repeated).unwrap();
+        assert!(fixture.validate(&fixture.audits).is_err());
+        std::fs::remove_dir(repeated).unwrap();
+        let kernel = fixture
+            .profile(10)
+            .join("pals-public-kernels_2026-10-12_00-00-00.json");
+        let original = std::fs::read(&kernel).unwrap();
+        std::fs::write(&kernel, b"changed digest").unwrap();
+        assert!(fixture.validate(&fixture.audits).is_err());
+        std::fs::write(&kernel, original).unwrap();
+        fixture.validate(&fixture.audits).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_profile_scope_requires_physical_closure_and_nofollow_owned_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let fixture = DefaultProfileCpuFixture::new();
+        fixture.validate(&fixture.audits).unwrap();
+        let mut unclosed = fixture.audits.clone();
+        unclosed[0].physical_shutdown_confirmed = false;
+        assert!(fixture.validate(&unclosed).is_err());
+        unclosed[0].physical_shutdown_confirmed = true;
+        unclosed[0].native_buffers_released = false;
+        assert!(fixture.validate(&unclosed).is_err());
+        unclosed[0].native_buffers_released = true;
+        unclosed[0].cuda_placement = None;
+        assert!(fixture.validate(&unclosed).is_err());
+        let kernel = fixture
+            .profile(10)
+            .join("pals-public-kernels_2026-10-12_00-00-00.json");
+        let original = std::fs::read(&kernel).unwrap();
+        std::fs::remove_file(&kernel).unwrap();
+        symlink(
+            fixture
+                .profile(12)
+                .join("pals-public-kernels_2026-10-12_00-00-00.json"),
+            &kernel,
+        )
+        .unwrap();
+        assert!(fixture.validate(&fixture.audits).is_err());
+        std::fs::remove_file(&kernel).unwrap();
+        std::fs::write(&kernel, original).unwrap();
+        let held = fixture.profile(10);
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(fixture.validate(&fixture.audits).is_err());
+        std::fs::set_permissions(held, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.validate(&fixture.audits).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_profile_scope_keeps_probe_slots_and_accepts_bounded_four_mib_placement_json() {
+        let mut fixture = DefaultProfileCpuFixture::new();
+        fixture.validate(&fixture.audits).unwrap();
+        let placement = fixture.profile(10).join("public-initial-placement.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&placement).unwrap()).unwrap();
+        // The producer's bounded JSON writer permits 4MiB, independently of its
+        // 1MiB logger input cap. This authored case catches a mistaken 1MiB reader.
+        value["authored_diagnostic_padding"] = "X".repeat(1024 * 1024).into();
+        std::fs::write(&placement, serde_json::to_vec(&value).unwrap()).unwrap();
+        fixture.validate(&fixture.audits).unwrap();
+        fixture.add_profile(100);
+        fixture.add_profile(102);
+        fixture.validate(&fixture.audits).unwrap(); // two probe slots + four profile PIDs; no game receipt in probe root
+        let forbidden_game_slot = fixture.root.join("native-process-100");
+        std::fs::create_dir(&forbidden_game_slot).unwrap();
+        assert!(fixture.validate(&fixture.audits).is_err());
+        std::fs::remove_dir(forbidden_game_slot).unwrap();
+        let overflow = fixture.profile(10).join("shared_pc-initial-placement.json");
+        let original = std::fs::read(&overflow).unwrap();
+        std::fs::write(&overflow, vec![b'X'; 4 * 1024 * 1024 + 1]).unwrap();
+        assert!(fixture.validate(&fixture.audits).is_err());
+        std::fs::write(overflow, original).unwrap();
+        fixture.validate(&fixture.audits).unwrap();
     }
 }
