@@ -5,7 +5,7 @@
 `model-pair`의 잠긴 V2 `match_execution`은 `ponder` on/off와 CPU/GPU/Hybrid 역할별
 할당을 연결한다. 선언·자동 가중치·명시적 override는
 [E01 자원 잠금](../rz-experiments/README.md#대결-v2의-선택적-실행자원-잠금)을 따른다.
-Linux의 실제 affinity·물리 코어/SMT·GPU UUID/VRAM을 먼저 조회한다.
+Linux의 실제 affinity·물리 코어/SMT·GPU UUID/모델명/VRAM을 먼저 조회한다.
 
 ```sh
 python scripts/run_managed.py -- cargo run -p rz-arena --bin model-pair -- hardware
@@ -17,7 +17,22 @@ python scripts/run_managed.py -- cargo run -p rz-arena --bin model-pair -- execu
 `hardware`의 목록을 선언에 옮기고 전체 CPU envelope를 같은 affinity로 잠근다.
 GPU probe가 없거나 실패한 경우 GPU를 CPU로 대체하지 않는다. GPU가 필요한 실행은
 실제 inventory 확인 전 시작하지 않는다. 현재 최소 물리 코어 수는 runner 1+엔진별 1이다.
-실행 직전에도 topology·UUID·용량을 대조해 다른 호스트의 선언을 거부한다.
+실행 직전에도 topology·UUID·모델명·용량을 대조해 다른 호스트의 선언을 거부한다.
+
+GPU inventory는 유한한 `nvidia-smi --query-gpu=uuid,name,memory.total` 결과에서 만든다.
+`memory.total`의 정수 MiB를 byte로 바꾸며, 선언의 `vram_bytes`는 엔진 예약이나 임의로
+낮춘 용량이 아니라 호스트가 보고한 장치 전체 용량이다. 선택 필드 `model`이 있으면
+같은 UUID의 모델명과 전체 용량이 정확히 일치해야 한다. 더 큰 장치를 작은 장치로
+선언하거나 모델명만 맞춘 다른 용량으로 controlled 비교를 통과시키지 않는다.
+기존 `model` 생략 선언은 같은 UUID의 관측 용량이 선언값 이상인 과거 조건을 유지한다.
+생략된 모델명을 새 잠금에 자동 주입하지 않으며 기존 canonical digest도 바꾸지 않는다.
+probe 실패·잘못된 inventory·소유 process의 cleanup 불명확은 선언을 신뢰하는 근거가 아니다.
+
+controlled 내부 비교에서는 역할별 파생 CPU/core/SMT/Threads·GPU 모델/용량/예약/공유
+조건을 [E01 비교 검증](../rz-experiments/README.md#대결-v2의-선택적-실행자원-잠금)으로
+먼저 대조한다. 별도 UUID를 배정한 내부 비교는 모델명이 필요하다. 두 단계는 선언의
+동등성 검사와 실제 호스트 readback 검사이며, 어느 쪽도 실제 GPU 성능·물리적 연산 격리나
+공정성을 증명하지 않는다. 가상 호스트의 topology는 그 환경이 노출한 범위로 기록한다.
 
 고정한 model-pair binary는 `engine-exec CPU_IDS GPU_IDS_OR_DASH PROGRAM [ARGS...]`
 접점을 제공한다. 같은 PID에서 `sched_setaffinity`를 설치·readback하고
@@ -60,6 +75,14 @@ python scripts/run_managed.py -- cargo run -p rz-arena --example ponder_runner_c
 off/on 각각 흑백 교환 두 판·5초+0.1초·최대 12 ply·20초 wall·종료 유예 2초·출력 2 MiB·
 자식 5개를 제한한다. CPU placement·폰더링 hit/stop·A Rules PGN·부모 전체 시계·Gone을
 검사하며 cutoff는 Incomplete다. 이 예제는 실제 NN/GPU·기력·공유 장치 공정성 인수가 아니다.
+
+2026-10-13에는 소스 `b06b0f2457de2b249d1eee2b4389dba02bab679b`의 release/default
+CPU/mock 경로와 위 Fastchess V2 patch를 새로 빌드해 off/on 각각의 흑백 교환 두 판을
+검사했다. off의 `go ponder`는 0회, on은 start 24회·hit 20회·stop 4회였고 Rules·PGN·
+부모 시계·exit 0·process group Gone을 확인했다. 별도 WSL 3-core/전체 SMT 프로필에서의
+기능 증거이며 물리 호스트 mapping은 unknown이다. NN/GPU·기력·공정성·속도 개선이나
+기존 PALS GPU pilot 인수 자료로 사용하지 않는다. 원시 자료는 저장소 밖 관리 reports의
+`pr24-cpu-pilot-b06b0f2`에 보존한다.
 
 ## 실행 후 독립 pair PGN 감사
 

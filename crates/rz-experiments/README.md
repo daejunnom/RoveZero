@@ -15,7 +15,9 @@ V1 및 공통 계약 revision 0.1은 바꾸지 않는다. `ponder`는 명시적�
 별도 잠금으로 비교한다. 실행 접점은 [model-pair](../rz-arena/README.md#폰더링과-동시-엔진-자원-배분)다.
 
 `hardware.cpu_cores`는 현재 affinity 안의 물리 코어별 SMT sibling ID 목록이고,
-`hardware.gpus`는 실제 UUID·VRAM byte 목록이다. 두 `engines` 요청은 `baseline`과
+`hardware.gpus`는 실제 UUID·VRAM byte와 선택적인 `model` 목록이다. `model`은
+호스트가 보고한 정확한 장치 모델명이고 `vram_bytes`는 장치의 전체 용량이며, 엔진별
+예약인 `gpu_memory_bytes`와 구분한다. 두 `engines` 요청은 `baseline`과
 `candidate` 역할을 정확히 하나씩 가진다. 요청은 예를 들어 다음처럼 자동 할당한다.
 
 ```json
@@ -44,6 +46,29 @@ caller는 `cpu_ids`, `threads`, `gpu_ids`, 장치당 `gpu_memory_bytes`를 명�
 다른 계획/version을 계산하면 거부하며, 변경하려면 해당 필드를 지우고 명시적으로 다시 잠근다.
 자원 mask와 충돌하는 endpoint 환경 변수는 거부한다. 미래 선언만 있는 native endpoint는
 provider 실행을 주장하지 않으며 현재 CPU/CUDA launch recipe는 별도 검증한다.
+
+`Runtime`, `AdapterEquivalence`, `InternalWeights`, `InternalSearch`의 controlled 비교는
+전체 자원 envelope만 같다고 통과하지 않는다. endpoint의 `baseline`/`candidate` 역할로
+파생 할당을 찾고 compute kind, Threads, 할당한 물리 코어 수와 코어별 SMT 폭·공유 여부,
+GPU 수와 모델·전체 용량·공유 여부 및 장치당 VRAM 예약이 서로 같아야 한다.
+서로 다른 CPU ID·GPU UUID나 목록 순서는 자원 예산 차이로 취급하지 않는다.
+서로 다른 GPU를 배정하면 양쪽 모델명을 알아야 하며, 같은 UUID를 명시적으로 공유하는
+기존 선언은 모델명 생략을 허용한다. CPU quota·메모리 한도·runner 예약·sharing·Ponder는
+두 엔진이 함께 사용하는 잠금 필드다. Ponder on/off는 각각 별도의 lock으로 비교한다.
+
+`InternalModel`도 CPU/core/SMT/Threads 조건을 유지한다. `backend` 변경을 사전 선언하고
+실제 모델 backend가 달라진 경우에만 compute kind 차이를 허용한다. 이때 한쪽이 CPU라면
+그쪽의 미사용 GPU 자원을 같은 것으로 요구하지 않지만, 양쪽 모두 GPU를 쓰면 위 GPU
+조건은 계속 같아야 한다. `Fixture`와 `ExternalEngine`에는 이 내부 동일 자원 대조를
+적용하지 않으며 각 엔진의 선언·관측 범위를 그대로 기록한다. 실제 조건은
+[V2 비교 검증](src/manifest_v2.rs)과 [자원 계획 형식](src/match_resources.rs)을 따른다.
+
+`match_execution`과 `GpuCapacity.model`의 생략은 직렬화에서도 생략하므로 새 선택 필드가
+없는 기존 V2의 canonical bytes와 digest를 바꾸지 않는다. 모델명 없는 과거 GPU 선언은
+실행 시 같은 UUID의 관측 용량이 선언값 이상인지 확인하는 기존 조건을 유지한다.
+모델명을 제공한 선언은 실행 직전 모델명과 전체 용량의 정확한 readback 일치를 요구한다.
+별도 장치의 모델명이 없는 내부 controlled 비교는 이 호환 경로로 통과하지 않는다.
+실행 검사는 [arena의 호스트 대조](../rz-arena/README.md#폰더링과-동시-엔진-자원-배분)를 따른다.
 
 ## 제공하는 동작
 
