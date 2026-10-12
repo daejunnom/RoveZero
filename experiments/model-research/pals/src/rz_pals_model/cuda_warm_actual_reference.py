@@ -288,6 +288,43 @@ def _input_fp32_bits(value, bits):
             compare(item["features"] if name == "records" else item, row, count)
 
 
+def _same_typed_fp32_input(left, right):
+    """Compare schema FP32 leaves by exact bits and all other JSON values exactly.
+
+    Rust serde may render a direct f32 using a shortest round-trip decimal while
+    serde_json::to_value promotes that f32 to an f64 decimal. Python's decoded
+    f64 values can therefore differ even though both identify the same f32.
+    This is not a numerical tolerance: signed zero and every finite f32 bit
+    remain significant. Typed validation, raw UTF-8 digest, canonical key and
+    supplied actual input-bit evidence are still required by each caller.
+    """
+    pending = [((), left, right)]
+    while pending:
+        path, first, second = pending.pop()
+        fp32_leaf = (
+            len(path) == 2 and path[0] in ("metadata", "query") and type(path[1]) is int
+            or len(path) == 4 and path[0] == "records" and type(path[1]) is int
+            and path[2] == "features" and type(path[3]) is int
+            or len(path) == 3 and path[0] == "divergence_features"
+            and all(type(part) is int for part in path[1:]))
+        if fp32_leaf:
+            if _f32_bytes(first) != _f32_bytes(second):
+                return False
+        elif type(first) is not type(second):
+            return False
+        elif type(first) is dict:
+            if set(first) != set(second):
+                return False
+            pending.extend((path + (key,), first[key], second[key]) for key in first)
+        elif type(first) is list:
+            if len(first) != len(second):
+                return False
+            pending.extend((path + (index,), value, second[index]) for index, value in enumerate(first))
+        elif first != second:
+            return False
+    return True
+
+
 def validate_actual_capture(capture, export_manifest_sha256):
     """Pure admission binds the exact full input, mode, seed and completed call."""
     _sha(export_manifest_sha256)
@@ -336,7 +373,7 @@ def validate_actual_capture(capture, export_manifest_sha256):
         if not 0 < len(encoded_input) <= MAX_CAPTURE_INPUT_BYTES or hashlib.sha256(encoded_input).hexdigest() != _sha(call["input_json_sha256_hex"]):
             raise ValueError("captured exact serde input bytes digest mismatch")
         parsed_input = _json_bytes(encoded_input)
-        if parsed_input != call["input"] or canonical_captured_input_key(parsed_input, config) != key:
+        if not _same_typed_fp32_input(parsed_input, call["input"]) or canonical_captured_input_key(parsed_input, config) != key:
             raise ValueError("captured input object differs from its actual serde bytes")
         _input_fp32_bits(call["input"], call["input_f32_bits"])
         seed_bytes = latent_bytes(call["initial_latent_bits"])
@@ -481,7 +518,7 @@ def _cost_packet(call, source, config, export_manifest_sha256, warm):
     _identity(call.get("execution_id"))
     key = canonical_captured_input_key(call["input"], config)
     encoded = call["input_json_utf8"].encode("utf-8")
-    if (not 0 < len(encoded) <= MAX_CAPTURE_INPUT_BYTES or _json_bytes(encoded) != call["input"]
+    if (not 0 < len(encoded) <= MAX_CAPTURE_INPUT_BYTES or not _same_typed_fp32_input(_json_bytes(encoded), call["input"])
             or _sha(call["input_json_sha256_hex"]) != hashlib.sha256(encoded).hexdigest()
             or _sha(call["input_key_hex"]) != key or key != source["input_key_hex"]):
         raise ValueError("cost exact input bytes or canonical key differ")

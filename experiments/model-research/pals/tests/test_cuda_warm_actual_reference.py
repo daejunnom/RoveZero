@@ -16,7 +16,7 @@ from rz_pals_model.cuda_warm_actual_reference import (
     _bind_native_source_identity, _compare_raw, _external_path, _json_bytes, _reference_call, _write_reference,
     _arguments, _cost_reference_profile, _cost_sample_origin, numeric_check_cuda_warm_actual_reference,
     canonical_captured_input_key, latent_bytes, seed_provenance_digest, run_actual_reference_cli,
-    validate_actual_capture, validate_captured_input, _reference_streams)
+    validate_actual_capture, validate_captured_input, _reference_streams, _same_typed_fp32_input)
 
 
 MANIFEST_SHA = "11" * 32
@@ -196,6 +196,109 @@ def _default_cost_capture():
 
 
 class CapturedReferenceAdmissionTests(unittest.TestCase):
+    def test_schema_fp32_decimal_views_bind_exact_same_bits_without_tolerance(self):
+        decoded, promoted = _input("critic"), _input("critic")
+        for left, right, index in ((decoded["metadata"], promoted["metadata"], 7),
+                                   (decoded["query"], promoted["query"], 10),
+                                   (decoded["records"][0]["features"], promoted["records"][0]["features"], 2),
+                                   (decoded["divergence_features"][0], promoted["divergence_features"][0], 0)):
+            left[index], right[index] = 0.013333334, struct.unpack("<f", struct.pack("<f", 0.013333334))[0]
+        self.assertNotEqual(decoded, promoted)
+        self.assertTrue(_same_typed_fp32_input(decoded, promoted))
+        config = ModelConfig.for_profile("full_line_interaction_v2")
+        self.assertEqual(canonical_captured_input_key(decoded, config), canonical_captured_input_key(promoted, config))
+
+    def test_actual_capture_accepts_serde_f32_decimal_with_exact_bytes_key_and_bits(self):
+        capture = _capture()
+        first = capture["calls"][0]
+        first["input"]["metadata"][7] = struct.unpack("<f", struct.pack("<f", 0.013333334))[0]
+        key = canonical_captured_input_key(first["input"], ModelConfig.for_profile("full_line_interaction_v2"))
+        first["input_key_hex"] = first["invocation"]["input_key_hex"] = first["invocation"]["invocation_key_hex"] = key
+        first["input_f32_bits"]["metadata"][7] = _bits(first["input"]["metadata"][7])
+        direct = copy.deepcopy(first["input"])
+        direct["metadata"][7] = 0.013333334
+        first["input_json_utf8"] = json.dumps(direct, separators=(",", ":"), allow_nan=False)
+        first["input_json_sha256_hex"] = hashlib.sha256(first["input_json_utf8"].encode("utf-8")).hexdigest()
+        capture["calls"][2]["seed_provenance"]["source_input_hex"] = key
+        before = copy.deepcopy(capture)
+        validate_actual_capture(capture, MANIFEST_SHA)
+        self.assertEqual(capture, before)
+        self.assertNotEqual(_json_bytes(first["input_json_utf8"].encode("utf-8")), first["input"])
+
+    def test_same_decimal_view_in_cost_packet_keeps_exact_context_seed_and_owner_guards(self):
+        capture = _cost_capture()
+        cost = capture["cost_same_seed_context"]
+        calls = capture["calls"] + [cost["original_accepted_repair_source"]] + cost["warm"]["calls"] + cost["fresh"]["calls"]
+        config = ModelConfig.for_profile("full_line_interaction_v2")
+        for call in calls:
+            call["input"]["metadata"][7] = struct.unpack("<f", struct.pack("<f", 0.013333334))[0]
+            key = canonical_captured_input_key(call["input"], config)
+            call["input_key_hex"] = call["invocation"]["input_key_hex"] = key
+            if not call["warm_start"]:
+                call["invocation"]["invocation_key_hex"] = key
+            call["input_f32_bits"]["metadata"][7] = _bits(call["input"]["metadata"][7])
+            direct = copy.deepcopy(call["input"])
+            direct["metadata"][7] = 0.013333334
+            call["input_json_utf8"] = json.dumps(direct, separators=(",", ":"), allow_nan=False)
+            call["input_json_sha256_hex"] = hashlib.sha256(call["input_json_utf8"].encode("utf-8")).hexdigest()
+            if call["warm_start"]:
+                call["seed_provenance"]["source_input_hex"] = key
+        cost["same_target_input_json_sha256_hex"] = cost["original_accepted_repair_source"]["input_json_sha256_hex"]
+        cost["warm"]["stable_accepted_seed_provenance"] = copy.deepcopy(cost["warm"]["calls"][0]["seed_provenance"])
+        before = copy.deepcopy(capture)
+        validate_actual_capture(capture, MANIFEST_SHA)
+        self.assertEqual(capture, before)
+
+    def test_fp32_identity_refuses_one_bit_signed_zero_bool_and_nonfinite(self):
+        value = _input()
+        for label in ("one_bit", "signed_zero", "bool", "nan", "infinity"):
+            changed = copy.deepcopy(value)
+            changed["metadata"][7] = {
+                "one_bit": struct.unpack("<f", struct.pack("<I", 1))[0], "signed_zero": -0.0,
+                "bool": False, "nan": float("nan"), "infinity": float("inf")}[label]
+            with self.subTest(label=label):
+                if label in ("bool", "nan", "infinity"):
+                    with self.assertRaises(ValueError):
+                        _same_typed_fp32_input(value, changed)
+                else:
+                    self.assertFalse(_same_typed_fp32_input(value, changed))
+
+    def test_non_fp32_structure_types_ids_relations_and_moves_remain_exact(self):
+        value = _input()
+        for label in ("integer_as_float", "integer_as_bool", "record_id", "role", "relation", "move", "extra", "length"):
+            changed = copy.deepcopy(value)
+            if label == "integer_as_float": changed["board"][0] = 0.0
+            elif label == "integer_as_bool": changed["board"][0] = False
+            elif label == "record_id": changed["records"][0]["record_id"] = 11
+            elif label == "role": changed["role"] = "critic"
+            elif label == "relation": changed["full_line"]["records"][1].update(parent=None, supersedes=0)
+            elif label == "move": changed["full_line"]["query_proposal"][1]["to"] = 39
+            elif label == "extra": changed["records"][0]["unexpected_features"] = [0.0]
+            else: changed["metadata"].pop()
+            with self.subTest(label=label):
+                self.assertFalse(_same_typed_fp32_input(value, changed))
+
+    def test_decimal_view_fix_does_not_bypass_raw_serde_sha_or_actual_bit_checks(self):
+        capture = _capture()
+        first = capture["calls"][0]
+        first["input"]["metadata"][7] = struct.unpack("<f", struct.pack("<f", 0.013333334))[0]
+        config = ModelConfig.for_profile("full_line_interaction_v2")
+        key = canonical_captured_input_key(first["input"], config)
+        first["input_key_hex"] = first["invocation"]["input_key_hex"] = first["invocation"]["invocation_key_hex"] = key
+        capture["calls"][2]["seed_provenance"]["source_input_hex"] = key
+        first["input_f32_bits"]["metadata"][7] = _bits(first["input"]["metadata"][7])
+        direct = copy.deepcopy(first["input"])
+        direct["metadata"][7] = 0.013333334
+        first["input_json_utf8"] = json.dumps(direct, separators=(",", ":"), allow_nan=False)
+        first["input_json_sha256_hex"] = hashlib.sha256(first["input_json_utf8"].encode("utf-8")).hexdigest()
+        for label in ("digest", "actual_bits", "key"):
+            changed = copy.deepcopy(capture)
+            if label == "digest": changed["calls"][0]["input_json_utf8"] += " "
+            elif label == "actual_bits": changed["calls"][0]["input_f32_bits"]["metadata"][7] ^= 1
+            else: changed["calls"][0]["input_key_hex"] = "66" * 32
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                validate_actual_capture(changed, MANIFEST_SHA)
+
     def test_progress_samples_bind_resident_prefix_and_final_owner_without_rewriting_capture(self):
         legacy, progress = _cost_capture(), _progress_cost_capture()
         for capture in (legacy, progress):
