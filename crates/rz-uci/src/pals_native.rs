@@ -229,6 +229,18 @@ pub enum NativeQueryKind {
 fn model_error(error: impl std::fmt::Display) -> RoleError {
     RoleError::Backend(error.to_string())
 }
+#[cfg(any(feature = "onnx-cpu", test))]
+fn runtime_admission_error(error: rz_contracts::ContractError) -> RoleError {
+    // Preserve the typed role deadline used by PALS bounded search completion.
+    // Other contract failures retain their original Backend diagnostic.
+    if error.stage == rz_contracts::Stage::Admission
+        && error.code == rz_contracts::ErrorCode::Expired
+    {
+        RoleError::Deadline
+    } else {
+        model_error(error)
+    }
+}
 fn flag(value: bool) -> f32 {
     f32::from(u8::from(value))
 }
@@ -6621,7 +6633,7 @@ mod native {
                 let _ = self.owner.observe("admission", |observer| {
                     observer.rejected(id, NativeRoleRejection::Admission)
                 });
-                return Err(model_error(error));
+                return Err(runtime_admission_error(error));
             }
             let mut outcome = None;
             let mut drain_until = None;
@@ -11422,6 +11434,52 @@ mod tests {
     use rz_search::pals::store::StateId;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
+    #[test]
+    fn only_typed_runtime_admission_expired_is_a_role_deadline() {
+        use rz_contracts::{ContractError, ErrorCode, Stage};
+
+        let codes = [
+            ErrorCode::InvalidInput,
+            ErrorCode::UnsupportedContract,
+            ErrorCode::BackendUnavailable,
+            ErrorCode::ResourceExhausted,
+            ErrorCode::NumericalFailure,
+            ErrorCode::IdentityMismatch,
+            ErrorCode::BackendFailure,
+            ErrorCode::Canceled,
+            ErrorCode::Expired,
+            ErrorCode::Stale,
+        ];
+        let stages = [
+            Stage::Contract,
+            Stage::Admission,
+            Stage::Backend,
+            Stage::Output,
+            Stage::Backup,
+        ];
+        for detail in ["deadline has expired", "PALS runtime scheduling fault"] {
+            for stage in stages {
+                for code in codes {
+                    let error = ContractError::new(code, stage, detail);
+                    if stage == Stage::Admission && code == ErrorCode::Expired {
+                        assert!(matches!(
+                            runtime_admission_error(error),
+                            RoleError::Deadline
+                        ));
+                    } else {
+                        assert!(matches!(
+                            runtime_admission_error(error),
+                            RoleError::Backend(message) if message == error.to_string()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(matches!(
+            model_error("Admission/Expired: deadline has expired"),
+            RoleError::Backend(_)
+        ));
+    }
     #[test]
     fn product_input_meaning_requires_the_exact_rules_profile() {
         let expected = pals_rules_encoding_semantic_digest();
