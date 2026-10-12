@@ -18,7 +18,7 @@ experimental-backup-scratch = []
 
 [dependencies]
 rz-contracts.workspace = true
-rz-position.workspace = true
+rz-position = { workspace = true, features = ["contracts"] }
 rz-telemetry.workspace = true
 rz-runtime.workspace = true
 serde.workspace = true

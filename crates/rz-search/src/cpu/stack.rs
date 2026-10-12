@@ -208,6 +208,45 @@ pub(super) fn run(
     resume: Option<&CpuResumeToken>,
     observer: &mut dyn FnMut(CpuIterationProgress),
 ) -> Result<CpuReport, CpuError> {
+    run_inner(
+        engine, position, root_moves, limits, cancel, resume, observer, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_controlled(
+    engine: &mut CpuEngine,
+    position: &Position,
+    root_moves: Option<&[BoardMove]>,
+    limits: CpuLimits,
+    cancel: &AtomicBool,
+    resume: Option<&CpuResumeToken>,
+    observer: &mut dyn FnMut(CpuIterationProgress),
+    slice: &CpuSliceControl,
+) -> Result<CpuReport, CpuError> {
+    run_inner(
+        engine,
+        position,
+        root_moves,
+        limits,
+        cancel,
+        resume,
+        observer,
+        Some(slice),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_inner(
+    engine: &mut CpuEngine,
+    position: &Position,
+    root_moves: Option<&[BoardMove]>,
+    limits: CpuLimits,
+    cancel: &AtomicBool,
+    resume: Option<&CpuResumeToken>,
+    observer: &mut dyn FnMut(CpuIterationProgress),
+    cooperative: Option<&CpuSliceControl>,
+) -> Result<CpuReport, CpuError> {
     engine.last_attempt_work = Some(CpuWork::default());
     if resume.is_none() {
         engine.invalidate_paused_stack();
@@ -346,6 +385,7 @@ pub(super) fn run(
     let mut control = Control {
         limits,
         cancellation: cancel,
+        cooperative,
         nodes: 0,
         quiescence_nodes: 0,
         tt_hits: 0,
@@ -356,12 +396,14 @@ pub(super) fn run(
         // task.cumulative diagnostics never initialize these counters.
         engine.observe_paused_stack_initial_work(control.actual_work());
     }
-    observer(CpuIterationProgress {
-        best_move: task.best.first().copied(),
-        score: task.score,
-        completed_depth: task.completed_depth,
-        nodes: 0,
-    });
+    if cooperative.is_none() || task.completed_depth > 0 {
+        observer(CpuIterationProgress {
+            best_move: task.best.first().copied(),
+            score: task.score,
+            completed_depth: task.completed_depth,
+            nodes: 0,
+        });
+    }
     let result = drive(engine, &mut task, &mut control, observer);
     let work = control.actual_work();
     task.value = Some(control.value);
@@ -399,10 +441,14 @@ pub(super) fn run(
             return Err(error);
         }
     };
-    let can_pause = matches!(
-        completion,
-        CpuCompletion::NodeLimit | CpuCompletion::Deadline
-    );
+    let can_pause = if cooperative.is_some() {
+        completion == CpuCompletion::Yielded
+    } else {
+        matches!(
+            completion,
+            CpuCompletion::NodeLimit | CpuCompletion::Deadline
+        )
+    };
     let mut token = None;
     if can_pause {
         if let Err(error) = task.check_memory() {
@@ -486,6 +532,51 @@ fn drive(
     observer: &mut dyn FnMut(CpuIterationProgress),
 ) -> Result<(), Abort> {
     loop {
+        // A coherent completed iteration is the only publishable score. A
+        // control request never exposes frame alpha or an unfinished child.
+        if let Some(slice) = control.cooperative {
+            if let Some(sequence) = slice
+                .mailbox
+                .snapshot()
+                .pending_publish()
+                .filter(|_| task.completed_depth > 0)
+            {
+                observer(CpuIterationProgress {
+                    best_move: task.best.first().copied(),
+                    score: task.score,
+                    completed_depth: task.completed_depth,
+                    nodes: control.nodes,
+                });
+                slice
+                    .mailbox
+                    .acknowledge_publish_progress(sequence)
+                    .map_err(|_| {
+                        Abort::Error(CpuError::InvalidLimits(
+                            "CPU progress acknowledgement failed",
+                        ))
+                    })?;
+            }
+            if task.frames.is_empty()
+                && task.returned.is_none()
+                && task.completed_depth >= task.target_depth
+            {
+                let controls = slice.mailbox.snapshot();
+                if control.cancellation.load(Ordering::Acquire)
+                    || controls.is_cancelled()
+                    || controls.terminal
+                {
+                    return Err(Abort::Stop(CpuCompletion::Canceled));
+                }
+                if control
+                    .limits
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return Err(Abort::Stop(CpuCompletion::Deadline));
+                }
+                return Ok(());
+            }
+        }
         control.check_stop()?;
         if task.frames.is_empty() {
             if let Some(value) = task.returned.take() {
@@ -2038,6 +2129,7 @@ mod tests {
             let mut control = Control {
                 limits: limits(100_000),
                 cancellation: &AtomicBool::new(false),
+                cooperative: None,
                 nodes: 0,
                 quiescence_nodes: 0,
                 tt_hits: 0,

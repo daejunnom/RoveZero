@@ -758,6 +758,12 @@ fn raw_report(
         CpuCompletion::NodeLimit => "node_limit",
         CpuCompletion::Deadline => "deadline",
         CpuCompletion::Canceled => "canceled",
+        CpuCompletion::Yielded => {
+            return Err(CpuTaskError::new(
+                "unsupported_completion",
+                "cooperative Yield requires the adaptive Job/Slice receipt",
+            ));
+        }
         CpuCompletion::QuiescenceLimit => "quiescence_limit",
         CpuCompletion::Terminal(_) => "rules_terminal",
     };

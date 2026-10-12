@@ -382,6 +382,12 @@ fn capture_report(
         CpuCompletion::NodeLimit => SearchCompletion::NodeLimit,
         CpuCompletion::Deadline => SearchCompletion::Deadline,
         CpuCompletion::Canceled => SearchCompletion::Canceled,
+        CpuCompletion::Yielded => {
+            return Err(CandidateTaskError::new(
+                "unsupported_completion",
+                "cooperative Yield requires the adaptive Job/Slice receipt",
+            ));
+        }
         CpuCompletion::QuiescenceLimit => SearchCompletion::QuiescenceLimit,
         CpuCompletion::Terminal(_) => SearchCompletion::RulesTerminal,
     };
