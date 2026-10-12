@@ -8,12 +8,16 @@ use std::collections::BTreeSet;
 
 mod full_line;
 pub use full_line::{PalsFullLineInput, PalsRecordLine, PreparedPalsFullLineTensors};
+pub mod virtual_review;
 
 pub const PALS_MODEL_SCHEMA: &str = "rovezero.pals-model.v1";
 pub const PALS_ENCODING_SCHEMA: &str = "rovezero.pals-board-records.v1";
 /// Semantic version, distinct from the legacy v2 shared-P/C export layout.
 pub const PALS_MODEL_SEMANTICS_V2: &str = "rovezero.pals-model-semantics.v2";
 pub const PALS_ENCODING_SCHEMA_V2: &str = "rovezero.pals-board-records.v2";
+pub const PALS_MODEL_SCHEMA_V3: &str = virtual_review::MODEL_SCHEMA;
+pub const PALS_MODEL_SEMANTICS_V3: &str = virtual_review::MODEL_SEMANTICS;
+pub const PALS_ENCODING_SCHEMA_V3: &str = virtual_review::ENCODING;
 pub const MAX_LINE_PLY: usize = 256;
 pub const QUERY_LINE_COUNT: usize = 3;
 pub const METADATA_FEATURES: usize = 16;
@@ -24,6 +28,8 @@ pub const INDEPENDENT_RECORD_PROJECTION_SEMANTICS: &str =
     "rz-pals-independent-record-fp32/1;16-feature-bits;four-fields;no-record-position;no-cross-record-context";
 pub const INDEPENDENT_RECORD_PROJECTION_SEMANTICS_V2: &str =
     "rz-pals-independent-record-fp32/2;16-feature-bits;full-ordered-move-line;masked-256-ply;no-record-position;no-relationships;no-cross-record-context";
+pub const INDEPENDENT_RECORD_PROJECTION_SEMANTICS_V3: &str =
+    "rz-pals-independent-record-fp32/3;8-feature-bits;exact-anchor-board-and-rules-metadata;full-ordered-move-line;dynamic-approved-L-bucket;no-record-position;no-relationships;no-cross-record-context";
 pub const QUERY_FEATURES: usize = 16;
 pub const DIVERGENCE_FEATURES: usize = 8;
 /// Same ordered vocabulary as the versioned verifier-data contract.
@@ -108,6 +114,64 @@ pub const PALS_REGISTERED_LEGACY_HEAD_DEFINITION: &str =
 pub const PALS_REGISTERED_INTERACTION_HEAD_DEFINITION: &str =
     "concat(candidate-embedding384,context384);768->128-with-bias;silu;128->1-no-bias;scalar";
 
+/// V3 has its own complete ABI declaration. The V1/V2 16-feature definition is
+/// not reused as a claim about the compact 8-feature input or four-anchor bank.
+pub const PALS_REGISTERED_VIRTUAL_REVIEW_DEFINITION: &str = concat!(
+    "anchors:1..4;root-local-anchor0-active;piece13x384+square64x384;metadata16->2x384-no-bias;",
+    "shared-board-bank:66-tokens-per-anchor;2x(rmsnorm-eps1e-6,gqa-q6-kv2-d64,residual,rmsnorm,swiglu1024-no-bias,residual);",
+    "anchor-context-mean66-tokens-times-anchor-mask;no-bucket-anchor-session-or-weight-copies;",
+    "records:selected-R0..64;physical-masked-slot1-when-empty;8-features->4x2;field2->384-no-bias+learned-field4x384;",
+    "record-1x-encoder-block-per-independent-record;mean4-fields+line64->384+anchor-context384->384-no-bias;",
+    "public-k384->128-no-bias;public-v384->128-no-bias;root66-before-records;bool-memory-mask;",
+    "public-extra-anchor-context-f32[B,A,384];private-query-anchor-three-local-refs-including-empty-lines;",
+    "private:hard-routed-proposer-critic-validator;learned-initial16x384+query8->384-no-bias;",
+    "initial-add-order:query8+line3x64,relation-summary,anchor3x384->384;",
+    "2-iterations-of-2-reader-blocks;shared-cross-gqa-and-latent-self-gqa;private-rmsnorm-swiglu1024;",
+    "attention-scale64-pow-minus-half;repeat-kv-groups3;masked-softmax-last-axis;",
+    "context-mean16-latents;wdl384->3-no-bias;critic-divergence8->384-no-bias-times-context->1-no-bias;validator384->7-no-bias;",
+    "candidate:from64x384,to64x384,promotion5x384;concat1152->384-no-bias;",
+    "task-order:defend_response,attack_repair,widen_responses,lower_selectivity,resume_task,cross_profile_recheck,defer;",
+    "anchor-board-i64[B,A,64];anchor-metadata-f32[B,A,16];anchor-mask-bool[B,A];records-f32[B,R,8];record-anchor-i64[B,R];",
+    "query-f32[B,8];query-anchor-i64[B,3];record-mask-bool[B,R];candidates-i64[B,C,3];candidate-mask-bool[B,C];",
+    "critic-divergence-f32[B,D,8];critic-divergence-mask-bool[B,D];inactive-output-minus1e9;fp32;tf32-off;",
+    "actual-game-history-not-appended-as-review-tokens;exact-Rules-history-retained-by-owner-seal;",
+    "record-feature-order:proposal,counterexample,repair,cpu_verification,perspective,completed_iteration,rules_terminal,line_nonempty;",
+    "query-feature-order:propose_policy,reply_policy,repair_policy,divergence_policy,value_fresh,task_policy,perspective,counter_present;",
+    "CP-depth-global-state-ID-hash-revision-not-numerical-features;parent-supersedes-local-graph-only"
+);
+pub const PALS_REGISTERED_VIRTUAL_LINE_DEFINITION: &str = concat!(
+    "shared-record-query-line-bank;width64;from64x64,to64x64,promotion5x64;concat192->64-no-bias+ply256x64;",
+    "physical-L-minimal-bucket8,16,32,64,128,256;single-dynamic-L-graph;",
+    "masked-token-zero-before-lookup;mask-after-embedding-and-each-residual;",
+    "2x-conv1d64->64-kernel3-dilation1,2-padding1,2-no-bias;residual-silu;",
+    "pool64->1-no-bias;inactive-score-minus1e9;softmax-times-mask;weighted-sum;empty-line-exact-zero;",
+    "record-line-i64[B,R,L,3];record-line-mask-bool[B,R,L];query-line-i64[B,3,L,3];query-line-mask-bool[B,3,L];",
+    "token-budget128,256,512;count-all-selected-record-and-query-sequences-including-duplicates;",
+    "relations-i64[B,R,2];absent-minus1;range-self-cycle-validation;independent-public-record-kv-before-role-mixing;",
+    "own-kv256+parent-kv256+supersedes-kv256;absent-related-kv-zero;concat768->128-with-bias;silu;128->384-no-bias;",
+    "active-record-and-any-relation-mask;masked-sum-divide-clamped-active-count;",
+    "Fresh-and-ApproxWarm-separate-typed-namespace;accepted-final-seed-same-model-role-Rules-query-epoch;",
+    "value-and-validator-Fresh-only;Warm-prefix-Identity-no-query-double-add;physical-owner-fence-before-reuse"
+);
+
+pub const PALS_VIRTUAL_MODEL_BOUNDARY_SOURCE_NAMES: [&str; 7] = [
+    "crates/rz-eval/src/pals_model.rs", "crates/rz-eval/src/pals_model/virtual_review.rs",
+    "experiments/model-research/pals/src/rz_pals_model/config.py", "experiments/model-research/pals/src/rz_pals_model/model.py",
+    "experiments/model-research/pals/src/rz_pals_model/virtual_review.py", "experiments/model-research/pals/src/rz_pals_model/onnx_virtual_review.py",
+    "experiments/model-research/pals/src/rz_pals_model/artifacts.py",
+];
+pub fn compiled_virtual_model_boundary_sha256() -> [u8;32] {
+    let mut hash=Sha256::new();hash_model_pin_frame(&mut hash,"domain",b"rz-pals-compiled-virtual-model-boundary-sources/1");
+    let sources=[include_str!("pals_model.rs"),include_str!("pals_model/virtual_review.rs"),
+        include_str!("../../../experiments/model-research/pals/src/rz_pals_model/config.py"),
+        include_str!("../../../experiments/model-research/pals/src/rz_pals_model/model.py"),
+        include_str!("../../../experiments/model-research/pals/src/rz_pals_model/virtual_review.py"),
+        include_str!("../../../experiments/model-research/pals/src/rz_pals_model/onnx_virtual_review.py"),
+        include_str!("../../../experiments/model-research/pals/src/rz_pals_model/artifacts.py")];
+    for(name,source)in PALS_VIRTUAL_MODEL_BOUNDARY_SOURCE_NAMES.into_iter().zip(sources){hash_model_pin_frame(&mut hash,name,source.as_bytes());}
+    hash.finalize().into()
+}
+
 pub const PALS_COMPILED_MODEL_BOUNDARY_DOMAIN: &str = "rz-pals-compiled-model-boundary-sources/1";
 /// Source names are repository-relative logical names, in hash order. Payloads
 /// are the exact UTF-8 bytes captured by `include_str!` at compilation, including
@@ -172,6 +236,7 @@ pub enum PalsModelProfile {
     FullLineV2,
     InteractionHeadV2,
     FullLineInteractionV2,
+    VirtualReviewV1,
 }
 impl PalsModelProfile {
     pub const fn is_legacy(&self) -> bool {
@@ -183,30 +248,40 @@ impl PalsModelProfile {
             Self::FullLineV2 => "full_line_v2",
             Self::InteractionHeadV2 => "interaction_head_v2",
             Self::FullLineInteractionV2 => "full_line_interaction_v2",
+            Self::VirtualReviewV1 => "virtual_review_v1",
         }
     }
     pub const fn uses_full_line(self) -> bool {
         matches!(self, Self::FullLineV2 | Self::FullLineInteractionV2)
     }
     pub const fn uses_interaction_head(self) -> bool {
-        matches!(self, Self::InteractionHeadV2 | Self::FullLineInteractionV2)
+        matches!(self, Self::InteractionHeadV2 | Self::FullLineInteractionV2 | Self::VirtualReviewV1)
+    }
+    pub const fn uses_virtual_review(self) -> bool {
+        matches!(self,Self::VirtualReviewV1)
     }
     pub const fn model_semantics(self) -> &'static str {
-        if self.is_legacy() {
+        if self.uses_virtual_review() {
+            PALS_MODEL_SEMANTICS_V3
+        } else if self.is_legacy() {
             PALS_MODEL_SCHEMA
         } else {
             PALS_MODEL_SEMANTICS_V2
         }
     }
     pub const fn encoding_schema(self) -> &'static str {
-        if self.is_legacy() {
+        if self.uses_virtual_review() {
+            PALS_ENCODING_SCHEMA_V3
+        } else if self.is_legacy() {
             PALS_ENCODING_SCHEMA
         } else {
             PALS_ENCODING_SCHEMA_V2
         }
     }
     pub const fn independent_projection_semantics(self) -> &'static str {
-        if self.uses_full_line() {
+        if self.uses_virtual_review() {
+            INDEPENDENT_RECORD_PROJECTION_SEMANTICS_V3
+        } else if self.uses_full_line() {
             INDEPENDENT_RECORD_PROJECTION_SEMANTICS_V2
         } else {
             INDEPENDENT_RECORD_PROJECTION_SEMANTICS
@@ -217,7 +292,7 @@ impl PalsModelProfile {
     /// Independent producers can hash these frames with the documented framing.
     /// This API is separate from the historical config JSON and all cache keys.
     pub fn registered_semantics_frames(self, mut consume: impl FnMut(&'static str, &[u8])) {
-        consume("domain", PALS_REGISTERED_SEMANTICS_DOMAIN.as_bytes());
+        consume("domain", if self.uses_virtual_review(){b"rz-pals-registered-model-semantics/3"}else{PALS_REGISTERED_SEMANTICS_DOMAIN.as_bytes()});
         consume("model_profile", self.as_str().as_bytes());
         consume("model_semantics", self.model_semantics().as_bytes());
         consume("encoding_schema", self.encoding_schema().as_bytes());
@@ -243,11 +318,13 @@ impl PalsModelProfile {
         }
         consume(
             "structure.public_and_private",
-            PALS_REGISTERED_BASE_DEFINITION.as_bytes(),
+            if self.uses_virtual_review(){PALS_REGISTERED_VIRTUAL_REVIEW_DEFINITION}else{PALS_REGISTERED_BASE_DEFINITION}.as_bytes(),
         );
         consume(
             "structure.line_encoder",
-            if self.uses_full_line() {
+            if self.uses_virtual_review() {
+                PALS_REGISTERED_VIRTUAL_LINE_DEFINITION
+            } else if self.uses_full_line() {
                 PALS_REGISTERED_FULL_LINE_DEFINITION
             } else {
                 PALS_REGISTERED_SUMMARY_DEFINITION
@@ -324,6 +401,7 @@ impl PalsModelConfig {
     pub const fn for_profile(profile: PalsModelProfile) -> Self {
         Self {
             profile,
+            max_records: if profile.uses_virtual_review(){64}else{128},
             ..Self::baseline()
         }
     }
@@ -485,6 +563,11 @@ impl PalsModelInput {
     }
     pub fn validate(&self, config: &PalsModelConfig) -> Result<(), PalsModelError> {
         config.validate()?;
+        if config.profile.uses_virtual_review() {
+            // The legacy 16-feature input must never become a compact V3
+            // tensor by changing its profile declaration alone.
+            return Err(PalsModelError::UnsupportedConfiguration);
+        }
         if self.board.len() != 64 || self.board.iter().any(|v| *v > 12) {
             return Err(PalsModelError::Shape("board"));
         }
@@ -834,6 +917,9 @@ impl PalsModelConfig {
         divergences: usize,
     ) -> Result<PalsMatmulFlops, PalsModelError> {
         self.validate()?;
+        if self.profile.uses_virtual_review() {
+            return Err(PalsModelError::Shape("V3 FLOPs requires physical anchors and L bucket"));
+        }
         if records > self.max_records
             || candidates > self.max_candidates
             || divergences > self.max_divergences
@@ -888,6 +974,27 @@ impl PalsModelConfig {
             role_forward,
         })
     }
+    /// Same analytic GEMM/Conv products as Python, with explicitly observed
+    /// physical A/L. This is not a latency, backward or peak-memory estimate.
+    pub fn virtual_review_matmul_flops(&self, role:PalsRole, records:usize, candidates:usize, divergences:usize, anchors:usize, length_bucket:usize) -> Result<PalsMatmulFlops,PalsModelError> {
+        self.validate()?;
+        if !self.profile.uses_virtual_review() { return Err(PalsModelError::UnsupportedConfiguration); }
+        if records>64 || candidates>256 || divergences>128 || !(1..=4).contains(&anchors) || !virtual_review::LENGTH_BUCKETS.contains(&length_bucket) { return Err(PalsModelError::Capacity("V3 FLOPs actual shape")); }
+        let (w,kv,h,n)=(self.width as u64,(self.kv_heads*self.head_dimension)as u64,self.ffn_width as u64,self.latent_slots as u64);
+        let (r,c,d,a,l)=(records.max(1)as u64,candidates.max(1)as u64,divergences.max(1)as u64,anchors as u64,length_bucket as u64);
+        let s=66+r;let self_attn=|tokens:u64|2*tokens*w*(2*w+2*kv)+4*tokens*tokens*w;
+        let ffn=|tokens:u64|6*tokens*w*h;
+        let line=2*l*(3*64*64+2*3*64*64+64);
+        let public_encode=a*(2*16*2*w+self.board_blocks as u64*(self_attn(66)+ffn(66)))
+            +r*(2*8*w+self.record_blocks as u64*(self_attn(4)+ffn(4))+line+2*64*w+2*w*w)+4*s*w*kv;
+        let cross=4*n*w*w+4*n*s*w;
+        let mut role_forward=2*8*w+(self.recurrent_blocks*self.iterations)as u64*(cross+self_attn(n)+ffn(n))
+            +2*c*3*w*w+2*c*w+2*w*3+3*line+2*3*64*w+2*3*w*w+r*(2*3*2*kv*128+2*128*w)
+            +c*(2*2*w*128+2*128-2*w);
+        if role==PalsRole::Critic {role_forward+=2*d*8*w+2*d*w;}
+        if role==PalsRole::Validator {role_forward+=2*w*V_TASKS as u64;}
+        Ok(PalsMatmulFlops{public_encode,role_forward})
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -917,6 +1024,21 @@ impl std::error::Error for PalsModelError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn virtual_profile_has_a_separate_abi_and_requires_explicit_physical_flops() {
+        let config=PalsModelConfig::for_profile(PalsModelProfile::VirtualReviewV1);
+        config.validate().unwrap();assert_eq!(config.max_records,64);
+        assert!(!config.profile.uses_full_line());assert!(config.profile.uses_virtual_review());
+        assert_eq!(config.profile.model_semantics(),PALS_MODEL_SEMANTICS_V3);
+        assert_eq!(config.profile.encoding_schema(),PALS_ENCODING_SCHEMA_V3);
+        assert!(input().validate(&config).is_err());
+        let mut base=Vec::new();config.profile.registered_semantics_frames(|name,payload|{if name=="structure.public_and_private"{base.extend_from_slice(payload);}});
+        assert_ne!(base,PALS_REGISTERED_BASE_DEFINITION.as_bytes());
+        assert!(String::from_utf8(base).unwrap().contains("query-f32[B,8]"));
+        assert!(config.matmul_flops(PalsRole::Proposer,3,7,0).is_err());
+        assert_eq!(config.virtual_review_matmul_flops(PalsRole::Proposer,3,7,0,2,8).unwrap(),PalsMatmulFlops{public_encode:911_496_192,role_forward:258_700_288});
+        assert!(config.virtual_review_matmul_flops(PalsRole::Proposer,3,7,0,2,24).is_err());
+    }
     fn input() -> PalsModelInput {
         PalsModelInput {
             role: PalsRole::Proposer,
