@@ -1,5 +1,7 @@
 //! Host evidence and bounded ponder lifecycle audit for the opt-in match policy.
 use crate::ArenaError;
+#[cfg(any(target_os = "linux", test))]
+use rz_experiments::GpuCapacity;
 use rz_experiments::{MatchExecutionV1, MatchHardware};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -9,6 +11,75 @@ pub struct MatchHardwareProbe {
     pub hardware: MatchHardware,
     pub gpu_inventory_known: bool,
     pub gpu_probe_error: Option<String>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+const GPU_INVENTORY_MAX_BYTES: usize = 8192;
+
+/// Parse only the bounded, unquoted three-column renderer requested below.
+/// A successful process exit alone is not evidence of a usable inventory.
+#[cfg(any(target_os = "linux", test))]
+fn parse_gpu_inventory(bytes: &[u8]) -> Result<Vec<GpuCapacity>, ArenaError> {
+    if bytes.len() > GPU_INVENTORY_MAX_BYTES {
+        return Err(ArenaError::Budget(
+            "GPU inventory exceeds byte bound".into(),
+        ));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| ArenaError::Invalid("invalid GPU inventory encoding".into()))?;
+    let mut gpus: Vec<GpuCapacity> = Vec::new();
+    for line in text.lines() {
+        if gpus.len() >= 16 || line.len() > 512 {
+            return Err(ArenaError::Budget(
+                "GPU inventory row bound exceeded".into(),
+            ));
+        }
+        let mut fields = line.split(',');
+        let id = fields.next().unwrap_or_default().trim_matches(' ');
+        let model = fields
+            .next()
+            .ok_or_else(|| ArenaError::Invalid("invalid GPU inventory row".into()))?
+            .trim_matches(' ');
+        let memory = fields
+            .next()
+            .ok_or_else(|| ArenaError::Invalid("invalid GPU inventory row".into()))?
+            .trim_matches(' ');
+        if fields.next().is_some()
+            || id.is_empty()
+            || id.len() > 80
+            || !id.as_bytes()[0].is_ascii_alphanumeric()
+            || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || model.is_empty()
+            || model.len() > 256
+            || !model
+                .bytes()
+                .all(|b| (b.is_ascii_graphic() || b == b' ') && b != b'"')
+        {
+            return Err(ArenaError::Invalid("invalid GPU inventory identity".into()));
+        }
+        // memory.total with nounits is an integral MiB count. Reject signs,
+        // floating/non-finite values, units and overflow rather than coercing.
+        let memory = (!memory.is_empty() && memory.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| memory.parse::<u64>().ok())
+            .flatten()
+            .and_then(|m| m.checked_mul(1024 * 1024))
+            .filter(|m| *m > 0)
+            .ok_or_else(|| ArenaError::Invalid("invalid GPU capacity".into()))?;
+        if gpus.iter().any(|gpu| gpu.id == id) {
+            return Err(ArenaError::Invalid(
+                "duplicate GPU inventory identity".into(),
+            ));
+        }
+        gpus.push(GpuCapacity {
+            id: id.into(),
+            model: Some(model.into()),
+            vram_bytes: memory,
+        });
+    }
+    if gpus.is_empty() {
+        return Err(ArenaError::Invalid("GPU inventory is empty".into()));
+    }
+    Ok(gpus)
 }
 #[cfg(not(target_os = "linux"))]
 pub fn probe_match_hardware() -> Result<MatchHardwareProbe, ArenaError> {
@@ -48,14 +119,14 @@ pub fn probe_match_hardware() -> Result<MatchHardwareProbe, ArenaError> {
         let output = crate::supervise(
             &file,
             &[
-                "--query-gpu=uuid,memory.total".into(),
+                "--query-gpu=uuid,name,memory.total".into(),
                 "--format=csv,noheader,nounits".into(),
             ],
             Path::new("/tmp"),
             crate::ProcessLimits {
                 wall_ms: 3000,
                 shutdown_grace_ms: 500,
-                max_output_bytes: 8192,
+                max_output_bytes: GPU_INVENTORY_MAX_BYTES as u64,
                 max_child_processes: 3,
             },
             None,
@@ -75,24 +146,7 @@ pub fn probe_match_hardware() -> Result<MatchHardwareProbe, ArenaError> {
             ));
             false
         } else {
-            let text = std::str::from_utf8(&output.stdout)
-                .map_err(|_| ArenaError::Invalid("invalid GPU inventory encoding".into()))?;
-            for line in text.lines() {
-                let (id, memory) = line
-                    .split_once(',')
-                    .ok_or_else(|| ArenaError::Invalid("invalid GPU inventory row".into()))?;
-                let memory = memory
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-                    .and_then(|m| m.checked_mul(1024 * 1024))
-                    .filter(|m| *m > 0)
-                    .ok_or_else(|| ArenaError::Invalid("invalid GPU capacity".into()))?;
-                gpus.push(rz_experiments::GpuCapacity {
-                    id: id.trim().into(),
-                    vram_bytes: memory,
-                });
-            }
+            gpus = parse_gpu_inventory(&output.stdout)?;
             true
         }
     } else {
@@ -109,10 +163,17 @@ pub fn probe_match_hardware() -> Result<MatchHardwareProbe, ArenaError> {
 }
 pub fn validate_match_host(execution: &MatchExecutionV1) -> Result<(), ArenaError> {
     let probe = probe_match_hardware()?;
+    validate_match_hardware(&execution.hardware, &probe)
+}
+
+fn validate_match_hardware(
+    declared_hardware: &MatchHardware,
+    probe: &MatchHardwareProbe,
+) -> Result<(), ArenaError> {
     // A declared inventory may select a subset, but cannot split one physical core
     // into several apparently isolated cores or claim a device/capacity not present.
     let mut owners = BTreeMap::new();
-    for (group, declared) in execution.hardware.cpu_cores.iter().enumerate() {
+    for (group, declared) in declared_hardware.cpu_cores.iter().enumerate() {
         let actual = probe
             .hardware
             .cpu_cores
@@ -127,16 +188,24 @@ pub fn validate_match_host(execution: &MatchExecutionV1) -> Result<(), ArenaErro
             ));
         }
     }
-    for gpu in &execution.hardware.gpus {
+    for gpu in &declared_hardware.gpus {
         if !probe.gpu_inventory_known
-            || !probe
-                .hardware
-                .gpus
-                .iter()
-                .any(|g| g.id == gpu.id && g.vram_bytes >= gpu.vram_bytes)
+            || !probe.hardware.gpus.iter().any(|g| {
+                g.id == gpu.id
+                    && match gpu.model.as_ref() {
+                        // A named physical device declares its full capacity,
+                        // not an engine reservation. Never let a larger device
+                        // masquerade as a smaller controlled-comparison device.
+                        Some(model) => {
+                            g.model.as_ref() == Some(model) && g.vram_bytes == gpu.vram_bytes
+                        }
+                        // Preserve historical unnamed inventory semantics.
+                        None => g.vram_bytes >= gpu.vram_bytes,
+                    }
+            })
         {
             return Err(ArenaError::Invalid(
-                "GPU inventory/capacity is unavailable or differs; no engine started".into(),
+                "GPU inventory/model/capacity is unavailable or differs; no engine started".into(),
             ));
         }
     }
@@ -239,4 +308,167 @@ pub fn audit_ponder_protocol(
         ));
     }
     Ok(audit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hardware(model: Option<&str>, vram_bytes: u64) -> MatchHardware {
+        MatchHardware {
+            cpu_cores: vec![vec![0], vec![2, 3]],
+            gpus: vec![GpuCapacity {
+                id: "GPU-a".into(),
+                model: model.map(str::to_owned),
+                vram_bytes,
+            }],
+        }
+    }
+
+    fn probe() -> MatchHardwareProbe {
+        MatchHardwareProbe {
+            hardware: hardware(Some("NVIDIA L4"), 24 << 30),
+            gpu_inventory_known: true,
+            gpu_probe_error: None,
+        }
+    }
+
+    #[test]
+    fn gpu_inventory_preserves_actual_model_uuid_and_integral_mib_capacity() {
+        let inventory = parse_gpu_inventory(
+            b"GPU-a, NVIDIA L4, 23034\r\nGPU-b, NVIDIA GeForce RTX 4090, 24564\r\n",
+        )
+        .unwrap();
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(inventory[0].id, "GPU-a");
+        assert_eq!(inventory[0].model.as_deref(), Some("NVIDIA L4"));
+        assert_eq!(inventory[0].vram_bytes, 23034 * 1024 * 1024);
+        assert_eq!(
+            inventory[1].model.as_deref(),
+            Some("NVIDIA GeForce RTX 4090")
+        );
+        assert_eq!(inventory[1].vram_bytes, 24564 * 1024 * 1024);
+    }
+
+    #[test]
+    fn gpu_inventory_rejects_malformed_empty_and_duplicate_rows() {
+        for text in [
+            "",
+            "GPU-a, 24564\n",
+            "GPU-a, NVIDIA L4, 24564, extra\n",
+            "GPU-a, NVIDIA L4, 24564,\n",
+            "GPU-a, NVIDIA L4, 24564\n\n",
+            ", NVIDIA L4, 24564\n",
+            "GPU-a, , 24564\n",
+            "GPU-a, \"NVIDIA L4\", 24564\n",
+            "GPU a, NVIDIA L4, 24564\n",
+            "GPU-a, NVIDIA\tL4, 24564\n",
+            "GPU-a, NVIDIA\0L4, 24564\n",
+            "GPU-a, NVIDIA L4, 24564\nGPU-a, NVIDIA L4, 24564\n",
+        ] {
+            assert!(parse_gpu_inventory(text.as_bytes()).is_err(), "{text:?}");
+        }
+        assert!(parse_gpu_inventory(b"GPU-a, NVIDIA \xff, 24564\n").is_err());
+    }
+
+    #[test]
+    fn gpu_inventory_rejects_non_integral_non_finite_zero_and_overflow_capacity() {
+        for capacity in [
+            "",
+            "0",
+            "-1",
+            "+1",
+            "1.5",
+            "NaN",
+            "inf",
+            "Infinity",
+            "1e4",
+            "24564 MiB",
+            "18446744073709551615",
+            "18446744073709551616",
+            "17592186044416",
+        ] {
+            let row = format!("GPU-a, NVIDIA L4, {capacity}\n");
+            assert!(parse_gpu_inventory(row.as_bytes()).is_err(), "{capacity}");
+        }
+    }
+
+    #[test]
+    fn gpu_inventory_limits_bytes_rows_and_identity_lengths_before_acceptance() {
+        let rows: String = (0..16)
+            .map(|id| format!("GPU-{id}, NVIDIA L4, 24564\n"))
+            .collect();
+        assert_eq!(parse_gpu_inventory(rows.as_bytes()).unwrap().len(), 16);
+        assert!(
+            parse_gpu_inventory(format!("{rows}GPU-16, NVIDIA L4, 24564\n").as_bytes()).is_err()
+        );
+        assert!(parse_gpu_inventory(&vec![b'x'; GPU_INVENTORY_MAX_BYTES + 1]).is_err());
+        assert!(
+            parse_gpu_inventory(format!("{}, NVIDIA L4, 24564\n", "G".repeat(81)).as_bytes())
+                .is_err()
+        );
+        assert!(
+            parse_gpu_inventory(format!("GPU-a, {}, 24564\n", "N".repeat(257)).as_bytes()).is_err()
+        );
+        assert!(
+            parse_gpu_inventory(format!("GPU-a, {}, 24564\n", "N".repeat(513)).as_bytes()).is_err()
+        );
+    }
+
+    #[test]
+    fn declared_gpu_model_requires_the_observed_model_for_the_same_device() {
+        let declared = hardware(Some("NVIDIA L4"), 24 << 30);
+        assert!(validate_match_hardware(&declared, &probe()).is_ok());
+        assert!(validate_match_hardware(&hardware(Some("NVIDIA L4"), 16 << 30), &probe()).is_err());
+        assert!(validate_match_hardware(&hardware(Some("NVIDIA L4"), 32 << 30), &probe()).is_err());
+        let mut actual = probe();
+        actual.hardware.gpus[0].vram_bytes = 25 << 30;
+        assert!(validate_match_hardware(&declared, &actual).is_err());
+        actual.hardware.gpus[0].vram_bytes = 23 << 30;
+        assert!(validate_match_hardware(&declared, &actual).is_err());
+        actual.hardware.gpus[0].vram_bytes = 24 << 30;
+        actual.hardware.gpus[0].model = Some("NVIDIA GeForce RTX 4090".into());
+        assert!(validate_match_hardware(&declared, &actual).is_err());
+        actual.hardware.gpus[0].model = Some("NVIDIA l4".into());
+        assert!(validate_match_hardware(&declared, &actual).is_err());
+        actual.hardware.gpus[0].model = None;
+        assert!(validate_match_hardware(&declared, &actual).is_err());
+        actual.hardware.gpus[0].model = Some("NVIDIA L4".into());
+        actual.hardware.gpus[0].id = "GPU-b".into();
+        assert!(validate_match_hardware(&declared, &actual).is_err());
+    }
+
+    #[test]
+    fn missing_unknown_or_insufficient_gpu_inventory_never_trusts_declaration() {
+        let declared = hardware(Some("NVIDIA L4"), 24 << 30);
+        let mut actual = probe();
+        actual.gpu_inventory_known = false;
+        assert!(validate_match_hardware(&declared, &actual).is_err());
+        actual.gpu_inventory_known = true;
+        actual.hardware.gpus[0].vram_bytes = 23 << 30;
+        assert!(validate_match_hardware(&declared, &actual).is_err());
+        actual.hardware.gpus.clear();
+        assert!(validate_match_hardware(&declared, &actual).is_err());
+    }
+
+    #[test]
+    fn historical_model_omission_preserves_uuid_capacity_and_cpu_checks() {
+        let mut declared = hardware(None, 16 << 30);
+        let mut actual = probe();
+        assert!(validate_match_hardware(&declared, &actual).is_ok());
+        actual.hardware.gpus[0].model = None;
+        assert!(validate_match_hardware(&declared, &actual).is_ok());
+        actual.hardware.gpus[0].vram_bytes = 15 << 30;
+        assert!(validate_match_hardware(&declared, &actual).is_err());
+        actual.hardware.gpus[0].vram_bytes = 24 << 30;
+        actual.hardware.gpus[0].id = "GPU-b".into();
+        assert!(validate_match_hardware(&declared, &actual).is_err());
+        declared.gpus.clear();
+        actual.gpu_inventory_known = false;
+        assert!(validate_match_hardware(&declared, &actual).is_ok());
+        declared.cpu_cores = vec![vec![2], vec![3]];
+        assert!(validate_match_hardware(&declared, &actual).is_err());
+        declared.cpu_cores = vec![vec![9]];
+        assert!(validate_match_hardware(&declared, &actual).is_err());
+    }
 }

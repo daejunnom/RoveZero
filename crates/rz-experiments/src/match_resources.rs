@@ -37,6 +37,11 @@ pub enum ResourceSharing {
 pub struct GpuCapacity {
     /// Stable CUDA UUID; execution checks it against the host GPU inventory.
     pub id: String,
+    /// Exact host-reported model name. Historical inventories omit this field.
+    /// Controlled comparisons on separate devices require it and execution
+    /// checks it against the bounded host probe before starting an engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub vram_bytes: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -129,6 +134,14 @@ impl MatchExecutionV1 {
                         && g.id.as_bytes()[0].is_ascii_alphanumeric()
                         && g.id.len() <= 80
                         && g.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                        && g.model.as_ref().is_none_or(|model| {
+                            !model.is_empty()
+                                && model.len() <= 256
+                                && model.trim() == model
+                                && model
+                                    .bytes()
+                                    .all(|b| (b.is_ascii_graphic() || b == b' ') && b != b',')
+                        })
                         && g.vram_bytes > 0
                 })
                 && self
@@ -390,10 +403,12 @@ mod tests {
                 gpus: vec![
                     GpuCapacity {
                         id: "GPU-a".into(),
+                        model: None,
                         vram_bytes: 12 << 30,
                     },
                     GpuCapacity {
                         id: "GPU-b".into(),
+                        model: None,
                         vram_bytes: 8 << 30,
                     },
                 ],
@@ -538,5 +553,41 @@ mod tests {
         m.engines[0].cpu_weight = None;
         m.resolved_resources.as_mut().unwrap().policy_version = 2;
         assert!(m.plan().is_err());
+    }
+    #[test]
+    fn historical_gpu_model_omission_keeps_exact_serialized_bytes() {
+        let legacy = r#"{"id":"GPU-a","vram_bytes":8589934592}"#;
+        let gpu: GpuCapacity = serde_json::from_str(legacy).unwrap();
+        assert_eq!(gpu.model, None);
+        assert_eq!(serde_json::to_string(&gpu).unwrap(), legacy);
+        let null: GpuCapacity =
+            serde_json::from_str(r#"{"id":"GPU-a","model":null,"vram_bytes":8589934592}"#).unwrap();
+        assert_eq!(serde_json::to_string(&null).unwrap(), legacy);
+        let mut explicit = gpu;
+        explicit.model = Some("Synthetic GPU model".into());
+        assert_ne!(
+            crate::digest(serde_json::to_string(&explicit).unwrap().as_bytes()),
+            crate::digest(legacy.as_bytes())
+        );
+    }
+    #[test]
+    fn gpu_model_identity_is_bounded_and_cannot_inject_inventory_rows() {
+        let mut m = fixture(EngineComputeKind::Gpu, EngineComputeKind::Gpu);
+        m.hardware.gpus[0].model = Some("NVIDIA GeForce RTX 4090".into());
+        m.plan().unwrap();
+        for invalid in [
+            "".to_string(),
+            " ".into(),
+            " model".into(),
+            "model ".into(),
+            "model,another-field".into(),
+            "model\nGPU-forged".into(),
+            "model\tname".into(),
+            "model\0name".into(),
+            "x".repeat(257),
+        ] {
+            m.hardware.gpus[0].model = Some(invalid.clone());
+            assert!(m.plan().is_err(), "{invalid:?}");
+        }
     }
 }

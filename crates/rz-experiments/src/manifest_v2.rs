@@ -740,6 +740,7 @@ impl RunManifestV2 {
         if self.comparison == ComparisonV2::Fixture {
             return Ok(());
         }
+        self.validate_control_resources()?;
         let (EngineEndpointV2::RoveZero(a), EngineEndpointV2::RoveZero(b)) =
             (&self.engines[0], &self.engines[1])
         else {
@@ -812,6 +813,89 @@ impl RunManifestV2 {
             )?;
         }
         Ok(())
+    }
+    fn validate_control_resources(&self) -> Result<(), ManifestError> {
+        if !matches!(
+            self.comparison,
+            ComparisonV2::Runtime
+                | ComparisonV2::AdapterEquivalence
+                | ComparisonV2::InternalWeights
+                | ComparisonV2::InternalSearch
+                | ComparisonV2::InternalModel
+        ) {
+            return Ok(());
+        }
+        let Some(execution) = &self.match_execution else {
+            // Historical V2 uses the one inherited envelope for both engines;
+            // omission remains ponder-off and keeps its original canonical bytes.
+            return Ok(());
+        };
+        let plan = execution.plan()?;
+        let allocations = self.engines.each_ref().map(|engine| {
+            plan.engines
+                .iter()
+                .find(|allocation| allocation.role == engine.role())
+        });
+        let [Some(a), Some(b)] = allocations else {
+            return require_v2(false, "controlled match allocation role missing");
+        };
+        // Compare available physical cores and SMT widths, not physical IDs or
+        // logical-CPU counts alone. Shared cores remain part of the signature.
+        let cpu_shape = |allocation: &EngineResourceAllocation,
+                         other: &EngineResourceAllocation| {
+            let mut shape: Vec<_> = execution
+                .hardware
+                .cpu_cores
+                .iter()
+                .filter(|core| core.iter().all(|id| allocation.cpu_ids.contains(id)))
+                .map(|core| (core.len(), core.iter().any(|id| other.cpu_ids.contains(id))))
+                .collect();
+            shape.sort_unstable();
+            shape
+        };
+        let gpu_shape = |allocation: &EngineResourceAllocation,
+                         other: &EngineResourceAllocation|
+         -> Result<Vec<_>, ManifestError> {
+            let mut shape = Vec::new();
+            for id in &allocation.gpu_ids {
+                let gpu = execution
+                    .hardware
+                    .gpus
+                    .iter()
+                    .find(|gpu| &gpu.id == id)
+                    .ok_or_else(|| {
+                        ManifestError::Integrity("controlled match GPU inventory missing".into())
+                    })?;
+                let shared = other.gpu_ids.contains(id);
+                require_v2(
+                    shared || gpu.model.is_some(),
+                    "controlled comparison on separate GPUs requires known host-checked models",
+                )?;
+                shape.push((gpu.model.as_deref(), gpu.vram_bytes, shared));
+            }
+            shape.sort_unstable();
+            Ok(shape)
+        };
+        let model_backend_change = self.comparison == ComparisonV2::InternalModel
+            && self.declared_changes.contains("backend")
+            && matches!(
+                (&self.engines[0], &self.engines[1]),
+                (EngineEndpointV2::RoveZero(left), EngineEndpointV2::RoveZero(right))
+                    if left.model.backend != right.model.backend
+            );
+        require_v2(
+            (a.kind == b.kind || model_backend_change)
+                && a.threads == b.threads
+                && cpu_shape(a, b) == cpu_shape(b, a)
+                && ((model_backend_change
+                    && (a.kind == EngineComputeKind::Cpu || b.kind == EngineComputeKind::Cpu))
+                    || (a.gpu_memory_bytes == b.gpu_memory_bytes
+                        && gpu_shape(a, b)? == gpu_shape(b, a)?)),
+            "controlled comparison requires equivalent CPU/core/SMT/thread and GPU/model/capacity/reservation/sharing allocations; only a declared model backend change permits unused GPU resources",
+        )
+        // Quota, memory, runner reservation, sharing policy and Ponder are common
+        // manifest fields. Ponder applies to both engines; distinct device/core
+        // identifiers alone do not change a controlled engine's resource budget.
     }
     pub fn declared_artifacts(&self) -> Vec<&ArtifactRef> {
         let mut assets = vec![&self.runner.binary, &self.opening_artifact];
@@ -1069,7 +1153,8 @@ mod tests {
             EngineEndpointV2::RoveZero(e) => e.clone(),
             _ => unreachable!(),
         };
-        candidate(&mut m).model = base.model.clone();
+        let model = base.model.clone();
+        candidate(&mut m).model = model;
         candidate(&mut m).environment = Some(environment());
         m.comparison = ComparisonV2::Runtime;
         m.change = ChangeV2::MeaningPreserving;
@@ -1186,6 +1271,278 @@ mod tests {
             panic!()
         };
         e
+    }
+    const RESOURCE_CONTROLS: [ComparisonV2; 4] = [
+        ComparisonV2::Runtime,
+        ComparisonV2::AdapterEquivalence,
+        ComparisonV2::InternalWeights,
+        ComparisonV2::InternalSearch,
+    ];
+    fn resource_control(comparison: ComparisonV2) -> RunManifestV2 {
+        let mut m = manifest(comparison);
+        let EngineEndpointV2::RoveZero(base) = &m.engines[0] else {
+            unreachable!()
+        };
+        candidate(&mut m).model = base.model.clone();
+        let changed = match comparison {
+            ComparisonV2::Runtime => {
+                candidate(&mut m).runtime.id = "runtime-variant".into();
+                m.change = ChangeV2::MeaningPreserving;
+                "runtime"
+            }
+            ComparisonV2::AdapterEquivalence => {
+                candidate(&mut m).adapter_implementation_sha256 = "b".repeat(64);
+                m.change = ChangeV2::MeaningPreserving;
+                "adapter_implementation"
+            }
+            ComparisonV2::InternalWeights => {
+                candidate(&mut m).model.weights[0].path = "variant-weights.bin".into();
+                candidate(&mut m).model.weights[0].sha256 = "b".repeat(64);
+                m.change = ChangeV2::Model;
+                "weights"
+            }
+            ComparisonV2::InternalSearch => {
+                candidate(&mut m).search.id = "search-variant".into();
+                m.change = ChangeV2::Search;
+                "search"
+            }
+            _ => unreachable!(),
+        };
+        m.declared_changes = BTreeSet::from([changed.into()]);
+        m.resources.cpu_threads = 3;
+        m.resources.affinity = vec![0, 1, 2];
+        m.match_execution = Some(MatchExecutionV1 {
+            ponder: false,
+            sharing: ResourceSharing::Isolated,
+            hardware: MatchHardware {
+                cpu_cores: vec![vec![0], vec![1], vec![2]],
+                gpus: vec![],
+            },
+            engines: [NativeEngineRole::Baseline, NativeEngineRole::Candidate]
+                .into_iter()
+                .enumerate()
+                .map(|(index, role)| EngineResourceRequest {
+                    role,
+                    kind: EngineComputeKind::Cpu,
+                    cpu_ids: Some(vec![index as u32 + 1]),
+                    threads: Some(1),
+                    gpu_ids: None,
+                    gpu_memory_bytes: None,
+                    cpu_weight: None,
+                    gpu_weight: None,
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+            executor: m.runner.binary.clone(),
+            resolved_resources: None,
+        });
+        m
+    }
+    fn resource_inventory_changed(m: &mut RunManifestV2) {
+        let execution = m.match_execution.as_ref().unwrap();
+        m.resources.affinity = execution
+            .hardware
+            .cpu_cores
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        m.resources.cpu_threads = m.resources.affinity.len() as u32;
+        m.resources.gpu =
+            (!execution.hardware.gpus.is_empty()).then(|| "synthetic-gpu-inventory".into());
+        m.resources.gpu_vram_bytes = execution.hardware.gpus.iter().map(|g| g.vram_bytes).sum();
+    }
+    fn gpu_resource_control(comparison: ComparisonV2) -> RunManifestV2 {
+        let mut m = resource_control(comparison);
+        let execution = m.match_execution.as_mut().unwrap();
+        execution.hardware.gpus = ["GPU-a", "GPU-b"]
+            .map(|id| GpuCapacity {
+                id: id.into(),
+                model: Some("Synthetic GPU model".into()),
+                vram_bytes: 8 << 30,
+            })
+            .to_vec();
+        for (index, engine) in execution.engines.iter_mut().enumerate() {
+            engine.kind = EngineComputeKind::Gpu;
+            engine.gpu_ids = Some(vec![execution.hardware.gpus[index].id.clone()]);
+            engine.gpu_memory_bytes = Some(2 << 30);
+        }
+        resource_inventory_changed(&mut m);
+        m
+    }
+    #[test]
+    fn internal_controls_reject_unequal_physical_cores_threads_and_smt_widths() {
+        for comparison in RESOURCE_CONTROLS {
+            let base = resource_control(comparison);
+            base.validate().unwrap();
+            let mut cores = base.clone();
+            let execution = cores.match_execution.as_mut().unwrap();
+            execution.hardware.cpu_cores.push(vec![3]);
+            execution.engines[1].cpu_ids = Some(vec![2, 3]);
+            // Same Threads is insufficient when one engine owns an extra core.
+            resource_inventory_changed(&mut cores);
+            assert!(cores.validate().is_err(), "{comparison:?}: core count");
+
+            let mut threads = base.clone();
+            let execution = threads.match_execution.as_mut().unwrap();
+            execution.hardware.cpu_cores = vec![vec![0], vec![1, 2], vec![3, 4]];
+            execution.engines[0].cpu_ids = Some(vec![1, 2]);
+            execution.engines[1].cpu_ids = Some(vec![3, 4]);
+            execution.engines[1].threads = Some(2);
+            resource_inventory_changed(&mut threads);
+            assert!(threads.validate().is_err(), "{comparison:?}: Threads");
+
+            let mut smt = threads;
+            let execution = smt.match_execution.as_mut().unwrap();
+            execution.engines[1].threads = Some(1);
+            execution.hardware.cpu_cores = vec![vec![0], vec![1, 2], vec![3], vec![4]];
+            // Equal logical CPU counts still describe one SMT core versus two cores.
+            assert!(
+                smt.validate().is_err(),
+                "{comparison:?}: physical SMT shape"
+            );
+        }
+    }
+    #[test]
+    fn internal_controls_accept_equal_placements_with_different_physical_ids() {
+        for comparison in RESOURCE_CONTROLS {
+            let mut m = resource_control(comparison);
+            let execution = m.match_execution.as_mut().unwrap();
+            execution.hardware.cpu_cores = vec![vec![7], vec![13, 15], vec![21, 23]];
+            execution.engines[0].cpu_ids = Some(vec![15, 13]);
+            execution.engines[1].cpu_ids = Some(vec![21, 23]);
+            execution.engines.swap(0, 1); // Roles, not array positions, own the budget.
+            resource_inventory_changed(&mut m);
+            m.validate().unwrap();
+            let lock = m.lock().unwrap();
+            assert_eq!(
+                LockedManifestV2::from_json(&lock.to_json().unwrap())
+                    .unwrap()
+                    .sha256(),
+                lock.sha256()
+            );
+        }
+    }
+    #[test]
+    fn internal_controls_reject_gpu_kind_model_capacity_and_reservation_confounds() {
+        for comparison in RESOURCE_CONTROLS {
+            let base = gpu_resource_control(comparison);
+            base.validate().unwrap();
+            let mut kind = base.clone();
+            kind.match_execution.as_mut().unwrap().engines[1].kind = EngineComputeKind::Hybrid;
+            assert!(kind.validate().is_err(), "{comparison:?}: compute kind");
+            let mut model = base.clone();
+            model.match_execution.as_mut().unwrap().hardware.gpus[1].model =
+                Some("Different GPU model".into());
+            assert!(model.validate().is_err(), "{comparison:?}: GPU model");
+            let mut capacity = base.clone();
+            capacity.match_execution.as_mut().unwrap().hardware.gpus[1].vram_bytes = 12 << 30;
+            resource_inventory_changed(&mut capacity);
+            assert!(capacity.validate().is_err(), "{comparison:?}: GPU capacity");
+            let mut reservation = base.clone();
+            reservation.match_execution.as_mut().unwrap().engines[1].gpu_memory_bytes =
+                Some(3 << 30);
+            assert!(
+                reservation.validate().is_err(),
+                "{comparison:?}: GPU reservation"
+            );
+            let mut unknown = base;
+            unknown.match_execution.as_mut().unwrap().hardware.gpus[1].model = None;
+            assert!(
+                unknown.validate().is_err(),
+                "{comparison:?}: unknown separate GPU model"
+            );
+        }
+    }
+    #[test]
+    fn internal_controls_accept_equivalent_gpu_ids_and_shared_legacy_device() {
+        for comparison in RESOURCE_CONTROLS {
+            let mut isolated = gpu_resource_control(comparison);
+            let execution = isolated.match_execution.as_mut().unwrap();
+            execution.engines[0].gpu_ids = Some(vec!["GPU-b".into()]);
+            execution.engines[1].gpu_ids = Some(vec!["GPU-a".into()]);
+            isolated.validate().unwrap();
+            let mut shared = isolated;
+            let execution = shared.match_execution.as_mut().unwrap();
+            execution.sharing = ResourceSharing::Shared;
+            execution.hardware.gpus.truncate(1);
+            execution.hardware.gpus[0].model = None;
+            for engine in &mut execution.engines {
+                engine.gpu_ids = Some(vec!["GPU-a".into()]);
+            }
+            resource_inventory_changed(&mut shared);
+            shared.validate().unwrap(); // Identical UUID identifies the same device.
+            shared.match_execution.as_mut().unwrap().engines[1].gpu_memory_bytes = Some(3 << 30);
+            assert!(
+                shared.validate().is_err(),
+                "{comparison:?}: shared reservation"
+            );
+        }
+    }
+    #[test]
+    fn fixture_and_declared_internal_model_keep_heterogeneous_resource_semantics() {
+        let mut m = gpu_resource_control(ComparisonV2::InternalWeights);
+        m.match_execution.as_mut().unwrap().engines[1].kind = EngineComputeKind::Hybrid;
+        m.comparison = ComparisonV2::Fixture;
+        m.validate().unwrap();
+        m.comparison = ComparisonV2::InternalModel;
+        candidate(&mut m).model.backend = "declared-model-backend".into();
+        m.declared_changes.insert("backend".into());
+        m.validate().unwrap();
+        m.declared_changes.remove("backend");
+        assert!(m.validate().is_err());
+        m.declared_changes.insert("backend".into());
+        let execution = m.match_execution.as_mut().unwrap();
+        execution.engines[0].kind = EngineComputeKind::Cpu;
+        execution.engines[0].gpu_ids = Some(vec![]);
+        execution.engines[0].gpu_memory_bytes = Some(0);
+        m.validate().unwrap(); // Same CPU limit, one backend leaves the GPU unused.
+        m.match_execution
+            .as_mut()
+            .unwrap()
+            .hardware
+            .cpu_cores
+            .push(vec![3]);
+        m.match_execution.as_mut().unwrap().engines[1].cpu_ids = Some(vec![2, 3]);
+        resource_inventory_changed(&mut m);
+        assert!(m.validate().is_err()); // Backend changes cannot confer extra CPU cores.
+    }
+    #[test]
+    fn omitted_match_policy_and_gpu_model_keep_historical_canonical_encoding() {
+        let old = resource_control(ComparisonV2::InternalWeights);
+        let mut m = old;
+        m.match_execution = None;
+        let lock = m.lock().unwrap();
+        let json = lock.to_json().unwrap();
+        assert!(!json.contains("match_execution"));
+        let reread = LockedManifestV2::from_json(&json).unwrap();
+        assert_eq!(reread.sha256(), lock.sha256());
+        assert_eq!(reread.to_json().unwrap(), json);
+    }
+    #[test]
+    fn controlled_ponder_is_common_to_both_engines_and_locked_separately() {
+        let m = resource_control(ComparisonV2::InternalWeights);
+        let off_digest = m.clone().lock().unwrap().sha256().to_owned();
+        let mut on = m;
+        on.match_execution.as_mut().unwrap().ponder = true;
+        let patch_bytes =
+            include_bytes!("../../../experiments/baselines/fastchess-clock-ponder-v2.patch");
+        let mut patch = on.runner.binary.clone();
+        patch.path = "synthetic/fastchess-clock-ponder-v2.patch".into();
+        patch.sha256 = digest(patch_bytes);
+        patch.bytes = patch_bytes.len() as u64;
+        on.runner.dirty = true;
+        on.runner.dirty_patch = Some(patch);
+        on.validate().unwrap();
+        let on_lock = on.lock().unwrap();
+        assert_ne!(on_lock.sha256(), off_digest);
+        assert_eq!(
+            LockedManifestV2::from_json(&on_lock.to_json().unwrap())
+                .unwrap()
+                .sha256(),
+            on_lock.sha256()
+        );
     }
     #[test]
     fn weights_comparison_keeps_backend_configuration_but_not_asset_bound_execution_hash() {
