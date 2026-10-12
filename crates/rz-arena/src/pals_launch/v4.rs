@@ -4450,7 +4450,23 @@ mod tests {
                     .cleanup_max_ms
                     .div_ceil(2)
             ));
-            assert!(preflight.contains(&shutdown) && actual.contains(&shutdown));
+            // The launcher combines endpoint base arguments with either extension.
+            // Check that each resulting argv has one owner budget, rather than
+            // requiring an endpoint option in the receipt-only extension.
+            let base = lock
+                .endpoint_view(role)
+                .arguments
+                .iter()
+                .map(OsString::from);
+            for extension in [&preflight, &actual] {
+                assert_eq!(
+                    base.clone()
+                        .chain(extension.iter().cloned())
+                        .filter(|argument| argument == &shutdown)
+                        .count(),
+                    1
+                );
+            }
             let receipt_flags = [
                 format!("--pals-output-root={}", probe.display()),
                 format!("--pals-launch-sha256={}", lock.sha256()),
