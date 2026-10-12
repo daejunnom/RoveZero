@@ -3948,11 +3948,31 @@ pub fn validate_pals_native_records(
 
 /// Shared physical admission context. Implementations keep their own semantic
 /// lock and native wire domain; no historical manifest is synthesized.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeReceiptEncodingIdentity<'a> {
+    LegacyRecipe(&'a str),
+    FreshModelInput(&'a str),
+}
+impl<'a> NativeReceiptEncodingIdentity<'a> {
+    fn sha256(self) -> &'a str {
+        match self {
+            Self::LegacyRecipe(value) | Self::FreshModelInput(value) => value,
+        }
+    }
+}
 trait PalsArenaValidationContext: NativeLaunchDeclaration {
     #[cfg(target_os = "linux")]
     fn verify_semantic(&self) -> Result<(), ArenaError>;
     fn launch_sha256(&self) -> &str;
     fn native(&self, role: NativeEngineRole) -> Result<&PalsOnnxLaunchV3, ArenaError>;
+    fn native_receipt_encoding_identity(
+        &self,
+        role: NativeEngineRole,
+    ) -> Result<NativeReceiptEncodingIdentity<'_>, ArenaError> {
+        Ok(NativeReceiptEncodingIdentity::LegacyRecipe(
+            &self.native(role)?.encoding_semantic_sha256,
+        ))
+    }
     fn recipe(&self, role: NativeEngineRole) -> &PalsEndpointLaunchV3;
     fn endpoint_view(&self, role: NativeEngineRole) -> &ExternalUciEndpointV2;
     fn pals_endpoint(
@@ -4065,6 +4085,23 @@ impl PalsArenaValidationContext for LockedPalsArenaLaunchV3 {
     ) -> Result<(), ArenaError> {
         validate_search_policy_pair(self, role, startup, termination)
     }
+}
+
+fn validate_native_model_identity(
+    native: &PalsOnnxLaunchV3,
+    checkpoint: &ArtifactRef,
+    trained: bool,
+    encoding: NativeReceiptEncodingIdentity<'_>,
+    record: &serde_json::Value,
+) -> Result<(), ArenaError> {
+    require(
+        array_hash(&record["model_epoch"])? == checkpoint.sha256
+            && array_hash(&record["export_manifest_sha256"])? == native.export.sha256
+            && array_hash(&record["encoding_semantic_sha256"])? == encoding.sha256()
+            && array_hash(&record["adapter_source_sha256"])? == native.adapter_source_sha256
+            && record["trained"] == trained,
+        "native model/adapter/epoch identity differs",
+    )
 }
 
 fn validate_pals_native_records_inner<L: PalsArenaValidationContext>(
@@ -4309,13 +4346,12 @@ fn validate_pals_native_records_inner<L: PalsArenaValidationContext>(
             "native frozen identity changed during game",
         )?;
     }
-    require(
-        array_hash(&sn["model_epoch"])? == checkpoint.sha256
-            && array_hash(&sn["export_manifest_sha256"])? == native.export.sha256
-            && array_hash(&sn["encoding_semantic_sha256"])? == native.encoding_semantic_sha256
-            && array_hash(&sn["adapter_source_sha256"])? == native.adapter_source_sha256
-            && sn["trained"] == trained,
-        "native model/adapter/epoch identity differs",
+    validate_native_model_identity(
+        native,
+        checkpoint,
+        trained,
+        lock.native_receipt_encoding_identity(role)?,
+        sn,
     )?;
     require(
         (e.model.frozen_epoch == 0 && sn["frozen_epoch"].is_null() && tn["frozen_epoch"].is_null())

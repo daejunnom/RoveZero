@@ -160,6 +160,18 @@ impl PalsArenaValidationContext for LockedPalsArenaLaunchV4 {
     fn native(&self, role: NativeEngineRole) -> Result<&PalsOnnxLaunchV3, ArenaError> {
         LockedPalsArenaLaunchV4::native(self, role)
     }
+    fn native_receipt_encoding_identity(
+        &self,
+        role: NativeEngineRole,
+    ) -> Result<NativeReceiptEncodingIdentity<'_>, ArenaError> {
+        self.native(role)?;
+        match &self.input.semantic_lock.manifest.engines[role_index(role)] {
+            PalsEngineV4::Pals(endpoint) => Ok(NativeReceiptEncodingIdentity::FreshModelInput(
+                &endpoint.model_v2.encoding_sha256,
+            )),
+            _ => Err(invalid("native V4 requires actual Fresh model/input identity")),
+        }
+    }
     fn recipe(&self, role: NativeEngineRole) -> &PalsEndpointLaunchV3 {
         &self.input.endpoints[role_index(role)]
     }
@@ -4361,6 +4373,229 @@ mod tests {
         assert!(
             validate_followup_marker_pair(&lock, NativeEngineRole::Baseline, &bad, &bad).is_err()
         );
+    }
+    #[cfg(any(feature = "pals-collection", feature = "native-cuda"))]
+    fn native_encoding_cpu_fixture() -> PalsArenaLaunchV4 {
+        let native = super::super::tests::native_fixture();
+        let PalsEngineV3::Pals(old) = &native.semantic_lock.manifest.engines[0] else {
+            unreachable!()
+        };
+        let mut input = colab_fixture();
+        for i in 0..2 {
+            let cfg = if i == 0 {
+                PalsModelConfig::baseline()
+            } else {
+                PalsModelConfig::full_line_interaction_v2()
+            };
+            let PalsEngineV4::Pals(e) = &mut input.semantic_lock.manifest.engines[i] else {
+                unreachable!()
+            };
+            e.base.model = old.model.clone();
+            e.base.model.input_schema = cfg.profile.encoding_schema().into();
+            e.base.model.implementation_sha256 =
+                hex(rz_eval::pals_model::compiled_model_boundary_sha256());
+            e.model_v2.profile = if i == 0 {
+                PalsModelProfileV4::LegacySummaryV1
+            } else {
+                PalsModelProfileV4::FullLineInteractionV2
+            };
+            e.model_v2.model_schema = if i == 0 {
+                "rovezero.pals-model.v1"
+            } else {
+                "rovezero.pals-model.v2"
+            }
+            .into();
+            e.model_v2.model_semantics = cfg.profile.model_semantics().into();
+            e.model_v2.model_semantics_sha256 = hex(cfg.profile.registered_semantics_sha256());
+            e.model_v2.encoding_schema = cfg.profile.encoding_schema().into();
+            e.model_v2.encoding_sha256 =
+                hex(rz_uci::pals_native::pals_fresh_encoding_semantic_digest_for_config(&cfg));
+            e.model_v2.max_line_plies = if i == 0 { 0 } else { 256 };
+            let PalsEndpointLaunchV3::OnnxCpu(mut n) = native.endpoints[0].clone() else {
+                unreachable!()
+            };
+            n.adapter_source_sha256 = hex(rz_uci::pals_native::pals_native_source_digest());
+            n.encoding_semantic_sha256 =
+                hex(rz_uci::pals_native::pals_rules_encoding_semantic_digest_for_config(&cfg));
+            if i == 1 {
+                n.graphs.retain(|g| g.role != "proposer");
+                n.graphs[1].role = "shared_pc".into();
+                n.graphs[1].file = "shared_pc_if.onnx".into();
+            }
+            e.model_v2.model_identity = format!("pals-onnx-pc-fp32-{}", n.export.sha256);
+            input.endpoints[i] = PalsEndpointLaunchV3::OnnxCpu(n);
+        }
+        input.semantic_lock.manifest.declared_changes =
+            input.semantic_lock.manifest.actual_change_axes();
+        input.semantic_lock = input.semantic_lock.manifest.lock().unwrap();
+        input
+    }
+    #[cfg(any(feature = "pals-collection", feature = "native-cuda"))]
+    fn native_encoding_fixtures() -> Vec<PalsArenaLaunchV4> {
+        let mut fixtures = vec![native_encoding_cpu_fixture()];
+        if cfg!(all(target_os = "linux", feature = "native-cuda")) {
+            #[cfg(all(target_os = "linux", feature = "native-cuda"))]
+            fixtures.push(cudnn_conv_pilot_fixture());
+        }
+        fixtures
+    }
+    fn encoding_array(value: &str) -> Vec<u8> {
+        (0..64)
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&value[i..i + 2], 16).unwrap())
+            .collect()
+    }
+    fn native_identity_record<L: PalsArenaValidationContext>(
+        lock: &L,
+        role: NativeEngineRole,
+    ) -> serde_json::Value {
+        let n = lock.native(role).unwrap();
+        let (checkpoint, trained) = match &lock.pals_endpoint(role).unwrap().model.weights {
+            PalsWeightIdentityV3::Untrained { artifact, .. } => (artifact, false),
+            PalsWeightIdentityV3::Trained { artifact, .. } => (artifact, true),
+            _ => unreachable!(),
+        };
+        serde_json::json!({
+            "model_epoch":encoding_array(&checkpoint.sha256),
+            "export_manifest_sha256":encoding_array(&n.export.sha256),
+            "encoding_semantic_sha256":encoding_array(lock.native_receipt_encoding_identity(role).unwrap().sha256()),
+            "adapter_source_sha256":encoding_array(&n.adapter_source_sha256),
+            "trained":trained
+        })
+    }
+    fn check_native_identity<L: PalsArenaValidationContext>(
+        lock: &L,
+        role: NativeEngineRole,
+        record: &serde_json::Value,
+    ) -> Result<(), ArenaError> {
+        let (checkpoint, trained) = match &lock.pals_endpoint(role)?.model.weights {
+            PalsWeightIdentityV3::Untrained { artifact, .. } => (artifact, false),
+            PalsWeightIdentityV3::Trained { artifact, .. } => (artifact, true),
+            _ => return Err(invalid("missing actual weights")),
+        };
+        validate_native_model_identity(
+            lock.native(role)?,
+            checkpoint,
+            trained,
+            lock.native_receipt_encoding_identity(role)?,
+            record,
+        )
+    }
+    #[cfg(any(feature = "pals-collection", feature = "native-cuda"))]
+    #[test]
+    fn native_v4_fresh_encoding_accepts_both_profiles_and_providers() {
+        for input in native_encoding_fixtures() {
+            let lock = input.lock().unwrap();
+            for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+                let fresh = lock.native_receipt_encoding_identity(role).unwrap();
+                assert!(matches!(fresh, NativeReceiptEncodingIdentity::FreshModelInput(_)));
+                let rules = &lock.native(role).unwrap().encoding_semantic_sha256;
+                assert_ne!(fresh.sha256(), rules);
+                let record = native_identity_record(&lock, role);
+                assert!(check_native_identity(&lock, role, &record).is_ok());
+                let mut wrong = record;
+                wrong["encoding_semantic_sha256"] = serde_json::json!(encoding_array(rules));
+                assert!(check_native_identity(&lock, role, &wrong).is_err());
+            }
+        }
+    }
+    #[cfg(any(feature = "pals-collection", feature = "native-cuda"))]
+    #[test]
+    fn native_v4_rules_and_fresh_declaration_domains_cannot_be_swapped() {
+        for input in native_encoding_fixtures() {
+            for i in 0..2 {
+                let PalsEngineV4::Pals(e) = &input.semantic_lock.manifest.engines[i] else {
+                    unreachable!()
+                };
+                let n = input.endpoints[i].native_model().unwrap();
+                assert!(validate_actual_encoding(e, n).is_ok());
+                let mut swapped_e = e.as_ref().clone();
+                let mut swapped_n = n.clone();
+                std::mem::swap(
+                    &mut swapped_e.model_v2.encoding_sha256,
+                    &mut swapped_n.encoding_semantic_sha256,
+                );
+                assert!(validate_actual_encoding(&swapped_e, &swapped_n).is_err());
+                assert!(validate_actual_encoding(&swapped_e, n).is_err());
+                assert!(validate_actual_encoding(e, &swapped_n).is_err());
+            }
+        }
+    }
+    #[cfg(any(feature = "pals-collection", feature = "native-cuda"))]
+    #[test]
+    fn native_v4_encoding_rejects_history_profile_and_malformed_namespaces() {
+        let exact = Position::startpos();
+        let unknown = Position::from_fen(&exact.to_fen()).unwrap();
+        let exact_history = rz_uci::pals_native::pals_history_digest(&exact).unwrap();
+        let unknown_history = rz_uci::pals_native::pals_history_digest(&unknown).unwrap();
+        assert_ne!(exact_history, unknown_history);
+        for input in native_encoding_fixtures() {
+            let lock = input.lock().unwrap();
+            for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+                let other = match role {
+                    NativeEngineRole::Baseline => NativeEngineRole::Candidate,
+                    NativeEngineRole::Candidate => NativeEngineRole::Baseline,
+                };
+                let record = native_identity_record(&lock, role);
+                let different_profile =
+                    lock.native_receipt_encoding_identity(other).unwrap().sha256();
+                assert_ne!(
+                    lock.native_receipt_encoding_identity(role).unwrap().sha256(),
+                    different_profile
+                );
+                for bytes in [
+                    exact_history.to_vec(),
+                    unknown_history.to_vec(),
+                    encoding_array(different_profile),
+                    vec![0_u8; 31],
+                ] {
+                    let mut wrong = record.clone();
+                    wrong["encoding_semantic_sha256"] = serde_json::json!(bytes);
+                    assert!(check_native_identity(&lock, role, &wrong).is_err());
+                }
+            }
+        }
+    }
+    #[cfg(any(feature = "pals-collection", feature = "native-cuda"))]
+    #[test]
+    fn native_v4_fresh_encoding_preserves_other_frozen_identity_guards() {
+        for input in native_encoding_fixtures() {
+            let lock = input.lock().unwrap();
+            for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+                let record = native_identity_record(&lock, role);
+                for field in ["model_epoch", "export_manifest_sha256", "adapter_source_sha256"] {
+                    let mut wrong = record.clone();
+                    let bytes = wrong[field].as_array_mut().unwrap();
+                    bytes[0] = (bytes[0].as_u64().unwrap() ^ 1).into();
+                    assert!(check_native_identity(&lock, role, &wrong).is_err());
+                }
+                let mut wrong = record.clone();
+                wrong["trained"] = true.into();
+                assert!(check_native_identity(&lock, role, &wrong).is_err());
+                let mut wrong = record;
+                wrong.as_object_mut().unwrap().remove("adapter_source_sha256");
+                assert!(check_native_identity(&lock, role, &wrong).is_err());
+            }
+        }
+    }
+    #[test]
+    fn native_v3_receipt_encoding_preserves_legacy_recipe_domain() {
+        let lock = super::super::tests::native_fixture().lock().unwrap();
+        let role = NativeEngineRole::Baseline;
+        let encoding = lock.native_receipt_encoding_identity(role).unwrap();
+        assert!(matches!(encoding, NativeReceiptEncodingIdentity::LegacyRecipe(_)));
+        assert_eq!(encoding.sha256(), lock.native(role).unwrap().encoding_semantic_sha256);
+        let mut record = native_identity_record(&lock, role);
+        assert!(check_native_identity(&lock, role, &record).is_ok());
+        record["encoding_semantic_sha256"] = serde_json::json!(vec![0xee_u8; 32]);
+        assert!(check_native_identity(&lock, role, &record).is_err());
+    }
+    #[test]
+    fn native_v4_mock_cannot_claim_a_native_fresh_encoding_domain() {
+        let lock = fixture().lock().unwrap();
+        for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
+            assert!(lock.native_receipt_encoding_identity(role).is_err());
+        }
     }
     #[test]
     fn actual_marker_conditions_resolver_and_stack_drift_reject() {
