@@ -104,6 +104,16 @@ V4 등록·실제 child argv는 [manifest](../crates/rz-experiments/src/pals_man
   Rules/query 문맥에서 사용한다. 공개 record revision만 변경 가능하다. value/V는 Fresh다.
   논리 취소가 물리 완료를 대신하지 않는다. 완료 불명 owner/buffer는 격리·보존한다.
 
+별도 `ResumeAfterAcceptedRepairC` 선택은 iterative Frozen WDL queue와 실제 paused
+owner를 요구한다. 기존 constructor의 `ReplaceOnFresh`, 일반 FIFO와 legacy fixture
+범위는 유지한다. held-parent-v2의 같은 root/first-move priority drain은 accepted
+Repair와 C tail을 원래 owner 재개 앞에 연결하며 다른 pending 순서는 보존한다.
+
+독립 reference의 입력 admission은 metadata/query/record features/divergence features의
+FP32 schema leaf만 정확한 32비트 값으로 비교한다. signed zero·비유한 값·bool, 나머지
+JSON 타입·ID·관계·수·owner/seed 문맥과 raw serde digest·canonical key·실제 input bits
+guard를 유지한다. 이 validator 수정은 native 계산이나 수치 허용오차 변경이 아니다.
+
 재검토의 실제 선택명은 다음처럼 계층별로 구분한다. 외부 CP/mate를 Raw WDL의 관점으로
 직접 비교하거나 search policy identity를 CLI 값으로 전달하지 않는다.
 
@@ -195,20 +205,33 @@ update는 0회이며, 실제 target coverage와 learned V 인수는 이 진단 �
 구체적인 진단 범위와 이전 학습 제외 이력은
 [TRAINING-PLAN](TRAINING-PLAN.md#2026-10-10-pals-diagnostic-학습-smoke)에 연결한다.
 
-승인된 GPU 검증은 기존 RTX 4050/WSL·Windows commit 여유 6GiB 이상·memory.high 6GiB/
-max 12GiB의 유한 창을 따른다. 실제 Repair→C→동일 owner CPU 재개, accepted seed의
-독립 Warm reference와 최종 physical drain/unknown을 각각 인수한다. 모델/queue/stack/Warm과
-GQA 반복·Signed192 변환 비용을 분리하며 모델·탐색 변경에 전역 5% gate를 적용하지 않는다.
-legacy/새 모델 paired pilot은 같은 own checker·`ModelWdlRestricted`, 120초+1초·256 ply·
-흑백 교환 1 pair/2 games·15분+정리30초, 선택 기능 off다. 각 판 두 엔진을 재시작하여
-4 PALS sessions 각각의 join/drain과 PGN 2판을 인수한다. 실제 비용·실패는 보존한다.
+실제 실행은 자원 프로필과 유한 창을 먼저 등록한다. 최신 사용자 지시에 따라 Windows
+commit 여유 6GiB의 진입·지속 stop 조건은 제거했다. CPU0/2·quota2·memory.high 6GiB/
+max12GiB·swap0, 유한 작업·단일 정리 예산·물리 완료와 실패 보존의 조건은 유지한다.
+Colab에서 이 조건의 실제 readback을 확보하지 못한 결과는 관측 프로필로 표시하고
+strict-local 인수와 performance eligibility를 false로 둔다. 외부 GC 요청·실제 GC
+실행·메모리 경합 진단을 각각 구분하며 이를 성능 개선 근거로 사용하지 않는다.
+
+실제 Repair→C→동일 owner CPU 재개, accepted seed의 독립 Warm reference와 최종
+physical drain/unknown을 각각 인수한다. 모델/queue/stack/Warm과 GQA 반복·Signed192
+변환 비용을 분리하며 모델·탐색 변경에 전역 5% gate를 적용하지 않는다. legacy/새 모델
+paired pilot은 같은 own checker·`ModelWdlRestricted`, 120초+1초·256 ply·흑백 교환
+1 pair/2 games·15분+정리30초, 선택 기능 off다. 각 판 두 엔진을 재시작하여 네 PALS
+session 각각의 join/drain과 PGN 2판을 인수한다. 실제 비용·실패는 보존한다.
 
 구현/검사 완료 상태는 후속 소스·PR 기록에 추가한다. 본격 학습·learned V 기력·병합은
 이번 계약의 인수에 포함하지 않는다.
-현재 source의 실제 CPU/NN/GPU 검사는 자원 대기로 미시작이다. optional common6 비용 모드는
-준비 중·미실행이며 paired pilot 준비의 자산 핀도 미등록이다. 실제 GPU Repair→C→paused
-CPU resume·seeded Warm·physical drain/unknown 수명, 새 V4/FullLineInteractionV2 baseline의
-제품 등록·Rust/GPU 인수와 pilot은 pending이다.
-새 자산의 독립 CPU 수치 확인은 [이번 후속 범위](PALS-IMPLEMENTATION.md#진단-학습과-남은-실행-인수)에
-별도로 기록한다. 기존 historical GPU·CI·
-CPU 자료는 원래 소스·설정의 증거로 보존하고 새 기준의 인수로 승격하지 않는다.
+현재555의 CPU fmt·Warm example32·native feature·strict Clippy 및 Build14 실제 성공은
+[최신 구현 기록](PALS-IMPLEMENTATION.md#2026-10-12-후속-구현과-실행-관측)에 연결한다.
+기존8b overlay CI와 현재555 exact CI의 네 job 성공을 각각 원 source로 기록한다.
+현재555 PR23은 develop 대상 OPEN/Draft이며 문서 적용 이후 최종 source/CI/PR 인수는 별도다.
+361행 component proof의 358동일·세 변경, native c3/Build13 기능·pilot 기준과
+검증-only8b overlay 및 비용 native555/Build14를 구분한다. Build14 repair/pair-prepare의
+byte 차이를 보존하고 source 동일성을 전체 binary 동일성으로 확대하지 않는다.
+총괄이 인수한 C02의 외부 counter 한 Repair→C/Fresh 연결과 P06/W04 source·seed·physical
+functional 근거는 원 source와 실제 단계 합성으로 보존한다. 연속 pipeline elapsed는
+null이며 원 serde FAIL·budget FAIL·causal HOLD·join 오류·export/wrapper 실패를 덮지 않는다.
+Label4 비용 실패는 첫 owner의 물리 종료와 Fresh load deadline/cancel 거부를 나눠 기록한다.
+role54·public 포함 NN94·role예산64를 혼동하지 않으며 not_comparable·ratio null과
+원 전체 session physical/tree unknown을 유지한다. 새555 비용 실행·paired pilot·최종 문서
+source/CI/PR 인수는 pending이다. 과거 actual receipt는 원 source·binary·설정으로 보존한다.

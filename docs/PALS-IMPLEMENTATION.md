@@ -99,6 +99,13 @@ PausedStack을 지원하지 않는다. 소스는 [CPU](../crates/rz-search/src/c
 orphan frame의 actual disposal·token/bytes 0·complete snapshot 확인 전에는 논리 pause를
 retire하지 않는다. `None`·incomplete는 성공이 아니며 resumed value 실패의 새 작업을 보존한다.
 
+기존 constructor의 CPU interleave는 `ReplaceOnFresh`다. 별도 opt-in
+`ResumeAfterAcceptedRepairC`만 `PausedStack` owner와 iterative Frozen WDL queue를
+요구한다. held-parent-v2는 accepted Repair의 같은 root/first-move queue를 다른 P
+게시 전에 비재귀적으로 drain하고 원래 CPU task를 C tail 뒤 재개한다. 일반 FIFO와
+다른 first-move의 pending 순서는 보존한다. legacy `Disabled`/`SingleReply` fixture
+성공을 이 opt-in의 실제 held-parent 인수로 사용하지 않는다.
+
 host Warm과 CUDA ApproxWarm은 별도 capability이며 둘 다 기본 off다. CUDA의 명시 선택은
 `--pals-cuda-private-warm=true`이고 `onnx-cuda`·`experimental-io-binding`과 등록된 FullLine
 V2 device public memory가 필요하다. accepted seed는 같은 role·모델/epoch·Rules/history·
@@ -119,6 +126,102 @@ request/execution/bank/ordinal과 accepted seed의 실제 join, 마지막 physic
 이번 새 optimizer update는 0회이며 제품 learned V utility/action의 실제 유용성 근거는 부족하다.
 사용자가 총 update 한도를 해제했지만 실행별 자원·시간·출력 상한과 실패 기록은 유지한다.
 상세 범위는 [학습 smoke 기록](TRAINING-PLAN.md#2026-10-10-pals-diagnostic-학습-smoke)을 따른다.
+
+### 2026-10-12 후속 구현과 실행 관측
+
+현재 소스 tip은 `555a913c3ec813c083c5f185ba71f79e710d5f96`다. 기능·수치·
+정상 resident Warm의 실제 native 소스·빌드와 paired pilot 준비 기준은
+`c3b035e4ed43e6756c843372e40ebef60dc9e082`·Build13으로 보존한다.
+독립 reference의 typed FP32 입력 admission overlay는
+`8b4970d6b5a9807a8a054d144da04fc6e7bd922f`이며 수학·허용오차·seed guard를
+바꾸지 않는다. 아직 미실행인 pilot을 빌드 등록이나 UCI preflight로 인수하지 않는다.
+
+c3→현재 tip의 명시적 Rust·Cargo·선정 Python source 361행을 대조한 결과는
+358행 동일, Warm example·typed FP32 validator·검사 세 파일 변경이다. 이 코호트의
+component 재사용 근거이며 저장소 전체나 모든 바이너리의 동일성 선언이 아니다.
+Warm example은 DEFAULT 비용 work 150초·cleanup 30초, legacy 45초·normal 60초와
+동일 source의 receipt admission을 명시한다. 모델·탐색·seed·role NN 예산 64를
+바꾸지 않으며 기존 actual receipt의 source나 실패 판정을 덮어쓰지 않는다.
+
+현재 tip의 CPU 검사는 fmt·Warm example 32개·native feature compile·strict Clippy를
+통과했고 source before/after를 확인했다. c3의 탐색 357개(별도 ignored 2개)·Warm 31개
+통합 검사와 validator의 순수 검사 35개·actual 62call 입력 admission은 각각 원 source의
+근거다. [기존 검증 overlay CI](https://github.com/daejunnom/RoveZero/actions/runs/38186946426)의
+네 job 성공은 exact 8b source에 한정한다.
+[현재555 CI](https://github.com/daejunnom/RoveZero/actions/runs/38193484338)의 Linux·Windows·
+bindings·PALS model 네 job도 exact 현재 source에서 완료·성공을 확인했다.
+PR23은 develop 대상 OPEN/Draft이며 문서 적용 이후 최종 tip의 CI·PR 인수는 별도다.
+
+Build14는 현재555에서 offline/locked release jobs2로 실제 292.3731초·exit 0·owned tree
+정리와 다섯 ELF의 GLIBC 2.34 범위를 확인했다. checker·UCI의 byte digest는 Build13과
+같고 Warm은 바뀌었다. repair·pair-prepare도 실제 byte digest가 달라 원 pin을 보존한다.
+같은 source라는 이유로 이 바이너리들을 bit-identical이라고 하지 않는다. 비용용 native는
+555/Build14로 별도 등록하며 정상 기능·pilot의 c3/Build13 actual 근거와 구분한다.
+새 비용 실행·독립 비교의 실제 결과는 pending이며 빌드 성공으로 대신하지 않는다.
+
+| 후속 관측 | 확인한 범위와 남은 인수 |
+|---|---|
+| FullLine·Legacy 수치 | normal 설정과 별도 비용용 설정의 실제 CUDA 수치, 물리 완료·shutdown·native 종료를 확인했다. declared TF32-off와 실제 TF32 kernel·retry·cuDNN plan의 관측은 별개이며 후자는 unknown이다. |
+| resident CUDA Warm | native capture에서 시작 2회와 실제 consumer 62회, seed 소비 1회 및 owner·worker·buffer 물리 정리를 확인했다. 원 serde 입력 비교 pipeline 실패는 보존하고 native phase만 별도로 인수했다. |
+| 독립 Warm reference | 같은 실제 입력·seed·Fresh/Warm mode의 독립 Torch와 CPU ORT reference 62call, Rust positive exit 0, seed·context 두 의미 거부(exit 1)와 same-task 실제 resume를 확인했다. 총괄은 native capture·reference·verify의 source/seed/physical 연결을 새 whole receipt로 functional 인수했다. 창20·21·22의 실제 단계를 합성한 근거이며 연속 pipeline 벽시계 elapsed는 null이다. typed FP32 bits·raw serde digest·canonical key·owner/seed guard와 원 serde pipeline FAIL는 보존한다. Warm 비용·기력 인수는 별도다. |
+| 실제 외부 counter chain | 원 node budget 초과 실패와 accepted trace incomplete HOLD를 보존한다. 새 실행은 native·causal validator exit 0 및 outer group 정리를 확인했고 독립 감사 35개 검사를 통과했다. 총괄은 b1a3의 외부 반환 27→P Repair 요청 57/수락 59→C 69와 Fresh NN 2+2, 같은 epoch·public revision 5·white 관점의 한 연결을 functional 인수했다. 다른 후보의 exact join 오류 1건은 남는다. 조건부 반박 증거이며 CP/mate→WDL·Rules·root 순위 반사실 효과·기력 근거로 바꾸지 않는다. |
+| 직접 CPU 비용 | Legacy/input-only/head-only/both 공통6 비용을 실제 측정했다. queue 원 wrapper 실패 뒤 기존 실행의 후처리 비용은 5개 모두 not_comparable이고 ratio null이다. stack의 실제 작업량이 달라 speedup 비교를 하지 않는다. Signed192는 공개 API 진단 비용이며 private limb-only·전체 탐색 개선은 미측정이다. |
+| 직접 DEFAULT GPU 비용 | Legacy·FullLine 공통6 직접 모델 API 비용의 원시 15파일을 회수·digest 대조했다. 각 profile은 ready 2+warmup 36+측정 60=98 role 호출, public 50+role 98=148 NN 입력이며 50 public 입력을 포함한다. outer 87.4068초·native exit 0·외부 group 정리를 확인했다. 원 첫 export guard 실패는 보존하고 engine이 소비한 NN 입력 수·VRAM peak·실제 cuDNN plan·TF32 kernel/retry는 unknown이다. |
+| GQA CPU 진단 비용 | 원시 3파일과 분석의 digest를 대조했다. CPU0/1·FP32 합성 tensor 6case, warmup 3회·측정 5회, outer 5.5193초·exit 0·물리 정리만의 관측이다. weights·모델 NN·GPU 실행은 없었다. repeat_interleave의 저장·할당 payload와 attention 호출 비용을 구분하며 whole-worker HWM을 operator 물리 peak로 바꾸거나 현재 모델·전체 엔진의 병목·speedup으로 보고하지 않는다. Warm 비용 및 최종 load/ready/transfer/cache/drain/peak 연결은 별도다. |
+| DEFAULT Warm 비용 Label4 실패 | 원 c3/Build13 비용 실행은 실패로 보존한다. role 호출 54와 public을 포함한 전체 NN 94는 다른 counter이며 role 예산 64 초과·CUDA·seed 실패의 근거가 없다. 첫 owner는 worker join·backend drop·buffer release·lease active/quarantine 0으로 종료했다. 이어진 fresh_load는 original_deadline_or_cancel로 거부되어 새 owner·Fresh 호출이 없다. 비교는 not_comparable·ratio null이고 원 실패 세션의 physical completion/tree gone unknown을 첫 owner 종료로 치환하지 않는다. 현재555/Build14의 새 비용 실행은 별도 pending이다. |
+| V4 paired pilot | Stockfish19 UCI preflight만 확인했다. 같은 own checker·ModelWdlRestricted, optional 기능 off, 120+1·최대256 ply·흑백 교환 2게임과 네 native PALS session의 실제 PGN·수명 인수는 pending이다. |
+
+#### DEFAULT 공통6 API 비용의 관측 범위
+
+각 case/lane의 준비 호출은 3회, 측정은 5회이며 아래는 nearest-rank P50(ms)다.
+P95는 표본 5개의 최대값이므로 일반 tail latency나 신뢰구간으로 해석하지 않는다.
+
+| 공통 case | Legacy cold | Legacy cache hit | FullLine cold | FullLine cache hit |
+|---|---:|---:|---:|---:|
+| empty_context | 3.709473 | 2.260881 | 4.732332 | 2.918340 |
+| critic_divergence | 3.820792 | 2.296201 | 4.796652 | 2.940714 |
+| proposer_order | 3.745652 | 2.233594 | 4.769851 | 2.909019 |
+| proposer_order_reversed | 3.668024 | 2.506251 | 4.803111 | 2.914934 |
+| same_board_other_history | 3.678463 | 2.236969 | 4.748416 | 2.921253 |
+| all_promotions | 3.674979 | 2.248154 | 4.790275 | 2.938637 |
+
+cold는 이미 로드된 모델의 public cache를 매 호출 전에 비운 조건이다. cache hit는
+같은 profile·case의 마지막 cold 입력 cache를 이어 쓰며 추가 priming Run은 없다.
+공통 여섯 case 이름·역할·record 수는 같지만 두 profile의 원 입력·canonical/public key는
+다르므로 위 수치를 동일 입력의 모델 speedup으로 계산하지 않는다. 준비 반복 3회는
+resident Warm seed/stack 비용의 측정이 아니다.
+
+호출 시간은 `PalsOnnxBackend::run`의 entry→return에 있는 준비·cache·public/role Run·
+transfer·fence·출력 검증을 포함한다. load·reset·verify·stats·JSON 기록은 제외한다.
+Legacy/FullLine의 backend load API는 각각 0.680481/0.729945초, readiness는
+5.171717/5.202648초다. readiness 이전 process startup은 32.522193/32.585970초,
+report write 이전 program wall은 42.953095/43.157123초이며 서로 포함 관계가 있어
+더하지 않는다. 두 profile outer 87.4068초와 단일 API P50도 다른 시간 범위다.
+
+각 profile의 fixture·가중치·runtime은 기존 비용용 numeric38과 같지만 ORT intra-thread는
+numeric38의 2에서 공통6 비용의 1로 명시적으로 다르다. graph optimization disable·
+DEFAULT 요청·환경 override 0은 이 별도 비용 세션의 선언이며 실제 TF32 plan 관측은
+unknown이다. 숫자 검사의 전체 suite나 arena 기본 profile의 성능으로 재사용하지 않는다.
+
+회수한 kernel profile은 startup과 ready P/C 두 호출까지이며 비용 lane 전에 종료했다.
+초기 placement·ready provider·허용 public-input transfer는 해당 startup 범위만 확인한다.
+cost lane의 개별 CUDA kernel·transfer event 시간은 unknown이다. host RSS/HWM은
+whole-process 관측이며 per-call allocator peak·VRAM peak로 바꾸지 않는다.
+
+실행 자료는 Colab 관측 프로필이다. strict-local 자원 인수와 performance eligibility는
+false로 유지하며 CPU·메모리·swap 선언을 실제 readback으로 대체하지 않는다.
+Windows commit 여유 6GiB의 진입·지속 stop 조건은 최신 사용자 지시로 제거했다.
+나머지 CPU·유한 시간·worker·출력·물리 종료와 원 실패 보존 계약은 유지한다.
+
+기존 39조건에 대한 총괄의 인수 판정은 유지한다. 후속 C02/P06/W04 functional 인수는
+명시 source와 단계 합성의 실제 근거로 별도 연결한다. E04의 Warm 비용·E06 pilot·E07의
+최종 문서 tip·CI·PR 기록은 pending이며 전체 45조건의 최종 판정 필드는 총괄 입력 전까지
+null이다. 본격 학습·learned V의 실제 유용성·기력·PR 병합 완료로 확대하지 않는다.
+
+#### 초기 준비 시점의 기록
+
+아래의 미확인·미실행·pending과 Windows 자원 대기는 초기 준비 시점의 역사다.
+당시 결과와 실패를 보존하며 위의 후속 실제 관측과 구분한다.
 
 `8bc8e26`은 이 문서 갱신에서 대조한 원본 코드 기준이다. 이후 수정된 `662094e`의
 검사·CI는 해당 SHA로 별도 인수하며, 이전 CI 실패·수정 이력을 보존한다. 현재 CI 최종
