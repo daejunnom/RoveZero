@@ -169,7 +169,9 @@ impl PalsArenaValidationContext for LockedPalsArenaLaunchV4 {
             PalsEngineV4::Pals(endpoint) => Ok(NativeReceiptEncodingIdentity::FreshModelInput(
                 &endpoint.model_v2.encoding_sha256,
             )),
-            _ => Err(invalid("native V4 requires actual Fresh model/input identity")),
+            _ => Err(invalid(
+                "native V4 requires actual Fresh model/input identity",
+            )),
         }
     }
     fn recipe(&self, role: NativeEngineRole) -> &PalsEndpointLaunchV3 {
@@ -4432,12 +4434,14 @@ mod tests {
     }
     #[cfg(any(feature = "pals-collection", feature = "native-cuda"))]
     fn native_encoding_fixtures() -> Vec<PalsArenaLaunchV4> {
-        let mut fixtures = vec![native_encoding_cpu_fixture()];
-        if cfg!(all(target_os = "linux", feature = "native-cuda")) {
-            #[cfg(all(target_os = "linux", feature = "native-cuda"))]
-            fixtures.push(cudnn_conv_pilot_fixture());
+        #[cfg(all(target_os = "linux", feature = "native-cuda"))]
+        {
+            vec![native_encoding_cpu_fixture(), cudnn_conv_pilot_fixture()]
         }
-        fixtures
+        #[cfg(not(all(target_os = "linux", feature = "native-cuda")))]
+        {
+            vec![native_encoding_cpu_fixture()]
+        }
     }
     fn encoding_array(value: &str) -> Vec<u8> {
         (0..64)
@@ -4488,7 +4492,10 @@ mod tests {
             let lock = input.lock().unwrap();
             for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
                 let fresh = lock.native_receipt_encoding_identity(role).unwrap();
-                assert!(matches!(fresh, NativeReceiptEncodingIdentity::FreshModelInput(_)));
+                assert!(matches!(
+                    fresh,
+                    NativeReceiptEncodingIdentity::FreshModelInput(_)
+                ));
                 let rules = &lock.native(role).unwrap().encoding_semantic_sha256;
                 assert_ne!(fresh.sha256(), rules);
                 let record = native_identity_record(&lock, role);
@@ -4524,8 +4531,8 @@ mod tests {
     #[cfg(any(feature = "pals-collection", feature = "native-cuda"))]
     #[test]
     fn native_v4_encoding_rejects_history_profile_and_malformed_namespaces() {
-        let exact = Position::startpos();
-        let unknown = Position::from_fen(&exact.to_fen()).unwrap();
+        let exact = rz_position::Position::startpos();
+        let unknown = rz_position::Position::from_fen(&exact.to_fen()).unwrap();
         let exact_history = rz_uci::pals_native::pals_history_digest(&exact).unwrap();
         let unknown_history = rz_uci::pals_native::pals_history_digest(&unknown).unwrap();
         assert_ne!(exact_history, unknown_history);
@@ -4537,10 +4544,14 @@ mod tests {
                     NativeEngineRole::Candidate => NativeEngineRole::Baseline,
                 };
                 let record = native_identity_record(&lock, role);
-                let different_profile =
-                    lock.native_receipt_encoding_identity(other).unwrap().sha256();
+                let different_profile = lock
+                    .native_receipt_encoding_identity(other)
+                    .unwrap()
+                    .sha256();
                 assert_ne!(
-                    lock.native_receipt_encoding_identity(role).unwrap().sha256(),
+                    lock.native_receipt_encoding_identity(role)
+                        .unwrap()
+                        .sha256(),
                     different_profile
                 );
                 for bytes in [
@@ -4563,7 +4574,11 @@ mod tests {
             let lock = input.lock().unwrap();
             for role in [NativeEngineRole::Baseline, NativeEngineRole::Candidate] {
                 let record = native_identity_record(&lock, role);
-                for field in ["model_epoch", "export_manifest_sha256", "adapter_source_sha256"] {
+                for field in [
+                    "model_epoch",
+                    "export_manifest_sha256",
+                    "adapter_source_sha256",
+                ] {
                     let mut wrong = record.clone();
                     let bytes = wrong[field].as_array_mut().unwrap();
                     bytes[0] = (bytes[0].as_u64().unwrap() ^ 1).into();
@@ -4573,7 +4588,10 @@ mod tests {
                 wrong["trained"] = true.into();
                 assert!(check_native_identity(&lock, role, &wrong).is_err());
                 let mut wrong = record;
-                wrong.as_object_mut().unwrap().remove("adapter_source_sha256");
+                wrong
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("adapter_source_sha256");
                 assert!(check_native_identity(&lock, role, &wrong).is_err());
             }
         }
@@ -4583,8 +4601,14 @@ mod tests {
         let lock = super::super::tests::native_fixture().lock().unwrap();
         let role = NativeEngineRole::Baseline;
         let encoding = lock.native_receipt_encoding_identity(role).unwrap();
-        assert!(matches!(encoding, NativeReceiptEncodingIdentity::LegacyRecipe(_)));
-        assert_eq!(encoding.sha256(), lock.native(role).unwrap().encoding_semantic_sha256);
+        assert!(matches!(
+            encoding,
+            NativeReceiptEncodingIdentity::LegacyRecipe(_)
+        ));
+        assert_eq!(
+            encoding.sha256(),
+            lock.native(role).unwrap().encoding_semantic_sha256
+        );
         let mut record = native_identity_record(&lock, role);
         assert!(check_native_identity(&lock, role, &record).is_ok());
         record["encoding_semantic_sha256"] = serde_json::json!(vec![0xee_u8; 32]);

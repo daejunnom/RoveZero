@@ -3950,7 +3950,9 @@ pub fn validate_pals_native_records(
 /// lock and native wire domain; no historical manifest is synthesized.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeReceiptEncodingIdentity<'a> {
+    // Historical V3 receipts retain their declared recipe domain.
     LegacyRecipe(&'a str),
+    // V4 loader metadata still names Rules; the physical owner names Fresh.
     FreshModelInput(&'a str),
 }
 impl<'a> NativeReceiptEncodingIdentity<'a> {
