@@ -270,3 +270,15 @@ Build15는315.3177초·일곱 명령 exit0/tree gone·다섯 ELF GLIBC 상한2.3
 [exact CI](https://github.com/daejunnom/RoveZero/actions/runs/38208720665) 네 job 성공은 CPU 범위다.
 원 수치·정상 Warm c3/Build13 및 비용555/Build14를 새 source로 재라벨하지 않는다. component
 재사용 검증·새 arena의 실제 두 게임/네 session과 E06/E07 최종 인수는 대기 상태다.
+
+### V4 native receipt와 launch recipe의 인코딩 식별
+
+V3의 native receipt는 기존 recipe의 `encoding_semantic_sha256`와 대조한다.
+V4의 native receipt는 모델 입력의 Fresh namespace를 나타내므로 manifest의
+`configuration.model_v2.encoding_sha256`와 대조한다. V4 loader가 검증하는
+`configuration.model.encoding_semantic_sha256`는 Rules-only recipe 식별이며
+두 값을 교환·자동 변환·같게 선언하지 않는다. epoch·export·adapter·trained 및
+startup/termination의 정확한 identity fence와 물리 완료 조건을 모두 유지한다.
+새 검사는 Legacy/FullLine·CPU/CUDA, namespace 교환·history/profile 혼입·잘못된
+encoding·다른 frozen identity·V3 호환·mock의 native 주장 거부를 포함한다.
+[실패·수정·Build18과 실제 인수 경계](PALS-IMPLEMENTATION.md#v4-native-영수증의-fresh-인코딩-경계)를 따른다.

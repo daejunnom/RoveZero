@@ -260,6 +260,37 @@ V18 준비에서는 선언한 CUDA device와 session arena로 두 endpoint의 id
 실패 자료를 별도 pin으로 보존한다. 후보 probe 두 개와 game session 네 개, PGN 두 판,
 시계·필수 종료·전체45 최종 인수는 실제 자료가 확보될 때까지 pending/null이다.
 
+
+#### V4 native 영수증의 Fresh 인코딩 경계
+
+V18 실제 실행은 metadata 9.3136초·exit0 뒤 execute 163.9297초·exit1로 끝났다.
+legacy baseline probe PID25376·25548은 각각 startup NN3·검색 소비0이며 정상 exit0,
+최종 mapping·physical shutdown·buffers released true, in-flight0·quarantine false를
+기록했다. 게임과 PGN은0이다. 원시38파일·경로 역대조·실패 원문을 보존한다.
+이 정상 probe를 E06의 실제 game session으로 대체하지 않는다.
+
+실패 원인은 V4 영수증의 native Fresh 입력 인코딩을 Rules-only recipe 인코딩과
+비교하던 공유 검증 접점이다. 수정 제품 소스는
+`ae36afcb4253a51f4e2ffa6cb01ec47358bc546d`다. V3의 recipe 경계를 유지하고,
+V4만 typed 접점에서 `configuration.model_v2.encoding_sha256`의 Fresh 모델 입력
+식별을 대조한다. `configuration.model.encoding_semantic_sha256`의 Rules/loader
+식별과 metadata는 그대로 별도 검증한다. epoch·export·adapter·trained와 모든
+startup/termination·물리 완료 guard는 유지하며 guard를 생략하거나 두 식별값을
+같게 만드는 명세 교정을 하지 않는다.
+
+선택 소스322개 중320개와 핵심 계산129개가 byte 동일하며 변경은 arena의
+`pals_launch.rs`·`pals_launch/v4.rs` 두 파일이다. 새 Build18은 실제397.7564초,
+offline/locked release jobs2와11개 감독 명령 exit0·owned tree 정리, 다섯 ELF의
+GLIBC 상한2.34를 확인했다. 종료 처리2개 selector와 native V4/V3 encoding CPU
+검사를 별도 실행했고 이 빌드의 NN·optimizer 실행은0이다. Windows 로컬 CPU 시도는
+애플리케이션 제어4551로 생성 build script가 실행 전 차단됐으며 실패를 보존한다.
+
+[제품 ae36 exact CPU CI](https://github.com/daejunnom/RoveZero/actions/runs/38241508426)의
+Linux·Windows·bindings·PALS model 네 job이 성공했다. 마지막 Windows 완료는
+2026-10-12 11:25:40 UTC다. V19는 원 V15/V18 strict gate와 새 source proof·Build18를
+함께 검사한 별도 실행으로 준비한다. 실제 네 probe·네 game process·두 PGN, 시계·
+물리 종료를 인수하기 전 E06/E07와 전체45 최종 verdict는 pending/null이다.
+
 #### DEFAULT 공통6 API 비용의 관측 범위
 
 각 case/lane의 준비 호출은 3회, 측정은 5회이며 아래는 nearest-rank P50(ms)다.
