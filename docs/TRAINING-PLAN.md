@@ -48,6 +48,16 @@ CPU 2·15분+정리 30초·출력 2GiB 상한과 actual dispatch/completion·실
 [PR23 후속 계약](PALS-FOLLOWUP-CONTRACTS.md), 구현·검사·미실행 구분은
 [이번 후속 범위](PALS-IMPLEMENTATION.md#2026-10-10-pr23-후속-범위)를 따른다.
 
+## 2026-10-12 frozen 실행과 학습 증거의 구분
+
+기존 작은 학습 smoke의 24회 성공과 이전 실패 9회, 누적 update 33회의 실행 이력과 checkpoint 근거를 보존한다. 이후의 제품 빌드, CPU 계약 검사, CI와 frozen 모델 대국 자료는 학습 update나 learned V의 일반화 근거로 합산하지 않는다. source-proof21과 검사 전용 소스 역변환은 학습·모델 실행을 다시 수행한 자료가 아니다.
+
+V22의 두 판과 개별 물리 종료 자료는 typed Core 생성 실패를 포함한 실제 자료로 남기며, 현재 Build22·Pilot23과 최종 인수는 대기 중이다. Colab에서 관측한 기능 자료는 strict-local 자원 인수, 성능·기력·Elo 또는 모델 승격을 증명하지 않는다. 본격적인 학습, learned V의 일반화와 선택 기능의 현재 바이너리 효과 검증은 해당 예산과 통제 비교를 갖춘 후속 작업으로 남긴다.
+
+이번 새 실행 창에서 실제 optimizer update는 0이다. 네 차례 capacity 실패로 새 Build22·NN·게임 실행은 시작되지 않았으며, 기존 33회 학습 이력과 V22의 실제 NN·대국 자료를 모두 보존한다.
+
+제품·검사 소스와 현재 대국 인수는 [현재 실행 기록](PALS-IMPLEMENTATION.md#2026-10-12-게임별-종료-소유자-수정과-현재-인수)에 연결한다.
+
 ## 0. 2026-10-04 강도용 모델 전환의 우선순위
 
 이 절의 실행·미실행은 2026-10-04 BT4 전환 당시 범위다. 위 PALS diagnostic 후속과

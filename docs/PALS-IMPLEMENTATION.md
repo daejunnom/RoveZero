@@ -127,6 +127,20 @@ request/execution/bank/ordinal과 accepted seed의 실제 join, 마지막 physic
 사용자가 총 update 한도를 해제했지만 실행별 자원·시간·출력 상한과 실패 기록은 유지한다.
 상세 범위는 [학습 smoke 기록](TRAINING-PLAN.md#2026-10-10-pals-diagnostic-학습-smoke)을 따른다.
 
+### 2026-10-12 게임별 종료 소유자 수정과 현재 인수
+
+현재 후속 실행에 등록한 제품 소스는 `4fef86812792823313fc67e845ed90a500954959`다. 이전 `f75a739`의 Build21은 13개 명령의 정상 종료, 등록된 ELF 5개, CPU selector 6개의 검사 10개 성공을 실제 자료로 보존한다. 새 제품 소스의 Build22와 Pilot23은 실제 완료 자료를 기다리고 있으며, 이전 빌드의 성공을 새 빌드의 성공으로 표시하지 않는다.
+
+V22의 회수 자료에는 원래 PGN의 두 판 무승부 기록, 서로 다른 preflight 4개와 game 4개의 소유자, 물리 종료 영수증 8개와 profile 원시 파일 32개가 있다. 게임별 검색 반환은 성공 116회·실패 0회지만, 이 수는 NN 실행 수가 아니다. typed Core는 재시작한 게임이 과거 process owner를 재사용했다는 오류로 생성되지 않았고 실행의 실패 상태도 보존한다. 따라서 개별 물리 종료와 검색 반환 자료를 전체 대국 인수로 승격하지 않는다. typed Admission/Expired 분기가 이번 실행에서 실제 발동했는지는 미확인이다.
+
+기존 43개 항목의 범위별 근거와 원래 출처를 유지하며 E06, E07과 최종 45개 판정은 대기 중이다. `b4ae4ff`의 CI 네 job 성공, `4fef868`의 Linux clippy 실패, 이를 고친 검사 전용 `ee6322f`의 정확 CI 네 job 성공을 각각 구분한다. 최신 제품의 실제 인수와 공개 문서·PR·총괄 점검을 마치기 전에는 플랜 완료로 표시하지 않는다.
+
+이번 후속 실행 창의 L4 시작 요청 네 차례는 모두 capacity code 8로 실패했다. 이번 창에서 새 Build22·NN·대국·optimizer update는 0이며 이전 V22 실행과 구분한다. 같은 창에서 추가 시작은 하지 않고 실제 runtime `STOPPED`와 이번 감독 프로세스의 exit 0을 확인했다. 이전 창의 감독 프로세스 exit 1과 뒤늦은 STOPPED 관측은 별도 실패 이력으로 보존한다.
+
+[검사 전용 소스의 CI 네 job](https://github.com/daejunnom/RoveZero/actions/runs/38261837495)은
+`ee6322ff4fc4f8882403f13ff5560920dfc5b44c`에서 성공했다. 새 cleanup owner 검사 두 개의
+실제 성공과 clippy 완료를 확인했으며, [제품 소스의 이전 CI 실패](https://github.com/daejunnom/RoveZero/actions/runs/38260291825)는 보존한다.
+
 ### 2026-10-12 후속 구현과 실행 관측
 
 실제 검사 코드 baseline은 `555a913c3ec813c083c5f185ba71f79e710d5f96`이며,

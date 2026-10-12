@@ -183,6 +183,18 @@ CUDA Warm의 별도 소유권은
 `--pals-cuda-private-warm=true`에는 `onnx-cuda`·`experimental-io-binding`과 등록된
 FullLine V2 device public memory가 필요하다.
 
+## 게임별 종료 소유자와 공유 정리 비용
+
+게임별 cleanup 영수증의 소유자는 실제 game PID, 실행 work와 native 종료 근거를 함께 연결한다. `4fef868`의 producer는 전체 pair의 cleanup 구간을 명시하고 공유 pair stream의 비용을 한 번만 청구한다. 공유 pair stream은 첫 baseline game에만 청구한다. 다른 게임의 0은 중복 청구를 피하기 위한 값이며, 해당 자식 프로세스의 stream을 독립 계측한 결과가 아니다. source-proof21의 역변환 검사는 기존 정상 종료, 시계, profile, group 종료와 보존 guard의 소스 경계를 확인한 자료이며 새 실행의 물리 종료를 대신하지 않는다.
+
+V22의 typed Core 생성 실패와 process owner 중복 오류는 원문을 유지한다. 회수된 startup·termination 자료가 개별 물리 완료를 증명하더라도, 기존 Core JSON을 수정하거나 이미 종료된 live owner를 다시 조립하여 새 대국 인수로 처리하지 않는다. 새 producer의 실제 typed Core, 별개 preflight/game 소유자, 입력 lock, PGN·시계·실패 및 종료 근거가 함께 있어야 후속 실행을 인수할 수 있다.
+
+`f75a739`에서 도입한 Admission/Expired의 typed deadline 전달과 그 CPU 검사는 별도 근거로 보존한다. 현재 V22의 성공 반환 자료는 이 오류 분기의 실제 발동 여부를 증명하지 않으므로 해당 관측은 unknown으로 둔다. 모델 의미와 Fresh/Rules namespace, 논리 취소와 물리 완료의 수명 계약은 그대로 적용한다.
+
+`ee6322f`의 실제 Linux CI에서는 네 게임 PID의 cleanup owner와 재사용 거부 검사, 공유 pair stream의 한 번 청구 검사 두 개가 각각 성공했고 clippy도 완료됐다. 이 CPU fixture 결과는 새 producer의 계약 검사이며 Build22·Pilot23의 실제 NN·게임 인수를 대신하지 않는다.
+
+현재 실행 상태와 실패 이력은 [게임별 종료 소유자 수정과 현재 인수](PALS-IMPLEMENTATION.md#2026-10-12-게임별-종료-소유자-수정과-현재-인수)를 따른다.
+
 ## 작은 학습과 실행 인수
 
 실제 target coverage와 진단 fixture를 분리한다. nonzero checkpoint는 zero-step
