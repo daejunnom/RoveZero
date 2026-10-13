@@ -1,5 +1,6 @@
 //! Pure model-content and exact Rules-declaration joins. No runtime is loaded.
 use super::*;
+use rz_experiments::PalsNumericalScopeV5;
 
 #[cfg(any(feature = "native-cuda", feature = "pals-collection-onnx"))]
 struct ExportContent {
@@ -16,19 +17,19 @@ pub fn validate_export_content_v5(
     config: &PalsAdaptiveStartupConfigV5,
     bytes: &[u8],
 ) -> Result<(), ArenaError> {
-    checked_export(config, bytes).map(|_| ())
+    checked_export(&PalsNumericalScopeV5::from_config(config), bytes).map(|_| ())
 }
 
 #[cfg(any(feature = "native-cuda", feature = "pals-collection-onnx"))]
 fn checked_export(
-    config: &PalsAdaptiveStartupConfigV5,
+    config: &PalsNumericalScopeV5,
     bytes: &[u8],
 ) -> Result<ExportContent, ArenaError> {
     use rz_eval::pals_onnx::virtual_review::{
         VirtualReviewExecutionMode, validate_pals_legacy_export_manifest,
         validate_virtual_review_export_manifest,
     };
-    let m = &config.endpoint.model;
+    let m = &config.model;
     if m.profile == "virtual_review_v1" {
         require(
             m.semantic_sha256
@@ -39,7 +40,7 @@ fn checked_export(
             "compact model/encoding registry identity differs from the compiled semantic and tensor ABI registries",
         )?;
     }
-    let collection = config.endpoint.mode == PalsEngineModeV5::Collection;
+    let collection = config.mode == PalsEngineModeV5::Collection;
     let mode = if collection {
         VirtualReviewExecutionMode::Collection
     } else {
@@ -201,9 +202,37 @@ fn checked_export(
     })
 }
 
+/// Actual post-prepare numerical scope; no endpoint or startup lock is invented.
+#[cfg(any(feature = "native-cuda", feature = "pals-collection-onnx"))]
+pub fn validate_scope_export_content_v5(
+    scope: &PalsNumericalScopeV5,
+    bytes: &[u8],
+) -> Result<(), ArenaError> {
+    scope.validate_pre_acceptance()?;
+    checked_export(scope, bytes).map(|_| ())
+}
+
 #[cfg(any(feature = "native-cuda", feature = "pals-collection-onnx"))]
 pub fn validate_export_rules_content_v5(
     config: &PalsAdaptiveStartupConfigV5,
+    export: &[u8],
+    rules: &[u8],
+) -> Result<(), ArenaError> {
+    checked_export_rules(&PalsNumericalScopeV5::from_config(config), export, rules)
+}
+
+#[cfg(any(feature = "native-cuda", feature = "pals-collection-onnx"))]
+pub fn validate_scope_export_rules_content_v5(
+    scope: &PalsNumericalScopeV5,
+    export: &[u8],
+    rules: &[u8],
+) -> Result<(), ArenaError> {
+    scope.validate_pre_acceptance()?;
+    checked_export_rules(scope, export, rules)
+}
+#[cfg(any(feature = "native-cuda", feature = "pals-collection-onnx"))]
+fn checked_export_rules(
+    config: &PalsNumericalScopeV5,
     export: &[u8],
     rules: &[u8],
 ) -> Result<(), ArenaError> {
@@ -214,7 +243,7 @@ pub fn validate_export_rules_content_v5(
             && format!("{:x}", Sha256::digest(rules)) == a.artifact.sha256,
         "actual Rules descriptor differs from registration",
     )?;
-    if config.endpoint.model.profile == "virtual_review_v1" {
+    if config.model.profile == "virtual_review_v1" {
         let r =
             rz_uci::pals_native::virtual_encoding::validate_pals_virtual_rules_descriptor_bytes(
                 rules,
@@ -253,6 +282,27 @@ pub fn validate_export_content_v5(
 #[cfg(not(any(feature = "native-cuda", feature = "pals-collection-onnx")))]
 pub fn validate_export_rules_content_v5(
     _: &PalsAdaptiveStartupConfigV5,
+    _: &[u8],
+    _: &[u8],
+) -> Result<(), ArenaError> {
+    Err(invalid(
+        "native Rules admission requires explicit ONNX capability",
+    ))
+}
+
+#[cfg(not(any(feature = "native-cuda", feature = "pals-collection-onnx")))]
+pub fn validate_scope_export_content_v5(
+    _: &PalsNumericalScopeV5,
+    _: &[u8],
+) -> Result<(), ArenaError> {
+    Err(invalid(
+        "native export admission requires explicit ONNX capability",
+    ))
+}
+
+#[cfg(not(any(feature = "native-cuda", feature = "pals-collection-onnx")))]
+pub fn validate_scope_export_rules_content_v5(
+    _: &PalsNumericalScopeV5,
     _: &[u8],
     _: &[u8],
 ) -> Result<(), ArenaError> {

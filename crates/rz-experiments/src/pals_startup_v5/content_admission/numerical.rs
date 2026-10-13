@@ -7,7 +7,7 @@
 //! boundary; ApproxWarm needs a separate seeded-reference admission.
 use crate::{
     ArtifactRef, ManifestError, PalsAdaptiveStartupConfigV5, PalsEngineModeV5, PalsModelBackendV3,
-    PalsPrecisionV3, PalsStartupAssetPurposeV5 as Purpose, decode_json,
+    PalsNumericalScopeV5, PalsPrecisionV3, PalsStartupAssetPurposeV5 as Purpose, decode_json,
 };
 use rz_eval::pals_model::{
     PalsCandidateToken, PalsModelConfig, PalsModelInput, PalsModelProfile, PalsRawOutput, PalsRole,
@@ -186,15 +186,47 @@ pub struct PalsNumericalAdmissionV5 {
 /// caller retains source/private FDs and returns bounded actual bytes; this
 /// function verifies their SHA and size again. Each run pair is released before
 /// the next read so raw fixtures do not remain resident for the whole arena.
+/// Completed startup compatibility path. The exact projection uses the same
+/// numerical core; full startup/config/lock admission remains the caller's gate.
 pub fn validate_pals_numerical_acceptance_v5(
     config: &PalsAdaptiveStartupConfigV5,
+    acceptance_bytes: &[u8],
+    read_artifact: impl FnMut(&ArtifactRef, usize) -> Result<Vec<u8>, ManifestError>,
+) -> Result<PalsNumericalAdmissionV5, ManifestError> {
+    validate_numerical_scope_core(
+        &PalsNumericalScopeV5::from_config(config),
+        acceptance_bytes,
+        read_artifact,
+    )
+}
+
+/// Numerical-only admission of actual post-prepare inputs. This does not grant
+/// a completed startup, CPU endpoint, process readiness or trained asset issuer.
+pub fn validate_pals_numerical_scope_acceptance_v5(
+    scope: &PalsNumericalScopeV5,
+    acceptance_bytes: &[u8],
+    read_artifact: impl FnMut(&ArtifactRef, usize) -> Result<Vec<u8>, ManifestError>,
+) -> Result<PalsNumericalAdmissionV5, ManifestError> {
+    scope.validate_pre_acceptance()?;
+    validate_numerical_scope_core(scope, acceptance_bytes, read_artifact)
+}
+
+/// Bind only actual post-prepare files; this cannot invent future graph hashes.
+pub fn numerical_scope_bindings_v5(
+    scope: &PalsNumericalScopeV5,
+) -> Result<PalsNumericalBindingsV5, ManifestError> {
+    scope.validate_pre_acceptance()?;
+    scope_expected_bindings(scope)
+}
+fn validate_numerical_scope_core(
+    config: &PalsNumericalScopeV5,
     acceptance_bytes: &[u8],
     mut read_artifact: impl FnMut(&ArtifactRef, usize) -> Result<Vec<u8>, ManifestError>,
 ) -> Result<PalsNumericalAdmissionV5, ManifestError> {
     let asset = config.asset(Purpose::NumericalAcceptance)?;
     verify_bytes(&asset.artifact, acceptance_bytes, ACCEPTANCE_LIMIT)?;
     let acceptance: PalsNumericalAcceptanceV5 = parse(acceptance_bytes, ACCEPTANCE_LIMIT)?;
-    let expected = expected_bindings(config)?;
+    let expected = scope_expected_bindings(config)?;
     if acceptance.schema_version != 5
         || acceptance.domain != PALS_NUMERICAL_ACCEPTANCE_V5_DOMAIN
         || acceptance.bindings != expected
@@ -339,11 +371,11 @@ fn verify_bytes(artifact: &ArtifactRef, bytes: &[u8], limit: usize) -> Result<()
     }
     Ok(())
 }
-fn expected_bindings(
-    config: &PalsAdaptiveStartupConfigV5,
+fn scope_expected_bindings(
+    config: &PalsNumericalScopeV5,
 ) -> Result<PalsNumericalBindingsV5, ManifestError> {
-    let m = &config.endpoint.model;
-    m.validate(config.endpoint.mode)?;
+    let m = &config.model;
+    m.validate(config.mode)?;
     if m.profile == "virtual_review_v1"
         && m.encoding_sha256
             != rz_eval::pals_model::virtual_review::registered_encoding_sha256()
@@ -402,7 +434,7 @@ fn expected_bindings(
             graphs.insert(role.into(), a.artifact.sha256.clone());
         }
     }
-    let collection = config.endpoint.mode == PalsEngineModeV5::Collection;
+    let collection = config.mode == PalsEngineModeV5::Collection;
     let valid = if m.profile == "virtual_review_v1" {
         BTreeSet::from_iter(
             ["public", "shared_pc"]
@@ -485,7 +517,7 @@ fn expected_bindings(
 
 #[cfg(feature = "pals-content-admission")]
 fn validate_export_boundary(
-    config: &PalsAdaptiveStartupConfigV5,
+    config: &PalsNumericalScopeV5,
     read: &mut impl FnMut(&ArtifactRef, usize) -> Result<Vec<u8>, ManifestError>,
 ) -> Result<(), ManifestError> {
     use rz_eval::pals_onnx::virtual_review::{
@@ -495,11 +527,11 @@ fn validate_export_boundary(
     let artifact = &config.asset(Purpose::ExportManifest)?.artifact;
     let bytes = read(artifact, 256 * 1024)?;
     verify_bytes(artifact, &bytes, 256 * 1024)?;
-    let mode = match config.endpoint.mode {
+    let mode = match config.mode {
         PalsEngineModeV5::Collection => VirtualReviewExecutionMode::Collection,
         PalsEngineModeV5::Deployment => VirtualReviewExecutionMode::Deployment,
     };
-    let expected = expected_bindings(config)?;
+    let expected = scope_expected_bindings(config)?;
     let actual = if expected.model_profile == "virtual_review_v1" {
         let summary = validate_virtual_review_export_manifest(&bytes, mode)
             .map_err(|e| integrity(&e.to_string()))?;
@@ -560,7 +592,7 @@ fn validate_export_boundary(
 }
 #[cfg(not(feature = "pals-content-admission"))]
 fn validate_export_boundary(
-    _: &PalsAdaptiveStartupConfigV5,
+    _: &PalsNumericalScopeV5,
     _: &mut impl FnMut(&ArtifactRef, usize) -> Result<Vec<u8>, ManifestError>,
 ) -> Result<(), ManifestError> {
     Err(integrity(
@@ -679,13 +711,13 @@ impl Coverage {
                 *r == role && candidates.len() > 1 && orders.len() > 1
             })
     }
-    fn validate(&self, config: &PalsAdaptiveStartupConfigV5) -> Result<(), ManifestError> {
-        let roles = if config.endpoint.mode == PalsEngineModeV5::Collection {
+    fn validate(&self, config: &PalsNumericalScopeV5) -> Result<(), ManifestError> {
+        let roles = if config.mode == PalsEngineModeV5::Collection {
             vec![PalsRole::Proposer, PalsRole::Critic, PalsRole::Validator]
         } else {
             vec![PalsRole::Proposer, PalsRole::Critic]
         };
-        let compact = config.endpoint.model.profile == "virtual_review_v1";
+        let compact = config.model.profile == "virtual_review_v1";
         let buckets: &[usize] = if compact {
             &[8, 16, 32, 64, 128, 256]
         } else {
@@ -1204,6 +1236,9 @@ fn compare_probabilities(reference: &[f32], native: &[f32]) -> Result<f64, Manif
     Ok(maximum)
 }
 
+#[cfg(test)]
+#[path = "numerical_scope_tests.rs"]
+mod numerical_scope_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

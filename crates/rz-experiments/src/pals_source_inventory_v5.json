@@ -239,6 +239,7 @@
       "crates/rz-experiments/src/pals_startup_v5/content_admission/artifact_domains.rs",
       "crates/rz-experiments/src/pals_startup_v5/content_admission/artifact_domains/frozen_collection.rs",
       "crates/rz-experiments/src/pals_startup_v5/content_admission/numerical.rs",
+      "crates/rz-experiments/src/pals_startup_v5/content_admission/numerical_scope.rs",
       "crates/rz-experiments/src/pals_startup_v5/content_admission/owned_files.rs"
     ],
     "model_native": [

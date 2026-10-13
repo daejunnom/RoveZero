@@ -29,17 +29,18 @@ impl PalsFrozenPcCollectionMetadataV5 {
     }
 }
 
-pub(super) fn validate_frozen_collection(
+// The completed startup metadata wrapper preserves its native-options Fresh
+// guard before projection. A numerical-only scope carries no Warm capability.
+pub(super) fn validate_frozen_collection_scope(
     p: &Value,
     registered_spec: &Value,
-    config: &PalsAdaptiveStartupConfigV5,
+    config: &PalsNumericalScopeV5,
     export: &Value,
 ) -> Result<PalsFrozenPcCollectionMetadataV5, ManifestError> {
     need(
-        config.endpoint.mode == PalsEngineModeV5::Collection
-            && config.endpoint.model.profile == "virtual_review_v1"
-            && config.endpoint.model.checkpoint_domain.as_deref() == Some(CHECKPOINT_DOMAIN)
-            && !config.native_options.approximate_warm,
+        config.mode == PalsEngineModeV5::Collection
+            && config.model.profile == "virtual_review_v1"
+            && config.model.checkpoint_domain.as_deref() == Some(CHECKPOINT_DOMAIN),
         "frozen P/C requires its own Fresh Collection domain",
     )?;
     fields(
@@ -111,12 +112,7 @@ pub(super) fn validate_frozen_collection(
         "frozen P/C cannot be relabelled as untrained or complete G1",
     )?;
     let checkpoint = &p["checkpoint"];
-    validate_frozen_checkpoint(
-        checkpoint,
-        spec,
-        &config.endpoint.model.weights,
-        config.endpoint.model.epoch,
-    )?;
+    validate_frozen_checkpoint(checkpoint, spec, &config.model.weights, config.model.epoch)?;
     validate_admission(&p["pc_admission"], spec, "pc", checkpoint)?;
     let descriptors = &p["collection"];
     let bytes = validate_role_artifacts(descriptors, "collection")?
@@ -158,9 +154,9 @@ pub(super) fn validate_frozen_collection(
         identity_join(pin, artifact_for(config, purpose)?)?;
     }
     Ok(PalsFrozenPcCollectionMetadataV5 {
-        checkpoint_sha256: config.endpoint.model.weights.sha256.clone(),
+        checkpoint_sha256: config.model.weights.sha256.clone(),
         named_shared_pc_sha256: sha(&checkpoint["frozen_pc_sha256"])?.into(),
-        model_epoch: config.endpoint.model.epoch,
+        model_epoch: config.model.epoch,
         context_epoch: uint(&checkpoint["context_epoch"])?,
         checkpoint_model_state_sha256: sha(&checkpoint["state_sha256"]["model"])?.into(),
         checkpoint_optimizer_state_sha256: sha(&checkpoint["state_sha256"]["optimizers"])?.into(),

@@ -8,7 +8,7 @@
 use crate::ManifestError;
 use crate::{
     ArtifactRef, PalsAdaptiveStartupConfigV5, PalsArtifactDomainV5, PalsEngineModeV5,
-    PalsStartupAssetPurposeV5 as Purpose, decode_json,
+    PalsNumericalScopeV5, PalsStartupAssetPurposeV5 as Purpose, decode_json,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -142,7 +142,7 @@ fn read_metadata(
     parse_bytes(&bytes)
 }
 fn artifact_for(
-    config: &PalsAdaptiveStartupConfigV5,
+    config: &PalsNumericalScopeV5,
     purpose: Purpose,
 ) -> Result<&ArtifactRef, ManifestError> {
     Ok(&config.asset(purpose)?.artifact)
@@ -197,12 +197,42 @@ fn identity_join(v: &Value, artifact: &ArtifactRef) -> Result<(), ManifestError>
 /// weights or graphs. The result explicitly leaves physical/file/source and GPU
 /// acceptance to the launch owner and independent numerical gate. It does not mint
 /// the private actual-content admission token or grant execution authority.
+/// Completed startup compatibility path. Preserve its original Fresh Frozen
+/// check, then apply an exact projection to the same producer metadata core.
 pub fn validate_pals_artifact_domain_v5(
     config: &PalsAdaptiveStartupConfigV5,
     export_bytes: &[u8],
+    read_artifact: impl FnMut(&ArtifactRef, usize) -> Result<Vec<u8>, ManifestError>,
+) -> Result<PalsArtifactDomainAdmissionV5, ManifestError> {
+    if config.endpoint.model.artifact_domain == PalsArtifactDomainV5::FrozenPcCollection {
+        need(
+            !config.native_options.approximate_warm,
+            "frozen P/C requires its own Fresh Collection domain",
+        )?;
+    }
+    validate_artifact_domain_scope_core(
+        &PalsNumericalScopeV5::from_config(config),
+        export_bytes,
+        read_artifact,
+    )
+}
+
+/// Same metadata verifier for a numerical-only Fresh scope. This is a public
+/// observation, not an initializer/trainer capability or completed startup.
+pub fn validate_pals_scope_artifact_domain_v5(
+    scope: &PalsNumericalScopeV5,
+    export_bytes: &[u8],
+    read_artifact: impl FnMut(&ArtifactRef, usize) -> Result<Vec<u8>, ManifestError>,
+) -> Result<PalsArtifactDomainAdmissionV5, ManifestError> {
+    scope.validate_pre_acceptance()?;
+    validate_artifact_domain_scope_core(scope, export_bytes, read_artifact)
+}
+fn validate_artifact_domain_scope_core(
+    config: &PalsNumericalScopeV5,
+    export_bytes: &[u8],
     mut read_artifact: impl FnMut(&ArtifactRef, usize) -> Result<Vec<u8>, ManifestError>,
 ) -> Result<PalsArtifactDomainAdmissionV5, ManifestError> {
-    config.endpoint.model.validate(config.endpoint.mode)?;
+    config.model.validate(config.mode)?;
     need(
         !config.training_executed,
         "arena startup cannot execute training",
@@ -214,8 +244,8 @@ pub fn validate_pals_artifact_domain_v5(
         "export manifest bytes differ from registration",
     )?;
     let export = parse_bytes(export_bytes)?;
-    profile_configuration_check(&export["config"], &config.endpoint.model.profile)?;
-    let legacy = config.endpoint.model.profile == "full_line_interaction_v2";
+    profile_configuration_check(&export["config"], &config.model.profile)?;
+    let legacy = config.model.profile == "full_line_interaction_v2";
     if legacy {
         // Historical separate-PC serialization kept model.v1 even though the
         // full-line model/encoding semantics were V2. The parent's strict
@@ -230,14 +260,14 @@ pub fn validate_pals_artifact_domain_v5(
     } else {
         exact(
             &export["schema"],
-            json!(config.endpoint.model.model_schema),
+            json!(config.model.model_schema),
             "export schema differs from registered compact model",
         )?;
     }
     for (key, value) in [
-        ("model_semantics", &config.endpoint.model.model_semantics),
-        ("encoding_schema", &config.endpoint.model.encoding_schema),
-        ("model_profile", &config.endpoint.model.profile),
+        ("model_semantics", &config.model.model_semantics),
+        ("encoding_schema", &config.model.encoding_schema),
+        ("model_profile", &config.model.profile),
     ] {
         exact(
             &export[key],
@@ -247,7 +277,7 @@ pub fn validate_pals_artifact_domain_v5(
     }
     exact(
         &export["checkpoint_sha256"],
-        json!(config.endpoint.model.weights.sha256),
+        json!(config.model.weights.sha256),
         "export references another checkpoint",
     )?;
     exact(
@@ -256,7 +286,7 @@ pub fn validate_pals_artifact_domain_v5(
         "export precision differs",
     )?;
     exact(&export["tf32"], json!(false), "TF32 must remain disabled")?;
-    let collection = config.endpoint.mode == PalsEngineModeV5::Collection;
+    let collection = config.mode == PalsEngineModeV5::Collection;
     exact(
         &export["roles"],
         if collection {
@@ -279,8 +309,8 @@ pub fn validate_pals_artifact_domain_v5(
         )?;
     }
     let mut result = PalsArtifactDomainAdmissionV5 {
-        artifact_domain: config.endpoint.model.artifact_domain,
-        checkpoint_sha256: config.endpoint.model.weights.sha256.clone(),
+        artifact_domain: config.model.artifact_domain,
+        checkpoint_sha256: config.model.weights.sha256.clone(),
         initialization_evidence_sha256: None,
         provenance_file_sha256: None,
         generation_specification_file_sha256: None,
@@ -297,11 +327,10 @@ pub fn validate_pals_artifact_domain_v5(
         arena_accepted: false,
         frozen_pc_collection: None,
     };
-    match config.endpoint.model.artifact_domain {
+    match config.model.artifact_domain {
         PalsArtifactDomainV5::Untrained => {
             need(
-                config.endpoint.model.provenance.is_none()
-                    && config.endpoint.model.checkpoint_domain.is_none(),
+                config.model.provenance.is_none() && config.model.checkpoint_domain.is_none(),
                 "G0 cannot carry a training/diagnostic provenance domain",
             )?;
             exact(
@@ -320,11 +349,11 @@ pub fn validate_pals_artifact_domain_v5(
         }
         PalsArtifactDomainV5::RealGeneration => {
             need(
-                config.endpoint.model.profile == "virtual_review_v1",
+                config.model.profile == "virtual_review_v1",
                 "actual generation cannot relabel a legacy model profile",
             )?;
             need(
-                config.endpoint.model.checkpoint_domain.as_deref() == Some(CHECKPOINT_DOMAIN),
+                config.model.checkpoint_domain.as_deref() == Some(CHECKPOINT_DOMAIN),
                 "G1 checkpoint domain differs",
             )?;
             exact(
@@ -338,7 +367,7 @@ pub fn validate_pals_artifact_domain_v5(
             )?;
             let provenance_pin = artifact_for(config, Purpose::Provenance)?;
             need(
-                config.endpoint.model.provenance.as_ref() == Some(provenance_pin),
+                config.model.provenance.as_ref() == Some(provenance_pin),
                 "G1 provenance is not independently registered",
             )?;
             let provenance = read_metadata(provenance_pin, &mut read_artifact)?;
@@ -355,13 +384,13 @@ pub fn validate_pals_artifact_domain_v5(
         PalsArtifactDomainV5::FrozenPcCollection => {
             let provenance_pin = artifact_for(config, Purpose::Provenance)?;
             need(
-                config.endpoint.model.provenance.as_ref() == Some(provenance_pin),
+                config.model.provenance.as_ref() == Some(provenance_pin),
                 "frozen P/C provenance is not independently registered",
             )?;
             let provenance = read_metadata(provenance_pin, &mut read_artifact)?;
             let spec_pin = artifact_for(config, Purpose::GenerationSpecification)?;
             let registered_spec = read_metadata(spec_pin, &mut read_artifact)?;
-            let frozen = frozen_collection::validate_frozen_collection(
+            let frozen = frozen_collection::validate_frozen_collection_scope(
                 &provenance,
                 &registered_spec,
                 config,
@@ -387,7 +416,7 @@ pub fn validate_pals_artifact_domain_v5(
 
 fn validate_g0(
     e: &Value,
-    config: &PalsAdaptiveStartupConfigV5,
+    config: &PalsNumericalScopeV5,
     export: &Value,
     reader: &mut impl FnMut(&ArtifactRef, usize) -> Result<Vec<u8>, ManifestError>,
     result: &mut PalsArtifactDomainAdmissionV5,
@@ -410,8 +439,8 @@ fn validate_g0(
             "acceptance",
         ],
     )?;
-    let legacy = config.endpoint.model.profile == "full_line_interaction_v2";
-    let expected_configuration = profile_configuration(&config.endpoint.model.profile);
+    let legacy = config.model.profile == "full_line_interaction_v2";
+    let expected_configuration = profile_configuration(&config.model.profile);
     exact(
         &e["schema"],
         json!(if legacy {
@@ -445,11 +474,11 @@ fn validate_g0(
     )?;
     exact(
         model,
-        json!({"schema":config.endpoint.model.model_schema,"semantics":config.endpoint.model.model_semantics,
-        "encoding":config.endpoint.model.encoding_schema,"profile":config.endpoint.model.profile,"config":expected_configuration,"roles":ROLES,"seed":23}),
+        json!({"schema":config.model.model_schema,"semantics":config.model.model_semantics,
+        "encoding":config.model.encoding_schema,"profile":config.model.profile,"config":expected_configuration,"roles":ROLES,"seed":23}),
         "registered initializer model, seed or role bank differs",
     )?;
-    profile_configuration_check(&model["config"], &config.endpoint.model.profile)?;
+    profile_configuration_check(&model["config"], &config.model.profile)?;
     need(uint(&model["seed"])? == 23, "G0 seed is not 23")?;
     let metadata = &e["metadata_fields"];
     fields(
@@ -473,12 +502,9 @@ fn validate_g0(
         ],
     )?;
     for (key, value) in [
-        ("schema", json!(config.endpoint.model.model_semantics)),
+        ("schema", json!(config.model.model_semantics)),
         ("checkpoint", json!("untrained.pt")),
-        (
-            "config",
-            profile_configuration(&config.endpoint.model.profile),
-        ),
+        ("config", profile_configuration(&config.model.profile)),
         ("seed", json!(23)),
         ("training_steps", json!(0)),
         ("roles", json!(ROLES)),
@@ -493,7 +519,7 @@ fn validate_g0(
     }
     uint(&metadata["seed"])?;
     uint(&metadata["training_steps"])?;
-    profile_configuration_check(&metadata["config"], &config.endpoint.model.profile)?;
+    profile_configuration_check(&metadata["config"], &config.model.profile)?;
     for key in ["trained", "external_weights", "external_teacher", "tf32"] {
         exact(
             &metadata[key],
@@ -524,7 +550,7 @@ fn validate_g0(
             "initializer named artifact exceeds its bound",
         )?;
     }
-    identity_join(&e["checkpoint"], &config.endpoint.model.weights)?;
+    identity_join(&e["checkpoint"], &config.model.weights)?;
     exact(
         &e["checkpoint"]["sha256"],
         metadata["checkpoint_sha256"].clone(),
@@ -579,7 +605,7 @@ fn validate_g0(
     )?;
     exact(
         &e["source"]["source_commit"],
-        json!(config.endpoint.source_commit),
+        json!(config.source_commit),
         "initializer and registered source commit differ",
     )?;
     fields(&e["source"]["pins"], &INITIALIZER_FILES)?;
@@ -588,7 +614,7 @@ fn validate_g0(
             .initializer_source_pins
             .insert(name.into(), sha(&e["source"]["pins"][name])?.into());
     }
-    result.initializer_source_commit = Some(config.endpoint.source_commit.clone());
+    result.initializer_source_commit = Some(config.source_commit.clone());
     validate_software(&e["software"], metadata)?;
     exact(
         &e["claims"],
@@ -883,7 +909,7 @@ fn semantic_digest(domain: &str, v: &Value) -> Result<String, ManifestError> {
 fn validate_g1(
     p: &Value,
     registered_spec: &Value,
-    config: &PalsAdaptiveStartupConfigV5,
+    config: &PalsNumericalScopeV5,
     export: &Value,
 ) -> Result<(), ManifestError> {
     fields(
@@ -954,12 +980,7 @@ fn validate_g1(
         )?;
     }
     let checkpoint = &p["checkpoint"];
-    validate_checkpoint_summary(
-        checkpoint,
-        spec,
-        &config.endpoint.model.weights,
-        config.endpoint.model.epoch,
-    )?;
+    validate_checkpoint_summary(checkpoint, spec, &config.model.weights, config.model.epoch)?;
     for phase in ["pc", "v"] {
         validate_admission(&p[format!("{phase}_admission")], spec, phase, checkpoint)?;
     }
@@ -983,7 +1004,7 @@ fn validate_g1(
         total <= MANAGED_BYTES,
         "actual independent exports exceed managed output cap",
     )?;
-    let kind = if config.endpoint.mode == PalsEngineModeV5::Collection {
+    let kind = if config.mode == PalsEngineModeV5::Collection {
         "collection"
     } else {
         "deployment"

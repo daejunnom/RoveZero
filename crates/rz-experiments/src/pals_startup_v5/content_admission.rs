@@ -10,6 +10,9 @@ mod numerical;
 #[cfg(feature = "pals-content-types")]
 pub use numerical::*;
 
+mod numerical_scope;
+pub use numerical_scope::*;
+
 #[cfg(feature = "pals-content-admission")]
 mod owned_files;
 #[cfg(feature = "pals-content-admission")]

@@ -303,6 +303,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
                 "crates/rz-experiments/src/pals_startup_v5/content_admission/artifact_domains/frozen_collection.rs"
             ),
             source!("crates/rz-experiments/src/pals_startup_v5/content_admission/numerical.rs"),
+            source!("crates/rz-experiments/src/pals_startup_v5/content_admission/numerical_scope.rs"),
             source!("crates/rz-experiments/src/pals_startup_v5/content_admission/owned_files.rs"),
         ],
     ),
