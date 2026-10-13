@@ -2,8 +2,8 @@
 //! released. Store reads remain hot-only; cold restoration is an explicit call.
 
 use super::super::store::{
-    ArchiveConfig, ArchiveIoBudget, ArchiveOwnerSnapshot, ArchiveRuntimeLimits, EngineArchiveNode,
-    EngineArchiveReceipt, StorePins,
+    ArchiveConfig, ArchiveIoBudget, ArchiveOwnerSnapshot, ArchiveRootCapability,
+    ArchiveRuntimeLimits, EngineArchiveNode, EngineArchiveReceipt, StorePins,
 };
 use super::*;
 use crate::cpu_value::CpuTrainingState;
@@ -18,6 +18,7 @@ const NODE_METADATA_MAGIC: &[u8; 8] = b"RZENGN01";
 #[derive(Default)]
 pub(super) struct EngineArchiveLifecycle {
     config: Option<ArchiveConfig>,
+    root_capability: Option<ArchiveRootCapability>,
     reopen_error: Option<StoreError>,
     deadline: Option<Instant>,
     remaining_io: u64,
@@ -36,6 +37,24 @@ impl<M: RoleModel> PalsEngine<M> {
             .enable_archive(config.clone())
             .map_err(PalsError::Store)?;
         self.archive_state.config = Some(config);
+        self.archive_state.root_capability = None;
+        self.archive_state.reopen_error = None;
+        self.archive_state.closed_current_owner = None;
+        Ok(())
+    }
+
+    /// Adaptive startup retains its held archive root through every game owner.
+    /// All fallible owner preparation precedes publishing this configuration.
+    pub fn enable_archive_with_capability(
+        &mut self,
+        config: ArchiveConfig,
+        capability: ArchiveRootCapability,
+    ) -> Result<(), PalsError> {
+        self.stores
+            .enable_archive_with_capability(config.clone(), capability.clone())
+            .map_err(PalsError::Store)?;
+        self.archive_state.config = Some(config);
+        self.archive_state.root_capability = Some(capability);
         self.archive_state.reopen_error = None;
         self.archive_state.closed_current_owner = None;
         Ok(())
@@ -151,10 +170,15 @@ impl<M: RoleModel> PalsEngine<M> {
         self.archive_state.reopen_error = if self.stores.archive_enabled() {
             None
         } else {
-            self.archive_state
-                .config
-                .as_ref()
-                .and_then(|config| self.stores.enable_archive(config.clone()).err())
+            self.archive_state.config.as_ref().and_then(|config| {
+                match &self.archive_state.root_capability {
+                    Some(capability) => self
+                        .stores
+                        .enable_archive_with_capability(config.clone(), capability.clone()),
+                    None => self.stores.enable_archive(config.clone()),
+                }
+                .err()
+            })
         };
     }
 
@@ -182,7 +206,11 @@ impl<M: RoleModel> PalsEngine<M> {
             .clone();
         let runtime_limits = self.archive_runtime_limits().copied();
         let mut next = PalsStores::new(Self::store_limits(&self.config));
-        next.enable_archive(config).map_err(PalsError::Store)?;
+        match &self.archive_state.root_capability {
+            Some(capability) => next.enable_archive_with_capability(config, capability.clone()),
+            None => next.enable_archive(config),
+        }
+        .map_err(PalsError::Store)?;
         if let Some(limits) = runtime_limits {
             next.set_archive_runtime_limits(limits)
                 .map_err(PalsError::Store)?;
@@ -210,6 +238,7 @@ impl<M: RoleModel> PalsEngine<M> {
         self.game_generation = Some(generation);
         self.nodes.clear();
         self.records.clear();
+        self.reset_review_context();
         self.model.new_game_with_generation(self.game_generation);
         self.revision = 0;
         self.checker_new_game_pending = false;
@@ -484,6 +513,33 @@ impl<M: RoleModel> PalsEngine<M> {
         pins.observations.insert(observation);
         Ok(())
     }
+    /// Raw worker evidence may have a checked PV rather than a public line.
+    /// This bounded pin operation performs no archive load, scan or write.
+    pub(super) fn pin_archive_active_observation(
+        &mut self,
+        observation: ObservationId,
+    ) -> Result<(), PalsError> {
+        if !self.stores.archive_enabled() {
+            return Ok(());
+        }
+        let observed = self.stores.observations.get(observation)?;
+        let lines = [observed.line, observed.cpu_pv];
+        for line in lines.into_iter().flatten() {
+            self.stores.lines.get(line)?;
+        }
+        let stats = self.stores.hot_stats();
+        let pins = &mut self.archive_state.active_search_pins;
+        if !pins.observations.contains(&observation)
+            && pins.observations.len() >= stats.observations
+        {
+            return Err(StoreError::PinSaturated("active archive evidence").into());
+        }
+        pins.observations.insert(observation);
+        for line in lines.into_iter().flatten() {
+            pins.lines.insert(line);
+        }
+        Ok(())
+    }
 
     pub(super) fn archive_insert_situation(
         &mut self,
@@ -710,8 +766,11 @@ impl<M: RoleModel> PalsEngine<M> {
             max_bytes: self.archive_state.remaining_io,
         })
     }
+    pub(super) fn archive_remaining_io(&self) -> u64 {
+        self.archive_state.remaining_io
+    }
 
-    fn charge_engine_archive_io(&mut self, bytes: u64) -> Result<(), PalsError> {
+    pub(super) fn charge_engine_archive_io(&mut self, bytes: u64) -> Result<(), PalsError> {
         self.archive_state.remaining_io = self
             .archive_state
             .remaining_io
@@ -754,7 +813,7 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(())
     }
 
-    fn resident_archive_pins(&self) -> Result<StorePins, PalsError> {
+    pub(super) fn resident_archive_pins(&self) -> Result<StorePins, PalsError> {
         let mut pins = self.archive_state.active_search_pins.clone();
         for node in &self.nodes {
             if !self
@@ -1242,6 +1301,7 @@ impl<M: RoleModel> PalsEngine<M> {
         self.nodes.extend(new_nodes);
         self.records.extend(added_records);
         self.records.sort_by_key(|record| record.revision);
+        self.restore_review_context_after_load();
         Ok(root)
     }
 
@@ -1326,7 +1386,9 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 }
 
-fn allocation_controls(controls: Option<(Instant, &AtomicBool)>) -> Result<(), StoreError> {
+pub(super) fn allocation_controls(
+    controls: Option<(Instant, &AtomicBool)>,
+) -> Result<(), StoreError> {
     if let Some((deadline, cancel)) = controls {
         if cancel.load(Ordering::Acquire) {
             return Err(StoreError::ArchiveCanceled);
@@ -2872,6 +2934,60 @@ mod tests {
                 .search(&Position::startpos(), limits(), &AtomicBool::new(false))
                 .unwrap();
             assert!(report.counters.cpu_tasks > 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_archive_new_game_keeps_root_authority_and_rejects_replacement() {
+        let mut engine = engine();
+        let config = archive_config("held-new-game");
+        let root = config.root.clone();
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let held = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let capability = ArchiveRootCapability::from_directory(root.clone(), held).unwrap();
+        engine
+            .enable_archive_with_capability(config, capability)
+            .unwrap();
+        engine
+            .set_archive_runtime_limits(selected_archive_limits())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let cancel = AtomicBool::new(false);
+        engine.observe_archive_startup(deadline, &cancel).unwrap();
+        let first = engine.archive_owner_snapshot().unwrap().unwrap();
+        engine.try_new_game(deadline, &cancel).unwrap();
+        let next = engine.archive_owner_snapshot().unwrap().unwrap();
+        assert_ne!(first.owner_id, next.owner_id);
+        assert_eq!(first.session_write_ledger_id, next.session_write_ledger_id);
+        assert!(engine.archive_state.root_capability.is_some());
+
+        let retained = root.with_file_name(format!(
+            "{}-retained",
+            root.file_name().unwrap().to_string_lossy(),
+        ));
+        std::fs::rename(&root, &retained).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        assert!(matches!(
+            engine.try_new_game(deadline, &cancel),
+            Err(PalsError::Store(StoreError::ArchiveIntegrity(
+                "held archive root was renamed or replaced"
+            ))),
+        ));
+        assert_eq!(
+            engine.archive_owner_snapshot().unwrap().unwrap().owner_id,
+            next.owner_id
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        drop(engine);
+        // Remove only this fixture's exclusively created, no-link directories.
+        // The selected parent and all unrelated outputs remain untouched.
+        for owned in [&root, &retained] {
+            assert_eq!(owned.parent(), root.parent());
+            let metadata = std::fs::symlink_metadata(owned).unwrap();
+            assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+            std::fs::remove_dir_all(owned).unwrap();
         }
     }
 

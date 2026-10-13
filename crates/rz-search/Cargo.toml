@@ -17,6 +17,8 @@ experimental-compact-child = []
 experimental-backup-scratch = []
 
 [dependencies]
+cap-std = { workspace = true }
+cap-fs-ext = { workspace = true }
 rz-contracts.workspace = true
 rz-position = { workspace = true, features = ["contracts"] }
 rz-telemetry.workspace = true

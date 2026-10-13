@@ -302,14 +302,15 @@ impl<M: RoleModel> PalsEngine<M> {
         match terminals {
             (None, None) => {
                 observed.comparison_attempted = true;
-                self.evaluate_model_value(
+                self.evaluate_model_value_pair(
                     frontier.counter_leaf,
                     &frontier.counterline,
+                    repaired_leaf,
+                    repaired,
                     limits,
                     cancel,
                     counters,
                 )?;
-                self.evaluate_model_value(repaired_leaf, repaired, limits, cancel, counters)?;
                 if self.nodes[frontier.counter_leaf].model_value_revision != Some(context_revision)
                     || self.nodes[repaired_leaf].model_value_revision != Some(context_revision)
                 {
@@ -454,7 +455,7 @@ impl<M: RoleModel> PalsEngine<M> {
         }
     }
 
-    fn endpoint_expectation(&self, node: usize, root_color: Color) -> Option<f32> {
+    pub(super) fn endpoint_expectation(&self, node: usize, root_color: Color) -> Option<f32> {
         let node = &self.nodes[node];
         let value = if let Some((_, value)) = node.terminal {
             value.signum() as f32
@@ -706,14 +707,15 @@ impl<M: RoleModel> PalsEngine<M> {
                 comparison_attempted = true;
                 // Both Fresh invocations see exactly the same public-record revision.
                 // They have different target states, not a shared raw input/cache key.
-                self.evaluate_model_value(
+                self.evaluate_model_value_pair(
                     work.repaired_leaf,
                     &work.repaired,
+                    leaf,
+                    &trace.counterline,
                     limits,
                     cancel,
                     counters,
                 )?;
-                self.evaluate_model_value(leaf, &trace.counterline, limits, cancel, counters)?;
                 if self.revision != comparison_revision
                     || self.stores.root() != Some(root_situation)
                     || self.stores.generation() != generation

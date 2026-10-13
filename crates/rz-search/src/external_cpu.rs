@@ -17,15 +17,61 @@ use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::io::Read;
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+pub mod adaptive;
+pub mod worker;
+
+pub use adaptive::*;
 
 pub const EXTERNAL_UCI_CHECKER_VERSION: &str = "rz-external-uci-checker/0.1";
 pub const EXTERNAL_UCI_SCORE_SEMANTICS: &str = "uci-native-cp-or-signed-mate-moves;root-side-to-move;reported-bounds;selectivity-unknown;no-cp-wdl-calibration;no-rules-proof";
 
+/// Retained executable/cwd capabilities for a private V5 snapshot. Path names
+/// remain declarations in ExternalCpuConfig; an actual start uses these held
+/// objects and repeats byte/ELF verification before spawning. This pin is not a
+/// startup, readiness or teacher completion authority.
+#[derive(Clone, Debug)]
+pub struct ExternalLaunchPin {
+    #[cfg(target_os = "linux")]
+    executable: Arc<File>,
+    #[cfg(target_os = "linux")]
+    directory: Arc<File>,
+    #[cfg(not(target_os = "linux"))]
+    _unsupported: (),
+}
+
+impl ExternalLaunchPin {
+    #[cfg(target_os = "linux")]
+    pub fn from_owned_descriptors(executable: File, directory: File) -> Result<Self, CheckerError> {
+        use std::os::unix::fs::MetadataExt;
+        let binary = executable
+            .metadata()
+            .map_err(|_| error("launch_pin", "executable_metadata"))?;
+        let cwd = directory
+            .metadata()
+            .map_err(|_| error("launch_pin", "directory_metadata"))?;
+        if !binary.is_file()
+            || binary.len() == 0
+            || binary.len() > 256 * 1024 * 1024
+            || binary.mode() & 0o111 == 0
+            || !cwd.is_dir()
+        {
+            return Err(error("launch_pin", "descriptor_kind_or_size"));
+        }
+        Ok(Self {
+            executable: Arc::new(executable),
+            directory: Arc::new(directory),
+        })
+    }
+}
+
 /// Files are opened, streamed and verified before spawn. Identity declarations
 /// do not prove training, license rights, an applied option or actual precision.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExternalCpuConfig {
     pub program: PathBuf,
     pub arguments: Vec<OsString>,
@@ -277,6 +323,74 @@ struct InfoFrame {
     multipv: u16,
 }
 
+/// A conditional teacher opinion from one complete, legal info tuple. Rank is
+/// not a value label and external CP/mate remains raw. Collection must seal the
+/// exact question/anchor and require completed stop/readiness before use.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalPolicyOpinion {
+    pub rank: u16,
+    pub depth: u16,
+    pub seldepth: Option<u16>,
+    pub pv: Vec<BoardMove>,
+    pub score: ExternalRawScore,
+    pub bound: ExternalBound,
+    pub reported_wdl: Option<[u16; 3]>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExternalCooperativeReport {
+    pub report: ExternalCheckerReport,
+    pub opinions: Vec<ExternalPolicyOpinion>,
+    pub stop_control: Option<ExternalControlObservation>,
+    /// Unknown by design: reported UCI nodes are not strict native credit.
+    pub strict_native_nodes: Option<u64>,
+    pub reported_node_request: u64,
+    pub requested_multipv: u16,
+    /// UCI readyok acknowledges readiness, not option-value readback.
+    pub option_application_observed: Option<bool>,
+    pub reported_node_overshoot: bool,
+    pub readiness_barrier_completed: bool,
+    /// Coherent complete rank-set opinion only. This remains a conditional
+    /// policy target, never a WDL label or a minimax completion assertion.
+    pub policy_target_known: bool,
+    pub go_issue: ExternalGoIssue,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalGoIssue {
+    NotIssued,
+    /// A write may have been partially delivered before failure.
+    Unknown,
+    Issued,
+}
+
+impl ExternalCooperativeReport {
+    /// Sparse conditional teacher opinion: softmax(-rank). Raw CP/mate/WDL
+    /// reports are not consulted and no value/utility target is manufactured.
+    pub fn conditional_rank_policy(&self) -> Option<Vec<(BoardMove, f32)>> {
+        if !self.policy_target_known || self.opinions.is_empty() || self.opinions.len() > 4 {
+            return None;
+        }
+        let sum = self
+            .opinions
+            .iter()
+            .map(|opinion| (-(f64::from(opinion.rank))).exp())
+            .sum::<f64>();
+        if !sum.is_finite() || sum <= 0.0 {
+            return None;
+        }
+        self.opinions
+            .iter()
+            .map(|opinion| {
+                Some((
+                    *opinion.pv.first()?,
+                    ((-f64::from(opinion.rank)).exp() / sum) as f32,
+                ))
+            })
+            .collect()
+    }
+}
+
 /// Each accepted score/PV/depth tuple comes from one complete info line. Sparse
 /// lines update observed work only; they cannot stitch a score onto a later PV.
 fn parse_info(line: &str, max_pv: usize) -> Result<InfoFrame, CheckerError> {
@@ -413,6 +527,13 @@ pub struct ExternalUciCpuChecker {
     active: bool,
     failed: bool,
     failed_output: Option<(Vec<u8>, Vec<u8>)>,
+    advertised_options: BTreeMap<String, OptionKind>,
+    cooperative_opinions: Vec<ExternalPolicyOpinion>,
+    stop_control: Option<ExternalControlObservation>,
+    go_issue: ExternalGoIssue,
+    startup_multipv: Option<u16>,
+    last_requested_multipv: Option<u16>,
+    launch_pin: Option<ExternalLaunchPin>,
 }
 
 impl ExternalUciCpuChecker {
@@ -446,12 +567,30 @@ impl ExternalUciCpuChecker {
             active: false,
             failed: false,
             failed_output: None,
+            advertised_options: BTreeMap::new(),
+            cooperative_opinions: Vec::new(),
+            stop_control: None,
+            go_issue: ExternalGoIssue::NotIssued,
+            startup_multipv: None,
+            last_requested_multipv: None,
+            launch_pin: None,
         })
     }
 
     /// Streamed executable validation, spawn and handshake are on the caller's
     /// finite startup clock. This object survives failure with evidence intact.
     pub fn start(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<(), CheckerError> {
+        self.start_with_cleanup_fence(deadline, cancel, None)
+    }
+
+    /// The private worker can shorten physical cleanup while startup is in
+    /// flight. The public synchronous start keeps its registered deadline.
+    fn start_with_cleanup_fence(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        cleanup_fence: Option<&dyn Fn() -> Option<Instant>>,
+    ) -> Result<(), CheckerError> {
         self.last_attempt = None;
         if self.failed || self.owner.is_some() {
             return Err(error("startup", "already_started_or_failed"));
@@ -461,7 +600,8 @@ impl ExternalUciCpuChecker {
         if cancel.load(Ordering::Acquire) || start >= deadline {
             return Err(error("startup", "cancel_or_deadline"));
         }
-        match process::OwnedProcess::spawn(&self.config, deadline, cancel) {
+        match process::OwnedProcess::spawn(&self.config, deadline, cancel, self.launch_pin.as_ref())
+        {
             Ok(owner) => self.owner = Some(owner),
             Err(failure) => {
                 self.failed = true;
@@ -481,8 +621,11 @@ impl ExternalUciCpuChecker {
         let result = self.handshake(deadline, cancel);
         if result.is_err() {
             self.failed = true;
+            let fence = cleanup_fence
+                .and_then(|read| read())
+                .map_or(deadline, |fence| fence.min(deadline));
             let cleanup =
-                bounded_deadline(Instant::now(), self.config.shutdown_grace, Some(deadline))?;
+                bounded_deadline(Instant::now(), self.config.shutdown_grace, Some(fence))?;
             let _ = self.shutdown(cleanup);
         }
         self.last_attempt = Some(CheckerAttempt {
@@ -548,6 +691,17 @@ impl ExternalUciCpuChecker {
                 self.observed_uci.author = Some(author.to_owned());
             } else if line.starts_with("option ") {
                 let (name, kind) = parse_option(&line)?;
+                if name == "MultiPV" {
+                    let words = line.split_ascii_whitespace().collect::<Vec<_>>();
+                    let value = words
+                        .windows(2)
+                        .find(|words| words[0] == "default")
+                        .and_then(|words| words[1].parse::<u16>().ok())
+                        .filter(|value| *value != 0 && validate_option(&kind, &value.to_string()))
+                        .ok_or_else(|| error("handshake", "invalid_multipv_default"))?;
+                    self.startup_multipv = Some(value);
+                    self.last_requested_multipv = Some(value);
+                }
                 if options.len() >= 256 || options.insert(name, kind).is_some() {
                     return Err(error("handshake", "duplicate_or_excess_options"));
                 }
@@ -577,22 +731,64 @@ impl ExternalUciCpuChecker {
                 format!("setoption name {name} value {value}")
             };
             self.owner()?.send(&command, deadline)?;
+            if name == "MultiPV" {
+                self.last_requested_multipv = value.parse().ok();
+            }
         }
+        self.advertised_options = options;
         self.ready(deadline, cancel)
     }
 
     fn ready(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<(), CheckerError> {
-        if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+        self.ready_with_fence(deadline, cancel, None)
+    }
+
+    fn next_line_with_fence(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        fence: Option<&dyn Fn() -> Option<Instant>>,
+    ) -> Result<Option<String>, CheckerError> {
+        loop {
+            let until = fence
+                .and_then(|read| read())
+                .map_or(deadline, |f| f.min(deadline));
+            if cancel.load(Ordering::Acquire) || Instant::now() >= until {
+                return Ok(None);
+            }
+            let poll_until = if fence.is_some() {
+                (Instant::now() + Duration::from_millis(10)).min(until)
+            } else {
+                until
+            };
+            let line = self.owner()?.next_line(poll_until, cancel)?;
+            if line.is_some() || fence.is_none() {
+                return Ok(line);
+            }
+        }
+    }
+
+    fn ready_with_fence(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        fence: Option<&dyn Fn() -> Option<Instant>>,
+    ) -> Result<(), CheckerError> {
+        let actual_deadline = || {
+            fence
+                .and_then(|read| read())
+                .map_or(deadline, |until| until.min(deadline))
+        };
+        if cancel.load(Ordering::Acquire) || Instant::now() >= actual_deadline() {
             return Err(error("readiness", "cancel_or_deadline_before_send"));
         }
-        self.owner()?.send("isready", deadline)?;
+        self.owner()?.send("isready", actual_deadline())?;
         loop {
             let line = self
-                .owner()?
-                .next_line(deadline, cancel)?
+                .next_line_with_fence(deadline, cancel, fence)?
                 .ok_or_else(|| error("readiness", "timeout_or_cancel"))?;
             if line == "readyok" {
-                if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+                if cancel.load(Ordering::Acquire) || Instant::now() >= actual_deadline() {
                     return Err(error("readiness", "late_readyok"));
                 }
                 return Ok(());
@@ -604,6 +800,61 @@ impl ExternalUciCpuChecker {
         }
     }
 
+    /// Runs only on the unchanged private owner after every accepted go has
+    /// reached its bestmove/ready barrier. This is not process shutdown or TT
+    /// reset; readiness proves a live reusable UCI owner without requiring EOF.
+    fn quiesce_root(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        fence: &dyn Fn() -> Option<Instant>,
+    ) -> Result<CheckerShutdown, CheckerError> {
+        if self.failed || self.active {
+            return Err(error("root_quiesce", "physical_completion_unknown"));
+        }
+        let result = self.ready_with_fence(deadline, cancel, Some(fence));
+        if let Err(failure) = result {
+            self.failed = true;
+            return Err(failure);
+        }
+        let state = self.owner()?.evidence();
+        if state.process_identity.is_none()
+            || state.quit_sent
+            || state.exit_observed
+            || state.cleanup_complete
+            || state.quarantined
+            || state.ownership_lost
+        {
+            self.failed = true;
+            return Err(error("root_quiesce", "owner_not_reusable"));
+        }
+        Ok(state)
+    }
+
+    fn reset_game_with_fence(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        fence: Option<&dyn Fn() -> Option<Instant>>,
+    ) -> Result<(), CheckerError> {
+        if self.failed || self.active {
+            return Err(error("new_game", "checker_not_available"));
+        }
+        let until = fence
+            .and_then(|read| read())
+            .map_or(deadline, |f| deadline.min(f));
+        if cancel.load(Ordering::Acquire) || Instant::now() >= until {
+            return Err(error("new_game", "cancel_or_deadline_before_reset"));
+        }
+        self.owner()?.send("ucinewgame", until)?;
+        if let Err(failure) = self.ready_with_fence(deadline, cancel, fence) {
+            self.failed = true;
+            return Err(failure);
+        }
+        self.last_attempt = None;
+        Ok(())
+    }
+
     fn run(
         &mut self,
         position: &Position,
@@ -611,7 +862,105 @@ impl ExternalUciCpuChecker {
         limits: CpuLimits,
         cancel: &AtomicBool,
     ) -> Result<CheckerReport, CheckerError> {
+        self.run_with_control(position, roots, limits, cancel, None)
+    }
+
+    /// The synchronous checker is owned by a private external worker. The
+    /// manager never calls this blocking pipe/drain path. Yield is a partial
+    /// stop observation, not an exact continuation token or completed bound.
+    pub fn analyze_cooperative(
+        &mut self,
+        position: &Position,
+        roots: Option<&[BoardMove]>,
+        mut limits: CpuLimits,
+        cancel: &AtomicBool,
+        control: &dyn ExternalControl,
+        policy: ExternalSlicePolicy,
+    ) -> Result<ExternalCooperativeReport, CheckerError> {
+        let candidates = roots.map_or_else(
+            || position.ordered_legal_moves().moves().len(),
+            <[BoardMove]>::len,
+        );
+        policy.validate(candidates)?;
+        if self.config.stop_grace != policy.stop_drain_reserve {
+            return Err(CheckerError::Invalid(
+                "external configured stop reserve differs from slice",
+            ));
+        }
+        if !limits.deadline.is_some_and(|deadline| {
+            deadline.saturating_duration_since(Instant::now())
+                >= policy.quantum + policy.stop_drain_reserve
+        }) {
+            return Err(error("admission", "insufficient_quantum_and_stop_reserve"));
+        }
+        let kind = self
+            .advertised_options
+            .get("MultiPV")
+            .ok_or_else(|| error("admission", "multipv_not_advertised"))?;
+        if !validate_option(kind, &policy.multipv.to_string()) {
+            return Err(error("admission", "multipv_out_of_range"));
+        }
+        // Policy limits are requested foreign work, never CpuJob native credits.
+        limits.max_nodes = policy.requested_reported_nodes;
+        self.cooperative_opinions.clear();
+        self.stop_control = None;
+        self.go_issue = ExternalGoIssue::NotIssued;
+        let CheckerReport::ExternalUci(report) =
+            self.run_with_control(position, roots, limits, cancel, Some((control, policy)))?
+        else {
+            return Err(error("analysis", "foreign_report_type"));
+        };
+        self.cooperative_opinions
+            .sort_by_key(|opinion| opinion.rank);
+        let policy_target_known = report.completion == ExternalCompletion::BestMove
+            && self.cooperative_opinions.len() == usize::from(policy.multipv)
+            && self
+                .cooperative_opinions
+                .iter()
+                .enumerate()
+                .all(|(index, opinion)| {
+                    opinion.rank == index as u16 + 1
+                        && Some(opinion.depth)
+                            == self.cooperative_opinions.first().map(|first| first.depth)
+                        && opinion.bound == ExternalBound::ExactReported
+                        && !self.cooperative_opinions[..index]
+                            .iter()
+                            .any(|prior| prior.pv.first() == opinion.pv.first())
+                })
+            && self
+                .cooperative_opinions
+                .first()
+                .and_then(|opinion| opinion.pv.first())
+                .copied()
+                == report.best_move;
+        Ok(ExternalCooperativeReport {
+            reported_node_overshoot: report
+                .work
+                .nodes
+                .is_some_and(|nodes| nodes > policy.requested_reported_nodes),
+            report,
+            opinions: self.cooperative_opinions.clone(),
+            stop_control: self.stop_control,
+            strict_native_nodes: None,
+            reported_node_request: policy.requested_reported_nodes,
+            requested_multipv: policy.multipv,
+            option_application_observed: None,
+            readiness_barrier_completed: true,
+            policy_target_known,
+            go_issue: self.go_issue,
+        })
+    }
+
+    fn run_with_control(
+        &mut self,
+        position: &Position,
+        roots: Option<&[BoardMove]>,
+        limits: CpuLimits,
+        cancel: &AtomicBool,
+        cooperative: Option<(&dyn ExternalControl, ExternalSlicePolicy)>,
+    ) -> Result<CheckerReport, CheckerError> {
         self.last_attempt = None;
+        self.go_issue = ExternalGoIssue::NotIssued;
         let start = Instant::now();
         if self.failed || self.active {
             return Err(error("analysis", "checker_not_available"));
@@ -702,6 +1051,7 @@ impl ExternalUciCpuChecker {
             budget,
             &command,
             &mut report,
+            cooperative,
         );
         report.elapsed = start.elapsed();
         self.capture(&report, start);
@@ -712,6 +1062,8 @@ impl ExternalUciCpuChecker {
                     CheckerError::External {
                         stage: "admission",
                         code: "insufficient_stop_reserve"
+                            | "insufficient_quantum_and_stop_reserve"
+                            | "control_before_go"
                     }
                 )
             {
@@ -722,13 +1074,19 @@ impl ExternalUciCpuChecker {
                 return Err(failure);
             }
             self.failed = true;
-            // Failed analysis may use only this task's remaining wall. If it is
-            // exhausted, shutdown records quarantine without a fresh wait; the
-            // retained owner can still be drained by explicit global shutdown.
+            // Failed analysis may use only the task's remaining wall and the
+            // cooperative owner's earlier physical fence. Never open a fresh
+            // cleanup grace after a shortened shutdown fence has expired.
+            // Retained quarantine can still be drained by explicit shutdown.
+            let cleanup_fence = cooperative
+                .and_then(|(control, _)| control.physical_fence_deadline())
+                .map_or(budget.task_deadline, |fence| {
+                    fence.min(budget.task_deadline)
+                });
             let cleanup = bounded_deadline(
                 Instant::now(),
                 self.config.shutdown_grace,
-                Some(budget.task_deadline),
+                Some(cleanup_fence),
             )?;
             let _ = self.shutdown(cleanup);
             self.capture(&report, start);
@@ -748,15 +1106,54 @@ impl ExternalUciCpuChecker {
         budget: ExternalTaskBudget,
         position_command: &str,
         report: &mut ExternalCheckerReport,
+        cooperative: Option<(&dyn ExternalControl, ExternalSlicePolicy)>,
     ) -> Result<(), CheckerError> {
         budget.analysis_millis(Instant::now())?;
+        let requested_width = cooperative.map(|(_, policy)| policy.multipv).or_else(|| {
+            self.config
+                .identity
+                .options
+                .get("MultiPV")
+                .and_then(|value| value.parse().ok())
+                .or(self.startup_multipv)
+        });
+        if let Some(width) = requested_width {
+            if self.last_requested_multipv != Some(width) {
+                self.owner()?.send(
+                    &format!("setoption name MultiPV value {width}"),
+                    budget.analysis_deadline,
+                )?;
+                self.last_requested_multipv = Some(width);
+            }
+        }
         self.ready(budget.analysis_deadline, cancel)?;
         self.owner()?
             .send(position_command, budget.analysis_deadline)?;
+        if cooperative
+            .is_some_and(|(control, _)| control.observe().action != ExternalControlAction::Continue)
+        {
+            return Err(error("admission", "control_before_go"));
+        }
         if cancel.load(Ordering::Acquire) {
             return Err(error("analysis", "cancel_or_deadline_before_go"));
         }
-        let remaining_ms = budget.analysis_millis(Instant::now())?;
+        let ready_at = Instant::now();
+        let remaining_ms = budget.analysis_millis(ready_at)?;
+        let budget = if let Some((_, policy)) = cooperative {
+            if remaining_ms < policy.quantum.as_millis() {
+                return Err(error("admission", "insufficient_quantum_and_stop_reserve"));
+            }
+            ExternalTaskBudget {
+                analysis_deadline: ready_at
+                    .checked_add(policy.quantum)
+                    .ok_or(CheckerError::Invalid("external quantum deadline overflow"))?
+                    .min(budget.analysis_deadline),
+                ..budget
+            }
+        } else {
+            budget
+        };
+        let remaining_ms = budget.analysis_millis(ready_at)?;
         let mut go = format!(
             "go depth {} nodes {} movetime {}",
             limits.max_depth, limits.max_nodes, remaining_ms
@@ -768,21 +1165,50 @@ impl ExternalUciCpuChecker {
                 go.push_str(&mv.to_string());
             }
         }
+        self.go_issue = ExternalGoIssue::Unknown;
         self.owner()?.send(&go, budget.analysis_deadline)?;
+        self.go_issue = ExternalGoIssue::Issued;
         self.active = true;
         let no_cancel = AtomicBool::new(false);
         let mut stopped_deadline = None;
         loop {
             let now = Instant::now();
+            let observed = cooperative.map(|(control, _)| control.observe());
+            let cooperative_stop =
+                observed.is_some_and(|observed| observed.action != ExternalControlAction::Continue);
             if stopped_deadline.is_none()
-                && (cancel.load(Ordering::Acquire) || now >= budget.analysis_deadline)
+                && (cancel.load(Ordering::Acquire)
+                    || cooperative_stop
+                    || now >= budget.analysis_deadline)
             {
-                report.completion = if cancel.load(Ordering::Acquire) {
+                report.completion = if cancel.load(Ordering::Acquire)
+                    || observed.is_some_and(|value| {
+                        matches!(
+                            value.action,
+                            ExternalControlAction::Cancel | ExternalControlAction::Revoked
+                        )
+                    }) {
                     ExternalCompletion::StoppedCanceled
+                } else if observed.is_some_and(|value| value.action == ExternalControlAction::Yield)
+                {
+                    ExternalCompletion::StoppedYield
+                } else if cooperative.is_some() {
+                    // Soft quantum completion is a partial external Yield. It
+                    // does not consume the original hard deadline or mint a
+                    // same-stack resume token.
+                    ExternalCompletion::StoppedYield
                 } else {
                     ExternalCompletion::StoppedDeadline
                 };
-                let stop_deadline = budget.drain_deadline(now)?;
+                if cooperative_stop && !cancel.load(Ordering::Acquire) {
+                    self.stop_control = observed;
+                }
+                let mut stop_deadline = budget.drain_deadline(now)?;
+                if let Some(limit) =
+                    cooperative.and_then(|(control, _)| control.physical_fence_deadline())
+                {
+                    stop_deadline = stop_deadline.min(limit);
+                }
                 self.owner()?.send("stop", stop_deadline)?;
                 self.owner()?.mark_stop();
                 stopped_deadline = Some(stop_deadline);
@@ -793,7 +1219,20 @@ impl ExternalUciCpuChecker {
             } else {
                 cancel
             };
-            let Some(line) = self.owner()?.next_line(wait_deadline, token)? else {
+            let active_control = if stopped_deadline.is_none() {
+                cooperative.map(|(control, _)| control)
+            } else {
+                None
+            };
+            let read_fence =
+                || cooperative.and_then(|(control, _)| control.physical_fence_deadline());
+            let line = if stopped_deadline.is_some() && cooperative.is_some() {
+                self.next_line_with_fence(wait_deadline, token, Some(&read_fence))?
+            } else {
+                self.owner()?
+                    .next_line_controlled(wait_deadline, token, active_control)?
+            };
+            let Some(line) = line else {
                 if stopped_deadline.is_some() {
                     return Err(error("stop", "bestmove_not_drained"));
                 }
@@ -807,8 +1246,41 @@ impl ExternalUciCpuChecker {
                     }
                     report.work.nodes = Some(nodes);
                     self.capture(report, start);
-                    if nodes > limits.max_nodes {
+                    if cooperative.is_none() && nodes > limits.max_nodes {
                         return Err(error("analysis", "reported_node_budget_exceeded"));
+                    }
+                }
+                if cooperative.is_some_and(|(_, policy)| frame.multipv > policy.multipv) {
+                    return Err(error("analysis", "multipv_outside_requested_width"));
+                }
+                if cooperative.is_some() {
+                    if let (Some(score), Some(bound), Some(depth), Some(pv)) =
+                        (frame.score, frame.bound, frame.depth, frame.pv.as_ref())
+                    {
+                        validate_pv(position, pv, roots)?;
+                        let opinion = ExternalPolicyOpinion {
+                            rank: frame.multipv,
+                            depth,
+                            seldepth: frame.seldepth,
+                            pv: pv.clone(),
+                            score,
+                            bound,
+                            reported_wdl: frame.wdl,
+                        };
+                        if opinion.rank == 1 {
+                            if let Some((control, _)) = cooperative {
+                                control.publish_progress(&opinion, report.work.nodes);
+                            }
+                        }
+                        if let Some(prior) = self
+                            .cooperative_opinions
+                            .iter_mut()
+                            .find(|prior| prior.rank == opinion.rank)
+                        {
+                            *prior = opinion;
+                        } else {
+                            self.cooperative_opinions.push(opinion);
+                        }
                     }
                 }
                 if frame.multipv != 1 {
@@ -853,19 +1325,40 @@ impl ExternalUciCpuChecker {
                 self.active = false;
                 let ready_deadline = match stopped_deadline {
                     Some(deadline) => deadline,
-                    None => budget.drain_deadline(Instant::now())?,
+                    None => {
+                        let deadline = budget.drain_deadline(Instant::now())?;
+                        cooperative
+                            .and_then(|(control, _)| control.physical_fence_deadline())
+                            .map_or(deadline, |limit| deadline.min(limit))
+                    }
                 };
-                let readiness = self.ready(ready_deadline, &no_cancel);
+                let read_fence =
+                    || cooperative.and_then(|(control, _)| control.physical_fence_deadline());
+                let readiness = self.ready_with_fence(
+                    ready_deadline,
+                    &no_cancel,
+                    cooperative.map(|_| &read_fence as &dyn Fn() -> Option<Instant>),
+                );
                 // Final cancellation/deadline remains a partial external
                 // observation even when bestmove races with the stop boundary.
                 if matches!(report.completion, ExternalCompletion::BestMove) {
                     if cancel.load(Ordering::Acquire) {
                         report.completion = ExternalCompletion::StoppedCanceled;
-                    } else if Instant::now() >= budget.analysis_deadline {
+                    } else if cooperative.is_none() && Instant::now() >= budget.analysis_deadline {
                         report.completion = ExternalCompletion::StoppedDeadline;
                     }
                 }
                 readiness?;
+                if let Some((control, _)) = cooperative {
+                    let latest = control.observe();
+                    if matches!(
+                        latest.action,
+                        ExternalControlAction::Cancel | ExternalControlAction::Revoked
+                    ) {
+                        report.completion = ExternalCompletion::StoppedCanceled;
+                        self.stop_control = Some(latest);
+                    }
+                }
                 return Ok(());
             } else if matches!(line.as_str(), "uciok" | "readyok") {
                 return Err(error("analysis", "unexpected_barrier_response"));
@@ -1035,19 +1528,7 @@ impl CpuChecker for ExternalUciCpuChecker {
         ))
     }
     fn new_game(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<(), CheckerError> {
-        if self.failed || self.active {
-            return Err(error("new_game", "checker_not_available"));
-        }
-        if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
-            return Err(error("new_game", "cancel_or_deadline_before_reset"));
-        }
-        self.owner()?.send("ucinewgame", deadline)?;
-        if let Err(failure) = self.ready(deadline, cancel) {
-            self.failed = true;
-            return Err(failure);
-        }
-        self.last_attempt = None;
-        Ok(())
+        self.reset_game_with_fence(deadline, cancel, None)
     }
     fn shutdown(&mut self, deadline: Instant) -> Result<CheckerShutdown, CheckerError> {
         let Some(owner) = self.owner.as_mut() else {
@@ -1209,6 +1690,7 @@ mod process {
             config: &ExternalCpuConfig,
             deadline: Instant,
             cancel: &AtomicBool,
+            launch_pin: Option<&ExternalLaunchPin>,
         ) -> Result<Self, Box<SpawnFailure>> {
             if PROCESS_SLOT
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1222,7 +1704,8 @@ mod process {
                 }));
             }
             let mut failure_evidence = None;
-            let result = Self::spawn_owned(config, deadline, cancel, &mut failure_evidence);
+            let result =
+                Self::spawn_owned(config, deadline, cancel, launch_pin, &mut failure_evidence);
             if result.is_err() && !QUARANTINE_PRESENT.load(Ordering::Acquire) {
                 PROCESS_SLOT.store(false, Ordering::Release);
             }
@@ -1243,13 +1726,21 @@ mod process {
             config: &ExternalCpuConfig,
             deadline: Instant,
             cancel: &AtomicBool,
+            launch_pin: Option<&ExternalLaunchPin>,
             failure_evidence: &mut Option<SpawnFailure>,
         ) -> Result<Self, CheckerError> {
-            let program = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(nix::libc::O_NOFOLLOW)
-                .open(&config.program)
-                .map_err(|_| error("spawn", "program_open"))?;
+            use std::os::unix::fs::FileExt;
+            let program = match launch_pin {
+                Some(pin) => pin
+                    .executable
+                    .try_clone()
+                    .map_err(|_| error("spawn", "pinned_program_clone"))?,
+                None => std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(nix::libc::O_NOFOLLOW)
+                    .open(&config.program)
+                    .map_err(|_| error("spawn", "program_open"))?,
+            };
             let metadata = program
                 .metadata()
                 .map_err(|_| error("spawn", "program_metadata"))?;
@@ -1259,10 +1750,9 @@ mod process {
             {
                 return Err(error("spawn", "program_kind_or_size"));
             }
-            let mut reader = &program;
             let mut header = [0u8; 4];
-            reader
-                .read_exact(&mut header)
+            program
+                .read_exact_at(&mut header, 0)
                 .map_err(|_| error("spawn", "program_header"))?;
             if header != *b"\x7fELF" {
                 return Err(error("spawn", "native_elf_required"));
@@ -1275,8 +1765,8 @@ mod process {
                 if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
                     return Err(error("spawn", "hash_cancel_or_deadline"));
                 }
-                let count = reader
-                    .read(&mut buffer)
+                let count = program
+                    .read_at(&mut buffer, total)
                     .map_err(|_| error("spawn", "program_hash_read"))?;
                 if count == 0 {
                     break;
@@ -1306,11 +1796,24 @@ mod process {
             if format!("{:x}", hash.finalize()) != config.identity.binary_sha256 {
                 return Err(error("spawn", "program_hash_mismatch"));
             }
-            let directory = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
-                .open(&config.working_directory)
-                .map_err(|_| error("spawn", "directory_open"))?;
+            let directory = match launch_pin {
+                Some(pin) => pin
+                    .directory
+                    .try_clone()
+                    .map_err(|_| error("spawn", "pinned_directory_clone"))?,
+                None => std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+                    .open(&config.working_directory)
+                    .map_err(|_| error("spawn", "directory_open"))?,
+            };
+            if !directory
+                .metadata()
+                .map_err(|_| error("spawn", "directory_metadata"))?
+                .is_dir()
+            {
+                return Err(error("spawn", "directory_kind"));
+            }
             let mut command = Command::new(format!("/proc/self/fd/{}", program.as_raw_fd()));
             if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
                 return Err(error("spawn", "cancel_or_deadline_before_spawn"));
@@ -1565,11 +2068,24 @@ mod process {
             deadline: Instant,
             cancel: &AtomicBool,
         ) -> Result<Option<String>, CheckerError> {
+            self.next_line_controlled(deadline, cancel, None)
+        }
+        pub(super) fn next_line_controlled(
+            &mut self,
+            deadline: Instant,
+            cancel: &AtomicBool,
+            control: Option<&dyn ExternalControl>,
+        ) -> Result<Option<String>, CheckerError> {
             loop {
                 if let Some(line) = self.lines.pop_front() {
                     return Ok(Some(line));
                 }
-                if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+                if cancel.load(Ordering::Acquire)
+                    || Instant::now() >= deadline
+                    || control.is_some_and(|control| {
+                        control.observe().action != ExternalControlAction::Continue
+                    })
+                {
                     return Ok(None);
                 }
                 self.pump(false)?;
@@ -1714,6 +2230,7 @@ mod process {
             _config: &ExternalCpuConfig,
             _deadline: Instant,
             _cancel: &AtomicBool,
+            _launch_pin: Option<&ExternalLaunchPin>,
         ) -> Result<Self, Box<SpawnFailure>> {
             Err(Box::new(SpawnFailure {
                 error: CheckerError::Unsupported("external UCI checker requires Linux/WSL"),
@@ -1729,6 +2246,14 @@ mod process {
             &mut self,
             _deadline: Instant,
             _cancel: &AtomicBool,
+        ) -> Result<Option<String>, CheckerError> {
+            Err(CheckerError::Unsupported("external UCI Linux process"))
+        }
+        pub(super) fn next_line_controlled(
+            &mut self,
+            _deadline: Instant,
+            _cancel: &AtomicBool,
+            _control: Option<&dyn ExternalControl>,
         ) -> Result<Option<String>, CheckerError> {
             Err(CheckerError::Unsupported("external UCI Linux process"))
         }
@@ -1847,13 +2372,17 @@ mod tests {
         let mut position = Position::startpos();
         let mut readiness_count = 0usize;
         let mut pending_best = None;
+        let mut multipv = 1_u16;
         for line in std::io::stdin().lock().lines() {
             let line = line.expect("fixture stdin");
             if line == "uci" {
                 println!("id name RZ external checker fixture");
                 println!("id author RoveZero tests");
                 println!("option name Threads type spin default 1 min 1 max 2");
+                println!("option name MultiPV type spin default 1 min 1 max 4");
                 println!("uciok");
+            } else if let Some(value) = line.strip_prefix("setoption name MultiPV value ") {
+                multipv = value.parse().unwrap();
             } else if line == "isready" {
                 readiness_count += 1;
                 if mode == 3 && readiness_count > 1 {
@@ -1896,6 +2425,20 @@ mod tests {
                     println!("info depth {depth} nodes {nodes} score cp NaN pv {best}");
                 } else {
                     println!("info depth {depth} seldepth 12 nodes {nodes} score cp 21 pv {best}");
+                    if mode == 6 || mode == 7 {
+                        let legal = position.legal_moves();
+                        for rank in 2..=multipv {
+                            let other = legal
+                                .iter()
+                                .filter(|mv| **mv != best)
+                                .nth(usize::from(rank - 2))
+                                .unwrap();
+                            let depth = if mode == 7 { "1" } else { depth };
+                            println!(
+                                "info depth {depth} multipv {rank} nodes {nodes} score cp 11 pv {other}"
+                            );
+                        }
+                    }
                 }
                 if mode == 4 || mode == 5 {
                     pending_best = Some(best);
@@ -1961,6 +2504,705 @@ mod tests {
         if fixture_mode("external_cpu::tests::fake_uci_ignores_stop") {
             fixture_loop(5);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fake_uci_multipv() {
+        if fixture_mode("external_cpu::tests::fake_uci_multipv") {
+            fixture_loop(6);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fake_uci_mixed_multipv() {
+        if fixture_mode("external_cpu::tests::fake_uci_mixed_multipv") {
+            fixture_loop(7);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct FixtureControl(rz_runtime::adaptive::ControlMailbox<u64>);
+
+    #[cfg(target_os = "linux")]
+    impl ExternalControl for FixtureControl {
+        fn observe(&self) -> ExternalControlObservation {
+            let snapshot = self.0.snapshot();
+            if snapshot.is_cancelled() {
+                ExternalControlObservation {
+                    sequence: snapshot.cancel_sequence,
+                    action: ExternalControlAction::Cancel,
+                }
+            } else if let Some(sequence) = snapshot.pending_yield() {
+                ExternalControlObservation {
+                    sequence,
+                    action: ExternalControlAction::Yield,
+                }
+            } else {
+                ExternalControlObservation {
+                    sequence: 0,
+                    action: ExternalControlAction::Continue,
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cooperative_fixture(mode: &str) -> ExternalUciCpuChecker {
+        let mut config = fixture_config(mode);
+        config.stop_grace = EXTERNAL_STOP_DRAIN_RESERVE;
+        let mut checker = ExternalUciCpuChecker::create(config).unwrap();
+        checker
+            .start(
+                Instant::now() + Duration::from_secs(10),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        checker
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cooperative_quantum_yields_partial_and_ready_before_a_second_go() {
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let mut checker = cooperative_fixture("fake_uci_waits_for_stop");
+        let cancel = AtomicBool::new(false);
+        for _ in 0..2 {
+            let control = FixtureControl(rz_runtime::adaptive::ControlMailbox::new(
+                1,
+                rz_runtime::CompletionSignal::default(),
+            ));
+            let hard = Instant::now() + Duration::from_secs(2);
+            let result = checker
+                .analyze_cooperative(
+                    &Position::startpos(),
+                    None,
+                    CpuLimits {
+                        max_depth: 8,
+                        max_nodes: 1,
+                        deadline: Some(hard),
+                    },
+                    &cancel,
+                    &control,
+                    ExternalSlicePolicy::default(),
+                )
+                .unwrap();
+            assert_eq!(result.report.completion, ExternalCompletion::StoppedYield);
+            assert_eq!(result.strict_native_nodes, None);
+            assert_eq!(result.report.work.nodes, Some(10));
+            assert!(result.readiness_barrier_completed);
+            assert!(result.stop_control.is_none()); // quantum, not a fabricated control ack
+            assert!(Instant::now() < hard);
+        }
+        assert_eq!(checker.request_id, 2);
+        assert!(
+            checker
+                .shutdown(Instant::now() + Duration::from_secs(2))
+                .unwrap()
+                .cleanup_complete
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cooperative_reported_overshoot_remains_raw_and_unknown_native_credit() {
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let mut checker = cooperative_fixture("fake_uci_overshoot");
+        let control = FixtureControl(rz_runtime::adaptive::ControlMailbox::new(
+            1,
+            rz_runtime::CompletionSignal::default(),
+        ));
+        let result = checker
+            .analyze_cooperative(
+                &Position::startpos(),
+                None,
+                CpuLimits {
+                    max_depth: 8,
+                    max_nodes: 5,
+                    deadline: Some(Instant::now() + Duration::from_secs(2)),
+                },
+                &AtomicBool::new(false),
+                &control,
+                ExternalSlicePolicy {
+                    requested_reported_nodes: 5,
+                    ..ExternalSlicePolicy::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(result.report.work.nodes, Some(6));
+        assert!(result.reported_node_overshoot);
+        assert_eq!(result.strict_native_nodes, None);
+        assert_eq!(result.report.completion, ExternalCompletion::BestMove);
+        checker
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cooperative_explicit_yield_is_not_cancel_or_an_exact_stack_resume() {
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let mut checker = cooperative_fixture("fake_uci_waits_for_stop");
+        let mailbox =
+            rz_runtime::adaptive::ControlMailbox::new(1, rz_runtime::CompletionSignal::default());
+        let request = mailbox.clone();
+        let driver = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            request.request_yield(7).unwrap();
+        });
+        let control = FixtureControl(mailbox);
+        let result = checker
+            .analyze_cooperative(
+                &Position::startpos(),
+                None,
+                CpuLimits {
+                    max_depth: 8,
+                    max_nodes: 100,
+                    deadline: Some(Instant::now() + Duration::from_secs(2)),
+                },
+                &AtomicBool::new(false),
+                &control,
+                ExternalSlicePolicy::default(),
+            )
+            .unwrap();
+        driver.join().unwrap();
+        assert_eq!(result.report.completion, ExternalCompletion::StoppedYield);
+        assert_eq!(
+            result.stop_control,
+            Some(ExternalControlObservation {
+                sequence: 7,
+                action: ExternalControlAction::Yield
+            })
+        );
+        assert!(result.readiness_barrier_completed);
+        assert!(!checker.capabilities().resume);
+        checker
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cooperative_failed_stop_cannot_reopen_an_expired_physical_fence() {
+        struct ShortFence(Instant);
+        impl ExternalControl for ShortFence {
+            fn observe(&self) -> ExternalControlObservation {
+                ExternalControlObservation {
+                    sequence: 0,
+                    action: ExternalControlAction::Continue,
+                }
+            }
+            fn physical_fence_deadline(&self) -> Option<Instant> {
+                Some(self.0)
+            }
+        }
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let mut checker = cooperative_fixture("fake_uci_ignores_stop");
+        let control = ShortFence(Instant::now() + Duration::from_millis(120));
+        let result = checker.analyze_cooperative(
+            &Position::startpos(),
+            None,
+            CpuLimits {
+                max_depth: 8,
+                max_nodes: 100,
+                deadline: Some(Instant::now() + Duration::from_secs(2)),
+            },
+            &AtomicBool::new(false),
+            &control,
+            ExternalSlicePolicy::default(),
+        );
+        assert!(result.is_err());
+        let process = checker
+            .last_attempt()
+            .unwrap()
+            .external
+            .as_ref()
+            .unwrap()
+            .process;
+        assert!(process.quarantined);
+        assert!(!process.cleanup_complete);
+        // A renewed cleanup grace would issue quit after the expired fence.
+        assert!(!process.quit_sent);
+        assert_eq!(checker.go_issue, ExternalGoIssue::Issued);
+        // An explicit, separately registered global cleanup can drain the
+        // retained owner; the failed task does not fabricate that proof.
+        assert!(
+            checker
+                .shutdown(Instant::now() + Duration::from_secs(2))
+                .unwrap()
+                .cleanup_complete
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn coherent_multipv_known_and_mixed_depth_masked_without_value_labels() {
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        for (mode, expected) in [
+            ("fake_uci_multipv", true),
+            ("fake_uci_mixed_multipv", false),
+        ] {
+            let mut checker = cooperative_fixture(mode);
+            let control = FixtureControl(rz_runtime::adaptive::ControlMailbox::new(
+                1,
+                rz_runtime::CompletionSignal::default(),
+            ));
+            let report = checker
+                .analyze_cooperative(
+                    &Position::startpos(),
+                    None,
+                    CpuLimits {
+                        max_depth: 8,
+                        max_nodes: 100,
+                        deadline: Some(Instant::now() + Duration::from_secs(2)),
+                    },
+                    &AtomicBool::new(false),
+                    &control,
+                    ExternalSlicePolicy {
+                        multipv: 4,
+                        ..ExternalSlicePolicy::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(report.opinions.len(), 4);
+            assert_eq!(report.policy_target_known, expected);
+            assert_eq!(report.conditional_rank_policy().is_some(), expected);
+            assert_eq!(report.report.wdl_per_mille, None);
+            if expected {
+                assert_eq!(checker.last_requested_multipv, Some(4));
+                checker
+                    .analyze(
+                        &Position::startpos(),
+                        CpuLimits {
+                            max_depth: 8,
+                            max_nodes: 100,
+                            deadline: Some(Instant::now() + Duration::from_secs(2)),
+                        },
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                assert_eq!(checker.last_requested_multipv, Some(1));
+            }
+            let commands = std::str::from_utf8(checker.diagnostic_output().0).unwrap();
+            assert!(!commands.is_empty());
+            checker
+                .shutdown(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_private_worker_seals_progress_report_and_joins_owned_process() {
+        use rz_contracts::pals::SearchAuthority;
+        use rz_contracts::pals_adaptive::{
+            CpuJobId, CpuWorkerId, ExternalCpuJobEnvelope, ExternalSliceGrant,
+        };
+        use rz_contracts::{
+            ClockDomain, Deadline, Digest as ContractDigest, ExecutionId, GameGeneration,
+            MonotonicTick, OwnerId, ProcessEpoch, RootGeneration,
+        };
+        use worker::*;
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let mut config = fixture_config("fake_uci_waits_for_stop");
+        config.stop_grace = EXTERNAL_STOP_DRAIN_RESERVE;
+        let epoch = ProcessEpoch(9);
+        let owner = CpuWorkerId(0);
+        let clock = ExternalWorkerClock {
+            domain: ClockDomain(epoch),
+            origin: Instant::now(),
+        };
+        let startup_deadline = Instant::now() + Duration::from_secs(10);
+        let mut worker =
+            ExternalCpuWorker::spawn(config.clone(), owner, clock, startup_deadline).unwrap();
+        while worker.startup_report().is_none() {
+            let version = worker.signal().version();
+            assert!(Instant::now() < startup_deadline);
+            worker
+                .signal()
+                .wait_changed(version, Duration::from_millis(20));
+        }
+        assert!(worker.startup_report().unwrap().result.is_ok());
+        let position = Position::startpos();
+        let state_identity =
+            rz_position::contracts::ContractPosition::new(OwnerId(43), position.clone())
+                .export()
+                .unwrap()
+                .snapshot()
+                .identity();
+        let roots = external_root_restriction_digest(None);
+        let evaluation = external_evaluation_namespace(&config.identity).unwrap();
+        let policy = ExternalSlicePolicy::default();
+        let conditions = external_search_conditions(&config, 8, policy);
+        let job = CpuJobId {
+            authority: SearchAuthority {
+                epoch,
+                game: GameGeneration(1),
+                root: RootGeneration(1),
+                implementation: ContractDigest([3; 32]),
+            },
+            sequence: 1,
+        };
+        let execution = ExecutionId::new(epoch, 1);
+        let scope = ExternalWorkerScope {
+            job,
+            execution,
+            owner,
+        };
+        let control = rz_runtime::adaptive::ControlMailbox::new(scope, worker.signal());
+        control.request_publish_progress(1).unwrap();
+        let at = u64::try_from((Instant::now() - clock.origin).as_nanos()).unwrap() + 3_000_000_000;
+        let template = ExternalJob {
+            envelope: ExternalCpuJobEnvelope {
+                id: job,
+                state_identity,
+                question: external_question_digest(state_identity, roots, evaluation, conditions),
+                root_restriction: roots,
+                evaluation_namespace: evaluation,
+                search_conditions: conditions,
+                requested_reported_node_hint: policy.requested_reported_nodes,
+                hard_deadline: Deadline {
+                    clock: clock.domain,
+                    at: MonotonicTick(at),
+                },
+            },
+            grant: ExternalSliceGrant {
+                job,
+                execution,
+                owner,
+                requested_reported_node_hint: policy.requested_reported_nodes,
+                soft_quantum: policy.quantum,
+                control_sequence: 1,
+            },
+            execution,
+            owner,
+            position,
+            root_moves: None,
+            max_depth: 8,
+            policy,
+            control: control.clone(),
+        };
+        let submitted = worker.submit_attested(template.clone()).unwrap();
+        assert!(submitted.matches_job(&template));
+        assert_eq!(submitted.scope(), scope);
+        assert_eq!(submitted.evaluation_namespace(), evaluation);
+        let mut different_question = template.clone();
+        different_question.envelope.question = ContractDigest([9; 32]);
+        assert!(!submitted.matches_job(&different_question));
+        let until = Instant::now() + Duration::from_secs(3);
+        let completion = loop {
+            let version = worker.signal().version();
+            if let Some(completion) = worker.take_report_attested() {
+                break completion;
+            }
+            assert!(Instant::now() < until);
+            worker
+                .signal()
+                .wait_changed(version, Duration::from_millis(20));
+        };
+        assert!(completion.matches_dispatch(&submitted));
+        assert_eq!(
+            completion.process_identity(),
+            Some(submitted.process_identity())
+        );
+        let report = completion.report().clone();
+        assert_eq!(report.scope, scope);
+        assert_eq!(report.go_issue, ExternalGoIssue::Issued);
+        assert_eq!(
+            report.result.unwrap().report.completion,
+            ExternalCompletion::StoppedYield
+        );
+        assert_eq!(report.controls.publish_ack, 1);
+        assert!(report.controls.terminal);
+        let (_, progress) = worker.take_progress().unwrap();
+        assert_eq!(progress.scope, scope);
+        assert_eq!(progress.strict_native_nodes, None);
+        assert_eq!(progress.completed_iteration_observed, None);
+        assert!(!report.exact_resume_supported);
+
+        fn retarget(
+            template: &ExternalJob,
+            authority: SearchAuthority,
+            sequence: u64,
+            clock: ExternalWorkerClock,
+            signal: rz_runtime::CompletionSignal,
+        ) -> ExternalJob {
+            let mut next = template.clone();
+            next.envelope.id = CpuJobId {
+                authority,
+                sequence,
+            };
+            next.envelope.hard_deadline.at = MonotonicTick(
+                u64::try_from((Instant::now() - clock.origin).as_nanos()).unwrap() + 3_000_000_000,
+            );
+            next.execution = ExecutionId::new(authority.epoch, sequence);
+            next.grant.job = next.envelope.id;
+            next.grant.execution = next.execution;
+            next.grant.control_sequence = sequence;
+            next.control = rz_runtime::adaptive::ControlMailbox::new(next.scope(), signal);
+            next
+        }
+        fn root_fence(worker: &ExternalCpuWorker) -> ExternalRootFence {
+            let until = Instant::now() + Duration::from_secs(3);
+            loop {
+                let version = worker.signal().version();
+                if let Some(fence) = worker.root_fence() {
+                    return fence.unwrap();
+                }
+                assert!(Instant::now() < until);
+                worker
+                    .signal()
+                    .wait_changed(version, Duration::from_millis(20));
+            }
+        }
+        fn terminal(worker: &ExternalCpuWorker) -> ExternalWorkerReport {
+            let until = Instant::now() + Duration::from_secs(3);
+            loop {
+                let version = worker.signal().version();
+                if let Some(report) = worker.take_report() {
+                    return report;
+                }
+                assert!(Instant::now() < until);
+                worker
+                    .signal()
+                    .wait_changed(version, Duration::from_millis(20));
+            }
+        }
+        let second_authority = SearchAuthority {
+            root: RootGeneration(2),
+            ..job.authority
+        };
+        assert!(worker.configuration_matches(&config, owner));
+        let mut wrong_config = config.clone();
+        wrong_config.max_depth -= 1;
+        assert!(!worker.configuration_matches(&wrong_config, owner));
+        assert!(worker.replace_root(second_authority).is_err());
+        worker
+            .request_root_quiesce(job.authority, Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        assert!(
+            worker
+                .submit(retarget(
+                    &template,
+                    second_authority,
+                    2,
+                    clock,
+                    worker.signal()
+                ))
+                .is_err()
+        );
+        let first_fence = root_fence(&worker);
+        assert!(first_fence.permits_reuse());
+        assert_eq!(first_fence.authority(), job.authority);
+        assert_eq!(first_fence.owner(), owner);
+        assert_eq!(first_fence.execution_high_water(), 1);
+        assert_eq!(first_fence.job_high_water(), 1);
+        assert_eq!(first_fence.native_request_high_water(), 1);
+        assert_eq!(first_fence.game_reset_high_water(), 0);
+        assert!(worker.replace_root(job.authority).is_err());
+        assert!(
+            worker
+                .replace_root(SearchAuthority {
+                    implementation: ContractDigest([8; 32]),
+                    ..second_authority
+                })
+                .is_err()
+        );
+        worker.replace_root(second_authority).unwrap();
+        assert!(worker.root_fence().is_none());
+        assert!(
+            worker
+                .submit(retarget(
+                    &template,
+                    job.authority,
+                    2,
+                    clock,
+                    worker.signal()
+                ))
+                .is_err()
+        );
+        let second = retarget(&template, second_authority, 2, clock, worker.signal());
+        second.control.request_publish_progress(2).unwrap();
+        let second_controls = second.control.clone();
+        worker.submit(second).unwrap();
+        let progress_until = Instant::now() + Duration::from_secs(3);
+        loop {
+            let version = worker.signal().version();
+            if worker.take_progress().is_some() {
+                break;
+            }
+            assert!(Instant::now() < progress_until);
+            worker
+                .signal()
+                .wait_changed(version, Duration::from_millis(20));
+        }
+        // Explicit cancellation and root revocation may race with the natural
+        // soft quantum; both retain their original job and physical barrier.
+        let _ = second_controls.request_cancel(3);
+        worker
+            .request_root_quiesce(second_authority, Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        let second_report = terminal(&worker);
+        assert_eq!(second_report.scope.job.authority, second_authority);
+        assert_eq!(second_report.go_issue, ExternalGoIssue::Issued);
+        assert!(
+            second_report
+                .result
+                .as_ref()
+                .unwrap()
+                .readiness_barrier_completed
+        );
+        let second_fence = root_fence(&worker);
+        assert_eq!(
+            second_fence.process_identity(),
+            first_fence.process_identity()
+        );
+        assert_eq!(second_fence.native_request_high_water(), 2);
+        assert_eq!(second_fence.execution_high_water(), 2);
+        assert_eq!(second_fence.job_high_water(), 2);
+        assert_eq!(second_fence.game_reset_high_water(), 0);
+
+        let third_authority = SearchAuthority {
+            game: GameGeneration(2),
+            root: RootGeneration(3),
+            ..second_authority
+        };
+        assert!(worker.replace_root(third_authority).is_err());
+        worker
+            .request_new_game(third_authority, Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        let new_game_until = Instant::now() + Duration::from_secs(3);
+        let new_game = loop {
+            let version = worker.signal().version();
+            if let Some(fence) = worker.new_game_fence() {
+                break fence.unwrap();
+            }
+            assert!(Instant::now() < new_game_until);
+            worker
+                .signal()
+                .wait_changed(version, Duration::from_millis(20));
+        };
+        assert!(new_game.permits_reuse());
+        assert_eq!(new_game.previous_authority(), second_authority);
+        assert_eq!(new_game.authority(), third_authority);
+        assert_eq!(new_game.process_identity(), first_fence.process_identity());
+        assert_eq!(new_game.game_reset_high_water(), 1);
+        assert!(
+            worker
+                .replace_root(SearchAuthority {
+                    game: GameGeneration(1),
+                    ..third_authority
+                })
+                .is_err()
+        );
+        worker.replace_root(third_authority).unwrap();
+        assert!(worker.new_game_fence().is_none());
+        assert!(
+            worker
+                .request_new_game(third_authority, Instant::now() + Duration::from_secs(3))
+                .is_err()
+        );
+        worker
+            .submit(retarget(
+                &template,
+                third_authority,
+                3,
+                clock,
+                worker.signal(),
+            ))
+            .unwrap();
+        assert!(terminal(&worker).result.is_ok());
+        worker
+            .request_root_quiesce(third_authority, Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        let third_fence = root_fence(&worker);
+        assert_eq!(
+            third_fence.process_identity(),
+            first_fence.process_identity()
+        );
+        assert_eq!(third_fence.native_request_high_water(), 3);
+        assert_eq!(third_fence.execution_high_water(), 3);
+        assert_eq!(third_fence.job_high_water(), 3);
+        assert_eq!(third_fence.game_reset_high_water(), 1);
+
+        // A manager that has not yet consumed a reliable terminal cannot
+        // delay closure forever or obtain a fake reusable root fence.
+        let fourth_authority = SearchAuthority {
+            root: RootGeneration(4),
+            ..third_authority
+        };
+        worker.replace_root(fourth_authority).unwrap();
+        let fourth = retarget(&template, fourth_authority, 4, clock, worker.signal());
+        let fourth_scope = fourth.scope();
+        let fourth_controls = fourth.control.clone();
+        worker.submit(fourth).unwrap();
+        let terminal_until = Instant::now() + Duration::from_secs(3);
+        while !fourth_controls.snapshot().terminal {
+            let version = worker.signal().version();
+            assert!(Instant::now() < terminal_until);
+            worker
+                .signal()
+                .wait_changed(version, Duration::from_millis(20));
+        }
+        worker
+            .request_root_quiesce(
+                fourth_authority,
+                Instant::now() + Duration::from_millis(100),
+            )
+            .unwrap();
+        let failure_until = Instant::now() + Duration::from_secs(3);
+        let failure = loop {
+            let version = worker.signal().version();
+            if let Some(fence) = worker.root_fence() {
+                break fence.unwrap_err();
+            }
+            assert!(Instant::now() < failure_until);
+            worker
+                .signal()
+                .wait_changed(version, Duration::from_millis(20));
+        };
+        assert_eq!(
+            failure,
+            error("root_quiesce", "deadline_before_terminal_drain")
+        );
+        let retained = terminal(&worker);
+        assert_eq!(retained.scope, fourth_scope);
+        assert_eq!(retained.go_issue, ExternalGoIssue::Issued);
+        assert!(retained.result.unwrap().readiness_barrier_completed);
+        assert_eq!(worker.root_fence(), Some(Err(failure.clone())));
+        worker
+            .request_root_quiesce(fourth_authority, Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(worker.root_fence(), Some(Err(failure)));
+        assert!(
+            worker
+                .replace_root(SearchAuthority {
+                    root: RootGeneration(5),
+                    ..fourth_authority
+                })
+                .is_err()
+        );
+        assert!(worker.shutdown_snapshot().is_none());
+        worker.request_shutdown(Instant::now() + Duration::from_secs(2));
+        let until = Instant::now() + Duration::from_secs(3);
+        let closed = loop {
+            let version = worker.signal().version();
+            if let Some(closed) = worker.try_join() {
+                break closed.unwrap();
+            }
+            assert!(Instant::now() < until);
+            worker
+                .signal()
+                .wait_changed(version, Duration::from_millis(20));
+        };
+        assert!(closed.cleanup_complete && !closed.quarantined);
+        assert!(closed.exit_observed && closed.stdout_drained && closed.stderr_drained);
+        assert!(closed.quit_sent);
+        assert_eq!(closed.process_identity, first_fence.process_identity());
+        assert_eq!(worker.shutdown_snapshot(), Some(Ok(closed)));
+        assert!(worker.try_join().is_none());
+        assert_eq!(worker.shutdown_snapshot(), Some(Ok(closed)));
     }
 
     #[cfg(target_os = "linux")]

@@ -23,7 +23,7 @@ use rz_runtime::adaptive::{
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::sync::{
-    Arc, OnceLock,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -57,12 +57,26 @@ impl From<CpuError> for CpuWorkerError {
 #[derive(Clone, Debug)]
 pub struct CpuAdmissionRejection {
     grant: SliceGrant,
+    verified_unqueued: bool,
+}
+impl CpuAdmissionRejection {
+    pub fn grant(&self) -> SliceGrant {
+        self.grant
+    }
+    /// A rejected duplicate, foreign owner or poisoned submission boundary is
+    /// not proof that the original execution never entered its owner queue.
+    pub fn is_verified_unqueued(&self) -> bool {
+        self.verified_unqueued
+    }
 }
 
 pub struct CpuSubmissionRejected {
     reason: CpuWorkerError,
-    proof: CpuAdmissionRejection,
-    job: Option<CpuJob>,
+    // Definite rejection is exceptional. Keep its large immutable authority
+    // and prepared Job off the success-path Result stack without changing the
+    // owned payload returned to callers.
+    proof: Box<CpuAdmissionRejection>,
+    job: Option<Box<CpuJob>>,
 }
 impl std::fmt::Debug for CpuSubmissionRejected {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -82,16 +96,19 @@ impl CpuSubmissionRejected {
         &self.proof
     }
     pub fn into_parts(self) -> (CpuWorkerError, CpuAdmissionRejection, Option<CpuJob>) {
-        (self.reason, self.proof, self.job)
+        (self.reason, *self.proof, self.job.map(|job| *job))
     }
-    fn from_command(reason: CpuWorkerError, command: CpuCommand) -> Self {
+    fn from_command(reason: CpuWorkerError, command: CpuCommand, verified_unqueued: bool) -> Self {
         let (grant, job) = match command {
             CpuCommand::Begin(job, grant) => (grant, Some(job)),
             CpuCommand::Resume(grant) => (grant, None),
         };
         Self {
             reason,
-            proof: CpuAdmissionRejection { grant },
+            proof: Box::new(CpuAdmissionRejection {
+                grant,
+                verified_unqueued,
+            }),
             job,
         }
     }
@@ -294,6 +311,10 @@ pub struct CpuJobTermination {
 }
 
 #[derive(Clone, Debug)]
+// Reliable storage already has a fixed admission/report-seat bound. Boxing
+// the slice here would add a heap allocation to every native slice; the idle
+// termination variant is less frequent and is kept in the same bounded queue.
+#[allow(clippy::large_enum_variant)]
 pub enum CpuWorkerEvent {
     Slice(CpuSliceReport),
     JobTerminated(CpuJobTermination),
@@ -313,6 +334,9 @@ pub struct CpuWorkerShutdown {
     /// None is not observed; Err retains a startup probe/role failure and never
     /// attests a complete inventory or an applied resource setting.
     pub ready_readback: Option<Result<CpuThreadReadback, CpuResourceError>>,
+    /// The actual engine may be taken only after this known joined exit. This
+    /// does not replace settlement of the returned reliable event receipts.
+    pub engine_recoverable: bool,
 }
 
 struct CreditAccount {
@@ -537,6 +561,9 @@ impl CpuCreditLedger {
         &mut self,
         rejection: &CpuAdmissionRejection,
     ) -> Result<(), CpuWorkerError> {
+        if !rejection.is_verified_unqueued() {
+            return Err(CpuWorkerError::UnknownUsage);
+        }
         let account = self
             .jobs
             .get_mut(&rejection.grant.job)
@@ -648,8 +675,56 @@ impl CpuCreditLedger {
 }
 
 enum CpuCommand {
-    Begin(CpuJob, SliceGrant),
+    Begin(Box<CpuJob>, SliceGrant),
     Resume(SliceGrant),
+}
+impl CpuCommand {
+    fn grant(&self) -> SliceGrant {
+        match self {
+            Self::Begin(_, grant) | Self::Resume(grant) => *grant,
+        }
+    }
+}
+
+/// One worker lifetime belongs to one root authority. Both admitted and
+/// definitely declined IDs advance this bounded fence, so a second call cannot
+/// mint a refund receipt for an execution that has already entered the queue.
+#[derive(Default)]
+struct CpuSubmissionFence {
+    authority: Option<SearchAuthority>,
+    high_water: u64,
+}
+impl CpuSubmissionFence {
+    fn claim(&mut self, owner: CpuWorkerId, grant: SliceGrant) -> Result<(), CpuWorkerError> {
+        if grant.owner != owner
+            || grant.execution.epoch != grant.job.authority.epoch
+            || grant.execution.sequence == 0
+            || grant.execution.sequence == u64::MAX
+            || grant.node_credit == 0
+            || grant.soft_lease.is_zero()
+            || grant.control_sequence == 0
+        {
+            return Err(CpuWorkerError::Invalid(
+                "CPU submission owner or grant mismatch",
+            ));
+        }
+        if self
+            .authority
+            .is_some_and(|authority| authority != grant.job.authority)
+        {
+            return Err(CpuWorkerError::Invalid("CPU worker root authority changed"));
+        }
+        if grant.execution.sequence <= self.high_water {
+            return Err(CpuWorkerError::Duplicate);
+        }
+        self.authority = Some(grant.job.authority);
+        self.high_water = grant.execution.sequence;
+        Ok(())
+    }
+}
+
+struct CpuWorkerExit {
+    engine: Option<CpuEngine>,
 }
 struct ActiveJob {
     job: CpuJob,
@@ -685,11 +760,16 @@ pub struct CpuWorker {
     max_depth: u16,
     evaluation_namespace: Digest,
     search_conditions: Digest,
+    command_capacity: usize,
+    paused_bytes_limit: usize,
     mailbox: CpuWorkerMailbox,
     shutdown: Arc<AtomicBool>,
     ready_readback: Arc<OnceLock<Result<CpuThreadReadback, CpuResourceError>>>,
     pub signal: CompletionSignal,
-    join: Option<JoinHandle<()>>,
+    submission: Mutex<CpuSubmissionFence>,
+    join: Option<JoinHandle<CpuWorkerExit>>,
+    recovered_engine: Option<CpuEngine>,
+    joined_known: bool,
 }
 
 impl CpuWorker {
@@ -700,331 +780,453 @@ impl CpuWorker {
     /// relay thread. Each Job still has its own immutable control mailbox.
     pub fn spawn_notified(
         owner: CpuWorkerId,
-        mut engine: CpuEngine,
+        engine: CpuEngine,
         signal: CompletionSignal,
     ) -> Result<Self, CpuWorkerError> {
+        Self::spawn_notified_retaining(owner, engine, signal).map_err(|(_, reason)| reason)
+    }
+    /// Return the same engine and TT if validation or OS thread creation fails
+    /// before this worker exists. Once a thread starts it owns the engine; only
+    /// the existing known-exit `take_engine` path can return it afterward.
+    // This startup-only error transfers a unique CpuEngine by value. Boxing it
+    // would change the ownership-preserving constructor contract merely to
+    // reduce an exceptional stack return, rather than the execution hot path.
+    #[allow(clippy::result_large_err)]
+    pub fn spawn_notified_retaining(
+        owner: CpuWorkerId,
+        engine: CpuEngine,
+        signal: CompletionSignal,
+    ) -> Result<Self, (CpuEngine, CpuWorkerError)> {
+        Self::spawn_notified_retaining_with_capacity(
+            owner,
+            engine,
+            signal,
+            CPU_WORKER_COMMAND_CAPACITY,
+        )
+    }
+    /// Apply the declaration to this actual command mailbox. The immutable
+    /// engine already owns its separately configured paused-stack ceiling;
+    /// no replacement engine or TT is constructed by this admission path.
+    #[allow(clippy::result_large_err)]
+    pub fn spawn_notified_retaining_with_capacity(
+        owner: CpuWorkerId,
+        engine: CpuEngine,
+        signal: CompletionSignal,
+        command_capacity: usize,
+    ) -> Result<Self, (CpuEngine, CpuWorkerError)> {
+        Self::spawn_notified_with_capacity_and_launcher(
+            owner,
+            engine,
+            signal,
+            command_capacity,
+            |builder, task| builder.spawn(task),
+        )
+    }
+    // The private launcher lets a source test exercise a real pre-start
+    // ownership failure without exhausting process/OS resources. An Err must
+    // drop, rather than invoke, the submitted task, as Thread::Builder does.
+    #[cfg(test)]
+    #[allow(clippy::result_large_err)]
+    fn spawn_notified_with_launcher(
+        owner: CpuWorkerId,
+        engine: CpuEngine,
+        signal: CompletionSignal,
+        launcher: impl FnOnce(
+            thread::Builder,
+            Box<dyn FnOnce() -> CpuWorkerExit + Send + 'static>,
+        ) -> std::io::Result<JoinHandle<CpuWorkerExit>>,
+    ) -> Result<Self, (CpuEngine, CpuWorkerError)> {
+        Self::spawn_notified_with_capacity_and_launcher(
+            owner,
+            engine,
+            signal,
+            CPU_WORKER_COMMAND_CAPACITY,
+            launcher,
+        )
+    }
+    #[allow(clippy::result_large_err)]
+    fn spawn_notified_with_capacity_and_launcher(
+        owner: CpuWorkerId,
+        engine: CpuEngine,
+        signal: CompletionSignal,
+        command_capacity: usize,
+        launcher: impl FnOnce(
+            thread::Builder,
+            Box<dyn FnOnce() -> CpuWorkerExit + Send + 'static>,
+        ) -> std::io::Result<JoinHandle<CpuWorkerExit>>,
+    ) -> Result<Self, (CpuEngine, CpuWorkerError)> {
+        if !(1..=CPU_WORKER_COMMAND_CAPACITY).contains(&command_capacity) {
+            return Err((engine, CpuWorkerError::Invalid("CPU command capacity")));
+        }
         if engine.resume_policy() != CpuResumePolicy::PausedStack {
-            return Err(CpuWorkerError::Invalid("CPU worker requires PausedStack"));
+            return Err((
+                engine,
+                CpuWorkerError::Invalid("CPU worker requires PausedStack"),
+            ));
         }
         let max_depth = engine.config().max_depth;
-        let evaluation_namespace = cpu_evaluation_namespace_digest(&engine)?;
+        let paused_bytes_limit = engine.paused_stack_max_bytes();
+        let evaluation_namespace = match cpu_evaluation_namespace_digest(&engine) {
+            Ok(namespace) => namespace,
+            Err(reason) => return Err((engine, reason)),
+        };
         let search_conditions = cpu_search_conditions_digest(&engine);
         let shutdown = Arc::new(AtomicBool::new(false));
-        let mailbox = CpuWorkerMailbox::new(
-            CPU_WORKER_COMMAND_CAPACITY,
-            CPU_WORKER_COMMAND_CAPACITY * 2,
-            signal.clone(),
-        )
-        .map_err(|_| CpuWorkerError::Invalid("CPU mailbox capacity"))?;
+        // One terminal seat belongs to the paused Job. A one-command profile
+        // still needs two more seats for its next slice/error receipt, so its
+        // owner can Resume after the earlier report is drained.
+        let reliable_capacity = (command_capacity * 2).max(3);
+        let mailbox =
+            match CpuWorkerMailbox::new(command_capacity, reliable_capacity, signal.clone()) {
+                Ok(mailbox) => mailbox,
+                Err(_) => return Err((engine, CpuWorkerError::Invalid("CPU mailbox capacity"))),
+            };
         let worker_shutdown = shutdown.clone();
         let worker_mailbox = mailbox.clone();
         let ready_readback = Arc::new(OnceLock::new());
         let worker_readback = ready_readback.clone();
-        let join = thread::Builder::new()
-            .name(format!("rz-cpu-{}", owner.0))
-            .spawn(move || {
-                // Observe this actual OS thread once, before accepting search
-                // work. A failed probe remains explicit and does not install
-                // affinity or promote SharedControl to DedicatedControl.
-                let observed = u8::try_from(owner.0)
-                    .map_err(|_| CpuResourceError::InvalidDeclaration)
-                    .and_then(|id| observe_current_cpu_thread(CpuActor::OwnWorker(id)));
-                let _ = worker_readback.set(observed);
-                worker_mailbox.signal().notify();
-                let mut active: Option<ActiveJob> = None;
-                let mut progress_sequence = 0u64;
-                loop {
-                    let observed = worker_mailbox.signal().version();
-                    // A paused owner keeps a reliable terminal seat. Atomic
-                    // cancellation is serviced even when normal queues are full.
-                    if let Some(task) = active.as_mut() {
-                        let snapshot = task.job.mailbox.snapshot();
-                        let reason = if snapshot.is_cancelled() {
-                            Some(CpuCompletion::Canceled)
-                        } else if Instant::now() >= task.job.hard_deadline {
-                            Some(CpuCompletion::Deadline)
-                        } else if worker_shutdown.load(Ordering::Acquire) {
-                            Some(CpuCompletion::Canceled)
-                        } else {
-                            None
-                        };
-                        if let Some(completion) = reason {
-                            engine.discard_paused_stack();
-                            if snapshot.cancel_sequence > snapshot.cancel_ack {
-                                let _ = task
-                                    .job
-                                    .mailbox
-                                    .acknowledge_cancel(snapshot.cancel_sequence);
-                            }
-                            let controls = task.job.mailbox.seal_terminal();
-                            if let Some(mut permit) = task.terminal_permit.take() {
-                                let termination = CpuJobTermination {
-                                    job: task.job.envelope.id,
+        // Builder::spawn drops its FnOnce argument when OS creation fails. A
+        // shared one-use gate retains the engine on that branch; no engine or
+        // TT is cloned. Successful threads take ownership before any work.
+        let staged_engine = Arc::new(Mutex::new(Some(engine)));
+        let worker_engine = staged_engine.clone();
+        let task = Box::new(move || {
+            let mut engine = worker_engine
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("CPU startup gate contains its unique engine");
+            drop(worker_engine);
+            // Observe this actual OS thread once, before accepting search
+            // work. A failed probe remains explicit and does not install
+            // affinity or promote SharedControl to DedicatedControl.
+            let observed = u8::try_from(owner.0)
+                .map_err(|_| CpuResourceError::InvalidDeclaration)
+                .and_then(|id| observe_current_cpu_thread(CpuActor::OwnWorker(id)));
+            let _ = worker_readback.set(observed);
+            worker_mailbox.signal().notify();
+            let mut active: Option<ActiveJob> = None;
+            let mut progress_sequence = 0u64;
+            let mut engine_reusable = true;
+            loop {
+                let observed = worker_mailbox.signal().version();
+                // A paused owner keeps a reliable terminal seat. Atomic
+                // cancellation is serviced even when normal queues are full.
+                if let Some(task) = active.as_mut() {
+                    let snapshot = task.job.mailbox.snapshot();
+                    let reason = if snapshot.is_cancelled() {
+                        Some(CpuCompletion::Canceled)
+                    } else if Instant::now() >= task.job.hard_deadline {
+                        Some(CpuCompletion::Deadline)
+                    } else if worker_shutdown.load(Ordering::Acquire) {
+                        Some(CpuCompletion::Canceled)
+                    } else {
+                        None
+                    };
+                    if let Some(completion) = reason {
+                        engine.discard_paused_stack();
+                        if snapshot.cancel_sequence > snapshot.cancel_ack {
+                            let _ = task
+                                .job
+                                .mailbox
+                                .acknowledge_cancel(snapshot.cancel_sequence);
+                        }
+                        let controls = task.job.mailbox.seal_terminal();
+                        if let Some(mut permit) = task.terminal_permit.take() {
+                            let termination = CpuJobTermination {
+                                job: task.job.envelope.id,
+                                owner,
+                                last_execution: ExecutionId::new(
+                                    task.job.envelope.id.authority.epoch,
+                                    task.last_sequence,
+                                ),
+                                completion,
+                                controls,
+                                retained_bytes: engine.paused_stack_bytes().unwrap_or(0),
+                                shutdown: worker_shutdown.load(Ordering::Acquire),
+                            };
+                            let _ = permit.publish(CpuWorkerEvent::JobTerminated(termination));
+                        }
+                        active = None;
+                    }
+                }
+                let mut command = match worker_mailbox.take_command() {
+                    Some(command) => command,
+                    None if worker_shutdown.load(Ordering::Acquire) => break,
+                    None => {
+                        worker_mailbox.wait_changed(observed, Duration::from_millis(10));
+                        continue;
+                    }
+                };
+                let mut rejected_controls = None;
+                let (grant, accepted_command) = match command.command {
+                    CpuCommand::Begin(job, grant) => {
+                        let fresh_eligible = !worker_shutdown.load(Ordering::Acquire)
+                            && grant.job == job.envelope.id
+                            && grant.owner == owner
+                            && job.mailbox.scope()
+                                == &CpuMailboxScope {
+                                    job: grant.job,
                                     owner,
-                                    last_execution: ExecutionId::new(
-                                        task.job.envelope.id.authority.epoch,
-                                        task.last_sequence,
-                                    ),
-                                    completion,
-                                    controls,
-                                    retained_bytes: engine.paused_stack_bytes().unwrap_or(0),
-                                    shutdown: worker_shutdown.load(Ordering::Acquire),
-                                };
-                                let _ = permit.publish(CpuWorkerEvent::JobTerminated(termination));
-                            }
-                            active = None;
-                        }
-                    }
-                    let mut command = match worker_mailbox.take_command() {
-                        Some(command) => command,
-                        None if worker_shutdown.load(Ordering::Acquire) => break,
-                        None => {
-                            worker_mailbox.wait_changed(observed, Duration::from_millis(10));
-                            continue;
-                        }
-                    };
-                    let mut rejected_controls = None;
-                    let (grant, accepted_command) = match command.command {
-                        CpuCommand::Begin(job, grant) => {
-                            let fresh_eligible = !worker_shutdown.load(Ordering::Acquire)
-                                && grant.job == job.envelope.id
-                                && grant.owner == owner
-                                && job.mailbox.scope()
-                                    == &CpuMailboxScope {
-                                        job: grant.job,
-                                        owner,
-                                    }
-                                && job.envelope.evaluation_namespace
-                                    == cpu_evaluation_namespace_digest(&engine)
-                                        .unwrap_or(Digest([0; 32]))
-                                && job.envelope.search_conditions
-                                    == cpu_search_conditions_digest(&engine)
-                                && job.target_depth <= engine.config().max_depth
-                                && job.clock.now().ok().is_some_and(|now| {
-                                    grant
-                                        .validate(&job.envelope, job.clock.domain(), now)
-                                        .is_ok()
-                                });
-                            if active.is_none() && fresh_eligible {
-                                active = Some(ActiveJob {
-                                    job,
-                                    token: None,
-                                    spent: 0,
-                                    last_sequence: 0,
-                                    last_control_sequence: 0,
-                                    terminal_permit: None,
-                                });
-                                (grant, true)
-                            } else {
-                                // This owned Begin never ran. Closing its
-                                // question admission is distinct from an
-                                // execution terminal or a retained stack ack.
-                                // A malformed duplicate must not seal the live
-                                // primary when it aliases that exact mailbox.
-                                let aliases_primary = active.as_ref().is_some_and(|task| {
-                                    Arc::ptr_eq(&task.job.mailbox, &job.mailbox)
-                                });
-                                if !aliases_primary {
-                                    rejected_controls = Some(job.mailbox.seal_terminal());
                                 }
-                                (grant, false)
-                            }
-                        }
-                        CpuCommand::Resume(grant) => (grant, true),
-                    };
-                    let mut report = CpuSliceReport {
-                        grant: grant.clone(),
-                        actual_work: Some(CpuWork::default()),
-                        result: Err(CpuError::InvalidLimits(
-                            "slice does not name the live private job",
-                        )),
-                        cumulative_nodes: 0,
-                        progress_sequence,
-                        continuation_retained: false,
-                        terminal: false,
-                        admission_rejected: true,
-                        controls: rejected_controls,
-                    };
-                    let eligible = !worker_shutdown.load(Ordering::Acquire)
-                        && accepted_command
-                        && active.as_ref().is_some_and(|task| {
-                            grant.job == task.job.envelope.id
-                                && grant.owner == owner
-                                && grant.execution.epoch == grant.job.authority.epoch
-                                && grant.execution.sequence > task.last_sequence
-                                && grant.node_credit > 0
-                                && !grant.soft_lease.is_zero()
-                                && grant.control_sequence > task.last_control_sequence
-                                && task.job.clock.now().ok().is_some_and(|now| {
-                                    grant
-                                        .validate(&task.job.envelope, task.job.clock.domain(), now)
-                                        .is_ok()
-                                })
-                                && task
-                                    .spent
-                                    .checked_add(grant.node_credit)
-                                    .is_some_and(|sum| {
-                                        sum <= task.job.envelope.total_native_node_credit
-                                    })
-                        });
-                    if eligible {
-                        let task = active.as_mut().expect("checked private job");
-                        // Starting the next slice consumes the previous pause
-                        // authority; its unused terminal storage can be released.
-                        task.terminal_permit.take();
-                        let lease = Instant::now().checked_add(grant.soft_lease);
-                        let mut invoked = false;
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            CpuSliceControl::new(grant.node_credit, lease, task.job.mailbox.clone())
-                                .and_then(|control| {
-                                    invoked = true;
-                                    engine.analyze_controlled(
-                                        &task.job.position,
-                                        task.job.root_moves.as_deref(),
-                                        CpuLimits {
-                                            max_depth: task.job.target_depth,
-                                            max_nodes: task.job.envelope.total_native_node_credit
-                                                - task.spent,
-                                            deadline: Some(task.job.hard_deadline),
-                                        },
-                                        &worker_shutdown,
-                                        &control,
-                                        task.token.as_ref(),
-                                        |iteration| {
-                                            if iteration.completed_depth == 0 {
-                                                return;
-                                            }
-                                            progress_sequence = progress_sequence.saturating_add(1);
-                                            let _ = worker_mailbox.publish_progress(
-                                                progress_sequence,
-                                                CpuWorkerProgress {
-                                                    job: grant.job,
-                                                    execution: grant.execution,
-                                                    owner,
-                                                    sequence: progress_sequence,
-                                                    iteration,
-                                                },
-                                            );
-                                        },
-                                    )
-                                })
-                        }));
-                        let panicked = result.is_err();
-                        let mut result = result.unwrap_or_else(|_| {
-                            Err(CpuError::Unsupported("CPU worker panicked; usage unknown"))
-                        });
-                        // Preserve the existing OwnedCpuChecker post-call
-                        // frozen namespace guard in this private execution path.
-                        if result.is_ok() {
-                            if let Err(error) = engine.validate_frozen_value_namespace() {
-                                result = Err(error);
-                            }
-                        }
-                        report.actual_work = if panicked {
-                            None
-                        } else if invoked {
-                            engine.last_attempt_work()
+                            && job.envelope.evaluation_namespace
+                                == cpu_evaluation_namespace_digest(&engine)
+                                    .unwrap_or(Digest([0; 32]))
+                            && job.envelope.search_conditions
+                                == cpu_search_conditions_digest(&engine)
+                            && job.target_depth <= engine.config().max_depth
+                            && job.clock.now().ok().is_some_and(|now| {
+                                grant
+                                    .validate(&job.envelope, job.clock.domain(), now)
+                                    .is_ok()
+                            });
+                        if active.is_none() && fresh_eligible {
+                            active = Some(ActiveJob {
+                                job: *job,
+                                token: None,
+                                spent: 0,
+                                last_sequence: 0,
+                                last_control_sequence: 0,
+                                terminal_permit: None,
+                            });
+                            (grant, true)
                         } else {
-                            Some(CpuWork::default())
-                        };
-                        if let Some(work) = report.actual_work {
-                            if let Some(spent) = task.spent.checked_add(work.nodes) {
-                                task.spent = spent;
-                            } else {
-                                report.actual_work = None;
-                                result = Err(CpuError::Unsupported(
-                                    "CPU cumulative native work overflow; usage unknown",
-                                ));
+                            // This owned Begin never ran. Closing its
+                            // question admission is distinct from an
+                            // execution terminal or a retained stack ack.
+                            // A malformed duplicate must not seal the live
+                            // primary when it aliases that exact mailbox.
+                            let aliases_primary = active
+                                .as_ref()
+                                .is_some_and(|task| Arc::ptr_eq(&task.job.mailbox, &job.mailbox));
+                            if !aliases_primary {
+                                rejected_controls = Some(job.mailbox.seal_terminal());
                             }
+                            (grant, false)
                         }
-                        report.cumulative_nodes = task.spent;
-                        task.last_sequence = grant.execution.sequence;
-                        task.last_control_sequence = grant.control_sequence;
-                        task.token = result
-                            .as_ref()
-                            .ok()
-                            .filter(|value| value.report.completion == CpuCompletion::Yielded)
-                            .and_then(|value| value.report.resume.clone());
-                        // Only this private worker retains the opaque engine
-                        // owner. The manager receives liveness, not the token.
-                        if let Ok(value) = &mut result {
-                            value.report.resume = None;
+                    }
+                    CpuCommand::Resume(grant) => (grant, true),
+                };
+                let mut report = CpuSliceReport {
+                    grant,
+                    actual_work: Some(CpuWork::default()),
+                    result: Err(CpuError::InvalidLimits(
+                        "slice does not name the live private job",
+                    )),
+                    cumulative_nodes: 0,
+                    progress_sequence,
+                    continuation_retained: false,
+                    terminal: false,
+                    admission_rejected: true,
+                    controls: rejected_controls,
+                };
+                let eligible = !worker_shutdown.load(Ordering::Acquire)
+                    && accepted_command
+                    && active.as_ref().is_some_and(|task| {
+                        grant.job == task.job.envelope.id
+                            && grant.owner == owner
+                            && grant.execution.epoch == grant.job.authority.epoch
+                            && grant.execution.sequence > task.last_sequence
+                            && grant.node_credit > 0
+                            && !grant.soft_lease.is_zero()
+                            && grant.control_sequence > task.last_control_sequence
+                            && task.job.clock.now().ok().is_some_and(|now| {
+                                grant
+                                    .validate(&task.job.envelope, task.job.clock.domain(), now)
+                                    .is_ok()
+                            })
+                            && task
+                                .spent
+                                .checked_add(grant.node_credit)
+                                .is_some_and(|sum| {
+                                    sum <= task.job.envelope.total_native_node_credit
+                                })
+                    });
+                if eligible {
+                    let task = active.as_mut().expect("checked private job");
+                    // Starting the next slice consumes the previous pause
+                    // authority; its unused terminal storage can be released.
+                    task.terminal_permit.take();
+                    let lease = Instant::now().checked_add(grant.soft_lease);
+                    let mut invoked = false;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        CpuSliceControl::new(grant.node_credit, lease, task.job.mailbox.clone())
+                            .and_then(|control| {
+                                invoked = true;
+                                engine.analyze_controlled(
+                                    &task.job.position,
+                                    task.job.root_moves.as_deref(),
+                                    CpuLimits {
+                                        max_depth: task.job.target_depth,
+                                        max_nodes: task.job.envelope.total_native_node_credit
+                                            - task.spent,
+                                        deadline: Some(task.job.hard_deadline),
+                                    },
+                                    &worker_shutdown,
+                                    &control,
+                                    task.token.as_ref(),
+                                    |iteration| {
+                                        if iteration.completed_depth == 0 {
+                                            return;
+                                        }
+                                        progress_sequence = progress_sequence.saturating_add(1);
+                                        let _ = worker_mailbox.publish_progress(
+                                            progress_sequence,
+                                            CpuWorkerProgress {
+                                                job: grant.job,
+                                                execution: grant.execution,
+                                                owner,
+                                                sequence: progress_sequence,
+                                                iteration,
+                                            },
+                                        );
+                                    },
+                                )
+                            })
+                    }));
+                    let panicked = result.is_err();
+                    let mut result = result.unwrap_or_else(|_| {
+                        Err(CpuError::Unsupported("CPU worker panicked; usage unknown"))
+                    });
+                    // Preserve the existing OwnedCpuChecker post-call
+                    // frozen namespace guard in this private execution path.
+                    if result.is_ok() {
+                        if let Err(error) = engine.validate_frozen_value_namespace() {
+                            result = Err(error);
                         }
-                        report.continuation_retained = task
-                            .token
-                            .as_ref()
-                            .is_some_and(|token| engine.token_is_current(token));
-                        report.terminal = match &result {
-                            Ok(value) => value.report.completion != CpuCompletion::Yielded,
-                            Err(_) => true,
-                        };
-                        report.admission_rejected = false;
-                        report.result = result;
-                        report.progress_sequence = progress_sequence;
-                        if report.terminal {
-                            engine.discard_paused_stack();
-                            let snapshot = task.job.mailbox.snapshot();
-                            if snapshot.cancel_sequence > snapshot.cancel_ack {
-                                let _ = task
-                                    .job
-                                    .mailbox
-                                    .acknowledge_cancel(snapshot.cancel_sequence);
-                            }
-                            task.job.mailbox.seal_terminal();
-                            report.controls = Some(task.job.mailbox.snapshot());
-                            active = None;
+                    }
+                    report.actual_work = if panicked {
+                        None
+                    } else if invoked {
+                        engine.last_attempt_work()
+                    } else {
+                        Some(CpuWork::default())
+                    };
+                    if let Some(work) = report.actual_work {
+                        if let Some(spent) = task.spent.checked_add(work.nodes) {
+                            task.spent = spent;
                         } else {
-                            report.controls = Some(task.job.mailbox.snapshot());
+                            report.actual_work = None;
+                            result = Err(CpuError::Unsupported(
+                                "CPU cumulative native work overflow; usage unknown",
+                            ));
                         }
-                        if panicked {
-                            worker_shutdown.store(true, Ordering::Release);
-                            worker_mailbox.close();
-                        }
-                    } else if let Some(task) = active
+                    }
+                    report.cumulative_nodes = task.spent;
+                    task.last_sequence = grant.execution.sequence;
+                    task.last_control_sequence = grant.control_sequence;
+                    task.token = result
                         .as_ref()
-                        .filter(|task| task.job.envelope.id == grant.job)
-                    {
-                        report.cumulative_nodes = task.spent;
-                        if accepted_command && task.last_sequence == 0 {
-                            // Shutdown can arrive between installing a fresh
-                            // primary and its first invocation. No stack or
-                            // work exists, so return the admission rejection
-                            // with its actual closed question scope.
-                            report.controls = Some(task.job.mailbox.seal_terminal());
-                            active = None;
-                        }
+                        .ok()
+                        .filter(|value| value.report.completion == CpuCompletion::Yielded)
+                        .and_then(|value| value.report.resume.clone());
+                    // Only this private worker retains the opaque engine
+                    // owner. The manager receives liveness, not the token.
+                    if let Ok(value) = &mut result {
+                        value.report.resume = None;
                     }
-                    let retain_permit = !report.admission_rejected && report.continuation_retained;
-                    if command
-                        .reliable
-                        .publish(CpuWorkerEvent::Slice(report))
-                        .is_err()
-                    {
-                        break;
+                    report.continuation_retained = task
+                        .token
+                        .as_ref()
+                        .is_some_and(|token| engine.token_is_current(token));
+                    report.terminal = match &result {
+                        Ok(value) => value.report.completion != CpuCompletion::Yielded,
+                        Err(_) => true,
+                    };
+                    report.admission_rejected = false;
+                    report.result = result;
+                    report.progress_sequence = progress_sequence;
+                    if report.actual_work.is_none() || report.result.is_err() {
+                        engine_reusable = false;
                     }
-                    if retain_permit {
-                        if let Some(task) = active.as_mut() {
-                            task.terminal_permit = Some(command.reliable);
+                    if report.terminal {
+                        engine.discard_paused_stack();
+                        let snapshot = task.job.mailbox.snapshot();
+                        if snapshot.cancel_sequence > snapshot.cancel_ack {
+                            let _ = task
+                                .job
+                                .mailbox
+                                .acknowledge_cancel(snapshot.cancel_sequence);
                         }
+                        task.job.mailbox.seal_terminal();
+                        report.controls = Some(task.job.mailbox.snapshot());
+                        active = None;
+                    } else {
+                        report.controls = Some(task.job.mailbox.snapshot());
+                    }
+                    if panicked {
+                        worker_shutdown.store(true, Ordering::Release);
+                        worker_mailbox.close();
+                    }
+                } else if let Some(task) = active
+                    .as_ref()
+                    .filter(|task| task.job.envelope.id == grant.job)
+                {
+                    report.cumulative_nodes = task.spent;
+                    if accepted_command && task.last_sequence == 0 {
+                        // Shutdown can arrive between installing a fresh
+                        // primary and its first invocation. No stack or
+                        // work exists, so return the admission rejection
+                        // with its actual closed question scope.
+                        report.controls = Some(task.job.mailbox.seal_terminal());
+                        active = None;
                     }
                 }
-                if let Some(task) = active {
-                    task.job.mailbox.seal_terminal();
+                let retain_permit = !report.admission_rejected && report.continuation_retained;
+                if command
+                    .reliable
+                    .publish(CpuWorkerEvent::Slice(report))
+                    .is_err()
+                {
+                    engine_reusable = false;
+                    break;
                 }
-                engine.discard_paused_stack();
-                worker_mailbox.signal().notify();
-            })
-            .map_err(|_| CpuWorkerError::Disconnected)?;
+                if retain_permit {
+                    if let Some(task) = active.as_mut() {
+                        task.terminal_permit = Some(command.reliable);
+                    }
+                }
+            }
+            if let Some(task) = active {
+                task.job.mailbox.seal_terminal();
+                engine_reusable = false;
+            }
+            engine.discard_paused_stack();
+            engine_reusable &= engine.validate_frozen_value_namespace().is_ok();
+            worker_mailbox.signal().notify();
+            CpuWorkerExit {
+                engine: engine_reusable.then_some(engine),
+            }
+        });
+        let join = match launcher(
+            thread::Builder::new().name(format!("rz-cpu-{}", owner.0)),
+            task,
+        ) {
+            Ok(join) => join,
+            Err(_) => {
+                let engine = staged_engine
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("failed OS spawn did not enter the CPU startup gate");
+                return Err((engine, CpuWorkerError::Disconnected));
+            }
+        };
         Ok(Self {
             owner,
             max_depth,
             evaluation_namespace,
             search_conditions,
+            command_capacity,
+            paused_bytes_limit,
             shutdown,
             ready_readback,
             mailbox,
             signal,
+            submission: Mutex::new(CpuSubmissionFence::default()),
             join: Some(join),
+            recovered_engine: None,
+            joined_known: false,
         })
     }
     /// Build a question from the immutable worker profile without copying its
@@ -1061,16 +1263,37 @@ impl CpuWorker {
             search_conditions: self.search_conditions,
         }
     }
+    /// The actual mailbox and engine ceilings captured before worker start.
+    pub fn command_capacity(&self) -> usize {
+        self.command_capacity
+    }
+    pub fn paused_bytes_limit(&self) -> usize {
+        self.paused_bytes_limit
+    }
     /// Borrow the single real ready observation without blocking or copying
     /// CPU sets on manager ticks. A declaration is not an observed placement.
     pub fn ready_readback(&self) -> Option<&Result<CpuThreadReadback, CpuResourceError>> {
         self.ready_readback.get()
     }
     fn submit(&self, command: CpuCommand) -> Result<(), CpuSubmissionRejected> {
+        let mut fence = match self.submission.lock() {
+            Ok(fence) => fence,
+            Err(_) => {
+                return Err(CpuSubmissionRejected::from_command(
+                    CpuWorkerError::Quarantined,
+                    command,
+                    false,
+                ));
+            }
+        };
+        if let Err(error) = fence.claim(self.owner, command.grant()) {
+            return Err(CpuSubmissionRejected::from_command(error, command, false));
+        }
         if self.shutdown.load(Ordering::Acquire) {
             return Err(CpuSubmissionRejected::from_command(
                 CpuWorkerError::Disconnected,
                 command,
+                true,
             ));
         }
         self.mailbox.admit(command, 2).map_err(|error| {
@@ -1079,7 +1302,7 @@ impl CpuWorker {
                 MailboxError::QueueFull | MailboxError::ReliableFull => CpuWorkerError::Capacity,
                 _ => CpuWorkerError::Invalid("CPU mailbox admission failed"),
             };
-            CpuSubmissionRejected::from_command(reason, error.value)
+            CpuSubmissionRejected::from_command(reason, error.value, true)
         })
     }
     pub fn begin(&self, job: CpuJob, grant: SliceGrant) -> Result<(), CpuWorkerError> {
@@ -1102,10 +1325,64 @@ impl CpuWorker {
         {
             return Err(CpuSubmissionRejected::from_command(
                 CpuWorkerError::Invalid("CPU job owner mismatch"),
-                CpuCommand::Begin(job, grant),
+                CpuCommand::Begin(Box::new(job), grant),
+                false,
             ));
         }
-        self.submit(CpuCommand::Begin(job, grant))
+        self.submit(CpuCommand::Begin(Box::new(job), grant))
+    }
+    /// Consume a prepared question at the actual owner boundary without
+    /// enqueueing. This is used when hot-store admission fails after reserve.
+    /// A repeated/enqueued ID or a foreign question cannot issue this proof.
+    pub fn reject_prepared(
+        &self,
+        job: CpuJob,
+        grant: SliceGrant,
+    ) -> Result<CpuSubmissionRejected, CpuWorkerError> {
+        if grant.owner != self.owner
+            || grant.job != job.envelope.id
+            || job.mailbox.scope()
+                != &(CpuMailboxScope {
+                    job: grant.job,
+                    owner: self.owner,
+                })
+            || job.envelope.evaluation_namespace != self.evaluation_namespace
+            || job.envelope.search_conditions != self.search_conditions
+        {
+            return Err(CpuWorkerError::Invalid(
+                "CPU prepared rejection scope mismatch",
+            ));
+        }
+        let mut fence = self
+            .submission
+            .lock()
+            .map_err(|_| CpuWorkerError::Quarantined)?;
+        fence.claim(self.owner, grant)?;
+        Ok(CpuSubmissionRejected::from_command(
+            CpuWorkerError::Invalid("CPU prepared question declined before enqueue"),
+            CpuCommand::Begin(Box::new(job), grant),
+            true,
+        ))
+    }
+    /// Seal only a new unsubmitted resume execution. The old private stack is
+    /// unaffected; no current/previously enqueued execution can be refunded.
+    pub fn reject_unsubmitted_resume(
+        &self,
+        grant: SliceGrant,
+    ) -> Result<CpuSubmissionRejected, CpuWorkerError> {
+        let mut fence = self
+            .submission
+            .lock()
+            .map_err(|_| CpuWorkerError::Quarantined)?;
+        if fence.authority != Some(grant.job.authority) {
+            return Err(CpuWorkerError::UnknownJob);
+        }
+        fence.claim(self.owner, grant)?;
+        Ok(CpuSubmissionRejected::from_command(
+            CpuWorkerError::Invalid("CPU resume declined before enqueue"),
+            CpuCommand::Resume(grant),
+            true,
+        ))
     }
     pub fn resume(&self, grant: SliceGrant) -> Result<(), CpuWorkerError> {
         self.resume_attested(grant).map_err(|error| error.reason)
@@ -1146,8 +1423,18 @@ impl CpuWorker {
         let join = self.join.take().expect("finished owner retained");
         Ok(Some(self.collect_joined(join)))
     }
-    fn collect_joined(&self, join: JoinHandle<()>) -> CpuWorkerShutdown {
-        let thread_panicked = join.join().is_err();
+    fn collect_joined(&mut self, join: JoinHandle<CpuWorkerExit>) -> CpuWorkerShutdown {
+        let thread_panicked = match join.join() {
+            Ok(exit) => {
+                self.recovered_engine = exit.engine;
+                self.joined_known = self.recovered_engine.is_some();
+                false
+            }
+            Err(_) => {
+                self.joined_known = false;
+                true
+            }
+        };
         let mut events = Vec::new();
         while let Some(event) = self.mailbox.take_reliable() {
             events.push(event);
@@ -1161,7 +1448,22 @@ impl CpuWorker {
             thread_panicked,
             mailbox: self.mailbox.occupancy(),
             ready_readback: self.ready_readback().cloned(),
+            engine_recoverable: self.joined_known,
         }
+    }
+    /// Move the same engine/TT out only after a known joined owner exit. The
+    /// caller settles all returned receipts before spawning the next root.
+    /// Caught panics, unknown work and failed owner executions quarantine it.
+    pub fn take_engine(&mut self) -> Result<CpuEngine, CpuWorkerError> {
+        if self.join.is_some() {
+            return Err(CpuWorkerError::AlreadyReserved);
+        }
+        if !self.joined_known {
+            return Err(CpuWorkerError::Quarantined);
+        }
+        self.recovered_engine
+            .take()
+            .ok_or(CpuWorkerError::Duplicate)
     }
     /// Explicit blocking shutdown for a caller outside the manager event loop.
     pub fn shutdown(mut self) -> Result<CpuWorkerShutdown, CpuWorkerError> {

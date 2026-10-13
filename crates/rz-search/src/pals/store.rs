@@ -7,7 +7,7 @@
 //! that its physical work has finished.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::cpu_checker::{
     CheckerIdentity, CheckerWork, ExternalBound, ExternalCheckerReport, ExternalCompletion,
@@ -20,11 +20,12 @@ use rz_position::{
 
 mod archive;
 mod hot;
+pub mod hot_commit;
 pub use archive::{
     ArchiveConfig, ArchiveIoBudget, ArchiveLoadPin, ArchiveOwnerLifecycle, ArchiveOwnerSnapshot,
-    ArchiveReceipt, ArchiveRecordKind, ArchiveRuntimeLimits, ArchiveStats, ColdHandle,
-    EngineArchiveNode, EngineArchiveReceipt, LoadedArchive, StorePins,
-    archive_accounting_source_sha256,
+    ArchiveReceipt, ArchiveRecordKind, ArchiveRootCapability, ArchiveRuntimeLimits, ArchiveStats,
+    ColdHandle, EngineArchiveNode, EngineArchiveReceipt, ForeignAppendPermit, ForeignGoIssuedProof,
+    LoadedArchive, StorePins, archive_accounting_source_sha256,
 };
 use hot::HotRecords;
 
@@ -83,6 +84,9 @@ pub enum StoreError {
     ArchiveCanceled,
     ArchiveDeadline,
     ArchiveByteBudget,
+    /// The cold uniqueness proof belongs to an older store/archive fact set.
+    /// The caller must report unknown and request a new bounded worker scan.
+    ForeignPermitStale,
     PinSaturated(&'static str),
     ColdRecord(&'static str),
 }
@@ -930,13 +934,21 @@ fn external_source_id(semantics: &str) -> u64 {
 pub struct ObservationStore {
     observations: HotRecords<Observation>,
     limit: usize,
+    /// A foreign append proof cannot survive replacement of this fact owner.
+    identity: Arc<()>,
 }
 
 impl ObservationStore {
+    /// Monotonic issued ID high-water; hot resident length decreases on
+    /// archival and is not a witness-baseline sequence.
+    pub fn next_observation_sequence(&self) -> usize {
+        self.observations.next_id()
+    }
     pub fn new(limit: usize) -> Self {
         Self {
             observations: HotRecords::new(),
             limit,
+            identity: Arc::new(()),
         }
     }
 
@@ -1892,6 +1904,77 @@ pub struct PalsStores {
     /// Session write authority survives archive close without retaining files,
     /// hot-store owners, cold handles or permission to admit another write.
     archive_write_ledger: Option<Arc<archive::ArchiveWriteLedger>>,
+    /// Immutable submitted review views own independent, bounded hot leases.
+    /// Archive authority and other consumers remain separate owners.
+    review_pins: Arc<Mutex<ReviewPinRegistry>>,
+}
+
+#[derive(Debug, Default)]
+struct ReviewPinRegistry {
+    next: u64,
+    leases: BTreeMap<u64, StorePins>,
+}
+
+/// Concrete store ownership; numeric handles never confer this authority.
+#[derive(Clone, Debug)]
+pub struct StoreReadOwner {
+    states: Weak<()>,
+    lines: Weak<()>,
+}
+impl StoreReadOwner {
+    pub fn matches(&self, stores: &PalsStores) -> bool {
+        self.states.ptr_eq(&Arc::downgrade(&stores.states.identity))
+            && self.lines.ptr_eq(&Arc::downgrade(&stores.lines.identity))
+    }
+}
+
+/// Dropping the last immutable view releases only its own hot lease. This is
+/// neither archive deletion nor a CPU/GPU physical completion acknowledgement.
+#[derive(Debug)]
+pub struct StoreReadPin {
+    owner: StoreReadOwner,
+    registry: Arc<Mutex<ReviewPinRegistry>>,
+    serial: u64,
+    generation: u64,
+}
+impl StoreReadPin {
+    pub fn validates(&self, stores: &PalsStores) -> bool {
+        self.owner.matches(stores)
+            && self.generation == stores.generation()
+            && Arc::ptr_eq(&self.registry, &stores.review_pins)
+            && self
+                .registry
+                .lock()
+                .is_ok_and(|pins| pins.leases.contains_key(&self.serial))
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn reborrow(&self, stores: &PalsStores) -> Result<StoreReadPin, StoreError> {
+        if !self.validates(stores) {
+            return Err(StoreError::StaleConsumer);
+        }
+        let pins = self
+            .registry
+            .lock()
+            .map_err(|_| StoreError::InvalidConditions("review pin owner poisoned"))?
+            .leases
+            .get(&self.serial)
+            .cloned()
+            .ok_or(StoreError::InvalidHandle("review pin lease"))?;
+        stores.pin_review(pins)
+    }
+}
+impl Drop for StoreReadPin {
+    fn drop(&mut self) {
+        // Recover poison for release only. Admission/collection remains closed
+        // on poison; discarding a poisoned ownership lock would leak a lease.
+        let mut pins = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        pins.leases.remove(&self.serial);
+    }
 }
 
 impl PalsStores {
@@ -1914,6 +1997,7 @@ impl PalsStores {
             checked_cpu_pvs: BTreeMap::new(),
             archive: None,
             archive_write_ledger: None,
+            review_pins: Arc::new(Mutex::new(ReviewPinRegistry::default())),
         }
     }
 
@@ -1922,6 +2006,77 @@ impl PalsStores {
     }
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub fn read_owner(&self) -> StoreReadOwner {
+        StoreReadOwner {
+            states: Arc::downgrade(&self.states.identity),
+            lines: Arc::downgrade(&self.lines.identity),
+        }
+    }
+    /// Validate seed handles now, then retain their dependency closure through
+    /// the archive's existing protected_pins/expand_pins path on reclamation.
+    pub fn pin_review(&self, pins: StorePins) -> Result<StoreReadPin, StoreError> {
+        if pins.states.len() > self.limits.states
+            || pins.lines.len() > self.limits.line_chunks
+            || pins.observations.len() > self.limits.observations
+            || pins.situations.len() > self.limits.situations
+            || pins.executions.len() > self.limits.executions
+        {
+            return Err(StoreError::PinSaturated("review seed index"));
+        }
+        for id in &pins.states {
+            self.states.get(*id)?;
+        }
+        for id in &pins.lines {
+            self.lines.get(*id)?;
+        }
+        for id in &pins.observations {
+            self.observations.get(*id)?;
+        }
+        for id in &pins.situations {
+            self.situations.get(*id)?;
+        }
+        for id in &pins.executions {
+            self.tasks.get(*id)?;
+        }
+        let mut registry = self
+            .review_pins
+            .lock()
+            .map_err(|_| StoreError::InvalidConditions("review pin owner poisoned"))?;
+        if registry.leases.len() >= 16 {
+            return Err(StoreError::PinSaturated("review view leases"));
+        }
+        let serial = registry.next;
+        registry.next = serial.checked_add(1).ok_or(StoreError::RevisionExhausted)?;
+        registry.leases.insert(serial, pins);
+        Ok(StoreReadPin {
+            owner: self.read_owner(),
+            registry: Arc::clone(&self.review_pins),
+            serial,
+            generation: self.generation,
+        })
+    }
+    pub fn review_pin_count(&self) -> Result<usize, StoreError> {
+        self.review_pins
+            .lock()
+            .map(|pins| pins.leases.len())
+            .map_err(|_| StoreError::InvalidConditions("review pin owner poisoned"))
+    }
+    pub(super) fn review_pin_union(&self) -> Result<StorePins, StoreError> {
+        let registry = self
+            .review_pins
+            .lock()
+            .map_err(|_| StoreError::InvalidConditions("review pin owner poisoned"))?;
+        let mut combined = StorePins::default();
+        for pins in registry.leases.values() {
+            combined.states.extend(&pins.states);
+            combined.lines.extend(&pins.lines);
+            combined.observations.extend(&pins.observations);
+            combined.situations.extend(&pins.situations);
+            combined.executions.extend(&pins.executions);
+        }
+        Ok(combined)
     }
 
     /// Admission controls are rechecked after immutable I/O commits and before
@@ -2231,17 +2386,13 @@ impl PalsStores {
                 ));
             }
             if let Some(report) = observation.external_report.as_deref() {
+                // A foreign node request is a hint, not strict native credit.
+                // Preserve an overshot raw report for the original one-use
+                // feedback path. validate_completed_task separately enforces
+                // the registered budget before bounded task/cache reuse.
                 if task.key.epoch != observation.epoch
                     || report.requested_depth != task.key.requested_depth
                     || report.root_restricted == task.key.root_moves.is_empty()
-                    || report
-                        .work
-                        .nodes
-                        .is_some_and(|nodes| nodes > task.key.node_budget)
-                    || report
-                        .work
-                        .qnodes
-                        .is_some_and(|nodes| nodes > task.key.node_budget)
                     || report.best_move.is_some_and(|movement| {
                         !task.key.root_moves.is_empty()
                             && Move16::pack(movement)

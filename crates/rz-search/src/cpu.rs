@@ -346,6 +346,9 @@ pub struct CpuPausedStackSnapshot {
     pub tokens_peak: u32,
     pub bytes_current: u64,
     pub bytes_peak: u64,
+    /// Current immutable owner ceiling, enforced by the retained traversal.
+    /// This is a configured limit, not an observed RSS or allocation peak.
+    pub bytes_limit_current: u64,
     pub stale_context_attempts: u64,
     pub stale_context_rejections: u64,
     /// Previously consumed nodes present in a resumed invocation's initial
@@ -377,6 +380,7 @@ impl CpuPausedStackSnapshot {
             tokens_peak: 0,
             bytes_current: 0,
             bytes_peak: 0,
+            bytes_limit_current: CPU_PAUSED_STACK_MAX_BYTES as u64,
             stale_context_attempts: 0,
             stale_context_rejections: 0,
             replayed_consumed_work: 0,
@@ -547,6 +551,10 @@ pub struct CpuEngine {
     value_identity: Arc<CpuValueIdentity>,
     last_attempt_work: Option<CpuWork>,
     resume_policy: CpuResumePolicy,
+    paused_stack_max_bytes: usize,
+    /// Owner configuration remains sealed across new-game cleanup. Token
+    /// serials and last-attempt observations deliberately reset at that boundary.
+    paused_stack_limit_sealed: bool,
     paused: Option<stack::PausedTask>,
     stack_owner: Arc<()>,
     stack_serial: u64,
@@ -946,6 +954,8 @@ impl CpuEngine {
             evaluator,
             last_attempt_work: None,
             resume_policy,
+            paused_stack_max_bytes: CPU_PAUSED_STACK_MAX_BYTES,
+            paused_stack_limit_sealed: false,
             paused: None,
             stack_owner: Arc::new(()),
             stack_serial: 0,
@@ -1043,6 +1053,51 @@ impl CpuEngine {
         self.resume_policy
     }
 
+    /// Configure the actual retained-frame ceiling before the first search.
+    /// The legacy constructors keep the 8MiB ceiling. This never transfers or
+    /// recreates the TT, ordering state, value namespace or token owner.
+    /// A held side scope receives the same ceiling before either owner starts.
+    pub fn set_paused_stack_max_bytes(&mut self, maximum_bytes: usize) -> Result<(), CpuError> {
+        if !(1..=CPU_PAUSED_STACK_MAX_BYTES).contains(&maximum_bytes) {
+            return Err(CpuError::InvalidConfig(
+                "paused stack limit must be in 1..=8388608 bytes",
+            ));
+        }
+        if maximum_bytes == self.paused_stack_max_bytes {
+            return Ok(());
+        }
+        if self.paused_stack_limit_sealed
+            || self.paused.is_some()
+            || self.last_attempt_work.is_some()
+            || self.stack_serial != 0
+            || self.paused_side_scope.as_ref().is_some_and(|side| {
+                side.paused_stack_limit_sealed
+                    || side.paused.is_some()
+                    || side.last_attempt_work.is_some()
+                    || side.stack_serial != 0
+            })
+        {
+            return Err(CpuError::InvalidConfig(
+                "paused stack limit is immutable after either CPU scope starts",
+            ));
+        }
+        if let Some(side) = self.paused_side_scope.as_mut() {
+            side.paused_stack_max_bytes = maximum_bytes;
+            if let Some(telemetry) = side.paused_stack_telemetry.as_mut() {
+                telemetry.bytes_limit_current = maximum_bytes as u64;
+            }
+        }
+        self.paused_stack_max_bytes = maximum_bytes;
+        if let Some(telemetry) = self.paused_stack_telemetry.as_mut() {
+            telemetry.bytes_limit_current = maximum_bytes as u64;
+        }
+        Ok(())
+    }
+
+    pub fn paused_stack_max_bytes(&self) -> usize {
+        self.paused_stack_max_bytes
+    }
+
     pub fn paused_stack_bytes(&self) -> Option<usize> {
         self.paused.as_ref().map(|task| task.retained_bytes())
     }
@@ -1063,7 +1118,8 @@ impl CpuEngine {
             None => 0,
         };
         snapshot.complete &= snapshot.owner_id != 0
-            && snapshot.bytes_current <= CPU_PAUSED_STACK_MAX_BYTES as u64
+            && snapshot.bytes_limit_current == self.paused_stack_max_bytes as u64
+            && snapshot.bytes_current <= snapshot.bytes_limit_current
             && snapshot
                 .tokens_resumed
                 .checked_add(snapshot.tokens_invalidated)
@@ -1126,8 +1182,9 @@ impl CpuEngine {
         let conditions = match self.resume_policy {
             CpuResumePolicy::CompletedIteration => conditions,
             CpuResumePolicy::PausedStack => format!(
-                "{conditions};resume={};paused-owner:single-use-root-full-history-restriction-profile-value-conditions-target-depth;paused-memory:max-1-task-8388608-bytes;consumed-work:no-replay-no-recharge;{}",
+                "{conditions};resume={};paused-owner:single-use-root-full-history-restriction-profile-value-conditions-target-depth;paused-memory:max-1-task-{}-bytes;consumed-work:no-replay-no-recharge;{}",
                 self.resume_policy.identity(),
+                self.paused_stack_max_bytes,
                 if self.paused_side_scope.is_some() {
                     "cancel-newgame:invalidate;fresh-analysis:held-parent-side-scope"
                 } else {
@@ -1234,6 +1291,7 @@ impl CpuEngine {
         resume: Option<&CpuResumeToken>,
         mut observer: impl FnMut(CpuIterationProgress),
     ) -> Result<CpuControlledReport, CpuError> {
+        self.paused_stack_limit_sealed = true;
         self.last_attempt_work = Some(CpuWork::default());
         if self.resume_policy != CpuResumePolicy::PausedStack {
             return Err(CpuError::Unsupported(
@@ -1314,6 +1372,7 @@ impl CpuEngine {
         limits: CpuLimits,
         cancellation: &AtomicBool,
     ) -> Result<CpuReport, CpuError> {
+        self.paused_stack_limit_sealed = true;
         self.last_attempt_work = Some(CpuWork::default());
         if self.paused_side_scope.is_none() || cancellation.load(Ordering::Acquire) {
             self.invalidate_paused_stack();
@@ -1335,6 +1394,7 @@ impl CpuEngine {
         limits: CpuLimits,
         cancellation: &AtomicBool,
     ) -> Result<CpuReport, CpuError> {
+        self.paused_stack_limit_sealed = true;
         self.last_attempt_work = Some(CpuWork::default());
         if self.resume_policy == CpuResumePolicy::PausedStack {
             return stack::run(
@@ -1448,6 +1508,7 @@ impl CpuEngine {
         resume: Option<&CpuResumeToken>,
         observer: &mut dyn FnMut(CpuIterationProgress),
     ) -> Result<CpuReport, CpuError> {
+        self.paused_stack_limit_sealed = true;
         if resume.is_none() && self.paused.is_some() && self.paused_side_scope.is_some() {
             return self.run_paused_side_scope(
                 position,

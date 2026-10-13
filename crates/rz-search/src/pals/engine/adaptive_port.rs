@@ -1,0 +1,1736 @@
+//! Single-writer semantic port for worker-owned adaptive execution.
+//! No method in this module forwards a model, searches a CPU, drains a pipe,
+//! or writes an archive. Only bounded Rules replay and checked hot commits run
+//! on the manager. A hot-capacity error is an archive-worker admission barrier.
+use super::*;
+use crate::pals::coordinator::{
+    ClosedFrame, CoordinatorWork, FrameBudget, FrameCompletionScope, FrameId, FrameInput,
+    FrameTransition, FreshPairSeal, ProposerRankingPublished, ProposerRankingSource,
+    RefinementStage,
+};
+use rz_contracts::pals::{Role, RoleOutput, RolePayload, SearchAuthority};
+use rz_contracts::pals_adaptive::{ReviewViewSeal, RoleTicketEnvelope};
+use rz_contracts::{Deadline, Digest as ContractDigest, OwnerId, RequestId};
+use rz_position::contracts::{ContractPosition, ContractState};
+use std::collections::{HashMap, HashSet, VecDeque};
+mod branch_queue;
+mod conditional_evidence;
+mod continuation_blueprint;
+mod cpu_commit;
+mod external_commit;
+#[cfg(test)]
+mod fixed_trace_tests;
+mod model_namespace;
+#[cfg(test)]
+mod port_tests;
+mod role_commit;
+pub mod validator_port;
+pub use branch_queue::{AdaptiveDeferredRepair, AdaptiveQueuedRecheck};
+pub use continuation_blueprint::{
+    AdaptiveContinuationBlueprint, AdaptivePortMaterializedStep, AdaptivePortTransition,
+};
+pub use external_commit::{AdaptiveForeignPublication, AdaptivePortExternalQuestion};
+pub use model_namespace::AdaptiveModelNamespace;
+pub mod archive_worker;
+/// The process registry remains owned by UCI. Search cannot invent an owner
+/// from a root generation or reuse one for a separately owned Rules instance.
+pub type AdaptiveRulesOwnerIssuer =
+    Arc<dyn Fn() -> Result<OwnerId, rz_contracts::ContractError> + Send + Sync>;
+
+/// Metadata mirror for the search owner; physical methods are deliberately
+/// unsupported. The actual backend identity is registered before construction.
+pub struct AdaptivePortModel {
+    identity: String,
+    value: Option<ModelValueIdentity>,
+    namespace: Option<AdaptiveModelNamespace>,
+}
+impl AdaptivePortModel {
+    pub fn new(identity: String, value: Option<ModelValueIdentity>) -> Result<Self, PalsError> {
+        if identity.is_empty() {
+            return Err(PalsError::InvalidConfig);
+        }
+        if let Some(value) = &value {
+            value.validate()?;
+        }
+        Ok(Self {
+            identity,
+            value,
+            namespace: None,
+        })
+    }
+    /// The caller obtains the explicit mapping from the actual native startup
+    /// snapshot, rather than deriving representation keys from display IDs.
+    pub fn new_with_namespace(
+        identity: String,
+        value: Option<ModelValueIdentity>,
+        namespace: AdaptiveModelNamespace,
+    ) -> Result<Self, PalsError> {
+        namespace.verify_identity(&identity, value.as_ref())?;
+        let mut model = Self::new(identity, value)?;
+        model.namespace = Some(namespace);
+        Ok(model)
+    }
+}
+impl RoleModel for AdaptivePortModel {
+    fn identity(&self) -> &str {
+        &self.identity
+    }
+    fn supports_selected_review_view(&self) -> bool {
+        true
+    }
+    fn requires_registered_representation_namespace(&self) -> bool {
+        true
+    }
+    fn registered_representation_namespace(&self) -> Option<&AdaptiveModelNamespace> {
+        self.namespace.as_ref()
+    }
+    fn value_identity(&self) -> Option<&ModelValueIdentity> {
+        self.value.as_ref()
+    }
+    fn propose(&mut self, _: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+        Err(RoleError::Unsupported("adaptive role owner is external"))
+    }
+    fn reply(&mut self, _: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+        Err(RoleError::Unsupported("adaptive role owner is external"))
+    }
+    fn repair(&mut self, _: RoleQuery<'_>) -> Result<RoleEvaluation, RoleError> {
+        Err(RoleError::Unsupported("adaptive role owner is external"))
+    }
+    fn divergences(&mut self, _: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
+        Err(RoleError::Unsupported("adaptive role owner is external"))
+    }
+}
+
+/// Search owns the opaque continuation fields. Native consumes only the three
+/// public fields; it cannot substitute a new line or revision on delivery.
+#[derive(Clone)]
+pub struct AdaptivePortQuestion {
+    pub position: Position,
+    pub context: RoleLogicalContext,
+    pub deadline: Instant,
+    node: usize,
+    stage: RefinementStage,
+    first: Option<BoardMove>,
+    proposal: Vec<BoardMove>,
+    counter: Option<Vec<BoardMove>>,
+    repaired: Option<Vec<BoardMove>>,
+    attack_ply: Option<usize>,
+    discovery_restricted: bool,
+    counter_source: Option<ObservationId>,
+    validator_root_moves: Option<Vec<BoardMove>>,
+    recheck: bool,
+    frozen_counter: Option<Arc<ReviewView>>,
+    paired_repaired: Option<ObservationId>,
+    paired_fresh_seal: Option<FreshPairSeal>,
+    question_digest: ContractDigest,
+}
+impl AdaptivePortQuestion {
+    /// Conservative known owned host backing, never an RSS/physical peak.
+    pub fn owned_host_bytes(&self) -> Option<u64> {
+        let mut bytes = std::mem::size_of::<Self>();
+        bytes = bytes.checked_add(self.position.snapshot().retained_history_bytes()?)?;
+        for capacity in [
+            self.context.prefix.capacity(),
+            self.proposal.capacity(),
+            self.counter.as_ref().map_or(0, Vec::capacity),
+            self.repaired.as_ref().map_or(0, Vec::capacity),
+            self.validator_root_moves.as_ref().map_or(0, Vec::capacity),
+        ] {
+            bytes = bytes.checked_add(capacity.checked_mul(std::mem::size_of::<BoardMove>())?)?;
+        }
+        if let Some(view) = &self.frozen_counter {
+            bytes = bytes.checked_add(usize::try_from(view.owned_host_bytes()?).ok()?)?;
+        }
+        u64::try_from(bytes).ok()
+    }
+}
+pub struct AdaptivePortCandidate {
+    pub first_move: rz_contracts::pals::Move16,
+    pub input: FrameInput<ReviewView, AdaptivePortQuestion>,
+    pub budget: FrameBudget,
+    pub deferred: Option<DeferredRootCandidate<AdaptivePortQuestion>>,
+    pub initialized: Option<CheckedRootCandidate<AdaptivePortQuestion>>,
+}
+/// The actual port alone attests the registered one-ply policy shortcut.
+/// General public FrameInput cannot claim that a second forward was omitted.
+pub struct CheckedRootCandidate<Q> {
+    source: ProposerRankingSource,
+    first: rz_contracts::pals::Move16,
+    input: FrameInput<ReviewView, Q>,
+    budget: FrameBudget,
+    line_plies: usize,
+}
+impl<Q> CheckedRootCandidate<Q> {
+    pub fn source(&self) -> ProposerRankingSource {
+        self.source
+    }
+    pub fn first_move(&self) -> rz_contracts::pals::Move16 {
+        self.first
+    }
+    pub fn input(&self) -> &FrameInput<ReviewView, Q> {
+        &self.input
+    }
+    pub fn budget(&self) -> FrameBudget {
+        self.budget
+    }
+    pub fn into_candidate(
+        self,
+    ) -> (
+        rz_contracts::pals::Move16,
+        FrameInput<ReviewView, Q>,
+        FrameBudget,
+    ) {
+        (self.first, self.input, self.budget)
+    }
+    pub fn validate(&self, ranking: &ProposerRankingPublished) -> Result<(), PalsError> {
+        let movement =
+            BoardMove::try_from(self.first.decode().map_err(|_| RoleError::InvalidOutput)?)
+                .map_err(|_| RoleError::InvalidOutput)?;
+        if self.line_plies != 1
+            || self.source != ranking.source()
+            || !ranking.candidates().contains(&self.first)
+            || self.input.stage != RefinementStage::CpuValidation
+            || self.input.view.query().prefix != [movement]
+            || self.input.view.query().proposal != [movement]
+            || self.input.view_seal.authority != self.source.ticket.authority
+            || self.input.view_seal.root_state != self.source.ticket.view.root_state
+            || self.input.view_seal.view_digest.0 != self.input.view.seal_digest()
+            || self.input.public_context.0 != self.input.view.record_scope_digest()
+            || !self.input.view.anchors()[0]
+                .snapshot
+                .same_state(ranking.rules().rules().snapshot())
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        Ok(())
+    }
+}
+/// Issued only by the sequential port after a prior actual main frame closes.
+/// The original root-head source remains separate from the new candidate view.
+pub struct DeferredRootCandidate<Q> {
+    source: ProposerRankingSource,
+    first: rz_contracts::pals::Move16,
+    input: FrameInput<ReviewView, Q>,
+    budget: FrameBudget,
+    previous: crate::pals::coordinator::FrameId,
+}
+impl<Q> DeferredRootCandidate<Q> {
+    pub fn source(&self) -> ProposerRankingSource {
+        self.source
+    }
+    pub fn first_move(&self) -> rz_contracts::pals::Move16 {
+        self.first
+    }
+    pub fn input(&self) -> &FrameInput<ReviewView, Q> {
+        &self.input
+    }
+    pub fn budget(&self) -> FrameBudget {
+        self.budget
+    }
+    pub fn previous_frame(&self) -> crate::pals::coordinator::FrameId {
+        self.previous
+    }
+    pub fn into_candidate(
+        self,
+    ) -> (
+        rz_contracts::pals::Move16,
+        FrameInput<ReviewView, Q>,
+        FrameBudget,
+    ) {
+        (self.first, self.input, self.budget)
+    }
+    pub fn validate(&self, ranking: &ProposerRankingPublished) -> Result<(), PalsError> {
+        let movement =
+            BoardMove::try_from(self.first.decode().map_err(|_| RoleError::InvalidOutput)?)
+                .map_err(|_| RoleError::InvalidOutput)?;
+        if self.source != ranking.source()
+            || !ranking.candidates().contains(&self.first)
+            || self.previous.authority != self.source.ticket.authority
+            || self.input.view_seal.authority != self.source.ticket.authority
+            || self.input.view_seal.root_state != self.source.ticket.view.root_state
+            || self.input.public_context.0 != self.input.view.record_scope_digest()
+            || self.input.view_seal.view_digest.0 != self.input.view.seal_digest()
+            || !matches!(
+                self.input.stage,
+                RefinementStage::ProposalContinuation | RefinementStage::CpuValidation
+            )
+            || self.input.view.query().prefix != [movement]
+            || !self.input.view.anchors()[0]
+                .snapshot
+                .same_state(ranking.rules().rules().snapshot())
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AdaptiveRootFanoutPolicy {
+    SequentialFixed,
+    #[default]
+    SimultaneousAdaptive,
+}
+pub struct AdaptivePortStep {
+    pub evidence: ContractDigest,
+    pub transition: AdaptivePortTransition,
+    consumption_gate: Option<(RequestId, ContractDigest, ContractDigest)>,
+    feedback_gate: Option<(ContractDigest, ObservationId)>,
+    queue_question: Option<(FrameId, ContractDigest)>,
+    pub fresh_pair: Option<FreshPairSeal>,
+    /// Present only when both exact Rules endpoints were compared. This is
+    /// never a substitute for physical NN completion or a Fresh pair seal.
+    pub rules_pair: Option<AdaptiveRulesPairProof>,
+}
+/// Search-owned proof of two exact terminal endpoints under one frozen public
+/// review scope. Construction remains private to the checked semantic port.
+#[derive(Clone)]
+pub struct AdaptiveRulesPairProof {
+    authority: SearchAuthority,
+    root_state: rz_contracts::StateIdentity,
+    public_context: ContractDigest,
+    submitted_question: ContractDigest,
+    repaired_line: Vec<BoardMove>,
+    counter_line: Vec<BoardMove>,
+    repaired: Arc<ContractState>,
+    counter: Arc<ContractState>,
+    perspective: rz_contracts::Color,
+}
+impl AdaptiveRulesPairProof {
+    pub fn validate(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), PalsError> {
+        self.validate_frozen_scope(work)?;
+        if work.input.question.repaired.as_ref() != Some(&self.repaired_line)
+            || (work.input.stage == RefinementStage::RecheckCounterValidation
+                && work.input.question.counter.as_ref() != Some(&self.counter_line))
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        Ok(())
+    }
+
+    /// The coordinator may validate its opaque Q without depending on native
+    /// or search-private continuation fields. No terminal flag is trusted.
+    pub fn validate_frozen_scope<Q>(
+        &self,
+        work: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<(), PalsError> {
+        let original_first = BoardMove::try_from(
+            work.original_first_move
+                .decode()
+                .map_err(|_| RoleError::InvalidOutput)?,
+        )
+        .map_err(|_| RoleError::InvalidOutput)?;
+        if work.frame.authority != self.authority
+            || !matches!(
+                work.input.stage,
+                RefinementStage::CriticRecheck | RefinementStage::RecheckCounterValidation
+            )
+            || work.input.public_context != self.public_context
+            || work.input.question_digest != self.submitted_question
+            || work.input.public_context.0 != work.input.view.record_scope_digest()
+            || work.input.view_seal.view_digest.0 != work.input.view.seal_digest()
+            || work.input.view_seal.authority != self.authority
+            || work.input.view_seal.root_state != self.root_state
+            || self.repaired_line.first() != Some(&original_first)
+            || self.repaired_line.first() != self.counter_line.first()
+            || self.repaired_line.len() != self.counter_line.len()
+            || self.repaired.terminal_wdl().is_none()
+            || self.counter.terminal_wdl().is_none()
+            || rz_contracts::Color::from(work.input.view.anchors()[0].snapshot.side_to_move())
+                != self.perspective
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        for (line, endpoint) in [
+            (&self.repaired_line, &self.repaired),
+            (&self.counter_line, &self.counter),
+        ] {
+            let mut replay = Position::from_snapshot(
+                &work.input.view.anchors()[0].snapshot,
+                rz_position::PositionLimits::default(),
+            )?;
+            for movement in line {
+                replay.make_move(*movement)?;
+            }
+            if !replay.snapshot().same_state(endpoint.rules().snapshot()) {
+                return Err(ReviewError::AnchorMismatch.into());
+            }
+        }
+        Ok(())
+    }
+    pub fn endpoints(&self) -> (&Arc<ContractState>, &Arc<ContractState>) {
+        (&self.repaired, &self.counter)
+    }
+    pub fn perspective(&self) -> rz_contracts::Color {
+        self.perspective
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct AdaptivePortRoleEvidence {
+    pub execution: Option<rz_contracts::ExecutionId>,
+    pub completed_nn_inputs: Option<u64>,
+    pub measurement_complete: bool,
+    pub physical_fresh: Option<bool>,
+}
+pub struct AdaptivePortRulesStep {
+    pub endpoint: Arc<ContractState>,
+    pub checked: AdaptivePortStep,
+}
+pub struct AdaptivePortCpuQuestion {
+    pub position: ContractPosition,
+    pub root_moves: Option<Vec<BoardMove>>,
+    pub target_depth: u16,
+    pub total_native_node_credit: u64,
+}
+
+/// Keeps existing Rules graph, observations, resolver and bounded review index
+/// as the authoritative implementation; workers own all physical execution.
+pub struct AdaptiveEnginePort<M: RoleModel> {
+    engine: PalsEngine<M>,
+    root: usize,
+    rules: Arc<ContractState>,
+    authority: SearchAuthority,
+    deadline: Deadline,
+    limits: PalsLimits,
+    started: Instant,
+    counters: PalsCounters,
+    next_question: u64,
+    root_rules_scanned: bool,
+    root_round: u64,
+    root_ranking_pending: bool,
+    root_ranking_question: Option<ContractDigest>,
+    root_fanout: AdaptiveRootFanoutPolicy,
+    lazy_frontier: VecDeque<BoardMove>,
+    sequential_ranking_source: Option<ProposerRankingSource>,
+    last_main_closed: Option<crate::pals::coordinator::FrameId>,
+    round_candidates:
+        HashMap<ContractDigest, (BoardMove, Option<crate::pals::coordinator::FrameId>)>,
+    accepted: HashSet<RequestId>,
+    attempted_role_commits: HashSet<RequestId>,
+    consumed_role_views: HashMap<RequestId, ContractDigest>,
+    committed_role_questions: HashMap<RequestId, ContractDigest>,
+    last_role_commit: Option<(ContractDigest, RequestId, usize, usize)>,
+    closed: HashSet<crate::pals::coordinator::FrameId>,
+    cpu_admissions: HashMap<ContractDigest, CpuPortAdmission>,
+    fresh_pending: HashMap<ContractDigest, FrameInput<ReviewView, AdaptivePortQuestion>>,
+    rules_owner_issuer: AdaptiveRulesOwnerIssuer,
+    external_admissions: HashMap<ContractDigest, external_commit::ExternalPortAdmission>,
+    supported_counters: HashMap<ContractDigest, conditional_evidence::SupportedCounter>,
+    conditional_witnesses: HashMap<ObservationId, (ObservationKind, Vec<BoardMove>)>,
+    pending_counters: HashMap<BoardMove, VecDeque<branch_queue::PendingCounter>>,
+    deferred_rechecks: VecDeque<branch_queue::DeferredRecheck>,
+    /// Exact consumed queue admissions, not a certificate that their parent
+    /// already closed. Deferred CPU use separately requires actual closure.
+    queued_recheck_closures:
+        HashMap<(crate::pals::coordinator::FrameId, ContractDigest), BoardMove>,
+    branch_issues: HashMap<BoardMove, &'static str>,
+    branch_receipts: Vec<branch_queue::AdaptiveBranchReceipt>,
+    queued_questions: HashSet<ContractDigest>,
+    validator_state: validator_port::ValidatorPortState,
+}
+#[derive(Clone)]
+struct CpuPortAdmission {
+    node: usize,
+    frame: crate::pals::coordinator::FrameId,
+    stage: RefinementStage,
+    view_seal: ReviewViewSeal,
+    context: RoleLogicalContext,
+    first_move: rz_contracts::pals::Move16,
+    execution: Option<ExecutionId>,
+    consumer: Option<u64>,
+    original_consumer: Option<TaskConsumer>,
+    target_depth: u16,
+    credit: u64,
+    restriction: Option<Vec<BoardMove>>,
+    generation: u64,
+    root: SituationId,
+    root_revision: u64,
+    root_snapshot: PositionSnapshot,
+    position: Position,
+    rules_identity: rz_contracts::StateIdentity,
+    situation: SituationId,
+    situation_revision: u64,
+    task_key: TaskKey,
+    value_identity: CpuValueIdentity,
+    base_condition: String,
+    profiles: Vec<crate::cpu_worker::CpuWorkerProfile>,
+    job: Option<rz_contracts::pals_adaptive::CpuJobEnvelope>,
+    grant: Option<rz_contracts::pals_adaptive::SliceGrant>,
+    owner: Option<rz_contracts::pals_adaptive::CpuWorkerId>,
+    cumulative_nodes: u64,
+    progress_sequence: u64,
+    control_sequence: u64,
+    execution_sequence: u64,
+    last_started_sequence: u64,
+    committed_execution: Option<(rz_contracts::ExecutionId, ExecutionId, ObservationId)>,
+    consumed_observation: Option<ObservationId>,
+    settled_receipt: Option<(rz_contracts::ExecutionId, ExecutionId, ContractDigest)>,
+    continuation_retained: bool,
+    terminal: bool,
+    quarantined: bool,
+}
+
+impl<M: RoleModel> AdaptiveEnginePort<M> {
+    pub fn new(
+        engine: PalsEngine<M>,
+        position: Position,
+        authority: SearchAuthority,
+        deadline: Deadline,
+        limits: PalsLimits,
+        rules_owner_issuer: AdaptiveRulesOwnerIssuer,
+    ) -> Result<Self, PalsError> {
+        Self::new_inner(
+            engine,
+            position,
+            authority,
+            deadline,
+            limits,
+            rules_owner_issuer,
+            None,
+        )
+        .map_err(|(_, error)| error)
+    }
+
+    /// Consume a one-use registration for the actual global UCI root. The
+    /// caller has already fenced and joined physical owners before transfer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_registered(
+        engine: PalsEngine<M>,
+        position: Position,
+        authority: SearchAuthority,
+        deadline: Deadline,
+        limits: PalsLimits,
+        rules_owner_issuer: AdaptiveRulesOwnerIssuer,
+        registration: super::adaptive_root::AdaptiveRootRegistration,
+    ) -> Result<Self, PalsError> {
+        Self::new_inner(
+            engine,
+            position,
+            authority,
+            deadline,
+            limits,
+            rules_owner_issuer,
+            Some(registration),
+        )
+        .map_err(|(_, error)| error)
+    }
+
+    /// Lifecycle owners can retain every Store/index allocation on a failed
+    /// registration or bounded hot admission. This does not assert a physical
+    /// worker fence; the caller must supply its actual quiescence evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_registered_retaining(
+        engine: PalsEngine<M>,
+        position: Position,
+        authority: SearchAuthority,
+        deadline: Deadline,
+        limits: PalsLimits,
+        rules_owner_issuer: AdaptiveRulesOwnerIssuer,
+        registration: super::adaptive_root::AdaptiveRootRegistration,
+    ) -> Result<Self, (PalsEngine<M>, PalsError)> {
+        Self::new_inner(
+            engine,
+            position,
+            authority,
+            deadline,
+            limits,
+            rules_owner_issuer,
+            Some(registration),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        mut engine: PalsEngine<M>,
+        position: Position,
+        authority: SearchAuthority,
+        deadline: Deadline,
+        limits: PalsLimits,
+        rules_owner_issuer: AdaptiveRulesOwnerIssuer,
+        registration: Option<super::adaptive_root::AdaptiveRootRegistration>,
+    ) -> Result<Self, (PalsEngine<M>, PalsError)> {
+        let prepared = (|| -> Result<(usize, Arc<ContractState>), PalsError> {
+            if engine.review_index.is_none()
+                || engine.review_policy.is_none()
+                || limits.max_rounds == 0
+                || limits.max_cpu_nodes == 0
+                || limits.cpu_depth == 0
+                || deadline.clock.0 != authority.epoch
+                || engine.game_generation != Some(authority.game.0)
+                || Instant::now() >= limits.deadline
+            {
+                return Err(PalsError::InvalidLimits);
+            }
+            if engine.model.requires_registered_representation_namespace()
+                && engine.model.registered_representation_namespace().is_none()
+            {
+                return Err(RoleError::Unsupported(
+                    "native representation namespace is not registered",
+                )
+                .into());
+            }
+            engine.validate_checker_namespace()?;
+            engine.ensure_archive_admission_open()?;
+            match registration {
+                Some(registration) => {
+                    engine.consume_adaptive_root_registration(
+                        registration,
+                        &position,
+                        authority,
+                    )?;
+                }
+                None => {
+                    engine.stores.hot_focus_actual_moves(position.snapshot())?;
+                }
+            }
+            if engine.stores.generation() != authority.root.0 {
+                return Err(StoreError::StaleConsumer.into());
+            }
+            let root = Self::intern_hot(&mut engine, position.clone())?;
+            for node in &mut engine.nodes {
+                node.model_value = None;
+                node.model_observation = None;
+                node.model_value_revision = None;
+            }
+            engine.refresh_projection(engine.nodes[root].state);
+            let rules = Arc::new(
+                ContractPosition::new(
+                    rules_owner_issuer().map_err(|_| RoleError::InvalidOutput)?,
+                    position,
+                )
+                .export()
+                .map_err(|_| RoleError::InvalidOutput)?,
+            );
+            Ok((root, rules))
+        })();
+        let (root, rules) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return Err((engine, error)),
+        };
+        Ok(Self {
+            engine,
+            root,
+            rules,
+            authority,
+            deadline,
+            limits,
+            started: Instant::now(),
+            counters: PalsCounters::default(),
+            next_question: 1,
+            root_rules_scanned: false,
+            root_round: 0,
+            root_ranking_pending: false,
+            root_ranking_question: None,
+            root_fanout: AdaptiveRootFanoutPolicy::default(),
+            lazy_frontier: VecDeque::new(),
+            sequential_ranking_source: None,
+            last_main_closed: None,
+            round_candidates: HashMap::new(),
+            accepted: HashSet::new(),
+            attempted_role_commits: HashSet::new(),
+            consumed_role_views: HashMap::new(),
+            committed_role_questions: HashMap::new(),
+            last_role_commit: None,
+            closed: HashSet::new(),
+            cpu_admissions: HashMap::new(),
+            fresh_pending: HashMap::new(),
+            rules_owner_issuer,
+            external_admissions: HashMap::new(),
+            supported_counters: HashMap::new(),
+            conditional_witnesses: HashMap::new(),
+            pending_counters: HashMap::new(),
+            deferred_rechecks: VecDeque::new(),
+            queued_recheck_closures: HashMap::new(),
+            branch_issues: HashMap::new(),
+            branch_receipts: Vec::new(),
+            queued_questions: HashSet::new(),
+            validator_state: validator_port::ValidatorPortState::default(),
+        })
+    }
+    pub fn root_rules(&self) -> Arc<ContractState> {
+        Arc::clone(&self.rules)
+    }
+    pub fn root_is_terminal(&self) -> bool {
+        self.engine.nodes[self.root].terminal.is_some()
+    }
+
+    /// Rules covers every immediate legal child before any model beam is used.
+    /// This bounded replay neither dispatches a worker nor invents NN work.
+    pub fn prepare_root_rules(&mut self) -> Result<(), PalsError> {
+        self.check_live()?;
+        if self.root_rules_scanned {
+            return Ok(());
+        }
+        let position = self.engine.nodes[self.root].position.clone();
+        for movement in position.legal_moves() {
+            self.check_live()?;
+            let mut child = position.clone();
+            child.make_move(movement)?;
+            if matches!(
+                child.classify_position()?.play_status,
+                PlayStatus::Terminal { .. }
+            ) {
+                self.connect_hot(self.root, movement)?;
+            }
+        }
+        self.root_rules_scanned = true;
+        Ok(())
+    }
+    pub fn engine(&self) -> &PalsEngine<M> {
+        &self.engine
+    }
+    pub fn counters(&self) -> PalsCounters {
+        self.counters
+    }
+    pub(super) fn role_action_committed(
+        &self,
+        question: ContractDigest,
+        request: RequestId,
+        observation_start: usize,
+        observation_end: usize,
+    ) -> bool {
+        self.accepted.contains(&request)
+            && self.last_role_commit
+                == Some((question, request, observation_start, observation_end))
+    }
+    pub fn authority(&self) -> SearchAuthority {
+        self.authority
+    }
+    /// Pure ownership transfer. This method attests no drain, worker join,
+    /// archive install or physical fence; the concrete owner must verify them.
+    pub fn into_engine(self) -> PalsEngine<M> {
+        self.engine
+    }
+    /// Register scheduling before accepting any role. A previously prepared
+    /// root-ranking view is unaffected; candidate views have not been created.
+    pub fn configure_root_fanout(
+        &mut self,
+        policy: AdaptiveRootFanoutPolicy,
+    ) -> Result<(), PalsError> {
+        if !self.accepted.is_empty()
+            || !self.round_candidates.is_empty()
+            || !self.lazy_frontier.is_empty()
+            || !self.deferred_rechecks.is_empty()
+        {
+            return Err(StoreError::InvalidConditions("root fanout already started").into());
+        }
+        self.root_fanout = policy;
+        Ok(())
+    }
+    fn issue_rules_position(&self, position: Position) -> Result<ContractPosition, PalsError> {
+        Ok(ContractPosition::new(
+            (self.rules_owner_issuer)().map_err(|_| RoleError::InvalidOutput)?,
+            position,
+        ))
+    }
+
+    pub fn root_input(
+        &mut self,
+    ) -> Result<FrameInput<ReviewView, AdaptivePortQuestion>, PalsError> {
+        self.prepare_root_rules()?;
+        if self.root_is_terminal() {
+            return Err(StoreError::InvalidConditions(
+                "Rules-terminal root has no policy question",
+            )
+            .into());
+        }
+        if self.root_ranking_pending
+            || !self.round_candidates.is_empty()
+            || !self.lazy_frontier.is_empty()
+        {
+            return Err(StoreError::InvalidConditions("root round is already active").into());
+        }
+        let input = self.input(
+            self.root,
+            RefinementStage::ProposerRanking,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )?;
+        self.root_ranking_pending = true;
+        self.root_ranking_question = Some(input.question_digest);
+        Ok(input)
+    }
+
+    /// Bind only a generated main candidate to the actual machine-issued ID.
+    /// V child frames and conditional branches do not count as root iterations.
+    pub fn root_candidate_admitted(
+        &mut self,
+        frame: crate::pals::coordinator::FrameId,
+        first: rz_contracts::pals::Move16,
+        input: &FrameInput<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), PalsError> {
+        let movement = BoardMove::try_from(first.decode().map_err(|_| RoleError::InvalidOutput)?)
+            .map_err(|_| RoleError::InvalidOutput)?;
+        let expected = self
+            .round_candidates
+            .get(&input.question_digest)
+            .ok_or(RoleError::InvalidOutput)?;
+        if expected.0 != movement || expected.1.is_some() || frame.authority != self.authority {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        // This admission only validates identity and Rules inputs. It must not
+        // fabricate a CoordinatorWork with freshly issued resource credit.
+        self.check_work_input(frame, self.deadline, input)?;
+        self.round_candidates
+            .get_mut(&input.question_digest)
+            .expect("checked root candidate")
+            .1 = Some(frame);
+        Ok(())
+    }
+
+    /// Called at the manager's quiescent boundary. Completed main frames finish
+    /// one root round together; frame count is never renamed as iteration count.
+    pub fn next_root_round_input(
+        &mut self,
+    ) -> Result<Option<FrameInput<ReviewView, AdaptivePortQuestion>>, PalsError> {
+        self.check_live()?;
+        if self.root_ranking_pending
+            || !self.lazy_frontier.is_empty()
+            || self.round_candidates.is_empty()
+            || self
+                .round_candidates
+                .values()
+                .any(|(_, frame)| frame.is_none_or(|frame| !self.closed.contains(&frame)))
+        {
+            return Ok(None);
+        }
+        self.root_round = self.root_round.checked_add(1).ok_or(PalsError::Capacity)?;
+        self.counters.rounds = self
+            .counters
+            .rounds
+            .checked_add(1)
+            .ok_or(PalsError::Capacity)?;
+        self.round_candidates.clear();
+        self.sequential_ranking_source = None;
+        self.last_main_closed = None;
+        if self.root_round >= self.limits.max_rounds
+            || self.engine.cpu_budget_used(&self.counters) >= self.limits.max_cpu_nodes
+            || self.counters.role_calls >= self.engine.config.max_role_calls
+        {
+            return Ok(None);
+        }
+        self.root_input().map(Some)
+    }
+    /// Fixed mode retains only unsubmitted move identities. Construct the next
+    /// view after earlier candidate publications; no existing frame or ticket
+    /// is refreshed and no second root forward is claimed.
+    pub fn next_fixed_root_candidate(
+        &mut self,
+    ) -> Result<Option<AdaptivePortCandidate>, PalsError> {
+        self.check_live()?;
+        if self.root_fanout != AdaptiveRootFanoutPolicy::SequentialFixed
+            || self.root_ranking_pending
+            || self
+                .round_candidates
+                .values()
+                .any(|(_, frame)| frame.is_none_or(|frame| !self.closed.contains(&frame)))
+        {
+            return Ok(None);
+        }
+        let Some(movement) = self.lazy_frontier.front().copied() else {
+            return Ok(None);
+        };
+        let source = self
+            .sequential_ranking_source
+            .ok_or(RoleError::InvalidOutput)?;
+        let previous = self.last_main_closed.ok_or(RoleError::InvalidOutput)?;
+        if !self.closed.contains(&previous)
+            || previous.authority != self.authority
+            || source.ticket.authority != self.authority
+            || source.ticket.view.root_state != self.rules.snapshot().identity()
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        let mut candidate = self.make_root_candidate(movement)?;
+        candidate.deferred = Some(DeferredRootCandidate {
+            source,
+            first: candidate.first_move,
+            input: candidate.input.clone(),
+            budget: candidate.budget,
+            previous,
+        });
+        self.round_candidates
+            .insert(candidate.input.question_digest, (movement, None));
+        self.lazy_frontier.pop_front();
+        Ok(Some(candidate))
+    }
+
+    /// Rules-terminal endpoints skip physical CPU/NN dispatch while any
+    /// earlier opponent divergence remains eligible for conditional review.
+    pub fn short_circuit(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<Option<AdaptivePortRulesStep>, PalsError> {
+        self.check_work(work)?;
+        let query = &work.input.question;
+        if self.engine.nodes[query.node].terminal.is_none()
+            || !matches!(
+                query.stage,
+                RefinementStage::CpuValidation
+                    | RefinementStage::CounterValidation
+                    | RefinementStage::RepairValidation
+                    | RefinementStage::RecheckCounterValidation
+                    | RefinementStage::RecheckRepairedValueFresh
+            )
+        {
+            return Ok(None);
+        }
+        let endpoint = Arc::new(
+            self.issue_rules_position(query.position.clone())?
+                .export()
+                .map_err(|_| RoleError::InvalidOutput)?,
+        );
+        if endpoint.terminal_wdl().is_none() {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"rz-pals-ready-Rules-terminal/1\0");
+        hash.update(work.input.question_digest.0);
+        hash.update(endpoint.snapshot().identity().semantic.0);
+        let (transition, rules_pair) = if query.stage == RefinementStage::RecheckCounterValidation {
+            self.prepare_final_pair(
+                work,
+                query.repaired.clone().ok_or(RoleError::InvalidOutput)?,
+                query.counter.clone().ok_or(RoleError::InvalidOutput)?,
+            )?
+        } else if query.stage == RefinementStage::RecheckRepairedValueFresh {
+            (self.critic_recheck_after_repaired_fresh(query)?, None)
+        } else {
+            (self.after_validation(query, Some(work))?, None)
+        };
+        let transition = self.finish_branch(work, transition)?;
+        Ok(Some(AdaptivePortRulesStep {
+            endpoint,
+            checked: AdaptivePortStep {
+                evidence: ContractDigest(hash.finalize().into()),
+                transition,
+                consumption_gate: None,
+                feedback_gate: None,
+                queue_question: Some((work.frame, work.input.question_digest)),
+                fresh_pair: None,
+                rules_pair,
+            },
+        }))
+    }
+
+    pub fn ranking_published(
+        &mut self,
+        ranking: &ProposerRankingPublished,
+    ) -> Result<Vec<AdaptivePortCandidate>, PalsError> {
+        self.check_live()?;
+        let observations_before = self.engine.stores.observations.next_observation_sequence();
+        if ranking.source().ticket.authority != self.authority
+            || !self.root_ranking_pending
+            || self.root_ranking_question != Some(ranking.source().ticket.question)
+            || !self.round_candidates.is_empty()
+            || !ranking.view().validates(&self.engine.stores)
+            || ranking.source().view_input_digest.0 != ranking.view().digest()
+            || !ranking
+                .rules()
+                .rules()
+                .snapshot()
+                .same_state(self.rules.rules().snapshot())
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        self.verify_registered_ticket_namespace(&ranking.source().ticket)?;
+        let mut ranked = Vec::new();
+        for movement in ranking.ranked_candidates() {
+            ranked.push(
+                BoardMove::try_from(movement.decode().map_err(|_| RoleError::InvalidOutput)?)
+                    .map_err(|_| RoleError::InvalidOutput)?,
+            );
+        }
+        // Preserve root candidate selection and deterministic ties. Independent
+        // frames carry the same already-consumed ranking source, never new NN work.
+        let width = self
+            .engine
+            .config
+            .beam_width
+            .saturating_add(usize::try_from(self.root_round).map_err(|_| PalsError::InvalidLimits)?)
+            .min(ranked.len());
+        let frontier = self.root_frontier(&ranked, width)?;
+        if self.accepted.contains(&ranking.source().ticket.id) {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        // The root ranking was linearly accepted by its physical owner before
+        // this publication. Consume that original immutable view before any
+        // candidate's new public record/view can observe the protection state.
+        self.accepted.insert(ranking.source().ticket.id);
+        self.committed_role_questions
+            .insert(ranking.source().ticket.id, ranking.source().ticket.question);
+        self.role_consumed(&ranking.source().ticket, ranking.view())?;
+        // Consumption is already real even if a later hot allocation or view
+        // materialization fails. Do not omit it from the failure receipt.
+        self.counters.proposer_calls += 1;
+        self.counters.completed_proposer_calls += 1;
+        self.counters.accepted_proposer_outputs += 1;
+        self.counters.role_calls += 1;
+        self.counters.consumed_role_outputs += 1;
+        let mut remaining: VecDeque<_> = frontier.into();
+        let issue_count = if self.root_fanout == AdaptiveRootFanoutPolicy::SequentialFixed {
+            1.min(remaining.len())
+        } else {
+            remaining.len()
+        };
+        let mut out = Vec::with_capacity(issue_count);
+        for _ in 0..issue_count {
+            let mut candidate =
+                self.make_root_candidate(remaining.pop_front().ok_or(PalsError::InvalidConfig)?)?;
+            if self.engine.config.line_plies == 1
+                && self.engine.nodes[candidate.input.question.node]
+                    .terminal
+                    .is_none()
+            {
+                candidate.initialized = Some(CheckedRootCandidate {
+                    source: ranking.source(),
+                    first: candidate.first_move,
+                    input: candidate.input.clone(),
+                    budget: candidate.budget,
+                    line_plies: self.engine.config.line_plies,
+                });
+            }
+            out.push(candidate);
+        }
+        self.lazy_frontier = remaining;
+        self.sequential_ranking_source =
+            if self.root_fanout == AdaptiveRootFanoutPolicy::SequentialFixed {
+                Some(ranking.source())
+            } else {
+                None
+            };
+        for candidate in &out {
+            self.round_candidates.insert(
+                candidate.input.question_digest,
+                (
+                    candidate
+                        .input
+                        .question
+                        .first
+                        .ok_or(RoleError::InvalidOutput)?,
+                    None,
+                ),
+            );
+        }
+        self.root_ranking_pending = false;
+        self.root_ranking_question = None;
+        self.last_role_commit = Some((
+            ranking.source().ticket.question,
+            ranking.source().ticket.id,
+            observations_before,
+            self.engine.stores.observations.next_observation_sequence(),
+        ));
+        Ok(out)
+    }
+
+    fn make_root_candidate(
+        &mut self,
+        movement: BoardMove,
+    ) -> Result<AdaptivePortCandidate, PalsError> {
+        let child = self.connect_hot(self.root, movement)?;
+        let prefix = vec![movement];
+        let stage =
+            if self.engine.config.line_plies <= 1 || self.engine.nodes[child].terminal.is_some() {
+                RefinementStage::CpuValidation
+            } else {
+                RefinementStage::ProposalContinuation
+            };
+        if stage == RefinementStage::CpuValidation {
+            self.record_hot(RecordKind::Proposal, &prefix, None)?;
+            self.counters.proposals += 1;
+        }
+        let proposal = if stage == RefinementStage::CpuValidation {
+            prefix.clone()
+        } else {
+            Vec::new()
+        };
+        let input = self.input(
+            child,
+            stage,
+            Some(movement),
+            prefix,
+            proposal,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )?;
+        Ok(AdaptivePortCandidate {
+            first_move: rz_contracts::pals::Move16::encode(
+                rz_contracts::Move::try_from(movement).map_err(|_| RoleError::InvalidOutput)?,
+            ),
+            input,
+            budget: FrameBudget {
+                original_cpu_credit: self.limits.max_cpu_nodes,
+                role_submissions_remaining: self.engine.config.max_role_calls,
+                original_store_byte_limit: 8 * 1024 * 1024,
+            },
+            deferred: None,
+            initialized: None,
+        })
+    }
+
+    fn root_frontier(
+        &self,
+        ranked: &[BoardMove],
+        width: usize,
+    ) -> Result<Vec<BoardMove>, PalsError> {
+        let mut frontier: Vec<_> = ranked.iter().take(width).copied().collect();
+        frontier.sort_by(|a, b| {
+            let rank = || {
+                ranked
+                    .iter()
+                    .position(|movement| movement == a)
+                    .cmp(&ranked.iter().position(|movement| movement == b))
+            };
+            if self.engine.uses_model_resolver() {
+                let value = |movement| {
+                    self.engine.nodes[self.root]
+                        .edges
+                        .iter()
+                        .find(|edge| edge.movement == movement)
+                        .and_then(|edge| {
+                            model_order_value(self.engine.root_model_value(edge.child).0)
+                        })
+                };
+                value(*b)
+                    .partial_cmp(&value(*a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(rank)
+            } else {
+                let value = |movement| {
+                    self.engine.nodes[self.root]
+                        .edges
+                        .iter()
+                        .find(|edge| edge.movement == movement)
+                        .and_then(|edge| {
+                            self.engine
+                                .value(edge.child, self.engine.config.line_plies.saturating_sub(1))
+                        })
+                        .map(|score| -score)
+                };
+                value(*b).cmp(&value(*a)).then_with(rank)
+            }
+        });
+        let new_root = ranked.iter().take(width).copied().find(|movement| {
+            !self.engine.nodes[self.root]
+                .edges
+                .iter()
+                .any(|edge| edge.movement == *movement)
+        });
+        frontier.truncate(self.engine.config.beam_width);
+        if let Some(movement) = new_root
+            && !frontier.contains(&movement)
+        {
+            if frontier.len() == self.engine.config.beam_width {
+                frontier.pop();
+            }
+            frontier.push(movement);
+        }
+        Ok(frontier)
+    }
+
+    /// Permit another frame's publication. The submitted context is never
+    /// recomputed against latest public_revision or latest situation revision.
+    pub fn validate_role(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        ticket: &RoleTicketEnvelope,
+        output: &RoleOutput,
+    ) -> Result<(), PalsError> {
+        self.check_work(work)?;
+        self.verify_registered_model_namespace(ticket, output)?;
+        let query = &work.input.question;
+        let view = &work.input.view;
+        if self.accepted.contains(&ticket.id)
+            || ticket.authority != self.authority
+            || ticket.question != work.input.question_digest
+            || ticket.original_deadline != work.original_deadline
+            || ticket.view != work.input.view_seal
+            || output.id != ticket.id
+            || output.authority != ticket.authority
+            || output.key != ticket.representation
+            || ticket.role != role_for_purpose(query.context.purpose)
+            || view.query().purpose != query.context.purpose
+            || view.query().prefix != query.context.prefix
+            || query.context.public_revision > self.engine.revision
+            || query.context.game_generation != self.authority.game.0
+            || query.context.search_generation != self.authority.root.0
+            || query.context.proposal_sha256
+                != role_line_sha256(b"proposal", &view.query().proposal)?
+            || query.context.refutation_sha256
+                != view
+                    .query()
+                    .counterexample
+                    .as_deref()
+                    .map(|line| role_line_sha256(b"refutation", line))
+                    .transpose()?
+            || query.context.divergence_sha256 != role_divergence_sha256(&view.query().divergences)?
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        let node = &self.engine.nodes[query.node];
+        let situation = self.engine.stores.situations.get(query.context.situation)?;
+        if node.state != query.context.state
+            || node.situation != query.context.situation
+            || situation.state != query.context.state
+            || situation.focus != query.context.focus
+            || self
+                .engine
+                .stores
+                .lines
+                .get(query.context.focus)?
+                .start_state
+                != query.context.state
+            || query.context.focus_sha256
+                != role_line_sha256(
+                    b"focus",
+                    &self.engine.stores.lines.moves(query.context.focus)?,
+                )?
+            || query.context.prefix_sha256 != role_line_sha256(b"prefix", &query.context.prefix)?
+            || !node
+                .position
+                .snapshot()
+                .same_state(&query.position.snapshot())
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        validate_payload(query.context.purpose, view, output)?;
+        if query.stage == RefinementStage::FreshCounterEndpoint {
+            let original = query.paired_fresh_seal.ok_or(RoleError::InvalidOutput)?;
+            let current = FreshPairSeal::from_ticket(
+                ticket,
+                work.input.public_context,
+                self.engine.nodes[self.root].position.side_to_move().into(),
+            );
+            original
+                .validate_pair(&current)
+                .map_err(|_| RoleError::InvalidOutput)?;
+            if query.paired_repaired.is_none() {
+                return Err(RoleError::InvalidOutput.into());
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_registered_model_namespace(
+        &self,
+        ticket: &RoleTicketEnvelope,
+        output: &RoleOutput,
+    ) -> Result<(), PalsError> {
+        match self.engine.model.registered_representation_namespace() {
+            Some(namespace) => {
+                namespace.verify_identity(
+                    self.engine.model.identity(),
+                    self.engine.model.value_identity(),
+                )?;
+                namespace.verify(ticket, output, self.engine.model.value_identity())?;
+                if self
+                    .engine
+                    .model_registered_value
+                    .as_ref()
+                    .is_some_and(|value| value != namespace.value_identity())
+                {
+                    return Err(RoleError::InvalidOutput.into());
+                }
+                Ok(())
+            }
+            None if self
+                .engine
+                .model
+                .requires_registered_representation_namespace() =>
+            {
+                Err(
+                    RoleError::Unsupported("native representation namespace is not registered")
+                        .into(),
+                )
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn verify_registered_ticket_namespace(
+        &self,
+        ticket: &RoleTicketEnvelope,
+    ) -> Result<(), PalsError> {
+        match self.engine.model.registered_representation_namespace() {
+            Some(namespace) => {
+                namespace.verify_identity(
+                    self.engine.model.identity(),
+                    self.engine.model.value_identity(),
+                )?;
+                namespace.verify_ticket(ticket, self.engine.model.value_identity())?;
+                if self
+                    .engine
+                    .model_registered_value
+                    .as_ref()
+                    .is_some_and(|value| value != namespace.value_identity())
+                {
+                    return Err(RoleError::InvalidOutput.into());
+                }
+                Ok(())
+            }
+            None if self
+                .engine
+                .model
+                .requires_registered_representation_namespace() =>
+            {
+                Err(
+                    RoleError::Unsupported("native representation namespace is not registered")
+                        .into(),
+                )
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub fn role_consumed(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        view: &Arc<ReviewView>,
+    ) -> Result<(), PalsError> {
+        if ticket.authority != self.authority
+            || ticket.view.view_digest.0 != view.seal_digest()
+            || ticket.view != self.seal(view)
+            || !view.validates(&self.engine.stores)
+            || !self.accepted.contains(&ticket.id)
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        if let Some(original) = self.consumed_role_views.get(&ticket.id) {
+            return if *original == ticket.view.view_digest {
+                Ok(())
+            } else {
+                Err(RoleError::InvalidOutput.into())
+            };
+        }
+        self.engine
+            .review_index
+            .as_mut()
+            .ok_or(PalsError::InvalidConfig)?
+            .consume(view, &self.engine.stores)?;
+        self.consumed_role_views
+            .insert(ticket.id, ticket.view.view_digest);
+        Ok(())
+    }
+
+    /// Observe an already recorded semantic consumption after a later
+    /// continuation/materialization failure. This does not consume again,
+    /// mutate protection, or certify that the next search stage succeeded.
+    pub fn role_consumption_recorded(
+        &self,
+        ticket: &RoleTicketEnvelope,
+        view: &ReviewView,
+    ) -> Result<bool, PalsError> {
+        if ticket.authority != self.authority
+            || ticket.view != self.seal(view)
+            || self
+                .committed_role_questions
+                .get(&ticket.id)
+                .is_some_and(|question| *question != ticket.question)
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        match self.consumed_role_views.get(&ticket.id) {
+            Some(original)
+                if *original == ticket.view.view_digest
+                    && self.accepted.contains(&ticket.id)
+                    && self.committed_role_questions.get(&ticket.id) == Some(&ticket.question) =>
+            {
+                Ok(true)
+            }
+            Some(_) => Err(RoleError::InvalidOutput.into()),
+            None => Ok(false),
+        }
+    }
+
+    fn check_live(&self) -> Result<(), PalsError> {
+        if Instant::now() >= self.limits.deadline {
+            return Err(RoleError::Deadline.into());
+        }
+        if self.engine.game_generation != Some(self.authority.game.0)
+            || self.engine.stores.generation() != self.authority.root.0
+            || self.engine.stores.root() != Some(self.engine.nodes[self.root].situation)
+            || !self.engine.nodes[self.root]
+                .position
+                .snapshot()
+                .same_state(self.rules.rules().snapshot())
+        {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        Ok(())
+    }
+    fn check_work(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), PalsError> {
+        self.check_work_input(work.frame, work.original_deadline, &work.input)
+    }
+
+    fn check_work_input(
+        &self,
+        frame: crate::pals::coordinator::FrameId,
+        original_deadline: Deadline,
+        input: &FrameInput<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), PalsError> {
+        self.check_live()?;
+        let query = &input.question;
+        if frame.authority != self.authority
+            || self.closed.contains(&frame)
+            || original_deadline != self.deadline
+            || input.stage != query.stage
+            || input.question_digest != query.question_digest
+            || input.view_seal != self.seal(&input.view)
+            || input.public_context.0 != input.view.record_scope_digest()
+            || !input.view.validates(&self.engine.stores)
+            || query.node >= self.engine.nodes.len()
+            || query.first.is_some_and(|first| {
+                Some(first) != query.context.prefix.first().copied()
+                    && !query.context.prefix.is_empty()
+            })
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        let root = &self.engine.nodes[self.root].position;
+        let mut replay = root.clone();
+        for movement in &query.context.prefix {
+            replay.make_move(*movement)?;
+        }
+        if !replay.snapshot().same_state(&query.position.snapshot()) {
+            return Err(ReviewError::AnchorMismatch.into());
+        }
+        Ok(())
+    }
+
+    fn seal(&self, view: &ReviewView) -> ReviewViewSeal {
+        ReviewViewSeal {
+            authority: self.authority,
+            view_sequence: view.sequence(),
+            context_policy: ContractDigest(view.policy_digest()),
+            view_digest: ContractDigest(view.seal_digest()),
+            root_state: self.rules.snapshot().identity(),
+            actual_tokens: view.token_count(),
+            selected_records: view.records().len() as u16,
+            anchors: view.anchors().len() as u8,
+            length_bucket: view.length_bucket(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn input(
+        &mut self,
+        node: usize,
+        stage: RefinementStage,
+        first: Option<BoardMove>,
+        prefix: Vec<BoardMove>,
+        proposal: Vec<BoardMove>,
+        counter: Option<Vec<BoardMove>>,
+        repaired: Option<Vec<BoardMove>>,
+        attack_ply: Option<usize>,
+        recheck: bool,
+        frozen: Option<Arc<ReviewView>>,
+        paired_repaired: Option<ObservationId>,
+    ) -> Result<FrameInput<ReviewView, AdaptivePortQuestion>, PalsError> {
+        self.input_with_purpose(
+            node,
+            stage,
+            first,
+            prefix,
+            proposal,
+            counter,
+            repaired,
+            attack_ply,
+            recheck,
+            frozen,
+            paired_repaired,
+            purpose_for_stage(stage),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn input_with_purpose(
+        &mut self,
+        node: usize,
+        stage: RefinementStage,
+        first: Option<BoardMove>,
+        prefix: Vec<BoardMove>,
+        proposal: Vec<BoardMove>,
+        counter: Option<Vec<BoardMove>>,
+        repaired: Option<Vec<BoardMove>>,
+        attack_ply: Option<usize>,
+        recheck: bool,
+        frozen: Option<Arc<ReviewView>>,
+        paired_repaired: Option<ObservationId>,
+        purpose: RoleQueryPurpose,
+    ) -> Result<FrameInput<ReviewView, AdaptivePortQuestion>, PalsError> {
+        self.check_live()?;
+        let divergences = if stage == RefinementStage::CriticDivergence {
+            self.divergence_indices(&proposal)?
+        } else {
+            Vec::new()
+        };
+        // The branch continuation is owner-private state, not an extra model
+        // refutation. Keep the synchronous Reply/ValueFresh input semantics.
+        let model_proposal = if purpose == RoleQueryPurpose::ValueFresh {
+            prefix.as_slice()
+        } else {
+            proposal.as_slice()
+        };
+        let model_counter = if purpose == RoleQueryPurpose::ValueFresh
+            || matches!(
+                stage,
+                RefinementStage::CriticReply | RefinementStage::CounterContinuation
+            ) {
+            None
+        } else {
+            counter.as_deref()
+        };
+        let question = RoleQuestion {
+            purpose,
+            prefix: &prefix,
+            proposal: model_proposal,
+            refutation: model_counter,
+            divergences: &divergences,
+        };
+        let context = self.engine.role_context(node, question)?;
+        let legal = if matches!(
+            purpose,
+            RoleQueryPurpose::DivergencePolicy | RoleQueryPurpose::TaskPolicy
+        ) {
+            Vec::new()
+        } else {
+            self.engine.nodes[node].position.legal_moves()
+        };
+        let view = match frozen {
+            Some(view) => {
+                if view.query().purpose != purpose
+                    || view.query().prefix != prefix
+                    || view.query().proposal != model_proposal
+                    || view.query().counterexample.as_deref() != model_counter
+                    || view.query().legal != legal
+                    || !view.validates(&self.engine.stores)
+                {
+                    return Err(RoleError::InvalidOutput.into());
+                }
+                view
+            }
+            None => self
+                .engine
+                .prepare_review_view(node, question, &legal)?
+                .ok_or(PalsError::InvalidConfig)?,
+        };
+        let sequence = self.next_question;
+        self.next_question = sequence.checked_add(1).ok_or(PalsError::Capacity)?;
+        let mut hash = Sha256::new();
+        hash.update(b"rz-pals-adaptive-checked-question/1\0");
+        hash.update(sequence.to_le_bytes());
+        hash.update([stage as u8]);
+        hash.update(view.digest());
+        hash.update(view.seal_digest());
+        hash.update(context.focus_prefix_sha256());
+        let question_digest = ContractDigest(hash.finalize().into());
+        let query = AdaptivePortQuestion {
+            position: self.engine.nodes[node].position.clone(),
+            context,
+            deadline: self.limits.deadline,
+            node,
+            stage,
+            first,
+            proposal,
+            counter,
+            repaired,
+            attack_ply,
+            discovery_restricted: false,
+            counter_source: None,
+            validator_root_moves: None,
+            recheck,
+            frozen_counter: None,
+            paired_repaired,
+            paired_fresh_seal: None,
+            question_digest,
+        };
+        Ok(FrameInput {
+            stage,
+            question_digest,
+            question: Arc::new(query),
+            view_seal: self.seal(&view),
+            public_context: ContractDigest(view.record_scope_digest()),
+            view,
+        })
+    }
+
+    fn divergence_indices(&self, line: &[BoardMove]) -> Result<Vec<usize>, PalsError> {
+        let mut replay = self.engine.nodes[self.root].position.clone();
+        let color = replay.side_to_move();
+        let mut indices = Vec::new();
+        for (ply, movement) in line.iter().enumerate() {
+            if replay.side_to_move() != color
+                && matches!(replay.classify_position()?.play_status, PlayStatus::Ongoing)
+            {
+                indices.push(ply);
+            }
+            replay.make_move(*movement)?;
+        }
+        Ok(indices)
+    }
+    fn intern_hot(engine: &mut PalsEngine<M>, position: Position) -> Result<usize, PalsError> {
+        let snapshot = position.snapshot();
+        if let Some(state) = engine.stores.states.find(&snapshot)
+            && let Some(index) = engine.nodes.iter().position(|node| node.state == state)
+        {
+            return Ok(index);
+        }
+        if engine.nodes.len() >= engine.config.max_nodes {
+            return Err(PalsError::Capacity);
+        }
+        let situation = if let Some(root) = engine.stores.root().filter(|root| {
+            engine.stores.situations.get(*root).is_ok_and(|situation| {
+                engine
+                    .stores
+                    .states
+                    .get(situation.state)
+                    .is_ok_and(|state| state.same_state(&snapshot))
+            })
+        }) {
+            root
+        } else {
+            engine.stores.hot_insert_situation(snapshot)?
+        };
+        let state = engine.stores.situations.get(situation)?.state;
+        let terminal = match position.classify_position()?.play_status {
+            PlayStatus::Ongoing => None,
+            PlayStatus::Terminal { reason, winner } => Some((
+                reason,
+                match winner {
+                    Some(color) if color == position.side_to_move() => CPU_MATE_SCORE,
+                    Some(_) => -CPU_MATE_SCORE,
+                    None => 0,
+                },
+            )),
+        };
+        if terminal.is_some() {
+            engine.stores.hot_append_rules_terminal(&position, 0, 0)?;
+        }
+        engine.nodes.push(Node {
+            position,
+            state,
+            situation,
+            terminal,
+            edges: Vec::new(),
+            evidence: None,
+            model_value: None,
+            model_observation: None,
+            model_value_revision: None,
+            resume: None,
+        });
+        Ok(engine.nodes.len() - 1)
+    }
+    fn connect_hot(&mut self, parent: usize, movement: BoardMove) -> Result<usize, PalsError> {
+        if let Some(edge) = self.engine.nodes[parent]
+            .edges
+            .iter()
+            .find(|edge| edge.movement == movement)
+        {
+            return Ok(edge.child);
+        }
+        let mut position = self.engine.nodes[parent].position.clone();
+        position.make_move(movement)?;
+        let child = Self::intern_hot(&mut self.engine, position)?;
+        self.engine.nodes[parent]
+            .edges
+            .push(Edge { movement, child });
+        self.counters.examined_edges += 1;
+        Ok(child)
+    }
+    fn replay_node(&mut self, prefix: &[BoardMove]) -> Result<usize, PalsError> {
+        let mut node = self.root;
+        for movement in prefix {
+            node = self.connect_hot(node, *movement)?;
+        }
+        Ok(node)
+    }
+}
+
+fn role_for_purpose(purpose: RoleQueryPurpose) -> Role {
+    match purpose {
+        RoleQueryPurpose::ReplyPolicy | RoleQueryPurpose::DivergencePolicy => Role::Critic,
+        RoleQueryPurpose::TaskPolicy => Role::Validator,
+        _ => Role::Proposer,
+    }
+}
+fn purpose_for_stage(stage: RefinementStage) -> RoleQueryPurpose {
+    match stage {
+        RefinementStage::CriticDivergence => RoleQueryPurpose::DivergencePolicy,
+        RefinementStage::CriticReply
+        | RefinementStage::CounterContinuation
+        | RefinementStage::CriticRecheck => RoleQueryPurpose::ReplyPolicy,
+        RefinementStage::Repair => RoleQueryPurpose::RepairPolicy,
+        RefinementStage::FreshRepairedEndpoint
+        | RefinementStage::FreshCounterEndpoint
+        | RefinementStage::ProposalValueFresh
+        | RefinementStage::CounterValueFresh
+        | RefinementStage::RepairValueFresh
+        | RefinementStage::RecheckRepairedValueFresh => RoleQueryPurpose::ValueFresh,
+        _ => RoleQueryPurpose::ProposePolicy,
+    }
+}
+fn validate_payload(
+    purpose: RoleQueryPurpose,
+    view: &ReviewView,
+    output: &RoleOutput,
+) -> Result<(), PalsError> {
+    if output.private_latent.len() != 16 * 384
+        || output.private_latent.iter().any(|value| !value.is_finite())
+    {
+        return Err(RoleError::InvalidOutput.into());
+    }
+    let (candidates, divergences, wdl) = match (&output.payload, role_for_purpose(purpose)) {
+        (
+            RolePayload::Proposal {
+                candidate_logits,
+                wdl,
+            },
+            Role::Proposer,
+        ) => (candidate_logits.as_slice(), &[][..], Some(*wdl)),
+        (
+            RolePayload::Counterexample {
+                candidate_logits,
+                divergence_logits,
+                wdl,
+            },
+            Role::Critic,
+        ) => (
+            candidate_logits.as_slice(),
+            divergence_logits.as_slice(),
+            Some(*wdl),
+        ),
+        (RolePayload::TaskRanking { task_logits }, Role::Validator)
+            if task_logits.len() == 7 && task_logits.iter().all(|x| x.is_finite()) =>
+        {
+            return Ok(());
+        }
+        _ => return Err(RoleError::InvalidOutput.into()),
+    };
+    if candidates.len() != view.query().legal.len()
+        || candidates.iter().any(|x| !x.is_finite())
+        || divergences.len() != view.query().divergences.len()
+        || divergences.iter().any(|x| !x.is_finite())
+    {
+        return Err(RoleError::InvalidOutput.into());
+    }
+    if let Some(wdl) = wdl {
+        let [w, d, l] = wdl.probabilities();
+        rz_contracts::Wdl::try_new(w, d, l, 1e-4).map_err(|_| RoleError::InvalidOutput)?;
+    }
+    Ok(())
+}

@@ -1,6 +1,326 @@
 use super::*;
 use std::time::Duration;
 
+/// A source fixture, never an observed engine execution. It exercises the
+/// production issued-report boundary instead of manufacturing opaque permits.
+fn foreign_worker_fixture(raw: &Observation) -> crate::external_cpu::worker::ExternalWorkerReport {
+    use crate::external_cpu::worker::{ExternalWorkerReport, ExternalWorkerScope};
+    use crate::external_cpu::{ExternalCooperativeReport, ExternalGoIssue};
+    use rz_contracts::pals::SearchAuthority;
+    use rz_contracts::pals_adaptive::{
+        CpuJobId, CpuWorkerId, ExternalCpuJobEnvelope, ExternalSliceGrant,
+    };
+    use rz_contracts::{
+        ClockDomain, Deadline, Digest, GameGeneration, MonotonicTick, OwnerId, ProcessEpoch,
+        RootGeneration, StateIdentity, StateRevision,
+    };
+    let epoch = ProcessEpoch(1);
+    let id = CpuJobId {
+        authority: SearchAuthority {
+            epoch,
+            game: GameGeneration(1),
+            root: RootGeneration(1),
+            implementation: Digest([1; 32]),
+        },
+        sequence: 1,
+    };
+    let execution = rz_contracts::ExecutionId::new(epoch, 2);
+    let owner = CpuWorkerId(0);
+    let job = ExternalCpuJobEnvelope {
+        id,
+        state_identity: StateIdentity {
+            owner: OwnerId(1),
+            revision: StateRevision(0),
+            semantic: Digest([2; 32]),
+        },
+        question: Digest([3; 32]),
+        root_restriction: Digest([4; 32]),
+        evaluation_namespace: Digest([5; 32]),
+        search_conditions: Digest([6; 32]),
+        requested_reported_node_hint: 128,
+        hard_deadline: Deadline {
+            clock: ClockDomain(epoch),
+            at: MonotonicTick(10_000_000_000),
+        },
+    };
+    ExternalWorkerReport {
+        job,
+        grant: ExternalSliceGrant {
+            job: id,
+            execution,
+            owner,
+            requested_reported_node_hint: 128,
+            soft_quantum: Duration::from_millis(100),
+            control_sequence: 1,
+        },
+        scope: ExternalWorkerScope {
+            job: id,
+            execution,
+            owner,
+        },
+        result: Ok(ExternalCooperativeReport {
+            report: (**raw.external_report.as_ref().unwrap()).clone(),
+            opinions: Vec::new(),
+            stop_control: None,
+            strict_native_nodes: None,
+            reported_node_request: 128,
+            requested_multipv: 1,
+            option_application_observed: None,
+            reported_node_overshoot: false,
+            readiness_barrier_completed: true,
+            policy_target_known: false,
+            go_issue: ExternalGoIssue::Issued,
+        }),
+        attempt: None,
+        controls: rz_runtime::adaptive::ControlSnapshot {
+            terminal: true,
+            ..Default::default()
+        },
+        exact_resume_supported: false,
+        go_issue: ExternalGoIssue::Issued,
+    }
+}
+
+fn permit_fixture(
+    store: &mut PalsStores,
+    raw: Observation,
+    allowance: &mut ArchiveIoBudget,
+) -> Result<ForeignAppendPermit, StoreError> {
+    let worker = foreign_worker_fixture(&raw);
+    let issued = ForeignGoIssuedProof::checked_worker_report(&worker, &raw, allowance.deadline)?;
+    store.prepare_foreign_append_permit(raw, issued, allowance)
+}
+
+fn live_foreign_fixture(store: &mut PalsStores) -> Observation {
+    let position = Position::startpos();
+    let root = store.focus_actual_moves(position.snapshot()).unwrap();
+    let state = store.situations.get(root).unwrap().state;
+    let TaskAdmission::Start(execution) = store
+        .request_task(
+            foreign_key(state),
+            TaskConsumer {
+                id: 71,
+                situation: root,
+                revision: 0,
+                generation: store.generation(),
+                deadline_tick: 100,
+            },
+            0,
+        )
+        .unwrap()
+    else {
+        panic!("fixture foreign task must start")
+    };
+    let pv = store.append_cpu_pv(&position, &[mv("e2e4")]).unwrap();
+    foreign_observation(state, execution, pv, mv("e2e4"), Color::White, 1)
+}
+
+#[test]
+fn foreign_worker_permit_scan_does_not_publish_and_hot_commit_does_not_touch_archive() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let raw = live_foreign_fixture(&mut store);
+    let before_sequence = store.observations.next_observation_sequence();
+    let before_hot = store.hot_stats();
+    let mut allowance = budget();
+    let permit = permit_fixture(&mut store, raw.clone(), &mut allowance).unwrap();
+    assert_eq!(store.hot_stats(), before_hot);
+    assert_eq!(
+        store.observations.next_observation_sequence(),
+        before_sequence
+    );
+    assert_eq!(permit.request_id(), 1);
+    assert_eq!(permit.observation(), &raw);
+    // Native worker execution and semantic Store execution remain distinct.
+    assert_eq!(permit.native_execution().sequence, 2);
+    let archive_before_append = owner_snapshot(&store);
+    let remaining = allowance;
+    let appended = store.hot_append_foreign_permitted(permit).unwrap();
+    assert_eq!(appended.0, before_sequence);
+    assert_eq!(store.observations.get(appended).unwrap(), &raw);
+    assert_eq!(owner_snapshot(&store), archive_before_append);
+    assert_eq!(allowance.deadline, remaining.deadline);
+    assert_eq!(allowance.max_bytes, remaining.max_bytes);
+    assert_eq!(
+        store.tasks.get(raw.execution.unwrap()).unwrap().status,
+        TaskStatus::InFlight
+    );
+}
+
+#[test]
+fn foreign_permit_rejects_not_issued_unknown_and_replaced_exact_payload() {
+    use crate::external_cpu::ExternalGoIssue;
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let raw = live_foreign_fixture(&mut store);
+    let mut worker = foreign_worker_fixture(&raw);
+    for go in [ExternalGoIssue::NotIssued, ExternalGoIssue::Unknown] {
+        worker.go_issue = go;
+        assert!(matches!(
+            ForeignGoIssuedProof::checked_worker_report(&worker, &raw, budget().deadline),
+            Err(StoreError::InvalidEvidence(
+                "foreign go was not exactly issued"
+            ))
+        ));
+    }
+    worker.go_issue = ExternalGoIssue::Issued;
+    let mut allowance = budget();
+    let issued =
+        ForeignGoIssuedProof::checked_worker_report(&worker, &raw, allowance.deadline).unwrap();
+    let mut changed = raw;
+    changed.external_report.as_mut().unwrap().request_id += 1;
+    assert!(matches!(
+        store.prepare_foreign_append_permit(changed, issued, &mut allowance),
+        Err(StoreError::InvalidEvidence(
+            "foreign append permit payload differs"
+        ))
+    ));
+    assert_eq!(store.observations.len(), 0);
+}
+
+#[test]
+fn foreign_permit_rejects_new_hot_fact_or_replacement_owner_before_append() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let raw = live_foreign_fixture(&mut store);
+    let permit = permit_fixture(&mut store, raw.clone(), &mut budget()).unwrap();
+    store.append_observation(observation(raw.state)).unwrap();
+    assert_eq!(
+        store.hot_append_foreign_permitted(permit),
+        Err(StoreError::ForeignPermitStale)
+    );
+    let permit = permit_fixture(&mut store, raw, &mut budget()).unwrap();
+    let replacement_root = TestRoot::new();
+    let mut replacement = setup(&replacement_root);
+    assert_eq!(
+        replacement.hot_append_foreign_permitted(permit),
+        Err(StoreError::ForeignPermitStale)
+    );
+}
+
+#[test]
+fn foreign_permit_rejects_new_cold_generation_before_append() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let raw = live_foreign_fixture(&mut store);
+    let permit = permit_fixture(&mut store, raw, &mut budget()).unwrap();
+    let manager = store.archive.as_mut().unwrap();
+    // A committed empty fixture segment still changes the archive namespace.
+    manager
+        .commit(&Bundle::new(0), &mut budget(), ArchiveStats::default())
+        .unwrap();
+    assert_eq!(
+        store.hot_append_foreign_permitted(permit),
+        Err(StoreError::ForeignPermitStale)
+    );
+    assert_eq!(store.observations.len(), 0);
+}
+
+#[test]
+fn foreign_permit_hot_capacity_failure_requires_new_bounded_worker_scan() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let raw = live_foreign_fixture(&mut store);
+    let mut allowance = budget();
+    let permit = permit_fixture(&mut store, raw.clone(), &mut allowance).unwrap();
+    let first_nonce = permit.nonce();
+    store.observations.observations.fail_next_reservations(1);
+    let archive_before = owner_snapshot(&store);
+    assert_eq!(
+        store.hot_append_foreign_permitted(permit),
+        Err(StoreError::Capacity("injected hot allocation"))
+    );
+    assert_eq!(owner_snapshot(&store), archive_before);
+    assert_eq!(store.observations.len(), 0);
+    // The consumed permission cannot be reused. A second explicit preparation
+    // gives a new nonce and performs its own bounded uniqueness read scope.
+    let second = permit_fixture(&mut store, raw, &mut allowance).unwrap();
+    assert_ne!(first_nonce, second.nonce());
+    store.hot_append_foreign_permitted(second).unwrap();
+}
+
+#[test]
+fn foreign_permit_cold_scan_preserves_global_request_uniqueness_and_debits_reads() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let raw = live_foreign_fixture(&mut store);
+    let old_execution = raw.execution.unwrap();
+    let mut allowance = budget();
+    let permit = permit_fixture(&mut store, raw, &mut allowance).unwrap();
+    let old_observation = store.hot_append_foreign_permitted(permit).unwrap();
+    store.complete_task(old_execution, old_observation).unwrap();
+    let mut position = Position::startpos();
+    position.make_move(mv("e2e4")).unwrap();
+    let current = store.focus_actual_moves(position.snapshot()).unwrap();
+    store
+        .archive_inactive_with_budget(&mut allowance)
+        .unwrap()
+        .unwrap();
+    let state = store.situations.get(current).unwrap().state;
+    let TaskAdmission::Start(execution) = store
+        .request_task(
+            foreign_key(state),
+            TaskConsumer {
+                id: 72,
+                situation: current,
+                revision: 0,
+                generation: store.generation(),
+                deadline_tick: 100,
+            },
+            0,
+        )
+        .unwrap()
+    else {
+        panic!("new-root fixture task must start")
+    };
+    let pv = store.append_cpu_pv(&position, &[mv("e7e5")]).unwrap();
+    let duplicate = foreign_observation(state, execution, pv, mv("e7e5"), Color::Black, 1);
+    let before = store.hot_stats();
+    let before_sequence = store.observations.next_observation_sequence();
+    let remaining = allowance.max_bytes;
+    let cold_bytes = fs::metadata(store.archive.as_ref().unwrap().path(0))
+        .unwrap()
+        .len();
+    assert!(matches!(
+        permit_fixture(&mut store, duplicate, &mut allowance),
+        Err(StoreError::InvalidEvidence(
+            "foreign physical request belongs to another archived task"
+        ))
+    ));
+    assert_eq!(remaining - allowance.max_bytes, cold_bytes);
+    assert_eq!(store.hot_stats(), before);
+    assert_eq!(
+        store.observations.next_observation_sequence(),
+        before_sequence
+    );
+}
+
+#[test]
+fn foreign_permit_rejects_root_generation_and_same_high_water_fact_owner_replacement() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let raw = live_foreign_fixture(&mut store);
+    let permit = permit_fixture(&mut store, raw.clone(), &mut budget()).unwrap();
+    store
+        .hot_focus_actual_moves(Position::startpos().snapshot())
+        .unwrap();
+    assert_eq!(
+        store.hot_append_foreign_permitted(permit),
+        Err(StoreError::ForeignPermitStale)
+    );
+    let permit = permit_fixture(&mut store, raw, &mut budget()).unwrap();
+    let old_high_water = store.observations.next_observation_sequence();
+    store.observations = ObservationStore::new(limits().observations);
+    assert_eq!(
+        store.observations.next_observation_sequence(),
+        old_high_water
+    );
+    assert_eq!(
+        store.hot_append_foreign_permitted(permit),
+        Err(StoreError::ForeignPermitStale)
+    );
+}
+
 struct TestRoot(PathBuf);
 impl TestRoot {
     fn new() -> Self {
@@ -79,6 +399,195 @@ fn managed_setup(root: &TestRoot, selected: ArchiveRuntimeLimits) -> PalsStores 
 }
 fn owner_snapshot(store: &PalsStores) -> ArchiveOwnerSnapshot {
     store.archive_owner_snapshot().unwrap().unwrap()
+}
+
+fn held_setup(root: &TestRoot) -> (PalsStores, ArchiveRootCapability) {
+    let config = root.config();
+    fs::create_dir(&config.root).unwrap();
+    let held = Dir::open_ambient_dir(&config.root, cap_std::ambient_authority()).unwrap();
+    let capability = ArchiveRootCapability::from_directory(config.root.clone(), held).unwrap();
+    let mut store = PalsStores::new(limits());
+    store
+        .enable_archive_with_capability(config, capability.clone())
+        .unwrap();
+    (store, capability)
+}
+
+#[test]
+fn held_archive_capability_preserves_commit_readback_and_session_domain() {
+    let root = TestRoot::new();
+    let (mut first, capability) = held_setup(&root);
+    let bundle = Bundle::new(0);
+    let extent = HEADER + serde_json::to_vec(&bundle).unwrap().len() as u64;
+    let selected = runtime_limits(2 * extent);
+    first.set_archive_runtime_limits(selected).unwrap();
+    let receipt = first
+        .archive
+        .as_mut()
+        .unwrap()
+        .commit(&bundle, &mut budget(), ArchiveStats::default())
+        .unwrap();
+    let manager = first.archive.as_ref().unwrap();
+    assert!(manager.directory_capability.is_some());
+    assert_eq!(
+        manager
+            .read(0, Some(receipt.checksum), &mut budget())
+            .unwrap()
+            .1,
+        receipt.checksum
+    );
+    assert_eq!(manager.usage(budget()).unwrap(), (extent, extent));
+    let first_game = manager.directory_identity.unwrap();
+    first.close_archive_owner().unwrap();
+    let mut next = PalsStores::new(limits());
+    next.enable_archive_with_capability(root.config(), capability)
+        .unwrap();
+    next.set_archive_runtime_limits(selected).unwrap();
+    next.inherit_archive_write_budget_from(&first).unwrap();
+    let next_manager = next.archive.as_ref().unwrap();
+    assert_ne!(next_manager.directory_identity.unwrap(), first_game);
+    assert_eq!(next_manager.usage(budget()).unwrap(), (0, extent));
+    assert_eq!(
+        owner_snapshot(&next).session_write_bytes_consumed,
+        Some(extent)
+    );
+}
+
+#[test]
+fn held_archive_capability_rejects_unrelated_directory_and_path_domain() {
+    let root = TestRoot::new();
+    let config = root.config();
+    fs::create_dir(&config.root).unwrap();
+    let unrelated = root.0.join("unrelated");
+    fs::create_dir(&unrelated).unwrap();
+    let wrong = Dir::open_ambient_dir(&unrelated, cap_std::ambient_authority()).unwrap();
+    assert!(matches!(
+        ArchiveRootCapability::from_directory(config.root, wrong),
+        Err(StoreError::ArchiveIntegrity(
+            "held archive root was renamed or replaced"
+        )),
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn held_archive_rejects_normal_parent_replacement_before_owner_open() {
+    let root = TestRoot::new();
+    let runtime = root.0.join("runtime");
+    let archive = runtime.join("archive");
+    fs::create_dir_all(&archive).unwrap();
+    let held = Dir::open_ambient_dir(&archive, cap_std::ambient_authority()).unwrap();
+    let capability = ArchiveRootCapability::from_directory(archive.clone(), held).unwrap();
+    fs::rename(&runtime, root.0.join("retained-runtime")).unwrap();
+    fs::create_dir_all(&archive).unwrap();
+    let mut store = PalsStores::new(limits());
+    assert!(matches!(
+        store.enable_archive_with_capability(
+            ArchiveConfig::new(archive.clone(), std::env::current_dir().unwrap()),
+            capability,
+        ),
+        Err(StoreError::ArchiveIntegrity(
+            "held archive root was renamed or replaced"
+        )),
+    ));
+    assert!(!store.archive_enabled());
+    assert_eq!(fs::read_dir(archive).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(root.0.join("retained-runtime/archive"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn held_archive_rejects_normal_root_replacement_after_owner_open_without_redirecting_io() {
+    let root = TestRoot::new();
+    let (mut store, _) = held_setup(&root);
+    let config = root.config();
+    let original_game = store
+        .archive
+        .as_ref()
+        .unwrap()
+        .directory
+        .file_name()
+        .unwrap()
+        .to_owned();
+    fs::rename(&config.root, root.0.join("retained-archive")).unwrap();
+    fs::create_dir(&config.root).unwrap();
+    let manager = store.archive.as_mut().unwrap();
+    assert!(matches!(
+        manager.commit(&Bundle::new(0), &mut budget(), ArchiveStats::default()),
+        Err(StoreError::ArchiveIntegrity(
+            "held archive root was renamed or replaced"
+        )),
+    ));
+    assert_eq!(manager.snapshot().committed_chunks, 0);
+    assert_eq!(manager.snapshot().io_failures, 1);
+    assert_eq!(fs::read_dir(&config.root).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(root.0.join("retained-archive").join(original_game))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn held_archive_rejects_game_directory_replacement() {
+    let root = TestRoot::new();
+    let (store, _) = held_setup(&root);
+    let manager = store.archive.as_ref().unwrap();
+    fs::rename(
+        &manager.directory,
+        manager.config.root.join("retained-game"),
+    )
+    .unwrap();
+    fs::create_dir(&manager.directory).unwrap();
+    assert!(matches!(
+        manager.usage(budget()),
+        Err(StoreError::ArchiveIntegrity(
+            "held archive game was renamed or replaced"
+        )),
+    ));
+    assert_eq!(fs::read_dir(&manager.directory).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn held_quota_lock_drop_retains_replaced_lock() {
+    let root = TestRoot::new();
+    let (store, capability) = held_setup(&root);
+    let manager = store.archive.as_ref().unwrap();
+    let lock = QuotaLock::take(&manager.config.root, Some(&capability)).unwrap();
+    let named = manager.config.root.join(".quota.lock");
+    fs::rename(&named, manager.config.root.join("retained-lock")).unwrap();
+    fs::write(&named, b"replacement").unwrap();
+    drop(lock);
+    assert_eq!(fs::read(named).unwrap(), b"replacement");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn held_archive_fifo_replacement_is_rejected_without_blocking_open_or_lock_drop() {
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+    let root = TestRoot::new();
+    let (store, capability) = held_setup(&root);
+    let manager = store.archive.as_ref().unwrap();
+    mkfifo(&manager.path(0), Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+    assert!(matches!(
+        manager.read(0, None, &mut budget()),
+        Err(StoreError::ArchiveIntegrity("archive record type")),
+    ));
+    let lock = QuotaLock::take(&manager.config.root, Some(&capability)).unwrap();
+    let named = manager.config.root.join(".quota.lock");
+    fs::rename(&named, manager.config.root.join("retained-lock")).unwrap();
+    mkfifo(&named, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+    drop(lock);
+    assert!(!fs::metadata(named).unwrap().is_file());
 }
 
 #[test]
