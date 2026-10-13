@@ -155,6 +155,23 @@ Windows 전체 strict Clippy(130)는 원래 deadline을 축소하는 내부 help
 해당 helper에 실제 Linux 제품·단위 검사와 같은 빌드 조건을 적용했다.
 실패와 정리 로그는 보존하고 후속 전체 strict 검사를 별도로 기록한다.
 
+전체 Windows strict Clippy(131)는 통과했고, Arena all-feature library 검사(133)는
+255개 통과·0 실패였다. 두 실행 모두 종료 코드 0·cleanup verified다. 그 사이
+정리 완료 전에 시도한 132는 live owner 거부로 시작되지 않았으며 검사 성공으로
+세지 않는다. 공유 `870dd18`의 CI에서 bindings·PALS model·Windows CPU job은
+성공했다. Linux CPU job은 Search 680개 통과·1개 실패·2개 의도적 미실행이었다.
+paused CPU 작업의 shutdown 확인 사이에 종료 이벤트를 건너뛰는 실제 경로를
+확인했으며, 후속 수정과 결정적인 경쟁 검사를 별도로 인수한다. 기존 실패 실행을
+통과로 바꾸거나 CI 세 job의 성공을 전체 CI 성공으로 합산하지 않는다.
+
+이 경쟁의 후속 수정은 paused owner가 있으면 원래 terminal permit의 seal·종료
+이벤트 경로로 돌아가도록 제한했다. 실제 Yield 뒤 두 shutdown 관측 사이의 순서를
+bounded channel로 고정하며 credit·token·owner 판정을 유지한다. Windows 관리 검사
+135에서 CPU worker 28개와 Search 전체 target/feature strict Clippy(136)가 통과하고
+종료·정리도 확인했다. Linux 실행 134는 컴파일
+도중 host/WSL 실행 환경이 종료되어 최종 관리 영수증을 얻지 못했다. 그 실행은 통과나
+제품 테스트 실패로 재분류하지 않으며, 원래 lease와 중단 자료를 보존해 확인한다.
+
 학습·export·수치 검증 실패 자료는 원래 등록 경로와 whole deadline·남은 read credit
 안에서 읽기 전용으로 회수한다. 열린 FD는 metadata·hash 검사보다 먼저 실패 전용
 owner에 보유하며, 빈 파일·여러 링크·partial을 성공 checkpoint·수치 인수 권한으로

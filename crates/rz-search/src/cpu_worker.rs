@@ -892,6 +892,8 @@ impl CpuWorker {
             signal,
             command_capacity,
             |builder, task| builder.spawn(task),
+            #[cfg(test)]
+            None,
         )
     }
     // The private launcher lets a source test exercise a real pre-start
@@ -914,6 +916,7 @@ impl CpuWorker {
             signal,
             CPU_WORKER_COMMAND_CAPACITY,
             launcher,
+            None,
         )
     }
     #[allow(clippy::result_large_err)]
@@ -926,6 +929,7 @@ impl CpuWorker {
             thread::Builder,
             Box<dyn FnOnce() -> CpuWorkerExit + Send + 'static>,
         ) -> std::io::Result<JoinHandle<CpuWorkerExit>>,
+        #[cfg(test)] mut before_paused_command_poll: Option<Box<dyn FnOnce() + Send + 'static>>,
     ) -> Result<Self, (CpuEngine, CpuWorkerError)> {
         if !(1..=CPU_WORKER_COMMAND_CAPACITY).contains(&command_capacity) {
             return Err((engine, CpuWorkerError::Invalid("CPU command capacity")));
@@ -1025,10 +1029,29 @@ impl CpuWorker {
                         active = None;
                     }
                 }
+                // A source fixture can hold this exact boundary after paused
+                // termination was checked and before the next shutdown read.
+                // The hook does not exist in non-test worker builds.
+                #[cfg(test)]
+                if active.is_some()
+                    && let Some(observe) = before_paused_command_poll.take()
+                {
+                    observe();
+                }
                 let mut command = match worker_mailbox.take_command() {
                     Some(command) => command,
-                    None if worker_shutdown.load(Ordering::Acquire) => break,
                     None => {
+                        if worker_shutdown.load(Ordering::Acquire) {
+                            // Shutdown may arrive after the paused-owner
+                            // check above. Publish its reserved terminal
+                            // receipt before joining; only an idle owner can
+                            // exit. Use this same shutdown observation for
+                            // both decisions, rather than two racing reads.
+                            if active.is_some() {
+                                continue;
+                            }
+                            break;
+                        }
                         worker_mailbox.wait_changed(observed, Duration::from_millis(10));
                         continue;
                     }

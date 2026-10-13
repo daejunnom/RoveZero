@@ -836,13 +836,42 @@ fn shutdown_seals_paused_job_and_joins_without_exposing_its_token() {
     let mut ledger = ledger(envelope, clock);
     ledger.register(envelope).unwrap();
     ledger.reserve(first).unwrap();
-    let worker = CpuWorker::spawn(CpuWorkerId(0), cpu).unwrap();
+    let (at_idle_boundary, idle_boundary) = std::sync::mpsc::sync_channel(1);
+    let (release, held) = std::sync::mpsc::sync_channel(1);
+    let fixture_deadline = clock.origin() + FIXTURE_WINDOW;
+    let worker = CpuWorker::spawn_notified_with_capacity_and_launcher(
+        CpuWorkerId(0),
+        cpu,
+        CompletionSignal::default(),
+        CPU_WORKER_COMMAND_CAPACITY,
+        |builder, task| builder.spawn(task),
+        Some(Box::new(move || {
+            at_idle_boundary.send(()).unwrap();
+            let remaining = fixture_deadline
+                .checked_duration_since(Instant::now())
+                .expect("paused owner handshake exceeded the original fixture deadline");
+            held.recv_timeout(remaining)
+                .expect("shutdown must release the paused owner within the fixture deadline");
+        })),
+    )
+    .unwrap_or_else(|(_, error)| panic!("paused shutdown fixture could not spawn: {error:?}"));
     worker.begin(original, first).unwrap();
     let paused = wait_report(&worker, clock.origin() + FIXTURE_WINDOW);
     assert!(paused.continuation_retained && !paused.terminal);
     assert!(paused.result.as_ref().unwrap().report.resume.is_none());
     ledger.settle(&paused).unwrap();
     let before = ledger.global_usage().unwrap();
+    // Force the real race: the owner checked shutdown=false for this paused
+    // Job, but shutdown is visible when it finds no next command. No sleep or
+    // additional node credit is needed to establish that schedule.
+    let remaining = fixture_deadline
+        .checked_duration_since(Instant::now())
+        .expect("paused shutdown handshake exceeded the original fixture deadline");
+    idle_boundary
+        .recv_timeout(remaining)
+        .expect("worker must reach its paused command boundary before shutdown");
+    worker.request_shutdown();
+    release.send(()).unwrap();
     let stopped = worker.shutdown().unwrap();
     assert_eq!(stopped.owner, CpuWorkerId(0));
     assert!(stopped.thread_joined && !stopped.thread_panicked);
@@ -1714,6 +1743,7 @@ fn declared_one_command_queue_rejects_second_command_but_control_still_reaches_o
                 task()
             })
         },
+        None,
     )
     .unwrap_or_else(|(_, error)| panic!("worker admission failed: {error:?}"));
     assert_eq!(worker.command_capacity(), 1);
@@ -1796,6 +1826,7 @@ fn invalid_command_limit_returns_unchanged_engine_before_os_owner_start() {
                     "invalid limit must not enter OS spawn",
                 ))
             },
+            None,
         );
         let (cpu, reason) = match result {
             Ok(_) => panic!("invalid command capacity was accepted"),
