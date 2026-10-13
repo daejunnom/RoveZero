@@ -20,6 +20,13 @@ pub mod native_bootstrap;
 pub mod native_cuda_attestation;
 #[cfg(feature = "onnx-cpu")]
 pub mod native_profile;
+pub mod pals_adaptive;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub mod pals_adaptive_bootstrap;
+#[cfg(feature = "pals-adaptive")]
+pub mod pals_adaptive_sources;
+#[cfg(feature = "pals-adaptive")]
+pub mod pals_adaptive_startup;
 #[cfg(feature = "search-work-receipts")]
 pub mod pals_attestation;
 #[cfg(feature = "search-work-receipts")]

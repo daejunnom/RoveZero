@@ -17,6 +17,10 @@ use std::sync::Arc;
 #[cfg(feature = "ort-bindings")]
 pub mod ort_binding;
 
+/// Retained-file OS ownership helpers, kept outside safe UCI consumers.
+#[cfg(windows)]
+pub mod pinned_reader;
+
 /// 확인한 CUDA 12/cuDNN 9 profile의 dependency-first 로딩 순서. 부분 집합은 거부한다.
 pub const NVIDIA_LOAD_ORDER: [&str; 16] = [
     "libcudart.so.12",

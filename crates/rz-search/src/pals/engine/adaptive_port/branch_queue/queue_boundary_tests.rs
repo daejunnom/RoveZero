@@ -352,27 +352,33 @@ fn registered_queue_requires_exact_transition_evidence_and_cannot_close_as_unkno
         .unwrap();
     let mut forged = evidence;
     forged.completed_evidence = ContractDigest([89; 32]);
-    assert!(machine
-        .resolve(
-            forged,
-            FrameTransition::Complete {
-                scope: FrameCompletionScope::QueuedRecheck
-            },
-            clock,
-            MonotonicTick(0)
-        )
-        .is_err());
-    assert!(machine
-        .resolve(
-            evidence,
-            FrameTransition::Unknown { reason: "raw-only" },
-            clock,
-            MonotonicTick(0)
-        )
-        .is_err());
-    assert!(machine
-        .enqueue_checked_recheck(deferred(&mut port, &original), clock, MonotonicTick(0))
-        .is_err());
+    assert!(
+        machine
+            .resolve(
+                forged,
+                FrameTransition::Complete {
+                    scope: FrameCompletionScope::QueuedRecheck
+                },
+                clock,
+                MonotonicTick(0)
+            )
+            .is_err()
+    );
+    assert!(
+        machine
+            .resolve(
+                evidence,
+                FrameTransition::Unknown { reason: "raw-only" },
+                clock,
+                MonotonicTick(0)
+            )
+            .is_err()
+    );
+    assert!(
+        machine
+            .enqueue_checked_recheck(deferred(&mut port, &original), clock, MonotonicTick(0))
+            .is_err()
+    );
     machine
         .resolve(
             evidence,
@@ -402,9 +408,11 @@ fn generic_queue_completion_does_not_mint_private_deferred_admission() {
             MonotonicTick(0),
         )
         .unwrap();
-    assert!(machine
-        .enqueue_checked_recheck(deferred(&mut port, &original), clock, MonotonicTick(0))
-        .is_err());
+    assert!(
+        machine
+            .enqueue_checked_recheck(deferred(&mut port, &original), clock, MonotonicTick(0))
+            .is_err()
+    );
 }
 
 #[test]
@@ -423,8 +431,8 @@ fn last_sibling_actual_queue_closure_preserves_prior_unknown_without_granting_ge
     let repaired = moves("e2e4 c7c5 b1c3 b8c6");
     port.record_hot(RecordKind::Proposal, &proposal, None)
         .unwrap();
-    assert!(port
-        .enqueue_counter(PendingCounter {
+    assert!(
+        port.enqueue_counter(PendingCounter {
             first,
             proposal: proposal.clone(),
             counter: counter.clone(),
@@ -432,7 +440,8 @@ fn last_sibling_actual_queue_closure_preserves_prior_unknown_without_granting_ge
             source: None,
             repair_direct: false,
         })
-        .unwrap());
+        .unwrap()
+    );
     let earlier_transition = port
         .finish_branch(
             &earlier,
@@ -701,18 +710,20 @@ fn ready_rules_terminal_queue_commits_without_creating_cpu_or_role_execution() {
             MonotonicTick(0),
         )
         .unwrap();
-    assert!(machine
-        .resolve_rules_terminal(
-            id,
-            &endpoint,
-            ContractDigest([92; 32]),
-            FrameTransition::Complete {
-                scope: FrameCompletionScope::QueuedRecheck
-            },
-            clock,
-            MonotonicTick(0)
-        )
-        .is_err());
+    assert!(
+        machine
+            .resolve_rules_terminal(
+                id,
+                &endpoint,
+                ContractDigest([92; 32]),
+                FrameTransition::Complete {
+                    scope: FrameCompletionScope::QueuedRecheck
+                },
+                clock,
+                MonotonicTick(0)
+            )
+            .is_err()
+    );
     let closed = machine
         .resolve_rules_terminal(
             id,
@@ -742,11 +753,13 @@ fn unsubmitted_ongoing_repair_cannot_claim_rules_terminal_queue() {
     // cannot substitute a Rules proof for a real worker completion.
     let clock = port.deadline.clock;
     let ready = machine.ready_work(id, clock, MonotonicTick(0)).unwrap();
-    assert!(machine
-        .register_checked_recheck_queue(
-            queued(&port, &ready, ContractDigest([93; 32])),
-            clock,
-            MonotonicTick(0)
-        )
-        .is_err());
+    assert!(
+        machine
+            .register_checked_recheck_queue(
+                queued(&port, &ready, ContractDigest([93; 32])),
+                clock,
+                MonotonicTick(0)
+            )
+            .is_err()
+    );
 }

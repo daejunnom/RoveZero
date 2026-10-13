@@ -113,7 +113,12 @@ impl RefinementStage {
             Self::ProposalValueFresh => next == Self::CriticDivergence,
             Self::CriticDivergence => next == Self::CpuDiscovery,
             Self::CpuDiscovery => matches!(next, Self::CpuDiscovery | Self::CriticReply),
-            Self::CriticReply => next == Self::CounterContinuation,
+            Self::CriticReply => {
+                // A reply can already complete the bounded counter line, or
+                // reach a Rules terminal; it then proceeds directly to CPU
+                // validation without an extra continuation inference.
+                matches!(next, Self::CounterContinuation | Self::CounterValidation)
+            }
             Self::CounterContinuation => {
                 matches!(next, Self::CounterContinuation | Self::CounterValidation)
             }

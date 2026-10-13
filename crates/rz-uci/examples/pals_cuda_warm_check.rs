@@ -182,6 +182,7 @@ mod check {
     fn role_error_code(error: &RoleError) -> &'static str {
         match error {
             RoleError::Unavailable => "unavailable",
+            RoleError::Unsupported(_) => "unsupported",
             RoleError::InvalidOutput => "invalid_output",
             RoleError::Canceled => "canceled",
             RoleError::Deadline => "deadline",
@@ -214,6 +215,7 @@ mod check {
             PalsError::Checker(_) => "Checker",
             PalsError::Role(_) => "Role",
             PalsError::Store(_) => "Store",
+            PalsError::Review(_) => "Review",
             PalsError::Capacity => "Capacity",
             PalsError::RoleCallLimit => "RoleCallLimit",
         };

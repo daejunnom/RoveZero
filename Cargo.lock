@@ -538,6 +538,7 @@ dependencies = [
  "rz-encoding",
  "rz-eval",
  "rz-experiments",
+ "rz-native-loader",
  "rz-position",
  "rz-runtime",
  "rz-search",
