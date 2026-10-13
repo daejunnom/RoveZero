@@ -39,7 +39,7 @@ def row(role="proposer"):
             "token_budget": 512, "length_bucket": 8}
     snapshot = {"game_id": "g1", "opening_id": "o1", "line_genealogy_id": "l1", "transposition_sha256": "d" * 64,
                 "role": role, "model_epoch": 0, "context_epoch": 0, "capture_sequence": 10,
-                "question_id": "q1", "worker_id": "w1", "job_id": "j1", "slice_id": "s1",
+                "question_id": "e" * 64, "worker_id": "native-owner-0", "job_id": "j1", "slice_id": "s1",
                 "rules_anchor": anchor, "actual_history": [64], "selected_view": view,
                 "view_sha256": data.view_digest(view), "legal_moves": [64, 128], "action_support_mask": [True] * 7, "divergence_record_ids": [],
                 "encoded_model_input": {"schema": "rovezero.pals-virtual-review-input.v1", "role": role,
@@ -60,6 +60,58 @@ def policy(record):
     return {**label_base(record), "source": "stockfish19_completed_multipv", "completed": True,
             "stale": False, "anchor": copy.deepcopy(record["input"]["rules_anchor"]), "ranked_moves": [128, 64],
             "teacher_binary_sha256": "6" * 64, "teacher_profile_sha256": "7" * 64, "go_sequence": 1, "completed_depth": 1}
+
+
+def add_teacher_policy_evidence(record, receipts, target):
+    """Low-count schema fixture for exact endpoint opinion provenance only.
+
+    These receipts were not emitted by an actual owner or engine. They never
+    supply real training quotas, model eligibility, or an executed game proof.
+    The native submission/retirement chain is supplied separately by its
+    existing fixture, preserving Fresh/Warm and semantic-sample test control.
+    """
+    snapshot = record["input"]
+    identity = {"adapter_semantics": "external-uci-checker-v1", "binary_sha256": target["teacher_binary_sha256"],
+                "launch_arguments_sha256": "8" * 64, "declared_name": "Stockfish 19 (schema fixture)",
+                "declared_version": "19", "declared_source": "https://github.com/official-stockfish/Stockfish/tree/sf_19",
+                "declared_license": "GPL-3.0", "options": {"Threads": "1", "Hash": "256", "MultiPV": str(len(target["ranked_moves"])),
+                "Skill Level": "20", "UCI_LimitStrength": "false", "Ponder": "false", "NumaPolicy": "none", "SyzygyPath": ""},
+                "assets": [], "model_metadata": {"weights_sha256": None, "training": "unknown", "declared_rights": None,
+                                                    "precision": None}}
+    namespace = data._teacher_namespace(identity)
+    process = {"pid": 1234, "process_group": 1234, "proc_start_ticks": 5678}
+    submission = {"schema": data.TEACHER_SUBMISSION_DOMAIN, "observed_sequence": snapshot["capture_sequence"] + 1,
+                  "execution_epoch": 0, "execution_sequence": 1, "job_sequence": 1, "root_generation": 1,
+                  "source_cpu_question_sha256": "9" * 64, "source_cpu_view_sha256": "a" * 64,
+                  "teacher_question_sha256": "b" * 64, "evaluation_namespace": namespace,
+                  "teacher_binary_sha256": target["teacher_binary_sha256"], "teacher_profile_sha256": target["teacher_profile_sha256"],
+                  "root_restriction_sha256": "c" * 64, "search_conditions_sha256": "d" * 64,
+                  "root_moves": [data._move16_uci(move) for move in snapshot["legal_moves"]], "process": process,
+                  "uci_name": identity["declared_name"], "uci_author": "schema fixture",
+                  "rules_anchor": copy.deepcopy(snapshot["rules_anchor"]),
+                  "interpretation": data.TEACHER_INTERPRETATION + "; neural_review_not_read_by_teacher"}
+    completion = {"schema": data.TEACHER_COMPLETION_DOMAIN, "observed_sequence": target["observed_sequence"],
+                  "submission_observed_sequence": submission["observed_sequence"],
+                  **{name: submission[name] for name in ("execution_epoch", "execution_sequence", "job_sequence", "root_generation",
+                                                         "evaluation_namespace", "teacher_binary_sha256", "teacher_profile_sha256")},
+                  "source_scope_joined": True, "successful_owner_join": True, "original_question_target_eligible": True,
+                  "cancel_sequence": 0, "physical_process_identity": copy.deepcopy(process), "exact_resume_supported": False,
+                  "go_issue": "Issued", "result": {"identity": identity, "uci_name": identity["declared_name"],
+                  "completion": "BestMove", "go_sequence": target["go_sequence"], "go_issue": "Issued",
+                  "best_move_move16": target["ranked_moves"][0], "readiness_barrier_completed": True,
+                  "policy_target_known": True, "requested_multipv": len(target["ranked_moves"]),
+                  "option_application_observed": True, "reported_nodes": 32,
+                  "opinions": [{"rank": rank, "depth": target["completed_depth"], "seldepth": None,
+                                "score": "Centipawns(0)", "bound": "ExactReported", "reported_wdl": None,
+                                "pv_move16": [move], "pv": [data._move16_uci(move)]}
+                               for rank, move in enumerate(target["ranked_moves"], 1)]}}
+    submission_seal, completion_seal = (data.digest(raw["schema"], raw) for raw in (submission, completion))
+    binding = {"schema": data.TEACHER_INPUT_BINDING_DOMAIN, "input_sha256": record["input_sha256"],
+               "policy_head_evidence_sha256": target["raw_evidence_sha256"], "teacher_submission_sha256": submission_seal,
+               "teacher_completion_sha256": completion_seal, "rules_anchor": copy.deepcopy(snapshot["rules_anchor"]),
+               "observed_sequence": target["observed_sequence"], "interpretation": data.TEACHER_INTERPRETATION}
+    for raw in (submission, completion, binding):
+        receipts[data.digest(raw["schema"], raw)] = raw
 
 
 def wdl(record):
@@ -111,6 +163,11 @@ def schema_dataset(records):
             identity = data.digest(receipt["schema"], receipt)
             target["raw_evidence_sha256"] = identity
             receipts[identity] = receipt
+            if head == "policy":
+                add_teacher_policy_evidence(r, receipts, target)
+                # This is a schema fixture join, never actual native execution.
+                from test_generation_chunks import add_native_chain
+                add_native_chain(r, receipts)
     trajectories = {trajectory_sha256: authority}
     return data.GenerationDataset(records, producer=producer, trajectories=trajectories, opening_splits=splits, allowed_evidence=receipts)
 

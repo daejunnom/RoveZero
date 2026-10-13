@@ -7,7 +7,7 @@ import struct
 import tempfile
 from unittest import mock
 
-from test_generation_contract import SourceOnlyTests, row, policy, wdl
+from test_generation_contract import SourceOnlyTests, row, policy, wdl, add_teacher_policy_evidence
 from rz_pals_model import generation_data as data
 from rz_pals_model import generation_training as train
 from rz_pals_model import generation_chunks as chunks
@@ -94,6 +94,7 @@ def add_policy(record, receipts):
     target["raw_evidence_sha256"] = data.digest(receipt["schema"], receipt)
     receipts[target["raw_evidence_sha256"]] = receipt
     record["future_targets"]["policy"] = target
+    add_teacher_policy_evidence(record, receipts, target)
 
 
 class ChunkTests(SourceOnlyTests):

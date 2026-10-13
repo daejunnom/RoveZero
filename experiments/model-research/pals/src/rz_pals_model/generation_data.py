@@ -22,12 +22,17 @@ RULES_ENDINGS = {"checkmate", "stalemate", "repetition", "fifty_move", "seventy_
                 "insufficient_material", "dead_position"}
 DRAW_ENDINGS = RULES_ENDINGS - {"checkmate"}
 BUCKETS = (8, 16, 32, 64, 128, 256)
+TEACHER_SUBMISSION_DOMAIN = "rz-pals-generation-teacher-submission-evidence/1"
+TEACHER_COMPLETION_DOMAIN = "rz-pals-generation-teacher-completion-evidence/1"
+TEACHER_INPUT_BINDING_DOMAIN = "rz-pals-generation-teacher-input-binding-evidence/1"
+TEACHER_INTERPRETATION = "conditional_exact_endpoint_opinion"
 EVIDENCE_DOMAINS = frozenset(("rz-pals-generation-head-evidence/1", "rz-pals-generation-causal-evidence/1",
                             "rz-pals-generation-witness-evidence/1", "rz-pals-rules-outcome-evidence/1",
                             "rz-pals-generation-submission-evidence/1", "rz-pals-generation-native-completion-evidence/1",
                             "rz-pals-generation-native-retirement-evidence/1", "rz-pals-generation-runtime-audit-evidence/1",
                             "rz-pals-generation-action-authority-evidence/1", "rz-pals-generation-game-pgn-evidence/1",
-                            "rz-pals-generation-game-failure-evidence/1", "rz-pals-generation-frozen-action-group-evidence/1"))
+                            "rz-pals-generation-game-failure-evidence/1", "rz-pals-generation-frozen-action-group-evidence/1",
+                            TEACHER_SUBMISSION_DOMAIN, TEACHER_COMPLETION_DOMAIN, TEACHER_INPUT_BINDING_DOMAIN))
 
 
 def fields(value, names, description):
@@ -64,7 +69,9 @@ def validate_evidence_receipt(evidence_sha256, receipt):
     if (type(receipt) is not dict or receipt.get("schema") not in EVIDENCE_DOMAINS
             or digest(receipt["schema"], receipt) != evidence_sha256):
         raise ValueError("recovered evidence receipt domain/digest mismatch")
-    if receipt["schema"] == "rz-pals-generation-runtime-audit-evidence/1":
+    if receipt["schema"] in (TEACHER_SUBMISSION_DOMAIN, TEACHER_COMPLETION_DOMAIN, TEACHER_INPUT_BINDING_DOMAIN):
+        _teacher_receipt(receipt)
+    elif receipt["schema"] == "rz-pals-generation-runtime-audit-evidence/1":
         fields(receipt, ("schema", "witness_json"), "raw runtime audit receipt")
         witness = receipt["witness_json"]
         if type(witness) is not str or len(witness.encode()) > 1024 * 1024:
@@ -289,6 +296,279 @@ def policy_target(snapshot, label):
     weights = [math.exp(-rank) for rank in range(len(moves))]
     total = sum(weights)
     return [weights[moves.index(m)] / total if m in moves else 0.0 for m in snapshot["legal_moves"]]
+
+
+def _teacher_process(value):
+    fields(value, ("pid", "process_group", "proc_start_ticks"), "teacher actual process identity")
+    uint(value["pid"], 2**32 - 1)
+    uint(value["process_group"], 2**32 - 1)
+    uint(value["proc_start_ticks"])
+    return value
+
+
+def _teacher_text(value, *, optional=False, maximum=1024):
+    if optional and value is None:
+        return
+    if (type(value) is not str or not value or len(value.encode()) > maximum
+            or any(ord(c) < 32 for c in value)):
+        raise ValueError("bounded teacher raw text required")
+
+
+def _teacher_uci(value):
+    # Serialization validation only. Exact legality remains the Rust Rules
+    # producer's responsibility; no chess Rules are reconstructed here.
+    if (type(value) is not str or len(value) not in (4, 5)
+            or value[0] not in "abcdefgh" or value[2] not in "abcdefgh"
+            or value[1] not in "12345678" or value[3] not in "12345678"
+            or value[:2] == value[2:4] or len(value) == 5 and value[4] not in "qrbn"):
+        raise ValueError("teacher raw UCI move serialization mismatch")
+    return value
+
+
+def _move16_uci(value):
+    _moves([value])
+    source, target, promotion = value & 63, (value >> 6) & 63, value >> 12
+    square = lambda number: "abcdefgh"[number % 8] + "12345678"[number // 8]
+    return square(source) + square(target) + ("qrbn"[promotion - 1] if promotion else "")
+
+
+def _teacher_identity(value):
+    fields(value, ("adapter_semantics", "binary_sha256", "launch_arguments_sha256", "declared_name", "declared_version",
+                   "declared_source", "declared_license", "options", "assets", "model_metadata"), "teacher checker identity")
+    for name in ("binary_sha256", "launch_arguments_sha256"):
+        sha(value[name])
+    for name in ("adapter_semantics", "declared_name", "declared_version", "declared_source", "declared_license"):
+        _teacher_text(value[name])
+    options = value["options"]
+    if type(options) is not dict or len(options) > 128:
+        raise ValueError("bounded teacher options required")
+    for name, option in options.items():
+        _teacher_text(name, maximum=256)
+        if type(option) is not str or len(option.encode()) > 1024 or any(ord(c) < 32 for c in option):
+            raise ValueError("bounded teacher option declaration required")
+    assets = value["assets"]
+    if type(assets) is not list or len(assets) > 32:
+        raise ValueError("bounded teacher asset declarations required")
+    for asset in assets:
+        fields(asset, ("purpose", "sha256"), "teacher declared asset")
+        _teacher_text(asset["purpose"], maximum=256); sha(asset["sha256"])
+    metadata = fields(value["model_metadata"], ("weights_sha256", "training", "declared_rights", "precision"), "teacher model metadata")
+    if metadata["weights_sha256"] is not None:
+        sha(metadata["weights_sha256"])
+    if metadata["training"] != "unknown":
+        raise ValueError("teacher declaration cannot certify its training knowledge")
+    for name in ("declared_rights", "precision"):
+        _teacher_text(metadata[name], optional=True)
+    return value
+
+
+def _teacher_namespace(identity):
+    """Independent framing of the existing typed Rust identity, not its value."""
+    _teacher_identity(identity)
+    ordered = {name: identity[name] for name in ("adapter_semantics", "binary_sha256", "launch_arguments_sha256",
+        "declared_name", "declared_version", "declared_source", "declared_license", "options", "assets", "model_metadata")}
+    ordered["options"] = dict(sorted(identity["options"].items()))
+    ordered["assets"] = [{name: asset[name] for name in ("purpose", "sha256")} for asset in identity["assets"]]
+    ordered["model_metadata"] = {name: identity["model_metadata"][name]
+                               for name in ("weights_sha256", "training", "declared_rights", "precision")}
+    raw = json.dumps(ordered, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
+    return hashlib.sha256(b"rz-external-evaluation-namespace/1\0" + len(raw).to_bytes(8, "little") + raw).hexdigest()
+
+
+def _teacher_receipt(value):
+    """Keep failed/unknown raw observations; shape validation does not admit labels."""
+    if value["schema"] == TEACHER_INPUT_BINDING_DOMAIN:
+        fields(value, ("schema", "input_sha256", "policy_head_evidence_sha256", "teacher_submission_sha256",
+                       "teacher_completion_sha256", "rules_anchor", "observed_sequence", "interpretation"), "teacher input binding")
+        for name in ("input_sha256", "policy_head_evidence_sha256", "teacher_submission_sha256", "teacher_completion_sha256"):
+            sha(value[name])
+        _anchor(value["rules_anchor"]); uint(value["observed_sequence"])
+        if value["interpretation"] != TEACHER_INTERPRETATION:
+            raise ValueError("teacher input binding interpretation mismatch")
+    elif value["schema"] == TEACHER_SUBMISSION_DOMAIN:
+        fields(value, ("schema", "observed_sequence", "execution_epoch", "execution_sequence", "job_sequence", "root_generation",
+            "source_cpu_question_sha256", "source_cpu_view_sha256", "teacher_question_sha256", "evaluation_namespace",
+            "teacher_binary_sha256", "teacher_profile_sha256", "root_restriction_sha256", "search_conditions_sha256",
+            "root_moves", "process", "uci_name", "uci_author", "rules_anchor", "interpretation"), "teacher owner submission")
+        for name in ("observed_sequence", "execution_epoch", "execution_sequence", "job_sequence", "root_generation"):
+            uint(value[name])
+        for name in ("source_cpu_question_sha256", "source_cpu_view_sha256", "teacher_question_sha256", "evaluation_namespace",
+                     "teacher_binary_sha256", "teacher_profile_sha256", "root_restriction_sha256", "search_conditions_sha256"):
+            sha(value[name])
+        _teacher_process(value["process"]); _anchor(value["rules_anchor"])
+        _teacher_text(value["uci_name"]); _teacher_text(value["uci_author"], optional=True)
+        moves = value["root_moves"]
+        if moves is not None:
+            if type(moves) is not list or not 1 <= len(moves) <= 256 or len(set(moves)) != len(moves):
+                raise ValueError("bounded unique teacher root restriction required")
+            for movement in moves:
+                _teacher_uci(movement)
+        if value["interpretation"] != TEACHER_INTERPRETATION + "; neural_review_not_read_by_teacher":
+            raise ValueError("teacher submission does not state its conditional endpoint scope")
+    elif value["schema"] == TEACHER_COMPLETION_DOMAIN:
+        fields(value, ("schema", "observed_sequence", "submission_observed_sequence", "execution_epoch", "execution_sequence",
+            "job_sequence", "root_generation", "source_scope_joined", "successful_owner_join", "evaluation_namespace",
+            "physical_process_identity", "teacher_binary_sha256", "teacher_profile_sha256", "exact_resume_supported",
+            "go_issue", "result", "original_question_target_eligible", "cancel_sequence"), "teacher owner completion")
+        for name in ("observed_sequence", "submission_observed_sequence", "execution_epoch", "execution_sequence", "job_sequence", "root_generation", "cancel_sequence"):
+            uint(value[name])
+        for name in ("evaluation_namespace", "teacher_binary_sha256", "teacher_profile_sha256"):
+            sha(value[name])
+        for name in ("source_scope_joined", "successful_owner_join", "exact_resume_supported", "original_question_target_eligible"):
+            if type(value[name]) is not bool:
+                raise ValueError("teacher owner completion flags require exact booleans")
+        if value["physical_process_identity"] is not None:
+            _teacher_process(value["physical_process_identity"])
+        if value["go_issue"] not in ("Issued", "NotIssued", "Unknown"):
+            raise ValueError("teacher raw go issuance state mismatch")
+        result = value["result"]
+        if type(result) is dict and set(result) == {"error"}:
+            _teacher_text(result["error"])
+            return value
+        fields(result, ("identity", "uci_name", "completion", "go_sequence", "go_issue", "best_move_move16",
+            "readiness_barrier_completed", "policy_target_known", "requested_multipv", "option_application_observed",
+            "reported_nodes", "opinions"), "teacher raw successful result")
+        _teacher_identity(result["identity"]); _teacher_text(result["uci_name"])
+        if result["completion"] not in ("Pending", "BestMove", "StoppedDeadline", "StoppedCanceled", "StoppedYield") or result["go_issue"] not in ("Issued", "NotIssued", "Unknown"):
+            raise ValueError("teacher raw terminal state mismatch")
+        for name in ("readiness_barrier_completed", "policy_target_known", "option_application_observed"):
+            if type(result[name]) is not bool:
+                raise ValueError("teacher raw result flags require exact booleans")
+        uint(result["go_sequence"]); uint(result["requested_multipv"], 4)
+        if result["reported_nodes"] is not None:
+            uint(result["reported_nodes"])
+        if result["best_move_move16"] is not None:
+            _moves([result["best_move_move16"]])
+        opinions = result["opinions"]
+        if type(opinions) is not list or len(opinions) > 4:
+            raise ValueError("bounded teacher raw opinion set required")
+        for opinion in opinions:
+            fields(opinion, ("rank", "depth", "seldepth", "score", "bound", "reported_wdl", "pv_move16", "pv"), "teacher raw opinion")
+            uint(opinion["rank"], 4); uint(opinion["depth"], 2**16 - 1)
+            if opinion["seldepth"] is not None:
+                uint(opinion["seldepth"], 2**16 - 1)
+            _teacher_text(opinion["score"])
+            if opinion["bound"] not in ("ExactReported", "Lower", "Upper", "Unknown"):
+                raise ValueError("teacher raw bound state mismatch")
+            if opinion["reported_wdl"] is not None:
+                values = opinion["reported_wdl"]
+                if type(values) is not list or len(values) != 3:
+                    raise ValueError("teacher raw WDL tuple mismatch")
+                for component in values:
+                    uint(component, 2**16 - 1)
+            if opinion["pv_move16"] is not None:
+                _moves(opinion["pv_move16"])
+            if type(opinion["pv"]) is not list or len(opinion["pv"]) > 256:
+                raise ValueError("bounded teacher raw UCI PV required")
+            for movement in opinion["pv"]:
+                _teacher_uci(movement)
+    else:
+        raise ValueError("unregistered teacher receipt domain")
+    return value
+
+
+class _RecoveredEvidence:
+    """Legacy in-memory authority index built once, never scanned per target."""
+    def __init__(self, values):
+        self.values = values
+        self.teacher_bindings, self.native_retirements = {}, {}
+        for identity, value in values.items():
+            if value["schema"] == TEACHER_INPUT_BINDING_DOMAIN:
+                key = (value["input_sha256"], value["policy_head_evidence_sha256"])
+                if key in self.teacher_bindings:
+                    raise ValueError("duplicate teacher input/source bindings")
+                self.teacher_bindings[key] = (identity, value)
+            elif value["schema"] == "rz-pals-generation-native-retirement-evidence/1" and value.get("accepted") is True:
+                key = sha(value["input_sha256"])
+                if key in self.native_retirements:
+                    raise ValueError("duplicate accepted original native retirements")
+                self.native_retirements[key] = identity
+
+    def get(self, key, default=None):
+        return self.values.get(key, default)
+
+    def teacher_input_binding(self, input_sha256, policy_head_evidence_sha256):
+        found = self.teacher_bindings.get((sha(input_sha256), sha(policy_head_evidence_sha256)))
+        if found is None:
+            raise ValueError("teacher policy missing actual input/source binding")
+        return found
+
+    def accepted_retirement(self, input_sha256):
+        found = self.native_retirements.get(sha(input_sha256))
+        if found is None:
+            raise ValueError("original teacher input lacks accepted native retirement")
+        return found
+
+
+def _teacher_policy_evidence(record, target, receipts):
+    """Admit a conditional opinion only after independent native/teacher joins.
+
+    The original selected NN input and teacher endpoint are joined through the
+    exact Rules anchor. The source CPU question/view may differ and is never
+    relabelled as the NN review the teacher supposedly consumed.
+    """
+    if record is None or not hasattr(receipts, "teacher_input_binding") or not hasattr(receipts, "accepted_retirement"):
+        raise ValueError("teacher policy requires original input and bounded recovered receipt index")
+    snapshot, input_sha = record["input"], record["input_sha256"]
+    binding_sha, binding = receipts.teacher_input_binding(input_sha, target["raw_evidence_sha256"])
+    validate_evidence_receipt(binding_sha, binding)
+    if (binding["input_sha256"] != input_sha or binding["policy_head_evidence_sha256"] != target["raw_evidence_sha256"]
+            or binding["rules_anchor"] != snapshot["rules_anchor"] or binding["observed_sequence"] != target["observed_sequence"]):
+        raise ValueError("teacher binding changed original input/head/anchor/chronology")
+    def recover(field, domain):
+        identity = sha(binding[field])
+        raw = receipts.get(identity)
+        validate_evidence_receipt(identity, raw)
+        if raw["schema"] != domain:
+            raise ValueError("teacher source receipt domain mismatch")
+        return raw
+    submitted = recover("teacher_submission_sha256", TEACHER_SUBMISSION_DOMAIN)
+    completed = recover("teacher_completion_sha256", TEACHER_COMPLETION_DOMAIN)
+    result = completed["result"]
+    if (not snapshot["capture_sequence"] < submitted["observed_sequence"] < target["observed_sequence"]
+            or completed["observed_sequence"] != target["observed_sequence"]
+            or completed["submission_observed_sequence"] != submitted["observed_sequence"]
+            or submitted["rules_anchor"] != snapshot["rules_anchor"]
+            or snapshot["worker_id"] != f"native-owner-{submitted['execution_epoch']}"):
+        raise ValueError("teacher source crossed original input chronology/Rules/process context")
+    for name in ("execution_epoch", "execution_sequence", "job_sequence", "root_generation", "evaluation_namespace"):
+        if submitted[name] != completed[name]:
+            raise ValueError("teacher original execution/job/root/namespace changed")
+    for name in ("teacher_binary_sha256", "teacher_profile_sha256"):
+        if submitted[name] != target[name] or completed[name] != target[name]:
+            raise ValueError("teacher registered binary/profile changed")
+    process = submitted["process"]
+    if (process != completed["physical_process_identity"] or not process["pid"] or not process["proc_start_ticks"]
+            or completed["successful_owner_join"] is not True or completed["source_scope_joined"] is not True
+            or completed["exact_resume_supported"] is not False or completed["go_issue"] != "Issued"
+            or completed["original_question_target_eligible"] is not True or completed["cancel_sequence"] != 0
+            or "error" in result or result["completion"] != "BestMove" or result["go_issue"] != "Issued"
+            or result["go_sequence"] != target["go_sequence"] or result["readiness_barrier_completed"] is not True
+            or result["policy_target_known"] is not True or result["identity"]["binary_sha256"] != target["teacher_binary_sha256"]
+            or result["uci_name"] != submitted["uci_name"] or _teacher_namespace(result["identity"]) != submitted["evaluation_namespace"]):
+        raise ValueError("teacher actual owner/go/readiness/identity source was not joined")
+    opinions = sorted(result["opinions"], key=lambda opinion: opinion["rank"])
+    if not opinions or result["requested_multipv"] != len(opinions):
+        raise ValueError("teacher completed opinion count differs from requested rank set")
+    ranked = []
+    for rank, opinion in enumerate(opinions, 1):
+        pv = opinion["pv_move16"]
+        if (opinion["rank"] != rank or opinion["depth"] != target["completed_depth"] or opinion["bound"] != "ExactReported"
+                or not pv or opinion["pv"] != [_move16_uci(movement) for movement in pv]):
+            raise ValueError("teacher opinion rank/depth/bound/PV serialization changed")
+        ranked.append(pv[0])
+    if ranked != target["ranked_moves"] or result["best_move_move16"] != ranked[0]:
+        raise ValueError("teacher policy differs from recovered complete ranked first moves")
+    if submitted["root_moves"] is not None and any(_move16_uci(movement) not in submitted["root_moves"] for movement in ranked):
+        raise ValueError("teacher ranked moves violate original registered root restriction")
+    from .generation_chunks import _native_chain
+    native = _native_chain(record, receipts, receipts.accepted_retirement(input_sha), with_details=True)
+    ticket = native["submission"]["ticket"]
+    if (snapshot["role"] == "validator"
+            or snapshot["selected_view"]["query"]["purpose"] not in ("propose_policy", "reply_policy", "repair_policy")
+            or ticket["epoch"] != submitted["execution_epoch"]
+            or ticket["root"] != submitted["root_generation"]):
+        raise ValueError("teacher conditional opinion crossed original native process/root authority")
 
 
 def wdl_target(snapshot, label):
@@ -520,8 +800,9 @@ class GenerationDataset:
         for membership_sha256, authority in trajectories.items():
             if sha(membership_sha256) != trajectory_digest(authority):
                 raise ValueError("actual trajectory membership seal mismatch")
+        lookup = _RecoveredEvidence(evidence)
         for record in records:
-            self._validate_published_record(record, producer, seals, games, trajectories, evidence)
+            self._validate_published_record(record, producer, seals, games, trajectories, lookup)
         split_rows, exclusions = split_records(records, opening_splits)
         self._records = copy.deepcopy(split_rows)
         self._producer = copy.deepcopy(producer)
@@ -540,7 +821,7 @@ class GenerationDataset:
             raise ValueError("input absent from actual producer publication")
         for head, target in record["future_targets"].items():
             if target is not None:
-                GenerationDataset._join_evidence(record["input_sha256"], head, target, evidence)
+                GenerationDataset._join_evidence(record["input_sha256"], head, target, evidence, record=record)
                 if head == "policy" and (target["teacher_binary_sha256"] != producer["teacher_binary_sha256"]
                                          or target["teacher_profile_sha256"] != producer["teacher_profile_sha256"]):
                     raise ValueError("conditional policy teacher differs from registered CPU_T")
@@ -558,12 +839,15 @@ class GenerationDataset:
                 raise ValueError("actual Rules termination evidence is missing or changed")
 
     @staticmethod
-    def _join_evidence(input_sha256, head, target, receipts):
+    def _join_evidence(input_sha256, head, target, receipts, *, record=None):
         content = {key: value for key, value in target.items() if key != "raw_evidence_sha256"}
         expected = {"schema": "rz-pals-generation-head-evidence/1", "input_sha256": input_sha256,
                     "head": head, "target": content}
-        if receipts.get(target["raw_evidence_sha256"]) != expected:
+        if (receipts.get(target["raw_evidence_sha256"]) != expected
+                or digest(expected["schema"], expected) != target["raw_evidence_sha256"]):
             raise ValueError("target differs from independently recovered full head evidence")
+        if head == "policy":
+            _teacher_policy_evidence(record, target, receipts)
         if head == "task":
             for outcome in target["outcomes"]:
                 # Only the bounded actual chunk reader can resolve a sealed

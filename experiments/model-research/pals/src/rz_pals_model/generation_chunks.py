@@ -19,7 +19,8 @@ from pathlib import Path, PurePosixPath
 
 from .generation_data import (ACTUAL_SOURCE, GenerationDataset, admit_phase, digest, fields,
                               identifier, sha, strict_json, trajectory_digest, uint, validate_record,
-                              _count_target_coverage, _admit_coverage, validate_evidence_receipt, _moves, TASKS)
+                              _count_target_coverage, _admit_coverage, validate_evidence_receipt, _moves, TASKS,
+                              TEACHER_INPUT_BINDING_DOMAIN)
 
 MANIFEST_DOMAIN = "rz-pals-generation-chunk-manifest/1"
 MAX_ROW_BYTES = 1024 * 1024
@@ -510,6 +511,25 @@ class _Lookup:
         found = self.owner._db.execute("SELECT seal FROM heads WHERE input_seal=? AND head=?", (sha(input_sha256), head)).fetchone()
         return None if found is None else (found[0], self.get(found[0]))
 
+    def teacher_input_binding(self, input_sha256, policy_head_evidence_sha256):
+        """Resolve one exact teacher/native input binding, never scan evidence.
+
+        The primary key keeps duplicate semantic bindings out of the bounded
+        index. Revalidation also binds the decoded immutable receipt to both
+        lookup keys before the consumer joins its native retirement chain.
+        """
+        keys = (sha(input_sha256), sha(policy_head_evidence_sha256))
+        found = self.owner._db.execute(
+            "SELECT seal FROM teacher_inputs WHERE input_seal=? AND head_seal=? LIMIT 2", keys).fetchmany(2)
+        if len(found) != 1:
+            raise ValueError("teacher policy needs exactly one sealed input binding")
+        seal = found[0][0]
+        receipt = validate_evidence_receipt(seal, self.get(seal))
+        if (receipt["schema"] != TEACHER_INPUT_BINDING_DOMAIN
+                or (receipt["input_sha256"], receipt["policy_head_evidence_sha256"]) != keys):
+            raise ValueError("teacher input binding index/raw authority mismatch")
+        return seal, receipt
+
     def action_group(self, input_sha256):
         found = self.owner._db.execute("SELECT seal FROM action_groups WHERE input_seal=?", (sha(input_sha256),)).fetchone()
         return None if found is None else self.get(found[0])
@@ -776,6 +796,8 @@ The index is regenerated in an explicitly supplied transient directory.
             CREATE TABLE action_authority(causal_seal TEXT PRIMARY KEY,seal TEXT UNIQUE);
             CREATE TABLE action_groups(input_seal TEXT PRIMARY KEY,group_seal TEXT UNIQUE,seal TEXT UNIQUE);
             CREATE TABLE heads(input_seal TEXT,head TEXT,seal TEXT UNIQUE,PRIMARY KEY(input_seal,head));
+            CREATE TABLE teacher_inputs(input_seal TEXT NOT NULL,head_seal TEXT NOT NULL,seal TEXT NOT NULL UNIQUE,
+                                        PRIMARY KEY(input_seal,head_seal));
             CREATE TABLE raw_records(input_seal TEXT PRIMARY KEY,chunk INTEGER,offset INTEGER,length INTEGER,row_seal TEXT);
             CREATE TABLE records(position INTEGER PRIMARY KEY,chunk INTEGER,offset INTEGER,length INTEGER,row_seal TEXT,
                                  input_seal TEXT UNIQUE,semantic_seal TEXT,valid_target INTEGER,physical_fresh INTEGER,role TEXT,split TEXT,
@@ -826,6 +848,9 @@ The index is regenerated in an explicitly supplied transient directory.
                         elif value["schema"] == HEAD_EVIDENCE_DOMAIN:
                             _head_receipt(value)
                             self._db.execute("INSERT INTO heads VALUES(?,?,?)", (value["input_sha256"], value["head"], seal))
+                        elif value["schema"] == TEACHER_INPUT_BINDING_DOMAIN:
+                            self._db.execute("INSERT INTO teacher_inputs VALUES(?,?,?)",
+                                             (sha(value["input_sha256"]), sha(value["policy_head_evidence_sha256"]), seal))
                     elif trajectory_digest(value) != seal:
                         raise ValueError("chunk trajectory seal mismatch")
                     self._db.execute(f"INSERT INTO {kind} VALUES(?,?,?,?)", (seal, index, offset, length))
