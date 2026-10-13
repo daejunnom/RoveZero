@@ -339,6 +339,54 @@ library 257개(147)가 통과했으며 각 원래 command의 종료 코드 0과 
 formatting 검사는 141·144에서 통과했다. 이 결과는 해당 working source 범위이며
 새 공유 SHA의 CI, 실제 G0 초기화·export·독립 reference·GPU 인수를 대신하지 않는다.
 
+### 최초 생성 전 선언과 생성 후 수치 범위의 분리
+
+아직 존재하지 않는 G0 weights·export·graph hash를 startup template에 미리 넣는
+순환 의존은 별도 `/2` bootstrap 경계에서 해소한다. 기존 `/1` 완료 template 경로와
+V5 startup·lock 검증은 유지한다. 최초 생성에 사용할 접점은
+[G0 bootstrap CLI](../crates/rz-arena/src/bin/pals-g0-bootstrap-numerical.rs)의
+`rz-pals-g0-bootstrap-numerical --execute --registration <등록한 절대 경로>
+--registration-sha256 <원래 SHA-256>`다. 정확한 인수 묶음과 Linux 실행 환경이 없으면
+입력 읽기·자식 실행 전에 거부한다.
+
+[최초 선언](../crates/rz-arena/src/pals_collect_v3/g0_bootstrap_process.rs)은
+`rz-pals-g0-bootstrap-numerical-launch/2`, `rz-pals-g0-pre-init-numerical-scope/2`,
+`rz-pals-g0-numerical-cases/2`, `rz-pals-g0-native-capture-recipe/2`로 구분한다.
+이미 존재하는 source·Rules·Python·ORT/CUDA 입력과 private 실행 경로·자원·유한 기한만
+등록한다. 모델 recipe와 case spec에는 미래 weights·export·graphs·model epoch 필드가
+없으며 추가 필드도 거부한다. CPU_T나 전체 startup·lock을 가상의 값으로 채우지 않는다.
+
+원래 parent는 seed 23·optimizer update 0의 실제 초기화와 Collection P/C/V export를
+수행한 prepare child의 출력 descriptor를 검증한다. 그 후에만 실제 weights·export·
+graph pin과 모델 namespace epoch 1을 결합한 수치 범위를 만든다. epoch 1은 초기 모델의
+cache namespace이며 학습 횟수가 아니다. 독립 reference와 native capture는 이 실제
+범위와 동일한 sealed case 순서·입력을 사용한다. 순수 Python case factory는 Collection의
+18개 그룹·150개 사례를 준비하지만 framework·모델·추론을 실행하지 않는다.
+
+[수치 전용 scope](../crates/rz-experiments/src/pals_startup_v5/content_admission/numerical_scope.rs)는
+기존 수치 core의 입력 bytes·합법 후보 순서·Fresh B1·FP32·TF32 off·coverage·허용 오차와
+물리 완료 검사를 재사용한다. 이 scope와 반환 opaque owner에는 전체 startup·lock·
+CPU_T·학습·수집·대국 권한이 없다. 기존 full-config API의 projection은 같은 core를
+사용하며 full startup의 별도 검증과 Frozen Collection의 Warm 거부는 유지한다.
+
+최초 등록 FD·원래 process·deadline·잔여 read credit은 prepare→reference→native→
+최종 저장까지 같은 owner가 보유한다. acceptance·parent receipt의 create-new FD는
+쓰기·동기화 전에 실패 custody에 들어가며, 검증 성공 후 같은 FD만 성공 목록으로
+이동한다. 최종 저장 이후에도 원래 cancel과 whole deadline을 확인한 뒤에만 성공
+owner를 발급한다. partial·빈 파일·미검증 FD와 물리 완료 unknown은 실패 자료로 남긴다.
+parent receipt의 `charged_read_bytes`는 자체 publication/readback 전 snapshot이며,
+같은 owner의 실제 read ledger는 그 후 비용도 계속 계수한다.
+
+소스·metadata·CPU 검사를 통과했다는 사실과 실제 G0 초기화·export·Torch/ORT/Rust
+수치·GPU 인수는 각각 따로 기록한다. 최초 bootstrap 성공을 실제 학습 세대 완료나
+전체 UCI readiness·대국 인수로 바꾸지 않는다.
+
+2026-10-14 소스 검사에서는 Linux의 experiments default/types/admission 215/237/238개와
+bootstrap 6개, Windows arena all-features 263개가 통과했다. 두 OS의 strict Clippy와
+framework 실행을 차단한 Python metadata 17/16개도 통과했다. Linux 전체 arena의
+fixture ID 실패는 제품 검증을 유지한 채 fixture만 수정하고 해당 6개를 재검사했다.
+이는 실제 최초 생성·신경망 수치·CUDA·정상 종료 인수를 대신하지 않는다.
+
 ### 실제 학습 세대의 원래 소유자
 
 실제 세대 실행은 같은 원래 128판 archive 소유자를 P/C 학습·V action 수집·V 학습에

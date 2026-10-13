@@ -241,9 +241,9 @@ pub struct G0NumericalFailureV5 {
     pub read_usage_uncertain: bool,
     pub registration_pin: Option<Pin>,
     // The original registration survives failures before staging preparation.
-    _registration: Option<File>,
+    pub(in crate::pals_collect_v3) _registration: Option<File>,
     #[cfg(target_os = "linux")]
-    _held: Option<super::training_process::LinuxHeld>,
+    pub(in crate::pals_collect_v3) _held: Option<super::training_process::LinuxHeld>,
 }
 impl std::fmt::Debug for G0NumericalFailureV5 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -285,7 +285,7 @@ pub fn run_g0_numerical_original_v5(
 }
 
 #[cfg(target_os = "linux")]
-mod linux {
+pub(super) mod linux {
     use super::super::{numerical_process as numerical, training_process as common};
     use super::*;
     use crate::process::{
@@ -324,14 +324,59 @@ mod linux {
         "initialization_evidence.py",
     ];
 
-    struct Running {
-        registration_pin: Option<Pin>,
-        registration: Option<File>,
-        held: Option<LinuxHeld>,
-        processes: Vec<OriginalProcessOutput>,
-        receipts: Vec<Value>,
-        preservation: Vec<Value>,
-        account: Arc<ReadAccounting>,
+    /// Neutral live process/descriptor custody shared by the completed-template
+    /// path and first-initialization bootstrap. This is not a decoded capability.
+    pub(in crate::pals_collect_v3) struct Running {
+        pub(in crate::pals_collect_v3) registration_pin: Option<Pin>,
+        pub(in crate::pals_collect_v3) registration: Option<File>,
+        pub(in crate::pals_collect_v3) held: Option<LinuxHeld>,
+        pub(in crate::pals_collect_v3) processes: Vec<OriginalProcessOutput>,
+        pub(in crate::pals_collect_v3) receipts: Vec<Value>,
+        pub(in crate::pals_collect_v3) preservation: Vec<Value>,
+        pub(in crate::pals_collect_v3) account: Arc<ReadAccounting>,
+    }
+
+    /// Actual common execution fields, deliberately excluding a completed
+    /// startup template, generated artifact refs and any generation authority.
+    pub(in crate::pals_collect_v3) struct OriginalG0Scope {
+        pub(in crate::pals_collect_v3) numerical_id: String,
+        pub(in crate::pals_collect_v3) source_commit: String,
+        pub(in crate::pals_collect_v3) python_runtime: GenerationTrainingPythonRuntimeV3,
+        pub(in crate::pals_collect_v3) runtime_module_pins: Vec<Pin>,
+        pub(in crate::pals_collect_v3) native_executable: Pin,
+        pub(in crate::pals_collect_v3) staging_root: PathBuf,
+        pub(in crate::pals_collect_v3) initialization_directory: PathBuf,
+        pub(in crate::pals_collect_v3) export_directory: PathBuf,
+        pub(in crate::pals_collect_v3) reference_output_root: PathBuf,
+        pub(in crate::pals_collect_v3) native_output_root: PathBuf,
+        pub(in crate::pals_collect_v3) prepare_receipt_path: PathBuf,
+        pub(in crate::pals_collect_v3) reference_receipt_path: PathBuf,
+        pub(in crate::pals_collect_v3) parent_receipt_path: PathBuf,
+        pub(in crate::pals_collect_v3) cudnn_conv_search: String,
+        pub(in crate::pals_collect_v3) max_wall_ns: u64,
+        pub(in crate::pals_collect_v3) max_output_bytes: u64,
+    }
+    impl From<&G0NumericalLaunchRegistrationV5> for OriginalG0Scope {
+        fn from(r: &G0NumericalLaunchRegistrationV5) -> Self {
+            Self {
+                numerical_id: r.numerical_id.clone(),
+                source_commit: r.source_commit.clone(),
+                python_runtime: r.python_runtime.clone(),
+                runtime_module_pins: r.runtime_module_pins.clone(),
+                native_executable: r.native_executable.clone(),
+                staging_root: r.staging_root.clone(),
+                initialization_directory: r.initialization_directory.clone(),
+                export_directory: r.export_directory.clone(),
+                reference_output_root: r.reference_output_root.clone(),
+                native_output_root: r.native_output_root.clone(),
+                prepare_receipt_path: r.prepare_receipt_path.clone(),
+                reference_receipt_path: r.reference_receipt_path.clone(),
+                parent_receipt_path: r.parent_receipt_path.clone(),
+                cudnn_conv_search: r.cudnn_conv_search.clone(),
+                max_wall_ns: r.max_wall_ns,
+                max_output_bytes: r.max_output_bytes,
+            }
+        }
     }
     pub(super) fn run(
         path: &Path,
@@ -555,7 +600,7 @@ mod linux {
         let initialization_sources = serde_json::json!({"schema":"rz-pals-g0-initialization-sources/1","source_commit":registration.source_commit,"pins":initializer_pins});
         let prepare_inputs = serde_json::json!({"rules_profile":registration.rules_profile,"case_plan_template":registration.case_plan});
         let prepare_receipt = child(
-            &registration,
+            &OriginalG0Scope::from(&registration),
             "prepare",
             prepare_inputs,
             &sources,
@@ -623,7 +668,7 @@ mod linux {
             "export_manifest":pin_value(&outputs["export_manifest"])?,"export_graphs":graph_pin_values(&outputs["export_graphs"])?,
             "cuda_control_inventory":pin_value(&outputs["cuda_control_inventory"])?});
         let reference_receipt = child(
-            &registration,
+            &OriginalG0Scope::from(&registration),
             "reference",
             reference_inputs,
             &sources,
@@ -637,7 +682,7 @@ mod linux {
             &mut credit,
         )?;
         let references = hold_reference_outputs(
-            &registration,
+            &OriginalG0Scope::from(&registration),
             &reference_receipt,
             &plan,
             running.held.as_mut().expect("G0 custody"),
@@ -671,12 +716,12 @@ mod linux {
         )
     }
 
-    fn pin_value(value: &Value) -> Result<Value, ArenaError> {
+    pub(in crate::pals_collect_v3) fn pin_value(value: &Value) -> Result<Value, ArenaError> {
         let observed: ObservedFile =
             serde_json::from_value(value.clone()).map_err(|e| invalid(e.to_string()))?;
         serde_json::to_value(observed.pin()).map_err(|e| invalid(e.to_string()))
     }
-    fn graph_pin_values(value: &Value) -> Result<Value, ArenaError> {
+    pub(in crate::pals_collect_v3) fn graph_pin_values(value: &Value) -> Result<Value, ArenaError> {
         let graphs = value
             .as_array()
             .ok_or_else(|| invalid("G0 exact graph outputs absent"))?;
@@ -769,8 +814,8 @@ mod linux {
         clippy::too_many_arguments,
         reason = "One original execution owns all phase clocks and file/process custody"
     )]
-    fn child(
-        r: &G0NumericalLaunchRegistrationV5,
+    pub(in crate::pals_collect_v3) fn child(
+        r: &OriginalG0Scope,
         phase: &str,
         inputs: Value,
         sources: &BTreeMap<String, String>,
@@ -812,6 +857,10 @@ mod linux {
             "G0 bounded original startup",
         )?;
         let held = running.held.as_mut().expect("G0 original phase custody");
+        // Freeze only registered output names from the already held original
+        // plan before dispatch. A post-child plan pathname/read failure must
+        // never prevent custody of the child's receipt or partial outputs.
+        let output_targets = freeze_child_output_targets(r, phase, &inputs, held, credit)?;
         numerical::ensure_output_credit(
             &held.staging,
             r.max_output_bytes,
@@ -883,71 +932,10 @@ mod linux {
         let result = (|| -> Result<Value, ArenaError> {
             let credit = &mut cleanup_credit;
             let original = running.processes.last().expect("actual original G0 child");
-            let mut targets = vec![
-                (receipt_path.clone(), MAX_JSON),
-                (receipt_path.with_extension("json.partial"), MAX_JSON),
-            ];
-            if phase == "prepare" {
-                for (directory, names) in [
-                    (
-                        &r.initialization_directory,
-                        &[
-                            "untrained.pt",
-                            "untrained.pt.partial",
-                            "checkpoint.json",
-                            "checkpoint.json.partial",
-                            "g0-initialization-evidence.json",
-                            "g0-initialization-evidence.json.partial",
-                            "pals-artifact-owner.json",
-                        ][..],
-                    ),
-                    (
-                        &r.export_directory,
-                        &[
-                            "public_memory.onnx",
-                            "public_memory.onnx.partial",
-                            "shared_pc_if.onnx",
-                            "shared_pc_if.onnx.partial",
-                            "role_validator.onnx",
-                            "role_validator.onnx.partial",
-                            "export.json",
-                            "export.json.partial",
-                            "cuda-control-inventory.json",
-                            "cuda-control-inventory.json.partial",
-                            "pals-artifact-owner.json",
-                        ][..],
-                    ),
-                ] {
-                    targets.extend(names.iter().map(|name| (directory.join(name), MAX_FILE)));
-                }
-            } else {
-                let plan_pin: Pin = serde_json::from_value(inputs["case_plan"].clone())
-                    .map_err(|e| invalid(e.to_string()))?;
-                let plan_file = common::open_file(&plan_pin.path)?;
-                let plan: Value =
-                    common::decode(&common::verify_bytes(&plan_file, &plan_pin, true, credit)?)?;
-                for group in plan["groups"]
-                    .as_array()
-                    .ok_or_else(|| invalid("G0 registered reference groups"))?
-                {
-                    let id = group["id"]
-                        .as_str()
-                        .ok_or_else(|| invalid("G0 registered group ID"))?;
-                    targets.push((
-                        r.reference_output_root.join(format!("reference.{id}.json")),
-                        MAX_JSON,
-                    ));
-                    targets.push((
-                        r.reference_output_root
-                            .join(format!("reference.{id}.json.partial")),
-                        MAX_JSON,
-                    ));
-                }
-            }
             let checkpoint_temporary =
                 (phase == "prepare").then(|| r.initialization_directory.join("untrained.pt"));
             let preservation = common::preserve_original_outputs(
-                &targets,
+                &output_targets,
                 checkpoint_temporary.as_deref(),
                 receipt_path,
                 running.held.as_mut().expect("G0 original output custody"),
@@ -994,7 +982,120 @@ mod linux {
         result
     }
 
-    fn limits(started: Instant, until: Instant) -> Result<ProcessLimits, ArenaError> {
+    fn freeze_child_output_targets(
+        r: &OriginalG0Scope,
+        phase: &str,
+        inputs: &Value,
+        held: &LinuxHeld,
+        credit: &mut ReadCredit<'_>,
+    ) -> Result<Vec<(PathBuf, u64)>, ArenaError> {
+        let receipt_path = if phase == "prepare" {
+            &r.prepare_receipt_path
+        } else {
+            &r.reference_receipt_path
+        };
+        let mut targets = vec![
+            (receipt_path.clone(), MAX_JSON),
+            (receipt_path.with_extension("json.partial"), MAX_JSON),
+        ];
+        if phase == "prepare" {
+            for (directory, names) in [
+                (
+                    &r.initialization_directory,
+                    &[
+                        "untrained.pt",
+                        "untrained.pt.partial",
+                        "checkpoint.json",
+                        "checkpoint.json.partial",
+                        "g0-initialization-evidence.json",
+                        "g0-initialization-evidence.json.partial",
+                        "pals-artifact-owner.json",
+                    ][..],
+                ),
+                (
+                    &r.export_directory,
+                    &[
+                        "public_memory.onnx",
+                        "public_memory.onnx.partial",
+                        "shared_pc_if.onnx",
+                        "shared_pc_if.onnx.partial",
+                        "role_validator.onnx",
+                        "role_validator.onnx.partial",
+                        "export.json",
+                        "export.json.partial",
+                        "cuda-control-inventory.json",
+                        "cuda-control-inventory.json.partial",
+                        "pals-artifact-owner.json",
+                    ][..],
+                ),
+            ] {
+                targets.extend(names.iter().map(|name| (directory.join(name), MAX_FILE)));
+            }
+        } else {
+            let plan_pin: Pin = serde_json::from_value(inputs["case_plan"].clone())
+                .map_err(|e| invalid(e.to_string()))?;
+            plan_pin.validate(MAX_JSON)?;
+            let mut plan_files = held
+                .inputs
+                .iter()
+                .chain(held.checkpoints.iter())
+                .filter(|file| file.pin == plan_pin);
+            let plan_file = plan_files
+                .next()
+                .ok_or_else(|| invalid("G0 original submitted case plan descriptor absent"))?;
+            check(
+                plan_files.next().is_none(),
+                "G0 original submitted case plan owner is ambiguous",
+            )?;
+            check(
+                common::same_named(&plan_pin, &plan_file.file)? == plan_file.identity,
+                "G0 original submitted case plan inode changed",
+            )?;
+            let plan: Value = common::decode(&common::verify_bytes(
+                &plan_file.file,
+                &plan_pin,
+                true,
+                credit,
+            )?)?;
+            targets.extend(reference_output_targets(&r.reference_output_root, &plan)?);
+        }
+        Ok(targets)
+    }
+
+    pub(super) fn reference_output_targets(
+        output_root: &Path,
+        submitted_plan: &Value,
+    ) -> Result<Vec<(PathBuf, u64)>, ArenaError> {
+        let groups = submitted_plan["groups"]
+            .as_array()
+            .ok_or_else(|| invalid("G0 registered reference groups"))?;
+        check(
+            !groups.is_empty() && groups.len() <= 18,
+            "G0 bounded original submitted reference groups",
+        )?;
+        let mut ids = BTreeSet::new();
+        let mut targets = Vec::with_capacity(groups.len() * 2);
+        for group in groups {
+            let id = group["id"]
+                .as_str()
+                .ok_or_else(|| invalid("G0 registered group ID"))?;
+            check(
+                common::plain_name(id) && ids.insert(id),
+                "G0 unique original submitted output group name",
+            )?;
+            targets.push((output_root.join(format!("reference.{id}.json")), MAX_JSON));
+            targets.push((
+                output_root.join(format!("reference.{id}.json.partial")),
+                MAX_JSON,
+            ));
+        }
+        Ok(targets)
+    }
+
+    pub(in crate::pals_collect_v3) fn limits(
+        started: Instant,
+        until: Instant,
+    ) -> Result<ProcessLimits, ArenaError> {
         Ok(ProcessLimits {
             wall_ms: u64::try_from(until.duration_since(started).as_nanos().div_ceil(1_000_000))
                 .map_err(|_| invalid("G0 wall milliseconds overflow"))?
@@ -1004,7 +1105,7 @@ mod linux {
             max_child_processes: 1,
         })
     }
-    fn watch(r: &G0NumericalLaunchRegistrationV5) -> OwnedArtifactTreeWatch {
+    pub(in crate::pals_collect_v3) fn watch(r: &OriginalG0Scope) -> OwnedArtifactTreeWatch {
         OwnedArtifactTreeWatch {
             max_total_bytes: r.max_output_bytes,
             max_file_bytes: MAX_FILE,
@@ -1028,8 +1129,8 @@ mod linux {
         clippy::too_many_arguments,
         reason = "Original child verification binds exact envelope, source and live process evidence"
     )]
-    fn verify_child(
-        r: &G0NumericalLaunchRegistrationV5,
+    pub(in crate::pals_collect_v3) fn verify_child(
+        r: &OriginalG0Scope,
         phase: &str,
         summary: &Value,
         receipt: &Value,
@@ -1259,7 +1360,7 @@ mod linux {
         Ok(())
     }
 
-    fn hold_observed(
+    pub(in crate::pals_collect_v3) fn hold_observed(
         value: &Value,
         expected_path: &Path,
         cap: u64,
@@ -1281,7 +1382,7 @@ mod linux {
         held.checkpoints.push(file);
         Ok(pin)
     }
-    fn startup_asset(
+    pub(in crate::pals_collect_v3) fn startup_asset(
         pin: &Pin,
         cwd: &Path,
         purpose: Purpose,
@@ -1460,9 +1561,18 @@ mod linux {
         limit: usize,
         credit: &mut ReadCredit<'_>,
     ) -> Result<Vec<u8>, rz_experiments::ManifestError> {
+        read_assets(&config.assets, cwd, held, artifact, limit, credit)
+    }
+    pub(in crate::pals_collect_v3) fn read_assets(
+        assets: &[PalsStartupAssetV5],
+        cwd: &Path,
+        held: &LinuxHeld,
+        artifact: &ArtifactRef,
+        limit: usize,
+        credit: &mut ReadCredit<'_>,
+    ) -> Result<Vec<u8>, rz_experiments::ManifestError> {
         let fail = |s: &str| rz_experiments::ManifestError::Artifact(s.into());
-        let asset = config
-            .assets
+        let asset = assets
             .iter()
             .find(|a| &a.artifact == artifact)
             .ok_or_else(|| fail("G0 read requested an undeclared asset"))?;
@@ -1485,8 +1595,8 @@ mod linux {
         common::verify_bytes(&original.file, &original.pin, true, credit)
             .map_err(|e| fail(&e.to_string()))
     }
-    fn hold_reference_outputs(
-        r: &G0NumericalLaunchRegistrationV5,
+    pub(in crate::pals_collect_v3) fn hold_reference_outputs(
+        r: &OriginalG0Scope,
         receipt: &Value,
         plan: &Value,
         held: &mut LinuxHeld,
@@ -1570,6 +1680,37 @@ mod linux {
             "G0 original native deadline exhausted",
         )?;
         numerical::validate_capture_inputs(&capture, config, cwd_path, &r.staging_root)?;
+        execute_native(
+            &OriginalG0Scope::from(r),
+            capture,
+            plan,
+            started,
+            until,
+            cleanup_until,
+            cancel,
+            running,
+            credit,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Original process clock and custody are shared, not reconstructed from JSON"
+    )]
+    pub(in crate::pals_collect_v3) fn execute_native(
+        r: &OriginalG0Scope,
+        capture: numerical::NativeCaptureConfig,
+        plan: &Value,
+        started: Instant,
+        until: Instant,
+        cleanup_until: Instant,
+        cancel: &AtomicBool,
+        running: &mut Running,
+        credit: &mut ReadCredit<'_>,
+    ) -> Result<(), ArenaError> {
+        credit.until = until;
+        credit.take(0)?;
+        let held = running.held.as_mut().expect("G0 original native custody");
         let raw = serde_json::to_vec(&capture).map_err(|e| invalid(e.to_string()))?;
         numerical::ensure_output_credit(
             &held.staging,
@@ -1826,8 +1967,8 @@ mod linux {
                 cleanup_until,
                 &preserve_cancel,
             )?;
-            let file = common::write_owned_new(&r.acceptance_path, &raw)?;
-            let acceptance_pin = file.pin.clone();
+            let acceptance_pin =
+                common::write_original_owned_new(&r.acceptance_path, &raw, held, credit)?;
             let relative = r
                 .acceptance_path
                 .strip_prefix(cwd)
@@ -1840,7 +1981,6 @@ mod linux {
                 relative,
                 Purpose::NumericalAcceptance,
             ));
-            held.checkpoints.push(file);
             config.validate_against(&lock)?;
             let mut read = |artifact: &ArtifactRef, limit: usize| {
                 read_asset(&config, cwd, held, artifact, limit, credit)
@@ -1888,8 +2028,10 @@ mod linux {
                 cleanup_until,
                 &preserve_cancel,
             )?;
-            held.checkpoints
-                .push(common::write_owned_new(&r.parent_receipt_path, &raw)?);
+            common::write_original_owned_new(&r.parent_receipt_path, &raw, held, credit)?;
+            // Final issuance, unlike failure preservation, uses the original
+            // cancel and the existing whole deadline with no clock/credit reset.
+            common::check_original_g0_issue(credit, cancel)?;
             Ok((config, lock, admission, acceptance_pin, parent))
         })();
         credit.remaining = cleanup_credit.remaining;
@@ -1966,6 +2108,32 @@ mod tests {
         let mut input_alias = valid;
         input_alias.case_plan.path = input_alias.export_directory.join("cases.json");
         assert!(input_alias.validate().is_err());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_failure_targets_keep_submitted_order_without_post_child_plan_lookup() {
+        let root = Path::new("/original/reference");
+        let mut submitted = serde_json::json!({"groups":[{"id":"proposerL8"},{"id":"criticL8"}]});
+        let frozen = linux::reference_output_targets(root, &submitted).unwrap();
+        // These paths remain available for receipt-first failure preservation
+        // even if the plan pathname disappears or its later JSON is invalid.
+        submitted["groups"] = Value::Null;
+        assert!(linux::reference_output_targets(root, &submitted).is_err());
+        assert_eq!(frozen.len(), 4);
+        assert_eq!(frozen[0].0, root.join("reference.proposerL8.json"));
+        assert_eq!(frozen[1].0, root.join("reference.proposerL8.json.partial"));
+        assert_eq!(frozen[2].0, root.join("reference.criticL8.json"));
+        assert!(frozen.iter().all(|(_, cap)| *cap == MAX_JSON));
+        for groups in [
+            serde_json::json!([{ "id":"../other" }]),
+            serde_json::json!([{ "id":"same" },{ "id":"same" }]),
+            serde_json::json!([]),
+        ] {
+            assert!(
+                linux::reference_output_targets(root, &serde_json::json!({"groups":groups}))
+                    .is_err()
+            );
+        }
     }
     #[cfg(not(target_os = "linux"))]
     #[test]

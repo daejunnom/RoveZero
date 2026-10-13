@@ -83,6 +83,10 @@ mod g0_numerical_process;
 #[cfg(feature = "pals-collection-onnx")]
 pub use g0_numerical_process::*;
 #[cfg(feature = "pals-collection-onnx")]
+mod g0_bootstrap_process;
+#[cfg(feature = "pals-collection-onnx")]
+pub use g0_bootstrap_process::*;
+#[cfg(feature = "pals-collection-onnx")]
 mod generation_pipeline;
 #[cfg(feature = "pals-collection-onnx")]
 pub use generation_pipeline::*;

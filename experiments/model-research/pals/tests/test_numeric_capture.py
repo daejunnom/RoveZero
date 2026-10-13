@@ -35,6 +35,18 @@ def bindings(collection=False, cuda=False):
         "source_components":{name:"09"*32 for name in ("model_native","model_encoding","nn_runtime","model_reference","model_export")}}
 
 
+def g0_immutable_bindings(cuda=False):
+    """Metadata fixture only: do not invent any future G0 asset identity."""
+    from rz_pals_model.virtual_review import registered_encoding_sha256
+    return {"model_profile":"virtual_review_v1", "model_schema":"rovezero.pals-model.v3",
+        "model_semantics":"rovezero.pals-model-semantics.v3", "encoding_schema":"rovezero.pals-virtual-review.v1",
+        "model_semantic_sha256":"01"*32, "encoding_sha256":registered_encoding_sha256(),
+        "runtime_library_sha256":"06"*32, "cuda_libraries":["07"*32] if cuda else [],
+        "cuda_manifest_sha256":"08"*32 if cuda else None,
+        "backend":"ort_cuda" if cuda else "ort_cpu", "precision":"fp32", "tf32":False,
+        "source_components":{name:"09"*32 for name in ("model_native","model_encoding","nn_runtime","model_reference","model_export")}}
+
+
 def first_payload():
     return capture.python_input(capture.make_case_plan(bindings())["groups"][0]["cases"][0]["input"]["input"])
 
@@ -99,6 +111,81 @@ class NumericCaptureTests(unittest.TestCase):
                 ids.extend(case["id"] for case in group["cases"])
             self.assertEqual(len(ids),len(set(ids)))
             self.assertNotIn("passed",plan); self.assertNotIn("physical_completion_known",plan)
+
+    def test_g0_bootstrap_is_exact_independent_preparation_without_future_assets(self):
+        exact = {"model_profile","model_schema","model_semantics","encoding_schema","model_semantic_sha256",
+                 "encoding_sha256","runtime_library_sha256","cuda_libraries","cuda_manifest_sha256",
+                 "backend","precision","tf32","source_components"}
+        for cuda in (False,True):
+            original = g0_immutable_bindings(cuda)
+            with patch.object(capture,"make_case_plan",side_effect=AssertionError("full asset binding is unavailable before prepare")), \
+                    patch.object(capture,"capture_reference",side_effect=AssertionError("pure /2 metadata must not execute")):
+                result = capture.make_g0_bootstrap_case_spec(original)
+            self.assertEqual(list(result),["schema","immutable_bindings","groups"])
+            self.assertEqual(result["schema"],"rz-pals-g0-numerical-cases/2")
+            self.assertEqual(set(result["immutable_bindings"]),exact)
+            self.assertEqual(result["immutable_bindings"],original)
+            self.assertFalse({"model_epoch","weights_sha256","export_manifest_sha256","graphs"} & set(result["immutable_bindings"]))
+            self.assertFalse({"passed","trained","optimizer_updates","native_ran","physical_completion_known"} & set(result))
+            result["immutable_bindings"]["source_components"]["model_native"] = "aa"*32
+            self.assertNotEqual(result["immutable_bindings"],original)
+
+    def test_g0_groups_preserve_legacy_collection_case_content_and_order(self):
+        spec = capture.make_g0_bootstrap_case_spec(g0_immutable_bindings())
+        legacy = capture.make_case_plan(bindings(collection=True))
+        canonical = lambda value: json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=False,allow_nan=False).encode("utf-8")
+        self.assertEqual(canonical(spec["groups"]),canonical(legacy["groups"]))
+        self.assertEqual([group["id"] for group in spec["groups"]],
+                         [f"{role}.L{bucket}" for role in ("proposer","critic","validator") for bucket in (8,16,32,64,128,256)])
+        self.assertEqual(sum(len(group["cases"]) for group in spec["groups"]),150)
+        self.assertEqual(sum(".L" in case["id"] for group in spec["groups"] for case in group["cases"]),144)
+        self.assertEqual(list(legacy),["schema_version","domain","bindings","invocation","batch","groups"])
+        self.assertEqual(legacy["domain"],"rz-pals-numerical-case-plan-v5/1")
+        self.assertEqual(capture.validate_case_plan(legacy),150)
+        self.assertEqual(legacy["invocation"],"fresh"); self.assertEqual(legacy["batch"],1)
+        for group in spec["groups"]:
+            self.assertEqual(list(group),["id","role","line_bucket","cases"])
+            if group["line_bucket"] == 8:
+                self.assertEqual([case["id"] for case in group["cases"][-2:]],
+                                 [group["role"]+".empty",group["role"]+".order_reversed"])
+            for case in group["cases"]:
+                capture.python_input(case["input"]["input"])
+        spec["groups"][0]["cases"][0]["input"]["input"]["candidates"].reverse()
+        self.assertNotEqual(spec["groups"],capture.make_g0_bootstrap_case_spec(g0_immutable_bindings())["groups"])
+
+    def test_g0_bootstrap_rejects_generated_fields_and_incomplete_immutable_identity(self):
+        for field in ("model_epoch","weights_sha256","export_manifest_sha256","graphs"):
+            bad = g0_immutable_bindings(); bad[field] = None
+            with self.assertRaisesRegex(ValueError,"without generated assets"):
+                capture.make_g0_bootstrap_case_spec(bad)
+        for field in g0_immutable_bindings():
+            bad = g0_immutable_bindings(); bad.pop(field)
+            with self.assertRaisesRegex(ValueError,"exact immutable"):
+                capture.make_g0_bootstrap_case_spec(bad)
+        for change in (lambda b: b.update(model_profile="legacy"), lambda b: b.update(model_schema="rovezero.pals-model.v2"),
+                       lambda b: b.update(model_semantics="other"), lambda b: b.update(encoding_schema="other"),
+                       lambda b: b.update(tf32=0), lambda b: b.update(tf32=True), lambda b: b.update(precision="fp16"),
+                       lambda b: b.update(backend="cuda"), lambda b: b.update(encoding_sha256="02"*32),
+                       lambda b: b.update(model_semantic_sha256="not-a-pin"), lambda b: b.update(runtime_library_sha256="not-a-pin"),
+                       lambda b: b["source_components"].pop("model_reference"),
+                       lambda b: b["source_components"].update(extra_source="01"*32),
+                       lambda b: b["source_components"].update(model_native="not-a-pin")):
+            bad = g0_immutable_bindings(); change(bad)
+            with self.assertRaises(ValueError): capture.make_g0_bootstrap_case_spec(bad)
+        with self.assertRaises(ValueError): capture.make_g0_bootstrap_case_spec(None)
+
+    def test_g0_bootstrap_cpu_cuda_bundle_identities_are_not_interchangeable(self):
+        for change in (lambda b: b.update(cuda_libraries=["07"*32]), lambda b: b.update(cuda_manifest_sha256="08"*32)):
+            bad = g0_immutable_bindings(); change(bad)
+            with self.assertRaisesRegex(ValueError,"CPU G0"):
+                capture.make_g0_bootstrap_case_spec(bad)
+        for libraries in (None,[],["not-a-pin"],["07"*32,"07"*32]):
+            bad = g0_immutable_bindings(cuda=True); bad["cuda_libraries"] = libraries
+            with self.assertRaises(ValueError): capture.make_g0_bootstrap_case_spec(bad)
+        for manifest in (None,"not-a-pin"):
+            bad = g0_immutable_bindings(cuda=True); bad["cuda_manifest_sha256"] = manifest
+            with self.assertRaisesRegex(ValueError,"already registered native bundle"):
+                capture.make_g0_bootstrap_case_spec(bad)
 
     def test_typed_move_codec_is_an_independent_copy_and_roundtrips(self):
         original = first_payload(); typed = capture.rust_input(original)

@@ -870,6 +870,152 @@ pub(super) fn write_owned_new(path: &Path, raw: &[u8]) -> Result<HeldFile, Arena
         },
     })
 }
+/// Final G0 issuance reconnects the original cancellation signal after
+/// preservation. It checks the existing whole deadline and ledger as-is.
+#[cfg(target_os = "linux")]
+pub(super) fn check_original_g0_issue<'a>(
+    credit: &mut ReadCredit<'a>,
+    original_cancel: &'a AtomicBool,
+) -> Result<(), ArenaError> {
+    credit.cancel = original_cancel;
+    credit.take(0)
+}
+/// G0 final publications retain the original create-new descriptor before any
+/// write, sync, metadata or byte verification can fail. This is not a training
+/// issuer and deliberately leaves the legacy general-purpose writer unchanged.
+#[cfg(target_os = "linux")]
+pub(super) fn write_original_owned_new(
+    path: &Path,
+    raw: &[u8],
+    held: &mut LinuxHeld,
+    credit: &mut ReadCredit<'_>,
+) -> Result<GenerationTrainingFilePinV3, ArenaError> {
+    write_original_owned_new_with(path, raw, held, credit, |_, _| Ok(()))
+}
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OriginalWriteStage {
+    Created,
+    Synced,
+}
+#[cfg(target_os = "linux")]
+fn write_original_owned_new_with(
+    path: &Path,
+    raw: &[u8],
+    held: &mut LinuxHeld,
+    credit: &mut ReadCredit<'_>,
+    mut observe: impl FnMut(OriginalWriteStage, &mut File) -> Result<(), ArenaError>,
+) -> Result<GenerationTrainingFilePinV3, ArenaError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    use cap_std::fs::OpenOptionsExt;
+    use std::{io::Write, os::unix::fs::MetadataExt};
+    credit.take(0)?;
+    let root = held
+        .directories
+        .first()
+        .ok_or_else(|| invalid("G0 final writer original root absent"))?;
+    check(
+        absolute_safe(path)
+            && path.starts_with(&root.0)
+            && path != root.0.as_path()
+            && !raw.is_empty()
+            && raw.len() as u64 <= MAX_JSON,
+        "G0 final writer requires bounded actual original output",
+    )?;
+    let parent = retained_output_directory(
+        path.parent()
+            .ok_or_else(|| invalid("G0 original writer parent"))?,
+        held,
+    )?
+    .ok_or_else(|| invalid("G0 original writer retained parent absent"))?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .follow(FollowSymlinks::No)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let file = parent
+        .open_with(
+            path.file_name()
+                .ok_or_else(|| invalid("G0 original writer basename"))?,
+            &options,
+        )
+        .map(|file| file.into_std())
+        .map_err(|_| io_error("g0_create_original_owned"))?;
+    let custody = held._failure_artifacts.len();
+    // No pin or success slot exists until the actual same descriptor has passed
+    // write, sync, single-link identity, named inode and byte hash verification.
+    held._failure_artifacts.push(FailureArtifact {
+        _path: path.into(),
+        _file: file,
+        _identity: None,
+        _raw_pin: None,
+    });
+    let original = &mut held._failure_artifacts[custody];
+    observe(OriginalWriteStage::Created, &mut original._file)?;
+    let metadata = original
+        ._file
+        .metadata()
+        .map_err(|_| io_error("g0_created_metadata"))?;
+    let created = FileIdentity::from(&metadata);
+    original._identity = Some(created);
+    check(
+        metadata.is_file()
+            && metadata.uid() == nix::unistd::Uid::effective().as_raw()
+            && metadata.nlink() == 1
+            && metadata.len() == 0,
+        "G0 original create-new current-owner single-link file",
+    )?;
+    original
+        ._file
+        .write_all(raw)
+        .map_err(|_| io_error("g0_write_original_owned"))?;
+    original
+        ._file
+        .sync_all()
+        .map_err(|_| io_error("g0_sync_original_owned"))?;
+    directory_file(&parent)?
+        .sync_all()
+        .map_err(|_| io_error("g0_sync_original_parent"))?;
+    observe(OriginalWriteStage::Synced, &mut original._file)?;
+    credit.take(0)?;
+    let pin = GenerationTrainingFilePinV3 {
+        path: path.into(),
+        sha256: hex(&Sha256::digest(raw)),
+        bytes: raw.len() as u64,
+    };
+    let after = original
+        ._file
+        .metadata()
+        .map_err(|_| io_error("g0_written_metadata"))?;
+    check(
+        created.same_inode(FileIdentity::from(&after))
+            && after.is_file()
+            && after.uid() == nix::unistd::Uid::effective().as_raw()
+            && after.nlink() == 1
+            && after.len() == pin.bytes,
+        "G0 original written inode/owner/link/size changed",
+    )?;
+    verify_bytes(&original._file, &pin, false, credit)?;
+    let identity = same_named(&pin, &original._file)?;
+    original._identity = Some(identity);
+    original._raw_pin = Some(pin.clone());
+    // Rejoin the retained original parent after publication; pathname reopening
+    // is used solely for comparison, never to replace the create-new descriptor.
+    retained_output_directory(path.parent().expect("checked original parent"), held)?
+        .ok_or_else(|| invalid("G0 original writer parent disappeared"))?;
+    credit.take(0)?;
+    let original = held._failure_artifacts.remove(custody);
+    held.checkpoints.push(HeldFile {
+        file: original._file,
+        pin: pin.clone(),
+        identity,
+    });
+    Ok(pin)
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn install_sources(
     held: &mut LinuxHeld,
@@ -2475,6 +2621,140 @@ mod tests {
         (root, held)
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn original_final_writer_retains_partial_descriptor_and_original_error() {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        let (root, mut held) = failure_custody_fixture();
+        let cancel = AtomicBool::new(false);
+        let mut credit = ReadCredit {
+            remaining: 4096,
+            maximum: 4096,
+            until: Instant::now() + Duration::from_secs(5),
+            cancel: &cancel,
+            account: ReadAccounting::new(),
+        };
+        let path = root.join("partial-parent.json");
+        let failed = write_original_owned_new_with(
+            &path,
+            b"unpublished receipt",
+            &mut held,
+            &mut credit,
+            |stage, file| {
+                if stage == OriginalWriteStage::Created {
+                    file.write_all(b"partial").unwrap();
+                    return Err(ArenaError::Io(
+                        "original injected partial write failure".into(),
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            failed.to_string(),
+            "arena IO: original injected partial write failure"
+        );
+        assert_eq!(held._failure_artifacts.len(), 1);
+        assert!(held.checkpoints.is_empty() && held._failure_artifacts[0]._raw_pin.is_none());
+        let original = &held._failure_artifacts[0]._file;
+        assert_eq!(original.metadata().unwrap().len(), 7);
+        assert_eq!(
+            original.metadata().unwrap().ino(),
+            std::fs::metadata(&path).unwrap().ino()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"partial");
+        assert_eq!(credit.remaining, 4096); // No hashing/read occurred and no refund was manufactured.
+        drop(held);
+        assert!(
+            root.starts_with(std::env::temp_dir())
+                && root
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("rz-training-failure-custody-")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn original_receipt_same_fd_survives_late_cancel_and_expired_issue_checks() {
+        use std::{cell::Cell, os::unix::fs::MetadataExt};
+        let (root, mut held) = failure_custody_fixture();
+        let original_cancel = AtomicBool::new(false);
+        let preservation_cancel = AtomicBool::new(false);
+        let account = ReadAccounting::new();
+        let whole_until = Instant::now() + Duration::from_secs(5);
+        let mut credit = ReadCredit {
+            remaining: 4096,
+            maximum: 4096,
+            until: whole_until,
+            cancel: &preservation_cancel,
+            account: Arc::clone(&account),
+        };
+        let created_inode = Cell::new(0);
+        let path = root.join("parent.json");
+        let pin = write_original_owned_new_with(
+            &path,
+            b"original completed receipt",
+            &mut held,
+            &mut credit,
+            |stage, file| {
+                if stage == OriginalWriteStage::Created {
+                    created_inode.set(file.metadata().unwrap().ino());
+                }
+                if stage == OriginalWriteStage::Synced {
+                    original_cancel.store(true, Ordering::Release);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            held.checkpoints[0].file.metadata().unwrap().ino(),
+            created_inode.get()
+        );
+        assert_eq!(held.checkpoints[0].pin, pin);
+        assert!(held._failure_artifacts.is_empty());
+        let remaining = credit.remaining;
+        let charged = account.charged.load(Ordering::Acquire);
+        assert!(check_original_g0_issue(&mut credit, &original_cancel).is_err());
+        assert_eq!(credit.until, whole_until);
+        assert_eq!(credit.remaining, remaining);
+        assert_eq!(credit.maximum, 4096);
+        assert!(Arc::ptr_eq(&credit.account, &account));
+        assert_eq!(account.charged.load(Ordering::Acquire), charged);
+        original_cancel.store(false, Ordering::Release);
+        // An already expired original window is refused even without cancel;
+        // the gate is forbidden to renew that caller-provided bound or credit.
+        let expired_until = Instant::now() - Duration::from_secs(1);
+        let mut expired = ReadCredit {
+            remaining,
+            maximum: 4096,
+            until: expired_until,
+            cancel: &preservation_cancel,
+            account: Arc::clone(&account),
+        };
+        assert!(check_original_g0_issue(&mut expired, &original_cancel).is_err());
+        assert_eq!(expired.until, expired_until);
+        assert_eq!(expired.remaining, remaining);
+        assert_eq!(account.charged.load(Ordering::Acquire), charged);
+        assert_eq!(
+            held.checkpoints[0].file.metadata().unwrap().ino(),
+            created_inode.get()
+        );
+        drop(held);
+        assert!(
+            root.starts_with(std::env::temp_dir())
+                && root
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("rz-training-failure-custody-")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn truncated_stdout_keeps_zero_byte_and_two_link_outputs_out_of_success_custody() {

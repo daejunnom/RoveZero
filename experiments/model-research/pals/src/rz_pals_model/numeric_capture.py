@@ -22,6 +22,7 @@ import time
 from .virtual_review import BUCKETS, INPUT_SCHEMA, prepare_payload, registered_encoding_sha256, validate_payload
 
 PLAN_DOMAIN = "rz-pals-numerical-case-plan-v5/1"
+G0_BOOTSTRAP_CASE_SPEC_DOMAIN = "rz-pals-g0-numerical-cases/2"
 RAW_DOMAIN = "rz-pals-numerical-raw-run-v5/1"
 TENSOR_DOMAIN = "rz-pals-captured-tensor-bytes-v5/1"
 MAX_FILE_BYTES = 4 * 1024 * 1024
@@ -33,6 +34,7 @@ _BINDINGS = {"model_profile", "model_schema", "model_semantics", "encoding_schem
              "model_semantic_sha256", "encoding_sha256", "model_epoch", "weights_sha256",
              "export_manifest_sha256", "graphs", "runtime_library_sha256", "cuda_libraries",
              "cuda_manifest_sha256", "backend", "precision", "tf32", "source_components"}
+_G0_IMMUTABLE_BINDINGS = _BINDINGS - {"model_epoch", "weights_sha256", "export_manifest_sha256", "graphs"}
 _SOURCE = {"model_native", "model_encoding", "nn_runtime", "model_reference", "model_export"}
 _INTEGER = {"anchor_board", "record_anchor", "record_line_tokens", "candidates", "query_anchor",
             "query_line_tokens", "record_relations"}
@@ -186,6 +188,53 @@ def make_case_plan(bindings):
     """Register deterministic Fresh B1 math coverage, never model execution."""
     bindings = validate_bindings(bindings)
     roles = _ROLES if "validator" in bindings["graphs"] else _ROLES[:2]
+    groups = _make_case_groups(roles)
+    result = {"schema_version": 5, "domain": PLAN_DOMAIN, "bindings": bindings, "invocation": "fresh", "batch": 1, "groups": groups}
+    validate_case_plan(result)
+    return result
+
+
+def make_g0_bootstrap_case_spec(immutable_bindings):
+    """Predeclare G0 math cases without identifiers for future generated assets.
+
+    The first original initializer has not produced weights or graphs yet. This
+    independent /2 spec contains only already registered model/runtime/source
+    semantics and deterministic Collection cases. The parent binds actual epoch
+    1 and generated file identities after its original preparation child ends;
+    this factory never manufactures those identities or execution authority.
+    """
+    value = immutable_bindings
+    if type(value) is not dict or set(value) != _G0_IMMUTABLE_BINDINGS:
+        raise ValueError("exact immutable G0 bootstrap bindings without generated assets required")
+    if (value["model_profile"] != "virtual_review_v1" or value["model_schema"] != "rovezero.pals-model.v3"
+            or value["model_semantics"] != "rovezero.pals-model-semantics.v3"
+            or value["encoding_schema"] != "rovezero.pals-virtual-review.v1"
+            or value["precision"] != "fp32" or value["tf32"] is not False
+            or value["backend"] not in ("ort_cpu", "ort_cuda")):
+        raise ValueError("registered G0 V3 Fresh FP32 TF32-off immutable semantics required")
+    for name in ("model_semantic_sha256", "encoding_sha256", "runtime_library_sha256"):
+        if not _sha(value[name]):
+            raise ValueError("G0 immutable binding digest: " + name)
+    if value["encoding_sha256"] != registered_encoding_sha256():
+        raise ValueError("actual registered G0 V3 tensor encoding digest differs")
+    sources = value["source_components"]
+    if (type(sources) is not dict or set(sources) != _SOURCE
+            or not all(_id(name) and _sha(pin) for name, pin in sources.items())):
+        raise ValueError("exact registered G0 numerical source components required")
+    cuda = value["cuda_libraries"]
+    if type(cuda) is not list or not all(_sha(pin) for pin in cuda) or len(set(cuda)) != len(cuda):
+        raise ValueError("unique CUDA library identities required for G0 immutable binding")
+    if value["backend"] == "ort_cpu":
+        if cuda or value["cuda_manifest_sha256"] is not None:
+            raise ValueError("CPU G0 bootstrap cannot claim a CUDA bundle")
+    elif not cuda or not _sha(value["cuda_manifest_sha256"]):
+        raise ValueError("CUDA G0 bootstrap requires its already registered native bundle")
+    return {"schema": G0_BOOTSTRAP_CASE_SPEC_DOMAIN, "immutable_bindings": copy.deepcopy(value),
+            "groups": _make_case_groups(_ROLES)}
+
+
+def _make_case_groups(roles):
+    """Model-independent math cases; do not invent generated asset identities."""
     groups = []
     for role in roles:
         for bucket in BUCKETS:
@@ -211,9 +260,7 @@ def make_case_plan(bindings):
                         extra["input"]["input"]["candidates"].reverse()
                     cases.append(extra)
             groups.append({"id": f"{role}.L{bucket}", "role": role, "line_bucket": bucket, "cases": cases})
-    result = {"schema_version": 5, "domain": PLAN_DOMAIN, "bindings": bindings, "invocation": "fresh", "batch": 1, "groups": groups}
-    validate_case_plan(result)
-    return result
+    return groups
 
 
 def validate_case_plan(plan):

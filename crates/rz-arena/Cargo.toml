@@ -46,6 +46,11 @@ name = "rz-pals-g0-numerical"
 path = "src/bin/pals-g0-numerical.rs"
 required-features = ["pals-collection-onnx"]
 
+[[bin]]
+name = "rz-pals-g0-bootstrap-numerical"
+path = "src/bin/pals-g0-bootstrap-numerical.rs"
+required-features = ["pals-collection-onnx"]
+
 [[example]]
 name = "pilot_failure_audit"
 required-features = ["native-cuda"]

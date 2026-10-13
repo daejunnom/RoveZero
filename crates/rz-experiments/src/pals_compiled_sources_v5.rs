@@ -303,7 +303,9 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
                 "crates/rz-experiments/src/pals_startup_v5/content_admission/artifact_domains/frozen_collection.rs"
             ),
             source!("crates/rz-experiments/src/pals_startup_v5/content_admission/numerical.rs"),
-            source!("crates/rz-experiments/src/pals_startup_v5/content_admission/numerical_scope.rs"),
+            source!(
+                "crates/rz-experiments/src/pals_startup_v5/content_admission/numerical_scope.rs"
+            ),
             source!("crates/rz-experiments/src/pals_startup_v5/content_admission/owned_files.rs"),
         ],
     ),
@@ -549,6 +551,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/pals_collect_v3/driver.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/frozen_intake.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/frozen_startup.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/g0_bootstrap_process.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/g0_numerical_process.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/game_process.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/generation_pipeline.rs"),
@@ -584,6 +587,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/pals_collect_v3/driver.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/frozen_intake.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/frozen_startup.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/g0_bootstrap_process.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/g0_numerical_process.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/game_process.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/generation_pipeline.rs"),
@@ -661,6 +665,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/bin/fixture-engine.rs"),
             source!("crates/rz-arena/src/bin/model-pair.rs"),
             source!("crates/rz-arena/src/bin/pals-action-outcomes.rs"),
+            source!("crates/rz-arena/src/bin/pals-g0-bootstrap-numerical.rs"),
             source!("crates/rz-arena/src/bin/pals-g0-numerical.rs"),
             source!("crates/rz-arena/src/bin/pals-generation-game-worker.rs"),
             source!("crates/rz-arena/src/bin/pals-generation-pipeline.rs"),
@@ -708,6 +713,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/pals_collect_v3/driver.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/frozen_intake.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/frozen_startup.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/g0_bootstrap_process.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/g0_numerical_process.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/game_process.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/generation_pipeline.rs"),
