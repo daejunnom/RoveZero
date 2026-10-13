@@ -73,21 +73,24 @@ pub struct GenerationNumericalLaunchRegistrationV3 {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NativeCaptureConfig {
-    case_plan: PathBuf,
-    case_plan_sha256: String,
-    export_manifest: PathBuf,
-    runtime_library: PathBuf,
-    runtime_cache: PathBuf,
-    output_root: PathBuf,
-    provider: String,
-    cuda_bundle: Option<PathBuf>,
-    cuda_inventory: Option<PathBuf>,
-    cuda_inventory_sha256: Option<String>,
-    gpu_device_id: i32,
-    gpu_arena_bytes: usize,
-    deadline_seconds: u64,
-    cleanup_seconds: u64,
+pub(super) struct NativeCaptureConfig {
+    pub(super) case_plan: PathBuf,
+    pub(super) case_plan_sha256: String,
+    pub(super) export_manifest: PathBuf,
+    pub(super) runtime_library: PathBuf,
+    pub(super) runtime_cache: PathBuf,
+    pub(super) output_root: PathBuf,
+    pub(super) provider: String,
+    pub(super) cuda_bundle: Option<PathBuf>,
+    pub(super) cuda_inventory: Option<PathBuf>,
+    pub(super) cuda_inventory_sha256: Option<String>,
+    /// Omission preserves the historical implicit exhaustive session policy.
+    #[serde(default)]
+    pub(super) cudnn_conv_search: Option<String>,
+    pub(super) gpu_device_id: i32,
+    pub(super) gpu_arena_bytes: usize,
+    pub(super) deadline_seconds: u64,
+    pub(super) cleanup_seconds: u64,
 }
 
 /// 두 실제 캡처와 원래 raw 파일을 보존한 성공 owner. 공개 생성자나 decoder는
@@ -385,7 +388,9 @@ pub fn run_frozen_numerical_original_v3(
     }
 }
 
-fn bindings(config: &PalsAdaptiveStartupConfigV5) -> Result<PalsNumericalBindingsV5, ArenaError> {
+pub(super) fn bindings(
+    config: &PalsAdaptiveStartupConfigV5,
+) -> Result<PalsNumericalBindingsV5, ArenaError> {
     let m = &config.endpoint.model;
     let asset = |p| config.asset(p).map_err(|e| invalid(e.to_string()));
     let source_components = COMPONENTS
@@ -1223,7 +1228,7 @@ fn run_captures(
     })
 }
 
-fn raw_asset(
+pub(super) fn raw_asset(
     pin: &GenerationTrainingFilePinV3,
     snapshot_path: String,
     purpose: Purpose,
@@ -1242,7 +1247,7 @@ fn raw_asset(
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_output_credit(
+pub(super) fn ensure_output_credit(
     root: &cap_std::fs::Dir,
     cap: u64,
     additional: u64,
@@ -1321,7 +1326,10 @@ fn validate_launch(
     Ok(())
 }
 
-fn validate_plan(plan: &Value, expected: &PalsNumericalBindingsV5) -> Result<(), ArenaError> {
+pub(super) fn validate_plan(
+    plan: &Value,
+    expected: &PalsNumericalBindingsV5,
+) -> Result<(), ArenaError> {
     check(
         plan.as_object().is_some_and(|o| o.len() == 6)
             && plan["schema_version"] == 5
@@ -1389,7 +1397,7 @@ fn validate_plan(plan: &Value, expected: &PalsNumericalBindingsV5) -> Result<(),
 }
 
 #[cfg(target_os = "linux")]
-fn validate_capture_inputs(
+pub(super) fn validate_capture_inputs(
     capture: &NativeCaptureConfig,
     config: &PalsAdaptiveStartupConfigV5,
     cwd: &Path,
@@ -1402,6 +1410,14 @@ fn validate_capture_inputs(
             .map_err(|e| invalid(e.to_string()))
     };
     let cuda = config.endpoint.model.backend == rz_experiments::PalsModelBackendV3::OrtCuda;
+    check(
+        capture
+            .cudnn_conv_search
+            .as_deref()
+            .unwrap_or(rz_experiments::PALS_CUDNN_IMPLICIT_EXHAUSTIVE_V5)
+            == config.native_options.cudnn_conv_search,
+        "native numerical cuDNN selection differs from original startup registration",
+    )?;
     check(
         capture.runtime_library == path(Purpose::RuntimeLibrary)?
             && capture.runtime_cache.starts_with(root)
@@ -1438,7 +1454,7 @@ fn validate_capture_inputs(
 }
 
 #[cfg(target_os = "linux")]
-fn reserve_image<'a>(
+pub(super) fn reserve_image<'a>(
     pin: &GenerationTrainingFilePinV3,
     credit: &mut super::training_process::ReadCredit<'_>,
     until: Instant,
@@ -1459,7 +1475,7 @@ fn reserve_image<'a>(
 }
 
 #[cfg(target_os = "linux")]
-fn observe_raw(
+pub(super) fn observe_raw(
     path: &Path,
     credit: &mut super::training_process::ReadCredit<'_>,
 ) -> Result<GenerationTrainingFilePinV3, ArenaError> {

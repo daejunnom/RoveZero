@@ -14,7 +14,9 @@ use rz_eval::pals_onnx::virtual_review::{
     VirtualReviewExecutionMode, VirtualReviewInvocation, VirtualReviewNativeCommand as Command,
     VirtualReviewNativeResult as Outcome,
 };
-use rz_eval::pals_onnx::{PalsBackendStats, PalsCudaControlPolicy, PalsOnnxConfig};
+use rz_eval::pals_onnx::{
+    PalsBackendStats, PalsCuDnnConvSearch, PalsCudaControlPolicy, PalsOnnxConfig,
+};
 use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeCache};
 use rz_eval::worker::{PhysicalPoll, SingleWorker};
 use serde::de::DeserializeOwned;
@@ -34,6 +36,7 @@ mod tensors;
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 type Worker = SingleWorker<Command, std::result::Result<Outcome, BackendError>>;
 const LIMIT: usize = 4 * 1024 * 1024;
+const POLICY_LIMIT: usize = 16 * 1024;
 // This bound is the registered logical raw numerical payload total. The exact
 // recovery staging owner adds one fixed header per file and publication keeps
 // at most one extra 4MiB payload. Separately bounded profile/placement evidence
@@ -181,6 +184,10 @@ struct Config {
     runtime_cache: PathBuf,
     output_root: PathBuf,
     provider: String,
+    /// Omission retains the original CUDA EP option without calling a setter.
+    /// This is execution-policy provenance, outside the unchanged raw V5 ABI.
+    #[serde(default)]
+    cudnn_conv_search: Option<String>,
     cuda_bundle: Option<PathBuf>,
     cuda_inventory: Option<PathBuf>,
     cuda_inventory_sha256: Option<String>,
@@ -188,6 +195,144 @@ struct Config {
     gpu_arena_bytes: usize,
     deadline_seconds: u64,
     cleanup_seconds: u64,
+}
+impl Config {
+    /// Pure selection before asset/native I/O. The loader repeats this fence
+    /// against the actual retained profile and parsed V3 inventory.
+    fn execution_config(&self) -> Result<PalsOnnxConfig> {
+        let mut selected = PalsOnnxConfig::cpu();
+        selected.intra_threads = 1;
+        selected.cache_public_memory = false;
+        let profile = match self.provider.as_str() {
+            "cpu" => None,
+            "cuda-control" => Some(NativeLoadingProfile::EagerCuda12Cudnn9V1),
+            "cuda-control-shim" => Some(NativeLoadingProfile::CuDnnShimLazyV1),
+            _ => {
+                return Err("explicit cpu/cuda-control/cuda-control-shim provider required".into())
+            }
+        };
+        if profile.is_some() {
+            selected.provider = Provider::Cuda {
+                device_id: self.gpu_device_id,
+                arena_bytes: self.gpu_arena_bytes,
+            };
+        }
+        selected.cudnn_conv_search = match self.cudnn_conv_search.as_deref() {
+            None | Some("legacy_implicit_exhaustive") => {
+                PalsCuDnnConvSearch::LegacyImplicitExhaustive
+            }
+            Some("experimental_default") => PalsCuDnnConvSearch::ExperimentalDefault,
+            _ => return Err("unsupported capture cuDNN convolution search selection".into()),
+        };
+        if selected.cudnn_conv_search == PalsCuDnnConvSearch::ExperimentalDefault {
+            if self.cuda_bundle.is_none() || self.cuda_inventory.is_none() {
+                return Err(
+                    "experimental DEFAULT requires explicit V3 inventory and bundle".into(),
+                );
+            }
+            pin(self
+                .cuda_inventory_sha256
+                .as_deref()
+                .ok_or("experimental DEFAULT requires explicit V3 inventory SHA")?)?;
+        }
+        selected.validate_execution_selection(profile, profile.is_some())?;
+        Ok(selected)
+    }
+}
+
+#[derive(Serialize)]
+struct SessionPolicyObservation {
+    role: String,
+    provider: &'static str,
+    intra_threads: usize,
+    inter_threads: usize,
+    intra_op_spinning: bool,
+    inter_op_spinning: bool,
+    parallel_execution: bool,
+    cuda_provider_available: Option<bool>,
+    evidence_scope: &'static str,
+    coverage_scope: &'static str,
+    evidence_method: &'static str,
+}
+
+/// Copied from the successfully loaded backend before it moves to the sole
+/// physical worker. This metadata grants no completion or process-exit proof.
+#[derive(Serialize)]
+struct LoadedPolicyObservation {
+    requested_cudnn_conv_search: Option<String>,
+    backend_config_cudnn_conv_search: &'static str,
+    cudnn_conv_algorithm_search_request: &'static str,
+    cudnn_setting_evidence: &'static str,
+    public_memory: &'static str,
+    native_loading_profile: Option<&'static str>,
+    applied_session_settings: Vec<SessionPolicyObservation>,
+}
+
+#[derive(Serialize)]
+struct JoinedPolicyObservation {
+    domain: &'static str,
+    scope: &'static str,
+    loaded: LoadedPolicyObservation,
+    captured_physical_completions_known: bool,
+    native_worker_joined: bool,
+    actual_cudnn_plan: &'static str,
+    tf32_actual: &'static str,
+    numerical_acceptance: bool,
+    performance_improvement_claim: bool,
+    process_exit_evidence: &'static str,
+}
+
+fn loaded_policy_observation(
+    backend: &PalsVirtualReviewOnnxBackend,
+    requested: Option<&str>,
+    explicit_control: bool,
+) -> Result<LoadedPolicyObservation> {
+    let config = backend.config();
+    config.validate_execution_selection(backend.native_loading_profile(), explicit_control)?;
+    if config.device_public_memory {
+        return Err("raw capture requires the original host-public execution path".into());
+    }
+    let (selection, option_request) = match config.cudnn_conv_search {
+        PalsCuDnnConvSearch::LegacyImplicitExhaustive => {
+            ("legacy_implicit_exhaustive", "no_setter_ep_default")
+        }
+        PalsCuDnnConvSearch::ExperimentalDefault => ("experimental_default", "DEFAULT"),
+        PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm => {
+            return Err("device Warm is outside Fresh capture selection".into())
+        }
+    };
+    let applied_session_settings = backend
+        .applied_session_settings()
+        .iter()
+        .map(|settings| SessionPolicyObservation {
+            role: settings.role().to_owned(),
+            provider: match settings.provider() {
+                Provider::Cpu => "CPUExecutionProvider",
+                Provider::Cuda { .. } => "CUDAExecutionProvider",
+            },
+            intra_threads: settings.intra_threads(),
+            inter_threads: settings.inter_threads(),
+            intra_op_spinning: settings.intra_op_spinning(),
+            inter_op_spinning: settings.inter_op_spinning(),
+            parallel_execution: settings.parallel_execution(),
+            cuda_provider_available: settings.cuda_provider_available(),
+            evidence_scope: settings.evidence_scope(),
+            coverage_scope: settings.coverage_scope(),
+            evidence_method: settings.evidence_method(),
+        })
+        .collect::<Vec<_>>();
+    if applied_session_settings.is_empty() || applied_session_settings.len() > 3 {
+        return Err("loaded capture model session count differs".into());
+    }
+    Ok(LoadedPolicyObservation {
+        requested_cudnn_conv_search: requested.map(str::to_owned),
+        backend_config_cudnn_conv_search: selection,
+        cudnn_conv_algorithm_search_request: option_request,
+        cudnn_setting_evidence: "successful_loader_config_not_observed_cudnn_plan",
+        public_memory: "host",
+        native_loading_profile: backend.native_loading_profile().map(|p| p.identifier()),
+        applied_session_settings,
+    })
 }
 #[derive(Serialize)]
 struct RawCase {
@@ -355,9 +500,12 @@ fn outside_git(path: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 fn write_exclusive(path: &Path, value: &impl Serialize) -> Result<u64> {
+    write_exclusive_bounded(path, value, LIMIT)
+}
+fn write_exclusive_bounded(path: &Path, value: &impl Serialize, limit: usize) -> Result<u64> {
     let bytes = serde_json::to_vec(value)?;
-    if bytes.is_empty() || bytes.len() > LIMIT {
-        return Err("raw receipt exceeds 4MiB file limit".into());
+    if bytes.is_empty() || bytes.len() > limit {
+        return Err("capture observation exceeds its registered file limit".into());
     }
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
     file.write_all(&bytes)?;
@@ -466,6 +614,8 @@ fn identity(
     })
 }
 fn execute(config: Config) -> Result<()> {
+    let selected = config.execution_config()?;
+    let is_cuda = matches!(selected.provider, Provider::Cuda { .. });
     for path in [
         &config.case_plan,
         &config.export_manifest,
@@ -530,13 +680,6 @@ fn execute(config: Config) -> Result<()> {
             let captured = tensors::capture(input)?;
             tensors::digest(&captured, input.role)?;
         }
-    }
-    let is_cuda = matches!(
-        config.provider.as_str(),
-        "cuda-control" | "cuda-control-shim"
-    );
-    if !is_cuda && config.provider != "cpu" {
-        return Err("explicit cpu/cuda-control/cuda-control-shim provider required".into());
     }
     let b = &plan.bindings;
     if b.model_epoch == 0 {
@@ -675,18 +818,10 @@ fn execute(config: Config) -> Result<()> {
     if hex(runtime.binary_digest()) != b.runtime_library_sha256 {
         return Err("actual loaded ORT pin differs".into());
     }
+    selected.validate_execution_selection(runtime.native_loading_profile(), control.is_some())?;
     let parent = outside_git(config.output_root.parent().ok_or("output parent absent")?)?;
     let root = parent.join(config.output_root.file_name().ok_or("output root absent")?);
     fs::create_dir(&root)?;
-    let mut selected = PalsOnnxConfig::cpu();
-    selected.intra_threads = 1;
-    selected.cache_public_memory = false;
-    if is_cuda {
-        selected.provider = Provider::Cuda {
-            device_id: config.gpu_device_id,
-            arena_bytes: config.gpu_arena_bytes,
-        };
-    }
     if Instant::now() >= until {
         return Err("capture window expired before model/session load".into());
     }
@@ -726,6 +861,8 @@ fn execute(config: Config) -> Result<()> {
     };
     let epoch = backend.model_epoch();
     let backend_digest = backend.backend_digest();
+    let policy_observation =
+        loaded_policy_observation(&backend, config.cudnn_conv_search.as_deref(), is_cuda)?;
     let mut worker = backend.into_worker()?;
     let work = (|| -> Result<Vec<(PathBuf, PathBuf)>> {
         let mut outputs = Vec::new();
@@ -835,6 +972,25 @@ fn execute(config: Config) -> Result<()> {
             return Err(format!("physical cleanup failed: {join}; pending files retained").into())
         }
     };
+    // This separate, small policy observation is never part of the unchanged
+    // numerical V5 payload. Publish only after all captured physical results,
+    // the placement/runtime audits, and normal worker join have succeeded.
+    write_exclusive_bounded(
+        &root.join("actual-cudnn-execution-policy.json"),
+        &JoinedPolicyObservation {
+            domain: "rz-pals-numerical-capture-execution-policy/1",
+            scope: "loaded_request_and_session_settings_not_selected_cudnn_plan",
+            loaded: policy_observation,
+            captured_physical_completions_known: true,
+            native_worker_joined: true,
+            actual_cudnn_plan: "unknown",
+            tf32_actual: "unknown",
+            numerical_acceptance: false,
+            performance_improvement_claim: false,
+            process_exit_evidence: "requires_external_process_owner_exit_observation",
+        },
+        POLICY_LIMIT,
+    )?;
     for (pending, final_path) in outputs {
         if final_path.exists() {
             return Err("refusing final receipt overwrite".into());
@@ -868,6 +1024,112 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selection_config(provider: &str) -> Config {
+        Config {
+            case_plan: PathBuf::new(),
+            case_plan_sha256: String::new(),
+            export_manifest: PathBuf::new(),
+            runtime_library: PathBuf::new(),
+            runtime_cache: PathBuf::new(),
+            output_root: PathBuf::new(),
+            provider: provider.to_owned(),
+            cudnn_conv_search: None,
+            cuda_bundle: Some(PathBuf::new()),
+            cuda_inventory: Some(PathBuf::new()),
+            cuda_inventory_sha256: Some("a".repeat(64)),
+            gpu_device_id: 0,
+            gpu_arena_bytes: 1024 * 1024,
+            deadline_seconds: 1,
+            cleanup_seconds: 1,
+        }
+    }
+
+    #[test]
+    fn omitted_capture_conv_selection_preserves_original_provider_modes() {
+        for provider in ["cpu", "cuda-control", "cuda-control-shim"] {
+            let mut config = selection_config(provider);
+            assert_eq!(
+                config.execution_config().unwrap().cudnn_conv_search,
+                PalsCuDnnConvSearch::LegacyImplicitExhaustive,
+            );
+            config.cudnn_conv_search = Some("legacy_implicit_exhaustive".into());
+            assert_eq!(
+                config.execution_config().unwrap().cudnn_conv_search,
+                PalsCuDnnConvSearch::LegacyImplicitExhaustive,
+            );
+        }
+        let config: Config = decode_unique(
+            br#"{
+            "case_plan":"plan","case_plan_sha256":"",
+            "export_manifest":"export","runtime_library":"runtime",
+            "runtime_cache":"cache","output_root":"output","provider":"cpu",
+            "cuda_bundle":null,"cuda_inventory":null,"cuda_inventory_sha256":null,
+            "gpu_device_id":0,"gpu_arena_bytes":0,
+            "deadline_seconds":1,"cleanup_seconds":1
+        }"#,
+        )
+        .unwrap();
+        assert!(config.cudnn_conv_search.is_none());
+        assert_eq!(
+            config.execution_config().unwrap().cudnn_conv_search,
+            PalsCuDnnConvSearch::LegacyImplicitExhaustive,
+        );
+    }
+
+    #[test]
+    fn capture_default_requires_exact_eager_v3_control_host_selection() {
+        let mut config = selection_config("cuda-control");
+        config.cudnn_conv_search = Some("experimental_default".into());
+        let selected = config.execution_config().unwrap();
+        assert_eq!(
+            selected.cudnn_conv_search,
+            PalsCuDnnConvSearch::ExperimentalDefault
+        );
+        assert!(!selected.device_public_memory);
+        assert!(!selected.cache_public_memory);
+        assert_eq!(selected.intra_threads, 1);
+        for provider in [
+            "cpu",
+            "cuda-control-shim",
+            "cuda",
+            "cuda-control-conv-default",
+        ] {
+            config.provider = provider.into();
+            assert!(config.execution_config().is_err());
+        }
+        config.provider = "cuda-control".into();
+        config.cuda_inventory = None;
+        assert!(config.execution_config().is_err());
+        config.cuda_inventory = Some(PathBuf::new());
+        config.cuda_bundle = None;
+        assert!(config.execution_config().is_err());
+        config.cuda_bundle = Some(PathBuf::new());
+        config.cuda_inventory_sha256 = None;
+        assert!(config.execution_config().is_err());
+        config.cuda_inventory_sha256 = Some("not-a-pin".into());
+        assert!(config.execution_config().is_err());
+        config.cuda_inventory_sha256 = Some("a".repeat(64));
+        config.gpu_device_id = -1;
+        assert!(config.execution_config().is_err());
+    }
+
+    #[test]
+    fn capture_conv_literals_do_not_admit_device_warm_or_fallback() {
+        for provider in ["cpu", "cuda-control", "cuda-control-shim"] {
+            let mut config = selection_config(provider);
+            for value in [
+                "DEFAULT",
+                "experimental_default_device_warm",
+                "",
+                "exhaustive",
+            ] {
+                config.cudnn_conv_search = Some(value.into());
+                assert!(config.execution_config().is_err());
+            }
+        }
+    }
+
     #[test]
     fn json_duplicates_and_unknown_config_fields_fail_before_state_construction() {
         assert!(

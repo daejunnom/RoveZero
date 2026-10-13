@@ -172,6 +172,13 @@ bounded channel로 고정하며 credit·token·owner 판정을 유지한다. Win
 도중 host/WSL 실행 환경이 종료되어 최종 관리 영수증을 얻지 못했다. 그 실행은 통과나
 제품 테스트 실패로 재분류하지 않으며, 원래 lease와 중단 자료를 보존해 확인한다.
 
+134의 lease가 현재 Linux boot보다 오래됐음을 metadata와 boot 시각으로 확인하고,
+원래 owner·active record를 보고서에 보존한 뒤 자신의 중단 lease만 회수했다. cache와
+scratch는 그때 보존했으며 새 137은 같은 조건에서 CPU worker 28개 통과·종료 코드 0·
+cleanup verified였다. 원래 134를 정상 종료로 표시하지 않는다. 공유 `29163e4`의
+CI 실행 `38426529151`은 Linux·Windows CPU·bindings·PALS model 네 job 모두 성공했다.
+이 정확한 SHA의 CI와 이후 G0 소비자 변경의 검사·실제 신경망 인수는 구분한다.
+
 학습·export·수치 검증 실패 자료는 원래 등록 경로와 whole deadline·남은 read credit
 안에서 읽기 전용으로 회수한다. 열린 FD는 metadata·hash 검사보다 먼저 실패 전용
 owner에 보유하며, 빈 파일·여러 링크·partial을 성공 checkpoint·수치 인수 권한으로
@@ -291,6 +298,48 @@ control inventory 12개, generation export 계약 34개도 통과했으며 frame
 통과로 바꾸지 않으며, 최신 UCI 재검사 결과와 CI는 별도로 확인해야 한다.
 
 ## 실제 세대의 소유권과 수치 검증
+
+### 학습 없이 G0 수치를 준비하는 별도 경로
+
+`rz-pals-g0-numerical --execute --registration <절대 경로>
+--registration-sha256 <원래 SHA-256>`는 미학습 compact G0의 별도 실행 접점이다.
+기본 호출이나 JSON 재구성으로 모델·신경망을 실행하지 않는다. 원래 등록은 V5
+startup template·Rules descriptor·고정 numerical case plan·실제 Python/native
+바이너리·runtime source pin과 유한 execution/cleanup 창을 요구한다.
+
+원래 Rust 부모가 보유한 private source와 출력 디렉터리에서 registered initializer로
+seed 23·steps 0·trained false를 생성하고, Collection P/C/V export와 새 static CUDA
+control inventory를 만든다. 실제 산출물의 FD·pin으로 reference와 native capture를
+연결한다. weights·graph는 원래 private cwd의 별도 하위 디렉터리에 두어 큰 산출물을
+다시 복제하지 않는다. 종료 후 작은 raw payload와 acceptance는 기존 bounded 경로로
+결합한다. 모든 L bucket 등의 coverage, 입력 bytes와 기존 수치 오차 기준은 공통 V5
+verifier가 확인한다.
+
+성공 소유자는 **G0 numerical-only**다. startup content admission·학습·수집·arena
+권한을 발급하지 않으며, 후속 실제 startup은 보존한 원래 roster·FD를 다시 검증한다.
+미지원 Windows 실행은 명시적으로 거부한다. Python의 기존 initializer/export는 개별
+write fence를 제공하지 않으므로, 사전 conservative phase 예약과 원래 부모의 tree
+watch를 사용한다는 한계를 영수증에 남긴다. 실패·partial·완료 unknown은 같은 원래
+소유자와 read credit·whole deadline 안에서 보존한다.
+
+capture의 선택적 `cudnn_conv_search`는 생략 시 기존 implicit exhaustive 정책을
+유지한다. `experimental_default`는 명시적인 eager V3 CUDA-control·host profile에서만
+선택하며 CPU·shim·device Warm을 조용히 대체하지 않는다. 실제 session 설정과
+물리 완료·worker join 후의 정책 관측을 별도로 남기고, 미관측 cuDNN plan·실제 TF32는
+unknown이다. 이 소스 연결과 metadata/CPU 검사 성공은 실제 초기화·수치·GPU 인수가
+아니다. 현재 실제 학습 보류 상태에서 generation pipeline을 G0 검사용으로 실행하지 않는다.
+
+후속 관리 검사에서 Python G0 metadata 16개(138), native capture의 순수 설정·입력
+검사 10개(139)가 통과했다. framework·initializer·NN·optimizer 실행을 차단한 검사와
+실제 수치 실행을 구분한다. Windows Arena 전체 feature/target strict Clippy(142),
+Linux의 같은 strict Clippy(145), Linux Arena library 328개(146), Windows Arena
+library 257개(147)가 통과했으며 각 원래 command의 종료 코드 0과 관리 cleanup을
+확인했다. 두 OS의 검사 수를 합산하지 않는다. 143의 owned path 비교 경고는 기존
+동등성·FD 수명을 유지하는 borrowed path 비교로 수정했으며 실패 로그를 보존했다.
+formatting 검사는 141·144에서 통과했다. 이 결과는 해당 working source 범위이며
+새 공유 SHA의 CI, 실제 G0 초기화·export·독립 reference·GPU 인수를 대신하지 않는다.
+
+### 실제 학습 세대의 원래 소유자
 
 실제 세대 실행은 같은 원래 128판 archive 소유자를 P/C 학습·V action 수집·V 학습에
 유지한다. P/C 4,000 update의 `FrozenPcCollection`과 전체 5,000 update의 G1은

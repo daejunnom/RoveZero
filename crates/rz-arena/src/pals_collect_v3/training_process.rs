@@ -771,8 +771,27 @@ pub(super) fn prepare_root(
     registration: &TrainingRegistration,
     execution_id: &str,
 ) -> Result<LinuxHeld, ArenaError> {
+    prepare_original_root(
+        &registration.staging_root,
+        registration
+            .staging_root
+            .join(format!("trainer-source-{execution_id}")),
+        &registration.receipt_path,
+        &[&registration.index_root, &registration.checkpoint_directory],
+    )
+}
+
+/// Original-process directory custody shared with the non-training G0 path.
+/// This creates no trainer, checkpoint or generation capability.
+#[cfg(target_os = "linux")]
+pub(super) fn prepare_original_root(
+    staging_root: &Path,
+    source_root: PathBuf,
+    receipt_path: &Path,
+    output_directories: &[&Path],
+) -> Result<LinuxHeld, ArenaError> {
     use std::os::unix::fs::MetadataExt;
-    let staging = open_directory(&registration.staging_root)?;
+    let staging = open_directory(staging_root)?;
     let metadata = directory_file(&staging)?
         .metadata()
         .map_err(|_| io_error("staging_metadata"))?;
@@ -781,20 +800,18 @@ pub(super) fn prepare_root(
             && metadata.uid() == nix::unistd::Uid::effective().as_raw(),
         "training exclusive current-owner 0700 staging root",
     )?;
-    for ancestor in registration.staging_root.ancestors() {
+    for ancestor in staging_root.ancestors() {
         check(
             open_directory(ancestor)?.symlink_metadata(".git").is_err(),
             "training staging and generated artifacts must remain outside Git",
         )?;
     }
-    let source_root = registration
-        .staging_root
-        .join(format!("trainer-source-{execution_id}"));
     check(
         !source_root.exists()
-            && !registration.receipt_path.exists()
-            && source_root != registration.index_root
-            && source_root != registration.checkpoint_directory,
+            && !receipt_path.exists()
+            && output_directories
+                .iter()
+                .all(|path| source_root.as_path() != *path),
         "training unique source/receipt paths; no overwrite/retry",
     )?;
     let mut held = LinuxHeld {
@@ -809,9 +826,9 @@ pub(super) fn prepare_root(
         consumed_read_bytes: 0,
         _failure_artifacts: Vec::new(),
     };
-    retain_directory(registration.staging_root.clone(), &mut held)?;
-    for path in [&registration.index_root, &registration.checkpoint_directory] {
-        retain_directory(path.clone(), &mut held)?;
+    retain_directory(staging_root.to_path_buf(), &mut held)?;
+    for path in output_directories {
+        retain_directory(path.to_path_buf(), &mut held)?;
     }
     Ok(held)
 }
