@@ -318,6 +318,30 @@ fn load_inner(
                 "generation startup lacks the registered complete 5000-update export structure",
             ));
         }
+        PalsArtifactDomainV5::FrozenPcCollection => {
+            let frozen = resources
+                .content_admission
+                .frozen_pc_collection()
+                .ok_or_else(|| {
+                    fail(
+                        K::IdentityMismatch,
+                        "frozen P/C lacks original descriptor-bound content admission",
+                    )
+                })?;
+            if endpoint.mode != PalsEngineModeV5::Collection
+                || !manifest.trained
+                || manifest.training_steps != 4000
+                || native.approximate_warm
+                || frozen.checkpoint_sha256() != model.weights.sha256
+                || frozen.model_epoch() != model.epoch
+                || !manifest.validator_present
+            {
+                return Err(fail(
+                    K::IdentityMismatch,
+                    "frozen P/C loaded export differs from its exact 4000-update Collection namespace",
+                ));
+            }
+        }
         PalsArtifactDomainV5::Diagnostic => {
             return Err(fail(
                 K::UnsupportedModel,
@@ -643,9 +667,9 @@ fn profile_child_name(
             .components()
             .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
         || requested.parent() != Some(runtime.as_path())
-        || !requested
+        || requested
             .to_str()
-            .is_some_and(|s| !s.split(['/', '\\']).any(|p| matches!(p, "." | "..")))
+            .is_none_or(|s| s.split(['/', '\\']).any(|p| matches!(p, "." | "..")))
         || name.is_empty()
         || name.len() > 96
         || !name

@@ -42,7 +42,8 @@ impl Fixture {
                     path: format!("runtime/{filename}"),
                     bytes: bytes.len() as u64,
                     sha256: format!("{:x}", Sha256::digest(bytes)),
-                    source: "unexecuted-runtime-fixture".into(),
+                    source: "https://example.org/fixtures/rovezero/unexecuted-runtime-fixture"
+                        .into(),
                     license: "fixture-only".into(),
                 },
                 snapshot_path,
@@ -170,11 +171,19 @@ fn changed_bytes_and_same_bytes_replacement_are_both_rejected() {
     let guards = SnapshotGuards::capture(&fixture.root, fixture.root_cap(), &plan).unwrap();
     let path = fixture.root.join(&assets[0].declaration.snapshot_path);
     let original = fs::read(&path).unwrap();
+    let original_modified = assets[0].file.metadata().unwrap().modified().unwrap();
     fs::write(&path, vec![b'x'; original.len()]).unwrap();
     assert_eq!(
         verify_descriptor(&assets[0]).unwrap_err().kind,
         K::IdentityMismatch
     );
+    // SHA verification above rejects the same-length corruption independently.
+    // The snapshot guard compares metadata, so make that change explicit rather
+    // than assuming back-to-back writes have distinct filesystem timestamps.
+    assets[0]
+        .file
+        .set_modified(original_modified + std::time::Duration::from_secs(60))
+        .unwrap();
     assert_eq!(
         guards.verify(&fixture.root).unwrap_err().kind,
         K::IdentityMismatch

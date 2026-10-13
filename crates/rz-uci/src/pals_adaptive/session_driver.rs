@@ -305,6 +305,10 @@ where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    #[allow(
+        clippy::result_large_err,
+        reason = "admission rejection returns the original native, CPU and Store owners without a failure-path allocation"
+    )]
     pub fn new(
         options: AdaptiveSessionOptions,
         sources: AdaptiveSessionSources<B>,
@@ -330,7 +334,11 @@ where
     /// Admit declarations only when the already-created engine ceilings agree.
     /// Root startup configures engines before capturing their immutable profile;
     /// this constructor never modifies a retained TT/token namespace in place.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::result_large_err,
+        reason = "independent admission authorities stay explicit and rejection returns their original owners without allocating"
+    )]
     pub fn new_with_resource_limits(
         options: AdaptiveSessionOptions,
         limits: AdaptiveExecutionLimits,
@@ -354,7 +362,11 @@ where
             true,
         )
     }
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::result_large_err,
+        reason = "independent admission authorities stay explicit and rejection returns their original owners without allocating"
+    )]
     pub fn new_with_resource_limits_and_collection_hooks(
         options: AdaptiveSessionOptions,
         limits: AdaptiveExecutionLimits,
@@ -379,7 +391,11 @@ where
             true,
         )
     }
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::result_large_err,
+        reason = "independent admission authorities stay explicit and rejection returns their original owners without allocating"
+    )]
     fn admit_with_resource_limits(
         options: AdaptiveSessionOptions,
         limits: AdaptiveExecutionLimits,
@@ -588,6 +604,105 @@ where
     }
     pub fn execution_limits(&self) -> AdaptiveExecutionLimits {
         self.limits
+    }
+    /// A nonblocking metadata read of the original idle native owner. This
+    /// does not observe the bootstrap caller as the native thread, start any
+    /// work, or turn a failed/absent OS reading into an applied placement.
+    pub fn native_ready_cpu_thread_observation(
+        &self,
+    ) -> Result<
+        Option<
+            Result<rz_runtime::adaptive::CpuThreadReadback, rz_runtime::adaptive::CpuResourceError>,
+        >,
+        SearchSessionFailure,
+    > {
+        let state = self.state.try_lock().map_err(|_| {
+            failure(
+                "AdaptiveResourceOwnerBusy",
+                "original owner busy or poisoned",
+            )
+        })?;
+        match &*state {
+            SessionState::Idle(owners) if !self.closed.load(Ordering::Acquire) => {
+                Ok(owners.native.ready_cpu_thread_observation())
+            }
+            _ => Err(failure(
+                "AdaptiveResourceOwnerUnavailable",
+                "native startup owner is not idle and live",
+            )),
+        }
+    }
+    /// Only the successful actual startup owner's immutable process identity
+    /// crosses this boundary. The read-only resource probe must bracket PID,
+    /// process group and start ticks itself; readyok proves no applied option.
+    pub fn external_startup_process_identity(
+        &self,
+    ) -> Result<Option<rz_search::cpu_checker::ExternalProcessIdentity>, SearchSessionFailure> {
+        let state = self.state.try_lock().map_err(|_| {
+            failure(
+                "AdaptiveResourceOwnerBusy",
+                "original owner busy or poisoned",
+            )
+        })?;
+        let SessionState::Idle(owners) = &*state else {
+            return Err(failure(
+                "AdaptiveResourceOwnerUnavailable",
+                "external startup owner is not idle",
+            ));
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return Err(failure(
+                "AdaptiveResourceOwnerUnavailable",
+                "admission closed",
+            ));
+        }
+        let Some(external) = &owners.external else {
+            return Ok(None);
+        };
+        let startup = external.worker.startup_report().ok_or_else(|| {
+            failure(
+                "AdaptiveResourceStartupUnknown",
+                "actual startup not observed",
+            )
+        })?;
+        startup.result.map_err(|error| {
+            SearchSessionFailure::debug("AdaptiveResourceStartupFailed", &error)
+        })?;
+        let process = startup
+            .attempt
+            .and_then(|attempt| attempt.external)
+            .map(|attempt| attempt.process)
+            .ok_or_else(|| {
+                failure(
+                    "AdaptiveResourceIdentityUnknown",
+                    "original process evidence missing",
+                )
+            })?;
+        if process.quit_sent
+            || process.exit_observed
+            || process.cleanup_complete
+            || process.quarantined
+            || process.ownership_lost
+        {
+            return Err(failure(
+                "AdaptiveResourceOwnerUnavailable",
+                "historical startup process is no longer reusable",
+            ));
+        }
+        let identity = process.process_identity.filter(|identity| {
+            identity.pid > 0
+                && identity.process_group > 0
+                && identity.proc_start_ticks > 0
+                && identity.pid != std::process::id()
+                && identity.pid <= i32::MAX as u32
+                && identity.process_group <= i32::MAX as u32
+        });
+        identity.map(Some).ok_or_else(|| {
+            failure(
+                "AdaptiveResourceIdentityUnknown",
+                "native spawn identity unavailable",
+            )
+        })
     }
     pub(crate) fn collection_context_ready(&self) -> Result<(), ContractError> {
         if self.closed.load(Ordering::Acquire) {

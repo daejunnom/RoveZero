@@ -507,6 +507,54 @@ impl ValidatorActionOutcome {
 }
 
 impl<M: RoleModel> AdaptiveEnginePort<M> {
+    /// Read-only eligibility for an S-policy prediction. This does not submit
+    /// V, accept CPU feedback, or attest a new witness. A real paused receipt
+    /// must still pass the original validator admission after Yield.
+    pub fn published_cpu_feedback_eligible(
+        &self,
+        target: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        progress: &crate::cpu_worker::CpuWorkerProgress,
+    ) -> bool {
+        if self.check_work(target).is_err()
+            || target.budget.role_submissions_remaining == 0
+            || self.validator_state.contexts.len() >= MAX_VALIDATOR_CONTEXTS_PER_ROOT
+            || self
+                .validator_state
+                .actions
+                .values()
+                .any(|a| a.frame == Some(target.frame))
+        {
+            return false;
+        }
+        let Some(admission) = self.cpu_admissions.get(&target.input.question_digest) else {
+            return false;
+        };
+        let (Some(job), Some(grant)) = (admission.job, admission.grant) else {
+            return false;
+        };
+        let Some(best) = progress.iteration.best_move else {
+            return false;
+        };
+        !admission.terminal
+            && !admission.quarantined
+            && self.cpu_context_current(target, admission)
+            && job.id == progress.job
+            && job.question == target.input.question_digest
+            && job.hard_deadline == target.original_deadline
+            && grant.job == job.id
+            && grant.execution == progress.execution
+            && grant.owner == progress.owner
+            && admission.owner == Some(progress.owner)
+            && progress.iteration.completed_depth > 0
+            && progress.iteration.completed_depth <= admission.target_depth
+            && progress.iteration.nodes <= grant.node_credit
+            && admission.position.legal_moves().contains(&best)
+            && admission
+                .restriction
+                .as_ref()
+                .is_none_or(|moves| moves.contains(&best))
+    }
+
     /// Actual eligibility revision for deciding whether a question deserves a
     /// new V review. This reads owner state and never increments RequestId or
     /// search root generation. The digest is scheduler identity, not an NN

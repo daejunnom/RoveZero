@@ -95,8 +95,8 @@ impl GenerationFrozenActionGroupReceiptV3 {
         )
     }
 }
-pub(super) fn causal_input_for_outcome<'a>(
-    record: &'a GenerationRecordV3,
+pub(super) fn causal_input_for_outcome(
+    record: &GenerationRecordV3,
     outcome: &GenerationActionOutcomeV3,
     evidence: &BTreeMap<String, serde_json::Value>,
 ) -> Result<String, ManifestError> {

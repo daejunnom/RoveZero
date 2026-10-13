@@ -834,8 +834,9 @@ mod native {
         HostRecordPageObservationBoundary, HostRecordPageObservationHandle,
         HostRecordPageObservationOutcome, HostRecordPageObservationSnapshot,
         HostRecordPageObservationStatus, HostRecordPagePolicy, HostRecordPageSnapshot,
-        PalsBackendStats, PalsCudaControlPolicy, PalsCudaPlacementWitness, PalsGraphOptimization,
-        PalsNativeCommand, PalsNativeMappingWitness, PalsNativeResult, PalsOnnxBackend,
+        PalsAppliedSessionSettings, PalsBackendStats, PalsCudaControlPolicy,
+        PalsCudaPlacementWitness, PalsGraphOptimization, PalsNativeCommand,
+        PalsNativeMappingWitness, PalsNativeOwnerAccounting, PalsNativeResult, PalsOnnxBackend,
         PalsSessionResidency, PalsStartupInputCompletionBinding, PalsStartupSnapshotStatus,
         PalsStartupStageProbe, PalsStartupStageSnapshot, PalsWarmCapability, PalsWarmInput,
     };
@@ -933,6 +934,8 @@ mod native {
         adapter_source_digest: [u8; 32],
         trained: bool,
         residency: PalsSessionResidency,
+        // 실제 SessionBuilder가 성공한 record만 보존. synthetic worker는 None이다.
+        applied_session_settings: Option<Arc<[PalsAppliedSessionSettings]>>,
         process_epoch: ProcessEpoch,
         // The original startup FDs and profile directory stay with the actual
         // worker owner, including retained physical leases and quarantine.
@@ -1197,6 +1200,40 @@ mod native {
         fresh: Option<bool>,
         completed_nn_inputs: Option<u64>,
         measurement_complete: bool,
+        owner_accounting: Option<PalsNativeOwnerAccounting>,
+    }
+    impl ObservedRoleExecution {
+        fn ticket_execution_evidence(&self) -> Option<super::ticketed::TicketExecutionEvidence> {
+            if !self.ready_observed || self.unknown_observed {
+                return None;
+            }
+            Some(super::ticketed::TicketExecutionEvidence {
+                execution: Some(self.binding.execution),
+                completed_nn_inputs: self.completed_nn_inputs,
+                measurement_complete: self.measurement_complete,
+                physical_fresh: self.fresh,
+                accounting: self.owner_accounting.map(native_ticket_accounting),
+            })
+        }
+    }
+    fn native_ticket_accounting(
+        accounting: PalsNativeOwnerAccounting,
+    ) -> super::ticketed::TicketNativeAccountingEvidence {
+        // 동일 binding으로 수신한 producer 소유 계수를 그대로 투영한다.
+        // 명령 수·출력 유효성·검색 소비로 physical 사용량을 추정하지 않는다.
+        super::ticketed::TicketNativeAccountingEvidence {
+            public_cache_hits: accounting.public_cache_hits(),
+            public_cache_misses: accounting.public_cache_misses(),
+            public_nn_runs_attempted: accounting.public_nn_runs_attempted(),
+            public_nn_runs_completed: accounting.public_nn_runs_completed(),
+            public_nn_runs_failed_known: accounting.public_nn_runs_failed_known(),
+            role_nn_runs_attempted: accounting.role_nn_runs_attempted(),
+            role_nn_runs_completed: accounting.role_nn_runs_completed(),
+            role_nn_runs_failed_known: accounting.role_nn_runs_failed_known(),
+            validator_nn_runs_attempted: accounting.validator_nn_runs_attempted(),
+            validator_nn_runs_completed: accounting.validator_nn_runs_completed(),
+            validator_nn_runs_failed_known: accounting.validator_nn_runs_failed_known(),
+        }
     }
     /// Optional bounded collector. All callbacks run on the calling/search
     /// thread and use its clock; startup probe inputs never enter this stream.
@@ -4073,6 +4110,7 @@ mod native {
                 fresh,
                 completed_nn_inputs: None,
                 measurement_complete: false,
+                owner_accounting: None,
             });
             if let Err(error) = self
                 .owner
@@ -4164,6 +4202,7 @@ mod native {
                 outcome,
                 actual_completed_nn_inputs_delta,
                 complete,
+                owner_accounting,
             }) = &result
             {
                 if let Err(error) = outcome {
@@ -4174,6 +4213,7 @@ mod native {
                 {
                     observed.completed_nn_inputs = *actual_completed_nn_inputs_delta;
                     observed.measurement_complete = *complete;
+                    observed.owner_accounting = *owner_accounting;
                 }
             }
             if let Err(error) = self
@@ -4428,6 +4468,9 @@ mod native {
                 },
             })
         }
+        // Ticket authority, exact Rules position, prepared view and cancellation
+        // remain independent inputs at the physical owner's admission boundary.
+        #[allow(clippy::too_many_arguments)]
         pub(super) fn ticketed_run(
             &mut self,
             ticket: &rz_contracts::pals_adaptive::RoleTicketEnvelope,
@@ -4470,31 +4513,25 @@ mod native {
             let observed = slot
                 .as_ref()
                 .filter(|entry| entry.binding.request == ticket.id);
-            let evidence = observed.map(|entry| {
-                (
-                    entry.binding.execution,
-                    entry.completed_nn_inputs,
-                    entry.measurement_complete,
-                    entry.fresh,
-                    entry.ready_observed,
-                    entry.unknown_observed,
-                )
-            });
+            // 완료 불명 상태에서는 원본 관측과 lease 근거를 보존한다.
+            // slot을 먼저 소비하면 실패 증거/격리에 필요한 소유자를 잃는다.
+            if observed.is_some_and(|entry| !entry.ready_observed || entry.unknown_observed) {
+                self.owner.quarantined.store(true, Ordering::Release);
+                return Err(RoleError::PhysicalCompletionUnknown);
+            }
+            let evidence = observed.and_then(ObservedRoleExecution::ticket_execution_evidence);
             if observed.is_some() {
                 slot.take();
             }
             drop(slot);
-            if evidence.is_some_and(|(_, _, _, _, ready, unknown)| !ready || unknown) {
-                self.owner.quarantined.store(true, Ordering::Release);
-                return Err(RoleError::PhysicalCompletionUnknown);
-            }
             self.ticketed_delivered.push(*ticket);
             Ok(super::ticketed::NativeTicketOutput {
                 output,
-                execution: evidence.map(|entry| entry.0),
-                completed_nn_inputs: evidence.and_then(|entry| entry.1),
-                measurement_complete: evidence.is_some_and(|entry| entry.2),
-                physical_fresh: evidence.and_then(|entry| entry.3),
+                execution: evidence.and_then(|entry| entry.execution),
+                completed_nn_inputs: evidence.and_then(|entry| entry.completed_nn_inputs),
+                measurement_complete: evidence.is_some_and(|entry| entry.measurement_complete),
+                physical_fresh: evidence.and_then(|entry| entry.physical_fresh),
+                accounting: evidence.and_then(|entry| entry.accounting),
             })
         }
         pub(super) fn ticketed_acknowledge(
@@ -4604,16 +4641,8 @@ mod native {
             let observed = slot
                 .as_ref()
                 .filter(|entry| entry.binding.request == ticket.id)?;
-            let evidence = super::ticketed::TicketExecutionEvidence {
-                execution: Some(observed.binding.execution),
-                completed_nn_inputs: observed.completed_nn_inputs,
-                measurement_complete: observed.measurement_complete,
-                physical_fresh: observed.fresh,
-                accounting: None,
-            };
-            if observed.ready_observed && !observed.unknown_observed {
-                slot.take();
-            }
+            let evidence = observed.ticket_execution_evidence()?;
+            slot.take();
             Some(evidence)
         }
         /// Enable metadata from the same physical execution before the first
@@ -5334,6 +5363,7 @@ mod native {
             };
             let trained = backend.is_trained();
             let residency = backend.residency().clone();
+            let applied_session_settings = backend.applied_session_settings();
             let mut identity = format!(
                 "pals-onnx-pc-fp32-{}",
                 model
@@ -5480,6 +5510,7 @@ mod native {
                 adapter_source_digest,
                 trained,
                 residency,
+                applied_session_settings: Some(applied_session_settings),
                 process_epoch: epoch,
                 _registered_sources: registered_sources,
                 last_failure: Mutex::new(None),
@@ -5587,6 +5618,10 @@ mod native {
         }
         pub fn model_config(&self) -> &PalsModelConfig {
             &self.owner.model_config
+        }
+        /// 원본 session 생성 성공 설정. OS thread inventory/affinity/첫 NN 증명은 아니다.
+        pub fn applied_session_settings(&self) -> Option<Arc<[PalsAppliedSessionSettings]>> {
+            self.owner.applied_session_settings.as_ref().map(Arc::clone)
         }
         fn fresh_command(&self, input: PalsModelInput) -> Result<PalsNativeCommand, RoleError> {
             #[cfg(feature = "experimental-io-binding")]
@@ -6763,6 +6798,9 @@ mod native {
                 None,
             )
         }
+        // The synchronous compatibility path and ticketed path share one owner;
+        // keep optional ticket authority distinct from model input and context.
+        #[allow(clippy::too_many_arguments)]
         pub(super) fn run_with_ticket(
             &mut self,
             input: PalsModelInput,
@@ -8940,6 +8978,7 @@ mod native {
             // Deterministic raw heads through the existing native runtime and
             // SingleWorker. No ORT library, model asset or GPU is loaded.
             let mut model = recorded_fixture_model(None, false);
+            assert!(model.applied_session_settings().is_none());
             let position = Position::startpos();
             let legal = position.legal_moves();
             let cancel = AtomicBool::new(false);
@@ -9032,6 +9071,33 @@ mod native {
                     .unwrap();
                 assert_eq!(output.output.id, ticket.id);
                 assert_eq!(output.output.key, ticket.representation);
+                // 이 synthetic worker는 owner 계수를 발급하지 않는다. 실제 요청/
+                // 출력 하나를 public/private/V 실행 수로 추정하면 안 된다.
+                assert!(output.accounting.is_none());
+                let mut observation = ObservedRoleExecution {
+                    binding: NativeRoleExecutionBinding {
+                        request: ticket.id,
+                        execution: output.execution.unwrap(),
+                    },
+                    ready_observed: false,
+                    unknown_observed: false,
+                    observer_error: Some(RoleError::Unavailable),
+                    prepared_state: state,
+                    prepared_perspective: Some(rz_contracts::Color::White),
+                    input_sha256: ticket.representation.input.0,
+                    fresh: Some(true),
+                    completed_nn_inputs: Some(1),
+                    measurement_complete: true,
+                    owner_accounting: None,
+                };
+                assert!(observation.ticket_execution_evidence().is_none());
+                observation.ready_observed = true;
+                let known = observation.ticket_execution_evidence().unwrap();
+                assert_eq!(known.completed_nn_inputs, Some(1));
+                assert!(known.accounting.is_none());
+                observation.unknown_observed = true;
+                assert!(observation.ticket_execution_evidence().is_none());
+                assert_eq!(observation.completed_nn_inputs, Some(1));
                 assert_eq!(model.scope.get().unwrap().authority.root, RootGeneration(7));
                 assert!(model.delivered_request.is_none());
                 assert!(model.owner.role_execution.lock().unwrap().is_none());
@@ -9120,6 +9186,7 @@ mod native {
                 cuda_record_page_snapshot: Mutex::new(None),
                 cuda_record_page_snapshot_error: Mutex::new(None),
                 host_record_page_observer: None,
+                applied_session_settings: None,
                 residency: PalsSessionResidency {
                     graphs: vec![],
                     native_sessions: 0,
@@ -9809,6 +9876,7 @@ mod native {
                             outcome: Ok(raw),
                             actual_completed_nn_inputs_delta: delta,
                             complete: true,
+                            owner_accounting: None,
                         }))
                     }
                     PalsNativeCommand::SnapshotStats => PhysicalRun::Complete(Ok(

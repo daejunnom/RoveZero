@@ -75,11 +75,22 @@ REVIEWED_OBSERVED_PROGRESS_SOURCE_PINS = {
 }
 
 
-REVIEWED_CURRENT_SOURCE_PINS = {
+REVIEWED_ORDERED_SCOPE_SOURCE_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
         "bytes": 402843, "sha256": "70d4bae5ad4e19e86137e47cc66922182c5232cbe35b9b30d42bf43ec6850171"},
     "crates/rz-arena/src/pals_collect/native.rs": {
         "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+}
+
+
+# Independently reissued live fixture after the legacy-only source review.
+# The new bank seals this exact pair before admission, never a past receipt.
+# Optional selected/adaptive code and Err/Review add no fixture authority.
+REVIEWED_CURRENT_SOURCE_PINS = {
+    "crates/rz-search/src/pals/engine.rs": {
+        "bytes": 414372, "sha256": "ce40b6f9ff8d13a41da8c9482b48528c1437896e9571c9630790c4b11b262726"},
+    "crates/rz-arena/src/pals_collect/native.rs": {
+        "bytes": 233208, "sha256": "02af59b9edbc350e6e1a204eb6543033bb4a859729eb2ed79c8b470cc6823a01"},
 }
 
 
@@ -538,6 +549,7 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_CONTROLLED_FALLBACK_SOURCE_PINS), REVIEWED_CONTROLLED_FALLBACK_SOURCE_PINS)
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_LIVE_BINDING_SOURCE_PINS), REVIEWED_LIVE_BINDING_SOURCE_PINS)
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_OBSERVED_PROGRESS_SOURCE_PINS), REVIEWED_OBSERVED_PROGRESS_SOURCE_PINS)
+        self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_ORDERED_SCOPE_SOURCE_PINS), REVIEWED_ORDERED_SCOPE_SOURCE_PINS)
         historical = dict(zip(slot_witness._SOURCE_PATHS, (
             {"bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
             {"bytes": 224380, "sha256": "a286a2403317be7f5f058b65488e7c9722d2b7f4b9bf683ea95e5c9f51a7aaf8"})))
@@ -545,6 +557,11 @@ class NativeSlotRepairTests(unittest.TestCase):
             with self.subTest(historical_component=path):
                 hybrid = copy.deepcopy(observed)
                 hybrid[path] = copy.deepcopy(historical[path])
+                with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
+                    slot_witness._reviewed_source_pair(hybrid)
+            with self.subTest(ordered_scope_component=path):
+                hybrid = copy.deepcopy(observed)
+                hybrid[path] = copy.deepcopy(REVIEWED_ORDERED_SCOPE_SOURCE_PINS[path])
                 with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
                     slot_witness._reviewed_source_pair(hybrid)
 

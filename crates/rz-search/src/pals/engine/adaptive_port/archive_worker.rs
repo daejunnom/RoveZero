@@ -21,6 +21,10 @@ const MAX_IO_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Before construction, root maintenance may compact the engine arena. An
 /// active port retains pending node references and permits Store-only reclaim.
+// This is the one exclusive engine/port transfer in a one-slot worker, not a
+// collection of variant values. Preserve rejected/quarantined owners by value
+// without adding a heap allocation at a pressure-recovery boundary.
+#[allow(clippy::large_enum_variant)]
 pub enum ArchiveOwner<M: RoleModel> {
     Engine(PalsEngine<M>),
     Port(AdaptiveEnginePort<M>),
@@ -40,6 +44,9 @@ impl<M: RoleModel> ArchiveOwner<M> {
     }
 }
 
+// One command slot owns the original observation and its one-use proof. Keep
+// them together by value; no additional box/clone is needed per archive dispatch.
+#[allow(clippy::large_enum_variant)]
 pub enum ArchiveOperation {
     /// Existing root preparation, including checked topology persistence and
     /// compaction. Only an Engine owner may use this pre-construction barrier.
@@ -261,6 +268,9 @@ impl<M: RoleModel> ArchiveCompletion<M> {
     }
     /// No clock/root authority is replaced by the worker's submitted copy.
     /// A late result is useful evidence but cannot resume semantic admission.
+    // Invalid returns retain every engine/session/pin in the original owner;
+    // quarantine must not depend on allocating a new boxed error.
+    #[allow(clippy::result_large_err)]
     pub fn install(
         mut self,
         expected_authority: SearchAuthority,
@@ -274,6 +284,8 @@ impl<M: RoleModel> ArchiveCompletion<M> {
         self.install_checked(expected_authority, expected_nonce)
             .map(|(owner, receipt, _)| (owner, receipt))
     }
+    // Same by-value quarantine as install, including the one-use foreign proof.
+    #[allow(clippy::result_large_err)]
     pub fn install_with_foreign(
         mut self,
         expected_authority: SearchAuthority,
@@ -292,6 +304,8 @@ impl<M: RoleModel> ArchiveCompletion<M> {
                 (owner, receipt, permit.expect("checked foreign permit"))
             })
     }
+    // Both public install paths share this allocation-free owner rejection.
+    #[allow(clippy::result_large_err)]
     fn install_checked(
         self,
         expected_authority: SearchAuthority,
@@ -411,7 +425,7 @@ impl<M: RoleModel> ArchiveCompletion<M> {
         }
         let actual = engine
             .archive_owner_snapshot()
-            .map_err(|error| ArchiveQuarantineReason::Operation(error))?
+            .map_err(ArchiveQuarantineReason::Operation)?
             .ok_or_else(|| invalid("archive owner missing"))?;
         let expected = self
             .seal
@@ -431,21 +445,19 @@ impl<M: RoleModel> ArchiveCompletion<M> {
         if matches!(
             self.receipt.operation,
             ArchiveOperationKind::ReclaimHot | ArchiveOperationKind::PrepareForeign
-        ) {
-            if engine.nodes.len() != self.seal.node_handles.len()
-                || engine
-                    .nodes
-                    .iter()
-                    .map(|node| (node.state, node.situation))
-                    .ne(self.seal.node_handles.iter().copied())
-                || engine.records.iter().map(|record| record.revision).ne(self
-                    .seal
-                    .record_revisions
-                    .iter()
-                    .copied())
-            {
-                return Err(invalid("active engine topology"));
-            }
+        ) && (engine.nodes.len() != self.seal.node_handles.len()
+            || engine
+                .nodes
+                .iter()
+                .map(|node| (node.state, node.situation))
+                .ne(self.seal.node_handles.iter().copied())
+            || engine.records.iter().map(|record| record.revision).ne(self
+                .seal
+                .record_revisions
+                .iter()
+                .copied()))
+        {
+            return Err(invalid("active engine topology"));
         }
         if let ArchiveOwner::Port(port) = &self.owner {
             if port.authority != self.seal.authority {
@@ -529,6 +541,9 @@ impl<M: RoleModel + 'static> ArchiveWorker<M> {
     pub fn is_busy(&self) -> bool {
         self.pending.is_some()
     }
+    // Busy, closed and failed sends must return the exact original owner. A
+    // second heap allocation on rejection would undermine bounded recovery.
+    #[allow(clippy::result_large_err)]
     pub fn submit(
         &mut self,
         owner: ArchiveOwner<M>,

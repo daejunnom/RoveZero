@@ -94,7 +94,8 @@ choices!(PalsComparisonV5 {
 choices!(PalsArtifactDomainV5 {
     Untrained,
     Diagnostic,
-    RealGeneration
+    RealGeneration,
+    FrozenPcCollection
 });
 choices!(PalsCpuSelectionV5 {
     Disabled,
@@ -661,6 +662,14 @@ impl PalsModelSpecificationV5 {
                         == Some(PALS_V5_TRAINING_CHECKPOINT_DOMAIN),
                 "real-generation provenance/checkpoint domain missing",
             ),
+            PalsArtifactDomainV5::FrozenPcCollection => require(
+                mode == PalsEngineModeV5::Collection
+                    && compact
+                    && self.provenance.is_some()
+                    && self.checkpoint_domain.as_deref()
+                        == Some(PALS_V5_TRAINING_CHECKPOINT_DOMAIN),
+                "frozen P/C is a distinct Collection-only actual checkpoint; it cannot become G0, G1 or Deployment",
+            ),
         }
     }
 }
@@ -1021,6 +1030,15 @@ impl PalsRunManifestV5 {
                 "diagnostic assets or CPU_T/foreign CPU_R cannot enter final own-CPU_R evaluation",
             )?;
         }
+        require(
+            self.engines.iter().all(|e| {
+                e.model.artifact_domain != PalsArtifactDomainV5::FrozenPcCollection
+                    || (self.purpose == PalsRunPurposeV5::ActionCollection
+                        && e.mode == PalsEngineModeV5::Collection
+                        && e.cpu.cpu_t == PalsCpuSelectionV5::Stockfish19Full)
+            }),
+            "frozen P/C collection assets are restricted to actual CPU_T action collection; they are not arena or full-generation assets",
+        )?;
         self.validate_comparison()?;
         self.unique_input_bytes()?;
         Ok(())

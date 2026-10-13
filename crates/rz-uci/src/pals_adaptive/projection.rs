@@ -36,6 +36,7 @@ impl NativeQuestionProjection for AdaptivePortQuestion {
             position: self.position.clone(),
             context: self.context.clone(),
             deadline: self.deadline,
+            legacy_full_records: self.legacy_full_records.clone(),
         })
     }
     fn owned_host_bytes(&self) -> Option<u64> {
@@ -194,6 +195,10 @@ where
         self.backend.output_host_bytes(output)
     }
 
+    fn acceptance_output_digest(&self, output: &Self::Output) -> Option<rz_contracts::Digest> {
+        self.backend.acceptance_output_digest(output)
+    }
+
     fn execution_evidence(
         &mut self,
         ticket: &RoleTicketEnvelope,
@@ -260,7 +265,11 @@ fn native_question_bytes(query: &NativeTicketQuestion) -> Option<u64> {
                 .capacity()
                 .checked_mul(size_of::<rz_position::BoardMove>())?,
         )?;
-    u64::try_from(bytes).ok()
+    let bytes = u64::try_from(bytes).ok()?;
+    match &query.legacy_full_records {
+        Some(records) => bytes.checked_add(records.owned_host_bytes()?),
+        None => Some(bytes),
+    }
 }
 
 #[cfg(test)]
@@ -303,6 +312,7 @@ mod tests {
         calls: Arc<Mutex<Vec<&'static str>>>,
         unknown: bool,
         finish_confirmed: bool,
+        acceptance_digest: Option<Digest>,
     }
     impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for Fake {
         type Prepared = u64;
@@ -347,6 +357,11 @@ mod tests {
         }
         fn output_host_bytes(&self, _: &u64) -> u64 {
             8
+        }
+        fn acceptance_output_digest(&self, output: &u64) -> Option<Digest> {
+            self.calls.lock().unwrap().push("acceptance_digest");
+            assert_eq!(*output, 11);
+            self.acceptance_digest
         }
         fn execution_evidence(
             &mut self,
@@ -470,6 +485,7 @@ mod tests {
                         situation_revision: 1,
                     },
                     deadline: clock.origin() + Duration::from_nanos(deadline.at.0),
+                    legacy_full_records: None,
                 },
                 projections: Arc::new(AtomicUsize::new(0)),
             },
@@ -500,9 +516,24 @@ mod tests {
                 calls: Arc::clone(&calls),
                 unknown,
                 finish_confirmed: !unknown,
+                acceptance_digest: None,
             }),
             calls,
         )
+    }
+
+    #[test]
+    fn acceptance_digest_preserves_underlying_some_and_none_with_original_output() {
+        let clock = ContractSystemClock::new(ProcessEpoch(23));
+        for expected in [Some(Digest([29; 32])), None] {
+            let (mut backend, calls) = backend(&clock, false);
+            backend.backend.acceptance_digest = expected;
+            let output = 11;
+
+            assert_eq!(backend.acceptance_output_digest(&output), expected);
+            assert_eq!(output, 11);
+            assert_eq!(*calls.lock().unwrap(), ["acceptance_digest"]);
+        }
     }
 
     #[test]

@@ -1279,3 +1279,625 @@ fn failed_hot_yield_commit_retains_actual_receipt_until_cancel_settlement() {
     assert!(!manager.driver().raw_cpu_receipts.is_empty());
     assert!(manager.driver().actual_cpu.is_empty());
 }
+
+#[cfg(test)]
+mod adaptive_partial_feedback {
+    use super::*;
+    use rz_search::cpu::{CpuIterationProgress, CpuScoreScope};
+    use rz_search::cpu_worker::{CpuJobTermination, CpuWorkerEvent, CpuWorkerProgress};
+
+    // Only the continuation is authored. Every tested slice and retained token
+    // comes from the same real PausedStack owner used by the existing fixture.
+    struct PartialDriver {
+        inner: DriverFixture,
+        admissions: Vec<(CoordinatorWork<ReviewView, u64>, CpuJobEnvelope, SliceGrant)>,
+        partial_commits: Vec<(CoordinatorWork<ReviewView, u64>, CpuSliceReport)>,
+        terminal_commits: Vec<CpuSliceReport>,
+        detached: Vec<(CoordinatorWork<ReviewView, u64>, CpuSliceReport)>,
+        discarded: Vec<(CoordinatorWork<ReviewView, u64>, CpuJobTermination)>,
+    }
+
+    impl AdaptiveSearchDriver<u64> for PartialDriver {
+        fn root_rules(&self) -> Arc<ContractState> {
+            self.inner.root_rules()
+        }
+        fn ranking_published(
+            &mut self,
+            ranking: &ProposerRankingPublished,
+        ) -> Result<Vec<CandidateFrame<u64>>, AdaptiveManagerError> {
+            self.inner.ranking_published(ranking)
+        }
+        fn validate_role(
+            &self,
+            work: &CoordinatorWork<ReviewView, u64>,
+            ticket: &RoleTicketEnvelope,
+            output: &RoleOutput,
+        ) -> Result<(), AdaptiveManagerError> {
+            self.inner.validate_role(work, ticket, output)
+        }
+        fn commit_role(
+            &mut self,
+            work: &CoordinatorWork<ReviewView, u64>,
+            ticket: &RoleTicketEnvelope,
+            output: &RoleOutput,
+            physical: Option<TicketExecutionEvidence>,
+        ) -> Result<CheckedStep<u64>, AdaptiveManagerError> {
+            self.inner.commit_role(work, ticket, output, physical)
+        }
+        fn cpu_question(
+            &mut self,
+            work: &CoordinatorWork<ReviewView, u64>,
+            profiles: &[CpuWorkerProfile],
+            external: Option<&ExternalCpuConfig>,
+            selection: CpuEndpointSelection,
+        ) -> Result<CpuQuestion, AdaptiveManagerError> {
+            self.inner.cpu_question(work, profiles, external, selection)
+        }
+        fn cpu_admitted(
+            &mut self,
+            work: &CoordinatorWork<ReviewView, u64>,
+            job: &CpuJobEnvelope,
+            grant: &SliceGrant,
+        ) -> Result<(), AdaptiveManagerError> {
+            if let Some((original, original_job, original_grant)) = self.admissions.first() {
+                assert_eq!(work.frame, original.frame);
+                assert_eq!(work.input.stage, original.input.stage);
+                assert_eq!(work.input.question_digest, original.input.question_digest);
+                assert_eq!(work.input.view_seal, original.input.view_seal);
+                assert_eq!(job, original_job);
+                assert_eq!(grant.owner, original_grant.owner);
+            }
+            self.admissions.push((work.clone(), *job, *grant));
+            Ok(())
+        }
+        fn cpu_partial_continuation_eligible(
+            &self,
+            work: &CoordinatorWork<ReviewView, u64>,
+            report: &CpuSliceReport,
+        ) -> bool {
+            work.input.stage == RefinementStage::CpuValidation
+                && !report.terminal
+                && !report.admission_rejected
+                && report.continuation_retained
+                && report.actual_work.is_some()
+                && report.result.as_ref().is_ok_and(|actual| {
+                    actual.report.completion == CpuCompletion::Yielded
+                        && actual.report.score_scope == CpuScoreScope::CompletedIteration
+                        && actual.report.completed_depth > 0
+                })
+        }
+        fn commit_cpu(
+            &mut self,
+            work: &CoordinatorWork<ReviewView, u64>,
+            report: &CpuSliceReport,
+        ) -> Result<CheckedStep<u64>, AdaptiveManagerError> {
+            let transition = if report.terminal {
+                assert!(!report.continuation_retained);
+                self.terminal_commits.push(report.clone());
+                FrameTransition::Unknown {
+                    reason: "authored terminal-only control ends after the actual CPU receipt",
+                }
+            } else {
+                assert!(self.cpu_partial_continuation_eligible(work, report));
+                assert!(self.partial_commits.is_empty());
+                assert!(
+                    !self
+                        .inner
+                        .raw_cpu_receipts
+                        .contains(&report.grant.execution)
+                );
+                self.partial_commits.push((work.clone(), report.clone()));
+                let first =
+                    BoardMove::try_from(work.original_first_move.decode().unwrap()).unwrap();
+                let mut input = self
+                    .inner
+                    .input(RefinementStage::CriticDivergence, Some(first));
+                input.question_digest =
+                    receipt_digest(b"authored-partial-next-question", report.grant.execution);
+                FrameTransition::Continue(input)
+            };
+            Ok(CheckedStep {
+                evidence: receipt_digest(b"authored-partial-feedback", report.grant.execution),
+                transition,
+                fresh_pair: None,
+                rules_pair: None,
+                queued_recheck: None,
+            })
+        }
+        fn cpu_slice_observed(
+            &mut self,
+            work: &CoordinatorWork<ReviewView, u64>,
+            report: &CpuSliceReport,
+        ) -> Result<(), AdaptiveManagerError> {
+            self.inner.cpu_slice_observed(work, report)
+        }
+        fn cpu_detached_slice_observed(
+            &mut self,
+            work: &CoordinatorWork<ReviewView, u64>,
+            report: &CpuSliceReport,
+        ) -> Result<(), AdaptiveManagerError> {
+            self.inner.cpu_slice_observed(work, report)?;
+            self.detached.push((work.clone(), report.clone()));
+            Ok(())
+        }
+        fn cpu_token_discarded(
+            &mut self,
+            work: &CoordinatorWork<ReviewView, u64>,
+            termination: &CpuJobTermination,
+        ) -> Result<(), AdaptiveManagerError> {
+            self.discarded.push((work.clone(), termination.clone()));
+            Ok(())
+        }
+        fn commit_external(
+            &mut self,
+            work: &CoordinatorWork<ReviewView, u64>,
+            report: &ExternalWorkerReport,
+        ) -> Result<CheckedStep<u64>, AdaptiveManagerError> {
+            self.inner.commit_external(work, report)
+        }
+        fn publish_closed(&mut self, closed: &ClosedFrame) -> Result<(), AdaptiveManagerError> {
+            self.inner.publish_closed(closed)
+        }
+        fn role_consumed(
+            &mut self,
+            ticket: &RoleTicketEnvelope,
+            view: &Arc<ReviewView>,
+        ) -> Result<(), AdaptiveManagerError> {
+            self.inner.role_consumed(ticket, view)
+        }
+        fn role_consumption_recorded(
+            &self,
+            ticket: &RoleTicketEnvelope,
+            view: &ReviewView,
+        ) -> Result<bool, AdaptiveManagerError> {
+            self.inner.role_consumption_recorded(ticket, view)
+        }
+    }
+
+    type PartialManager = AdaptiveExecutionManager<u64, NativeFixture, PartialDriver>;
+
+    fn partial_fixture(
+        policy: CoordinatorPolicy,
+        root_generation: RootGeneration,
+    ) -> (
+        PartialManager,
+        Arc<NativeFacts>,
+        FrameInput<ReviewView, u64>,
+        Instant,
+    ) {
+        let position = Position::from_fen("3rk3/8/8/3p4/4P3/8/8/4K3 w - - 0 1").unwrap();
+        let clock = ContractSystemClock::new(ProcessEpoch(117));
+        let until = clock.origin() + WINDOW;
+        let authority = SearchAuthority {
+            epoch: ProcessEpoch(117),
+            game: GameGeneration(1),
+            root: root_generation,
+            implementation: Digest([19; 32]),
+        };
+        let rules = Arc::new(
+            ContractPosition::new(OwnerId(17), position.clone())
+                .export()
+                .unwrap(),
+        );
+        let mut stores = PalsStores::new(StoreLimits::default());
+        let root_registration = stores
+            .prepare_hot_root_registration(position.snapshot(), root_generation.0)
+            .unwrap();
+        let root = stores.hot_focus_registered_root(root_registration).unwrap();
+        assert_eq!(stores.generation(), authority.root.0);
+        let state = stores.situations.get(root).unwrap().state;
+        let mut driver = PartialDriver {
+            inner: DriverFixture {
+                authority,
+                rules,
+                stores,
+                index: ReviewContextIndex::default(),
+                state,
+                scope: FixtureScope::OwnCpuResume,
+                consumed: Vec::new(),
+                closed: Vec::new(),
+                expected_cpu: BTreeMap::new(),
+                actual_cpu: Vec::new(),
+                fail_raw_once: false,
+                fail_role_once: false,
+                fail_after_role_consumption_once: false,
+                raw_cpu_receipts: Vec::new(),
+            },
+            admissions: Vec::new(),
+            partial_commits: Vec::new(),
+            terminal_commits: Vec::new(),
+            detached: Vec::new(),
+            discarded: Vec::new(),
+        };
+        let input = driver.inner.input(RefinementStage::ProposerRanking, None);
+        let facts = Arc::new(NativeFacts::default());
+        let thread_facts = Arc::clone(&facts);
+        let native_clock = clock.clone();
+        let native = TicketedNativeService::spawn(
+            move || {
+                thread_facts.factories.fetch_add(1, Ordering::Relaxed);
+                Ok(NativeFixture {
+                    clock: native_clock,
+                    facts: thread_facts,
+                    finish_ok: true,
+                })
+            },
+            TicketServiceLimits::default(),
+        )
+        .unwrap();
+        let worker =
+            CpuWorker::spawn_notified(CpuWorkerId(0), cpu_engine(), native.signal()).unwrap();
+        let registration = AdaptiveManagerRegistration {
+            authority,
+            hard_deadline: until,
+            token_budget: 512,
+            policy,
+            first_request_sequence: 1,
+            native_cpu_node_limit: TOTAL_NODES,
+            endpoints: CpuEndpointSelection::deployment(),
+            controller: ControllerConfig {
+                policy,
+                fixed_node_credit: 1,
+                ..ControllerConfig::default()
+            },
+            device_digest: Digest([71; 32]),
+            cpu_device_digest: Digest([72; 32]),
+        };
+        let manager =
+            AdaptiveExecutionManager::new(registration, clock, native, vec![worker], None, driver)
+                .unwrap();
+        (manager, facts, input, until)
+    }
+
+    fn pump_partial(
+        manager: &mut PartialManager,
+        until: Instant,
+        predicate: impl Fn(&PartialManager) -> bool,
+    ) {
+        while !predicate(manager) {
+            assert!(Instant::now() < until, "partial fixture timeout");
+            manager.tick().unwrap();
+            assert!(manager.failures().next().is_none());
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn start_cpu(
+        manager: &mut PartialManager,
+        facts: &NativeFacts,
+        root: FrameInput<ReviewView, u64>,
+        until: Instant,
+    ) {
+        facts.child_gate.store(true, Ordering::Release);
+        manager.prepare_root_ranking(root).unwrap();
+        pump_partial(manager, until, |manager| manager.own[0].binding.is_some());
+    }
+
+    fn next_slice(manager: &mut PartialManager, until: Instant) -> CpuWorkerEventObservation {
+        loop {
+            assert!(Instant::now() < until, "actual CPU receipt timeout");
+            if let Some(event) = manager.own[0]
+                .worker
+                .as_ref()
+                .unwrap()
+                .try_event_observed()
+                .unwrap()
+            {
+                return event;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn forward_first(manager: &mut PartialManager, until: Instant) -> CpuSliceReport {
+        loop {
+            let event = next_slice(manager, until);
+            let (event, _) = event.into_parts();
+            let CpuWorkerEvent::Slice(report) = event else {
+                panic!("live original owner terminated before its first completed iteration");
+            };
+            assert!(
+                !report.terminal,
+                "one-node slices must retain the depth-two traversal"
+            );
+            manager
+                .own_event(0, CpuWorkerEvent::Slice(report.clone()))
+                .unwrap();
+            if manager.own[0].binding.as_ref().unwrap().feedback_forwarded {
+                return report;
+            }
+            manager.resume_cpu(0, 1, Duration::from_millis(8)).unwrap();
+        }
+    }
+
+    fn frame_fingerprint(
+        manager: &PartialManager,
+        frame: FrameId,
+    ) -> Option<(FramePhase, RefinementStage, Digest, ReviewViewSeal, Digest)> {
+        manager.machine.frame(frame).map(|current| {
+            (
+                current.phase,
+                current.input.stage,
+                current.input.question_digest,
+                current.input.view_seal,
+                current.input.public_context,
+            )
+        })
+    }
+
+    fn shutdown_partial(manager: &mut PartialManager, until: Instant) -> AdaptiveShutdownReceipt {
+        manager.begin_shutdown(until).unwrap();
+        while {
+            let receipt = manager.shutdown_receipt().unwrap();
+            !receipt.native_owner_joined || receipt.own_cpu_joined != 1
+        } {
+            assert!(Instant::now() < until, "partial owner shutdown timeout");
+            manager.tick().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        manager.shutdown_receipt().unwrap()
+    }
+
+    #[test]
+    fn real_completed_iteration_handoff_resumes_only_original_custody() {
+        let (mut manager, facts, root, until) =
+            partial_fixture(CoordinatorPolicy::Adaptive, RootGeneration(1));
+        start_cpu(&mut manager, &facts, root, until);
+        let first = forward_first(&mut manager, until);
+        let original = manager.own[0].binding.as_ref().unwrap().work.clone();
+        let original_job = manager.own[0].binding.as_ref().unwrap().envelope;
+        let fingerprint = frame_fingerprint(&manager, original.frame);
+        assert_eq!(fingerprint.as_ref().unwrap().0, FramePhase::Ready);
+        assert_eq!(
+            fingerprint.as_ref().unwrap().1,
+            RefinementStage::CriticDivergence
+        );
+        assert_ne!(
+            fingerprint.as_ref().unwrap().2,
+            original.input.question_digest
+        );
+        assert_eq!(manager.driver.partial_commits.len(), 1);
+        assert!(
+            !manager
+                .driver
+                .inner
+                .raw_cpu_receipts
+                .contains(&first.grant.execution)
+        );
+
+        // A repeated publication of this already-settled real iteration cannot
+        // bind its execution to the newly materialized logical question.
+        let actual = &first.result.as_ref().unwrap().report;
+        let progress = CpuWorkerProgress {
+            job: first.grant.job,
+            execution: first.grant.execution,
+            owner: first.grant.owner,
+            sequence: first.progress_sequence,
+            iteration: CpuIterationProgress {
+                best_move: actual.best_move,
+                score: actual.score,
+                completed_depth: actual.completed_depth,
+                nodes: actual.nodes,
+            },
+        };
+        manager.own_progress(0, progress.clone()).unwrap();
+        manager.own_progress(0, progress).unwrap();
+        assert_eq!(frame_fingerprint(&manager, original.frame), fingerprint);
+
+        let terminal = loop {
+            manager.resume_cpu(0, 1, Duration::from_millis(8)).unwrap();
+            let binding = manager.own[0].binding.as_ref().unwrap();
+            assert!(binding.feedback_forwarded);
+            assert_eq!(binding.envelope, original_job);
+            assert_eq!(
+                binding.work.input.question_digest,
+                original.input.question_digest
+            );
+            assert_eq!(binding.work.input.view_seal, original.input.view_seal);
+            assert_eq!(frame_fingerprint(&manager, original.frame), fingerprint);
+            let (event, _) = next_slice(&mut manager, until).into_parts();
+            let CpuWorkerEvent::Slice(report) = event else {
+                panic!("resumed original traversal terminated without its slice receipt");
+            };
+            manager
+                .own_event(0, CpuWorkerEvent::Slice(report.clone()))
+                .unwrap();
+            assert_eq!(frame_fingerprint(&manager, original.frame), fingerprint);
+            assert_eq!(manager.driver.partial_commits.len(), 1);
+            assert!(manager.driver.terminal_commits.is_empty());
+            assert!(manager.driver.inner.closed.is_empty());
+            if report.terminal {
+                break report;
+            }
+        };
+        assert_eq!(
+            terminal.result.as_ref().unwrap().report.completion,
+            CpuCompletion::DepthLimit
+        );
+        assert!(manager.own[0].binding.is_none());
+        assert!(manager.driver.detached.iter().all(|(work, report)| {
+            work.frame == original.frame
+                && work.input.question_digest == original.input.question_digest
+                && work.input.view_seal == original.input.view_seal
+                && report.grant.job == original_job.id
+                && report.grant.owner == first.grant.owner
+        }));
+        assert_eq!(
+            manager.native_cpu_usage().unwrap(),
+            (terminal.cumulative_nodes, 0)
+        );
+        assert_eq!(
+            manager.counters.cpu_slice_receipts,
+            manager.counters.cpu_yields + 1
+        );
+
+        // A duplicate terminal is rejected before another semantic consumption.
+        assert!(
+            manager
+                .own_event(0, CpuWorkerEvent::Slice(terminal))
+                .is_err()
+        );
+        assert_eq!(frame_fingerprint(&manager, original.frame), fingerprint);
+        assert_eq!(manager.driver.partial_commits.len(), 1);
+        assert!(manager.driver.terminal_commits.is_empty());
+        let receipt = shutdown_partial(&mut manager, until);
+        assert_eq!(receipt.native_cpu_reserved, 0);
+        assert!(!receipt.permits_archive_close());
+    }
+
+    #[test]
+    fn forwarded_paused_token_discard_after_cancel_never_retires_new_question() {
+        let (mut manager, facts, root, until) =
+            partial_fixture(CoordinatorPolicy::Adaptive, RootGeneration(1));
+        start_cpu(&mut manager, &facts, root, until);
+        let first = forward_first(&mut manager, until);
+        let original = manager.own[0].binding.as_ref().unwrap().work.clone();
+        manager.begin_shutdown(until).unwrap();
+        let revoked = frame_fingerprint(&manager, original.frame);
+        let closed = manager.driver.inner.closed.len();
+        // Check the old token discard before the separate, intentional root
+        // retirement at the all-owner join fence clears every frame.
+        let (event, timing) = next_slice(&mut manager, until).into_parts();
+        assert!(matches!(&event, CpuWorkerEvent::JobTerminated(_)));
+        assert!(timing.is_none());
+        manager.own_event(0, event).unwrap();
+        manager.flush_deferred().unwrap();
+        assert_eq!(frame_fingerprint(&manager, original.frame), revoked);
+        assert_eq!(manager.driver.inner.closed.len(), closed);
+        assert_eq!(manager.driver.discarded.len(), 1);
+        let receipt = shutdown_partial(&mut manager, until);
+        assert!(frame_fingerprint(&manager, original.frame).is_none());
+        assert_eq!(manager.driver.inner.closed.len(), closed);
+        assert_eq!(manager.driver.partial_commits.len(), 1);
+        assert!(manager.driver.terminal_commits.is_empty());
+        assert_eq!(manager.driver.discarded.len(), 1);
+        let (work, termination) = &manager.driver.discarded[0];
+        assert_eq!(work.input.question_digest, original.input.question_digest);
+        assert_eq!(work.input.view_seal, original.input.view_seal);
+        assert_eq!(termination.job, first.grant.job);
+        assert_eq!(termination.owner, first.grant.owner);
+        assert_eq!(termination.last_execution, first.grant.execution);
+        assert_eq!(receipt.native_cpu_reserved, 0);
+        assert!(receipt.permits_archive_close());
+        assert!(manager.failures().next().is_none());
+    }
+
+    #[test]
+    fn old_root_yield_receipt_cannot_change_a_new_root_live_frame() {
+        let (mut old, facts, root, until) =
+            partial_fixture(CoordinatorPolicy::Adaptive, RootGeneration(1));
+        start_cpu(&mut old, &facts, root, until);
+        let old_report = forward_first(&mut old, until);
+        assert!(shutdown_partial(&mut old, until).permits_archive_close());
+
+        let (mut next, facts, root, until) =
+            partial_fixture(CoordinatorPolicy::Adaptive, RootGeneration(2));
+        start_cpu(&mut next, &facts, root, until);
+        let original = next.own[0].binding.as_ref().unwrap().work.clone();
+        let fingerprint = frame_fingerprint(&next, original.frame);
+        assert_ne!(old_report.grant.job.authority, original.frame.authority);
+        assert!(
+            next.own_event(0, CpuWorkerEvent::Slice(old_report))
+                .is_err()
+        );
+        assert_eq!(frame_fingerprint(&next, original.frame), fingerprint);
+        assert_eq!(
+            next.own[0]
+                .binding
+                .as_ref()
+                .unwrap()
+                .work
+                .input
+                .question_digest,
+            original.input.question_digest
+        );
+        assert!(next.driver.partial_commits.is_empty());
+        assert!(next.driver.terminal_commits.is_empty());
+        assert!(next.driver.detached.is_empty());
+        let receipt = shutdown_partial(&mut next, until);
+        assert_eq!(receipt.native_cpu_reserved, 0);
+        assert!(!receipt.permits_archive_close());
+    }
+
+    #[test]
+    fn fixed_and_synchronous_keep_partial_receipts_on_the_original_cpu_step() {
+        for policy in [CoordinatorPolicy::Fixed, CoordinatorPolicy::Synchronous] {
+            let (mut manager, facts, root, until) = partial_fixture(policy, RootGeneration(1));
+            start_cpu(&mut manager, &facts, root, until);
+            let original = manager.own[0].binding.as_ref().unwrap().work.clone();
+            let terminal = loop {
+                let (event, _) = next_slice(&mut manager, until).into_parts();
+                let CpuWorkerEvent::Slice(report) = event else {
+                    panic!("control owner terminated without its slice receipt");
+                };
+                manager
+                    .own_event(0, CpuWorkerEvent::Slice(report.clone()))
+                    .unwrap();
+                assert!(manager.driver.partial_commits.is_empty());
+                assert!(manager.driver.detached.is_empty());
+                if report.terminal {
+                    break report;
+                }
+                let binding = manager.own[0].binding.as_ref().unwrap();
+                assert!(!binding.feedback_forwarded);
+                assert_eq!(
+                    binding.work.input.question_digest,
+                    original.input.question_digest
+                );
+                assert_eq!(
+                    manager.machine.frame(original.frame).unwrap().input.stage,
+                    RefinementStage::CpuValidation
+                );
+                manager.resume_cpu(0, 1, Duration::from_millis(8)).unwrap();
+            };
+            assert_eq!(manager.driver.terminal_commits.len(), 1);
+            assert_eq!(manager.driver.inner.closed.len(), 1);
+            assert_eq!(
+                manager.native_cpu_usage().unwrap(),
+                (terminal.cumulative_nodes, 0)
+            );
+            assert_eq!(
+                manager.counters.cpu_slice_receipts,
+                manager.counters.cpu_yields + 1
+            );
+            assert!(shutdown_partial(&mut manager, until).permits_archive_close());
+            assert!(manager.failures().next().is_none());
+        }
+    }
+
+    #[test]
+    fn scheduling_yield_ignores_closed_owners_and_preserves_live_control_errors() {
+        use rz_runtime::CompletionSignal;
+        use rz_runtime::adaptive::ControlMailbox;
+
+        let terminal = ControlMailbox::new((), CompletionSignal::default());
+        let terminal_before = terminal.seal_terminal();
+        assert!(!scheduling_yield(&terminal, 1).unwrap());
+        assert_eq!(terminal.snapshot(), terminal_before);
+        assert_eq!(terminal.snapshot().yield_sequence, 0);
+        assert_eq!(terminal.snapshot().yield_ack, 0);
+
+        let canceled = ControlMailbox::new((), CompletionSignal::default());
+        canceled.request_cancel(1).unwrap();
+        let canceled_before = canceled.snapshot();
+        assert!(!scheduling_yield(&canceled, 2).unwrap());
+        assert_eq!(canceled.snapshot(), canceled_before);
+        assert_eq!(canceled.snapshot().yield_sequence, 0);
+        assert_eq!(canceled.snapshot().yield_ack, 0);
+
+        let live = ControlMailbox::new((), CompletionSignal::default());
+        assert!(scheduling_yield(&live, 1).unwrap());
+        assert_eq!(live.snapshot().yield_sequence, 1);
+        assert_eq!(live.snapshot().yield_ack, 0);
+        let requested = live.snapshot();
+        assert!(matches!(
+            scheduling_yield(&live, 2),
+            Err(AdaptiveManagerError::Invalid("adaptive Yield control"))
+        ));
+        assert!(matches!(
+            scheduling_yield(&live, 1),
+            Err(AdaptiveManagerError::Invalid("adaptive Yield control"))
+        ));
+        assert_eq!(live.snapshot(), requested);
+    }
+}

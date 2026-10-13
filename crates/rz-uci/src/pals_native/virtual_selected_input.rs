@@ -62,7 +62,7 @@ pub fn prepare_selected_virtual_review_input(
         .collect::<Result<Vec<_>, RoleError>>()?;
     let anchor_history_seals = positions
         .iter()
-        .map(|position| pals_native::pals_history_digest(position))
+        .map(pals_native::pals_history_digest)
         .collect::<Result<Vec<_>, _>>()?;
     // The model's anchor zero is the exact root; the request position is the
     // Rules endpoint of its explicit virtual prefix, not necessarily that root.

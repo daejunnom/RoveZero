@@ -678,6 +678,10 @@ enum CpuCommand {
     Begin(Box<CpuJob>, SliceGrant),
     Resume(SliceGrant),
 }
+struct TimedCpuCommand {
+    original: CpuCommand,
+    admitted_at: Instant,
+}
 impl CpuCommand {
     fn grant(&self) -> SliceGrant {
         match self {
@@ -729,10 +733,13 @@ struct CpuWorkerExit {
 struct ActiveJob {
     job: CpuJob,
     token: Option<CpuResumeToken>,
+    retained_completed_depth: u16,
     spent: u64,
     last_sequence: u64,
     last_control_sequence: u64,
-    terminal_permit: Option<ReliablePermit<CpuCommand, CpuWorkerEvent, CpuWorkerProgress>>,
+    terminal_permit: Option<
+        ReliablePermit<TimedCpuCommand, CpuWorkerEventObservation, CpuWorkerProgressObservation>,
+    >,
 }
 #[derive(Clone, Debug)]
 pub struct CpuWorkerProgress {
@@ -744,10 +751,75 @@ pub struct CpuWorkerProgress {
     pub iteration: CpuIterationProgress,
 }
 
+/// Original owner clocks travel with their publication, never in a separate
+/// mutable "latest timing" slot. This is timing evidence, not a new witness.
+#[derive(Clone, Debug)]
+pub struct CpuWorkerProgressObservation {
+    original: CpuWorkerProgress,
+    run_started_at: Instant,
+    published_at: Instant,
+    interval_started_at: Instant,
+    advanced_depth: bool,
+    resume_admission_and_restore: Option<Duration>,
+}
+impl CpuWorkerProgressObservation {
+    pub fn progress(&self) -> &CpuWorkerProgress {
+        &self.original
+    }
+    pub fn run_started_at(&self) -> Instant {
+        self.run_started_at
+    }
+    pub fn published_at(&self) -> Instant {
+        self.published_at
+    }
+    pub fn completed_progress_interval(&self) -> Option<Duration> {
+        self.advanced_depth
+            .then(|| self.published_at.duration_since(self.interval_started_at))
+    }
+    pub fn resume_admission_and_restore(&self) -> Option<Duration> {
+        self.resume_admission_and_restore
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct CpuWorkerSliceTiming {
+    run_started_at: Instant,
+    analyze_returned_at: Instant,
+    report_ready_at: Instant,
+    resume_admission_and_restore: Option<Duration>,
+}
+impl CpuWorkerSliceTiming {
+    pub fn run_started_at(&self) -> Instant {
+        self.run_started_at
+    }
+    pub fn analyze_returned_at(&self) -> Instant {
+        self.analyze_returned_at
+    }
+    pub fn report_ready_at(&self) -> Instant {
+        self.report_ready_at
+    }
+    pub fn return_processing(&self) -> Duration {
+        self.report_ready_at
+            .duration_since(self.analyze_returned_at)
+    }
+    pub fn resume_admission_and_restore(&self) -> Option<Duration> {
+        self.resume_admission_and_restore
+    }
+}
+pub struct CpuWorkerEventObservation {
+    original: CpuWorkerEvent,
+    timing: Option<CpuWorkerSliceTiming>,
+}
+impl CpuWorkerEventObservation {
+    pub fn into_parts(self) -> (CpuWorkerEvent, Option<CpuWorkerSliceTiming>) {
+        (self.original, self.timing)
+    }
+}
+
 /// Commands and terminal slots share an admission count of eight. Each command
 /// reserves its report seat before enqueueing, so terminal send never depends
 /// on an unavailable general queue slot. Progress alone is coalesced.
-type CpuWorkerMailbox = WorkerMailbox<CpuCommand, CpuWorkerEvent, CpuWorkerProgress>;
+type CpuWorkerMailbox =
+    WorkerMailbox<TimedCpuCommand, CpuWorkerEventObservation, CpuWorkerProgressObservation>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuWorkerProfile {
     pub owner: CpuWorkerId,
@@ -945,7 +1017,10 @@ impl CpuWorker {
                                 retained_bytes: engine.paused_stack_bytes().unwrap_or(0),
                                 shutdown: worker_shutdown.load(Ordering::Acquire),
                             };
-                            let _ = permit.publish(CpuWorkerEvent::JobTerminated(termination));
+                            let _ = permit.publish(CpuWorkerEventObservation {
+                                original: CpuWorkerEvent::JobTerminated(termination),
+                                timing: None,
+                            });
                         }
                         active = None;
                     }
@@ -958,8 +1033,9 @@ impl CpuWorker {
                         continue;
                     }
                 };
+                let admitted_at = command.command.admitted_at;
                 let mut rejected_controls = None;
-                let (grant, accepted_command) = match command.command {
+                let (grant, accepted_command) = match command.command.original {
                     CpuCommand::Begin(job, grant) => {
                         let fresh_eligible = !worker_shutdown.load(Ordering::Acquire)
                             && grant.job == job.envelope.id
@@ -984,6 +1060,7 @@ impl CpuWorker {
                             active = Some(ActiveJob {
                                 job: *job,
                                 token: None,
+                                retained_completed_depth: 0,
                                 spent: 0,
                                 last_sequence: 0,
                                 last_control_sequence: 0,
@@ -1042,12 +1119,19 @@ impl CpuWorker {
                                     sum <= task.job.envelope.total_native_node_credit
                                 })
                     });
+                let mut owner_timing = None;
                 if eligible {
                     let task = active.as_mut().expect("checked private job");
                     // Starting the next slice consumes the previous pause
                     // authority; its unused terminal storage can be released.
                     task.terminal_permit.take();
-                    let lease = Instant::now().checked_add(grant.soft_lease);
+                    let run_started_at = Instant::now();
+                    let lease = run_started_at.checked_add(grant.soft_lease);
+                    let resumed_depth = task.token.as_ref().map(|_| task.retained_completed_depth);
+                    let mut last_depth = resumed_depth.unwrap_or(0);
+                    let mut interval_started_at = run_started_at;
+                    let mut first_publication = true;
+                    let mut resume_admission_and_restore = None;
                     let mut invoked = false;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         CpuSliceControl::new(grant.node_credit, lease, task.job.mailbox.clone())
@@ -1069,21 +1153,50 @@ impl CpuWorker {
                                         if iteration.completed_depth == 0 {
                                             return;
                                         }
+                                        let published_at = Instant::now();
+                                        if first_publication
+                                            && resumed_depth == Some(iteration.completed_depth)
+                                            && iteration.nodes == 0
+                                        {
+                                            // The existing stack owner publishes its
+                                            // reused iteration after exact restoration.
+                                            // This is not a newly completed depth.
+                                            resume_admission_and_restore =
+                                                published_at.checked_duration_since(admitted_at);
+                                        }
+                                        first_publication = false;
+                                        let advanced_depth = iteration.completed_depth > last_depth;
+                                        last_depth = last_depth.max(iteration.completed_depth);
                                         progress_sequence = progress_sequence.saturating_add(1);
                                         let _ = worker_mailbox.publish_progress(
                                             progress_sequence,
-                                            CpuWorkerProgress {
-                                                job: grant.job,
-                                                execution: grant.execution,
-                                                owner,
-                                                sequence: progress_sequence,
-                                                iteration,
+                                            CpuWorkerProgressObservation {
+                                                original: CpuWorkerProgress {
+                                                    job: grant.job,
+                                                    execution: grant.execution,
+                                                    owner,
+                                                    sequence: progress_sequence,
+                                                    iteration,
+                                                },
+                                                run_started_at,
+                                                published_at,
+                                                interval_started_at,
+                                                advanced_depth,
+                                                resume_admission_and_restore,
                                             },
                                         );
+                                        interval_started_at = published_at;
                                     },
                                 )
                             })
                     }));
+                    let analyze_returned_at = Instant::now();
+                    owner_timing = Some(CpuWorkerSliceTiming {
+                        run_started_at,
+                        analyze_returned_at,
+                        report_ready_at: analyze_returned_at,
+                        resume_admission_and_restore,
+                    });
                     let panicked = result.is_err();
                     let mut result = result.unwrap_or_else(|_| {
                         Err(CpuError::Unsupported("CPU worker panicked; usage unknown"))
@@ -1120,6 +1233,9 @@ impl CpuWorker {
                         .ok()
                         .filter(|value| value.report.completion == CpuCompletion::Yielded)
                         .and_then(|value| value.report.resume.clone());
+                    task.retained_completed_depth = result
+                        .as_ref()
+                        .map_or(0, |value| value.report.completed_depth);
                     // Only this private worker retains the opaque engine
                     // owner. The manager receives liveness, not the token.
                     if let Ok(value) = &mut result {
@@ -1173,9 +1289,15 @@ impl CpuWorker {
                     }
                 }
                 let retain_permit = !report.admission_rejected && report.continuation_retained;
+                if let Some(timing) = &mut owner_timing {
+                    timing.report_ready_at = Instant::now();
+                }
                 if command
                     .reliable
-                    .publish(CpuWorkerEvent::Slice(report))
+                    .publish(CpuWorkerEventObservation {
+                        original: CpuWorkerEvent::Slice(report),
+                        timing: owner_timing,
+                    })
                     .is_err()
                 {
                     engine_reusable = false;
@@ -1296,14 +1418,24 @@ impl CpuWorker {
                 true,
             ));
         }
-        self.mailbox.admit(command, 2).map_err(|error| {
-            let reason = match error.reason {
-                MailboxError::Closed => CpuWorkerError::Disconnected,
-                MailboxError::QueueFull | MailboxError::ReliableFull => CpuWorkerError::Capacity,
-                _ => CpuWorkerError::Invalid("CPU mailbox admission failed"),
-            };
-            CpuSubmissionRejected::from_command(reason, error.value, true)
-        })
+        self.mailbox
+            .admit(
+                TimedCpuCommand {
+                    original: command,
+                    admitted_at: Instant::now(),
+                },
+                2,
+            )
+            .map_err(|error| {
+                let reason = match error.reason {
+                    MailboxError::Closed => CpuWorkerError::Disconnected,
+                    MailboxError::QueueFull | MailboxError::ReliableFull => {
+                        CpuWorkerError::Capacity
+                    }
+                    _ => CpuWorkerError::Invalid("CPU mailbox admission failed"),
+                };
+                CpuSubmissionRejected::from_command(reason, error.value.original, true)
+            })
     }
     pub fn begin(&self, job: CpuJob, grant: SliceGrant) -> Result<(), CpuWorkerError> {
         self.begin_retaining(job, grant)
@@ -1391,6 +1523,10 @@ impl CpuWorker {
         self.submit(CpuCommand::Resume(grant))
     }
     pub fn try_event(&self) -> Result<Option<CpuWorkerEvent>, CpuWorkerError> {
+        self.try_event_observed()
+            .map(|event| event.map(|event| event.original))
+    }
+    pub fn try_event_observed(&self) -> Result<Option<CpuWorkerEventObservation>, CpuWorkerError> {
         if let Some(report) = self.mailbox.take_reliable() {
             return Ok(Some(report));
         }
@@ -1400,6 +1536,10 @@ impl CpuWorker {
         Ok(None)
     }
     pub fn latest_progress(&self) -> Option<CpuWorkerProgress> {
+        self.latest_progress_observed()
+            .map(|progress| progress.original)
+    }
+    pub fn latest_progress_observed(&self) -> Option<CpuWorkerProgressObservation> {
         self.mailbox.take_progress().map(|(_, progress)| progress)
     }
     pub fn occupancy(&self) -> rz_runtime::adaptive::MailboxOccupancy {
@@ -1437,7 +1577,7 @@ impl CpuWorker {
         };
         let mut events = Vec::new();
         while let Some(event) = self.mailbox.take_reliable() {
-            events.push(event);
+            events.push(event.original);
         }
         let last_progress = self.latest_progress();
         CpuWorkerShutdown {
@@ -1486,3 +1626,77 @@ impl Drop for CpuWorker {
 #[cfg(test)]
 #[path = "cpu_worker_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod owner_clock_tests {
+    use super::*;
+    use rz_contracts::pals::SearchAuthority;
+    use rz_contracts::{GameGeneration, ProcessEpoch, RootGeneration};
+
+    fn original_progress() -> CpuWorkerProgress {
+        let epoch = ProcessEpoch(1);
+        CpuWorkerProgress {
+            job: CpuJobId {
+                authority: SearchAuthority {
+                    epoch,
+                    game: GameGeneration(1),
+                    root: RootGeneration(1),
+                    implementation: Digest([1; 32]),
+                },
+                sequence: 1,
+            },
+            execution: ExecutionId::new(epoch, 1),
+            owner: CpuWorkerId(0),
+            sequence: 1,
+            iteration: CpuIterationProgress {
+                best_move: None,
+                score: 0,
+                completed_depth: 2,
+                nodes: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn restored_iteration_is_not_a_new_progress_interval() {
+        let started = Instant::now();
+        let mut publication = CpuWorkerProgressObservation {
+            original: original_progress(),
+            run_started_at: started,
+            published_at: started + Duration::from_millis(3),
+            interval_started_at: started,
+            advanced_depth: false,
+            resume_admission_and_restore: Some(Duration::from_millis(5)),
+        };
+        assert_eq!(publication.completed_progress_interval(), None);
+        assert_eq!(
+            publication.resume_admission_and_restore(),
+            Some(Duration::from_millis(5))
+        );
+        publication.interval_started_at = publication.published_at;
+        publication.published_at += Duration::from_millis(7);
+        publication.advanced_depth = true;
+        assert_eq!(
+            publication.completed_progress_interval(),
+            Some(Duration::from_millis(7))
+        );
+        // Admission/restore has its own scope and does not become this sample.
+        assert_ne!(
+            publication.completed_progress_interval(),
+            publication.resume_admission_and_restore()
+        );
+    }
+
+    #[test]
+    fn feedback_return_excludes_owner_search_and_paused_residence() {
+        let started = Instant::now();
+        let timing = CpuWorkerSliceTiming {
+            run_started_at: started,
+            analyze_returned_at: started + Duration::from_millis(100),
+            report_ready_at: started + Duration::from_millis(102),
+            resume_admission_and_restore: None,
+        };
+        assert_eq!(timing.return_processing(), Duration::from_millis(2));
+        assert_eq!(timing.resume_admission_and_restore(), None);
+    }
+}

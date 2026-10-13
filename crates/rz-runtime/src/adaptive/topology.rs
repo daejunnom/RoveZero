@@ -12,6 +12,8 @@ use std::fmt;
 use std::io::Read;
 #[cfg(any(target_os = "linux", test))]
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 pub const CPU_PROBE_MAX_LOGICAL_CPUS: usize = 4096;
 pub const CPU_PROBE_MAX_THREADS: usize = 1024;
@@ -373,6 +375,9 @@ pub enum CpuResourceError {
     AffinityMismatch,
     ManagerSmtOverlap,
     OrtSettingsMismatch,
+    ProbeDeadline,
+    ProbeCanceled,
+    ProbeBudgetExceeded,
 }
 impl fmt::Display for CpuResourceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -768,6 +773,96 @@ pub fn observe_current_cpu() -> HostCpuSnapshot {
     HostCpuSnapshot::unknown()
 }
 
+/// Reuses the same read-only metadata probe with cooperative caller controls.
+/// Linux brackets every read/chunk and topology/ancestor traversal. Windows
+/// brackets the fixed native call before/after; neither branch interrupts an
+/// in-progress kernel syscall or installs a resource policy.
+pub fn observe_current_cpu_until(
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<HostCpuSnapshot, CpuResourceError> {
+    let control = || cpu_probe_control(deadline, cancel);
+    control()?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::cell::Cell;
+        const TOTAL_READ_MAX: usize = 8 * 1024 * 1024;
+        let total_bytes = Cell::new(0usize);
+        let read_failure = Cell::new(None);
+        let read = |path: &Path| {
+            let result = (|| -> Result<Option<String>, CpuResourceError> {
+                control()?;
+                let Ok(mut file) = std::fs::File::open(path) else {
+                    control()?;
+                    return Ok(None);
+                };
+                control()?;
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 1024];
+                loop {
+                    control()?;
+                    let remaining = PROBE_FILE_MAX_BYTES + 1 - bytes.len();
+                    let limit = chunk.len().min(remaining);
+                    let count = match file.read(&mut chunk[..limit]) {
+                        Ok(count) => count,
+                        Err(_) => {
+                            control()?;
+                            return Ok(None);
+                        }
+                    };
+                    control()?;
+                    if count == 0 {
+                        break;
+                    }
+                    let next = total_bytes
+                        .get()
+                        .checked_add(count)
+                        .filter(|value| *value <= TOTAL_READ_MAX)
+                        .ok_or(CpuResourceError::ProbeBudgetExceeded)?;
+                    total_bytes.set(next);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if bytes.len() > PROBE_FILE_MAX_BYTES {
+                        return Err(CpuResourceError::ProbeBudgetExceeded);
+                    }
+                }
+                control()?;
+                Ok(String::from_utf8(bytes).ok())
+            })();
+            match result {
+                Ok(value) => value,
+                Err(error) => {
+                    read_failure.set(Some(error));
+                    None
+                }
+            }
+        };
+        let guarded_control = || {
+            if let Some(error) = read_failure.get() {
+                Err(error)
+            } else {
+                control()
+            }
+        };
+        observe_linux_cpu_controlled(read, guarded_control)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let value = observe_current_cpu();
+        control()?;
+        Ok(value)
+    }
+}
+
+fn cpu_probe_control(deadline: Instant, cancel: &AtomicBool) -> Result<(), CpuResourceError> {
+    if cancel.load(Ordering::Acquire) {
+        Err(CpuResourceError::ProbeCanceled)
+    } else if Instant::now() >= deadline {
+        Err(CpuResourceError::ProbeDeadline)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn parse_linux_cpus(raw: &str) -> Option<Vec<LogicalCpu>> {
     if raw.is_empty() || raw.len() > PROBE_FILE_MAX_BYTES {
@@ -945,11 +1040,27 @@ fn tighter(a: CpuQuotaReadback, b: CpuQuotaReadback) -> CpuQuotaReadback {
 
 #[cfg(any(target_os = "linux", test))]
 fn observe_linux_cpu(read: impl Fn(&Path) -> Option<String>) -> HostCpuSnapshot {
+    observe_linux_cpu_controlled(read, || Ok(()))
+        .expect("the compatibility metadata probe has no failing control callback")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn observe_linux_cpu_controlled(
+    raw_read: impl Fn(&Path) -> Option<String>,
+    control: impl Fn() -> Result<(), CpuResourceError>,
+) -> Result<HostCpuSnapshot, CpuResourceError> {
+    let read = |path: &Path| {
+        control()?;
+        let value = raw_read(path);
+        control()?;
+        Ok::<_, CpuResourceError>(value)
+    };
+    control()?;
     let mut snapshot = HostCpuSnapshot::unknown();
-    let process_before = read(Path::new("/proc/self/status"));
-    let thread_before = read(Path::new("/proc/thread-self/status"));
+    let process_before = read(Path::new("/proc/self/status"))?;
+    let thread_before = read(Path::new("/proc/thread-self/status"))?;
     snapshot.process_affinity_scope = CpuAffinityScope::ThreadGroupLeader;
-    let online_before = read(Path::new("/sys/devices/system/cpu/online"));
+    let online_before = read(Path::new("/sys/devices/system/cpu/online"))?;
     let mut observed_files: Vec<(PathBuf, Option<String>)> = Vec::new();
     let process_cpus = process_before
         .as_deref()
@@ -992,6 +1103,7 @@ fn observe_linux_cpu(read: impl Fn(&Path) -> Option<String>) -> HostCpuSnapshot 
         let mut groups = BTreeSet::new();
         let mut complete = true;
         for cpu in cpus {
+            control()?;
             if groups
                 .iter()
                 .any(|siblings: &Vec<LogicalCpu>| siblings.contains(cpu))
@@ -1002,7 +1114,7 @@ fn observe_linux_cpu(read: impl Fn(&Path) -> Option<String>) -> HostCpuSnapshot 
                 "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list",
                 cpu.index
             ));
-            let raw = read(&path);
+            let raw = read(&path)?;
             observed_files.push((path, raw.clone()));
             if let Some(siblings) = raw.and_then(|s| parse_linux_cpus(s.trim())) {
                 if !siblings.contains(cpu) {
@@ -1028,8 +1140,8 @@ fn observe_linux_cpu(read: impl Fn(&Path) -> Option<String>) -> HostCpuSnapshot 
             CpuReadback::Unknown(CpuProbeUnknown::ReadUnavailable)
         };
     }
-    let member_before = read(Path::new("/proc/thread-self/cgroup"));
-    let mounts_before = read(Path::new("/proc/thread-self/mountinfo"));
+    let member_before = read(Path::new("/proc/thread-self/cgroup"))?;
+    let mounts_before = read(Path::new("/proc/thread-self/mountinfo"))?;
     let mapping = member_before
         .as_deref()
         .and_then(unified_cgroup)
@@ -1040,7 +1152,7 @@ fn observe_linux_cpu(read: impl Fn(&Path) -> Option<String>) -> HostCpuSnapshot 
         });
     if let Some((directory, mount)) = mapping {
         let direct_path = directory.join("cpu.max");
-        let direct_raw = read(&direct_path);
+        let direct_raw = read(&direct_path)?;
         observed_files.push((direct_path, direct_raw.clone()));
         let direct = direct_raw.and_then(|s| parse_cpu_max(&s));
         snapshot.direct_cpu_quota = direct.map_or(
@@ -1054,11 +1166,12 @@ fn observe_linux_cpu(read: impl Fn(&Path) -> Option<String>) -> HostCpuSnapshot 
         let mut effective = CpuQuotaReadback::Unlimited;
         let mut complete = false;
         for _ in 0..CGROUP_MAX_ANCESTORS {
+            control()?;
             // A cgroup namespace/bind mount root can be a real non-root
             // cgroup with cpu.max. Missing root data stays unknown; never
             // substitute Unlimited solely because this is a mount boundary.
             let path = current.join("cpu.max");
-            let raw = read(&path);
+            let raw = read(&path)?;
             observed_files.push((path, raw.clone()));
             let Some(quota) = raw.and_then(|s| parse_cpu_max(&s)) else {
                 break;
@@ -1087,10 +1200,10 @@ fn observe_linux_cpu(read: impl Fn(&Path) -> Option<String>) -> HostCpuSnapshot 
         snapshot.visible_ancestor_cpu_quota =
             CpuReadback::Unknown(CpuProbeUnknown::NamespaceOrMountAmbiguous);
     }
-    let process_after = read(Path::new("/proc/self/status"));
-    let thread_after = read(Path::new("/proc/thread-self/status"));
-    let member_after = read(Path::new("/proc/thread-self/cgroup"));
-    if process_after
+    let process_after = read(Path::new("/proc/self/status"))?;
+    let thread_after = read(Path::new("/proc/thread-self/status"))?;
+    let member_after = read(Path::new("/proc/thread-self/cgroup"))?;
+    let boundary_changed = process_after
         .as_deref()
         .and_then(|s| parse_status(s, "Cpus_allowed_list:"))
         .and_then(|s| parse_linux_cpus(&s))
@@ -1113,12 +1226,21 @@ fn observe_linux_cpu(read: impl Fn(&Path) -> Option<String>) -> HostCpuSnapshot 
                 .as_deref()
                 .and_then(|s| parse_status(s, "Pid:"))
         || member_after != member_before
-        || read(Path::new("/proc/thread-self/mountinfo")) != mounts_before
-        || read(Path::new("/sys/devices/system/cpu/online")) != online_before
-        || observed_files
-            .iter()
-            .any(|(path, before)| read(path) != *before)
-    {
+        || read(Path::new("/proc/thread-self/mountinfo"))? != mounts_before
+        || read(Path::new("/sys/devices/system/cpu/online"))? != online_before;
+    // Preserve the compatibility probe's original read/recheck order and
+    // short-circuit behavior while bracketing every traversal iteration.
+    let mut observed_files_changed = false;
+    if !boundary_changed {
+        for (path, before) in &observed_files {
+            control()?;
+            if read(path)? != *before {
+                observed_files_changed = true;
+                break;
+            }
+        }
+    }
+    if boundary_changed || observed_files_changed {
         snapshot.process_affinity = CpuReadback::Unknown(CpuProbeUnknown::ChangedDuringProbe);
         snapshot.caller_affinity = CpuReadback::Unknown(CpuProbeUnknown::ChangedDuringProbe);
         snapshot.physical_cores = CpuReadback::Unknown(CpuProbeUnknown::ChangedDuringProbe);
@@ -1126,12 +1248,48 @@ fn observe_linux_cpu(read: impl Fn(&Path) -> Option<String>) -> HostCpuSnapshot 
         snapshot.visible_ancestor_cpu_quota =
             CpuReadback::Unknown(CpuProbeUnknown::ChangedDuringProbe);
     }
-    snapshot
+    control()?;
+    Ok(snapshot)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cooperative_cpu_probe_rejects_expiry_and_cancel_before_any_read() {
+        assert_eq!(
+            observe_current_cpu_until(Instant::now(), &AtomicBool::new(false)),
+            Err(CpuResourceError::ProbeDeadline)
+        );
+        assert_eq!(
+            observe_current_cpu_until(
+                Instant::now() + std::time::Duration::from_secs(1),
+                &AtomicBool::new(true)
+            ),
+            Err(CpuResourceError::ProbeCanceled)
+        );
+    }
+    #[test]
+    fn cooperative_linux_traversal_stops_at_a_read_boundary() {
+        use std::cell::Cell;
+        let reads = Cell::new(0usize);
+        let read = |_: &Path| {
+            reads.set(reads.get() + 1);
+            Some("Pid:\t100\nCpus_allowed_list:\t0-3\n".into())
+        };
+        let control = || {
+            if reads.get() >= 2 {
+                Err(CpuResourceError::ProbeCanceled)
+            } else {
+                Ok(())
+            }
+        };
+        assert_eq!(
+            observe_linux_cpu_controlled(read, control),
+            Err(CpuResourceError::ProbeCanceled)
+        );
+        assert_eq!(reads.get(), 2);
+    }
     fn cpu(index: u16) -> LogicalCpu {
         LogicalCpu { group: 0, index }
     }
@@ -1142,13 +1300,15 @@ mod tests {
         }
     }
     fn local() -> (AdaptiveCpuResourcePlan, HostCpuSnapshot, CpuReadyReadback) {
-        let mut plan = AdaptiveCpuResourcePlan::default();
-        plan.profile_id = "dedicated-control-cpu2-v1".into();
-        plan.host_kind = CpuHostKind::RegisteredLocal;
-        plan.placement = ControlPlacement::DedicatedControl;
-        plan.allowed_cpus = vec![cpu(0), cpu(1), cpu(2), cpu(3)];
-        plan.manager_cpu = Some(cpu(0));
-        plan.worker_cpus = vec![cpu(2), cpu(3)];
+        let plan = AdaptiveCpuResourcePlan {
+            profile_id: "dedicated-control-cpu2-v1".into(),
+            host_kind: CpuHostKind::RegisteredLocal,
+            placement: ControlPlacement::DedicatedControl,
+            allowed_cpus: vec![cpu(0), cpu(1), cpu(2), cpu(3)],
+            manager_cpu: Some(cpu(0)),
+            worker_cpus: vec![cpu(2), cpu(3)],
+            ..AdaptiveCpuResourcePlan::default()
+        };
         let mut host = HostCpuSnapshot::unknown();
         host.process_affinity_scope = CpuAffinityScope::Process;
         host.process_affinity = known(plan.allowed_cpus.clone());
@@ -1239,8 +1399,10 @@ mod tests {
     }
     #[test]
     fn worker_profiles_and_ort_thread_settings_are_not_silently_scaled() {
-        let mut p = AdaptiveCpuResourcePlan::default();
-        p.own_cpu_workers = 2;
+        let mut p = AdaptiveCpuResourcePlan {
+            own_cpu_workers: 2,
+            ..AdaptiveCpuResourcePlan::default()
+        };
         assert_eq!(
             p.validate(),
             Err(CpuResourceError::SeparateWorkerProfileRequired)

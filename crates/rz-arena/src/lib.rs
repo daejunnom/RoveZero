@@ -18,7 +18,9 @@ mod native_pilot;
 #[cfg(target_os = "linux")]
 mod native_retention;
 mod native_runner;
+pub mod pals_adaptive_launch;
 pub mod pals_collect;
+pub mod pals_collect_v3;
 pub mod pals_launch;
 #[cfg(feature = "pals-collection-onnx")]
 pub mod pals_replay;

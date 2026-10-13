@@ -92,6 +92,16 @@ fn fixture() -> (
     ProcessClock,
     u64,
 ) {
+    fixture_with_startup_gate(None)
+}
+fn fixture_with_startup_gate(
+    startup_gate: Option<std::sync::mpsc::Receiver<()>>,
+) -> (
+    AdaptiveSessionDriver<TerminalOwner>,
+    Arc<OwnerFacts>,
+    ProcessClock,
+    u64,
+) {
     let clock = ProcessClock::new(ProcessEpoch(31));
     let facts = Arc::new(OwnerFacts::default());
     facts.finish_ok.store(true, Ordering::Release);
@@ -100,6 +110,11 @@ fn fixture() -> (
     let native = TicketedNativeService::spawn(
         move || {
             factory_facts.factories.fetch_add(1, Ordering::AcqRel);
+            if let Some(gate) = startup_gate {
+                gate.recv_timeout(Duration::from_secs(3)).map_err(|_| {
+                    RoleFailure::Backend("terminal fixture startup gate expired".into())
+                })?;
+            }
             Ok(TerminalOwner {
                 clock: native_clock,
                 facts: factory_facts,
@@ -284,6 +299,73 @@ fn terminal_roots_and_new_game_preserve_actual_session_and_cpu_owner_then_finish
     assert!(
         driver
             .finish_process(until)
+            .unwrap()
+            .permits_process_close()
+    );
+    assert_eq!(facts.finishes.load(Ordering::Acquire), 1);
+}
+#[test]
+fn actual_native_ready_after_terminal_quiesce_keeps_revoked_admission_closed_and_owner_reusable() {
+    let (release, wait) = std::sync::mpsc::sync_channel(1);
+    let (mut driver, facts, clock, _) = fixture_with_startup_gate(Some(wait));
+    let mate = Position::from_fen("7k/6Q1/5K2/8/8/8/8/8 b - - 0 1").unwrap();
+    let first = context(&clock, 1, 0);
+    let until = first.shutdown_deadline;
+    driver.collection_hooks.root_admission = Some(Arc::new(move |manager| {
+        // The actual factory cannot publish Ready until the exact terminal
+        // Rules root has revoked admission. No sleeps or scheduling assumption
+        // decide which event wins this regression.
+        manager.driver_mut().prepare_root_rules()?;
+        assert!(manager.driver().root_is_terminal()?);
+        manager.begin_root_quiesce(until)?;
+        release.send(()).map_err(|_| {
+            AdaptiveManagerError::Invalid("terminal fixture startup gate receiver lost")
+        })?;
+        Ok(())
+    }));
+    let report = driver
+        .run(&mate, &first, &mut |_| {
+            panic!("terminal Rules root has no bestmove")
+        })
+        .unwrap();
+    assert_eq!(report.best_move, None);
+    assert!(
+        driver
+            .latest_root_receipt()
+            .unwrap()
+            .unwrap()
+            .permits_root_reuse()
+    );
+    assert_eq!(facts.factories.load(Ordering::Acquire), 1);
+    assert_eq!(facts.finishes.load(Ordering::Acquire), 0);
+    driver
+        .accept_uci_output(first.authority, "0000", true)
+        .unwrap();
+
+    // A new root installs the persistent owner's actual verifier through normal
+    // Running admission, without starting another native factory or NN call.
+    driver.collection_hooks.root_admission = None;
+    let second = context(&clock, 2, 0);
+    assert_eq!(
+        driver
+            .run(&mate, &second, &mut |_| panic!(
+                "terminal Rules root has no bestmove"
+            ))
+            .unwrap()
+            .best_move,
+        None
+    );
+    assert!(
+        driver
+            .latest_root_receipt()
+            .unwrap()
+            .unwrap()
+            .permits_root_reuse()
+    );
+    assert_eq!(facts.factories.load(Ordering::Acquire), 1);
+    assert!(
+        driver
+            .finish_process(second.shutdown_deadline)
             .unwrap()
             .permits_process_close()
     );

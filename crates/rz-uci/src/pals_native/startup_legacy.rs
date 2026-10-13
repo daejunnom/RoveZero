@@ -1,11 +1,12 @@
-//! Registered V5 loader for the original FullLineInteractionV2 selected view.
+//! Registered V5 loader for the original FullLineInteractionV2 model.
 //!
 //! Original manifest, graph names, fixed-L ABI, P/C-only guard and namespace
 //! remain legacy identities. This is not a VirtualReview model conversion and
-//! cannot represent V2Full as a selected view. All native work happens inside
+//! preserves V2Full and V2Selected as distinct input routes. All native work happens inside
 //! the ticket owner's one factory, with the caller's original process clock.
 use crate::pals_adaptive_startup::{PinnedPalsStartupV5, PinnedStartupAssetV5};
 use crate::pals_native::ticketed::NativeFreshTicketBackend;
+use crate::pals_native::ticketed::NativeLegacyInputModeV5;
 use crate::pals_native::{
     NativeOwnerOptions, NativeRoleFinishHandle, NativeRoleModel, NativeRoleReceipt,
     NativeRoleSourceIdentity, pals_fresh_encoding_semantic_digest_for_config,
@@ -203,6 +204,26 @@ pub fn load_native_legacy_selected_startup_v5(
     clock: ContractSystemClock,
     resources: NativeLegacySelectedStartupResourcesV5,
 ) -> Result<LoadedNativeLegacySelectedStartupV5, NativeLegacyStartupFailureV5> {
+    if owner.config.endpoint.context.selection != PalsViewSelectionV5::V2Selected {
+        return Err(NativeLegacyStartupFailureV5::backend(
+            "selected_context",
+            fail(
+                K::UnsupportedModel,
+                "selected legacy startup cannot relabel the full context route",
+            ),
+        ));
+    }
+    load_native_legacy_startup_v5(owner, process_clock, clock, resources)
+}
+
+/// The original V2 model is loaded once; full versus selected records affect
+/// the retained input route, never the graph ABI or the loaded model identity.
+pub fn load_native_legacy_startup_v5(
+    owner: Arc<PinnedPalsStartupV5>,
+    process_clock: crate::engine::ProcessClock,
+    clock: ContractSystemClock,
+    resources: NativeLegacySelectedStartupResourcesV5,
+) -> Result<LoadedNativeLegacySelectedStartupV5, NativeLegacyStartupFailureV5> {
     validate_process_clock(&process_clock, &clock)
         .map_err(|error| NativeLegacyStartupFailureV5::backend("process_clock", error))?;
     let admitted = admit(&owner, &clock, &resources)
@@ -309,11 +330,16 @@ pub fn load_native_legacy_selected_startup_v5(
             Some(finish),
         ));
     }
+    let selected_view = owner.config.endpoint.context.selection == PalsViewSelectionV5::V2Selected;
     let snapshot = NativeLegacySelectedStartupSnapshotV5 {
-        schema: "rz-pals-native-legacy-selected-startup-snapshot-v5/1",
+        schema: if selected_view {
+            "rz-pals-native-legacy-selected-startup-snapshot-v5/1"
+        } else {
+            "rz-pals-native-legacy-full-startup-snapshot-v5/1"
+        },
         process_epoch: clock.domain().0.0,
         model_profile: source.model_configuration.profile.as_str().into(),
-        selected_view: true,
+        selected_view,
         model_semantic_sha256: source
             .model_configuration
             .profile
@@ -363,14 +389,18 @@ pub fn load_native_legacy_selected_startup_v5(
         source,
         namespace,
     };
-    let backend = NativeFreshTicketBackend::new(model, resources.until).map_err(|cause| {
-        NativeLegacyStartupFailureV5 {
+    let input_mode = if selected_view {
+        NativeLegacyInputModeV5::SelectedV2
+    } else {
+        NativeLegacyInputModeV5::FullV2
+    };
+    let backend = NativeFreshTicketBackend::new_with_input_mode(model, resources.until, input_mode)
+        .map_err(|cause| NativeLegacyStartupFailureV5 {
             stage: "ticket_owner",
             cause,
             startup_owner_receipt: Some(Box::new(finish.receipt())),
             finish: Some(finish),
-        }
-    })?;
+        })?;
     Ok(LoadedNativeLegacySelectedStartupV5 { backend, snapshot })
 }
 
@@ -440,8 +470,10 @@ fn admit(
     let endpoint = &owner.config.endpoint;
     let specification = &endpoint.model;
     let native = &owner.config.native_options;
-    if endpoint.context.selection != PalsViewSelectionV5::V2Selected
-        || endpoint.mode != PalsEngineModeV5::Deployment
+    if !matches!(
+        endpoint.context.selection,
+        PalsViewSelectionV5::V2Selected | PalsViewSelectionV5::V2Full
+    ) || endpoint.mode != PalsEngineModeV5::Deployment
         || native.approximate_warm
         || native.device_public_memory
         || endpoint.resources.ort_intra_threads != 1
@@ -455,7 +487,7 @@ fn admit(
     {
         return Err(fail(
             K::UnsupportedModel,
-            "legacy loader requires V2 selected Fresh P/C Deployment and registered host ORT configuration; Full and V cannot be relabeled",
+            "legacy loader requires explicitly selected V2 full/selected Fresh P/C Deployment and registered host ORT configuration; compact and V cannot be relabeled",
         ));
     }
     let manifest_bytes = read_pinned(

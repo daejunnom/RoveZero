@@ -618,7 +618,7 @@ fn bounded_native_cpu_commit_is_causal_and_frontier_does_not_mint_a_witness() {
         soft_lease: Duration::from_secs(1),
         control_sequence: 1,
     };
-    let mut ledger = CpuCreditLedger::new(port.authority, 8192, clock.clone()).unwrap();
+    let mut ledger = CpuCreditLedger::new(port.authority, 8192, clock).unwrap();
     ledger.register(envelope).unwrap();
     ledger.reserve(grant).unwrap();
     port.cpu_admitted(&work, &envelope, &grant).unwrap();

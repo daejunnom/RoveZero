@@ -503,127 +503,6 @@ impl PalsCudaControlPolicy {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    use sha2::{Digest as _, Sha256};
-
-    fn binding() -> WeightBindingV3 {
-        WeightBindingV3 {
-            initializer: "experts.validator.task_head.weight.linear_transpose".into(),
-            parameter: "experts.validator.task_head.weight".into(),
-            dtype: "FLOAT".into(),
-            shape: vec![384, 7],
-            bytes: 384 * 7 * 4,
-            sha256: "11".repeat(32),
-            source_parameter_sha256: "22".repeat(32),
-        }
-    }
-    fn graph() -> InventoryGraphV3 {
-        InventoryGraphV3 {
-            role: "validator".into(),
-            file: "role_validator.onnx".into(),
-            sha256: "33".repeat(32),
-            serialized_graph_name: VALIDATOR_GRAPH.into(),
-            inventory: serde_json::from_value(json!({"path":"validator","inputs":[],"outputs":[],
-                "integral_initializers":[],"initializer_count":1,"nodes":[],"subgraphs":[]}))
-            .unwrap(),
-            weight_bindings: vec![binding()],
-            private_neural_dependencies: vec![],
-        }
-    }
-    fn policy(manifest: [u8; 32], bindings: Vec<WeightBindingV3>) -> PalsCudaControlPolicy {
-        PalsCudaControlPolicy {
-            manifest,
-            inventory: [7; 32],
-            graphs: BTreeMap::new(),
-            virtual_layout: Some(VirtualReviewControlLayout {
-                kind: Kind::FreshCollection,
-                validator_private: BTreeMap::new(),
-                validator_task_head: BTreeMap::new(),
-                weight_bindings: BTreeMap::from([("validator".into(), bindings)]),
-            }),
-        }
-    }
-    #[test]
-    fn virtual_inventory_rejects_legacy_unknown_and_duplicate_keys() {
-        assert!(
-            PalsCudaControlPolicy::from_virtual_review_bytes(br#"{"schema":"legacy"}"#).is_err()
-        );
-        assert!(
-            PalsCudaControlPolicy::from_virtual_review_bytes(br#"{"schema":1,"schema":2}"#)
-                .is_err()
-        );
-        assert!(PalsCudaControlPolicy::from_virtual_review_bytes(&vec![
-            0;
-            MAX_VIRTUAL_INVENTORY_BYTES
-                + 1
-        ])
-        .is_err());
-    }
-    #[test]
-    fn owned_inventory_bytes_require_actual_pin_before_strict_schema_admission() {
-        let bytes = br#"{"schema":"legacy"}"#;
-        let wrong =
-            PalsCudaControlPolicy::from_virtual_review_inventory_bytes(bytes, &"00".repeat(32))
-                .err()
-                .expect("incorrect pin must fail before schema admission");
-        assert_eq!(wrong.detail, "V3 control inventory digest differs");
-        let actual = format!("{:x}", Sha256::digest(bytes));
-        assert!(
-            PalsCudaControlPolicy::from_virtual_review_inventory_bytes(bytes, &actual).is_err()
-        );
-        assert!(PalsCudaControlPolicy::from_virtual_review_inventory_bytes(b"", &actual).is_err());
-    }
-    #[test]
-    fn source_weight_metadata_cannot_cross_private_roles_or_forge_byte_shape() {
-        assert!(validate_weight_bindings(&graph()).is_ok());
-        let mut value = graph();
-        value.weight_bindings[0].bytes -= 4;
-        assert!(validate_weight_bindings(&value).is_err());
-        let mut value = graph();
-        value.role = "public".into();
-        assert!(validate_weight_bindings(&value).is_err());
-        let mut value = graph();
-        value.weight_bindings[0].sha256 = "AB".repeat(32);
-        assert!(validate_weight_bindings(&value).is_err());
-    }
-    #[test]
-    fn weight_ledger_requires_actual_pinned_manifest_bytes_and_exact_rows() {
-        let binding = binding();
-        let mut row = serde_json::to_value(&binding).unwrap();
-        row.as_object_mut().unwrap().remove("dtype");
-        let bytes =
-            serde_json::to_vec(&json!({"initializer_banks":{"validator":{"parameters":[row]}}}))
-                .unwrap();
-        let value = policy(asset::sha256(&bytes), vec![binding.clone()]);
-        assert!(value
-            .validate_virtual_manifest_weight_bindings(&bytes)
-            .is_ok());
-        let mut changed = serde_json::from_slice::<Value>(&bytes).unwrap();
-        changed["initializer_banks"]["validator"]["parameters"][0]["bytes"] = 1.into();
-        let changed = serde_json::to_vec(&changed).unwrap();
-        assert!(value
-            .validate_virtual_manifest_weight_bindings(&changed)
-            .is_err());
-        let value = policy(asset::sha256(&changed), vec![binding]);
-        assert!(value
-            .validate_virtual_manifest_weight_bindings(&changed)
-            .is_err());
-    }
-    #[test]
-    fn missing_v_actual_evidence_cannot_issue_a_pc_only_witness() {
-        let value = policy([0; 32], vec![binding()]);
-        let profiles = BTreeMap::from([
-            ("public".into(), b"[]".to_vec()),
-            ("shared_pc".into(), b"[]".to_vec()),
-        ]);
-        assert!(value
-            .verify_virtual_profiles(&profiles, vec![], [1; 32], [2; 32])
-            .is_err());
-    }
-}
 fn count_cuda_named(bytes: &[u8], names: &BTreeMap<String, String>) -> Result<usize, BackendError> {
     let events: Vec<Value> = serde_json::from_slice(bytes).map_err(|e| {
         policy_error("cannot decode V3 private kernel evidence")
@@ -1128,5 +1007,127 @@ impl PalsCudaControlPolicy {
                 policy_error("cannot preserve bounded PALS placement metadata")
                     .with_external_cause(CauseCode::ProfilingFinish, &error)
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use sha2::{Digest as _, Sha256};
+
+    fn binding() -> WeightBindingV3 {
+        WeightBindingV3 {
+            initializer: "experts.validator.task_head.weight.linear_transpose".into(),
+            parameter: "experts.validator.task_head.weight".into(),
+            dtype: "FLOAT".into(),
+            shape: vec![384, 7],
+            bytes: 384 * 7 * 4,
+            sha256: "11".repeat(32),
+            source_parameter_sha256: "22".repeat(32),
+        }
+    }
+    fn graph() -> InventoryGraphV3 {
+        InventoryGraphV3 {
+            role: "validator".into(),
+            file: "role_validator.onnx".into(),
+            sha256: "33".repeat(32),
+            serialized_graph_name: VALIDATOR_GRAPH.into(),
+            inventory: serde_json::from_value(json!({"path":"validator","inputs":[],"outputs":[],
+                "integral_initializers":[],"initializer_count":1,"nodes":[],"subgraphs":[]}))
+            .unwrap(),
+            weight_bindings: vec![binding()],
+            private_neural_dependencies: vec![],
+        }
+    }
+    fn policy(manifest: [u8; 32], bindings: Vec<WeightBindingV3>) -> PalsCudaControlPolicy {
+        PalsCudaControlPolicy {
+            manifest,
+            inventory: [7; 32],
+            graphs: BTreeMap::new(),
+            virtual_layout: Some(VirtualReviewControlLayout {
+                kind: Kind::FreshCollection,
+                validator_private: BTreeMap::new(),
+                validator_task_head: BTreeMap::new(),
+                weight_bindings: BTreeMap::from([("validator".into(), bindings)]),
+            }),
+        }
+    }
+    #[test]
+    fn virtual_inventory_rejects_legacy_unknown_and_duplicate_keys() {
+        assert!(
+            PalsCudaControlPolicy::from_virtual_review_bytes(br#"{"schema":"legacy"}"#).is_err()
+        );
+        assert!(
+            PalsCudaControlPolicy::from_virtual_review_bytes(br#"{"schema":1,"schema":2}"#)
+                .is_err()
+        );
+        assert!(PalsCudaControlPolicy::from_virtual_review_bytes(&vec![
+            0;
+            MAX_VIRTUAL_INVENTORY_BYTES
+                + 1
+        ])
+        .is_err());
+    }
+    #[test]
+    fn owned_inventory_bytes_require_actual_pin_before_strict_schema_admission() {
+        let bytes = br#"{"schema":"legacy"}"#;
+        let wrong =
+            PalsCudaControlPolicy::from_virtual_review_inventory_bytes(bytes, &"00".repeat(32))
+                .err()
+                .expect("incorrect pin must fail before schema admission");
+        assert_eq!(wrong.detail, "V3 control inventory digest differs");
+        let actual = format!("{:x}", Sha256::digest(bytes));
+        assert!(
+            PalsCudaControlPolicy::from_virtual_review_inventory_bytes(bytes, &actual).is_err()
+        );
+        assert!(PalsCudaControlPolicy::from_virtual_review_inventory_bytes(b"", &actual).is_err());
+    }
+    #[test]
+    fn source_weight_metadata_cannot_cross_private_roles_or_forge_byte_shape() {
+        assert!(validate_weight_bindings(&graph()).is_ok());
+        let mut value = graph();
+        value.weight_bindings[0].bytes -= 4;
+        assert!(validate_weight_bindings(&value).is_err());
+        let mut value = graph();
+        value.role = "public".into();
+        assert!(validate_weight_bindings(&value).is_err());
+        let mut value = graph();
+        value.weight_bindings[0].sha256 = "AB".repeat(32);
+        assert!(validate_weight_bindings(&value).is_err());
+    }
+    #[test]
+    fn weight_ledger_requires_actual_pinned_manifest_bytes_and_exact_rows() {
+        let binding = binding();
+        let mut row = serde_json::to_value(&binding).unwrap();
+        row.as_object_mut().unwrap().remove("dtype");
+        let bytes =
+            serde_json::to_vec(&json!({"initializer_banks":{"validator":{"parameters":[row]}}}))
+                .unwrap();
+        let value = policy(asset::sha256(&bytes), vec![binding.clone()]);
+        assert!(value
+            .validate_virtual_manifest_weight_bindings(&bytes)
+            .is_ok());
+        let mut changed = serde_json::from_slice::<Value>(&bytes).unwrap();
+        changed["initializer_banks"]["validator"]["parameters"][0]["bytes"] = 1.into();
+        let changed = serde_json::to_vec(&changed).unwrap();
+        assert!(value
+            .validate_virtual_manifest_weight_bindings(&changed)
+            .is_err());
+        let value = policy(asset::sha256(&changed), vec![binding]);
+        assert!(value
+            .validate_virtual_manifest_weight_bindings(&changed)
+            .is_err());
+    }
+    #[test]
+    fn missing_v_actual_evidence_cannot_issue_a_pc_only_witness() {
+        let value = policy([0; 32], vec![binding()]);
+        let profiles = BTreeMap::from([
+            ("public".into(), b"[]".to_vec()),
+            ("shared_pc".into(), b"[]".to_vec()),
+        ]);
+        assert!(value
+            .verify_virtual_profiles(&profiles, vec![], [1; 32], [2; 32])
+            .is_err());
     }
 }

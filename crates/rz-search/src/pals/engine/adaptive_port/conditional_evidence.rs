@@ -1099,11 +1099,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             || observation.model_value_identity.is_some()
             || observation.cpu_condition.is_none()
             || observation.cpu_condition != task.key.cpu_condition
-            || !task
+            || task
                 .key
                 .cpu_condition
                 .as_ref()
-                .is_some_and(|actual| actual == &base_condition)
+                .is_none_or(|actual| actual != &base_condition)
             || task.key.state != endpoint.state
             || task.key.line.is_some()
             || task.key.question != TaskQuestion::AnalyzePosition

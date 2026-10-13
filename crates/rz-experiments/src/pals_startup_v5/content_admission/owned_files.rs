@@ -49,6 +49,37 @@ pub struct PalsStartupContentAdmissionV5 {
     file_identities: BTreeMap<String, FileIdentity>,
     artifact_domain: PalsArtifactDomainAdmissionV5,
     numerical: PalsNumericalAdmissionV5,
+    frozen_pc_collection: Option<PalsFrozenPcCollectionContentV5>,
+}
+
+/// Issued only after the source inventory, original descriptor roster, strong
+/// frozen producer metadata and independent numerical inputs were joined.
+/// This is not a Torch optimizer decoder or an original trainer execution token.
+/// The collection pipeline retains that independent actual export owner.
+#[derive(Clone, Debug)]
+pub struct PalsFrozenPcCollectionContentV5 {
+    checkpoint_sha256: String,
+    named_shared_pc_sha256: String,
+    model_epoch: u64,
+    context_epoch: u64,
+    provenance_sha256: String,
+}
+impl PalsFrozenPcCollectionContentV5 {
+    pub fn checkpoint_sha256(&self) -> &str {
+        &self.checkpoint_sha256
+    }
+    pub fn named_shared_pc_sha256(&self) -> &str {
+        &self.named_shared_pc_sha256
+    }
+    pub fn model_epoch(&self) -> u64 {
+        self.model_epoch
+    }
+    pub fn context_epoch(&self) -> u64 {
+        self.context_epoch
+    }
+    pub fn provenance_sha256(&self) -> &str {
+        &self.provenance_sha256
+    }
 }
 
 impl PalsStartupContentAdmissionV5 {
@@ -72,6 +103,9 @@ impl PalsStartupContentAdmissionV5 {
     }
     pub fn numerical(&self) -> &PalsNumericalAdmissionV5 {
         &self.numerical
+    }
+    pub fn frozen_pc_collection(&self) -> Option<&PalsFrozenPcCollectionContentV5> {
+        self.frozen_pc_collection.as_ref()
     }
     pub fn tensor_optimizer_content_verified(&self) -> bool {
         false
@@ -346,6 +380,20 @@ pub fn admit_pals_startup_content_v5(
         !domain.tensor_optimizer_content_verified && !domain.arena_accepted,
         "content verifier scope unexpectedly expanded",
     )?;
+    let frozen_pc_collection =
+        domain
+            .frozen_pc_collection
+            .as_ref()
+            .map(|frozen| PalsFrozenPcCollectionContentV5 {
+                checkpoint_sha256: frozen.checkpoint_sha256().to_owned(),
+                named_shared_pc_sha256: frozen.named_shared_pc_sha256().to_owned(),
+                model_epoch: frozen.model_epoch(),
+                context_epoch: frozen.context_epoch(),
+                provenance_sha256: domain
+                    .provenance_file_sha256
+                    .clone()
+                    .expect("validated frozen provenance identity"),
+            });
     let result = PalsStartupContentAdmissionV5 {
         config_sha256: digest(&config.canonical_bytes(lock)?),
         lock_sha256: lock.canonical_sha256.clone(),
@@ -355,6 +403,7 @@ pub fn admit_pals_startup_content_v5(
         file_identities,
         artifact_domain: domain,
         numerical,
+        frozen_pc_collection,
     };
     result.verify_binding(config, lock, assets)?;
     Ok(result)
@@ -395,6 +444,12 @@ mod tests {
         assert_eq!(file.stream_position().unwrap(), 3);
         std::fs::write(&path, b"changed---content!").unwrap();
         assert!(stream_identity(&file, &artifact).is_err());
+        assert_eq!(file.stream_position().unwrap(), 3);
+        // A same-size rewrite is rejected by the hash even when the host's
+        // metadata timestamp resolution cannot distinguish the two writes.
+        // Use a distinct length to test identity changes deterministically.
+        std::fs::write(&path, b"changed---content!!").unwrap();
+        assert_ne!(file.metadata().unwrap().len(), artifact.bytes);
         assert_ne!(identity(&file).unwrap(), admitted);
         std::fs::hard_link(&path, root.join("alias.bin")).unwrap();
         assert!(identity(&file).is_err());

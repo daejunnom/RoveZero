@@ -251,8 +251,10 @@ fn zero_run_success_does_not_become_a_full_cache_hit() {
 
 #[test]
 fn overflow_is_atomic_and_unknown_merge_never_becomes_known() {
-    let mut snapshot = AdaptiveNativeAccountingSnapshot::default();
-    snapshot.completed_service_commands = u64::MAX;
+    let mut snapshot = AdaptiveNativeAccountingSnapshot {
+        completed_service_commands: u64::MAX,
+        ..AdaptiveNativeAccountingSnapshot::default()
+    };
     let original = snapshot;
     assert!(
         snapshot

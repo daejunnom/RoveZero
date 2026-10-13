@@ -12,6 +12,142 @@ use crate::cpu_worker::{
 use rz_contracts::pals_adaptive::{CpuJobEnvelope, CpuJobId, SliceGrant};
 
 impl<M: RoleModel> AdaptiveEnginePort<M> {
+    /// Read-only authorization for an independent PublishProgress control.
+    /// The worker keeps running and owns completed-iteration acknowledgement;
+    /// no credit, result or new consumer is issued by this query.
+    pub fn cpu_progress_request_eligible(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        job: &CpuJobEnvelope,
+        grant: &SliceGrant,
+    ) -> bool {
+        self.cpu_admissions
+            .get(&work.input.question_digest)
+            .is_some_and(|admission| {
+                self.check_work(work).is_ok()
+                    && self.cpu_context_current(work, admission)
+                    && !admission.terminal
+                    && !admission.quarantined
+                    && admission.job.as_ref() == Some(job)
+                    && admission.grant.as_ref() == Some(grant)
+                    && admission.owner == Some(grant.owner)
+                    && admission
+                        .execution
+                        .zip(admission.original_consumer)
+                        .is_some_and(|(execution, original)| {
+                            admission.consumer == Some(original.id)
+                                && self
+                                    .engine
+                                    .stores
+                                    .hot_validate_pending_cpu_feedback(
+                                        execution,
+                                        original,
+                                        &admission.task_key,
+                                        &admission.position.snapshot(),
+                                        self.engine.tick_at(Instant::now()),
+                                    )
+                                    .is_ok()
+                        })
+            })
+    }
+
+    /// An adaptive S-policy may feed a completed iteration to the existing
+    /// P/C path while the original physical CPU question keeps its token.
+    /// This is not requested-depth coverage or a conditional refutation.
+    pub fn published_cpu_continuation_eligible(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        progress: &crate::cpu_worker::CpuWorkerProgress,
+    ) -> bool {
+        let Some(admission) = self.cpu_admissions.get(&work.input.question_digest) else {
+            return false;
+        };
+        let (Some(job), Some(grant), Some(best)) =
+            (admission.job, admission.grant, progress.iteration.best_move)
+        else {
+            return false;
+        };
+        let query = &work.input.question;
+        let proposal = if query.proposal.is_empty() {
+            &query.context.prefix
+        } else {
+            &query.proposal
+        };
+        self.check_work(work).is_ok()
+            && self.cpu_context_current(work, admission)
+            && admission
+                .execution
+                .zip(admission.original_consumer)
+                .is_some_and(|(execution, original)| {
+                    admission.consumer == Some(original.id)
+                        && self
+                            .engine
+                            .stores
+                            .hot_validate_pending_cpu_feedback(
+                                execution,
+                                original,
+                                &admission.task_key,
+                                &admission.position.snapshot(),
+                                self.engine.tick_at(Instant::now()),
+                            )
+                            .is_ok()
+                })
+            && work.budget.role_submissions_remaining > 0
+            && !admission.terminal
+            && !admission.quarantined
+            && query.stage == RefinementStage::CpuValidation
+            && self.engine.nodes[query.node].terminal.is_none()
+            && self
+                .divergence_indices(proposal)
+                .is_ok_and(|indices| !indices.is_empty())
+            && job.id == progress.job
+            && job.question == work.input.question_digest
+            && grant.job == job.id
+            && grant.execution == progress.execution
+            && grant.owner == progress.owner
+            && admission.owner == Some(progress.owner)
+            && progress.iteration.completed_depth > 0
+            && progress.iteration.completed_depth <= admission.target_depth
+            && progress.iteration.nodes <= grant.node_credit
+            && admission.position.legal_moves().contains(&best)
+            && admission
+                .restriction
+                .as_ref()
+                .is_none_or(|moves| moves.contains(&best))
+    }
+
+    pub fn yielded_cpu_continuation_eligible(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        receipt: &CpuSliceReport,
+    ) -> bool {
+        let Ok(actual) = &receipt.result else {
+            return false;
+        };
+        if receipt.terminal
+            || receipt.admission_rejected
+            || !receipt.continuation_retained
+            || actual.report.completion != CpuCompletion::Yielded
+            || actual.report.score_scope != crate::cpu::CpuScoreScope::CompletedIteration
+            || receipt.actual_work.is_none()
+        {
+            return false;
+        }
+        let progress = crate::cpu_worker::CpuWorkerProgress {
+            job: receipt.grant.job,
+            execution: receipt.grant.execution,
+            owner: receipt.grant.owner,
+            sequence: receipt.progress_sequence,
+            iteration: crate::cpu::CpuIterationProgress {
+                best_move: actual.report.best_move,
+                score: actual.report.score,
+                completed_depth: actual.report.completed_depth,
+                nodes: actual.report.nodes,
+            },
+        };
+        self.published_cpu_continuation_eligible(work, &progress)
+    }
+
     /// Only a worker-issued proof of definitive pre-enqueue rejection permits
     /// rollback. An unknown worker response never reaches this path.
     pub fn reject_cpu_admission(
@@ -1539,6 +1675,42 @@ mod tests {
             search_conditions,
         };
         (port, work, profile)
+    }
+
+    #[test]
+    fn independent_publish_progress_gate_preserves_original_pending_consumer() {
+        let (mut port, work, profile) = port_and_work(RefinementStage::CpuValidation, 2);
+        let (job, grant) = first_grant(&mut port, &work, profile);
+        assert!(port.cpu_progress_request_eligible(&work, &job, &grant));
+        let mut different_owner = grant;
+        different_owner.owner = CpuWorkerId(grant.owner.0 + 1);
+        assert!(!port.cpu_progress_request_eligible(&work, &job, &different_owner));
+        let mut different_execution = grant;
+        different_execution.execution.sequence += 1;
+        assert!(!port.cpu_progress_request_eligible(&work, &job, &different_execution));
+        let mut different_root = work.clone();
+        different_root.frame.authority.root.0 += 1;
+        assert!(!port.cpu_progress_request_eligible(&different_root, &job, &grant));
+        let original = port.cpu_admissions[&work.input.question_digest].clone();
+        let execution = original.execution.unwrap();
+        let consumer = original.original_consumer.unwrap();
+        assert_eq!(
+            port.engine.stores.tasks.get(execution).unwrap().status,
+            TaskStatus::InFlight
+        );
+        port.engine
+            .stores
+            .tasks
+            .cancel_consumer(execution, consumer.id)
+            .unwrap();
+        assert!(!port.cpu_progress_request_eligible(&work, &job, &grant));
+        assert_eq!(port.counters.consumed_cpu_tasks, 0);
+        assert_eq!(port.counters.consumed_partial_cpu_values, 0);
+        assert!(
+            port.cpu_admissions[&work.input.question_digest]
+                .consumed_observation
+                .is_none()
+        );
     }
 
     fn first_grant(

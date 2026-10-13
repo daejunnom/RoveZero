@@ -55,6 +55,101 @@ pub struct ExternalWorkerProgress {
     pub completed_iteration_observed: Option<bool>,
 }
 
+/// A coherent foreign info tuple and the actual private owner's clocks. The
+/// tuple remains raw selective-engine feedback, not a completed native depth.
+#[derive(Clone, Debug)]
+pub struct ExternalWorkerProgressObservation {
+    original: ExternalWorkerProgress,
+    published_at: Instant,
+    go_issued_at: Option<Instant>,
+    quantum_deadline: Option<Instant>,
+    stop_sent_at: Option<Instant>,
+    coherent_tuple_advanced: bool,
+    coherent_tuple_interval: Option<Duration>,
+}
+
+impl ExternalWorkerProgressObservation {
+    pub fn progress(&self) -> &ExternalWorkerProgress {
+        &self.original
+    }
+    pub fn published_at(&self) -> Instant {
+        self.published_at
+    }
+    pub fn go_issued_at(&self) -> Option<Instant> {
+        self.go_issued_at
+    }
+    pub fn quantum_deadline(&self) -> Option<Instant> {
+        self.quantum_deadline
+    }
+    pub fn stop_sent_at(&self) -> Option<Instant> {
+        self.stop_sent_at
+    }
+    pub fn is_new_coherent_tuple(&self) -> bool {
+        self.coherent_tuple_advanced
+    }
+    /// Requires two distinct legal tuples from this same actual go. The first
+    /// tuple and repeated identical tuples never create an interval sample.
+    pub fn completed_coherent_tuple_interval(&self) -> Option<Duration> {
+        self.coherent_tuple_interval
+    }
+}
+
+/// Owner-observed protocol timing, separate from public receipt/codec fields.
+/// A ready barrier does not certify applied options or completed minimax work.
+#[derive(Clone, Copy, Debug)]
+pub struct ExternalWorkerTiming {
+    admitted_at: Instant,
+    run_started_at: Instant,
+    go_issued_at: Option<Instant>,
+    quantum_deadline: Option<Instant>,
+    stop_sent_at: Option<Instant>,
+    bestmove_drained_at: Option<Instant>,
+    ready_completed_at: Option<Instant>,
+    analyze_returned_at: Instant,
+    report_ready_at: Instant,
+}
+
+impl ExternalWorkerTiming {
+    pub fn admitted_at(&self) -> Instant {
+        self.admitted_at
+    }
+    pub fn run_started_at(&self) -> Instant {
+        self.run_started_at
+    }
+    pub fn go_issued_at(&self) -> Option<Instant> {
+        self.go_issued_at
+    }
+    pub fn quantum_deadline(&self) -> Option<Instant> {
+        self.quantum_deadline
+    }
+    pub fn stop_sent_at(&self) -> Option<Instant> {
+        self.stop_sent_at
+    }
+    pub fn bestmove_drained_at(&self) -> Option<Instant> {
+        self.bestmove_drained_at
+    }
+    pub fn ready_completed_at(&self) -> Option<Instant> {
+        self.ready_completed_at
+    }
+    pub fn analyze_returned_at(&self) -> Instant {
+        self.analyze_returned_at
+    }
+    pub fn report_ready_at(&self) -> Instant {
+        self.report_ready_at
+    }
+    pub fn queue_wait(&self) -> Duration {
+        self.run_started_at.duration_since(self.admitted_at)
+    }
+    pub fn stop_drain(&self) -> Option<Duration> {
+        self.ready_completed_at?
+            .checked_duration_since(self.stop_sent_at?)
+    }
+    pub fn return_processing(&self) -> Duration {
+        self.report_ready_at
+            .duration_since(self.analyze_returned_at)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ExternalWorkerReport {
     pub job: ExternalCpuJobEnvelope,
@@ -123,6 +218,7 @@ pub struct ExternalWorkerCompletion {
     report: ExternalWorkerReport,
     process: Option<ExternalProcessIdentity>,
     evaluation_namespace: Digest,
+    timing: Option<ExternalWorkerTiming>,
 }
 
 impl ExternalWorkerCompletion {
@@ -134,6 +230,9 @@ impl ExternalWorkerCompletion {
     }
     pub fn evaluation_namespace(&self) -> Digest {
         self.evaluation_namespace
+    }
+    pub fn timing(&self) -> Option<ExternalWorkerTiming> {
+        self.timing
     }
     /// Submission/failure join only. A failed report has no successful UCI
     /// tuple to compare and does not acquire readiness or target authority.
@@ -158,7 +257,14 @@ impl ExternalWorkerCompletion {
     }
 }
 
-type Mailbox = WorkerMailbox<ExternalJob, ExternalWorkerCompletion, ExternalWorkerProgress>;
+struct TimedExternalJob {
+    original: ExternalJob,
+    admitted_at: Instant,
+    observed_progress: bool,
+}
+
+type Mailbox =
+    WorkerMailbox<TimedExternalJob, ExternalWorkerCompletion, ExternalWorkerProgressObservation>;
 
 /// Issued only after the private owner observed a new ready barrier and all
 /// accepted old-root terminal permits were consumed. A live owner needs no
@@ -556,6 +662,32 @@ fn validate_submission(
     Ok(())
 }
 
+struct ExternalOwnerObservations {
+    timing: ExternalWorkerTiming,
+    last_coherent_tuple: Option<ExternalPolicyOpinion>,
+    last_coherent_published_at: Option<Instant>,
+}
+
+impl ExternalOwnerObservations {
+    fn new(admitted_at: Instant, run_started_at: Instant) -> Self {
+        Self {
+            timing: ExternalWorkerTiming {
+                admitted_at,
+                run_started_at,
+                go_issued_at: None,
+                quantum_deadline: None,
+                stop_sent_at: None,
+                bestmove_drained_at: None,
+                ready_completed_at: None,
+                analyze_returned_at: run_started_at,
+                report_ready_at: run_started_at,
+            },
+            last_coherent_tuple: None,
+            last_coherent_published_at: None,
+        }
+    }
+}
+
 struct WorkerControl {
     scope: ExternalWorkerScope,
     controls: ControlMailbox<ExternalWorkerScope>,
@@ -563,6 +695,8 @@ struct WorkerControl {
     progress_sequence: Arc<AtomicU64>,
     shutdown_deadline: Arc<Mutex<Option<Instant>>>,
     roots: Arc<Mutex<RootLifecycle>>,
+    observations: Arc<Mutex<ExternalOwnerObservations>>,
+    observed_progress: bool,
 }
 
 impl ExternalControl for WorkerControl {
@@ -606,10 +740,74 @@ impl ExternalControl for WorkerControl {
         physical_fence(&self.shutdown_deadline, &self.roots)
     }
 
+    fn observe_owner_phase(&self, phase: ExternalOwnerPhase) {
+        let mut observations = self
+            .observations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let timing = &mut observations.timing;
+        match phase {
+            ExternalOwnerPhase::GoIssued {
+                at,
+                quantum_deadline,
+            } => {
+                if timing.go_issued_at.is_none() {
+                    timing.go_issued_at = Some(at);
+                    timing.quantum_deadline = Some(quantum_deadline);
+                }
+            }
+            ExternalOwnerPhase::StopSent { at } => {
+                timing.stop_sent_at.get_or_insert(at);
+            }
+            ExternalOwnerPhase::BestMoveDrained { at } => {
+                timing.bestmove_drained_at.get_or_insert(at);
+            }
+            ExternalOwnerPhase::ReadyBarrierCompleted { at } => {
+                timing.ready_completed_at.get_or_insert(at);
+            }
+        }
+    }
+
     fn publish_progress(&self, opinion: &ExternalPolicyOpinion, reported_nodes: Option<u64>) {
-        let Some(control_sequence) = self.controls.snapshot().pending_publish() else {
+        let pending_publish = self.controls.snapshot().pending_publish();
+        if !self.observed_progress && pending_publish.is_none() {
             return;
+        }
+        let published_at = Instant::now();
+        let (go_issued_at, quantum_deadline, stop_sent_at, advanced, interval) = {
+            let mut observations = self
+                .observations
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            // Equality uses the whole coherent source tuple, not an increased
+            // reported-node count or a repeated public-control request.
+            let advanced = observations.last_coherent_tuple.as_ref() != Some(opinion);
+            let active_go = observations.timing.go_issued_at.is_some()
+                && observations.timing.stop_sent_at.is_none();
+            let interval = if advanced && active_go {
+                observations
+                    .last_coherent_published_at
+                    .and_then(|previous| published_at.checked_duration_since(previous))
+            } else {
+                None
+            };
+            if advanced && active_go {
+                observations.last_coherent_tuple = Some(opinion.clone());
+                observations.last_coherent_published_at = Some(published_at);
+            }
+            (
+                observations.timing.go_issued_at,
+                observations.timing.quantum_deadline,
+                observations.timing.stop_sent_at,
+                advanced && active_go,
+                interval,
+            )
         };
+        // Legacy explicit publication remains available, including its real
+        // ack. Observed admission alone enables new coherent-tuple feedback.
+        if pending_publish.is_none() && !advanced {
+            return;
+        }
         let sequence =
             self.progress_sequence
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
@@ -623,15 +821,28 @@ impl ExternalControl for WorkerControl {
             opinion: opinion.clone(),
             reported_nodes,
             strict_native_nodes: None,
-            control_sequence,
+            control_sequence: pending_publish.unwrap_or(0),
             completed_iteration_observed: None,
         };
         if self
             .mailbox
-            .publish_progress(previous + 1, progress)
+            .publish_progress(
+                previous + 1,
+                ExternalWorkerProgressObservation {
+                    original: progress,
+                    published_at,
+                    go_issued_at,
+                    quantum_deadline,
+                    stop_sent_at,
+                    coherent_tuple_advanced: advanced,
+                    coherent_tuple_interval: interval,
+                },
+            )
             .is_ok()
         {
-            let _ = self.controls.acknowledge_publish_progress(control_sequence);
+            if let Some(sequence) = pending_publish {
+                let _ = self.controls.acknowledge_publish_progress(sequence);
+            }
         }
     }
 }
@@ -750,6 +961,21 @@ impl ExternalCpuWorker {
         &mut self,
         job: ExternalJob,
     ) -> Result<ExternalTeacherDispatch, CheckerError> {
+        self.submit_attested_inner(job, false)
+    }
+    /// Opt in to immediate distinct coherent-tuple observations. Submission
+    /// still issues only the original dispatch authority, never a go/target.
+    pub fn submit_observed(
+        &mut self,
+        job: ExternalJob,
+    ) -> Result<ExternalTeacherDispatch, CheckerError> {
+        self.submit_attested_inner(job, true)
+    }
+    fn submit_attested_inner(
+        &mut self,
+        job: ExternalJob,
+        observed_progress: bool,
+    ) -> Result<ExternalTeacherDispatch, CheckerError> {
         let startup = self
             .startup_report()
             .ok_or_else(|| error("teacher_admission", "actual_startup_missing"))?;
@@ -783,10 +1009,17 @@ impl ExternalCpuWorker {
             observed_uci,
             evaluation_namespace,
         };
-        self.submit(job)?;
+        self.submit_inner(job, observed_progress)?;
         Ok(submitted)
     }
     pub fn submit(&mut self, job: ExternalJob) -> Result<(), CheckerError> {
+        self.submit_inner(job, false)
+    }
+    fn submit_inner(
+        &mut self,
+        job: ExternalJob,
+        observed_progress: bool,
+    ) -> Result<(), CheckerError> {
         validate_submission(&job, self.owner, self.clock, &self.config)?;
         if self.shutdown.load(Ordering::Acquire)
             || self.thread.as_ref().is_none_or(JoinHandle::is_finished)
@@ -811,7 +1044,14 @@ impl ExternalCpuWorker {
             return Err(error("admission", "external_root_or_job_revoked"));
         }
         self.mailbox
-            .admit(job, 2)
+            .admit(
+                TimedExternalJob {
+                    original: job,
+                    admitted_at: Instant::now(),
+                    observed_progress,
+                },
+                2,
+            )
             .map_err(|rejected| match rejected.reason {
                 MailboxError::QueueFull | MailboxError::ReliableFull => {
                     error("admission", "external_worker_capacity")
@@ -1052,6 +1292,10 @@ impl ExternalCpuWorker {
         self.mailbox.take_reliable()
     }
     pub fn take_progress(&self) -> Option<(u64, ExternalWorkerProgress)> {
+        self.take_progress_observed()
+            .map(|(sequence, observation)| (sequence, observation.original))
+    }
+    pub fn take_progress_observed(&self) -> Option<(u64, ExternalWorkerProgressObservation)> {
         self.mailbox.take_progress()
     }
 
@@ -1101,6 +1345,10 @@ impl Drop for ExternalCpuWorker {
     }
 }
 
+// The single thread entry transfers the original clock, admission, root-fence
+// and shutdown handles once. Keep those independent authorities explicit at
+// this initialization boundary rather than merging their lifecycle scopes.
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     config: ExternalCpuConfig,
     owner: CpuWorkerId,
@@ -1160,8 +1408,14 @@ fn run_worker(
                 .reliable
                 .split_off(1)
                 .map_err(|_| error("worker", "failure_permit_split"))?;
-            let job = admitted.command;
+            let admitted_at = admitted.command.admitted_at;
+            let observed_progress = admitted.command.observed_progress;
+            let job = admitted.command.original;
             let scope = job.scope();
+            let observations = Arc::new(Mutex::new(ExternalOwnerObservations::new(
+                admitted_at,
+                Instant::now(),
+            )));
             if startup.is_ok() {
                 checker.reset_attempt();
                 checker.go_issue = ExternalGoIssue::NotIssued;
@@ -1200,6 +1454,8 @@ fn run_worker(
                             progress_sequence: progress_sequence.clone(),
                             shutdown_deadline: shutdown_deadline.clone(),
                             roots: roots.clone(),
+                            observations: observations.clone(),
+                            observed_progress,
                         };
                         checker.analyze_cooperative(
                             &job.position,
@@ -1216,6 +1472,7 @@ fn run_worker(
                     })
                 }
             }));
+            let analyze_returned_at = Instant::now();
             let (result, panicked) = match operation {
                 Ok(result) => (result, false),
                 Err(_) => {
@@ -1278,6 +1535,14 @@ fn run_worker(
                     .as_ref()
                     .and_then(|owned| owned.evidence().process_identity),
                 evaluation_namespace,
+                timing: {
+                    let mut observed = observations
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    observed.timing.analyze_returned_at = analyze_returned_at;
+                    observed.timing.report_ready_at = Instant::now();
+                    Some(observed.timing)
+                },
             };
             // Admission reserved the normal terminal and its failure backup
             // atomically; only one terminal fact is published for this scope.
@@ -1504,6 +1769,7 @@ mod tests {
         };
         let mailbox = Mailbox::new(8, 16, CompletionSignal::default()).unwrap();
         let controls = ControlMailbox::new(scope, mailbox.signal());
+        let now = Instant::now();
         let reader = WorkerControl {
             scope,
             controls: controls.clone(),
@@ -1511,6 +1777,8 @@ mod tests {
             progress_sequence: Arc::new(AtomicU64::new(0)),
             shutdown_deadline: Arc::new(Mutex::new(None)),
             roots: Arc::new(Mutex::new(RootLifecycle::default())),
+            observations: Arc::new(Mutex::new(ExternalOwnerObservations::new(now, now))),
+            observed_progress: false,
         };
         controls.request_yield(1).unwrap();
         assert_eq!(reader.observe().action, ExternalControlAction::Yield);

@@ -73,6 +73,13 @@ pub struct OriginalProcessInput<'a> {
     pub window: OriginalProcessWindow,
 }
 
+/// 수치 캡처의 고정 FP32 조건만 전달한다. 임의 환경이나 부모의 CUDA/
+/// 인증/검색 경로를 상속하는 접점이 아니며 기존 실행의 환경은 보존한다.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OriginalNumericalEnvironment {
+    Fp32Tf32Off,
+}
+
 /// Observed transport only. This is not model/source admission, physical native
 /// completion, a cgroup resource proof or a checked next Query capability.
 #[derive(Debug, Serialize)]
@@ -91,6 +98,8 @@ pub struct OriginalProcessObservation {
     finished_before_whole: bool,
     cancelled_at_return: bool,
     ownership_lost: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    numerical_environment: Option<&'static str>,
     // Process-local observations are not added to the legacy transport/1 JSON.
     #[serde(skip)]
     loaded_image: Option<LoadedImageObservation>,
@@ -148,6 +157,7 @@ impl OriginalProcessObservation {
             finished_before_whole: false,
             cancelled_at_return: false,
             ownership_lost: false,
+            numerical_environment: None,
             loaded_image: None,
             first_input_written_ns: None,
             loaded_image_progress: LoadedImageProgress::default(),
@@ -155,6 +165,9 @@ impl OriginalProcessObservation {
     }
     pub fn written_bytes(&self) -> Option<usize> {
         self.written_bytes
+    }
+    pub fn numerical_environment(&self) -> Option<&'static str> {
+        self.numerical_environment
     }
     pub fn stdout_eof(&self) -> bool {
         self.stdout_eof
@@ -797,7 +810,9 @@ pub fn supervise_input_in_original_window(
     watch: &OwnedArtifactTreeWatch,
     input: OriginalProcessInput<'_>,
 ) -> Result<OriginalProcessOutput, ArenaError> {
-    supervise_original_input(program, args, directory, limits, cancel, watch, input, None)
+    supervise_original_input(
+        program, args, directory, limits, cancel, watch, input, None, None,
+    )
 }
 
 /// Only internal callers may add content checks on the actual proc executable.
@@ -824,6 +839,33 @@ pub(crate) fn supervise_verified_input_in_original_window(
         watch,
         input,
         Some(verify_loaded),
+        None,
+    )
+}
+
+#[cfg(all(target_os = "linux", any(feature = "pals-collection-onnx", test)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_numerical_input_in_original_window(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    input: OriginalProcessInput<'_>,
+    verify_loaded: LoadedImageVerifier<'_>,
+    environment: OriginalNumericalEnvironment,
+) -> Result<OriginalProcessOutput, ArenaError> {
+    supervise_original_input(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        watch,
+        input,
+        Some(verify_loaded),
+        Some(environment),
     )
 }
 
@@ -837,6 +879,7 @@ fn supervise_original_input(
     watch: &OwnedArtifactTreeWatch,
     input: OriginalProcessInput<'_>,
     verify_loaded: Option<LoadedImageVerifier<'_>>,
+    numerical_environment: Option<OriginalNumericalEnvironment>,
 ) -> Result<OriginalProcessOutput, ArenaError> {
     input.window.check_before_spawn(limits)?;
     watch.validate()?;
@@ -848,6 +891,7 @@ fn supervise_original_input(
     #[cfg(target_os = "linux")]
     {
         let mut observation = OriginalProcessObservation::new(input.bytes.len());
+        observation.numerical_environment = numerical_environment.map(|_| "NVIDIA_TF32_OVERRIDE=0");
         observation.original_supervisor_entry_ns = input.window.elapsed_ns(Instant::now());
         if !directory
             .metadata()
@@ -874,6 +918,7 @@ fn supervise_original_input(
                 original: Some(input.window),
                 observation: Some(&mut observation),
                 verify_loaded,
+                numerical_environment,
             },
         )?;
         let returned = Instant::now();
@@ -889,7 +934,14 @@ fn supervise_original_input(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (program, args, directory, cancel, verify_loaded);
+        let _ = (
+            program,
+            args,
+            directory,
+            cancel,
+            verify_loaded,
+            numerical_environment,
+        );
         Err(ArenaError::Invalid(
             "original input supervision currently requires Linux".into(),
         ))
@@ -922,6 +974,7 @@ mod linux {
         pub original: Option<OriginalProcessWindow>,
         pub observation: Option<&'b mut OriginalProcessObservation>,
         pub verify_loaded: Option<LoadedImageVerifier<'v>>,
+        pub numerical_environment: Option<OriginalNumericalEnvironment>,
     }
 
     #[derive(Clone, Copy)]
@@ -965,6 +1018,7 @@ mod linux {
             original,
             mut observation,
             mut verify_loaded,
+            numerical_environment,
         } = io;
         if let Some(window) = original {
             window.check_before_spawn(limits)?;
@@ -1002,6 +1056,10 @@ mod linux {
             .envs(source_profile_environment(std::env::var_os(
                 "RZ_ARENA_SOURCE_PROFILE",
             )))
+            .envs(
+                numerical_environment
+                    .map(|OriginalNumericalEnvironment::Fp32Tf32Off| ("NVIDIA_TF32_OVERRIDE", "0")),
+            )
             .stdin(if commands.is_some() {
                 Stdio::piped()
             } else {

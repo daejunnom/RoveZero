@@ -5,354 +5,16 @@
 use super::*;
 use crate::pals::store::StoreReadOwner;
 
+// Keep this bounded, owner-private blueprint inline. Boxing it would add an
+// allocation per continuation around the immutable exact authority and Arc
+// custodians retained until materialization; it would not narrow that lifetime.
+#[allow(clippy::large_enum_variant)]
 pub enum AdaptivePortTransition {
     Continue(AdaptiveContinuationBlueprint),
     Complete { scope: FrameCompletionScope },
     Unknown { reason: &'static str },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::super::port_tests::{output, setup, work};
-    use super::*;
-
-    #[test]
-    fn role_commit_builds_no_next_view_and_materialization_requires_original_consume() {
-        let mut port = setup(Position::startpos(), 3);
-        let submitted = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
-        let (ticket, response) = output(&submitted, 1);
-        let questions = port.next_question;
-        let leases = port.engine.stores.review_pin_count().unwrap();
-        let step = port
-            .commit_role(&submitted, &ticket, &response, None)
-            .unwrap();
-        assert_eq!(port.next_question, questions);
-        assert_eq!(port.engine.stores.review_pin_count().unwrap(), leases);
-        assert!(matches!(
-            step.transition,
-            AdaptivePortTransition::Continue(_)
-        ));
-        assert!(matches!(
-            port.materialize_step(step),
-            Err(PalsError::Store(StoreError::InvalidConditions(
-                "step precedes submitted view consumption"
-            )))
-        ));
-        assert_eq!(port.next_question, questions);
-    }
-
-    #[test]
-    fn actual_original_consumption_is_idempotent_then_selects_next_view_once() {
-        let mut port = setup(Position::startpos(), 3);
-        let submitted = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
-        let (ticket, response) = output(&submitted, 1);
-        let questions = port.next_question;
-        let step = port
-            .commit_role(&submitted, &ticket, &response, None)
-            .unwrap();
-        port.role_consumed(&ticket, &submitted.input.view).unwrap();
-        port.role_consumed(&ticket, &submitted.input.view).unwrap();
-        let materialized = port.materialize_step(step).unwrap();
-        let FrameTransition::Continue(next) = materialized.transition else {
-            panic!("continuation")
-        };
-        assert_eq!(port.next_question, questions + 1);
-        assert_eq!(next.stage, RefinementStage::ProposalContinuation);
-        assert_eq!(next.question.context.prefix.len(), 2);
-        assert_ne!(next.view.seal_digest(), submitted.input.view.seal_digest());
-    }
-
-    #[test]
-    fn terminal_step_shapes_cannot_bypass_the_original_consumption_gate() {
-        for unknown in [false, true] {
-            let mut port = setup(Position::startpos(), 3);
-            let submitted = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
-            let (ticket, response) = output(&submitted, 1);
-            let mut step = port
-                .commit_role(&submitted, &ticket, &response, None)
-                .unwrap();
-            // Authored shape variation isolates the all-transition gate. The
-            // real role commit and its original seal remain unchanged.
-            step.transition = if unknown {
-                AdaptivePortTransition::Unknown {
-                    reason: "authored terminal shape",
-                }
-            } else {
-                AdaptivePortTransition::Complete {
-                    scope: FrameCompletionScope::NoAlternative,
-                }
-            };
-            assert!(matches!(
-                port.materialize_step(step),
-                Err(PalsError::Store(StoreError::InvalidConditions(
-                    "step precedes submitted view consumption"
-                )))
-            ));
-            assert!(!port.consumed_role_views.contains_key(&ticket.id));
-        }
-    }
-
-    #[test]
-    fn consumed_semantic_terminal_step_expires_without_erasing_historical_consumption() {
-        let mut port = setup(Position::startpos(), 3);
-        let submitted = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
-        let (ticket, response) = output(&submitted, 1);
-        let mut step = port
-            .commit_role(&submitted, &ticket, &response, None)
-            .unwrap();
-        port.role_consumed(&ticket, &submitted.input.view).unwrap();
-        step.transition = AdaptivePortTransition::Complete {
-            scope: FrameCompletionScope::NoAlternative,
-        };
-        port.limits.deadline = Instant::now();
-        assert!(
-            port.role_consumption_recorded(&ticket, &submitted.input.view)
-                .unwrap()
-        );
-        assert!(matches!(
-            port.materialize_step(step),
-            Err(PalsError::Role(RoleError::Deadline))
-        ));
-        assert!(
-            port.role_consumption_recorded(&ticket, &submitted.input.view)
-                .unwrap()
-        );
-        // A raw-only closing result remains reportable after expiry without
-        // asserting a successful semantic completion or selecting a new view.
-        let raw = AdaptivePortStep {
-            evidence: ContractDigest([9; 32]),
-            transition: AdaptivePortTransition::Unknown {
-                reason: "raw-only expired feedback",
-            },
-            fresh_pair: None,
-            rules_pair: None,
-            consumption_gate: None,
-            feedback_gate: None,
-            queue_question: None,
-        };
-        assert!(matches!(
-            port.materialize_step(raw).unwrap().transition,
-            FrameTransition::Unknown { .. }
-        ));
-    }
-
-    #[test]
-    fn fresh_physical_admission_failure_does_not_consume_a_semantic_attempt() {
-        let mut port = setup(Position::startpos(), 3);
-        let submitted = work(&mut port, "e2e4", RefinementStage::ProposalValueFresh, 1);
-        let (ticket, response) = output(&submitted, 1);
-        let observations = port.engine.stores.observations.next_observation_sequence();
-        for _ in 0..2 {
-            assert!(matches!(
-                port.commit_role(&submitted, &ticket, &response, None),
-                Err(PalsError::Role(RoleError::InvalidOutput))
-            ));
-            assert!(!port.attempted_role_commits.contains(&ticket.id));
-            assert!(!port.accepted.contains(&ticket.id));
-            assert_eq!(
-                port.engine.stores.observations.next_observation_sequence(),
-                observations
-            );
-        }
-    }
-
-    #[test]
-    fn partial_semantic_failure_cannot_replay_the_same_response() {
-        let mut port = setup(Position::startpos(), 2);
-        let submitted = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
-        let (ticket, response) = output(&submitted, 1);
-        port.engine.config.max_records = 0;
-        let nodes = port.engine.nodes.len();
-        assert!(matches!(
-            port.commit_role(&submitted, &ticket, &response, None),
-            Err(PalsError::Store(StoreError::PinSaturated(_)))
-        ));
-        assert!(port.engine.nodes.len() > nodes);
-        assert!(port.attempted_role_commits.contains(&ticket.id));
-        assert!(!port.accepted.contains(&ticket.id));
-        let nodes_after_failure = port.engine.nodes.len();
-        assert!(matches!(
-            port.commit_role(&submitted, &ticket, &response, None),
-            Err(PalsError::Store(StoreError::InvalidEvidence(
-                "role semantic commit was already attempted"
-            )))
-        ));
-        assert_eq!(port.engine.nodes.len(), nodes_after_failure);
-        assert_eq!(port.counters.consumed_role_outputs, 0);
-    }
-
-    #[test]
-    fn later_pending_commit_does_not_stale_an_independently_consumed_blueprint() {
-        let mut port = setup(Position::startpos(), 3);
-        let first = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
-        let second = work(&mut port, "d2d4", RefinementStage::ProposalContinuation, 2);
-        let (a, output_a) = output(&first, 1);
-        let (b, output_b) = output(&second, 2);
-        let step_a = port.commit_role(&first, &a, &output_a, None).unwrap();
-        port.role_consumed(&a, &first.input.view).unwrap();
-        let step_b = port.commit_role(&second, &b, &output_b, None).unwrap();
-        port.role_consumed(&b, &second.input.view).unwrap();
-        assert!(matches!(
-            port.materialize_step(step_a).unwrap().transition,
-            FrameTransition::Continue(_)
-        ));
-        assert!(matches!(
-            port.materialize_step(step_b).unwrap().transition,
-            FrameTransition::Continue(_)
-        ));
-    }
-
-    #[test]
-    fn frozen_pair_views_are_created_only_at_materialization_and_share_public_scope() {
-        let mut port = setup(Position::startpos(), 3);
-        let submitted = work(&mut port, "e2e4", RefinementStage::RepairValueFresh, 1);
-        let repaired: Vec<BoardMove> = ["e2e4", "e7e5"]
-            .into_iter()
-            .map(|m| m.parse().unwrap())
-            .collect();
-        let counter: Vec<BoardMove> = ["e2e4", "c7c5"]
-            .into_iter()
-            .map(|m| m.parse().unwrap())
-            .collect();
-        let repaired_node = port.replay_node(&repaired).unwrap();
-        let counter_node = port.replay_node(&counter).unwrap();
-        let questions = port.next_question;
-        let leases = port.engine.stores.review_pin_count().unwrap();
-        let blueprint = port
-            .blueprint_fresh_pair(
-                &submitted.input.question,
-                repaired_node,
-                repaired,
-                counter_node,
-                counter,
-            )
-            .unwrap();
-        assert!(port.fresh_pending.is_empty());
-        assert_eq!(port.next_question, questions);
-        assert_eq!(port.engine.stores.review_pin_count().unwrap(), leases);
-        let step = AdaptivePortStep {
-            evidence: ContractDigest([1; 32]),
-            transition: AdaptivePortTransition::Continue(blueprint),
-            fresh_pair: None,
-            rules_pair: None,
-            consumption_gate: None,
-            feedback_gate: None,
-            queue_question: None,
-        };
-        let FrameTransition::Continue(first) = port.materialize_step(step).unwrap().transition
-        else {
-            panic!("Fresh pair first")
-        };
-        let second = port.fresh_pending.get(&first.question_digest).unwrap();
-        assert_eq!(first.public_context, second.public_context);
-        assert_ne!(first.view.digest(), second.view.digest());
-        assert_eq!(port.next_question, questions + 2);
-    }
-
-    #[test]
-    fn original_view_release_and_real_archive_reclaim_preserve_blueprint_endpoint() {
-        use super::super::archive_worker::{
-            ArchiveOperation, ArchiveOwner, ArchiveWork, ArchiveWorker,
-        };
-        use crate::pals::store::ArchiveConfig;
-        use std::path::PathBuf;
-        let mut port = setup(Position::startpos(), 3);
-        let output_root = if cfg!(windows) {
-            std::env::var_os("APPDATA").map(PathBuf::from)
-        } else {
-            std::env::var_os("RUNNER_TEMP").map(PathBuf::from)
-        }
-        .unwrap_or_else(std::env::temp_dir);
-        let serial = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = output_root.join("RoveZero").join("tmp").join(format!(
-            "blueprint-archive-fixture-{}-{serial}",
-            std::process::id()
-        ));
-        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_owned();
-        port.engine
-            .enable_archive(ArchiveConfig::new(root.clone(), repository))
-            .unwrap();
-        let position = port.engine.nodes[port.root].position.clone();
-        port.engine
-            .prepare_archive_root(&position, port.limits.deadline, &AtomicBool::new(false))
-            .unwrap();
-        let submitted = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
-        let (ticket, response) = output(&submitted, 1);
-        let step = port
-            .commit_role(&submitted, &ticket, &response, None)
-            .unwrap();
-        port.role_consumed(&ticket, &submitted.input.view).unwrap();
-        drop(submitted);
-        assert_eq!(port.engine.stores.review_pin_count().unwrap(), 0);
-        let inactive = port
-            .engine
-            .stores
-            .insert_situation(
-                Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 100")
-                    .unwrap()
-                    .snapshot(),
-            )
-            .unwrap();
-        let state = port.engine.stores.situations.get(inactive).unwrap().state;
-        let authority = port.authority;
-        let deadline = port.limits.deadline;
-        let allowance = port.archive_remaining_io();
-        let mut worker = ArchiveWorker::start().unwrap();
-        let transfer = worker
-            .submit(
-                ArchiveOwner::Port(port),
-                authority,
-                ArchiveWork {
-                    operation: ArchiveOperation::ReclaimHot {
-                        incoming_pins: Default::default(),
-                    },
-                    deadline,
-                    max_io_bytes: allowance,
-                },
-            )
-            .unwrap_or_else(|_| panic!("archive owner transfer"));
-        let completion = loop {
-            if let Some(completed) = worker.try_receive(&transfer).unwrap() {
-                break completed;
-            }
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        let (ArchiveOwner::Port(mut port), _) = completion
-            .install(authority, transfer.nonce())
-            .unwrap_or_else(|_| panic!("archive owner return"))
-        else {
-            panic!("port owner kind")
-        };
-        assert!(matches!(
-            port.engine.stores.states.get(state),
-            Err(StoreError::ColdRecord(_))
-        ));
-        assert!(matches!(
-            port.materialize_step(step).unwrap().transition,
-            FrameTransition::Continue(_)
-        ));
-        worker.finish().unwrap();
-        drop(port);
-        // Only this uniquely named, outside-repository fixture directory.
-        if root.file_name().is_some_and(|name| {
-            name.to_string_lossy()
-                .starts_with("blueprint-archive-fixture-")
-        }) && std::fs::symlink_metadata(&root)
-            .is_ok_and(|metadata| !metadata.file_type().is_symlink())
-        {
-            std::fs::remove_dir_all(&root).unwrap();
-        }
-    }
-}
 pub struct AdaptivePortMaterializedStep {
     pub evidence: ContractDigest,
     pub transition: FrameTransition<ReviewView, AdaptivePortQuestion>,
@@ -818,5 +480,348 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             rules_pair: step.rules_pair,
             queued_recheck,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::port_tests::{output, setup, work};
+    use super::*;
+
+    #[test]
+    fn role_commit_builds_no_next_view_and_materialization_requires_original_consume() {
+        let mut port = setup(Position::startpos(), 3);
+        let submitted = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
+        let (ticket, response) = output(&submitted, 1);
+        let questions = port.next_question;
+        let leases = port.engine.stores.review_pin_count().unwrap();
+        let step = port
+            .commit_role(&submitted, &ticket, &response, None)
+            .unwrap();
+        assert_eq!(port.next_question, questions);
+        assert_eq!(port.engine.stores.review_pin_count().unwrap(), leases);
+        assert!(matches!(
+            step.transition,
+            AdaptivePortTransition::Continue(_)
+        ));
+        assert!(matches!(
+            port.materialize_step(step),
+            Err(PalsError::Store(StoreError::InvalidConditions(
+                "step precedes submitted view consumption"
+            )))
+        ));
+        assert_eq!(port.next_question, questions);
+    }
+
+    #[test]
+    fn actual_original_consumption_is_idempotent_then_selects_next_view_once() {
+        let mut port = setup(Position::startpos(), 3);
+        let submitted = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
+        let (ticket, response) = output(&submitted, 1);
+        let questions = port.next_question;
+        let step = port
+            .commit_role(&submitted, &ticket, &response, None)
+            .unwrap();
+        port.role_consumed(&ticket, &submitted.input.view).unwrap();
+        port.role_consumed(&ticket, &submitted.input.view).unwrap();
+        let materialized = port.materialize_step(step).unwrap();
+        let FrameTransition::Continue(next) = materialized.transition else {
+            panic!("continuation")
+        };
+        assert_eq!(port.next_question, questions + 1);
+        assert_eq!(next.stage, RefinementStage::ProposalContinuation);
+        assert_eq!(next.question.context.prefix.len(), 2);
+        assert_ne!(next.view.seal_digest(), submitted.input.view.seal_digest());
+    }
+
+    #[test]
+    fn terminal_step_shapes_cannot_bypass_the_original_consumption_gate() {
+        for unknown in [false, true] {
+            let mut port = setup(Position::startpos(), 3);
+            let submitted = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
+            let (ticket, response) = output(&submitted, 1);
+            let mut step = port
+                .commit_role(&submitted, &ticket, &response, None)
+                .unwrap();
+            // Authored shape variation isolates the all-transition gate. The
+            // real role commit and its original seal remain unchanged.
+            step.transition = if unknown {
+                AdaptivePortTransition::Unknown {
+                    reason: "authored terminal shape",
+                }
+            } else {
+                AdaptivePortTransition::Complete {
+                    scope: FrameCompletionScope::NoAlternative,
+                }
+            };
+            assert!(matches!(
+                port.materialize_step(step),
+                Err(PalsError::Store(StoreError::InvalidConditions(
+                    "step precedes submitted view consumption"
+                )))
+            ));
+            assert!(!port.consumed_role_views.contains_key(&ticket.id));
+        }
+    }
+
+    #[test]
+    fn consumed_semantic_terminal_step_expires_without_erasing_historical_consumption() {
+        let mut port = setup(Position::startpos(), 3);
+        let submitted = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
+        let (ticket, response) = output(&submitted, 1);
+        let mut step = port
+            .commit_role(&submitted, &ticket, &response, None)
+            .unwrap();
+        port.role_consumed(&ticket, &submitted.input.view).unwrap();
+        step.transition = AdaptivePortTransition::Complete {
+            scope: FrameCompletionScope::NoAlternative,
+        };
+        port.limits.deadline = Instant::now();
+        assert!(
+            port.role_consumption_recorded(&ticket, &submitted.input.view)
+                .unwrap()
+        );
+        assert!(matches!(
+            port.materialize_step(step),
+            Err(PalsError::Role(RoleError::Deadline))
+        ));
+        assert!(
+            port.role_consumption_recorded(&ticket, &submitted.input.view)
+                .unwrap()
+        );
+        // A raw-only closing result remains reportable after expiry without
+        // asserting a successful semantic completion or selecting a new view.
+        let raw = AdaptivePortStep {
+            evidence: ContractDigest([9; 32]),
+            transition: AdaptivePortTransition::Unknown {
+                reason: "raw-only expired feedback",
+            },
+            fresh_pair: None,
+            rules_pair: None,
+            consumption_gate: None,
+            feedback_gate: None,
+            queue_question: None,
+        };
+        assert!(matches!(
+            port.materialize_step(raw).unwrap().transition,
+            FrameTransition::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn fresh_physical_admission_failure_does_not_consume_a_semantic_attempt() {
+        let mut port = setup(Position::startpos(), 3);
+        let submitted = work(&mut port, "e2e4", RefinementStage::ProposalValueFresh, 1);
+        let (ticket, response) = output(&submitted, 1);
+        let observations = port.engine.stores.observations.next_observation_sequence();
+        for _ in 0..2 {
+            assert!(matches!(
+                port.commit_role(&submitted, &ticket, &response, None),
+                Err(PalsError::Role(RoleError::InvalidOutput))
+            ));
+            assert!(!port.attempted_role_commits.contains(&ticket.id));
+            assert!(!port.accepted.contains(&ticket.id));
+            assert_eq!(
+                port.engine.stores.observations.next_observation_sequence(),
+                observations
+            );
+        }
+    }
+
+    #[test]
+    fn partial_semantic_failure_cannot_replay_the_same_response() {
+        let mut port = setup(Position::startpos(), 2);
+        let submitted = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
+        let (ticket, response) = output(&submitted, 1);
+        port.engine.config.max_records = 0;
+        let nodes = port.engine.nodes.len();
+        assert!(matches!(
+            port.commit_role(&submitted, &ticket, &response, None),
+            Err(PalsError::Store(StoreError::PinSaturated(_)))
+        ));
+        assert!(port.engine.nodes.len() > nodes);
+        assert!(port.attempted_role_commits.contains(&ticket.id));
+        assert!(!port.accepted.contains(&ticket.id));
+        let nodes_after_failure = port.engine.nodes.len();
+        assert!(matches!(
+            port.commit_role(&submitted, &ticket, &response, None),
+            Err(PalsError::Store(StoreError::InvalidEvidence(
+                "role semantic commit was already attempted"
+            )))
+        ));
+        assert_eq!(port.engine.nodes.len(), nodes_after_failure);
+        assert_eq!(port.counters.consumed_role_outputs, 0);
+    }
+
+    #[test]
+    fn later_pending_commit_does_not_stale_an_independently_consumed_blueprint() {
+        let mut port = setup(Position::startpos(), 3);
+        let first = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
+        let second = work(&mut port, "d2d4", RefinementStage::ProposalContinuation, 2);
+        let (a, output_a) = output(&first, 1);
+        let (b, output_b) = output(&second, 2);
+        let step_a = port.commit_role(&first, &a, &output_a, None).unwrap();
+        port.role_consumed(&a, &first.input.view).unwrap();
+        let step_b = port.commit_role(&second, &b, &output_b, None).unwrap();
+        port.role_consumed(&b, &second.input.view).unwrap();
+        assert!(matches!(
+            port.materialize_step(step_a).unwrap().transition,
+            FrameTransition::Continue(_)
+        ));
+        assert!(matches!(
+            port.materialize_step(step_b).unwrap().transition,
+            FrameTransition::Continue(_)
+        ));
+    }
+
+    #[test]
+    fn frozen_pair_views_are_created_only_at_materialization_and_share_public_scope() {
+        let mut port = setup(Position::startpos(), 3);
+        let submitted = work(&mut port, "e2e4", RefinementStage::RepairValueFresh, 1);
+        let repaired: Vec<BoardMove> = ["e2e4", "e7e5"]
+            .into_iter()
+            .map(|m| m.parse().unwrap())
+            .collect();
+        let counter: Vec<BoardMove> = ["e2e4", "c7c5"]
+            .into_iter()
+            .map(|m| m.parse().unwrap())
+            .collect();
+        let repaired_node = port.replay_node(&repaired).unwrap();
+        let counter_node = port.replay_node(&counter).unwrap();
+        let questions = port.next_question;
+        let leases = port.engine.stores.review_pin_count().unwrap();
+        let blueprint = port
+            .blueprint_fresh_pair(
+                &submitted.input.question,
+                repaired_node,
+                repaired,
+                counter_node,
+                counter,
+            )
+            .unwrap();
+        assert!(port.fresh_pending.is_empty());
+        assert_eq!(port.next_question, questions);
+        assert_eq!(port.engine.stores.review_pin_count().unwrap(), leases);
+        let step = AdaptivePortStep {
+            evidence: ContractDigest([1; 32]),
+            transition: AdaptivePortTransition::Continue(blueprint),
+            fresh_pair: None,
+            rules_pair: None,
+            consumption_gate: None,
+            feedback_gate: None,
+            queue_question: None,
+        };
+        let FrameTransition::Continue(first) = port.materialize_step(step).unwrap().transition
+        else {
+            panic!("Fresh pair first")
+        };
+        let second = port.fresh_pending.get(&first.question_digest).unwrap();
+        assert_eq!(first.public_context, second.public_context);
+        assert_ne!(first.view.digest(), second.view.digest());
+        assert_eq!(port.next_question, questions + 2);
+    }
+
+    #[test]
+    fn original_view_release_and_real_archive_reclaim_preserve_blueprint_endpoint() {
+        use super::super::archive_worker::{
+            ArchiveOperation, ArchiveOwner, ArchiveWork, ArchiveWorker,
+        };
+        use crate::pals::store::ArchiveConfig;
+        use std::path::PathBuf;
+        let mut port = setup(Position::startpos(), 3);
+        let output_root = if cfg!(windows) {
+            std::env::var_os("APPDATA").map(PathBuf::from)
+        } else {
+            std::env::var_os("RUNNER_TEMP").map(PathBuf::from)
+        }
+        .unwrap_or_else(std::env::temp_dir);
+        let serial = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = output_root.join("RoveZero").join("tmp").join(format!(
+            "blueprint-archive-fixture-{}-{serial}",
+            std::process::id()
+        ));
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        port.engine
+            .enable_archive(ArchiveConfig::new(root.clone(), repository))
+            .unwrap();
+        let position = port.engine.nodes[port.root].position.clone();
+        port.engine
+            .prepare_archive_root(&position, port.limits.deadline, &AtomicBool::new(false))
+            .unwrap();
+        let submitted = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
+        let (ticket, response) = output(&submitted, 1);
+        let step = port
+            .commit_role(&submitted, &ticket, &response, None)
+            .unwrap();
+        port.role_consumed(&ticket, &submitted.input.view).unwrap();
+        drop(submitted);
+        assert_eq!(port.engine.stores.review_pin_count().unwrap(), 0);
+        let inactive = port
+            .engine
+            .stores
+            .insert_situation(
+                Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 100")
+                    .unwrap()
+                    .snapshot(),
+            )
+            .unwrap();
+        let state = port.engine.stores.situations.get(inactive).unwrap().state;
+        let authority = port.authority;
+        let deadline = port.limits.deadline;
+        let allowance = port.archive_remaining_io();
+        let mut worker = ArchiveWorker::start().unwrap();
+        let transfer = worker
+            .submit(
+                ArchiveOwner::Port(port),
+                authority,
+                ArchiveWork {
+                    operation: ArchiveOperation::ReclaimHot {
+                        incoming_pins: Default::default(),
+                    },
+                    deadline,
+                    max_io_bytes: allowance,
+                },
+            )
+            .unwrap_or_else(|_| panic!("archive owner transfer"));
+        let completion = loop {
+            if let Some(completed) = worker.try_receive(&transfer).unwrap() {
+                break completed;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let (ArchiveOwner::Port(mut port), _) = completion
+            .install(authority, transfer.nonce())
+            .unwrap_or_else(|_| panic!("archive owner return"))
+        else {
+            panic!("port owner kind")
+        };
+        assert!(matches!(
+            port.engine.stores.states.get(state),
+            Err(StoreError::ColdRecord(_))
+        ));
+        assert!(matches!(
+            port.materialize_step(step).unwrap().transition,
+            FrameTransition::Continue(_)
+        ));
+        worker.finish().unwrap();
+        drop(port);
+        // Only this uniquely named, outside-repository fixture directory.
+        if root.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .starts_with("blueprint-archive-fixture-")
+        }) && std::fs::symlink_metadata(&root)
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink())
+        {
+            std::fs::remove_dir_all(&root).unwrap();
+        }
     }
 }

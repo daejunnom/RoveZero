@@ -134,6 +134,10 @@ impl<V, O: ProposerRankingOutput> RoleTicketRegistry<V, O> {
     /// Capture from the worker completion while its output remains owned by
     /// that message. This does not accept or consume the result. The existing
     /// physical-completion and fixed/adaptive delivery rules remain unchanged.
+    #[expect(
+        clippy::result_large_err,
+        reason = "preserve the original bounded completion custody on rejection without allocation under cancellation or memory pressure"
+    )]
     pub fn complete_proposer_ranking(
         &mut self,
         completion: RoleCompletion<O>,

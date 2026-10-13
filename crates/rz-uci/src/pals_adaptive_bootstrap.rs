@@ -2,9 +2,12 @@
 //! native owner; root fences keep the same model, Store and CPU/TT owners.
 //! Neither metadata preflight nor a successful UCI handshake is NN acceptance.
 pub mod external;
+mod native_backend;
 mod observations;
 mod protocol;
+mod resource_readback;
 pub mod runtime_assets;
+mod startup_snapshot;
 
 use crate::EngineIdentity;
 use crate::engine::{EngineSettings, OwnerRegistry, ProcessClock};
@@ -17,26 +20,29 @@ use crate::pals_adaptive::{
 use crate::pals_adaptive_startup::{
     PalsStartupOptionsV5, PinnedPalsStartupV5, parse_pals_search_settings_v5,
 };
+use crate::pals_native::startup_legacy::{
+    NativeLegacySelectedStartupResourcesV5, load_native_legacy_startup_v5,
+};
 use crate::pals_native::startup_virtual::{
-    NativeVirtualReviewStartupResourcesV5, NativeVirtualReviewStartupSnapshotV5,
-    load_native_virtual_review_startup_v5,
+    NativeVirtualReviewStartupResourcesV5, load_native_virtual_review_startup_v5,
 };
 use crate::pals_native::ticketed::{
-    NativeVirtualReviewTicketBackend, TicketNativeEvent, TicketServiceLimits,
-    TicketedNativeService, VirtualReviewCollectionObserver,
+    TicketNativeEvent, TicketServiceLimits, TicketedNativeService, VirtualReviewCollectionObserver,
 };
 use crate::search_driver::{
     PalsCheckerRegistration, SearchSessionContext, SearchSessionDriver, SearchSessionFailure,
 };
 use cap_fs_ext::DirExt;
+pub use native_backend::ActualNativeBackendV5;
 use observations::PalsAdaptiveObservationBridgeV5;
+use resource_readback::NativeResourceOwnerV5;
 use rz_contracts::pals::SearchAuthority;
 use rz_contracts::pals_adaptive::CpuWorkerId;
 use rz_contracts::{CancelToken, Digest, GameGeneration, ProcessEpoch, RootGeneration};
 use rz_eval::asset::parse_sha256;
 use rz_experiments::{
-    PalsCoordinatorPolicyV5, PalsEngineModeV5, PalsTopologyPolicyV5, admit_pals_startup_content_v5,
-    compiled_source_components_v5,
+    PalsCoordinatorPolicyV5, PalsEngineModeV5, PalsTopologyPolicyV5, PalsViewSelectionV5,
+    admit_pals_startup_content_v5, compiled_source_components_v5,
 };
 use rz_runtime::adaptive::{ControllerConfig, CoordinatorPolicy};
 use rz_search::cpu::{CpuEngine, CpuResumePolicy};
@@ -54,14 +60,19 @@ use rz_search::pals::engine::adaptive_port::{
 };
 use rz_search::pals::review_context::{ReviewAnchorMode, ReviewIndexLimits, ReviewSelectionPolicy};
 use rz_search::pals::store::{ArchiveConfig, ArchiveRootCapability};
+use startup_snapshot::ActualStartupSnapshotV5;
 use std::{
     fmt,
-    sync::{Arc, Mutex, atomic::AtomicBool, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub type ActualAdaptiveBackendV5 =
-    ProjectedNativeBackend<AdaptivePortQuestion, NativeVirtualReviewTicketBackend>;
+    ProjectedNativeBackend<AdaptivePortQuestion, ActualNativeBackendV5>;
 type ActualBackend = ActualAdaptiveBackendV5;
 type ActualService = TicketedNativeService<
     rz_search::pals::review_context::ReviewView,
@@ -109,6 +120,43 @@ fn boundary(stage: &'static str) -> AdaptiveBootstrapError {
     failure(stage, &stage)
 }
 
+fn require_original_startup_window(
+    until: Instant,
+    cancel: &AtomicBool,
+) -> Result<(), AdaptiveBootstrapError> {
+    if cancel.load(Ordering::Acquire) {
+        Err(boundary("StartupCanceled"))
+    } else if Instant::now() >= until {
+        Err(boundary("StartupExpired"))
+    } else {
+        Ok(())
+    }
+}
+
+fn receive_original_startup<T>(
+    receiver: &mpsc::Receiver<T>,
+    until: Instant,
+    cancel: &AtomicBool,
+) -> Result<T, AdaptiveBootstrapError> {
+    loop {
+        require_original_startup_window(until, cancel)?;
+        let slice = until
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(10));
+        match receiver.recv_timeout(slice) {
+            Ok(value) => {
+                require_original_startup_window(until, cancel)?;
+                return Ok(value);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(error @ mpsc::RecvTimeoutError::Disconnected) => {
+                require_original_startup_window(until, cancel)?;
+                return Err(failure("NativeFactoryChannelClosed", &error));
+            }
+        }
+    }
+}
+
 fn verify_private_working_directory(cwd: &std::path::Path) -> Result<(), AdaptiveBootstrapError> {
     // Archive's immutable-input exclusion and source-checkout exclusion are
     // separate. Inspect only marker metadata, never repository contents.
@@ -152,8 +200,30 @@ pub fn prepare_collection_actual(
     hooks: AdaptiveCollectionHooksV5,
     until: Instant,
 ) -> Result<PreparedAdaptiveProcessV5, AdaptiveBootstrapError> {
+    // Compatibility caller has no supplied cancellation channel. Mint its
+    // one startup signal here and retain that same owner through every stage.
+    prepare_collection_actual_with_cancellation(
+        pinned,
+        epoch,
+        hooks,
+        until,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+/// The actual collector supplies its original cancellation owner. The exact
+/// same Arc crosses snapshot admission, checker startup and resource probes;
+/// no stage creates a replacement false signal or cancellation authority.
+pub fn prepare_collection_actual_with_cancellation(
+    pinned: Arc<PinnedPalsStartupV5>,
+    epoch: ProcessEpoch,
+    hooks: AdaptiveCollectionHooksV5,
+    until: Instant,
+    startup_cancel: Arc<AtomicBool>,
+) -> Result<PreparedAdaptiveProcessV5, AdaptiveBootstrapError> {
     let started = Instant::now();
     if started >= until
+        || startup_cancel.load(Ordering::Acquire)
         || epoch.0 == 0
         || pinned.metadata_preflight
         || pinned.config.endpoint.mode != PalsEngineModeV5::Collection
@@ -174,15 +244,18 @@ pub fn prepare_collection_actual(
         started,
         Some(until),
         Some(hooks),
+        startup_cancel,
     )?;
     let published = prepared
         .driver
-        .start_checker(prepared.startup_deadline, Arc::new(AtomicBool::new(false)))
+        .start_checker(
+            prepared.startup_deadline,
+            Arc::clone(&prepared.startup_cancel),
+        )
         .map_err(|e| failure("CheckerStartupFence", &e))
         .and_then(|_checker_fence| {
             prepared
-                .observations
-                .publish_startup()
+                .publish_startup_resources()
                 .map_err(|e| failure("StartupReceipt", &e))
         });
     if let Err(error) = published {
@@ -303,16 +376,22 @@ pub fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapError> {
         started,
         None,
         None,
+        // Ordinary CLI startup precedes the existing stdin/protocol owner.
+        // Preserve that non-interactive startup behavior while sharing this
+        // single original CLI signal through all bounded startup stages.
+        Arc::new(AtomicBool::new(false)),
     )?;
     settings.search.max_simulations = prepared.cpu_nodes_limit;
     let published = prepared
         .driver
-        .start_checker(prepared.startup_deadline, Arc::new(AtomicBool::new(false)))
+        .start_checker(
+            prepared.startup_deadline,
+            Arc::clone(&prepared.startup_cancel),
+        )
         .map_err(|e| failure("CheckerStartupFence", &e))
         .and_then(|_| {
             prepared
-                .observations
-                .publish_startup()
+                .publish_startup_resources()
                 .map_err(|e| failure("StartupReceipt", &e))
         });
     if let Err(error) = published {
@@ -370,12 +449,33 @@ pub struct PreparedAdaptiveProcessV5 {
     _pinned: Arc<PinnedPalsStartupV5>,
     cpu_nodes_limit: u64,
     startup_deadline: Instant,
+    startup_cancel: Arc<AtomicBool>,
     process_cleanup_ceiling: Instant,
     cleanup_deadline: Mutex<Option<Instant>>,
     clock: ProcessClock,
     collection_context: Mutex<CollectionContextOwnerV5>,
 }
 impl PreparedAdaptiveProcessV5 {
+    fn publish_startup_resources(
+        &self,
+    ) -> Result<rz_experiments::ArtifactRef, rz_experiments::ManifestError> {
+        resource_readback::require_original_startup_active(&self.startup_cancel)?;
+        let native = self
+            .driver
+            .native_ready_cpu_thread_observation()
+            .map_err(|error| rz_experiments::ManifestError::Integrity(error.detail))?
+            .and_then(Result::ok);
+        let external = self
+            .driver
+            .external_startup_process_identity()
+            .map_err(|error| rz_experiments::ManifestError::Integrity(error.detail))?;
+        self.observations.publish_startup(
+            native,
+            external,
+            self.startup_deadline,
+            &self.startup_cancel,
+        )
+    }
     pub fn driver(&self) -> Arc<AdaptiveSessionDriver<ActualAdaptiveBackendV5>> {
         Arc::clone(&self.driver)
     }
@@ -539,6 +639,10 @@ fn source_digest(
     .map_err(|e| failure("SourceComponent", &e))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the original startup pin, owner, deadline, cancellation and collection authorities remain explicit at this single assembly boundary"
+)]
 fn prepare_actual(
     pinned: Arc<PinnedPalsStartupV5>,
     clock: ProcessClock,
@@ -548,6 +652,7 @@ fn prepare_actual(
     started: Instant,
     startup_ceiling: Option<Instant>,
     hooks: Option<AdaptiveCollectionHooksV5>,
+    startup_cancel: Arc<AtomicBool>,
 ) -> Result<PreparedAdaptiveProcessV5, AdaptiveBootstrapError> {
     let process_cleanup_ceiling = match startup_ceiling {
         Some(original) => original,
@@ -569,9 +674,20 @@ fn prepare_actual(
     if Instant::now() >= startup_until {
         return Err(boundary("StartupExpired"));
     }
+    if startup_cancel.load(Ordering::Acquire) {
+        return Err(boundary("StartupCanceled"));
+    }
     let declaration = &pinned.config.endpoint;
-    if declaration.model.profile != "virtual_review_v1"
-        || declaration.resources.topology != PalsTopologyPolicyV5::SharedControl
+    let view_selection = declaration.context.selection;
+    let registered_profile = match view_selection {
+        PalsViewSelectionV5::VirtualReview => declaration.model.profile == "virtual_review_v1",
+        PalsViewSelectionV5::V2Full | PalsViewSelectionV5::V2Selected => {
+            declaration.model.profile == "full_line_interaction_v2"
+                && declaration.mode == PalsEngineModeV5::Deployment
+                && hooks.is_none()
+        }
+    };
+    if !registered_profile || declaration.resources.topology != PalsTopologyPolicyV5::SharedControl
     {
         return Err(boundary("UnsupportedActualStartupProfile"));
     }
@@ -587,7 +703,7 @@ fn prepare_actual(
         role_tickets_max: slices.role_tickets_max as usize,
         paused_bytes_per_worker_max: slices.paused_bytes_per_worker_max as usize,
     };
-    let external = external::load_external_cpu_v5(&pinned, startup_until, &AtomicBool::new(false))
+    let external = external::load_external_cpu_v5(&pinned, startup_until, &startup_cancel)
         .map_err(|e| failure("ExternalSnapshot", &e))?;
     let collection_enabled = hooks.is_some();
     let (native_observer, dispatch_observer, native_intake, collection_hooks) = match hooks {
@@ -626,6 +742,7 @@ fn prepare_actual(
     cpu.try_reserve_exact(declaration.coordinator.slices.workers as usize)
         .map_err(|e| failure("CpuOwnerAllocation", &e))?;
     for index in 0..declaration.coordinator.slices.workers {
+        require_original_startup_window(startup_until, &startup_cancel)?;
         let evaluator = Arc::new(BootstrapCpuValue::default());
         let mut engine = if selections.paused_side_scope {
             CpuEngine::with_paused_side_scope(
@@ -670,19 +787,35 @@ fn prepare_actual(
         .iter()
         .map(|a| (&a.declaration, &a.file))
         .collect();
+    require_original_startup_window(startup_until, &startup_cancel)?;
     let admission = admit_pals_startup_content_v5(&pinned.config, &pinned.lock, &asset_refs)
         .map_err(|e| failure("ContentAdmission", &e))?;
     drop(asset_refs);
     let factory_pinned = Arc::clone(&pinned);
     let factory_admission = admission.clone();
     let factory_clock = clock.runtime_clock();
+    let factory_process_clock = clock.clone();
     let factory_epoch = clock.epoch();
+    let factory_startup_cancel = Arc::clone(&startup_cancel);
     let (sender, receiver) = mpsc::sync_channel::<
-        Result<NativeVirtualReviewStartupSnapshotV5, rz_search::pals::coordinator::RoleFailure>,
+        Result<
+            (ActualStartupSnapshotV5, NativeResourceOwnerV5),
+            rz_search::pals::coordinator::RoleFailure,
+        >,
     >(1);
+    require_original_startup_window(startup_until, &startup_cancel)?;
     let native = TicketedNativeService::spawn_with_capacity(
         move || {
             let result = (|| {
+                // Recheck on the actual factory thread, closing the race
+                // between caller admission and thread scheduling. A started
+                // native owner is still drained by StartupNativeGuard.
+                if factory_startup_cancel.load(Ordering::Acquire) {
+                    return Err(rz_search::pals::coordinator::RoleFailure::Canceled);
+                }
+                if Instant::now() >= startup_until {
+                    return Err(rz_search::pals::coordinator::RoleFailure::Expired);
+                }
                 let runtime_pin = runtime_assets::pin_runtime_v5(&factory_pinned).map_err(|e| {
                     rz_search::pals::coordinator::RoleFailure::Backend(e.to_string())
                 })?;
@@ -701,28 +834,76 @@ fn prepare_actual(
                                     factory_epoch.0
                                 ))
                         });
-                let mut loaded = load_native_virtual_review_startup_v5(
-                    factory_pinned,
-                    factory_clock,
-                    NativeVirtualReviewStartupResourcesV5 {
-                        content_admission: factory_admission,
-                        runtime_pin,
-                        cuda_profile_root,
-                        until: startup_until,
-                        content_intake: native_intake,
-                    },
-                )?;
-                if let Some(observer) = native_observer {
-                    loaded.backend.set_collection_observer(observer)?;
+                if factory_startup_cancel.load(Ordering::Acquire) {
+                    return Err(rz_search::pals::coordinator::RoleFailure::Canceled);
                 }
-                Ok(loaded)
+                if Instant::now() >= startup_until {
+                    return Err(rz_search::pals::coordinator::RoleFailure::Expired);
+                }
+                match view_selection {
+                    PalsViewSelectionV5::VirtualReview => {
+                        let mut loaded = load_native_virtual_review_startup_v5(
+                            factory_pinned,
+                            factory_clock,
+                            NativeVirtualReviewStartupResourcesV5 {
+                                content_admission: factory_admission,
+                                runtime_pin,
+                                cuda_profile_root,
+                                until: startup_until,
+                                content_intake: native_intake,
+                            },
+                        )?;
+                        if let Some(observer) = native_observer {
+                            loaded.backend.set_collection_observer(observer)?;
+                        }
+                        Ok((
+                            ActualNativeBackendV5::from(loaded.backend),
+                            ActualStartupSnapshotV5::Virtual(loaded.snapshot),
+                        ))
+                    }
+                    PalsViewSelectionV5::V2Full | PalsViewSelectionV5::V2Selected => {
+                        // A legacy factory neither accepts compact collection hooks nor
+                        // relabels its startup probe and encoding as compact evidence.
+                        if native_observer.is_some() || native_intake.is_some() {
+                            return Err(rz_search::pals::coordinator::RoleFailure::Unsupported(
+                                "legacy V2 collection intake",
+                            ));
+                        }
+                        let loaded = load_native_legacy_startup_v5(
+                            factory_pinned,
+                            factory_process_clock,
+                            factory_clock,
+                            NativeLegacySelectedStartupResourcesV5 {
+                                content_admission: factory_admission,
+                                runtime_pin,
+                                cuda_profile_root,
+                                until: startup_until,
+                            },
+                        )
+                        .map_err(|rejected| {
+                            finish_rejected_legacy_factory(rejected, startup_until)
+                        })?;
+                        Ok((
+                            ActualNativeBackendV5::from(loaded.backend),
+                            ActualStartupSnapshotV5::Legacy(loaded.snapshot),
+                        ))
+                    }
+                }
             })();
             let notification = result
                 .as_ref()
-                .map(|loaded| loaded.snapshot.clone())
+                .map(|(backend, snapshot)| {
+                    (
+                        snapshot.clone(),
+                        NativeResourceOwnerV5::from_original_native_factory(
+                            backend.applied_session_settings(),
+                            &factory_startup_cancel,
+                        ),
+                    )
+                })
                 .map_err(Clone::clone);
             let _ = sender.send(notification);
-            result.map(|loaded| ProjectedNativeBackend::new(loaded.backend))
+            result.map(|(backend, _)| ProjectedNativeBackend::new(backend))
         },
         TicketServiceLimits {
             review_token_budget: declaration.context.token_budget as u16,
@@ -736,10 +917,11 @@ fn prepare_actual(
         native: Some(native),
         cleanup_until: startup_until,
     };
-    let snapshot = receiver
-        .recv_timeout(startup_until.saturating_duration_since(Instant::now()))
-        .map_err(|e| failure("NativeFactoryDeadline", &e))?
-        .map_err(|e| failure("NativeFactory", &e))?;
+    // The original native guard remains live on every cancellation/error.
+    // Polling does not grant a replacement deadline or physical completion.
+    let (snapshot, resource_owner) =
+        receive_original_startup(&receiver, startup_until, &startup_cancel)?
+            .map_err(|e| failure("NativeFactory", &e))?;
     let observations = Arc::new(
         PalsAdaptiveObservationBridgeV5::new(
             Arc::clone(&pinned),
@@ -747,6 +929,7 @@ fn prepare_actual(
             snapshot.clone(),
             actual_binary,
             pinned.private_cwd(),
+            resource_owner,
         )
         .map_err(|e| failure("ObservationOwner", &e))?,
     );
@@ -776,18 +959,31 @@ fn prepare_actual(
     .map_err(|e| failure("SearchStore", &e))?
     .with_selected_review_context(
         ReviewSelectionPolicy {
-            mode: ReviewAnchorMode::AnchoredCompact,
+            mode: if view_selection == PalsViewSelectionV5::VirtualReview {
+                ReviewAnchorMode::AnchoredCompact
+            } else {
+                ReviewAnchorMode::CurrentRootOnly
+            },
             token_budget: declaration.context.token_budget as u16,
-            max_records: declaration.context.selected_records_max as u16,
-            max_anchors: declaration.context.anchors_max as u8,
+            max_records: declaration.context.selected_records_max.min(64) as u16,
+            max_anchors: if view_selection == PalsViewSelectionV5::VirtualReview {
+                declaration.context.anchors_max as u8
+            } else {
+                1
+            },
             required_bundle: None,
         },
         ReviewIndexLimits {
             active_bundles: declaration.context.active_bundles_max as usize,
-            records_per_bundle: declaration.context.selected_records_max as usize,
+            records_per_bundle: declaration.context.selected_records_max.min(64) as usize,
         },
     )
     .map_err(|e| failure("ReviewIndex", &e))?;
+    if view_selection == PalsViewSelectionV5::V2Full {
+        engine = engine
+            .with_legacy_full_native_context()
+            .map_err(|e| failure("LegacyFullContext", &e))?;
+    }
     let archive_name = format!(
         "adaptive-archive-{}-{}",
         std::process::id(),
@@ -818,6 +1014,7 @@ fn prepare_actual(
     let external_owner = match &external {
         None => None,
         Some(external) => {
+            require_original_startup_window(startup_until, &startup_cancel)?;
             let owner = CpuWorkerId((declaration.coordinator.slices.workers + 1) as u16);
             let runtime = clock.runtime_clock();
             let worker = ExternalCpuWorker::spawn_pinned(
@@ -869,7 +1066,7 @@ fn prepare_actual(
         policy,
         endpoints,
         controller,
-        device_digest: Digest(snapshot.backend_sha256),
+        device_digest: Digest(snapshot.backend_sha256()),
         cpu_device_digest: source_digest(&pinned, "resource_boundary")?,
         external_policy: external
             .as_ref()
@@ -911,6 +1108,7 @@ fn prepare_actual(
         _pinned: pinned,
         cpu_nodes_limit: selections.limits.max_cpu_nodes,
         startup_deadline: startup_until,
+        startup_cancel,
         process_cleanup_ceiling,
         cleanup_deadline: Mutex::new(None),
         clock,
@@ -921,6 +1119,36 @@ fn prepare_actual(
             active: None,
         }),
     })
+}
+
+/// A legacy loader can fail after creating its physical owner. Its original
+/// finish handle is not dropped as if startup never created any native work.
+/// Use the already registered deadline and quarantine an unknown outcome.
+fn finish_rejected_legacy_factory(
+    mut rejected: crate::pals_native::startup_legacy::NativeLegacyStartupFailureV5,
+    until: Instant,
+) -> rz_search::pals::coordinator::RoleFailure {
+    let cause = rz_search::pals::coordinator::RoleFailure::Backend(format!(
+        "legacy native factory {}: {:?}",
+        rejected.stage, rejected.cause,
+    ));
+    if let Some(receipt) = &rejected.startup_owner_receipt {
+        if let Ok(raw) = serde_json::to_string(receipt.as_ref()) {
+            eprintln!("pals_v5_legacy_failed_factory_original_receipt {raw}");
+        }
+    }
+    if let Some(finish) = rejected.finish.take() {
+        let closed = finish.finish(until).is_ok_and(|receipt| {
+            receipt.physical_shutdown_confirmed
+                && receipt.native_buffers_released
+                && !receipt.quarantined
+        });
+        eprintln!("pals_v5_legacy_failed_factory_cleanup physical_and_owner_closed={closed}");
+        if !closed {
+            let _quarantined = Box::leak(Box::new(finish));
+        }
+    }
+    cause
 }
 
 /// Rejected declarations never re-enter session admission. These are the same
@@ -993,4 +1221,54 @@ fn cleanup_rejected_sources(mut sources: AdaptiveSessionSources<ActualBackend>, 
     // quarantine is never labelled successful, refunded, or reused.
     let _quarantined = Box::leak(Box::new(sources));
     eprintln!("pals_v5_rejected_startup_cleanup physical=unknown owners_quarantined=true");
+}
+
+#[cfg(test)]
+mod original_startup_control_tests {
+    use super::*;
+
+    #[test]
+    fn canceled_or_expired_original_admission_does_not_consume_notification() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(7u8).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let original_caller = Arc::clone(&cancel);
+        original_caller.store(true, Ordering::Release);
+        assert_eq!(
+            receive_original_startup(&receiver, Instant::now() + Duration::from_secs(1), &cancel,)
+                .unwrap_err()
+                .stage,
+            "StartupCanceled"
+        );
+        assert_eq!(receiver.try_recv().unwrap(), 7);
+
+        sender.send(9u8).unwrap();
+        original_caller.store(false, Ordering::Release);
+        assert_eq!(
+            receive_original_startup(&receiver, Instant::now(), &cancel)
+                .unwrap_err()
+                .stage,
+            "StartupExpired"
+        );
+        assert_eq!(receiver.try_recv().unwrap(), 9);
+    }
+
+    #[test]
+    fn live_original_admission_keeps_value_and_closed_channel_is_an_error() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let until = Instant::now() + Duration::from_secs(1);
+        let cancel = AtomicBool::new(false);
+        sender.send(11u8).unwrap();
+        assert_eq!(
+            receive_original_startup(&receiver, until, &cancel).unwrap(),
+            11
+        );
+        drop(sender);
+        assert_eq!(
+            receive_original_startup(&receiver, until, &cancel)
+                .unwrap_err()
+                .stage,
+            "NativeFactoryChannelClosed"
+        );
+    }
 }

@@ -122,7 +122,7 @@ impl PalsNativeStartupOptionsV5 {
         match endpoint.model.backend {
             PalsModelBackendV3::OrtCuda => {
                 if self.native_loading_profile.as_deref() != Some(PALS_NATIVE_EAGER_CUDA_PROFILE_V5)
-                    || !self.cuda_device_id.is_some_and(|id| id >= 0)
+                    || self.cuda_device_id.is_none_or(|id| id < 0)
                     || !self
                         .cuda_arena_bytes
                         .is_some_and(|bytes| (1..=6u64 << 30).contains(&bytes))
@@ -283,16 +283,17 @@ impl PalsAdaptiveStartupConfigV5 {
                     "G0 requires exact initialization evidence/metadata and cannot relabel a generation specification",
                 ));
             }
-        } else if self.endpoint.model.artifact_domain == crate::PalsArtifactDomainV5::RealGeneration
+        } else if matches!(
+            self.endpoint.model.artifact_domain,
+            crate::PalsArtifactDomainV5::RealGeneration
+                | crate::PalsArtifactDomainV5::FrozenPcCollection
+        ) && (count(P::GenerationSpecification) != 1
+            || count(P::InitializationEvidence) != 0
+            || count(P::InitializationCheckpointMetadata) != 0)
         {
-            if count(P::GenerationSpecification) != 1
-                || count(P::InitializationEvidence) != 0
-                || count(P::InitializationCheckpointMetadata) != 0
-            {
-                return Err(fail(
-                    "G1 requires its preregistered actual generation specification; G0 evidence cannot stand in for trained provenance",
-                ));
-            }
+            return Err(fail(
+                "G1 requires its preregistered actual generation specification; G0 evidence cannot stand in for trained provenance",
+            ));
         }
         let compact = self.endpoint.model.profile == "virtual_review_v1";
         let shared = count(P::PublicGraph) == 1
@@ -303,7 +304,7 @@ impl PalsAdaptiveStartupConfigV5 {
             && count(P::SharedPcGraph) == 0
             && count(P::ProposerGraph) == 1
             && count(P::CriticGraph) == 1;
-        if (compact && !shared) || (!compact && !shared && !separate) {
+        if !shared && (compact || !separate) {
             return Err(fail(
                 "model graph capability does not match compact/shared or original legacy PC layout",
             ));

@@ -192,6 +192,25 @@ pub(crate) fn observe(
     }
 }
 
+/// 현재 프로세스의 실제 identity·membership·thread 목록을 같은 bounded
+/// probe로 읽는다. helper identity나 자식 관계를 만들거나 요구하지 않는다.
+/// None은 미지원 OS이며, unavailable/invalid/deadline은 원인과 함께 보존한다.
+/// 직접 cgroup 값과 준비 경계 관측만 제공하며 정책 적용·peak 증명이 아니다.
+pub(crate) fn observe_current_process(
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<Option<ProcessResourceSnapshot>, ResourceError> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (deadline, cancel);
+        Ok(None)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::observe_current_process(deadline, cancel).map(Some)
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn controlled(deadline: Instant, cancel: &AtomicBool) -> Result<(), ResourceError> {
     if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
@@ -699,6 +718,34 @@ mod linux {
         })
     }
 
+    pub(super) fn observe_current_process(
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<ProcessResourceSnapshot, ResourceError> {
+        let started = Instant::now();
+        // Reuse the helper probe's cooperative window and read budget. This
+        // does not interrupt an in-progress kernel syscall or attest limits.
+        let deadline = deadline.min(started + Duration::from_millis(500));
+        controlled(deadline, cancel)?;
+        let mut budget = Budget {
+            bytes: 0,
+            deadline,
+            cancel,
+        };
+        let proc = open_absolute("/proc", &budget)?;
+        if filesystem(&proc, &budget)? != PROC_SUPER_MAGIC {
+            return Err(ResourceError::Invalid("resource_proc_filesystem_mismatch"));
+        }
+        let pid = std::process::id();
+        let directory = proc
+            .open_dir_nofollow(pid.to_string())
+            .map_err(unavailable)?;
+        let mount = mount(&budget.read(&directory, "mountinfo", MAX_MOUNTINFO)?)?;
+        let observed = snapshot(&proc, pid, &mount, &mut budget, None)?;
+        budget.check()?;
+        Ok(observed)
+    }
+
     pub(super) fn observe(
         helper: ExternalProcessIdentity,
         deadline: Instant,
@@ -780,6 +827,20 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn current_process_probe_preserves_expiry_and_cancel_before_io() {
+            assert_eq!(
+                super::super::observe_current_process(Instant::now(), &AtomicBool::new(false)),
+                Err(ResourceError::Deadline)
+            );
+            assert_eq!(
+                super::super::observe_current_process(
+                    Instant::now() + Duration::from_secs(1),
+                    &AtomicBool::new(true)
+                ),
+                Err(ResourceError::Deadline)
+            );
+        }
         #[test]
         fn expired_or_canceled_read_never_probes_the_reader() {
             let mut cursor = std::io::Cursor::new(vec![b'x'; 16]);

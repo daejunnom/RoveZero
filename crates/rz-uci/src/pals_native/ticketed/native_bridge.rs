@@ -13,6 +13,7 @@ use rz_search::pals::engine::{
     DivergenceQuery, RoleError, RoleLogicalContext, RoleQuery, RoleQueryPurpose,
 };
 use rz_search::pals::review_context::ReviewView;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
@@ -21,6 +22,15 @@ pub struct NativeTicketQuestion {
     pub position: Position,
     pub context: RoleLogicalContext,
     pub deadline: Instant,
+    /// Search seals the complete original V2 record projection separately from
+    /// the bounded ticket authorization view. Native cannot create this owner.
+    pub legacy_full_records:
+        Option<Arc<rz_search::pals::engine::adaptive_port::LegacyFullRoleRecords>>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeLegacyInputModeV5 {
+    SelectedV2,
+    FullV2,
 }
 pub struct NativePreparedTicket {
     pub input: PalsModelInput,
@@ -33,6 +43,8 @@ pub struct NativeTicketOutput {
     pub completed_nn_inputs: Option<u64>,
     pub measurement_complete: bool,
     pub physical_fresh: Option<bool>,
+    /// 원본 physical owner가 확인한 단계 계수. legacy/mock의 누락은 unknown이다.
+    pub accounting: Option<TicketNativeAccountingEvidence>,
 }
 impl rz_search::pals::coordinator::ProposerRankingOutput for NativeTicketOutput {
     fn proposer_ranking_output(&self) -> &RoleOutput {
@@ -43,11 +55,32 @@ impl rz_search::pals::coordinator::ProposerRankingOutput for NativeTicketOutput 
 pub struct NativeFreshTicketBackend {
     model: NativeRoleModel,
     evidence: Option<(RequestId, TicketExecutionEvidence)>,
+    input_mode: NativeLegacyInputModeV5,
 }
 impl NativeFreshTicketBackend {
+    pub fn applied_session_settings(
+        &self,
+    ) -> Option<Arc<[rz_eval::pals_onnx::PalsAppliedSessionSettings]>> {
+        self.model.applied_session_settings()
+    }
     /// Call inside the service factory. Model loading/startup remain owned by
     /// the same dedicated thread and existing single native physical worker.
-    pub fn new(mut model: NativeRoleModel, startup_deadline: Instant) -> Result<Self, RoleFailure> {
+    pub fn new(model: NativeRoleModel, startup_deadline: Instant) -> Result<Self, RoleFailure> {
+        Self::new_with_input_mode(model, startup_deadline, NativeLegacyInputModeV5::SelectedV2)
+    }
+    pub fn new_with_input_mode(
+        mut model: NativeRoleModel,
+        startup_deadline: Instant,
+        input_mode: NativeLegacyInputModeV5,
+    ) -> Result<Self, RoleFailure> {
+        if input_mode == NativeLegacyInputModeV5::FullV2
+            && model.ticketed_config().profile
+                != rz_eval::pals_model::PalsModelProfile::FullLineInteractionV2
+        {
+            return Err(RoleFailure::Unsupported(
+                "full V2 ticket encoding requires the original FullLineInteractionV2 model",
+            ));
+        }
         model.ticketed_require_fresh().map_err(|_| {
             RoleFailure::Unsupported("ticket-owned Warm bank or reused synchronous owner")
         })?;
@@ -55,6 +88,7 @@ impl NativeFreshTicketBackend {
         Ok(Self {
             model,
             evidence: None,
+            input_mode,
         })
     }
 }
@@ -89,26 +123,68 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeFreshTicket
         let config = self.model.ticketed_config();
         let epoch = self.model.ticketed_model_epoch();
         let native_kind = kind(question.query.context.purpose)?;
+        match self.input_mode {
+            NativeLegacyInputModeV5::SelectedV2 => {
+                if question.query.legacy_full_records.is_some() {
+                    return Err(RoleFailure::InvalidOutput);
+                }
+            }
+            NativeLegacyInputModeV5::FullV2 => {
+                let full = question
+                    .query
+                    .legacy_full_records
+                    .as_ref()
+                    .ok_or(RoleFailure::InvalidOutput)?;
+                let anchor = view.anchors().first().ok_or(RoleFailure::InvalidOutput)?;
+                if full.revision() != question.query.context.public_revision
+                    || full.authority() != question.seal.authority
+                    || full.generation() != question.query.context.search_generation
+                    || full.root_state()
+                        != rz_position::contracts::rules_snapshot_semantic_digest(&anchor.snapshot)
+                            .0
+                    || view.anchor_mode()
+                        != rz_search::pals::review_context::ReviewAnchorMode::CurrentRootOnly
+                {
+                    return Err(RoleFailure::InvalidOutput);
+                }
+            }
+        }
         let input = if question.query.context.purpose == RoleQueryPurpose::DivergencePolicy {
             let query = DivergenceQuery {
                 root: &question.query.position,
                 proposal: &view.query().proposal,
                 candidates: &view.query().divergences,
-                records: view.records(),
+                records: retained_records(question),
                 revision: question.query.context.public_revision,
                 deadline: question.query.deadline,
                 cancel: canceled,
             };
-            pals_native::prepare_selected_divergence_input_for_config(&query, epoch, &config, view)
+            match self.input_mode {
+                NativeLegacyInputModeV5::SelectedV2 => {
+                    pals_native::prepare_selected_divergence_input_for_config(
+                        &query, epoch, &config, view,
+                    )
+                }
+                NativeLegacyInputModeV5::FullV2 => {
+                    pals_native::prepare_divergence_input_for_config(&query, epoch, &config)
+                }
+            }
         } else {
             let query = role_query(question, canceled);
-            pals_native::prepare_selected_role_input_for_config(
-                &query,
-                native_kind,
-                epoch,
-                &config,
-                view,
-            )
+            match self.input_mode {
+                NativeLegacyInputModeV5::SelectedV2 => {
+                    pals_native::prepare_selected_role_input_for_config(
+                        &query,
+                        native_kind,
+                        epoch,
+                        &config,
+                        view,
+                    )
+                }
+                NativeLegacyInputModeV5::FullV2 => {
+                    pals_native::prepare_role_input_for_config(&query, native_kind, epoch, &config)
+                }
+            }
         }
         .map_err(failure)?;
         let representation = self
@@ -128,10 +204,14 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeFreshTicket
         ))
     }
     fn prepared_host_bytes(&self, prepared: &NativePreparedTicket) -> u64 {
-        input_bytes(&prepared.input).saturating_add(
-            (std::mem::size_of::<NativePreparedTicket>() - std::mem::size_of::<PalsModelInput>())
-                as u64,
-        )
+        // The retained preparation and physical command's owned clone overlap
+        // until real completion. Count both backing allocations, as V3 does.
+        input_bytes(&prepared.input)
+            .saturating_mul(2)
+            .saturating_add(
+                (std::mem::size_of::<NativePreparedTicket>()
+                    - std::mem::size_of::<PalsModelInput>()) as u64,
+            )
     }
     fn question_host_bytes(
         &self,
@@ -157,6 +237,15 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeFreshTicket
                         .retained_history_bytes()? as u64,
                 )?
                 .checked_add(prefix)
+                .and_then(|bytes| {
+                    question
+                        .query
+                        .legacy_full_records
+                        .as_ref()
+                        .map_or(Some(bytes), |records| {
+                            bytes.checked_add(records.owned_host_bytes()?)
+                        })
+                })
         };
         owned().unwrap_or(u64::MAX)
     }
@@ -174,7 +263,7 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeFreshTicket
                 root: &question.query.position,
                 proposal: &question.view.query().proposal,
                 candidates: &question.view.query().divergences,
-                records: question.view.records(),
+                records: retained_records(question),
                 revision: question.query.context.public_revision,
                 deadline: question.query.deadline,
                 cancel: canceled,
@@ -209,7 +298,7 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeFreshTicket
                 completed_nn_inputs: output.completed_nn_inputs,
                 measurement_complete: output.measurement_complete,
                 physical_fresh: output.physical_fresh,
-                accounting: None,
+                accounting: output.accounting,
             }),
             Err(_) => self.model.ticketed_take_execution_evidence(ticket),
         }
@@ -300,11 +389,20 @@ fn role_query<'a>(
         prefix: &query.prefix,
         proposal: &query.proposal,
         counterexample: query.counterexample.as_deref(),
-        records: question.view.records(),
+        records: retained_records(question),
         revision: question.query.context.public_revision,
         deadline: question.query.deadline,
         cancel: canceled,
     }
+}
+fn retained_records(
+    question: &TicketPreparation<ReviewView, NativeTicketQuestion>,
+) -> &[rz_search::pals::engine::RoleRecord] {
+    question
+        .query
+        .legacy_full_records
+        .as_ref()
+        .map_or_else(|| question.view.records(), |records| records.records())
 }
 fn kind(purpose: RoleQueryPurpose) -> Result<NativeQueryKind, RoleFailure> {
     Ok(match purpose {

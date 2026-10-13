@@ -297,6 +297,10 @@ impl<V, O> RoleTicketRegistry<V, O> {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "return the original bounded ticket completion intact under failure/memory pressure without a new allocation"
+    )]
     pub fn complete(
         &mut self,
         completion: RoleCompletion<O>,

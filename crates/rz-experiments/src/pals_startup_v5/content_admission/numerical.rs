@@ -96,6 +96,10 @@ pub enum PalsNumericalProducerV5 {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+// Each raw case owns one typed input. Admission bounds the raw bytes and case
+// count, and releases each run pair before reading the next; boxing a variant
+// would add a separate allocation to this existing inline ownership boundary.
+#[allow(clippy::large_enum_variant)]
 pub enum PalsNumericalInputV5 {
     VirtualReview(PalsVirtualReviewInput),
     LegacyFullLine(PalsModelInput),

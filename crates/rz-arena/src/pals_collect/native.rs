@@ -666,6 +666,7 @@ fn search_return_result(
                 PalsError::Checker(_) => "Checker",
                 PalsError::Role(_) => "Role",
                 PalsError::Store(_) => "Store",
+                PalsError::Review(_) => "Review",
                 PalsError::Capacity => "Capacity",
                 PalsError::RoleCallLimit => "RoleCallLimit",
             };

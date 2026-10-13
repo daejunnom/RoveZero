@@ -534,7 +534,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     /// Lifecycle owners can retain every Store/index allocation on a failed
     /// registration or bounded hot admission. This does not assert a physical
     /// worker fence; the caller must supply its actual quiescence evidence.
-    #[allow(clippy::too_many_arguments)]
+    // The rejected engine must return intact even under allocation pressure;
+    // allocating a boxed error would add a new failure point to owner recovery.
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     pub fn new_registered_retaining(
         engine: PalsEngine<M>,
         position: Position,
@@ -555,7 +557,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    // Both callers recover the original engine by value on failed admission;
+    // the hot path must not allocate an error box to retain that ownership.
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     fn new_inner(
         mut engine: PalsEngine<M>,
         position: Position,

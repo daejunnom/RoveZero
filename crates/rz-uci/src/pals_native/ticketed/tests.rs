@@ -572,22 +572,24 @@ fn prepare(
 fn completed(service: &TicketedNativeService<View, u64, Fake>) -> RoleCompletion<Arc<(u64, u64)>> {
     completed_with_evidence(service).0
 }
-fn completed_with_evidence(
-    service: &TicketedNativeService<View, u64, Fake>,
-) -> (
+type FakeCompletionWithEvidence = (
     RoleCompletion<Arc<(u64, u64)>>,
     Option<TicketExecutionEvidence>,
-) {
+);
+type FakeCompletionWithOwnerWitness = (
+    RoleCompletion<Arc<(u64, u64)>>,
+    Option<TicketExecutionEvidence>,
+    TicketOwnerRunWitness,
+);
+fn completed_with_evidence(
+    service: &TicketedNativeService<View, u64, Fake>,
+) -> FakeCompletionWithEvidence {
     let (completion, evidence, _) = completed_with_owner_witness(service);
     (completion, evidence)
 }
 fn completed_with_owner_witness(
     service: &TicketedNativeService<View, u64, Fake>,
-) -> (
-    RoleCompletion<Arc<(u64, u64)>>,
-    Option<TicketExecutionEvidence>,
-    TicketOwnerRunWitness,
-) {
+) -> FakeCompletionWithOwnerWitness {
     loop {
         if let TicketNativeEvent::Completed {
             completion,

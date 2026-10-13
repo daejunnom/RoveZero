@@ -15,6 +15,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod frozen_collection;
+pub use frozen_collection::{
+    PALS_FROZEN_PC_COLLECTION_EXPORT_V5_DOMAIN, PalsFrozenPcCollectionMetadataV5,
+};
+
 const METADATA_LIMIT: usize = 4 << 20;
 const MANAGED_BYTES: u64 = 18 << 30;
 const INITIALIZATION_DOMAIN: &str = "rz-pals-g0-initialization-evidence/1";
@@ -64,6 +69,8 @@ pub struct PalsArtifactDomainAdmissionV5 {
     pub tensor_optimizer_content_verified: bool,
     pub numerical_acceptance_verified: bool,
     pub arena_accepted: bool,
+    /// Distinct 4000-update Collection metadata, never a full G1 acceptance.
+    pub frozen_pc_collection: Option<PalsFrozenPcCollectionMetadataV5>,
 }
 
 fn fail(message: &str) -> ManifestError {
@@ -115,7 +122,7 @@ fn parse_bytes(bytes: &[u8]) -> Result<Value, ManifestError> {
         "metadata byte limit exceeded",
     )?;
     let input = std::str::from_utf8(bytes).map_err(|_| fail("UTF-8 metadata required"))?;
-    Ok(decode_json(input)?)
+    decode_json(input)
 }
 fn read_metadata(
     artifact: &ArtifactRef,
@@ -288,6 +295,7 @@ pub fn validate_pals_artifact_domain_v5(
         tensor_optimizer_content_verified: false,
         numerical_acceptance_verified: false,
         arena_accepted: false,
+        frozen_pc_collection: None,
     };
     match config.endpoint.model.artifact_domain {
         PalsArtifactDomainV5::Untrained => {
@@ -343,6 +351,29 @@ pub fn validate_pals_artifact_domain_v5(
             result.spec_semantic_sha256 = Some(sha(&provenance["spec_sha256"])?.into());
             result.training_source_sha256 = Some(sha(&provenance["source_sha256"])?.into());
             result.training_runtime_sha256 = Some(sha(&provenance["runtime_sha256"])?.into());
+        }
+        PalsArtifactDomainV5::FrozenPcCollection => {
+            let provenance_pin = artifact_for(config, Purpose::Provenance)?;
+            need(
+                config.endpoint.model.provenance.as_ref() == Some(provenance_pin),
+                "frozen P/C provenance is not independently registered",
+            )?;
+            let provenance = read_metadata(provenance_pin, &mut read_artifact)?;
+            let spec_pin = artifact_for(config, Purpose::GenerationSpecification)?;
+            let registered_spec = read_metadata(spec_pin, &mut read_artifact)?;
+            let frozen = frozen_collection::validate_frozen_collection(
+                &provenance,
+                &registered_spec,
+                config,
+                &export,
+            )?;
+            result.provenance_file_sha256 = Some(provenance_pin.sha256.clone());
+            result.generation_specification_file_sha256 = Some(spec_pin.sha256.clone());
+            result.generation_id = Some(text(&provenance["generation_id"])?.into());
+            result.spec_semantic_sha256 = Some(sha(&provenance["spec_sha256"])?.into());
+            result.training_source_sha256 = Some(sha(&provenance["source_sha256"])?.into());
+            result.training_runtime_sha256 = Some(sha(&provenance["runtime_sha256"])?.into());
+            result.frozen_pc_collection = Some(frozen);
         }
         PalsArtifactDomainV5::Diagnostic => {
             return Err(fail(
@@ -1422,10 +1453,10 @@ fn validate_role_artifacts(a: &Value, kind: &str) -> Result<u64, ManifestError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn spec_fixture() -> Value {
+    pub(super) fn spec_fixture() -> Value {
         json!({"schema":GENERATION_SPEC_DOMAIN,"generation_id":"g1","source_sha256":"a".repeat(64),"dataset_sha256":"b".repeat(64),"split_sha256":"c".repeat(64),"model_sha256":"d".repeat(64),"runtime_sha256":"e".repeat(64),"profile":"virtual_review_v1","model_epoch":0,"context_epoch":0,"device":"cuda:0","precision":"fp32","tf32":false,"cpu_threads":2,"microbatch":1,"accumulation":8,"optimizer":{"name":"adamw","lr":1e-4,"betas":[0.9,0.999],"epsilon":1e-8,"weight_decay":0.01,"clip_norm":1.0,"schedule":"constant"},"role_updates":{"proposer":2000,"critic":2000,"validator":1000},"checkpoint_interval":250,"seeds":{"initialization":23,"sampling":29,"training":31,"arena":1},"loss_weights":{"policy":1.0,"wdl":1.0,"divergence":1.0,"task":1.0},"eligibility":"actual_training_pending_acceptance","collection_inference":{"mode":"fresh","batch_size":1}})
     }
-    fn weights_fixture() -> ArtifactRef {
+    pub(super) fn weights_fixture() -> ArtifactRef {
         ArtifactRef {
             path: "fixture/checkpoint.pt".into(),
             sha256: "f".repeat(64),
@@ -1434,7 +1465,7 @@ mod tests {
             license: "MIT".into(),
         }
     }
-    fn checkpoint_fixture(spec: &Value) -> Value {
+    pub(super) fn checkpoint_fixture(spec: &Value) -> Value {
         let weights = weights_fixture();
         let cost = json!({"forward_calls":40_000,"backward_calls":40_000,"samples":40_000,"wall_time_ns":1,"partial_accumulation_ns":0,"replay_ns":0,"masked_groups":0,"output_bytes":64});
         let updates = json!({"proposer":2000,"critic":2000,"validator":1000});

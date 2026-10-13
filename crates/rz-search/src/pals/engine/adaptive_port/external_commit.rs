@@ -171,6 +171,94 @@ fn foreign_identity_owned_backing(
 }
 
 impl<M: RoleModel> AdaptiveEnginePort<M> {
+    /// A legal coherent external tuple may forecast early stop for the
+    /// existing P/C continuation. It remains raw selective-engine feedback:
+    /// neither an own completed iteration nor a conditional proof.
+    pub fn published_external_continuation_eligible(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        progress: &crate::external_cpu::worker::ExternalWorkerProgress,
+    ) -> bool {
+        let Some(admission) = self.external_admissions.get(&work.input.question_digest) else {
+            return false;
+        };
+        let (Some(job), Some(grant), Some(best)) = (
+            admission.job,
+            admission.grant,
+            progress.opinion.pv.first().copied(),
+        ) else {
+            return false;
+        };
+        let query = &work.input.question;
+        let proposal = if query.proposal.is_empty() {
+            &query.context.prefix
+        } else {
+            &query.proposal
+        };
+        if self.check_work(work).is_err()
+            || !self.external_context_current(work, admission)
+            || !admission
+                .execution
+                .zip(admission.original_consumer)
+                .is_some_and(|(execution, original)| {
+                    admission.consumer == Some(original.id)
+                        && self
+                            .engine
+                            .stores
+                            .hot_validate_pending_cpu_feedback(
+                                execution,
+                                original,
+                                &admission.task_key,
+                                &admission.position.snapshot(),
+                                self.engine.tick_at(Instant::now()),
+                            )
+                            .is_ok()
+                })
+            || !Arc::ptr_eq(&work.input.question, &admission.question)
+            || !Arc::ptr_eq(&work.input.view, &admission.view)
+            || work.input.view_seal != admission.view_seal
+            || work.original_first_move != admission.first_move
+            || query.node != admission.node
+            || query.context != admission.context
+            || !query
+                .position
+                .snapshot()
+                .same_state(&admission.position.snapshot())
+            || !foreign_root_restriction(query)
+                .is_ok_and(|restriction| restriction == admission.restriction)
+            || work.budget.role_submissions_remaining == 0
+            || admission.terminal
+            || admission.quarantined
+            || query.stage != RefinementStage::CpuValidation
+            || self.engine.nodes[query.node].terminal.is_some()
+            || !self
+                .divergence_indices(proposal)
+                .is_ok_and(|indices| !indices.is_empty())
+            || job.id != progress.scope.job
+            || grant.job != job.id
+            || grant.execution != progress.scope.execution
+            || grant.owner != progress.scope.owner
+            || progress.strict_native_nodes.is_some()
+            || progress.completed_iteration_observed.is_some()
+            || progress.opinion.rank != 1
+            || progress.opinion.depth == 0
+            || progress.opinion.depth > admission.target_depth
+            || !admission.position.legal_moves().contains(&best)
+            || admission
+                .restriction
+                .as_ref()
+                .is_some_and(|moves| !moves.contains(&best))
+        {
+            return false;
+        }
+        let mut position = admission.position.clone();
+        progress
+            .opinion
+            .pv
+            .iter()
+            .all(|move_| position.make_move(*move_).is_ok())
+    }
+
     /// Observable admission payload backing retained by the foreign endpoint.
     /// HashMap allocator/control, Arc control blocks and the Store-owned pin
     /// registry are outside this scope: this is neither whole-port ownership
@@ -1467,7 +1555,7 @@ mod tests {
         ExternalCheckerIdentity, ExternalModelMetadata, ExternalRawScore,
         ExternalTrainingKnowledge, ExternalUciIdentity,
     };
-    use crate::external_cpu::worker::ExternalWorkerScope;
+    use crate::external_cpu::worker::{ExternalWorkerProgress, ExternalWorkerScope};
     use crate::pals::coordinator::FrameId;
     use crate::pals::review_context::{ReviewIndexLimits, ReviewSelectionPolicy};
     use rz_contracts::pals_adaptive::{CpuJobId, CpuWorkerId};
@@ -1756,6 +1844,140 @@ mod tests {
             exact_resume_supported: false,
             go_issue: ExternalGoIssue::Issued,
         }
+    }
+
+    fn published_continuation_fixture() -> (Port, Work, ExternalWorkerProgress) {
+        let (mut port, mut work, config) = fixture();
+        let first = BoardMove::from_uci("e2e4").unwrap();
+        let reply = BoardMove::from_uci("e7e5").unwrap();
+        // The submitted proposal includes a real opponent continuation point.
+        // The ordinary one-ply receipt fixture is otherwise insufficient to
+        // authorize a P/C continuation forecast.
+        work.input = port
+            .input(
+                work.input.question.node,
+                RefinementStage::CpuValidation,
+                Some(first),
+                vec![first],
+                vec![first, reply],
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let receipt = dispatched(&mut port, &work, &config);
+        let raw = &receipt.result.as_ref().unwrap().report;
+        let progress = ExternalWorkerProgress {
+            scope: receipt.scope,
+            opinion: crate::external_cpu::ExternalPolicyOpinion {
+                rank: 1,
+                depth: raw.reported_depth.unwrap(),
+                seldepth: raw.seldepth,
+                pv: raw.pv.clone(),
+                score: raw.score,
+                bound: raw.bound,
+                reported_wdl: raw.wdl_per_mille,
+            },
+            reported_nodes: raw.work.nodes,
+            strict_native_nodes: None,
+            control_sequence: 0,
+            completed_iteration_observed: None,
+        };
+        (port, work, progress)
+    }
+
+    #[test]
+    fn published_foreign_continuation_allows_only_the_original_legal_raw_question() {
+        let (port, work, progress) = published_continuation_fixture();
+        let before = port.engine.stores.observations.next_observation_sequence();
+        assert!(port.published_external_continuation_eligible(&work, &progress));
+        // Eligibility is read-only scheduling advice, not observation/target
+        // publication, search consumption or completed native work.
+        assert_eq!(
+            port.engine.stores.observations.next_observation_sequence(),
+            before
+        );
+        assert!(port.engine.records.is_empty());
+        assert_eq!(port.counters.consumed_external_checker_tasks, 0);
+        assert_eq!(port.counters.external_checker_nodes_observed, 0);
+    }
+
+    #[test]
+    fn published_foreign_continuation_rejects_old_go_and_native_completion_fabrication() {
+        let (port, work, progress) = published_continuation_fixture();
+        let mut changed = progress.clone();
+        changed.scope.job.sequence += 1;
+        assert!(!port.published_external_continuation_eligible(&work, &changed));
+        let mut changed = progress.clone();
+        changed.scope.execution.sequence += 1;
+        assert!(!port.published_external_continuation_eligible(&work, &changed));
+        let mut changed = progress.clone();
+        changed.scope.owner.0 += 1;
+        assert!(!port.published_external_continuation_eligible(&work, &changed));
+        for completed in [false, true] {
+            let mut changed = progress.clone();
+            changed.completed_iteration_observed = Some(completed);
+            assert!(!port.published_external_continuation_eligible(&work, &changed));
+        }
+        for nodes in [0, 8] {
+            let mut changed = progress.clone();
+            changed.strict_native_nodes = Some(nodes);
+            assert!(!port.published_external_continuation_eligible(&work, &changed));
+        }
+        let mut changed = progress.clone();
+        changed.opinion.pv.clear();
+        assert!(!port.published_external_continuation_eligible(&work, &changed));
+        let mut changed = progress.clone();
+        changed.opinion.pv = vec![BoardMove::from_uci("e2e3").unwrap()];
+        assert!(!port.published_external_continuation_eligible(&work, &changed));
+        let mut changed = progress.clone();
+        changed
+            .opinion
+            .pv
+            .push(BoardMove::from_uci("e2e4").unwrap());
+        assert!(!port.published_external_continuation_eligible(&work, &changed));
+    }
+
+    #[test]
+    fn published_foreign_continuation_rejects_anchor_query_view_and_first_move_drift() {
+        let (mut port, work, progress) = published_continuation_fixture();
+        let mut changed = work.clone();
+        Arc::make_mut(&mut changed.input.question).position = Position::startpos();
+        assert!(!port.published_external_continuation_eligible(&changed, &progress));
+        let mut changed = work.clone();
+        // Equal fields/digest in another Arc cannot replace the private query.
+        let _ = Arc::make_mut(&mut changed.input.question);
+        assert!(!port.published_external_continuation_eligible(&changed, &progress));
+        let query = &work.input.question;
+        let replacement = port
+            .input(
+                query.node,
+                query.stage,
+                query.first,
+                query.context.prefix.clone(),
+                query.proposal.clone(),
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut changed = work.clone();
+        changed.input.view = replacement.view;
+        changed.input.view_seal = replacement.view_seal;
+        changed.input.public_context = replacement.public_context;
+        assert!(!port.published_external_continuation_eligible(&changed, &progress));
+        let mut changed = work.clone();
+        changed.original_first_move = rz_contracts::pals::Move16::encode(
+            rz_contracts::Move::try_from(BoardMove::from_uci("d2d4").unwrap()).unwrap(),
+        );
+        assert!(!port.published_external_continuation_eligible(&changed, &progress));
+        assert!(port.published_external_continuation_eligible(&work, &progress));
     }
 
     fn assert_partial_foreign_feedback_is_one_use(

@@ -1,11 +1,16 @@
 //! Actual-process V5 evidence join. Declaration, native load, root fence,
 //! process finish and independently registered numerical evidence retain
 //! separate scopes. No model, worker, optimizer or performance run starts here.
+use super::resource_readback::{
+    ActualResourceObservationsV5, NativeResourceOwnerV5, require_original_startup_active,
+};
+use super::startup_snapshot::ActualStartupSnapshotV5;
 use crate::pals_adaptive::{
     AdaptiveCloseMode, AdaptiveManagerCounters, AdaptiveNativeAccountingSnapshot,
     AdaptiveRootObservationSnapshot, AdaptiveSessionProcessReceipt, AdaptiveSessionRetention,
 };
 use crate::pals_adaptive_startup::PinnedPalsStartupV5;
+use crate::pals_native::startup_legacy::NativeLegacySelectedStartupSnapshotV5;
 use crate::pals_native::startup_virtual::NativeVirtualReviewStartupSnapshotV5;
 use crate::search_driver::{DriverPhysicalCompletion, SearchSessionFailure};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
@@ -18,6 +23,7 @@ use rz_experiments::{
     PalsModelVerificationV5, PalsNativeNumericalCheckV5, PalsObservedV3, PalsPhysicalStateV3,
     PalsRoleV3, PalsStartupAssetPurposeV5, PalsStartupContentAdmissionV5,
     pals_coordinator_evidence_bytes_v5, pals_model_verification_evidence_bytes_v5,
+    pals_resource_readback_evidence_bytes_v5,
 };
 use rz_search::pals::coordinator::{
     CoordinatorHistoryUsage, RoleTicketCumulativeObservation, RoleTicketPhaseOccupancy,
@@ -29,12 +35,15 @@ use std::{
     io::Write,
     path::Path,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 const METADATA_BYTES_MAX: usize = 128 << 10;
 const OWNED_ROOT_BYTES_MAX: u64 = 18 << 30;
 const ROOT_OBSERVATIONS_MAX: u64 = 65_536;
-const OUTPUT_FILES_MAX: usize = 8;
+// Two additional bounded envelopes preserve startup and last-root resource
+// scope separately. They are not rewritten as a single lifetime observation.
+const OUTPUT_FILES_MAX: usize = 10;
 
 fn fail(message: &str) -> ManifestError {
     ManifestError::Integrity(format!("V5 actual observation: {message}"))
@@ -137,6 +146,8 @@ enum OutputKind {
     Coordinator,
     Termination,
     FailedTermination,
+    StartupResources,
+    FinalResources,
 }
 impl OutputKind {
     fn name(self) -> &'static str {
@@ -148,6 +159,8 @@ impl OutputKind {
             Self::Coordinator => "pals-coordinator-observation.v5.json",
             Self::Termination => "pals-native-termination.v5.json",
             Self::FailedTermination => "pals-native-failed-termination-observation.v5.json",
+            Self::StartupResources => "pals-startup-resource-readback.v5.json",
+            Self::FinalResources => "pals-final-resource-readback.v5.json",
         }
     }
 }
@@ -322,7 +335,7 @@ fn owned_root_bytes(root: &Dir) -> Result<u64, ManifestError> {
     walk(root, 0, &mut 0)
 }
 
-fn join_factory_snapshot(
+fn join_virtual_factory_snapshot(
     pinned: &PinnedPalsStartupV5,
     admission: &PalsStartupContentAdmissionV5,
     snapshot: &NativeVirtualReviewStartupSnapshotV5,
@@ -389,21 +402,150 @@ fn join_factory_snapshot(
     )
 }
 
+fn join_legacy_factory_snapshot(
+    pinned: &PinnedPalsStartupV5,
+    admission: &PalsStartupContentAdmissionV5,
+    snapshot: &NativeLegacySelectedStartupSnapshotV5,
+) -> Result<(), ManifestError> {
+    use rz_experiments::{PalsEngineModeV5, PalsViewSelectionV5};
+    let assets: Vec<_> = pinned
+        .assets()
+        .iter()
+        .map(|asset| (&asset.declaration, &asset.file))
+        .collect();
+    admission.verify_binding(&pinned.config, &pinned.lock, &assets)?;
+    let endpoint = &pinned.config.endpoint;
+    let model = &endpoint.model;
+    let domain = admission.artifact_domain();
+    let source = &snapshot.source;
+    let receipt = &snapshot.startup_owner_receipt;
+    let selected = match endpoint.context.selection {
+        PalsViewSelectionV5::V2Selected => true,
+        PalsViewSelectionV5::V2Full => false,
+        PalsViewSelectionV5::VirtualReview => {
+            return Err(fail("legacy factory cannot admit compact context"));
+        }
+    };
+    let schema = if selected {
+        "rz-pals-native-legacy-selected-startup-snapshot-v5/1"
+    } else {
+        "rz-pals-native-legacy-full-startup-snapshot-v5/1"
+    };
+    need(
+        !pinned.metadata_preflight
+            && !pinned.config.training_executed
+            && endpoint.mode == PalsEngineModeV5::Deployment
+            && snapshot.schema == schema
+            && snapshot.selected_view == selected
+            && snapshot.model_profile == "full_line_interaction_v2"
+            && snapshot.model_profile == model.profile
+            && source.model_configuration.profile.as_str() == model.profile
+            && !source.trained
+            && !receipt.trained
+            && hex(snapshot.content_admission_config_sha256) == admission.config_sha256()
+            && hex(snapshot.content_admission_semantic_lock_sha256)
+                == admission.semantic_lock_sha256()
+            && hex(snapshot.numerical_acceptance_sha256) == admission.numerical().acceptance.sha256
+            && hex(source.checkpoint_sha256) == model.weights.sha256
+            && hex(snapshot.model_semantic_sha256) == model.semantic_sha256
+            && hex(snapshot.encoding_sha256) == model.encoding_sha256
+            && snapshot.encoding_sha256 == source.encoding_semantic_sha256
+            && hex(snapshot.model_implementation_sha256) == model.implementation_sha256
+            && snapshot.registered_model_epoch == model.epoch
+            && !snapshot.validator_loaded
+            && !model.exported_roles.contains(&PalsRoleV3::Validator)
+            && snapshot.physical_workers_created == 1
+            && snapshot.configured_intra_threads == endpoint.resources.ort_intra_threads as usize
+            && snapshot.configured_inter_threads == endpoint.resources.ort_inter_threads as usize
+            && !snapshot.configured_spinning
+            && !snapshot.configured_tf32
+            && !snapshot.configured_approximate_warm
+            && !snapshot.tensor_optimizer_content_verified
+            && !admission.tensor_optimizer_content_verified()
+            && domain.artifact_domain == model.artifact_domain
+            && domain.checkpoint_sha256 == model.weights.sha256
+            && domain.producer_metadata_verified
+            && domain.registered_artifact_bytes_verified_by_launch_owner
+            && domain.numerical_acceptance_verified
+            && receipt.process_epoch == snapshot.process_epoch
+            && receipt.model_epoch == source.checkpoint_sha256
+            && receipt.export_manifest_sha256 == source.export_manifest_sha256
+            && receipt.encoding_semantic_sha256 == source.encoding_semantic_sha256
+            && receipt.physical_runs_in_flight == 0
+            && !receipt.quarantined
+            && !receipt.physical_shutdown_confirmed
+            && !receipt.native_buffers_released,
+        "actual legacy load/probe snapshot differs from its original content owner or V2 context",
+    )?;
+    let provider = match model.backend {
+        PalsModelBackendV3::OrtCpu => "CPUExecutionProvider",
+        PalsModelBackendV3::OrtCuda => "CUDAExecutionProvider",
+        _ => {
+            return Err(fail(
+                "legacy actual snapshot requires the declared ORT backend",
+            ));
+        }
+    };
+    need(
+        snapshot.configured_provider == provider,
+        "legacy loaded provider differs from its declared backend",
+    )?;
+    need(
+        hex(source.export_manifest_sha256)
+            == pinned
+                .asset(PalsStartupAssetPurposeV5::ExportManifest)?
+                .declaration
+                .artifact
+                .sha256
+            && hex(source.execution.runtime_sha256)
+                == pinned
+                    .asset(PalsStartupAssetPurposeV5::RuntimeLibrary)?
+                    .declaration
+                    .artifact
+                    .sha256
+            && receipt.execution.runtime_sha256 == source.execution.runtime_sha256
+            && receipt.execution.runtime_bundle_sha256 == source.execution.runtime_bundle_sha256
+            && source.execution.provider
+                == if model.backend == PalsModelBackendV3::OrtCpu {
+                    "cpu"
+                } else {
+                    "cuda"
+                },
+        "actual legacy loaded export/runtime differs from the retained asset descriptors",
+    )
+}
+fn join_factory_snapshot(
+    pinned: &PinnedPalsStartupV5,
+    admission: &PalsStartupContentAdmissionV5,
+    snapshot: &ActualStartupSnapshotV5,
+) -> Result<(), ManifestError> {
+    match snapshot {
+        ActualStartupSnapshotV5::Virtual(snapshot) => {
+            join_virtual_factory_snapshot(pinned, admission, snapshot)
+        }
+        ActualStartupSnapshotV5::Legacy(snapshot) => {
+            join_legacy_factory_snapshot(pinned, admission, snapshot)
+        }
+    }
+}
+
 pub(crate) struct PalsAdaptiveObservationBridgeV5 {
     pinned: Arc<PinnedPalsStartupV5>,
     identity: ActualProcessIdentityV5,
-    snapshot: NativeVirtualReviewStartupSnapshotV5,
+    snapshot: ActualStartupSnapshotV5,
     writer: Mutex<BoundedObservationWriterV5>,
     aggregate: Mutex<RootAggregateV5>,
     startup: PalsEndpointReceiptV5,
+    resources: Mutex<ActualResourceObservationsV5>,
 }
 impl PalsAdaptiveObservationBridgeV5 {
     pub(crate) fn new(
         pinned: Arc<PinnedPalsStartupV5>,
         admission: &PalsStartupContentAdmissionV5,
-        snapshot: NativeVirtualReviewStartupSnapshotV5,
+        snapshot: ActualStartupSnapshotV5,
         actual_binary_sha256: [u8; 32],
         actual_cwd: &Path,
+        resource_owner: NativeResourceOwnerV5,
     ) -> Result<Self, ManifestError> {
         join_factory_snapshot(&pinned, admission, &snapshot)?;
         let identity = ActualProcessIdentityV5::join(&pinned, actual_binary_sha256, actual_cwd)?;
@@ -463,7 +605,7 @@ impl PalsAdaptiveObservationBridgeV5 {
         observe_verified_factory_roles(
             &mut startup,
             &model.exported_roles,
-            snapshot.validator_loaded,
+            snapshot.validator_loaded(),
         )?;
         // Configured threads/TF32 are requests. They never fill applied resource
         // readback, actual TF32, RSS/VRAM peaks or process-tree exit observations.
@@ -474,9 +616,46 @@ impl PalsAdaptiveObservationBridgeV5 {
             writer: Mutex::new(writer),
             aggregate: Mutex::new(RootAggregateV5::default()),
             startup,
+            resources: Mutex::new(ActualResourceObservationsV5::new(resource_owner)),
         })
     }
-    pub(crate) fn publish_startup(&self) -> Result<ArtifactRef, ManifestError> {
+    pub(crate) fn publish_startup(
+        &self,
+        native_thread: Option<rz_runtime::adaptive::CpuThreadReadback>,
+        external: Option<rz_search::cpu_checker::ExternalProcessIdentity>,
+        until: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<ArtifactRef, ManifestError> {
+        require_original_startup_active(cancel)?;
+        let mut resources = self
+            .resources
+            .lock()
+            .map_err(|_| fail("resource observation owner poisoned"))?;
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| fail("evidence writer poisoned"))?;
+        let mut value = resources.observe_startup(
+            self.pinned.config.endpoint.resources.evidence_profile,
+            native_thread,
+            external,
+            until,
+            cancel,
+            writer.artifact_name(OutputKind::StartupResources),
+        )?;
+        let bytes = pals_resource_readback_evidence_bytes_v5(
+            &model_endpoint(&self.pinned),
+            self.identity.process_id,
+            &self.identity.process_run_id,
+            &value,
+        )?;
+        require_original_startup_active(cancel)?;
+        value.evidence = writer.write_bytes(OutputKind::StartupResources, &bytes)?;
+        let mut observation = self.startup.clone();
+        observation.resource_readback = observed(
+            value,
+            "actual native loader settings joined to read-only OS observations at this process startup; unknown fields and direct/visible quota scope retained",
+        );
         let record = PalsAdaptiveStartupRecordV5 {
             schema_version: 5,
             domain: PALS_NATIVE_STARTUP_V5_DOMAIN.into(),
@@ -487,30 +666,45 @@ impl PalsAdaptiveObservationBridgeV5 {
             process_run_id: self.identity.process_run_id.clone(),
             source_commit: self.pinned.config.endpoint.source_commit.clone(),
             component_source_pins: self.pinned.config.source_components.clone(),
-            observation: self.startup.clone(),
+            observation,
         };
-        self.writer
-            .lock()
-            .map_err(|_| fail("evidence writer poisoned"))?
-            .write_json(OutputKind::Startup, &record)
+        require_original_startup_active(cancel)?;
+        writer.write_json(OutputKind::Startup, &record)
     }
     /// Call once from the actual root-fence observer before manager dismantle.
-    /// This fixed-size merge neither writes files nor calls a worker/model.
+    /// This bounded merge does not write files or call a worker/model. Only
+    /// the current actual manager thread's fixed OS metadata is read here.
     pub(crate) fn observe_closed_root(
         &self,
         actual: &AdaptiveRootObservationSnapshot,
     ) -> Result<(), ManifestError> {
-        self.aggregate
+        let mut aggregate = self
+            .aggregate
             .lock()
-            .map_err(|_| fail("root observation aggregate poisoned"))?
-            .add(actual, self.snapshot.process_epoch)
+            .map_err(|_| fail("root observation aggregate poisoned"))?;
+        // Validate all root-counter joins/overflow checks before the bounded
+        // resource merge; either merge failure preserves the previous state.
+        let mut next = *aggregate;
+        next.add(actual, self.snapshot.process_epoch())?;
+        self.resources
+            .lock()
+            .map_err(|_| fail("resource observation owner poisoned"))?
+            .observe_closed_root(
+                actual,
+                rz_runtime::adaptive::observe_current_cpu_thread(
+                    rz_runtime::adaptive::CpuActor::Manager,
+                )
+                .ok(),
+            )?;
+        *aggregate = next;
+        Ok(())
     }
     pub(crate) fn publish_termination(
         &self,
         finish: &AdaptiveSessionProcessReceipt,
     ) -> Result<ArtifactRef, ManifestError> {
         need(
-            finish.epoch().0 == self.snapshot.process_epoch
+            finish.epoch().0 == self.snapshot.process_epoch()
                 && finish.permits_process_close()
                 && finish.native_owner_joined()
                 && finish.native_physical_shutdown_confirmed()
@@ -522,12 +716,38 @@ impl PalsAdaptiveObservationBridgeV5 {
             .lock()
             .map_err(|_| fail("root observation aggregate poisoned"))?;
         aggregate.require_process_finish_join(finish.last_authority())?;
+        let resources = self
+            .resources
+            .lock()
+            .map_err(|_| fail("resource observation owner poisoned"))?;
         let mut writer = self
             .writer
             .lock()
             .map_err(|_| fail("evidence writer poisoned"))?;
-        writer.write_json(OutputKind::RawTotals, &aggregate.metadata())?;
+        let mut raw_metadata = aggregate.metadata();
+        raw_metadata["applied_resource_readback"] = serde_json::json!({
+            "producer":"actual native loader, original ready thread owners, bounded read-only OS probe",
+            "diagnostic":resources.diagnostic(),
+            "host_cpu_probe_diagnostic":resources.host_diagnostic(),
+            "scope":"startup and latest settled-root snapshots; unknown application, hidden ancestors, peak and external option values are not synthesized"
+        });
+        writer.write_json(OutputKind::RawTotals, &raw_metadata)?;
         let mut endpoint = self.startup.clone();
+        if let Some(mut value) =
+            resources.final_readback(writer.artifact_name(OutputKind::FinalResources))
+        {
+            let bytes = pals_resource_readback_evidence_bytes_v5(
+                &endpoint.endpoint_id,
+                self.identity.process_id,
+                &self.identity.process_run_id,
+                &value,
+            )?;
+            value.evidence = writer.write_bytes(OutputKind::FinalResources, &bytes)?;
+            endpoint.resource_readback = observed(
+                value,
+                "startup OS snapshot and latest settled root's original ready owner readings; no lifetime/peak or declared-to-applied conversion",
+            );
+        }
         if let Some(mut coordinator) =
             aggregate.complete_coordinator(writer.artifact_name(OutputKind::Coordinator))
         {
@@ -589,7 +809,7 @@ impl PalsAdaptiveObservationBridgeV5 {
     ) -> Result<ArtifactRef, ManifestError> {
         if let Some(receipt) = finish {
             need(
-                receipt.epoch().0 == self.snapshot.process_epoch,
+                receipt.epoch().0 == self.snapshot.process_epoch(),
                 "failed termination receipt belongs to a different process epoch",
             )?;
         }
@@ -604,7 +824,7 @@ impl PalsAdaptiveObservationBridgeV5 {
             "endpoint_id":model_endpoint(&self.pinned),
             "process_id":self.identity.process_id,
             "process_run_id":self.identity.process_run_id,
-            "process_epoch":self.snapshot.process_epoch,
+            "process_epoch":self.snapshot.process_epoch(),
             "source_commit":self.pinned.config.endpoint.source_commit,
             "lock_sha256":self.pinned.lock.canonical_sha256,
             "startup_config_sha256":self.pinned.config_sha256,
@@ -995,7 +1215,7 @@ impl RootAggregateV5 {
                 ||serde_json::json!({"status":"unknown","scope":"incomplete actual original-command accounting; profile or NN count is not V-call evidence"}),
                 |called|serde_json::json!({"status":"observed","value":called,"scope":"settled root command accounting only; final process owner join is still required"})
             ),
-            "applied_resource_readback":"unknown: no resource producer imported"
+            "applied_resource_readback":"separate actual-owner resource envelopes; root work counters alone grant no resource application evidence"
         })
     }
     fn require_process_finish_join(

@@ -6,6 +6,9 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 
 pub type EmbeddedSourceFile = (&'static str, &'static [u8]);
+/// Logical path, byte length and SHA-256 of one embedded source file.
+pub type CompiledSourceFilePinV5 = (String, u64, [u8; 32]);
+pub type CompiledSourceInventoryV5 = BTreeMap<String, Vec<CompiledSourceFilePinV5>>;
 pub const PALS_SOURCE_INVENTORY_V5_JSON: &str = include_str!("pals_source_inventory_v5.json");
 
 macro_rules! source {
@@ -66,6 +69,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/pals/engine/adaptive_port/continuation_blueprint.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/cpu_commit.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/external_commit.rs"),
+            source!("crates/rz-search/src/pals/engine/adaptive_port/legacy_full_context.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/model_namespace.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/role_commit.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/validator_port.rs"),
@@ -129,6 +133,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/pals/engine/adaptive_port/continuation_blueprint.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/cpu_commit.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/external_commit.rs"),
+            source!("crates/rz-search/src/pals/engine/adaptive_port/legacy_full_context.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/model_namespace.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/role_commit.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/validator_port.rs"),
@@ -188,6 +193,11 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-platform/src/windows.rs"),
             source!("crates/rz-runtime/Cargo.toml"),
             source!("crates/rz-runtime/src/adaptive/topology.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/session_driver.rs"),
+            source!("crates/rz-uci/src/pals_adaptive_bootstrap.rs"),
+            source!("crates/rz-uci/src/pals_adaptive_bootstrap/observations.rs"),
+            source!("crates/rz-uci/src/pals_adaptive_bootstrap/resource_readback.rs"),
+            source!("crates/rz-uci/src/pals_attestation/checker/resource.rs"),
         ],
     ),
     (
@@ -219,9 +229,12 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_adaptive/validator.rs"),
             source!("crates/rz-uci/src/pals_adaptive_bootstrap.rs"),
             source!("crates/rz-uci/src/pals_adaptive_bootstrap/external.rs"),
+            source!("crates/rz-uci/src/pals_adaptive_bootstrap/native_backend.rs"),
             source!("crates/rz-uci/src/pals_adaptive_bootstrap/observations.rs"),
             source!("crates/rz-uci/src/pals_adaptive_bootstrap/protocol.rs"),
+            source!("crates/rz-uci/src/pals_adaptive_bootstrap/resource_readback.rs"),
             source!("crates/rz-uci/src/pals_adaptive_bootstrap/runtime_assets.rs"),
+            source!("crates/rz-uci/src/pals_adaptive_bootstrap/startup_snapshot.rs"),
             source!("crates/rz-uci/src/pals_adaptive_sources.rs"),
             source!("crates/rz-uci/src/pals_adaptive_startup.rs"),
             source!("crates/rz-uci/src/pals_adaptive_startup/search_settings.rs"),
@@ -285,6 +298,9 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-experiments/src/pals_startup_v5/content_admission.rs"),
             source!(
                 "crates/rz-experiments/src/pals_startup_v5/content_admission/artifact_domains.rs"
+            ),
+            source!(
+                "crates/rz-experiments/src/pals_startup_v5/content_admission/artifact_domains/frozen_collection.rs"
             ),
             source!("crates/rz-experiments/src/pals_startup_v5/content_admission/numerical.rs"),
             source!("crates/rz-experiments/src/pals_startup_v5/content_admission/owned_files.rs"),
@@ -419,8 +435,13 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("experiments/model-research/pals/src/rz_pals_model/generation_chunks.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_data.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_export.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/generation_export_cli.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_frozen_pc.py"),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/generation_numerical_cli.py"
+            ),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_training.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/generation_training_cli.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/initialization_evidence.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/model.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/native_continuation.py"),
@@ -465,6 +486,8 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
     (
         "model_export",
         &[
+            source!("crates/rz-arena/src/pals_collect_v3/training_export_process.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/training_process.rs"),
             source!("experiments/model-research/pals/src/rz_pals_model/artifacts.py"),
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/controlled_initialization.py"
@@ -478,7 +501,12 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
                 "experiments/model-research/pals/src/rz_pals_model/device_packing_artifacts.py"
             ),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_export.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/generation_export_cli.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_frozen_pc.py"),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/generation_numerical_cli.py"
+            ),
+            source!("experiments/model-research/pals/src/rz_pals_model/generation_training_cli.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/initialization_evidence.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/onnx_shared.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/onnx_virtual_review.py"),
@@ -507,6 +535,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
         &[
             source!("crates/rz-arena/Cargo.toml"),
             source!("crates/rz-arena/src/pals_collect_v3.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/action_cli.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/action_driver.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/actions.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/actual_actions.rs"),
@@ -516,8 +545,15 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/pals_collect_v3/collection_pgn.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/driver.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/frozen_intake.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/frozen_startup.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/game_process.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/generation_pipeline.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/generation_series.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/numerical_process.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/selfplay_cli.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/teacher.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/training_export_process.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/training_process.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/writer.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/writer_worker.rs"),
             source!("crates/rz-experiments/Cargo.toml"),
@@ -533,6 +569,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
         &[
             source!("crates/rz-arena/Cargo.toml"),
             source!("crates/rz-arena/src/pals_collect_v3.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/action_cli.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/action_driver.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/actions.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/actual_actions.rs"),
@@ -542,8 +579,15 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/pals_collect_v3/collection_pgn.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/driver.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/frozen_intake.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/frozen_startup.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/game_process.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/generation_pipeline.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/generation_series.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/numerical_process.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/selfplay_cli.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/teacher.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/training_export_process.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/training_process.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/writer.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/writer_worker.rs"),
             source!("crates/rz-experiments/Cargo.toml"),
@@ -557,11 +601,18 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
     (
         "trainer",
         &[
+            source!("crates/rz-arena/src/pals_collect_v3/training_export_process.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/training_process.rs"),
             source!("experiments/model-research/pals/src/rz_pals_model/config.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_chunks.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_data.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/generation_export_cli.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_frozen_pc.py"),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/generation_numerical_cli.py"
+            ),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_training.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/generation_training_cli.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/model.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/training.py"),
         ],
@@ -569,9 +620,17 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
     (
         "checkpoint",
         &[
+            source!("crates/rz-arena/src/pals_collect_v3/training_export_process.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/training_process.rs"),
             source!("experiments/model-research/pals/src/rz_pals_model/artifacts.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_export.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/generation_export_cli.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/generation_frozen_pc.py"),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/generation_numerical_cli.py"
+            ),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_training.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/generation_training_cli.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/initialization_evidence.py"),
         ],
     ),
@@ -580,7 +639,13 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
         &[
             source!("experiments/model-research/pals/src/rz_pals_model/config.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_data.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/generation_export_cli.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/generation_frozen_pc.py"),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/generation_numerical_cli.py"
+            ),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_training.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/generation_training_cli.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/training.py"),
         ],
     ),
@@ -590,6 +655,10 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/Cargo.toml"),
             source!("crates/rz-arena/src/bin/fixture-engine.rs"),
             source!("crates/rz-arena/src/bin/model-pair.rs"),
+            source!("crates/rz-arena/src/bin/pals-action-outcomes.rs"),
+            source!("crates/rz-arena/src/bin/pals-generation-game-worker.rs"),
+            source!("crates/rz-arena/src/bin/pals-generation-pipeline.rs"),
+            source!("crates/rz-arena/src/bin/pals-selfplay-collect.rs"),
             source!("crates/rz-arena/src/contract.rs"),
             source!("crates/rz-arena/src/engine_environment.rs"),
             source!("crates/rz-arena/src/external_uci.rs"),
@@ -608,6 +677,8 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/native_runner.rs"),
             source!("crates/rz-arena/src/pals_adaptive_launch.rs"),
             source!("crates/rz-arena/src/pals_adaptive_launch/artifact_domains.rs"),
+            source!("crates/rz-arena/src/pals_adaptive_launch/evaluation_series.rs"),
+            source!("crates/rz-arena/src/pals_adaptive_launch/evaluation_templates.rs"),
             source!("crates/rz-arena/src/pals_adaptive_launch/evidence.rs"),
             source!("crates/rz-arena/src/pals_adaptive_launch/export_rules.rs"),
             source!("crates/rz-arena/src/pals_adaptive_launch/normalized_receipt.rs"),
@@ -620,6 +691,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/pals_collect/native.rs"),
             source!("crates/rz-arena/src/pals_collect/producer.rs"),
             source!("crates/rz-arena/src/pals_collect_v3.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/action_cli.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/action_driver.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/actions.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/actual_actions.rs"),
@@ -629,8 +701,15 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/pals_collect_v3/collection_pgn.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/driver.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/frozen_intake.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/frozen_startup.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/game_process.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/generation_pipeline.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/generation_series.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/numerical_process.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/selfplay_cli.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/teacher.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/training_export_process.rs"),
+            source!("crates/rz-arena/src/pals_collect_v3/training_process.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/writer.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/writer_worker.rs"),
             source!("crates/rz-arena/src/pals_launch.rs"),
@@ -667,8 +746,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
     ),
 ];
 
-pub fn compiled_source_inventory_v5()
--> Result<BTreeMap<String, Vec<(String, u64, [u8; 32])>>, ManifestError> {
+pub fn compiled_source_inventory_v5() -> Result<CompiledSourceInventoryV5, ManifestError> {
     let mut inventory = BTreeMap::new();
     for (name, files) in SOURCE_COMPONENT_FILES_V5 {
         if inventory.contains_key(*name) {

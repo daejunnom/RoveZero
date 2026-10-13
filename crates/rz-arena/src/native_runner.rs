@@ -16,6 +16,40 @@ use std::{
     },
 };
 
+fn clamp_original_wall(
+    declared_ms: u64,
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Result<u64, ArenaError> {
+    let Some(deadline) = deadline else {
+        return Ok(declared_ms);
+    };
+    let remaining = deadline
+        .checked_duration_since(now)
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .filter(|n| *n > 0)
+        .ok_or_else(|| {
+            ArenaError::Budget("original provider run window expired before child dispatch".into())
+        })?;
+    Ok(declared_ms.min(remaining))
+}
+#[cfg(test)]
+mod original_window_tests {
+    use super::*;
+    #[test]
+    fn original_window_only_reduces_time_and_refuses_expired_dispatch() {
+        let now = std::time::Instant::now();
+        let deadline = now + std::time::Duration::from_millis(37);
+        assert_eq!(clamp_original_wall(100, Some(deadline), now).unwrap(), 37);
+        assert_eq!(clamp_original_wall(9, Some(deadline), now).unwrap(), 9);
+        assert_eq!(clamp_original_wall(100, None, now).unwrap(), 100);
+        assert!(clamp_original_wall(100, Some(deadline), deadline).is_err());
+        assert!(
+            clamp_original_wall(100, Some(now + std::time::Duration::from_nanos(1)), now).is_err()
+        );
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct NativeProviderSessionAudit {
     pub role: String,
@@ -56,6 +90,13 @@ pub trait NativeProviderDeclaration: NativeLaunchDeclaration {
     }
     fn contract_revision(&self) -> &str {
         "0.1"
+    }
+    /// An optional original run window that started before common preparation
+    /// checks. Historical providers keep None and their existing timing. This
+    /// only reduces dispatch time; the separately registered cleanup reserve is
+    /// never increased or removed.
+    fn original_wall_deadline(&self) -> Result<Option<std::time::Instant>, ArenaError> {
+        Ok(None)
     }
     #[cfg(target_os = "linux")]
     fn validate_runtime_admission(&self) -> Result<(), ArenaError> {
@@ -464,6 +505,122 @@ impl<S: NativeProviderDeclaration> NativePairOutput<S> {
             .owner
             .as_ref()
             .expect("completed wrapper retains input owner")
+    }
+
+    /// Move the original, normally closed scope into a read-only archive and
+    /// release only its exclusive execution lease. No serialized receipt can
+    /// call this constructor. Unknown physical/process closure keeps `self`
+    /// and its lease intact, preventing another pair from being admitted.
+    pub fn into_closed_archive(mut self) -> Result<ClosedNativePairArchive<S>, Self> {
+        let original = self.bundle.receipt.as_ref();
+        let process = self.bundle.process.as_ref();
+        let projections_match = original.is_some_and(|receipt| {
+            matches!(
+                (serde_json::to_vec(receipt), serde_json::to_vec(&self.receipt)),
+                (Ok(a), Ok(b)) if a == b
+            )
+        }) && self.bundle.receipt_artifact.as_ref()
+            == Some(&self.receipt_artifact);
+        let closed = projections_match
+            && original.is_some_and(|receipt| {
+                receipt.integration_checks_passed
+                    && receipt.cleanup_verified
+                    && !receipt.unresolved_owner_retained
+                    && receipt.primary_error.is_none()
+                    && receipt.provider_audit_error.is_none()
+                    && receipt.provider_sessions.len()
+                        == self.launch_owner().spec.expected_provider_sessions()
+            })
+            && process.is_some_and(|process| {
+                process.receipt.stop == crate::ProcessStop::Exited
+                    && process.receipt.exit_code == Some(0)
+                    && process.receipt.exit_signal.is_none()
+                    && process.receipt.group_cleanup == CleanupStatus::Gone
+                    && process.pending_child.is_none()
+                    && process.receipt.errors.is_empty()
+                    && original.is_some_and(|receipt| {
+                        matches!(
+                            (
+                                serde_json::to_vec(&receipt.process),
+                                serde_json::to_vec(&process.receipt)
+                            ),
+                            (Ok(a), Ok(b)) if a == b
+                        )
+                    })
+            });
+        if !closed {
+            return Err(self);
+        }
+        let owner = self.bundle.owner.take().expect("checked original owner");
+        let NativeLaunchOwner {
+            spec,
+            _lease,
+            #[cfg(target_os = "linux")]
+            snapshot,
+        } = owner;
+        let archive = ClosedNativePairArchive {
+            spec,
+            #[cfg(target_os = "linux")]
+            snapshot,
+            process: self.bundle.process.take().expect("checked closed process"),
+            receipt: self
+                .bundle
+                .receipt
+                .take()
+                .expect("checked original receipt"),
+            receipt_artifact: self
+                .bundle
+                .receipt_artifact
+                .take()
+                .expect("checked original receipt artifact"),
+        };
+        drop(_lease);
+        Ok(archive)
+    }
+}
+
+/// Original process/input/receipt custody after normal closure. Its private
+/// fields cannot be reconstituted from JSON or used to spawn another runner.
+pub struct ClosedNativePairArchive<S: NativeProviderDeclaration> {
+    spec: S,
+    #[cfg(target_os = "linux")]
+    snapshot: crate::native_launch::linux::Snapshot,
+    process: ProcessOutput,
+    receipt: NativePairReceipt<S::Audit>,
+    receipt_artifact: rz_experiments::ArtifactRef,
+}
+impl<S: NativeProviderDeclaration> ClosedNativePairArchive<S> {
+    pub fn spec(&self) -> &S {
+        &self.spec
+    }
+    pub fn process(&self) -> &ProcessOutput {
+        &self.process
+    }
+    pub fn receipt(&self) -> &NativePairReceipt<S::Audit> {
+        &self.receipt
+    }
+    pub fn receipt_artifact(&self) -> &rz_experiments::ArtifactRef {
+        &self.receipt_artifact
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn output_root(&self) -> Option<&std::path::Path> {
+        self.snapshot.path.parent()
+    }
+    #[cfg(target_os = "linux")]
+    pub fn snapshots(&self) -> &[NativeSnapshotReceipt] {
+        &self.snapshot.receipts
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub fn snapshots(&self) -> &[NativeSnapshotReceipt] {
+        &[]
+    }
+}
+impl<S: NativeProviderDeclaration> fmt::Debug for ClosedNativePairArchive<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClosedNativePairArchive")
+            .field("input_sha256", &self.spec.input_sha256())
+            .field("receipt_artifact", &self.receipt_artifact)
+            .finish_non_exhaustive()
     }
 }
 impl<S: NativeProviderDeclaration> fmt::Debug for NativePairOutput<S> {
@@ -1042,8 +1199,12 @@ pub(crate) mod linux {
                 e.environment.is_some(),
                 &owner.snapshot.pins,
             )?;
-            let limits = crate::ProcessLimits {
-                wall_ms: e.handshake_timeout_ms,
+            let mut limits = crate::ProcessLimits {
+                wall_ms: clamp_original_wall(
+                    e.handshake_timeout_ms,
+                    owner.spec.original_wall_deadline()?,
+                    std::time::Instant::now(),
+                )?,
                 shutdown_grace_ms: owner.spec.view().timeouts.shutdown_ms,
                 max_output_bytes: 256 * 1024,
                 max_child_processes: owner.spec.view().budget.max_child_processes,
@@ -1106,6 +1267,11 @@ pub(crate) mod linux {
             crate::validate_uci_options(&advertisement, &e.expected_uci_name, &requested)?;
             let commands = crate::uci_preflight_commands(&requested, e.family == "stockfish")?;
             preflight_runtime_totals(owner)?;
+            limits.wall_ms = clamp_original_wall(
+                limits.wall_ms,
+                owner.spec.original_wall_deadline()?,
+                std::time::Instant::now(),
+            )?;
             let process = crate::supervise_protocol_in_directory(
                 &launch.program.file,
                 &launch.arguments,
@@ -1271,6 +1437,14 @@ pub(crate) mod linux {
         cancel: Option<&AtomicBool>,
     ) -> Result<(NativePairReceipt<S::Audit>, ArtifactRef), ArenaError> {
         let run_started = std::time::Instant::now();
+        {
+            let owner = bundle.owner.as_mut().expect("prepared native owner");
+            owner.snapshot.limits.wall_ms = clamp_original_wall(
+                owner.snapshot.limits.wall_ms,
+                owner.spec.original_wall_deadline()?,
+                std::time::Instant::now(),
+            )?;
+        }
         bundle
             .owner
             .as_ref()
@@ -1315,6 +1489,11 @@ pub(crate) mod linux {
             .checked_sub(u64::try_from(run_started.elapsed().as_millis()).unwrap_or(u64::MAX))
             .filter(|n| *n > 0)
             .ok_or_else(|| invalid("V2 prelaunch consumed whole pair runtime budget"))?;
+        limits.wall_ms = clamp_original_wall(
+            limits.wall_ms,
+            owner.spec.original_wall_deadline()?,
+            std::time::Instant::now(),
+        )?;
         let process = crate::process::supervise_tree_observed(
             &if let Some(execution) = owner.spec.match_execution() {
                 crate::native_launch::linux::pin(&s.pins, &execution.executor)?

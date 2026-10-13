@@ -236,6 +236,9 @@ pub enum TicketServiceError {
     Backend(RoleFailure),
 }
 
+// The bounded event queue retains the original ticket, completion evidence and
+// non-clone acceptance permit/receipt together, without a per-event allocation.
+#[allow(clippy::large_enum_variant)]
 pub enum TicketNativeEvent<O> {
     Ready {
         clock: ContractSystemClock,
@@ -284,10 +287,16 @@ pub enum TicketNativeEvent<O> {
     },
 }
 
+// Keep the original question/ticket inline in the bounded command channel;
+// dispatch must not allocate an extra box or separate its authority payload.
+#[allow(clippy::large_enum_variant)]
 enum Command<V, Q> {
     Prepare(PreparationId, TicketPreparation<V, Q>, Arc<AtomicBool>),
     Execute(PreparationId, RoleTicketEnvelope, bool),
 }
+// One bounded acknowledgement owns its original ticket and non-clone permit
+// until the physical owner accepts or returns that same permit on failure.
+#[allow(clippy::large_enum_variant)]
 enum Ack {
     Accept(
         PreparationId,
@@ -340,6 +349,9 @@ struct EventPublisher<O> {
     shared: Arc<Shared>,
 }
 impl<O> EventPublisher<O> {
+    // SendError returns the original terminal/ack event, including any owned
+    // permit, instead of replacing failed delivery with a smaller error token.
+    #[allow(clippy::result_large_err)]
     fn send(
         &self,
         event: TicketNativeEvent<O>,
@@ -470,6 +482,9 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         self.shared.command_capacity
     }
 
+    // Failed admission returns the exact immutable question/view ownership;
+    // no extra allocation or early drop is introduced at this boundary.
+    #[allow(clippy::result_large_err)]
     pub fn prepare(
         &mut self,
         question: TicketPreparation<V, Q>,
@@ -533,6 +548,16 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         preparation: PreparationId,
         ticket: RoleTicketEnvelope,
     ) -> Result<(), TicketServiceError> {
+        self.execute_with_admission_clock(preparation, ticket)
+            .map(|_| ())
+    }
+    /// Timestamp the original successful command-queue admission. A failed
+    /// admission returns no timestamp; a later receiver clock is not queue wait.
+    pub(crate) fn execute_with_admission_clock(
+        &self,
+        preparation: PreparationId,
+        ticket: RoleTicketEnvelope,
+    ) -> Result<Instant, TicketServiceError> {
         if self.shared.closed.load(Ordering::Acquire)
             || self.shared.root_closed.load(Ordering::Acquire)
         {
@@ -558,6 +583,7 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         // Holding this lock through queue admission and registration prevents
         // the owner from retiring a canceled preparation as unsubmitted while
         // its already accepted Execute command is waiting behind a run.
+        let admitted_at = Instant::now();
         self.commands
             .try_send(Command::Execute(preparation, ticket, next_queued.is_some()))
             .map_err(send_error)?;
@@ -566,7 +592,7 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         }
         drop(controls);
         self.shared.signal.notify();
-        Ok(())
+        Ok(admitted_at)
     }
     pub fn cancel(&self, preparation: PreparationId) -> Result<(), TicketServiceError> {
         let controls = self
@@ -659,6 +685,9 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         self.shared.signal.notify();
         Ok(())
     }
+    // A failed enqueue returns the original non-clone acceptance permit so its
+    // authority and rejection custody remain with the caller.
+    #[allow(clippy::result_large_err)]
     pub fn accept_with_permit(
         &self,
         preparation: PreparationId,
@@ -881,6 +910,7 @@ struct Held<V, Q, P, O> {
     ack_attempted: bool,
     evidence: Option<TicketExecutionEvidence>,
 }
+type HeldTickets<V, Q, P, O> = BTreeMap<PreparationId, Held<V, Q, P, O>>;
 
 fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>(
     mut backend: B,
@@ -901,7 +931,7 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
         Some(rz_runtime::adaptive::observe_current_cpu_thread(
             rz_runtime::adaptive::CpuActor::NativeCaller,
         ));
-    let mut held: BTreeMap<PreparationId, Held<V, Q, B::Prepared, B::Output>> = BTreeMap::new();
+    let mut held: HeldTickets<V, Q, B::Prepared, B::Output> = BTreeMap::new();
     let mut request_high_water = 0;
     if events
         .send(TicketNativeEvent::Ready {
@@ -1264,9 +1294,12 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
     }
 }
 
+// This owner-only boundary checks independent ticket/view, clock, publication
+// and issuer authority without folding them into a caller-constructible input.
+#[allow(clippy::too_many_arguments)]
 fn acknowledge<V, Q, B: TicketNativeBackend<V, Q>>(
     backend: &mut B,
-    held: &mut BTreeMap<PreparationId, Held<V, Q, B::Prepared, B::Output>>,
+    held: &mut HeldTickets<V, Q, B::Prepared, B::Output>,
     ack: Ack,
     events: &EventPublisher<B::Output>,
     shared: &Shared,
@@ -1379,7 +1412,7 @@ fn reject_acceptance<O>(
 
 fn quarantine<V, Q, B: TicketNativeBackend<V, Q>>(
     backend: B,
-    held: BTreeMap<PreparationId, Held<V, Q, B::Prepared, B::Output>>,
+    held: HeldTickets<V, Q, B::Prepared, B::Output>,
     commands: mpsc::Receiver<Command<V, Q>>,
     shared: &Shared,
 ) {

@@ -1169,6 +1169,12 @@ impl ExternalUciCpuChecker {
         self.owner()?.send(&go, budget.analysis_deadline)?;
         self.go_issue = ExternalGoIssue::Issued;
         self.active = true;
+        if let Some((control, _)) = cooperative {
+            control.observe_owner_phase(ExternalOwnerPhase::GoIssued {
+                at: Instant::now(),
+                quantum_deadline: budget.analysis_deadline,
+            });
+        }
         let no_cancel = AtomicBool::new(false);
         let mut stopped_deadline = None;
         loop {
@@ -1211,6 +1217,10 @@ impl ExternalUciCpuChecker {
                 }
                 self.owner()?.send("stop", stop_deadline)?;
                 self.owner()?.mark_stop();
+                if let Some((control, _)) = cooperative {
+                    control
+                        .observe_owner_phase(ExternalOwnerPhase::StopSent { at: Instant::now() });
+                }
                 stopped_deadline = Some(stop_deadline);
             }
             let wait_deadline = stopped_deadline.unwrap_or(budget.analysis_deadline);
@@ -1323,6 +1333,11 @@ impl ExternalUciCpuChecker {
                     report.completion = ExternalCompletion::BestMove;
                 }
                 self.active = false;
+                if let Some((control, _)) = cooperative {
+                    control.observe_owner_phase(ExternalOwnerPhase::BestMoveDrained {
+                        at: Instant::now(),
+                    });
+                }
                 let ready_deadline = match stopped_deadline {
                     Some(deadline) => deadline,
                     None => {
@@ -1350,6 +1365,9 @@ impl ExternalUciCpuChecker {
                 }
                 readiness?;
                 if let Some((control, _)) = cooperative {
+                    control.observe_owner_phase(ExternalOwnerPhase::ReadyBarrierCompleted {
+                        at: Instant::now(),
+                    });
                     let latest = control.observe();
                     if matches!(
                         latest.action,

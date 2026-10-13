@@ -42,6 +42,14 @@ pub struct FrameId {
     pub sequence: u64,
 }
 
+/// Admission carries ancestry as one value while keeping parent and supersedes
+/// distinct. This is an inline private context, not a new runtime allocation.
+#[derive(Clone, Copy, Default)]
+struct FrameLineage {
+    parent: Option<FrameId>,
+    supersedes: Option<FrameId>,
+}
+
 /// These are actual existing refinement responsibilities, rather than a new
 /// CPU algorithm. A step advances only after its sealed completion is admitted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -347,6 +355,13 @@ pub struct StepEvidence {
     pub completed_evidence: Digest,
 }
 
+// Continue owns the next immutable envelope on the ordinary refinement path.
+// Boxing it would add an allocation per continuation just to shrink the two
+// terminal variants; retained frame capacity is independently bounded to 64.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keep the bounded hot continuation envelope inline without per-step allocation"
+)]
 pub enum FrameTransition<V, Q> {
     Continue(FrameInput<V, Q>),
     Complete { scope: FrameCompletionScope },
@@ -558,15 +573,21 @@ impl<V, Q> RefinementMachine<V, Q> {
                 "new workflow starts with P ranking",
             ));
         }
-        self.admit_internal(first_move, input, budget, None, None, clock, now)
+        self.admit_internal(
+            first_move,
+            input,
+            budget,
+            FrameLineage::default(),
+            clock,
+            now,
+        )
     }
     fn admit_internal(
         &mut self,
         first_move: Move16,
         input: FrameInput<V, Q>,
         budget: FrameBudget,
-        parent: Option<FrameId>,
-        supersedes: Option<FrameId>,
+        lineage: FrameLineage,
         clock: ClockDomain,
         now: MonotonicTick,
     ) -> Result<FrameId, CoordinatorError> {
@@ -597,8 +618,8 @@ impl<V, Q> RefinementMachine<V, Q> {
             input,
             phase: FramePhase::Ready,
             evidence: Vec::with_capacity(16),
-            parent,
-            supersedes,
+            parent: lineage.parent,
+            supersedes: lineage.supersedes,
             ranking_source: None,
             progress_sequence: 0,
             yield_sequence: 0,
@@ -1138,6 +1159,10 @@ impl<V, Q> RefinementMachine<V, Q> {
 
     /// Enqueue only a distinct question under a new public revision/evidence.
     /// Counts and genealogy persist after older frames close; no recursive call.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "preserve the public Repair boundary's distinct parent/supersedes and explicit original clock observation"
+    )]
     pub fn enqueue_repair(
         &mut self,
         parent: FrameId,
@@ -1178,8 +1203,10 @@ impl<V, Q> RefinementMachine<V, Q> {
             first_move,
             input,
             budget,
-            Some(parent),
-            supersedes,
+            FrameLineage {
+                parent: Some(parent),
+                supersedes,
+            },
             clock,
             now,
         )?;
@@ -1584,8 +1611,10 @@ impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
             original_first,
             input,
             budget,
-            Some(original_parent),
-            Some(original_parent),
+            FrameLineage {
+                parent: Some(original_parent),
+                supersedes: Some(original_parent),
+            },
             clock,
             now,
         )?;
@@ -1904,7 +1933,17 @@ impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
                 let id = if input.stage == RefinementStage::Repair {
                     self.enqueue_repair(parent_id, first, input, budget, None, clock, now)?
                 } else {
-                    self.admit_internal(first, input, budget, Some(parent_id), None, clock, now)?
+                    self.admit_internal(
+                        first,
+                        input,
+                        budget,
+                        FrameLineage {
+                            parent: Some(parent_id),
+                            supersedes: None,
+                        },
+                        clock,
+                        now,
+                    )?
                 };
                 self.match_frame_mut(parent_id)
                     .expect("checked live parent")
@@ -2486,7 +2525,14 @@ impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
         {
             return Err(CoordinatorError::Capacity("role binding history"));
         }
-        let id = self.admit_internal(first_move, input, budget, None, None, clock, now)?;
+        let id = self.admit_internal(
+            first_move,
+            input,
+            budget,
+            FrameLineage::default(),
+            clock,
+            now,
+        )?;
         let frame = self.match_frame_mut(id).expect("new candidate frame");
         frame.ranking_source = Some(source);
         frame.evidence.push(source.consumption_digest);

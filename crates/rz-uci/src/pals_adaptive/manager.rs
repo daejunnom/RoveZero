@@ -18,21 +18,22 @@ use rz_position::contracts::{ContractPosition, ContractState};
 use rz_runtime::adaptive::{
     AdaptiveController, BacklogEstimate, CacheClass, CensorReason, ControllerConfig,
     ControllerInput, CoordinatorPolicy, CostClass, CostDisposition, CostEstimator, CostObservation,
-    CostStage, InvocationClass, ObservedCost, ReadyJob, ReadySelector, ReadyServiceCost,
-    RunningCost, WorkerProgress,
+    CostStage, ExternalFeedbackWaitPrediction, FeedbackWaitPrediction, InvocationClass,
+    ObservedCost, ReadyJob, ReadySelector, ReadyServiceCost, RunningCost, WorkerProgress,
 };
 use rz_runtime::contracts::{ContractClock as _, ContractSystemClock};
 use rz_search::contract_time::InstantClock;
 use rz_search::cpu::{CpuCompletion, CpuControlMailbox, CpuEngine};
 use rz_search::cpu_worker::{
     CPU_JOB_CAPACITY, CpuAdmissionRejection, CpuCreditLedger, CpuJobTermination, CpuSliceReport,
-    CpuWorker, CpuWorkerError, CpuWorkerEvent, CpuWorkerProfile, CpuWorkerProgress,
+    CpuWorker, CpuWorkerError, CpuWorkerEvent, CpuWorkerEventObservation, CpuWorkerProfile,
+    CpuWorkerProgress, CpuWorkerProgressObservation, CpuWorkerSliceTiming,
 };
 use rz_search::external_cpu::worker::{
     ExternalCpuWorker, ExternalJob, ExternalRootFence, ExternalTeacherDispatch,
-    ExternalWorkerCompletion, ExternalWorkerReport, ExternalWorkerScope,
-    external_evaluation_namespace, external_question_digest, external_root_restriction_digest,
-    external_search_conditions,
+    ExternalWorkerCompletion, ExternalWorkerProgress, ExternalWorkerProgressObservation,
+    ExternalWorkerReport, ExternalWorkerScope, external_evaluation_namespace,
+    external_question_digest, external_root_restriction_digest, external_search_conditions,
 };
 use rz_search::external_cpu::{
     CpuEndpoint, CpuEndpointSelection, CpuExecutionUse, ExternalCpuConfig, ExternalSlicePolicy,
@@ -328,6 +329,22 @@ pub trait AdaptiveSearchDriver<Q> {
     ) -> Result<(), AdaptiveManagerError> {
         Ok(())
     }
+    fn cpu_partial_continuation_eligible(
+        &self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuSliceReport,
+    ) -> bool {
+        false
+    }
+    /// The original CPU question outlives its first feedback transition. Its
+    /// later actual receipts may update only that question's evidence/custody.
+    fn cpu_detached_slice_observed(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, Q>,
+        report: &CpuSliceReport,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.cpu_slice_observed(work, report)
+    }
     fn cpu_token_discarded(
         &mut self,
         _: &CoordinatorWork<ReviewView, Q>,
@@ -410,6 +427,23 @@ pub trait AdaptiveSearchDriver<Q> {
     fn cpu_progress(&mut self, _: &CpuWorkerProgress) -> Result<(), AdaptiveManagerError> {
         Ok(())
     }
+    /// The original live question accompanies owner-issued progress. Legacy
+    /// drivers retain their old callback; actual drivers can check its context.
+    fn cpu_progress_for(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        progress: &CpuWorkerProgress,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.cpu_progress(progress)
+    }
+    fn cpu_progress_request_eligible(
+        &self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuJobEnvelope,
+        _: &SliceGrant,
+    ) -> bool {
+        false
+    }
     /// Read actual single-writer consumption after a later semantic failure.
     /// The default carries no evidence; the concrete Search port verifies the
     /// original authority/ticket/view without consuming or updating it again.
@@ -420,9 +454,30 @@ pub trait AdaptiveSearchDriver<Q> {
     ) -> Result<bool, AdaptiveManagerError> {
         Ok(false)
     }
-    /// Only an observed useful feedback benefit can request adaptive Yield.
+    /// Legacy hook retained for callers. A scalar alone is not authority for
+    /// the actual manager's calibrated S-policy prediction.
     fn yield_feedback_gain(&self, _: &CoordinatorWork<ReviewView, Q>) -> Option<Duration> {
         None
+    }
+    /// A scheduling forecast, not realized saving, witness, or V utility.
+    /// The concrete driver must validate its original coherent publication
+    /// and a downstream consumer before querying the observed cost model.
+    fn predict_yield_feedback(
+        &self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CostEstimator,
+        _: CostClass,
+        _: Duration,
+        _: Duration,
+    ) -> Option<FeedbackWaitPrediction> {
+        None
+    }
+    fn external_feedback_eligible(
+        &self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &ExternalWorkerProgress,
+    ) -> bool {
+        false
     }
     fn validate_rules_pair(
         &self,
@@ -497,6 +552,9 @@ pub struct AdaptiveManagerCounters {
     pub foreign_reports: u64,
     pub foreign_reported_nodes: u64,
     pub foreign_node_count_unknown: u64,
+    /// Foreign stop/drain controls, never exact native stack resumptions.
+    pub foreign_yield_requests: u64,
+    pub foreign_yield_acknowledgements: u64,
     pub rejected_events: u64,
     pub notification_waits: u64,
 }
@@ -772,6 +830,9 @@ struct RoleBinding<Q, O> {
     collection_registered: bool,
     physical: Option<TicketExecutionEvidence>,
     prepared_at: Instant,
+    preparation_elapsed: Option<Duration>,
+    queue_admitted_at: Option<Instant>,
+    queue_wait: Option<Duration>,
     dispatched_at: Option<Instant>,
     service_completed: bool,
     class: Option<CostClass>,
@@ -801,8 +862,12 @@ struct OwnBinding<Q> {
     started_at: Instant,
     class: CostClass,
     resume_pending: bool,
+    feedback_forwarded: bool,
     progress_sequence: u64,
     progress_since_slice: bool,
+    progress_published_at: Option<Instant>,
+    owner_run_started_at: Option<Instant>,
+    resume_cost_observed_execution: Option<ExecutionId>,
     last_yield_ack: u64,
     requested_yield: Option<(u64, Instant)>,
     pending_slice: Option<CpuSliceReport>,
@@ -825,6 +890,37 @@ struct ForeignBinding<Q> {
     teacher_dispatch: ExternalTeacherDispatch,
     started_at: Instant,
     class: CostClass,
+    progress_sequence: u64,
+    observed_progress: Option<ExternalWorkerProgressObservation>,
+    requested_yield: Option<(u64, Instant)>,
+}
+/// An advice is bound to the exact physical execution it evaluated. This
+/// private S-policy selection is not CPU evidence or a utility target.
+#[derive(Clone, Copy)]
+enum YieldSelection {
+    Own {
+        index: usize,
+        execution: ExecutionId,
+        prediction: FeedbackWaitPrediction,
+    },
+    External {
+        scope: ExternalWorkerScope,
+        prediction: ExternalFeedbackWaitPrediction,
+    },
+}
+impl YieldSelection {
+    fn gain(self) -> Duration {
+        match self {
+            Self::Own { prediction, .. } => prediction.gain_before_return_cost(),
+            Self::External { prediction, .. } => prediction.gain_before_return_cost(),
+        }
+    }
+    fn return_cost(self) -> rz_runtime::adaptive::CostEstimate {
+        match self {
+            Self::Own { prediction, .. } => prediction.return_cost(),
+            Self::External { prediction, .. } => prediction.return_cost(),
+        }
+    }
 }
 /// Failed processing retains the actual completion and cost/physical evidence;
 /// keeping an Arc is not a second model output or a new acceptance authority.
@@ -834,6 +930,9 @@ pub struct RetainedNativeCompletion<O> {
     pub owner_run: TicketOwnerRunWitness,
     pub owner_service_elapsed: Option<Duration>,
 }
+// The bounded deferred queue retains original owners and terminal obligations.
+// Inline variants avoid allocating error-recovery boxes per deferred receipt.
+#[allow(clippy::large_enum_variant)]
 enum DeferredCommit<Q> {
     Role {
         ticket: RoleTicketEnvelope,
@@ -849,6 +948,10 @@ enum DeferredCommit<Q> {
     },
     Closed(ClosedFrame),
     OwnRaw {
+        work: CoordinatorWork<ReviewView, Q>,
+        report: CpuSliceReport,
+    },
+    DetachedOwn {
         work: CoordinatorWork<ReviewView, Q>,
         report: CpuSliceReport,
     },
@@ -895,6 +998,14 @@ where
     continuation: AdaptiveSequenceContinuation,
     receipt: AdaptiveShutdownReceipt,
 }
+type PersistentComponents<Q, B, D> = (
+    TicketedNativeService<ReviewView, Q, B>,
+    Vec<PersistentCpuOwner>,
+    Option<ExternalManagerWorker>,
+    D,
+    AdaptiveSequenceContinuation,
+    AdaptiveShutdownReceipt,
+);
 impl<Q, B, D> AdaptivePersistentParts<Q, B, D>
 where
     B: TicketNativeBackend<ReviewView, Q>,
@@ -902,16 +1013,7 @@ where
     pub fn receipt(&self) -> &AdaptiveShutdownReceipt {
         &self.receipt
     }
-    pub fn into_components(
-        self,
-    ) -> (
-        TicketedNativeService<ReviewView, Q, B>,
-        Vec<PersistentCpuOwner>,
-        Option<ExternalManagerWorker>,
-        D,
-        AdaptiveSequenceContinuation,
-        AdaptiveShutdownReceipt,
-    ) {
+    pub fn into_components(self) -> PersistentComponents<Q, B, D> {
         (
             self.native,
             self.cpu,
@@ -976,6 +1078,11 @@ where
     ready: ReadySelector<FrameId, Move16, Digest>,
     costs: CostEstimator,
     controller: AdaptiveController,
+    advised_yield: Option<YieldSelection>,
+    /// Actual completed role namespaces retained only for this root. A lookup
+    /// for the next Critic is a prospective S scope, not a submitted role or
+    /// a cache observation. The bounded index never owns model/view buffers.
+    observed_role_classes: Vec<(Role, CostClass)>,
     observation_sequence: u64,
     next_job: u64,
     next_execution: u64,
@@ -1038,6 +1145,9 @@ where
         )
         .map_err(|rejected| rejected.error)
     }
+    // Rejected admission returns every original process/session/worker by
+    // value; recovery must not require allocating a new error box.
+    #[allow(clippy::result_large_err)]
     pub fn new_retaining(
         registration: AdaptiveManagerRegistration,
         clock: ContractSystemClock,
@@ -1051,6 +1161,8 @@ where
             false,
         )
     }
+    // Preserve the same allocation-free source-owner rejection as new_retaining.
+    #[allow(clippy::result_large_err)]
     pub fn new_retaining_with_limits(
         registration: AdaptiveManagerRegistration,
         clock: ContractSystemClock,
@@ -1059,6 +1171,8 @@ where
     ) -> Result<Self, AdaptiveManagerAdmissionRejection<Q, B, D>> {
         Self::admit_retaining_with_limits(registration, clock, limits, sources, true)
     }
+    // A failed resource/authority check retains the complete source bundle.
+    #[allow(clippy::result_large_err)]
     fn admit_retaining_with_limits(
         registration: AdaptiveManagerRegistration,
         clock: ContractSystemClock,
@@ -1266,6 +1380,8 @@ where
             ready,
             costs,
             controller,
+            advised_yield: None,
+            observed_role_classes: Vec::with_capacity(64),
             observation_sequence: 0,
             next_job: 1,
             next_execution: 1,
@@ -1281,7 +1397,7 @@ where
             counters: AdaptiveManagerCounters::default(),
             native_accounting: AdaptiveNativeAccountingSnapshot::default(),
             shutdown_until: None,
-            native_ready: native_ready,
+            native_ready,
             native_verifier_registered,
             retained_native_permits: Vec::with_capacity(limits.role_tickets_max),
             retained_native_receipts: Vec::with_capacity(limits.role_tickets_max),
@@ -1323,6 +1439,9 @@ where
         )
         .map_err(|rejected| rejected.error)
     }
+    // Keep both physical owners and the original sequence continuation on
+    // rejection without allocating a second failure container.
+    #[allow(clippy::result_large_err)]
     pub fn new_continued_retaining(
         registration: AdaptiveManagerRegistration,
         clock: ContractSystemClock,
@@ -1338,6 +1457,8 @@ where
             false,
         )
     }
+    // Same by-value ownership recovery, including the original continuation.
+    #[allow(clippy::result_large_err)]
     pub fn new_continued_retaining_with_limits(
         registration: AdaptiveManagerRegistration,
         clock: ContractSystemClock,
@@ -1354,6 +1475,8 @@ where
             true,
         )
     }
+    // Invalid continuation cannot drop or reconstruct its still-owned sources.
+    #[allow(clippy::result_large_err)]
     fn admit_continued_retaining_with_limits(
         registration: AdaptiveManagerRegistration,
         clock: ContractSystemClock,
@@ -1394,6 +1517,9 @@ where
         manager.next_control = continuation.next_control;
         Ok(manager)
     }
+    // Failed physical-fence/reuse checks return the intact manager, retaining
+    // any quarantined buffers; no error-box allocation is needed to keep it.
+    #[allow(clippy::result_large_err)]
     pub fn into_persistent_parts(
         self,
     ) -> Result<AdaptivePersistentParts<Q, B, D>, AdaptivePersistentRejection<Q, B, D>> {
@@ -1401,11 +1527,15 @@ where
     }
     /// Explicit process quit/join teardown. Returned closed native/external
     /// owners cannot be reused: their receipt never permits root admission.
+    // Failure retains the same still-owned manager as root-fence recovery.
+    #[allow(clippy::result_large_err)]
     pub fn into_process_parts(
         self,
     ) -> Result<AdaptivePersistentParts<Q, B, D>, AdaptivePersistentRejection<Q, B, D>> {
         self.into_settled_parts(AdaptiveCloseMode::ProcessShutdown)
     }
+    // Owner transfer failure preserves the manager and every linear owner.
+    #[allow(clippy::result_large_err)]
     fn into_settled_parts(
         mut self,
         mode: AdaptiveCloseMode,
@@ -1775,6 +1905,9 @@ where
             collection_registered: false,
             physical: None,
             prepared_at: Instant::now(),
+            preparation_elapsed: None,
+            queue_admitted_at: None,
+            queue_wait: None,
             dispatched_at: None,
             service_completed: false,
             class: None,
@@ -1810,13 +1943,13 @@ where
         for slot in 0..self.own.len() {
             for _ in 0..16 {
                 let event = match self.own[slot].worker.as_ref() {
-                    Some(worker) => worker.try_event(),
+                    Some(worker) => worker.try_event_observed(),
                     None => break,
                 };
                 match event {
                     Ok(Some(event)) => {
                         changed = true;
-                        if let Err(error) = self.own_event(slot, event) {
+                        if let Err(error) = self.own_event_observed(slot, event) {
                             self.record_failure(error);
                         }
                     }
@@ -1832,10 +1965,10 @@ where
             if let Some(progress) = self.own[slot]
                 .worker
                 .as_ref()
-                .and_then(CpuWorker::latest_progress)
+                .and_then(CpuWorker::latest_progress_observed)
             {
                 changed = true;
-                if let Err(error) = self.own_progress(slot, progress) {
+                if let Err(error) = self.own_progress_observed(slot, progress) {
                     self.record_failure(error);
                 }
             }
@@ -1868,26 +2001,11 @@ where
         if let Some((sequence, progress)) = self
             .external
             .as_ref()
-            .and_then(|external| external.worker.take_progress())
+            .and_then(|external| external.worker.take_progress_observed())
         {
             changed = true;
-            if let Some(binding) = &self.foreign {
-                if binding.job.scope() == progress.scope {
-                    if self.phase == ManagerPhase::Running {
-                        if let Err(error) = self.machine.publish_progress(
-                            binding.work.frame,
-                            StepExecution::ExternalCpu {
-                                job: progress.scope.job,
-                                execution: progress.scope.execution,
-                            },
-                            sequence,
-                        ) {
-                            self.record_failure(error.into());
-                        }
-                    }
-                } else {
-                    self.record_failure(AdaptiveManagerError::Invalid("old-go external progress"));
-                }
+            if let Err(error) = self.foreign_progress_observed(sequence, progress) {
+                self.record_failure(error);
             }
         }
         if let Err(error) = self.flush_acks() {
@@ -2060,7 +2178,12 @@ where
                     ));
                 }
                 self.native_ready = true;
-                if !self.native_verifier_registered {
+                if self.phase == ManagerPhase::Running && !self.native_verifier_registered {
+                    // Startup may finish after a terminal root or cancellation
+                    // has already revoked admission. Its real Ready remains a
+                    // clock/owner observation; it cannot install new acceptance
+                    // authority into the closed registry. The next root uses
+                    // the same native owner's persistent verifier readback.
                     let verifier = self.native.native_acceptance_verifier().ok_or(
                         AdaptiveManagerError::Invalid(
                             "native Ready has no owner acceptance verifier",
@@ -2132,14 +2255,12 @@ where
                         .bind_role(work.frame, &ticket, self.clock.domain(), now)?;
                 }
                 let class = role_cost_class(&ticket, self.registration.device_digest);
-                self.observe(
-                    class,
-                    CostStage::Preparation,
-                    binding.prepared_at.elapsed(),
-                    CostDisposition::Completed,
-                )?;
+                // Cache/Fresh ownership is known only at the actual completion.
+                // Retain this duration rather than training an assumed Miss.
+                let preparation_elapsed = binding.prepared_at.elapsed();
                 self.roles[index].ticket = Some(ticket);
                 self.roles[index].class = Some(class);
+                self.roles[index].preparation_elapsed = Some(preparation_elapsed);
                 self.roles[index].dispatch_pending = true;
                 if let Some(frame) = self.roles[index].work.as_ref().map(|work| work.frame) {
                     self.roles[index].work = Some(
@@ -2168,6 +2289,15 @@ where
                 if binding.ticket != Some(ticket) || binding.dispatched_at.is_some() {
                     return Err(AdaptiveManagerError::Invalid("owner service start ticket"));
                 }
+                let admitted_at =
+                    binding
+                        .queue_admitted_at
+                        .ok_or(AdaptiveManagerError::Invalid(
+                            "owner start lacks queue admission clock",
+                        ))?;
+                binding.queue_wait = Some(started_at.checked_duration_since(admitted_at).ok_or(
+                    AdaptiveManagerError::Invalid("owner start predates queue admission"),
+                )?);
                 binding.dispatched_at = Some(started_at);
             }
             TicketNativeEvent::Completed {
@@ -2221,19 +2351,18 @@ where
                                 InvocationClass::Warm
                             };
                         }
-                        // Zero physical NN inputs also occurs before admission
-                        // or cancellation; only an explicit owner cache witness
-                        // may classify this service observation as a cache hit.
+                        class.cache = observed_public_cache_class(physical, evidence);
                     }
+                    binding.class = class;
+                    let preparation_elapsed = binding.preparation_elapsed.take();
+                    let queue_wait = binding.queue_wait.take();
                     // Receive-time differences can collapse to zero when Started
                     // and Completed share one manager turn. Use owner measurement.
-                    // Until the native owner exposes a cache disposition, a
-                    // successful zero-input result cannot calibrate the Miss
-                    // class. Preserve owner elapsed in the retained raw event
-                    // while leaving this class-specific sample uncalibrated.
+                    // A public cache hit may still run a private role head.
+                    // Zero/unknown NN inputs alone never decide cache class.
                     let elapsed = if evidence.is_some_and(|actual| {
                         actual.measurement_complete
-                            && actual.completed_nn_inputs.is_some_and(|count| count > 0)
+                            && actual.completed_nn_inputs.is_some()
                             && actual.physical_fresh.is_some()
                     }) {
                         owner_service_elapsed
@@ -2251,11 +2380,49 @@ where
                         CostDisposition::Censored(CensorReason::Failed)
                     };
                     if let Some(class) = class {
+                        if disposition == CostDisposition::Completed && elapsed.is_some() {
+                            let mut query = class;
+                            query.invocation = InvocationClass::Fresh;
+                            query.cache = CacheClass::Unknown;
+                            if !self.observed_role_classes.contains(&(ticket.role, query))
+                                && self.observed_role_classes.len() < 64
+                            {
+                                self.observed_role_classes.push((ticket.role, query));
+                            }
+                        }
+                        for (stage, elapsed) in [
+                            (CostStage::Preparation, preparation_elapsed),
+                            (CostStage::QueueWait, queue_wait),
+                        ] {
+                            self.observe_observation(
+                                class,
+                                stage,
+                                CostObservation {
+                                    elapsed: elapsed
+                                        .map_or(ObservedCost::Unknown, ObservedCost::Known),
+                                    disposition: if elapsed.is_some() {
+                                        CostDisposition::Completed
+                                    } else {
+                                        disposition
+                                    },
+                                },
+                            )?;
+                        }
                         self.observe_observation(
                             class,
                             CostStage::GpuService,
                             CostObservation {
                                 elapsed: elapsed.map_or(ObservedCost::Unknown, ObservedCost::Known),
+                                disposition,
+                            },
+                        )?;
+                        // No backend phase witness separates the physical fence
+                        // wait from service. Do not relabel service as this cost.
+                        self.observe_observation(
+                            class,
+                            CostStage::PhysicalCompletionWait,
+                            CostObservation {
+                                elapsed: ObservedCost::Unknown,
                                 disposition,
                             },
                         )?;
@@ -2759,7 +2926,13 @@ where
             }
             if let Some(binding) = &mut self.own[index].binding {
                 if let Some(report) = binding.pending_slice.take() {
-                    if let Err(error) = self.driver.cpu_slice_observed(&binding.work, &report) {
+                    let observed = if binding.feedback_forwarded {
+                        self.driver
+                            .cpu_detached_slice_observed(&binding.work, &report)
+                    } else {
+                        self.driver.cpu_slice_observed(&binding.work, &report)
+                    };
+                    if let Err(error) = observed {
                         binding.pending_slice = Some(report);
                         return Err(error);
                     }
@@ -2794,6 +2967,9 @@ where
                 DeferredCommit::Closed(closed) => self.publish_closed_frame(closed),
                 DeferredCommit::OwnRaw { work, report } => {
                     self.driver.cpu_slice_observed(work, report)
+                }
+                DeferredCommit::DetachedOwn { work, report } => {
+                    self.driver.cpu_detached_slice_observed(work, report)
                 }
                 DeferredCommit::TokenDiscard { work, termination } => {
                     self.driver.cpu_token_discarded(work, termination)
@@ -2830,8 +3006,15 @@ where
                     .collection_before_dispatch(&ticket, &self.roles[index].input)?;
                 self.roles[index].collection_registered = true;
             }
-            match self.native.execute(self.roles[index].preparation, ticket) {
-                Ok(()) => {
+            if self.roles[index].queue_admitted_at.is_some() {
+                return Err(AdaptiveManagerError::Invalid("duplicate queue admission"));
+            }
+            match self
+                .native
+                .execute_with_admission_clock(self.roles[index].preparation, ticket)
+            {
+                Ok(admitted_at) => {
+                    self.roles[index].queue_admitted_at = Some(admitted_at);
                     self.roles[index].dispatch_pending = false;
                     changed = true;
                 }
@@ -2948,6 +3131,100 @@ where
         }
         Ok(())
     }
+    /// Independent progress request on the original live physical question.
+    /// It uses the atomic control mailbox, does not Yield/cancel/reserve nodes,
+    /// and is acknowledged only at the worker's coherent iteration boundary.
+    /// Fixed/synchronous policies do not automatically issue this request.
+    pub fn request_cpu_progress(&mut self, job: CpuJobId) -> Result<u64, AdaptiveManagerError> {
+        self.check_running()?;
+        let index = self
+            .own
+            .iter()
+            .position(|slot| {
+                slot.binding.as_ref().is_some_and(|binding| {
+                    binding.envelope.id == job
+                        && binding.grant.job == job
+                        && slot
+                            .worker
+                            .as_ref()
+                            .is_some_and(|worker| binding.grant.owner == worker.profile().owner)
+                        && !binding.resume_pending
+                        && binding.pending_slice.is_none()
+                        && self.driver.cpu_progress_request_eligible(
+                            &binding.work,
+                            &binding.envelope,
+                            &binding.grant,
+                        )
+                })
+            })
+            .ok_or(AdaptiveManagerError::Invalid(
+                "PublishProgress original CPU question",
+            ))?;
+        let sequence = self.issue_control()?;
+        self.own[index]
+            .binding
+            .as_ref()
+            .expect("checked original CPU owner")
+            .controls
+            .request_publish_progress(sequence)
+            .map_err(|_| AdaptiveManagerError::Invalid("PublishProgress control admission"))?;
+        Ok(sequence)
+    }
+
+    fn own_progress_observed(
+        &mut self,
+        slot: usize,
+        observation: CpuWorkerProgressObservation,
+    ) -> Result<(), AdaptiveManagerError> {
+        let progress = observation.progress();
+        let eligible = self.phase == ManagerPhase::Running
+            && self.own[slot].settled_execution != Some(progress.execution)
+            && self.own[slot].binding.as_ref().is_some_and(|binding| {
+                progress.job == binding.envelope.id
+                    && progress.execution == binding.grant.execution
+                    && progress.owner == binding.grant.owner
+                    && progress.sequence > binding.progress_sequence
+            });
+        self.own_progress(slot, progress.clone())?;
+        if !eligible {
+            return Ok(());
+        }
+        let binding = self.own[slot]
+            .binding
+            .as_mut()
+            .expect("validated original publication");
+        // The restoration callback repeats an old coherent iteration. Keep
+        // its original progress semantics, but do not make it new forecast
+        // eligibility or a newly completed interval sample.
+        binding.progress_published_at = observation
+            .completed_progress_interval()
+            .map(|_| observation.published_at());
+        binding.owner_run_started_at = Some(observation.run_started_at());
+        let class = binding.class;
+        let resume = observation
+            .resume_admission_and_restore()
+            .filter(|_| binding.resume_cost_observed_execution != Some(progress.execution));
+        if resume.is_some() {
+            binding.resume_cost_observed_execution = Some(progress.execution);
+        }
+        if let Some(interval) = observation.completed_progress_interval() {
+            self.observe(
+                class,
+                CostStage::CpuProgressInterval,
+                interval,
+                CostDisposition::Completed,
+            )?;
+        }
+        if let Some(resume) = resume {
+            self.observe(
+                class,
+                CostStage::CpuResumeAdmissionAndRestore,
+                resume,
+                CostDisposition::Completed,
+            )?;
+        }
+        Ok(())
+    }
     fn own_progress(
         &mut self,
         slot: usize,
@@ -2976,19 +3253,21 @@ where
                 "stale or wrong-owner CPU progress",
             ));
         }
-        self.machine.publish_progress(
-            binding.work.frame,
-            StepExecution::Cpu {
-                job: progress.job,
-                execution: progress.execution,
-            },
-            progress.sequence,
-        )?;
+        if !binding.feedback_forwarded {
+            self.machine.publish_progress(
+                binding.work.frame,
+                StepExecution::Cpu {
+                    job: progress.job,
+                    execution: progress.execution,
+                },
+                progress.sequence,
+            )?;
+        }
         binding.progress_sequence = progress.sequence;
         binding.progress_since_slice = true;
         // Progress is not credit settlement and cannot publish incomplete alpha.
         if self.driver.semantic_owner_available() {
-            self.driver.cpu_progress(&progress)?;
+            self.driver.cpu_progress_for(&binding.work, &progress)?;
         }
         self.counters.cpu_progress_publications += 1;
         Ok(())
@@ -2997,6 +3276,22 @@ where
         &mut self,
         slot: usize,
         event: CpuWorkerEvent,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.own_event_with_timing(slot, event, None)
+    }
+    fn own_event_observed(
+        &mut self,
+        slot: usize,
+        event: CpuWorkerEventObservation,
+    ) -> Result<(), AdaptiveManagerError> {
+        let (original, timing) = event.into_parts();
+        self.own_event_with_timing(slot, original, timing)
+    }
+    fn own_event_with_timing(
+        &mut self,
+        slot: usize,
+        event: CpuWorkerEvent,
+        timing: Option<CpuWorkerSliceTiming>,
     ) -> Result<(), AdaptiveManagerError> {
         match event {
             CpuWorkerEvent::Slice(report) => {
@@ -3024,6 +3319,51 @@ where
                     return Err(AdaptiveManagerError::Invalid(
                         "CPU slice grant echo mismatch",
                     ));
+                }
+                // Original worker boundaries only. Queue delivery, paused
+                // residence and manager processing are outside these scopes.
+                let timing_result = (|| {
+                    if !report.admission_rejected
+                        && report.result.is_ok()
+                        && report.actual_work.is_some()
+                    {
+                        if let Some(timing) = timing {
+                            self.observe(
+                                binding.class,
+                                CostStage::FeedbackReturn,
+                                timing.return_processing(),
+                                CostDisposition::Completed,
+                            )?;
+                            if let Some(resume) =
+                                timing.resume_admission_and_restore().filter(|_| {
+                                    binding.resume_cost_observed_execution
+                                        != Some(report.grant.execution)
+                                })
+                            {
+                                self.observe(
+                                    binding.class,
+                                    CostStage::CpuResumeAdmissionAndRestore,
+                                    resume,
+                                    CostDisposition::Completed,
+                                )?;
+                                binding.resume_cost_observed_execution =
+                                    Some(report.grant.execution);
+                            }
+                        }
+                    }
+                    Ok::<(), AdaptiveManagerError>(())
+                })();
+                if let Err(error) = timing_result {
+                    if report.continuation_retained {
+                        binding.pending_slice = Some(report);
+                        self.own[slot].binding = Some(binding);
+                    } else {
+                        self.defer(DeferredCommit::OwnRaw {
+                            work: binding.work,
+                            report,
+                        })?;
+                    }
+                    return Err(error);
                 }
                 if report.terminal
                     && report.result.as_ref().is_ok_and(|actual| {
@@ -3085,6 +3425,85 @@ where
                     ));
                 }
                 if report.continuation_retained && !report.terminal {
+                    if binding.feedback_forwarded {
+                        // First feedback already advanced the logical frame.
+                        // Keep physical custody on the original question; its
+                        // future reports must never advance that new frame.
+                        let ack = report.controls.and_then(|control| {
+                            (control.yield_ack > binding.last_yield_ack)
+                                .then_some(control.yield_ack)
+                        });
+                        let mut timing_error = None;
+                        if let Some(ack) = ack {
+                            binding.last_yield_ack = ack;
+                            self.counters.cpu_yield_acknowledgements += 1;
+                            if let Some((_, requested_at)) = binding
+                                .requested_yield
+                                .filter(|(request, _)| ack >= *request)
+                            {
+                                timing_error = self
+                                    .observe_yield_ack_latency(binding.class, requested_at, timing)
+                                    .err();
+                            }
+                        }
+                        self.counters.cpu_yields += 1;
+                        binding.pending_slice = Some(report);
+                        binding.resume_pending = self.phase == ManagerPhase::Running;
+                        binding.progress_since_slice = false;
+                        binding.progress_published_at = None;
+                        binding.requested_yield = None;
+                        self.own[slot].binding = Some(binding);
+                        self.flush_deferred()?;
+                        return timing_error.map_or(Ok(()), Err);
+                    }
+                    if self.registration.policy == CoordinatorPolicy::Adaptive
+                        && self.phase == ManagerPhase::Running
+                        && self.driver.semantic_owner_available()
+                        && self
+                            .driver
+                            .cpu_partial_continuation_eligible(&binding.work, &report)
+                    {
+                        // Resolve while the exact original execution is still
+                        // Waiting. commit_cpu consumes the real receipt once;
+                        // do not also call cpu_slice_observed for this report.
+                        if let Err(error) = self.commit_own(&binding, &report) {
+                            binding.pending_slice = Some(report);
+                            self.own[slot].binding = Some(binding);
+                            return Err(error);
+                        }
+                        binding.feedback_forwarded = true;
+                        let mut yield_timing_error = None;
+                        if let Some(ack) = report.controls.and_then(|control| {
+                            (control.yield_ack > binding.last_yield_ack)
+                                .then_some(control.yield_ack)
+                        }) {
+                            binding.last_yield_ack = ack;
+                            self.counters.cpu_yield_acknowledgements += 1;
+                            if let Some((request, requested_at)) = binding
+                                .requested_yield
+                                .filter(|(request, _)| ack >= *request)
+                            {
+                                let _ = request;
+                                if let Err(error) = self.observe_yield_ack_latency(
+                                    binding.class,
+                                    requested_at,
+                                    timing,
+                                ) {
+                                    yield_timing_error = Some(error);
+                                }
+                            }
+                        }
+                        binding.resume_pending = true;
+                        binding.progress_since_slice = false;
+                        binding.progress_published_at = None;
+                        binding.requested_yield = None;
+                        self.counters.cpu_yields += 1;
+                        self.own[slot].binding = Some(binding);
+                        return match yield_timing_error {
+                            Some(error) => Err(error),
+                            None => Ok(()),
+                        };
+                    }
                     if self.driver.semantic_owner_available() {
                         if let Err(error) = self.driver.cpu_slice_observed(&binding.work, &report) {
                             binding.pending_slice = Some(report);
@@ -3115,12 +3534,8 @@ where
                     }
                     if let Some((requested, requested_at)) = binding.requested_yield {
                         if ack.is_some_and(|ack| ack >= requested) {
-                            let observed = self.observe(
-                                binding.class,
-                                CostStage::YieldLatency,
-                                requested_at.elapsed(),
-                                CostDisposition::Completed,
-                            );
+                            let observed =
+                                self.observe_yield_ack_latency(binding.class, requested_at, timing);
                             if let Err(error) = observed {
                                 binding.pending_slice = Some(report);
                                 self.own[slot].binding = Some(binding);
@@ -3159,6 +3574,12 @@ where
                         return Ok(());
                     }
                     self.own[slot].binding = Some(binding);
+                } else if binding.feedback_forwarded {
+                    self.defer(DeferredCommit::DetachedOwn {
+                        work: binding.work,
+                        report,
+                    })?;
+                    self.flush_deferred()?;
                 } else if self.phase == ManagerPhase::Running {
                     self.defer(DeferredCommit::Own { binding, report })?;
                     self.flush_deferred()?;
@@ -3206,6 +3627,11 @@ where
                     work: binding.work.clone(),
                     termination: termination.clone(),
                 })?;
+                if binding.feedback_forwarded {
+                    // Revocation belongs to the old paused CPU custody. It
+                    // cannot close the already-advanced P/C logical frame.
+                    return Ok(());
+                }
                 let closed = self.machine.retire_suspended_cpu(
                     binding.work.frame,
                     &termination,
@@ -3214,6 +3640,72 @@ where
                 )?;
                 self.defer(DeferredCommit::Closed(closed))?;
             }
+        }
+        Ok(())
+    }
+    fn observe_yield_ack_latency(
+        &mut self,
+        class: CostClass,
+        requested_at: Instant,
+        timing: Option<CpuWorkerSliceTiming>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.observe_observation(
+            class,
+            CostStage::YieldLatency,
+            CostObservation {
+                elapsed: timing
+                    .and_then(|observed| {
+                        observed
+                            .report_ready_at()
+                            .checked_duration_since(requested_at)
+                    })
+                    .map_or(ObservedCost::Unknown, ObservedCost::Known),
+                disposition: CostDisposition::Completed,
+            },
+        )
+    }
+
+    fn foreign_progress_observed(
+        &mut self,
+        sequence: u64,
+        observation: ExternalWorkerProgressObservation,
+    ) -> Result<(), AdaptiveManagerError> {
+        let Some(binding) = self.foreign.as_mut() else {
+            // A coalesced publication can remain after its terminal packet.
+            // No current execution is authorized to consume it.
+            return Ok(());
+        };
+        let progress = observation.progress();
+        if binding.job.scope() != progress.scope {
+            return Err(AdaptiveManagerError::Invalid("old-go external progress"));
+        }
+        if sequence <= binding.progress_sequence {
+            return Ok(());
+        }
+        binding.progress_sequence = sequence;
+        if self.phase != ManagerPhase::Running {
+            return Ok(());
+        }
+        self.machine.publish_progress(
+            binding.work.frame,
+            StepExecution::ExternalCpu {
+                job: progress.scope.job,
+                execution: progress.scope.execution,
+            },
+            sequence,
+        )?;
+        // Store the producer's whole raw tuple and original timestamps. It is
+        // not a native completed iteration or strict CPU-credit observation.
+        let class = binding.class;
+        let interval = observation.completed_coherent_tuple_interval();
+        binding.observed_progress = Some(observation);
+        if let Some(elapsed) = interval {
+            self.observe(
+                class,
+                CostStage::ExternalCoherentTupleInterval,
+                elapsed,
+                CostDisposition::Completed,
+            )?;
         }
         Ok(())
     }
@@ -3269,6 +3761,7 @@ where
                 "external old-go or unsupported exact resume",
             ));
         }
+        let timing = completion.timing();
         let report = completion.into_report();
         self.counters.foreign_reports += 1;
         let reported = report
@@ -3300,6 +3793,49 @@ where
             .result
             .as_ref()
             .is_ok_and(|result| result.readiness_barrier_completed);
+        let timing_observed = (|| {
+            if let Some(timing) = timing {
+                self.observe(
+                    binding.class,
+                    CostStage::QueueWait,
+                    timing.queue_wait(),
+                    CostDisposition::Completed,
+                )?;
+                if completed && timing.go_issued_at().is_some() {
+                    self.observe(
+                        binding.class,
+                        CostStage::FeedbackReturn,
+                        timing.return_processing(),
+                        CostDisposition::Completed,
+                    )?;
+                    if let Some(elapsed) = timing.stop_drain() {
+                        self.observe(
+                            binding.class,
+                            CostStage::ExternalStopDrain,
+                            elapsed,
+                            CostDisposition::Completed,
+                        )?;
+                    }
+                    if let Some((sequence, requested_at)) = binding.requested_yield {
+                        if report.controls.yield_ack >= sequence {
+                            self.counters.foreign_yield_acknowledgements += 1;
+                            self.observe(
+                                binding.class,
+                                CostStage::YieldLatency,
+                                timing
+                                    .report_ready_at()
+                                    .checked_duration_since(requested_at)
+                                    .ok_or(AdaptiveManagerError::Invalid(
+                                        "external Yield owner clock",
+                                    ))?,
+                                CostDisposition::Completed,
+                            )?;
+                        }
+                    }
+                }
+            }
+            Ok::<_, AdaptiveManagerError>(())
+        })();
         let observed = self.observe(
             binding.class,
             CostStage::CpuSearch,
@@ -3313,6 +3849,7 @@ where
         // No foreign node report is ever sent through the native credit ledger.
         self.defer(DeferredCommit::External { binding, report })?;
         teacher_observed?;
+        timing_observed?;
         if let Some(error) = observation_error {
             return Err(error);
         }
@@ -3325,7 +3862,7 @@ where
         binding: &OwnBinding<Q>,
         report: &CpuSliceReport,
     ) -> Result<(), AdaptiveManagerError> {
-        let checked = self.driver.commit_cpu(&binding.work, &report)?;
+        let checked = self.driver.commit_cpu(&binding.work, report)?;
         self.resolve(
             binding.work.clone(),
             StepExecution::Cpu {
@@ -3340,7 +3877,7 @@ where
         binding: &ForeignBinding<Q>,
         report: &ExternalWorkerReport,
     ) -> Result<(), AdaptiveManagerError> {
-        let checked = self.driver.commit_external(&binding.work, &report)?;
+        let checked = self.driver.commit_external(&binding.work, report)?;
         self.resolve(
             binding.work.clone(),
             StepExecution::ExternalCpu {
@@ -3432,9 +3969,9 @@ where
                             .is_some_and(|work| work.frame == frame.id)
                     })
                     && !self.own.iter().any(|slot| {
-                        slot.binding
-                            .as_ref()
-                            .is_some_and(|binding| binding.work.frame == frame.id)
+                        slot.binding.as_ref().is_some_and(|binding| {
+                            binding.work.frame == frame.id && !binding.feedback_forwarded
+                        })
                     })
                     && !self
                         .foreign
@@ -3478,31 +4015,81 @@ where
         let advice = self.advice(now)?;
         let mut changed = false;
         if advice.yield_selected_worker {
-            if let Some(index) = self.own.iter().position(|slot| {
-                slot.binding.as_ref().is_some_and(|binding| {
-                    binding.progress_since_slice
-                        && binding.requested_yield.is_none()
-                        && !binding.resume_pending
-                        && self.driver.yield_feedback_gain(&binding.work).is_some()
-                })
-            }) {
-                let sequence = self.issue_control()?;
-                let binding = self.own[index]
-                    .binding
-                    .as_mut()
-                    .expect("selected CPU binding");
-                binding
-                    .controls
-                    .request_yield(sequence)
-                    .map_err(|_| AdaptiveManagerError::Invalid("adaptive Yield control"))?;
-                binding.requested_yield = Some((sequence, Instant::now()));
-                self.counters.cpu_yield_requests += 1;
-                changed = true;
+            if let Some(selection) = self.advised_yield.take() {
+                // Advice and delivery refer to the same original execution;
+                // do not rescan and transfer one owner's forecast to another.
+                match selection {
+                    YieldSelection::Own {
+                        index, execution, ..
+                    } => {
+                        if self.own[index].binding.as_ref().is_some_and(|binding| {
+                            binding.grant.execution == execution
+                                && !binding.feedback_forwarded
+                                && !binding.resume_pending
+                                && binding.requested_yield.is_none()
+                        }) {
+                            let sequence = self.issue_control()?;
+                            let binding = self.own[index]
+                                .binding
+                                .as_mut()
+                                .expect("selected CPU binding");
+                            let requested_at = Instant::now();
+                            if scheduling_yield(&binding.controls, sequence)? {
+                                binding.requested_yield = Some((sequence, requested_at));
+                                self.counters.cpu_yield_requests += 1;
+                                changed = true;
+                            }
+                        }
+                    }
+                    YieldSelection::External { scope, .. } => {
+                        if self.foreign.as_ref().is_some_and(|binding| {
+                            binding.job.scope() == scope && binding.requested_yield.is_none()
+                        }) {
+                            let sequence = self.issue_control()?;
+                            let binding = self.foreign.as_mut().expect("selected external binding");
+                            let requested_at = Instant::now();
+                            if scheduling_yield(&binding.job.control, sequence)? {
+                                binding.requested_yield = Some((sequence, requested_at));
+                                self.counters.foreign_yield_requests += 1;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
             }
         }
         for index in 0..self.own.len() {
             if self.own[index].binding.as_ref().is_some_and(|binding| {
-                binding.resume_pending
+                binding.feedback_forwarded
+                    && binding.resume_pending
+                    && binding.pending_slice.is_none()
+            }) {
+                let frame = self.own[index]
+                    .binding
+                    .as_ref()
+                    .expect("detached custody")
+                    .work
+                    .frame;
+                if self.machine.frame(frame).is_none() {
+                    // The logical question is closed. Ask the same physical
+                    // owner to discard its token; retain custody until ack.
+                    let sequence = self.issue_control()?;
+                    let binding = self.own[index].binding.as_mut().expect("detached custody");
+                    binding
+                        .controls
+                        .request_cancel(sequence)
+                        .map_err(|_| AdaptiveManagerError::Invalid("detached CPU cancel"))?;
+                    binding.resume_pending = false;
+                    changed = true;
+                } else if let Some(slice) = advice.slice {
+                    self.resume_cpu(index, slice.node_credit, slice.soft_lease)?;
+                    changed = true;
+                }
+                continue;
+            }
+            if self.own[index].binding.as_ref().is_some_and(|binding| {
+                !binding.feedback_forwarded
+                    && binding.resume_pending
                     && binding.pending_slice.is_none()
                     && !self.validator_waiting.contains(&binding.work.frame)
                     && self
@@ -3797,13 +4384,155 @@ where
         }
         Ok(changed)
     }
+    /// The exact worker used for gain/cost advice is also the only worker that
+    /// can receive its Yield. Do not evaluate one owner then control another.
+    fn selected_yield_worker(&self) -> Option<(usize, FeedbackWaitPrediction)> {
+        // Adaptive's completed-iteration handoff drives the existing P/C
+        // continuation without V. Fixed/synchronous order stays unchanged.
+        if self.phase != ManagerPhase::Running
+            || self.registration.policy != CoordinatorPolicy::Adaptive
+            || !self.driver.semantic_owner_available()
+            || self.roles.len() >= self.role_pending_limit()
+            || self.validator_waiting.len() >= self.validator_waiting_limit()
+        {
+            return None;
+        }
+        let now = Instant::now();
+        self.own.iter().enumerate().find_map(|(index, slot)| {
+            let binding = slot.binding.as_ref()?;
+            if !binding.progress_since_slice
+                || binding.feedback_forwarded
+                || binding.requested_yield.is_some()
+                || binding.resume_pending
+                || binding.pending_slice.is_some()
+                || self.validator_waiting.contains(&binding.work.frame)
+                || self
+                    .exclusive_scope
+                    .as_ref()
+                    .is_some_and(|scope| !scope.allows(binding.work.frame))
+            {
+                return None;
+            }
+            let since_publication = now.checked_duration_since(binding.progress_published_at?)?;
+            let owner_elapsed = now.checked_duration_since(binding.owner_run_started_at?)?;
+            let lease_remaining = binding.grant.soft_lease.checked_sub(owner_elapsed)?;
+            let prediction = self.driver.predict_yield_feedback(
+                &binding.work,
+                &self.costs,
+                binding.class,
+                since_publication,
+                lease_remaining,
+            )?;
+            Some((index, prediction))
+        })
+    }
+    fn selected_external_yield(&self) -> Option<ExternalFeedbackWaitPrediction> {
+        if self.phase != ManagerPhase::Running
+            || self.registration.policy != CoordinatorPolicy::Adaptive
+            || !self.driver.semantic_owner_available()
+            || self.roles.len() >= self.role_pending_limit()
+            || self.validator_waiting.len() >= self.validator_waiting_limit()
+        {
+            return None;
+        }
+        let binding = self.foreign.as_ref()?;
+        let observation = binding.observed_progress.as_ref()?;
+        if binding.requested_yield.is_some()
+            || !observation.is_new_coherent_tuple()
+            || observation.stop_sent_at().is_some()
+            || observation.go_issued_at().is_none()
+            || observation.progress().scope != binding.job.scope()
+            || self.validator_waiting.contains(&binding.work.frame)
+            || self
+                .exclusive_scope
+                .as_ref()
+                .is_some_and(|scope| !scope.allows(binding.work.frame))
+            || !self
+                .driver
+                .external_feedback_eligible(&binding.work, observation.progress())
+            || !self.machine.frame(binding.work.frame).is_some_and(|frame| {
+                frame.phase
+                    == FramePhase::Waiting(StepExecution::ExternalCpu {
+                        job: binding.job.envelope.id,
+                        execution: binding.job.grant.execution,
+                    })
+            })
+        {
+            return None;
+        }
+        let now = Instant::now();
+        self.costs.external_feedback_wait_prediction(
+            binding.class,
+            now.checked_duration_since(observation.published_at())?,
+            observation
+                .quantum_deadline()?
+                .checked_duration_since(now)?,
+        )
+    }
     fn advice(
         &mut self,
         now: MonotonicTick,
     ) -> Result<rz_runtime::adaptive::ControllerAdvice, AdaptiveManagerError> {
-        let role_class = self.roles.iter().find_map(|binding| binding.class);
-        let role_service =
-            role_class.and_then(|class| self.costs.estimate(class, CostStage::GpuService));
+        let selected = self
+            .selected_yield_worker()
+            .map(|(index, prediction)| YieldSelection::Own {
+                index,
+                execution: self.own[index]
+                    .binding
+                    .as_ref()
+                    .expect("selected CPU owner")
+                    .grant
+                    .execution,
+                prediction,
+            })
+            .or_else(|| {
+                self.selected_external_yield()
+                    .map(|prediction| YieldSelection::External {
+                        scope: self
+                            .foreign
+                            .as_ref()
+                            .expect("selected external owner")
+                            .job
+                            .scope(),
+                        prediction,
+                    })
+            });
+        self.advised_yield = selected;
+        let predicted_critic_bucket = selected.map(|selection| match selection {
+            YieldSelection::Own { index, .. } => {
+                self.own[index]
+                    .binding
+                    .as_ref()
+                    .expect("selected owner")
+                    .work
+                    .input
+                    .view_seal
+                    .length_bucket
+            }
+            YieldSelection::External { .. } => {
+                self.foreign
+                    .as_ref()
+                    .expect("selected foreign owner")
+                    .work
+                    .input
+                    .view_seal
+                    .length_bucket
+            }
+        });
+        let role_class = if let Some(bucket) = predicted_critic_bucket {
+            self.observed_role_classes.iter().find_map(|(role, class)| {
+                (*role == Role::Critic && class.input_bucket == bucket).then_some(*class)
+            })
+        } else {
+            self.roles.iter().find_map(|binding| binding.class)
+        };
+        // Prediction across observed completed source classes does not label
+        // the pending role as an actual Hit/Miss or prove physical completion.
+        let role_service = role_class.and_then(|class| {
+            self.costs
+                .service_prediction_envelope(class)
+                .map(|envelope| envelope.estimate())
+        });
         let running = self
             .roles
             .iter()
@@ -3831,14 +4560,39 @@ where
             }
         } else {
             self.costs
-                .gpu_backlog(running, &queued)
+                .predicted_gpu_backlog(running, &queued)
                 .map_err(|_| AdaptiveManagerError::Invalid("GPU backlog bound"))?
         };
-        let yield_overhead = self
-            .own
-            .iter()
-            .find_map(|slot| slot.binding.as_ref())
-            .and_then(|binding| self.costs.estimate(binding.class, CostStage::YieldLatency));
+        let yield_overhead = selected
+            .map(|selection| {
+                // Include any calibrated request-to-ack cost conservatively; the
+                // owner return-processing phase alone excludes safe-boundary wait.
+                let class = match selection {
+                    YieldSelection::Own { index, .. } => {
+                        self.own[index]
+                            .binding
+                            .as_ref()
+                            .expect("selected owner")
+                            .class
+                    }
+                    YieldSelection::External { .. } => {
+                        self.foreign
+                            .as_ref()
+                            .expect("selected external owner")
+                            .class
+                    }
+                };
+                self.costs
+                    .estimate(class, CostStage::YieldLatency)
+                    .filter(|latency| latency.p95 > selection.return_cost().p95)
+                    .unwrap_or_else(|| selection.return_cost())
+            })
+            .or_else(|| {
+                self.own
+                    .iter()
+                    .find_map(|slot| slot.binding.as_ref())
+                    .and_then(|binding| self.costs.estimate(binding.class, CostStage::YieldLatency))
+            });
         self.controller
             .advise(ControllerInput {
                 observation_sequence: self.observation_sequence,
@@ -3848,14 +4602,11 @@ where
                 yield_overhead,
                 backlog,
                 waiting_cpu_jobs: self.ready.len(),
-                // A completed iteration alone does not prove a useful feedback
-                // witness. The driver must opt in to an observed return benefit.
-                selected_progress: self.own.iter().find_map(|slot| slot.binding.as_ref()).map(
-                    |binding| WorkerProgress {
-                        has_new_consistent_progress: binding.progress_since_slice,
-                        expected_feedback_gain: self.driver.yield_feedback_gain(&binding.work),
-                    },
-                ),
+                // Typed S forecast is distinct from realized benefit/witness.
+                selected_progress: selected.map(|selection| WorkerProgress {
+                    has_new_consistent_progress: true,
+                    expected_feedback_gain: Some(selection.gain()),
+                }),
             })
             .map_err(|_| AdaptiveManagerError::Invalid("adaptive advice"))
     }
@@ -3918,7 +4669,7 @@ where
                 return Err(error);
             }
         };
-        if let Err(error) = self.ledger.reserve(grant.clone()) {
+        if let Err(error) = self.ledger.reserve(grant) {
             self.ledger.retire_unstarted(envelope.id)?;
             return Err(error.into());
         }
@@ -3936,7 +4687,7 @@ where
             .worker
             .as_ref()
             .expect("checked owner")
-            .begin_retaining(prepared, grant.clone())
+            .begin_retaining(prepared, grant)
         {
             Ok(()) => {}
             Err(rejected) => {
@@ -3954,12 +4705,16 @@ where
             work,
             envelope,
             controls,
-            grant: grant.clone(),
+            grant,
             started_at: Instant::now(),
             class,
             resume_pending: false,
+            feedback_forwarded: false,
             progress_sequence: 0,
             progress_since_slice: false,
+            progress_published_at: None,
+            owner_run_started_at: None,
+            resume_cost_observed_execution: None,
             last_yield_ack: 0,
             requested_yield: None,
             pending_slice: None,
@@ -4007,7 +4762,7 @@ where
                 return Err(error);
             }
         };
-        if let Err(error) = self.ledger.reserve(grant.clone()) {
+        if let Err(error) = self.ledger.reserve(grant) {
             self.own[index].binding = Some(binding);
             return Err(error.into());
         }
@@ -4028,7 +4783,7 @@ where
             .worker
             .as_ref()
             .expect("checked paused CPU worker")
-            .resume_attested(grant.clone())
+            .resume_attested(grant)
         {
             Ok(()) => {}
             Err(rejected) => {
@@ -4044,11 +4799,23 @@ where
         }
         let frame = binding.work.frame;
         let envelope = binding.envelope;
-        binding.grant = grant.clone();
+        binding.grant = grant;
         binding.resume_pending = false;
         binding.started_at = Instant::now();
+        binding.progress_published_at = None;
+        binding.owner_run_started_at = None;
         self.own[index].settled_execution = None;
         self.own[index].binding = Some(binding);
+        if self.own[index]
+            .binding
+            .as_ref()
+            .expect("resumed owner")
+            .feedback_forwarded
+        {
+            // The owner continues its ORIGINAL question independently of the
+            // newer logical P/C frame. Never bind this grant to that frame.
+            return Ok(());
+        }
         match self.machine.frame(frame).map(|frame| frame.phase) {
             Some(FramePhase::Suspended) => self.machine.make_resumed_ready(frame)?,
             // The actual accepted ResumeTask already made this same owner
@@ -4176,7 +4943,7 @@ where
         };
         let job = ExternalJob {
             envelope,
-            grant: grant.clone(),
+            grant,
             execution,
             owner,
             position: question.position.into_position(),
@@ -4193,13 +4960,17 @@ where
             self.clock.domain(),
             admitted_at,
         )?;
-        let teacher_dispatch = match self
+        let worker = &mut self
             .external
             .as_mut()
             .expect("checked external owner")
-            .worker
-            .submit_attested(job.clone())
-        {
+            .worker;
+        let submitted = if self.registration.policy == CoordinatorPolicy::Adaptive {
+            worker.submit_observed(job.clone())
+        } else {
+            worker.submit_attested(job.clone())
+        };
+        let teacher_dispatch = match submitted {
             Ok(dispatch) => dispatch,
             Err(error) => {
                 self.driver.external_rejected(&work, &envelope, &grant)?;
@@ -4220,6 +4991,9 @@ where
             teacher_dispatch,
             started_at: Instant::now(),
             class,
+            progress_sequence: 0,
+            observed_progress: None,
+            requested_yield: None,
         });
         self.machine.bind_checked_external_cpu(
             frame,
@@ -4477,34 +5251,33 @@ where
                     .as_ref()
                     .is_none_or(|binding| binding.pending_slice.is_none())
             })
+            && self.phase != ManagerPhase::Quarantined
         {
-            if self.phase != ManagerPhase::Quarantined {
-                // Finished is an owner fence, not a late output acceptance.
-                // Canceled questions are retired with zero search consumption.
-                let retired = self.registry.retire_revoked_after_worker_join()?;
-                self.counters.unused_role_results = self
-                    .counters
-                    .unused_role_results
-                    .checked_add(retired.len() as u64)
-                    .ok_or(AdaptiveManagerError::Capacity("unused result sum"))?;
-                self.roles.clear();
-                self.acknowledgements.clear();
-                self.retained_native_permits.clear();
-                self.retained_native_receipts.clear();
-                self.machine.retired_after_worker_join();
-                self.ready_ids.clear();
-                self.validator_waiting.clear();
-                self.root_ranking_proof = None;
-                let (_, reserved) = self.ledger.global_usage()?;
-                if reserved != 0
-                    || self.own.iter().any(|slot| slot.binding.is_some())
-                    || self.foreign.is_some()
-                {
-                    self.phase = ManagerPhase::Quarantined;
-                } else {
-                    self.phase = ManagerPhase::Finished;
-                    self.finished_at.get_or_insert_with(Instant::now);
-                }
+            // Finished is an owner fence, not a late output acceptance.
+            // Canceled questions are retired with zero search consumption.
+            let retired = self.registry.retire_revoked_after_worker_join()?;
+            self.counters.unused_role_results = self
+                .counters
+                .unused_role_results
+                .checked_add(retired.len() as u64)
+                .ok_or(AdaptiveManagerError::Capacity("unused result sum"))?;
+            self.roles.clear();
+            self.acknowledgements.clear();
+            self.retained_native_permits.clear();
+            self.retained_native_receipts.clear();
+            self.machine.retired_after_worker_join();
+            self.ready_ids.clear();
+            self.validator_waiting.clear();
+            self.root_ranking_proof = None;
+            let (_, reserved) = self.ledger.global_usage()?;
+            if reserved != 0
+                || self.own.iter().any(|slot| slot.binding.is_some())
+                || self.foreign.is_some()
+            {
+                self.phase = ManagerPhase::Quarantined;
+            } else {
+                self.phase = ManagerPhase::Finished;
+                self.finished_at.get_or_insert_with(Instant::now);
             }
         }
         Ok(changed)
@@ -4521,10 +5294,7 @@ where
             own_cpu_joined: self.own.iter().filter(|slot| slot.joined).count(),
             expected_own_cpu_owners: self.own.len(),
             own_cpu_panicked: self.own.iter().filter(|slot| slot.panicked).count(),
-            external_shutdown_confirmed: self
-                .external
-                .as_ref()
-                .and_then(|_| self.external_finished),
+            external_shutdown_confirmed: self.external.as_ref().and(self.external_finished),
             external_owner_quiesced: self.external.as_ref().map(|_| {
                 self.external_root_fence
                     .is_some_and(|fence| fence.permits_reuse())
@@ -4655,6 +5425,19 @@ where
     }
 }
 
+/// A natural terminal/cancel racing with S-policy advice remains an owner
+/// terminal to drain. It is not a failed search or an acknowledged Yield.
+fn scheduling_yield<S>(
+    controls: &rz_runtime::adaptive::ControlMailbox<S>,
+    sequence: u64,
+) -> Result<bool, AdaptiveManagerError> {
+    match controls.request_yield(sequence) {
+        Ok(()) => Ok(true),
+        Err(rz_runtime::adaptive::ControlError::Closed) => Ok(false),
+        Err(_) => Err(AdaptiveManagerError::Invalid("adaptive Yield control")),
+    }
+}
+
 fn issue(next: &mut u64) -> Result<u64, AdaptiveManagerError> {
     let issued = *next;
     *next = next
@@ -4770,8 +5553,94 @@ fn role_cost_class(ticket: &RoleTicketEnvelope, device: Digest) -> CostClass {
         role_or_checker: hash.finalize().into(),
         input_bucket: ticket.view.length_bucket,
         invocation: InvocationClass::Fresh,
-        cache: CacheClass::Miss,
+        cache: CacheClass::Unknown,
         device: device.0,
+    }
+}
+fn observed_public_cache_class(
+    physical: PhysicalRoleCompletion,
+    evidence: TicketExecutionEvidence,
+) -> CacheClass {
+    if physical != PhysicalRoleCompletion::Confirmed
+        || !evidence.measurement_complete
+        || evidence.physical_fresh.is_none()
+    {
+        return CacheClass::Unknown;
+    }
+    let Some(accounting) = evidence.accounting else {
+        return CacheClass::Unknown;
+    };
+    match (
+        accounting.public_cache_hits(),
+        accounting.public_cache_misses(),
+    ) {
+        (hits, 0) if hits > 0 => CacheClass::Hit,
+        (0, misses) if misses > 0 => CacheClass::Miss,
+        (hits, misses) if hits > 0 && misses > 0 => CacheClass::Mixed,
+        _ => CacheClass::Unknown,
+    }
+}
+#[cfg(test)]
+mod observed_cache_tests {
+    use super::*;
+    use crate::pals_native::ticketed::TicketNativeAccountingEvidence;
+
+    fn actual(hits: u64, misses: u64) -> TicketExecutionEvidence {
+        TicketExecutionEvidence {
+            execution: None,
+            completed_nn_inputs: Some(1),
+            measurement_complete: true,
+            physical_fresh: Some(true),
+            accounting: Some(TicketNativeAccountingEvidence {
+                public_cache_hits: hits,
+                public_cache_misses: misses,
+                public_nn_runs_attempted: 0,
+                public_nn_runs_completed: 0,
+                public_nn_runs_failed_known: 0,
+                role_nn_runs_attempted: 1,
+                role_nn_runs_completed: 1,
+                role_nn_runs_failed_known: 0,
+                validator_nn_runs_attempted: 0,
+                validator_nn_runs_completed: 0,
+                validator_nn_runs_failed_known: 0,
+            }),
+        }
+    }
+    #[test]
+    fn public_hit_with_private_nn_work_is_still_hit() {
+        let confirmed = PhysicalRoleCompletion::Confirmed;
+        assert_eq!(
+            observed_public_cache_class(confirmed, actual(1, 0)),
+            CacheClass::Hit
+        );
+        assert_eq!(
+            observed_public_cache_class(confirmed, actual(0, 1)),
+            CacheClass::Miss
+        );
+        assert_eq!(
+            observed_public_cache_class(confirmed, actual(1, 1)),
+            CacheClass::Mixed
+        );
+        assert_eq!(
+            observed_public_cache_class(confirmed, actual(0, 0)),
+            CacheClass::Unknown
+        );
+        let mut no_accounting = actual(1, 0);
+        no_accounting.accounting = None;
+        assert_eq!(
+            observed_public_cache_class(confirmed, no_accounting),
+            CacheClass::Unknown
+        );
+        let mut incomplete = actual(0, 1);
+        incomplete.measurement_complete = false;
+        assert_eq!(
+            observed_public_cache_class(confirmed, incomplete),
+            CacheClass::Unknown
+        );
+        assert_eq!(
+            observed_public_cache_class(PhysicalRoleCompletion::Unknown, actual(0, 1)),
+            CacheClass::Unknown
+        );
     }
 }
 fn cpu_cost_class(namespace: Digest, bucket: u16, device: Digest) -> CostClass {

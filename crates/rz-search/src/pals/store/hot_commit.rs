@@ -241,6 +241,10 @@ impl PalsStores {
         )
     }
 
+    // Exact task namespace, original consumer, Rules history and owner mode
+    // are independent checks. Keep both resume APIs on this one validation
+    // path without hiding any authority in a copied or newly allocated bundle.
+    #[allow(clippy::too_many_arguments)]
     fn resume_sealed_cpu_task(
         &mut self,
         previous: ExecutionId,
@@ -684,6 +688,32 @@ impl PalsStores {
             ));
         }
         Ok(())
+    }
+
+    /// Read-only eligibility for an original still-running owner question.
+    /// This verifies the existing exact consumer seal and issues no result,
+    /// cache hit, new task, consumption or conditional proof.
+    pub(crate) fn hot_validate_pending_cpu_feedback(
+        &self,
+        execution: ExecutionId,
+        original: TaskConsumer,
+        key: &TaskKey,
+        exact_state: &PositionSnapshot,
+        now_tick: u64,
+    ) -> Result<(), StoreError> {
+        if self.tasks.get(execution)?.status != TaskStatus::InFlight {
+            return Err(StoreError::InvalidConditions(
+                "feedback owner is not pending",
+            ));
+        }
+        self.validate_sealed_feedback_consumer(
+            execution,
+            original,
+            key,
+            exact_state,
+            now_tick,
+            false,
+        )
     }
 
     fn validate_sealed_feedback_consumer(

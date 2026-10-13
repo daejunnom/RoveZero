@@ -177,6 +177,19 @@ _REVIEWED_OPT_IN_SOURCE_PROFILES = (
         "crates/rz-arena/src/pals_collect/native.rs": {
             "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
     }),
+    # Independently reviewed optional-review successor, legacy SingleReply only.
+    # Old constructors leave review_index/review_policy unset, so full records,
+    # accepted Repair, original controls and completed OwnCPU/Rules gates remain.
+    # The Fresh-pair fallback keeps the original endpoint call order; the native
+    # Err/Review classification cannot issue a completed or successful result.
+    # This pair admits no selected-view/adaptive, archive, V4/ModelWdl or actual
+    # continuation scope, and certifies no build, execution, utility or training.
+    ("opt_in_single_reply_followup_optional_review_ce40b6f9_native_02af59b9", {
+        "crates/rz-search/src/pals/engine.rs": {
+            "bytes": 414372, "sha256": "ce40b6f9ff8d13a41da8c9482b48528c1437896e9571c9630790c4b11b262726"},
+        "crates/rz-arena/src/pals_collect/native.rs": {
+            "bytes": 233208, "sha256": "02af59b9edbc350e6e1a204eb6543033bb4a859729eb2ed79c8b470cc6823a01"},
+    }),
 )
 _POLICY = {
     "version": "pals-post-repair-recheck/1",

@@ -131,6 +131,10 @@ impl<V, O> RoleTicketRegistry<V, O> {
         held.native_acceptance_issued = Some(seal);
         Ok(NativeAcceptancePermit { seal })
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "return the original linear owner receipt intact on rejection without allocating during failure or memory pressure"
+    )]
     pub fn confirm_native_acceptance(
         &mut self,
         receipt: NativeAcceptanceReceipt,

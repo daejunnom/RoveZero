@@ -20,14 +20,11 @@ impl LegacyRulesDescriptorSummary {
 
 // Absence and a declared field are different: V1 has neither extension, while
 // V2 requires both. In particular JSON null cannot impersonate an absent field.
+#[derive(Default)]
 enum Declared<T> {
+    #[default]
     Absent,
     Present(T),
-}
-impl<T> Default for Declared<T> {
-    fn default() -> Self {
-        Self::Absent
-    }
 }
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Declared<T> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {

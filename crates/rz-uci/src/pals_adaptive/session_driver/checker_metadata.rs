@@ -46,6 +46,10 @@ struct ResetState {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the bounded reset arm keeps its original Copy fence inline without a reset-path allocation"
+)]
 enum MetadataResetArm {
     Owned { deadline: Instant },
     External { fence: ExternalNewGameFence },

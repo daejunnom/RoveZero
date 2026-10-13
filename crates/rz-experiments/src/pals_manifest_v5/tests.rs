@@ -1020,6 +1020,63 @@ fn diagnostic_domain_cannot_be_relabelled_as_real_generation() {
 }
 
 #[test]
+fn frozen_pc_domain_is_collection_action_only_not_deployment_arena_or_g1_training() {
+    // Pure declaration fixture. It grants neither actual export provenance,
+    // numerical acceptance nor original trainer/loaded-native authority.
+    let mut frozen = collection_engine();
+    frozen.model.artifact_domain = PalsArtifactDomainV5::FrozenPcCollection;
+    frozen.model.provenance = Some(asset("reports/frozen-pc-collection-v2.json"));
+    frozen.model.checkpoint_domain = Some(PALS_V5_TRAINING_CHECKPOINT_DOMAIN.into());
+    let mut action = manifest();
+    action.purpose = PalsRunPurposeV5::ActionCollection;
+    action.engines = vec![frozen.clone()];
+    action.validate().unwrap();
+
+    let mut deployment = frozen.clone();
+    deployment.mode = PalsEngineModeV5::Deployment;
+    deployment
+        .model
+        .exported_roles
+        .remove(&PalsRoleV3::Validator);
+    deployment.v_generate = false;
+    deployment.v_load = false;
+    deployment.v_call = false;
+    deployment.cpu.cpu_t = PalsCpuSelectionV5::Disabled;
+    deployment.cpu.external = None;
+    assert!(deployment.validate().is_err());
+
+    let mut training = action.clone();
+    training.purpose = PalsRunPurposeV5::TrainingGeneration;
+    training.training_authorized = true;
+    assert!(training.validate().is_err());
+
+    for (purpose, max_plies, endpoint) in [
+        (PalsRunPurposeV5::CollectionPair, 512, frozen.clone()),
+        (PalsRunPurposeV5::EvaluationPair, 256, deployment),
+    ] {
+        let mut pair = action.clone();
+        pair.purpose = purpose;
+        let mut second = endpoint.clone();
+        second.id = "b".into();
+        pair.engines = vec![endpoint, second];
+        pair.pair = Some(PalsPairPlanV5 {
+            opening_id: "frozen-declaration-boundary".into(),
+            position_command: "position startpos".into(),
+            white_order: ["a".into(), "b".into()],
+            base_ms: 120000,
+            increment_ms: 1000,
+            max_plies,
+            seed: 1,
+            concurrent_games: 1,
+            restart_processes_each_game: true,
+            ponder: false,
+            score_adjudication: false,
+        });
+        assert!(pair.validate().is_err());
+    }
+}
+
+#[test]
 fn unknown_observations_remain_valid_ineligible_evidence() {
     let lock = manifest().lock().unwrap();
     let mut r = receipt(&lock);

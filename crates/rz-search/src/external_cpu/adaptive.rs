@@ -3,7 +3,7 @@
 
 use super::{CheckerError, ExternalCheckerIdentity};
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const EXTERNAL_MIN_QUANTUM: Duration = Duration::from_millis(100);
 pub const EXTERNAL_STOP_DRAIN_RESERVE: Duration = Duration::from_millis(500);
@@ -174,6 +174,25 @@ pub struct ExternalControlObservation {
     pub action: ExternalControlAction,
 }
 
+/// Actual native-owner protocol boundaries. These clocks do not certify a
+/// native completed iteration, an applied option, or exact-stack resumption.
+#[derive(Clone, Copy, Debug)]
+pub enum ExternalOwnerPhase {
+    GoIssued {
+        at: Instant,
+        quantum_deadline: Instant,
+    },
+    StopSent {
+        at: Instant,
+    },
+    BestMoveDrained {
+        at: Instant,
+    },
+    ReadyBarrierCompleted {
+        at: Instant,
+    },
+}
+
 /// Adapter for the coordinator's atomic mailbox. No second mailbox or runtime
 /// dependency is hidden in search; observations must already be job-sealed.
 pub trait ExternalControl: Send + Sync {
@@ -181,6 +200,9 @@ pub trait ExternalControl: Send + Sync {
     fn physical_fence_deadline(&self) -> Option<std::time::Instant> {
         None
     }
+    /// Optional owner timing only. The default preserves existing control
+    /// consumers; progress/terminal authority still comes from their receipts.
+    fn observe_owner_phase(&self, _phase: ExternalOwnerPhase) {}
     /// Optional consistent raw tuple publication; does not stop external go or
     /// assert that its selective iteration is independently complete.
     fn publish_progress(

@@ -14,11 +14,11 @@ use rz_eval::pals_model::virtual_review::{
     self as model, PalsVirtualReviewInput, ReviewAnchorInput, ReviewExecutionIdentity,
 };
 use rz_eval::pals_model::{PalsModelConfig, PalsRawOutput, PalsRole};
-use rz_eval::pals_onnx::VirtualReviewCudaPlacementWitness;
 use rz_eval::pals_onnx::virtual_review::{
     PalsVirtualReviewOnnxBackend, VirtualReviewCompletion, VirtualReviewInvocation,
     VirtualReviewNativeCommand, VirtualReviewNativeResult,
 };
+use rz_eval::pals_onnx::{PalsAppliedSessionSettings, VirtualReviewCudaPlacementWitness};
 use rz_eval::worker::{PhysicalLease, PhysicalPoll, SingleWorker};
 use rz_position::{BoardMove, Position};
 use rz_runtime::Clock;
@@ -27,6 +27,7 @@ use rz_search::pals::coordinator::{PhysicalRoleCompletion, RoleFailure};
 use rz_search::pals::review_context::ReviewView;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -105,6 +106,7 @@ pub trait VirtualReviewCollectionObserver: Send + 'static {
 }
 pub struct NativeVirtualReviewTicketBackend {
     worker: NativeWorker,
+    applied_session_settings: Option<Arc<[PalsAppliedSessionSettings]>>,
     clock: ContractSystemClock,
     config: PalsModelConfig,
     model_epoch: [u8; 32],
@@ -157,8 +159,10 @@ impl NativeVirtualReviewTicketBackend {
         let approximate_warm_capable = backend.approximate_warm_capable();
         let virtual_cuda_placement_required = backend.virtual_cuda_placement_required();
         let game = backend.game_generation();
+        let applied_session_settings = backend.applied_session_settings();
         Ok(Self {
             worker: backend.into_worker().map_err(backend_failure)?,
+            applied_session_settings: Some(applied_session_settings),
             clock,
             config,
             model_epoch,
@@ -189,6 +193,10 @@ impl NativeVirtualReviewTicketBackend {
         }
         self.observer = Some(observer);
         Ok(())
+    }
+    /// 원본 session 생성 성공의 설정 기록만 전달하며 첫 NN/OS 관측을 만들지 않는다.
+    pub fn applied_session_settings(&self) -> Option<Arc<[PalsAppliedSessionSettings]>> {
+        self.applied_session_settings.as_ref().map(Arc::clone)
     }
     pub fn validator_present(&self) -> bool {
         self.validator_present
@@ -289,7 +297,9 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
         if canceled.load(Ordering::Acquire) {
             return Err(RoleFailure::Canceled);
         }
-        if question.seal.authority.epoch != self.clock.domain().0 {
+        if question.seal.authority.epoch != self.clock.domain().0
+            || question.query.legacy_full_records.is_some()
+        {
             return Err(RoleFailure::InvalidOutput);
         }
         if question.role == Role::Validator && !self.validator_present {
@@ -488,6 +498,11 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                 + raw.private_latent.capacity()
                 + raw.divergence_logits.as_ref().map_or(0, Vec::capacity))
                 * 4) as u64
+    }
+    fn acceptance_output_digest(&self, output: &Self::Output) -> Option<Digest> {
+        // 원래 native P/V head만 식별한다. Search가 별도로 판정한 Rules 종료
+        // 가치나 이후의 view를 이 출력에 덮어쓰지 않으며, C는 기존 경로를 따른다.
+        rz_search::pals::coordinator::native_acceptance_output_digest(&output.output).ok()
     }
     fn execution_evidence(
         &mut self,
@@ -843,8 +858,7 @@ fn question_bytes(question: &TicketPreparation<ReviewView, NativeTicketQuestion>
             .context
             .prefix
             .capacity()
-            .checked_mul(std::mem::size_of::<BoardMove>())
-            .unwrap_or(usize::MAX),
+            .saturating_mul(std::mem::size_of::<BoardMove>()),
     );
     question
         .view
@@ -932,6 +946,7 @@ mod tests {
     ) -> NativeVirtualReviewTicketBackend {
         NativeVirtualReviewTicketBackend {
             worker,
+            applied_session_settings: None,
             clock: ContractSystemClock::new(ProcessEpoch(7)),
             config: PalsModelConfig::default(),
             model_epoch: [1; 32],
@@ -976,6 +991,7 @@ mod tests {
         })
         .unwrap();
         let mut backend = mock_finish_backend(worker, false);
+        assert!(backend.applied_session_settings().is_none());
         backend.request_high_water = 42;
         backend.execution_sequence = 7;
         backend
@@ -1263,6 +1279,7 @@ mod tests {
                     position: endpoint,
                     context,
                     deadline: Instant::now() + Duration::from_secs(10),
+                    legacy_full_records: None,
                 },
             },
         )

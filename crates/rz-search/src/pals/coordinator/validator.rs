@@ -90,6 +90,10 @@ impl AcceptedValidatorPublished {
 impl<V, O: ProposerRankingOutput> RoleTicketRegistry<V, O> {
     /// No native acceptance is implied yet. Unknown physical completion takes
     /// precedence over malformed numerical output, retaining all owned data.
+    #[expect(
+        clippy::result_large_err,
+        reason = "preserve the original bounded completion custody on rejection without allocation under cancellation or memory pressure"
+    )]
     pub fn complete_validator_task(
         &mut self,
         completion: RoleCompletion<O>,

@@ -4,13 +4,14 @@ use super::*;
 use crate::pals_native::ticketed::TicketExecutionEvidence;
 use rz_contracts::pals::{RoleOutput, SearchAuthority};
 use rz_contracts::pals_adaptive::{
-    CpuJobEnvelope, ExternalCpuJobEnvelope, ExternalSliceGrant, RoleTicketEnvelope, SliceGrant,
+    CpuJobEnvelope, ExternalCpuJobEnvelope, ExternalSliceGrant, ReviewViewSeal, RoleTicketEnvelope,
+    SliceGrant,
 };
 use rz_contracts::{ClockDomain, Digest, MonotonicTick};
 use rz_position::contracts::ContractState;
 use rz_runtime::CompletionSignal;
 use rz_search::cpu_worker::{
-    CpuAdmissionRejection, CpuJobTermination, CpuSliceReport, CpuWorkerProfile,
+    CpuAdmissionRejection, CpuJobTermination, CpuSliceReport, CpuWorkerProfile, CpuWorkerProgress,
 };
 use rz_search::external_cpu::worker::{
     ExternalJob, ExternalTeacherDispatch, ExternalWorkerCompletion, ExternalWorkerReport,
@@ -39,10 +40,46 @@ use rz_search::pals::review_context::ReviewView;
 use rz_search::pals::store::{ForeignAppendPermit, ObservationId, StorePins};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const MAX_RETAINED_QUESTIONS: usize = 64;
 const MAX_ARCHIVE_RECEIPTS: usize = 64;
+
+/// A coherent iteration publication is scoped to its original question and
+/// physical owner. It is not CPU credit settlement or a new semantic witness.
+struct PublishedCpuFeedback {
+    frame: FrameId,
+    view: ReviewViewSeal,
+    public_context: Digest,
+    job: CpuJobEnvelope,
+    grant: SliceGrant,
+    sequence: u64,
+    progress: Option<CpuWorkerProgress>,
+}
+
+impl PublishedCpuFeedback {
+    fn matches_work<Q>(&self, work: &CoordinatorWork<ReviewView, Q>) -> bool {
+        self.frame == work.frame
+            && self.job.question == work.input.question_digest
+            && self.view == work.input.view_seal
+            && self.public_context == work.input.public_context
+            && self.job.hard_deadline == work.original_deadline
+    }
+    fn publish(&mut self, progress: &CpuWorkerProgress) -> Result<(), AdaptiveManagerError> {
+        if progress.job != self.job.id
+            || progress.execution != self.grant.execution
+            || progress.owner != self.grant.owner
+            || progress.sequence <= self.sequence
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "original CPU progress authority",
+            ));
+        }
+        self.sequence = progress.sequence;
+        self.progress = Some(progress.clone());
+        Ok(())
+    }
+}
 
 /// The observer registers the original immutable input before native Execute.
 /// The optional V question is the Search-issued support plan, not caller masks.
@@ -59,6 +96,9 @@ pub type AdaptiveCollectionDispatchObserver = Arc<
 /// Actual external owner evidence. The submitted view is immutable and remains
 /// identified as the CPU question; it is never relabelled as a native output.
 /// Collection explicitly joins an earlier sealed P/C input by exact endpoint.
+// Keep the original bounded job and completion inline at the observer seam;
+// boxing would add allocation around the sealed dispatch/receipt owners.
+#[allow(clippy::large_enum_variant)]
 pub enum AdaptiveExternalTeacherEvent {
     Submitted {
         input: FrameInput<ReviewView, AdaptivePortQuestion>,
@@ -95,6 +135,7 @@ pub struct AdaptivePortDriver<M: RoleModel + 'static> {
     // A raw receipt is committed once. Building its next continuation may
     // require another owner turn and must not duplicate TaskTable settlement.
     cpu_committed: HashMap<Digest, (ObservationId, bool)>,
+    cpu_feedback: HashMap<Digest, PublishedCpuFeedback>,
     foreign_committed: HashMap<Digest, (ObservationId, bool)>,
     validator_questions: HashMap<Digest, AdaptiveValidatorQuestion>,
     validator_seen: HashSet<Digest>,
@@ -138,6 +179,9 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
         )
         .map_err(|(_, error)| error)
     }
+    // Failure returns the original port and its session/Store owners intact;
+    // an error box would add allocation to this ownership-preserving rollback.
+    #[allow(clippy::result_large_err)]
     pub fn new_with_coordinator_policy_retaining(
         mut port: AdaptiveEnginePort<M>,
         hard_deadline: Instant,
@@ -189,6 +233,7 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
             archive_joined,
             external_policy,
             cpu_committed: HashMap::new(),
+            cpu_feedback: HashMap::new(),
             foreign_committed: HashMap::new(),
             validator_questions: HashMap::new(),
             validator_seen: HashSet::new(),
@@ -268,6 +313,9 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
     ) -> Result<CompletedValidatorAction, AdaptiveManagerError> {
         CompletedValidatorAction::after_manager_shutdown(outcome, receipt)
     }
+    // A failed closure returns this complete lifecycle owner with every
+    // session/worker/quarantine intact, without an extra error-box allocation.
+    #[allow(clippy::result_large_err)]
     pub fn into_port(
         mut self,
         receipt: &AdaptiveShutdownReceipt,
@@ -740,13 +788,146 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         job: &CpuJobEnvelope,
         grant: &SliceGrant,
     ) -> Result<(), AdaptiveManagerError> {
-        self.hot()?.cpu_admitted(work, job, grant).map_err(semantic)
+        let key = work.input.question_digest;
+        if let Some(original) = self.cpu_feedback.get(&key) {
+            if !original.matches_work(work)
+                || original.job != *job
+                || original.grant.owner != grant.owner
+            {
+                return Err(AdaptiveManagerError::Invalid("CPU progress resume context"));
+            }
+        } else if self.cpu_feedback.len() >= MAX_RETAINED_QUESTIONS {
+            return Err(AdaptiveManagerError::Capacity("CPU progress questions"));
+        }
+        self.hot()?
+            .cpu_admitted(work, job, grant)
+            .map_err(semantic)?;
+        match self.cpu_feedback.get_mut(&key) {
+            Some(original) => {
+                original.grant = *grant;
+                original.progress = None;
+            }
+            None => {
+                self.cpu_feedback.insert(
+                    key,
+                    PublishedCpuFeedback {
+                        frame: work.frame,
+                        view: work.input.view_seal,
+                        public_context: work.input.public_context,
+                        job: *job,
+                        grant: *grant,
+                        sequence: 0,
+                        progress: None,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+    fn cpu_progress_for(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        progress: &CpuWorkerProgress,
+    ) -> Result<(), AdaptiveManagerError> {
+        let original = self
+            .cpu_feedback
+            .get_mut(&work.input.question_digest)
+            .ok_or(AdaptiveManagerError::Invalid(
+                "CPU progress lacks original admission",
+            ))?;
+        if self.closing || work.frame.authority != self.authority || !original.matches_work(work) {
+            return Err(AdaptiveManagerError::Invalid(
+                "CPU progress question context",
+            ));
+        }
+        original.publish(progress)
+    }
+    fn predict_yield_feedback(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        costs: &rz_runtime::adaptive::CostEstimator,
+        class: rz_runtime::adaptive::CostClass,
+        since_publication: Duration,
+        lease_remaining: Duration,
+    ) -> Option<rz_runtime::adaptive::FeedbackWaitPrediction> {
+        if self.closing || work.frame.authority != self.authority {
+            return None;
+        }
+        let original = self.cpu_feedback.get(&work.input.question_digest)?;
+        if !original.matches_work(work) {
+            return None;
+        }
+        let progress = original.progress.as_ref()?;
+        if !self
+            .port
+            .as_ref()?
+            .published_cpu_continuation_eligible(work, progress)
+        {
+            return None;
+        }
+        // This only forecasts waiting until eligible feedback can be consumed.
+        // The model uses original completed owner timing, never CPU agreement,
+        // depth as utility, a fabricated witness, or paused residence time.
+        costs.feedback_wait_prediction(class, since_publication, lease_remaining)
+    }
+    fn cpu_progress_request_eligible(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        job: &CpuJobEnvelope,
+        grant: &SliceGrant,
+    ) -> bool {
+        !self.closing
+            && work.frame.authority == self.authority
+            && self
+                .port
+                .as_ref()
+                .is_some_and(|port| port.cpu_progress_request_eligible(work, job, grant))
+    }
+    fn cpu_partial_continuation_eligible(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        report: &CpuSliceReport,
+    ) -> bool {
+        !self.closing
+            && work.frame.authority == self.authority
+            && self
+                .port
+                .as_ref()
+                .is_some_and(|port| port.yielded_cpu_continuation_eligible(work, report))
+    }
+    fn external_feedback_eligible(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        progress: &rz_search::external_cpu::worker::ExternalWorkerProgress,
+    ) -> bool {
+        !self.closing
+            && work.frame.authority == self.authority
+            && self
+                .port
+                .as_ref()
+                .is_some_and(|port| port.published_external_continuation_eligible(work, progress))
+    }
+    fn cpu_detached_slice_observed(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        report: &CpuSliceReport,
+    ) -> Result<(), AdaptiveManagerError> {
+        // The original CPU question remains the consumer. No after_cpu or
+        // next-frame transition is issued for later receipts from this owner.
+        self.cpu_slice_observed(work, report)?;
+        if report.terminal {
+            self.cpu_feedback.remove(&work.input.question_digest);
+        }
+        Ok(())
     }
     fn cpu_slice_observed(
         &mut self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
         report: &CpuSliceReport,
     ) -> Result<(), AdaptiveManagerError> {
+        if let Some(original) = self.cpu_feedback.get_mut(&work.input.question_digest) {
+            original.progress = None;
+        }
         if self.closing {
             self.hot()?
                 .observe_cpu_report(work, report)
@@ -769,7 +950,9 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         }
         self.hot()?
             .reject_cpu_admission(work, job, proof)
-            .map_err(semantic)
+            .map_err(semantic)?;
+        self.cpu_feedback.remove(&work.input.question_digest);
+        Ok(())
     }
     fn role_consumption_recorded(
         &self,
@@ -789,7 +972,9 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
     ) -> Result<(), AdaptiveManagerError> {
         self.hot()?
             .retire_cpu_token(work, termination)
-            .map_err(semantic)
+            .map_err(semantic)?;
+        self.cpu_feedback.remove(&work.input.question_digest);
+        Ok(())
     }
     fn commit_cpu(
         &mut self,
@@ -797,6 +982,9 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         report: &CpuSliceReport,
     ) -> Result<CheckedStep<AdaptivePortQuestion>, AdaptiveManagerError> {
         let key = work.input.question_digest;
+        if let Some(original) = self.cpu_feedback.get_mut(&key) {
+            original.progress = None;
+        }
         let guard = self.action_before(
             work,
             StepExecution::Cpu {
@@ -824,6 +1012,7 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         self.action_after(work, guard)?;
         self.cpu_committed.remove(&key);
         let materialized = self.hot()?.materialize_step(step).map_err(semantic)?;
+        self.cpu_feedback.remove(&key);
         Ok(checked(materialized))
     }
     fn external_admitted(
@@ -1086,5 +1275,134 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod published_progress_tests {
+    use super::*;
+    use rz_contracts::pals_adaptive::{CpuJobId, CpuWorkerId};
+    use rz_contracts::{
+        Deadline, ExecutionId, GameGeneration, OwnerId, ProcessEpoch, RootGeneration,
+        StateIdentity, StateRevision,
+    };
+    use rz_search::cpu::CpuIterationProgress;
+
+    fn original() -> PublishedCpuFeedback {
+        let authority = SearchAuthority {
+            epoch: ProcessEpoch(3),
+            game: GameGeneration(2),
+            root: RootGeneration(4),
+            implementation: Digest([1; 32]),
+        };
+        let state_identity = StateIdentity {
+            owner: OwnerId(1),
+            revision: StateRevision(5),
+            semantic: Digest([2; 32]),
+        };
+        let job = CpuJobEnvelope {
+            id: CpuJobId {
+                authority,
+                sequence: 1,
+            },
+            state_identity,
+            question: Digest([3; 32]),
+            root_restriction: Digest([4; 32]),
+            evaluation_namespace: Digest([5; 32]),
+            search_conditions: Digest([6; 32]),
+            total_native_node_credit: 8192,
+            hard_deadline: Deadline {
+                clock: ClockDomain(authority.epoch),
+                at: MonotonicTick(20_000_000),
+            },
+        };
+        PublishedCpuFeedback {
+            frame: FrameId {
+                authority,
+                sequence: 1,
+            },
+            view: ReviewViewSeal {
+                authority,
+                view_sequence: 1,
+                context_policy: Digest([7; 32]),
+                view_digest: Digest([8; 32]),
+                root_state: state_identity,
+                actual_tokens: 0,
+                selected_records: 0,
+                anchors: 1,
+                length_bucket: 8,
+            },
+            public_context: Digest([9; 32]),
+            job,
+            grant: SliceGrant {
+                job: job.id,
+                execution: ExecutionId::new(authority.epoch, 1),
+                owner: CpuWorkerId(0),
+                node_credit: 4096,
+                soft_lease: Duration::from_millis(8),
+                control_sequence: 1,
+            },
+            sequence: 0,
+            progress: None,
+        }
+    }
+    #[test]
+    fn published_progress_rejects_other_question_owner_and_old_slice() {
+        let mut original = original();
+        let progress = CpuWorkerProgress {
+            job: original.job.id,
+            execution: original.grant.execution,
+            owner: original.grant.owner,
+            sequence: 1,
+            iteration: CpuIterationProgress {
+                best_move: None,
+                score: 100,
+                completed_depth: 1,
+                nodes: 4,
+            },
+        };
+        for wrong in [
+            CpuWorkerProgress {
+                job: CpuJobId {
+                    sequence: 2,
+                    ..progress.job
+                },
+                ..progress.clone()
+            },
+            CpuWorkerProgress {
+                owner: CpuWorkerId(1),
+                ..progress.clone()
+            },
+            CpuWorkerProgress {
+                execution: ExecutionId::new(progress.execution.epoch, 2),
+                ..progress.clone()
+            },
+        ] {
+            assert!(original.publish(&wrong).is_err());
+            assert!(original.progress.is_none());
+            assert_eq!(original.sequence, 0);
+        }
+        original.publish(&progress).unwrap();
+        assert!(original.publish(&progress).is_err());
+        assert_eq!(original.progress.as_ref().unwrap().iteration.nodes, 4);
+        original.grant.execution.sequence = 2;
+        original.progress = None;
+        assert!(
+            original
+                .publish(&CpuWorkerProgress {
+                    sequence: 2,
+                    ..progress.clone()
+                })
+                .is_err()
+        );
+        original
+            .publish(&CpuWorkerProgress {
+                execution: original.grant.execution,
+                sequence: 2,
+                ..progress
+            })
+            .unwrap();
+        // Publication did not change the immutable Job or settle any credit.
+        assert_eq!(original.job.total_native_node_credit, 8192);
     }
 }
