@@ -1,0 +1,896 @@
+//! Actual Fresh B1 ORT raw capture; numerical admission is a separate reader.
+//! This executable does not label tensor fixtures as Rules/legal-game evidence.
+//! Every CUDA graph requires the explicit V3 source/placement policy. Failures
+//! leave pending output files for recovery and never publish completed receipts.
+use rz_eval::asset;
+use rz_eval::error::BackendError;
+use rz_eval::onnx::{NativeLoadingProfile, OrtRuntime, Provider};
+use rz_eval::pals_model::virtual_review::{
+    self as model, PalsVirtualReviewInput, ReviewExecutionIdentity,
+};
+use rz_eval::pals_model::{PalsCandidateToken, PalsModelProfile, PalsRawOutput, PalsRole};
+use rz_eval::pals_onnx::virtual_review::{
+    validate_virtual_review_export_manifest, PalsVirtualReviewOnnxBackend,
+    VirtualReviewExecutionMode, VirtualReviewInvocation, VirtualReviewNativeCommand as Command,
+    VirtualReviewNativeResult as Outcome,
+};
+use rz_eval::pals_onnx::{PalsBackendStats, PalsCudaControlPolicy, PalsOnnxConfig};
+use rz_eval::runtime_pin::{CudaRuntimeBundleSpec, RuntimeBundleFileRole, RuntimeCache};
+use rz_eval::worker::{PhysicalPoll, SingleWorker};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    task::Poll,
+    time::{Duration, Instant},
+};
+#[path = "virtual_review_numeric_capture/tensors.rs"]
+mod tensors;
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
+type Worker = SingleWorker<Command, std::result::Result<Outcome, BackendError>>;
+const LIMIT: usize = 4 * 1024 * 1024;
+// This bound is the registered logical raw numerical payload total. The exact
+// recovery staging owner adds one fixed header per file and publication keeps
+// at most one extra 4MiB payload. Separately bounded profile/placement evidence
+// is not relabeled as numerical payload or unobserved disk use.
+const RAW_TOTAL: u64 = 64 * 1024 * 1024;
+const PENDING_HEADER: &[u8] = b"RZ_PENDING_PROFILE_AND_JOIN\n";
+
+/// serde's typed unknown-field validation alone does not reject duplicate
+/// object keys inside BTreeMaps or payloads. Validate every JSON object before
+/// constructing the typed plan/config; the caller has already bounded bytes.
+fn decode_unique<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    struct Unique(serde_json::Value);
+    impl<'de> Deserialize<'de> for Unique {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            decoder: D,
+        ) -> std::result::Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = Unique;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("bounded JSON without duplicate object keys")
+                }
+                fn visit_bool<E: serde::de::Error>(
+                    self,
+                    v: bool,
+                ) -> std::result::Result<Unique, E> {
+                    Ok(Unique(v.into()))
+                }
+                fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<Unique, E> {
+                    Ok(Unique(v.into()))
+                }
+                fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Unique, E> {
+                    Ok(Unique(v.into()))
+                }
+                fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<Unique, E> {
+                    serde_json::Number::from_f64(v)
+                        .map(|n| Unique(n.into()))
+                        .ok_or_else(|| E::custom("nonfinite JSON number"))
+                }
+                fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Unique, E> {
+                    Ok(Unique(v.into()))
+                }
+                fn visit_string<E: serde::de::Error>(
+                    self,
+                    v: String,
+                ) -> std::result::Result<Unique, E> {
+                    Ok(Unique(v.into()))
+                }
+                fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Unique, E> {
+                    Ok(Unique(serde_json::Value::Null))
+                }
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut seq: A,
+                ) -> std::result::Result<Unique, A::Error> {
+                    let mut values = Vec::new();
+                    while let Some(v) = seq.next_element::<Unique>()? {
+                        values.push(v.0);
+                    }
+                    Ok(Unique(values.into()))
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> std::result::Result<Unique, A::Error> {
+                    let mut values = serde_json::Map::new();
+                    while let Some(key) = map.next_key::<String>()? {
+                        if values.contains_key(&key) {
+                            return Err(serde::de::Error::custom("duplicate JSON object key"));
+                        }
+                        values.insert(key, map.next_value::<Unique>()?.0);
+                    }
+                    Ok(Unique(values.into()))
+                }
+            }
+            decoder.deserialize_any(Visitor)
+        }
+    }
+    let unique: Unique = serde_json::from_slice(bytes)?;
+    Ok(serde_json::from_value(unique.0)?)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Bindings {
+    model_profile: String,
+    model_schema: String,
+    model_semantics: String,
+    encoding_schema: String,
+    model_semantic_sha256: String,
+    encoding_sha256: String,
+    model_epoch: u64,
+    weights_sha256: String,
+    export_manifest_sha256: String,
+    graphs: BTreeMap<String, String>,
+    runtime_library_sha256: String,
+    cuda_libraries: BTreeSet<String>,
+    cuda_manifest_sha256: Option<String>,
+    backend: String,
+    precision: String,
+    tf32: bool,
+    source_components: BTreeMap<String, String>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(
+    tag = "model_input_kind",
+    content = "input",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum Input {
+    VirtualReview(PalsVirtualReviewInput),
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Case {
+    id: String,
+    input: Input,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Group {
+    id: String,
+    role: PalsRole,
+    line_bucket: usize,
+    cases: Vec<Case>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Plan {
+    domain: String,
+    schema_version: u32,
+    invocation: String,
+    batch: u32,
+    bindings: Bindings,
+    groups: Vec<Group>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    case_plan: PathBuf,
+    case_plan_sha256: String,
+    export_manifest: PathBuf,
+    runtime_library: PathBuf,
+    runtime_cache: PathBuf,
+    output_root: PathBuf,
+    provider: String,
+    cuda_bundle: Option<PathBuf>,
+    cuda_inventory: Option<PathBuf>,
+    cuda_inventory_sha256: Option<String>,
+    gpu_device_id: i32,
+    gpu_arena_bytes: usize,
+    deadline_seconds: u64,
+    cleanup_seconds: u64,
+}
+#[derive(Serialize)]
+struct RawCase {
+    id: String,
+    input: Input,
+    input_tensors: Vec<tensors::TensorCapture>,
+    input_tensor_sha256: String,
+    candidate_order: Vec<PalsCandidateToken>,
+    raw_output: PalsRawOutput,
+    physical_completion_id: Option<String>,
+}
+#[derive(Serialize)]
+struct RawRun {
+    schema_version: u32,
+    domain: &'static str,
+    run_id: String,
+    producer: &'static str,
+    producer_source_component: String,
+    bindings: Bindings,
+    invocation: &'static str,
+    batch: u32,
+    observed_provider: Option<&'static str>,
+    completed_nn_inputs: u64,
+    public_cache_hits: u64,
+    physical_completion_known: bool,
+    cases: Vec<RawCase>,
+}
+#[derive(Serialize)]
+struct StageWork {
+    admitted_role_requests: u64,
+    public_cache_hits: u64,
+    public_cache_misses: u64,
+    public_nn_runs_attempted: u64,
+    public_nn_runs_completed: u64,
+    public_nn_runs_failed_known: u64,
+    role_nn_runs_attempted: u64,
+    role_nn_runs_completed: u64,
+    role_nn_runs_failed_known: u64,
+    validated_public_outputs: u64,
+    validated_role_outputs: u64,
+    completed_nn_inputs: u64,
+}
+fn stage_delta(
+    before: &PalsBackendStats,
+    after: &PalsBackendStats,
+    count: usize,
+) -> Result<StageWork> {
+    before.validate()?;
+    after.validate()?;
+    let delta = |a: u64, b: u64| {
+        a.checked_sub(b)
+            .ok_or_else(|| Box::<dyn Error>::from("native stage counter regressed"))
+    };
+    let s = StageWork {
+        admitted_role_requests: delta(after.admitted_role_requests, before.admitted_role_requests)?,
+        public_cache_hits: delta(after.public_cache_hits, before.public_cache_hits)?,
+        public_cache_misses: delta(after.public_cache_misses, before.public_cache_misses)?,
+        public_nn_runs_attempted: delta(
+            after.public_nn_runs_attempted,
+            before.public_nn_runs_attempted,
+        )?,
+        public_nn_runs_completed: delta(
+            after.public_nn_runs_completed,
+            before.public_nn_runs_completed,
+        )?,
+        public_nn_runs_failed_known: delta(
+            after.public_nn_runs_failed_known,
+            before.public_nn_runs_failed_known,
+        )?,
+        role_nn_runs_attempted: delta(after.role_nn_runs_attempted, before.role_nn_runs_attempted)?,
+        role_nn_runs_completed: delta(after.role_nn_runs_completed, before.role_nn_runs_completed)?,
+        role_nn_runs_failed_known: delta(
+            after.role_nn_runs_failed_known,
+            before.role_nn_runs_failed_known,
+        )?,
+        validated_public_outputs: delta(
+            after.validated_public_outputs,
+            before.validated_public_outputs,
+        )?,
+        validated_role_outputs: delta(after.validated_role_outputs, before.validated_role_outputs)?,
+        completed_nn_inputs: delta(after.completed_nn_inputs, before.completed_nn_inputs)?,
+    };
+    let n = count as u64;
+    if [
+        s.admitted_role_requests,
+        s.public_cache_misses,
+        s.public_nn_runs_attempted,
+        s.public_nn_runs_completed,
+        s.role_nn_runs_attempted,
+        s.role_nn_runs_completed,
+        s.validated_public_outputs,
+        s.validated_role_outputs,
+    ]
+    .iter()
+    .any(|v| *v != n)
+        || s.public_cache_hits != 0
+        || s.public_nn_runs_failed_known != 0
+        || s.role_nn_runs_failed_known != 0
+        || s.completed_nn_inputs != 2 * n
+    {
+        return Err(
+            "Fresh cache-off public/private completed work does not match captured cases".into(),
+        );
+    }
+    Ok(s)
+}
+
+fn hex(bytes: [u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+fn pin(value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("lowercase SHA-256 required".into());
+    }
+    Ok(asset::parse_sha256(value)?)
+}
+fn id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+}
+/// One shared source registry binds this executable, its numerical reader and
+/// the independent reference. No local framing/catalog can diverge from V5.
+fn source_pins() -> Result<BTreeMap<String, String>> {
+    let registered = rz_experiments::compiled_source_components_v5()?;
+    [
+        "model_native",
+        "model_encoding",
+        "nn_runtime",
+        "model_reference",
+        "model_export",
+    ]
+    .into_iter()
+    .map(|name| {
+        let pin = registered
+            .get(name)
+            .ok_or("required common source component absent")?;
+        Ok((name.to_string(), pin.clone()))
+    })
+    .collect()
+}
+fn outside_git(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err("capture paths must be absolute".into());
+    }
+    for ancestor in path.ancestors() {
+        if fs::symlink_metadata(ancestor)?.file_type().is_symlink() {
+            return Err("capture owner must not traverse original symlink ancestors".into());
+        }
+    }
+    let resolved = path.canonicalize()?;
+    for ancestor in resolved.ancestors() {
+        if ancestor.join(".git").exists()
+            || fs::symlink_metadata(ancestor)?.file_type().is_symlink()
+        {
+            return Err("capture owner must be outside Git with no symlink ancestors".into());
+        }
+    }
+    Ok(resolved)
+}
+fn write_exclusive(path: &Path, value: &impl Serialize) -> Result<u64> {
+    let bytes = serde_json::to_vec(value)?;
+    if bytes.is_empty() || bytes.len() > LIMIT {
+        return Err("raw receipt exceeds 4MiB file limit".into());
+    }
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(bytes.len() as u64)
+}
+fn write_pending(path: &Path, value: &impl Serialize, remaining: u64) -> Result<u64> {
+    let bytes = serde_json::to_vec(value)?;
+    if bytes.is_empty() || bytes.len() > LIMIT || bytes.len() as u64 > remaining {
+        return Err("pending payload exceeds registered file/total limit before creation".into());
+    }
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    // A pending file is deliberately not a valid raw-receipt JSON document.
+    // The independent reader cannot accept it before profile audit and join.
+    file.write_all(PENDING_HEADER)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(bytes.len() as u64)
+}
+fn publish_pending(pending: &Path, final_path: &Path) -> Result<()> {
+    let bytes = asset::read_bounded(pending, LIMIT + PENDING_HEADER.len())?;
+    let raw = bytes
+        .strip_prefix(PENDING_HEADER)
+        .ok_or("pending capture framing differs")?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(final_path)?;
+    file.write_all(raw)?;
+    file.sync_all()?;
+    drop(file);
+    let actual = asset::read_bounded(final_path, LIMIT)?;
+    if actual != raw {
+        return Err("published raw receipt integrity differs; retaining pending".into());
+    }
+    // Only this exact create-new staging file is removed after full recovery
+    // bytes are verified. Failed captures retain all original pending files.
+    fs::remove_file(pending)?;
+    Ok(())
+}
+fn command(worker: &mut Worker, command: Command, until: Instant) -> Result<Outcome> {
+    if Instant::now() >= until {
+        return Err("capture window expired before native dispatch".into());
+    }
+    let mut lease = worker.submit(command)?;
+    loop {
+        match lease.poll() {
+            PhysicalPoll::Ready(result) => return Ok(result?),
+            PhysicalPoll::Quarantined => {
+                let cause = lease.quarantine_cause()?;
+                std::mem::forget(lease);
+                return Err(format!("physical completion unknown: {cause:?}").into());
+            }
+            PhysicalPoll::Consumed => return Err("completion consumed twice".into()),
+            PhysicalPoll::Pending if Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(1))
+            }
+            PhysicalPoll::Pending => {
+                std::mem::forget(lease);
+                return Err("finite capture deadline reached; physical owners retained".into());
+            }
+        }
+    }
+}
+fn stats(worker: &mut Worker, until: Instant) -> Result<PalsBackendStats> {
+    match command(worker, Command::SnapshotStats, until)? {
+        Outcome::Stats(s) => Ok(s),
+        _ => Err("incorrect stats completion".into()),
+    }
+}
+fn finish(worker: &mut Worker, until: Instant) -> Result<()> {
+    loop {
+        match worker.try_shutdown() {
+            Poll::Ready(result) => return Ok(result?),
+            Poll::Pending if Instant::now() < until => std::thread::sleep(Duration::from_millis(1)),
+            Poll::Pending => {
+                return Err("native worker did not join within cleanup deadline".into())
+            }
+        }
+    }
+}
+fn identity(
+    input: &PalsVirtualReviewInput,
+    epoch: [u8; 32],
+    backend: [u8; 32],
+) -> Result<ReviewExecutionIdentity> {
+    // Numerical tensor fixtures are not Rules states. These explicit fixture
+    // namespaces prevent cache aliasing and grant no Rules/history authority.
+    let anchors = input
+        .anchors
+        .iter()
+        .map(|anchor| {
+            let bytes = serde_json::to_vec(anchor)?;
+            let mut hash = Sha256::new();
+            hash.update(b"rz-pals-numeric-fixture-anchor-no-rules-history-claim/1");
+            hash.update(bytes);
+            Ok(hash.finalize().into())
+        })
+        .collect::<Result<Vec<[u8; 32]>>>()?;
+    Ok(ReviewExecutionIdentity {
+        model_epoch: epoch,
+        backend,
+        fp32: true,
+        rules_history: anchors[0],
+        anchor_history_seals: anchors,
+    })
+}
+fn execute(config: Config) -> Result<()> {
+    for path in [
+        &config.case_plan,
+        &config.export_manifest,
+        &config.runtime_library,
+        &config.runtime_cache,
+        &config.output_root,
+    ]
+    .into_iter()
+    .chain(config.cuda_bundle.as_ref())
+    .chain(config.cuda_inventory.as_ref())
+    {
+        if !path.is_absolute() {
+            return Err("all configured capture asset/output paths must be absolute".into());
+        }
+    }
+    if !(1..=7200).contains(&config.deadline_seconds) || !(1..=30).contains(&config.cleanup_seconds)
+    {
+        return Err("capture requires registered finite execution/cleanup windows".into());
+    }
+    let until = Instant::now() + Duration::from_secs(config.deadline_seconds);
+    let plan_bytes = asset::read_bounded(&config.case_plan, LIMIT)?;
+    if asset::sha256(&plan_bytes) != pin(&config.case_plan_sha256)? {
+        return Err("actual case plan SHA differs".into());
+    }
+    let plan: Plan = decode_unique(&plan_bytes)?;
+    if plan.domain != "rz-pals-numerical-case-plan-v5/1"
+        || plan.schema_version != 5
+        || plan.invocation != "fresh"
+        || plan.batch != 1
+        || plan.groups.is_empty()
+        || plan.groups.len() > 18
+        || plan.bindings.source_components != source_pins()?
+    {
+        return Err("exact Fresh B1 plan/source registration required".into());
+    }
+    let mut ids = BTreeSet::new();
+    let mut cases = 0usize;
+    for group in &plan.groups {
+        if !id(&group.id)
+            || !id(&format!("native-{}", group.id))
+            || !ids.insert(group.id.clone())
+            || !model::LENGTH_BUCKETS.contains(&group.line_bucket)
+            || group.cases.is_empty()
+            || group.cases.len() > 10
+        {
+            return Err("bounded unique role/bucket group required".into());
+        }
+        for case in &group.cases {
+            let Input::VirtualReview(input) = &case.input;
+            let prepared = input.prepare()?;
+            cases += 1;
+            if !id(&case.id)
+                || !ids.insert(case.id.clone())
+                || input.role != group.role
+                || prepared.length_bucket != group.line_bucket
+                || input.candidates.is_empty()
+                || ![0.0, 1.0].contains(&input.anchors[0].metadata[0])
+                || cases > 256
+            {
+                return Err("case role/bucket/order capacity differs".into());
+            }
+            let captured = tensors::capture(input)?;
+            tensors::digest(&captured, input.role)?;
+        }
+    }
+    let is_cuda = matches!(
+        config.provider.as_str(),
+        "cuda-control" | "cuda-control-shim"
+    );
+    if !is_cuda && config.provider != "cpu" {
+        return Err("explicit cpu/cuda-control/cuda-control-shim provider required".into());
+    }
+    let b = &plan.bindings;
+    if b.model_epoch == 0 {
+        return Err(
+            "declared model epoch must be nonzero; actual identity is the pinned checkpoint SHA"
+                .into(),
+        );
+    }
+    if b.model_profile != model::PROFILE
+        || b.model_schema != model::MODEL_SCHEMA
+        || b.model_semantics != model::MODEL_SEMANTICS
+        || b.encoding_schema != model::ENCODING
+        || b.precision != "fp32"
+        || b.tf32
+        || b.backend != if is_cuda { "ort_cuda" } else { "ort_cpu" }
+        || b.model_semantic_sha256
+            != hex(PalsModelProfile::VirtualReviewV1.registered_semantics_sha256())
+        || b.encoding_sha256 != hex(model::registered_encoding_sha256())
+    {
+        return Err("registered model/precision/backend semantics differ".into());
+    }
+    for value in [
+        &b.weights_sha256,
+        &b.export_manifest_sha256,
+        &b.runtime_library_sha256,
+        &b.encoding_sha256,
+    ] {
+        pin(value)?;
+    }
+    let mode = if b.graphs.contains_key("validator") {
+        VirtualReviewExecutionMode::Collection
+    } else {
+        VirtualReviewExecutionMode::Deployment
+    };
+    let roles = plan
+        .groups
+        .iter()
+        .map(|g| format!("{:?}", g.role))
+        .collect::<BTreeSet<_>>();
+    let expected = BTreeSet::from_iter(
+        ["Proposer".to_string(), "Critic".to_string()]
+            .into_iter()
+            .chain(
+                (mode == VirtualReviewExecutionMode::Collection).then_some("Validator".to_string()),
+            ),
+    );
+    if roles != expected {
+        return Err("capture plan omits or adds an actual registered role".into());
+    }
+    let manifest_bytes = asset::read_bounded(&config.export_manifest, 256 * 1024)?;
+    let summary = validate_virtual_review_export_manifest(&manifest_bytes, mode)?;
+    let graph_pins = summary
+        .graphs
+        .iter()
+        .map(|g| (g.role.clone(), hex(g.sha256)))
+        .collect::<BTreeMap<_, _>>();
+    if hex(summary.manifest_sha256()) != b.export_manifest_sha256
+        || hex(summary.checkpoint_sha256) != b.weights_sha256
+        || graph_pins != b.graphs
+    {
+        return Err("actual strict export/checkpoint/graph/encoding pins differ".into());
+    }
+    let cache = RuntimeCache::open(&config.runtime_cache)?;
+    let control = if is_cuda {
+        if std::env::var("NVIDIA_TF32_OVERRIDE").ok().as_deref() != Some("0") {
+            return Err("CUDA capture requires NVIDIA_TF32_OVERRIDE=0".into());
+        }
+        Some(PalsCudaControlPolicy::from_virtual_review_inventory(
+            config
+                .cuda_inventory
+                .as_ref()
+                .ok_or("V3 inventory missing")?,
+            config
+                .cuda_inventory_sha256
+                .as_deref()
+                .ok_or("V3 inventory SHA missing")?,
+        )?)
+    } else {
+        if config.cuda_bundle.is_some()
+            || config.cuda_inventory.is_some()
+            || config.cuda_inventory_sha256.is_some()
+            || b.cuda_manifest_sha256.is_some()
+            || !b.cuda_libraries.is_empty()
+        {
+            return Err("CPU cannot carry CUDA assets".into());
+        }
+        None
+    };
+    let runtime_pin = if is_cuda {
+        let bytes = asset::read_bounded(
+            config.cuda_bundle.as_ref().ok_or("CUDA bundle missing")?,
+            64 * 1024,
+        )?;
+        if Some(hex(asset::sha256(&bytes))) != b.cuda_manifest_sha256 {
+            return Err("actual CUDA bundle manifest SHA differs".into());
+        }
+        let spec = CudaRuntimeBundleSpec::from_json(std::str::from_utf8(&bytes)?)?;
+        let expected = spec
+            .files
+            .iter()
+            .filter(|f| f.role != RuntimeBundleFileRole::Core)
+            .map(|f| f.sha256.clone())
+            .collect::<BTreeSet<_>>();
+        let core = spec
+            .files
+            .iter()
+            .find(|f| f.role == RuntimeBundleFileRole::Core)
+            .ok_or("core absent")?;
+        if expected != b.cuda_libraries
+            || core.sha256 != b.runtime_library_sha256
+            || config.runtime_library.file_name().and_then(|n| n.to_str()) != Some(&core.filename)
+        {
+            return Err("actual native library roster differs".into());
+        }
+        cache.cuda_bundle(
+            config
+                .runtime_library
+                .parent()
+                .ok_or("core parent absent")?,
+            &spec,
+        )?
+    } else {
+        cache.library(&config.runtime_library, &b.runtime_library_sha256)?
+    };
+    if Instant::now() >= until {
+        return Err("capture window expired before runtime load".into());
+    }
+    let runtime = if config.provider == "cuda-control-shim" {
+        OrtRuntime::load_with_cuda_loading_profile(
+            &runtime_pin,
+            NativeLoadingProfile::CuDnnShimLazyV1,
+        )?
+    } else {
+        OrtRuntime::load(&runtime_pin)?
+    };
+    if hex(runtime.binary_digest()) != b.runtime_library_sha256 {
+        return Err("actual loaded ORT pin differs".into());
+    }
+    let parent = outside_git(config.output_root.parent().ok_or("output parent absent")?)?;
+    let root = parent.join(config.output_root.file_name().ok_or("output root absent")?);
+    fs::create_dir(&root)?;
+    let mut selected = PalsOnnxConfig::cpu();
+    selected.intra_threads = 1;
+    selected.cache_public_memory = false;
+    if is_cuda {
+        selected.provider = Provider::Cuda {
+            device_id: config.gpu_device_id,
+            arena_bytes: config.gpu_arena_bytes,
+        };
+    }
+    if Instant::now() >= until {
+        return Err("capture window expired before model/session load".into());
+    }
+    let backend = match (mode, control) {
+        (VirtualReviewExecutionMode::Collection, Some(policy)) => {
+            PalsVirtualReviewOnnxBackend::load_collection_with_cuda_control_policy(
+                &config.export_manifest,
+                &b.export_manifest_sha256,
+                runtime,
+                selected,
+                policy,
+                &root.join("profiles"),
+            )?
+        }
+        (_, Some(policy)) => PalsVirtualReviewOnnxBackend::load_with_cuda_control_policy(
+            &config.export_manifest,
+            &b.export_manifest_sha256,
+            runtime,
+            selected,
+            policy,
+            &root.join("profiles"),
+        )?,
+        (VirtualReviewExecutionMode::Collection, None) => {
+            PalsVirtualReviewOnnxBackend::load_collection(
+                &config.export_manifest,
+                &b.export_manifest_sha256,
+                runtime,
+                selected,
+            )?
+        }
+        (_, None) => PalsVirtualReviewOnnxBackend::load(
+            &config.export_manifest,
+            &b.export_manifest_sha256,
+            runtime,
+            selected,
+        )?,
+    };
+    let epoch = backend.model_epoch();
+    let backend_digest = backend.backend_digest();
+    let mut worker = backend.into_worker()?;
+    let work = (|| -> Result<Vec<(PathBuf, PathBuf)>> {
+        let mut outputs = Vec::new();
+        let mut bytes = 0u64;
+        let mut completion = 0u64;
+        let mut stages = BTreeMap::new();
+        for group in plan.groups {
+            let before = stats(&mut worker, until)?;
+            let mut captured = Vec::new();
+            for case in group.cases {
+                let Input::VirtualReview(input) = &case.input;
+                let input_tensors = tensors::capture(input)?;
+                let input_tensor_sha256 = tensors::digest(&input_tensors, input.role)?;
+                let identity = identity(input, epoch, backend_digest)?;
+                let output = match command(
+                    &mut worker,
+                    Command::Evaluate(VirtualReviewInvocation {
+                        request_history: identity.rules_history,
+                        identity,
+                        input: input.clone(),
+                    }),
+                    until,
+                )? {
+                    Outcome::Evaluation(raw) => raw,
+                    _ => return Err("incorrect physical evaluation completion".into()),
+                };
+                completion += 1;
+                let candidate_order = input.candidates.clone();
+                captured.push(RawCase {
+                    id: case.id,
+                    input: case.input,
+                    candidate_order,
+                    input_tensors,
+                    input_tensor_sha256,
+                    raw_output: output,
+                    physical_completion_id: Some(format!("native-{}-{completion}", group.id)),
+                });
+            }
+            let after = stats(&mut worker, until)?;
+            let stage = stage_delta(&before, &after, captured.len())?;
+            let completed_nn_inputs = stage.completed_nn_inputs;
+            let public_cache_hits = stage.public_cache_hits;
+            stages.insert(group.id.clone(), stage);
+            let raw = RawRun {
+                schema_version: 5,
+                domain: "rz-pals-numerical-raw-run-v5/1",
+                run_id: format!("native-{}", group.id),
+                producer: "rust_ort_native",
+                producer_source_component: b.source_components["model_native"].clone(),
+                bindings: b.clone(),
+                invocation: "fresh",
+                batch: 1,
+                observed_provider: Some(if is_cuda {
+                    "CUDAExecutionProvider"
+                } else {
+                    "CPUExecutionProvider"
+                }),
+                completed_nn_inputs,
+                public_cache_hits,
+                physical_completion_known: true,
+                cases: captured,
+            };
+            let pending = root.join(format!("native-{}.pending.json", group.id));
+            let final_path = root.join(format!("native-{}.json", group.id));
+            bytes = bytes
+                .checked_add(write_pending(&pending, &raw, RAW_TOTAL - bytes)?)
+                .filter(|n| *n <= RAW_TOTAL)
+                .ok_or("raw collection exceeds 64MiB")?;
+            outputs.push((pending, final_path));
+        }
+        match command(&mut worker, Command::VerifyRuntime, until)? {
+            Outcome::RuntimeVerified => {}
+            _ => return Err("runtime audit incomplete".into()),
+        }
+        if is_cuda {
+            match command(&mut worker, Command::VerifyVirtualCudaPlacement, until)? {
+                Outcome::VirtualCudaPlacementVerified(witness) => {
+                    write_exclusive(&root.join("actual-virtual-cuda-placement.json"), &witness)?;
+                }
+                _ => return Err("actual V3 placement witness absent".into()),
+            }
+        }
+        let stage_pending = root.join("actual-stage-counters.pending.json");
+        write_pending(&stage_pending, &stages, LIMIT as u64)?;
+        outputs.push((stage_pending, root.join("actual-stage-counters.json")));
+        Ok(outputs)
+    })();
+    let joined = finish(
+        &mut worker,
+        Instant::now() + Duration::from_secs(config.cleanup_seconds),
+    );
+    let outputs = match (work, joined) {
+        (Ok(outputs), Ok(())) => outputs,
+        (Err(work), Err(join)) => {
+            return Err(format!(
+                "capture failed: {work}; physical cleanup failed: {join}; pending files retained"
+            )
+            .into())
+        }
+        (Err(work), Ok(())) => {
+            return Err(format!(
+                "capture failed: {work}; native worker joined; pending files retained"
+            )
+            .into())
+        }
+        (Ok(_), Err(join)) => {
+            return Err(format!("physical cleanup failed: {join}; pending files retained").into())
+        }
+    };
+    for (pending, final_path) in outputs {
+        if final_path.exists() {
+            return Err("refusing final receipt overwrite".into());
+        }
+        publish_pending(&pending, &final_path)?;
+    }
+    println!("RZ_NUMERIC_CAPTURE_STATUS={{\"status\":\"captured\",\"numerical_acceptance\":false,\"rules_legality_certified\":false,\"native_worker_joined\":true}}");
+    Ok(())
+}
+fn main() -> Result<()> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--source-pins"] {
+        println!("{}", serde_json::to_string(&source_pins()?)?);
+        return Ok(());
+    }
+    if args.len() != 1 {
+        return Err(
+            "usage: virtual_review_numeric_capture --source-pins | ABSOLUTE_CAPTURE_CONFIG.json"
+                .into(),
+        );
+    }
+    let path = Path::new(&args[0]);
+    if !path.is_absolute() {
+        return Err("capture config must be absolute".into());
+    }
+    let bytes = asset::read_bounded(path, 64 * 1024)?;
+    let config: Config = decode_unique(&bytes)?;
+    execute(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn json_duplicates_and_unknown_config_fields_fail_before_state_construction() {
+        assert!(
+            decode_unique::<serde_json::Value>(br#"{"sources":{"native":"a","native":"b"}}"#)
+                .is_err()
+        );
+        assert!(decode_unique::<serde_json::Value>(br#"{"outer":[{"x":1,"x":2}]}"#).is_err());
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            n: u64,
+        }
+        assert_eq!(decode_unique::<Fields>(br#"{"n":7}"#).unwrap().n, 7);
+        assert!(decode_unique::<Fields>(br#"{"n":7,"secret":0}"#).is_err());
+    }
+    #[test]
+    fn source_registry_selects_exact_registered_capture_components() {
+        let actual = source_pins().unwrap();
+        let common = rz_experiments::compiled_source_components_v5().unwrap();
+        assert_eq!(actual.len(), 5);
+        assert!(actual
+            .iter()
+            .all(|(name, digest)| common.get(name) == Some(digest)));
+        assert!(!id("unsafe:ads"));
+    }
+}

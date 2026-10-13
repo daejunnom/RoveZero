@@ -718,6 +718,7 @@ impl PalsOnnxBackend {
             private_warm: None,
             private_cuda_warm: Some(capability),
             runtime,
+            owned_sources: None,
             config,
             model_config: manifest.config,
             epoch,

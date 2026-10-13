@@ -37,10 +37,12 @@ mod device_packing_assets;
 mod device_packing_graph;
 mod device_pages_plan;
 mod public_pages;
+pub mod virtual_review;
 mod warm;
 pub use cuda_control::{
     PalsControlTransfer, PalsControlTransferKind, PalsCudaControlPolicy, PalsCudaPlacementWitness,
-    PalsGraphOptimization, PalsGraphPlacement, PalsKernelWitness,
+    PalsGraphOptimization, PalsGraphPlacement, PalsKernelWitness, VirtualReviewControlLayout,
+    VirtualReviewCudaPlacementWitness,
 };
 pub use device_packing_admission::{
     DevicePackingAdmissionError, DevicePackingDeclaredResources, DevicePackingResourceDeclaration,
@@ -1945,14 +1947,24 @@ fn load_session(
     } else {
         None
     };
-    let recorded = if let (Some((_, root)), Some(log)) = (audit, &placement_log) {
-        cuda_control::record_initial_log(
-            log,
-            &root.join(format!("{role}-initial-placement.json")),
-            role,
-            loaded.is_ok(),
-            placement.as_ref(),
-        )
+    let recorded = if let (Some((policy, root)), Some(log)) = (audit, &placement_log) {
+        if policy.virtual_review_layout().is_some() {
+            policy.record_initial_log_virtual(
+                log,
+                &root.join(format!("{role}-initial-placement.json")),
+                role,
+                loaded.is_ok(),
+                placement.as_ref(),
+            )
+        } else {
+            cuda_control::record_initial_log(
+                log,
+                &root.join(format!("{role}-initial-placement.json")),
+                role,
+                loaded.is_ok(),
+                placement.as_ref(),
+            )
+        }
     } else {
         Ok(())
     };
@@ -2479,6 +2491,9 @@ pub struct PalsOnnxBackend {
     #[cfg(feature = "experimental-io-binding")]
     private_cuda_warm: Option<PalsCudaWarmCapability>,
     runtime: OrtRuntime,
+    // Registered descriptor sources outlive their sessions and profile I/O.
+    // Unknown physical completion retains this same owner with native values.
+    owned_sources: Option<Arc<dyn PalsOwnedSources>>,
     config: PalsOnnxConfig,
     model_config: PalsModelConfig,
     epoch: [u8; 32],
@@ -2523,7 +2538,99 @@ struct CudaControlAudit {
     witness: Option<PalsCudaPlacementWitness>,
     rejected: Option<BackendError>,
 }
+/// Immutable artifact access owned by a native startup capability. A callback
+/// must not infer graph identity from a role name or replace a missing graph.
+/// Returning bytes grants no acceptance: native loading independently repeats
+/// bounded manifest validation and each complete graph hash before ORT sees it.
+pub trait PalsOwnedSources: Send + Sync {
+    fn read_manifest(&self, maximum: usize) -> Result<Vec<u8>, BackendError>;
+    fn read_graph(
+        &self,
+        role: &str,
+        registered_file: &str,
+        expected_sha256: [u8; 32],
+        maximum: usize,
+    ) -> Result<Vec<u8>, BackendError>;
+}
+// Historical path loaders preserve their ordinary-path access and validation;
+// only the new registered startup loader supplies retained descriptor sources.
+struct PathPalsSources<'a> {
+    path: &'a Path,
+}
+impl PalsOwnedSources for PathPalsSources<'_> {
+    fn read_manifest(&self, maximum: usize) -> Result<Vec<u8>, BackendError> {
+        asset::read_bounded(self.path, maximum)
+    }
+    fn read_graph(
+        &self,
+        _role: &str,
+        registered_file: &str,
+        _expected_sha256: [u8; 32],
+        maximum: usize,
+    ) -> Result<Vec<u8>, BackendError> {
+        let parent = self.path.parent().ok_or_else(|| {
+            fail(
+                K::InvalidInput,
+                S::Asset,
+                "PALS export manifest has no parent",
+            )
+        })?;
+        asset::read_bounded(&parent.join(registered_file), maximum)
+    }
+}
 impl PalsOnnxBackend {
+    /// A startup owner may retain its original read-only descriptors instead of
+    /// reopening ambient model paths. These callbacks supply bytes only: the
+    /// existing manifest, digest, shape, provider and session validators below
+    /// remain the native admission authority.
+    pub fn load_owned_sources(
+        sources: Arc<dyn PalsOwnedSources>,
+        expected_manifest_sha256: &str,
+        runtime: OrtRuntime,
+        config: PalsOnnxConfig,
+    ) -> Result<Self, BackendError> {
+        let mut backend = Self::load_sources_inner(
+            sources.as_ref(),
+            expected_manifest_sha256,
+            runtime,
+            config,
+            None,
+        )?;
+        backend.owned_sources = Some(sources);
+        Ok(backend)
+    }
+    /// The profile owner is a retained directory descriptor, rather than a
+    /// checked-then-reopened path. It must outlive this backend, including any
+    /// physical-completion quarantine, as part of the startup source owner.
+    pub fn load_owned_sources_with_cuda_control_policy(
+        sources: Arc<dyn PalsOwnedSources>,
+        expected_manifest_sha256: &str,
+        runtime: OrtRuntime,
+        config: PalsOnnxConfig,
+        policy: PalsCudaControlPolicy,
+        profile: &virtual_review::VirtualReviewProfileDirectory,
+    ) -> Result<Self, BackendError> {
+        if config.cudnn_conv_search != PalsCuDnnConvSearch::LegacyImplicitExhaustive {
+            config.validate_execution_selection(runtime.native_loading_profile(), true)?;
+        }
+        if !matches!(config.provider, Provider::Cuda { .. }) || config.device_public_memory {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Admission,
+                "PALS owned metadata-control requires explicit CUDA with host public memory",
+            ));
+        }
+        profile.validate_live()?;
+        let mut backend = Self::load_sources_inner(
+            sources.as_ref(),
+            expected_manifest_sha256,
+            runtime,
+            config,
+            Some((policy, profile.path().to_owned())),
+        )?;
+        backend.owned_sources = Some(sources);
+        Ok(backend)
+    }
     pub fn load(
         path: &Path,
         expected_manifest_sha256: &str,
@@ -2576,7 +2683,25 @@ impl PalsOnnxBackend {
                 "PALS manifest path must be absolute",
             ));
         }
-        let bytes = asset::read_bounded(path, MAX_MANIFEST_BYTES)?;
+        let sources = PathPalsSources { path };
+        Self::load_sources_inner(&sources, expected_manifest_sha256, runtime, config, audit)
+    }
+    fn load_sources_inner(
+        sources: &dyn PalsOwnedSources,
+        expected_manifest_sha256: &str,
+        runtime: OrtRuntime,
+        config: PalsOnnxConfig,
+        audit: Option<(PalsCudaControlPolicy, std::path::PathBuf)>,
+    ) -> Result<Self, BackendError> {
+        config.validate_execution_selection(runtime.native_loading_profile(), audit.is_some())?;
+        let bytes = sources.read_manifest(MAX_MANIFEST_BYTES)?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(fail(
+                K::ResourceExhausted,
+                S::Asset,
+                "PALS manifest source exceeded its bound",
+            ));
+        }
         let manifest_digest = asset::sha256(&bytes);
         if manifest_digest != parse_sha256(expected_manifest_sha256)? {
             return Err(fail(
@@ -2617,13 +2742,6 @@ impl PalsOnnxBackend {
             }
             _ => {}
         }
-        let parent = path.parent().ok_or_else(|| {
-            fail(
-                K::InvalidInput,
-                S::Asset,
-                "PALS export manifest has no parent",
-            )
-        })?;
         let mut sessions = BTreeMap::new();
         let mut graph_identities = Vec::with_capacity(3);
         let mut total = 0_u64;
@@ -2632,7 +2750,20 @@ impl PalsOnnxBackend {
             if let Some((policy, _)) = &audit {
                 policy.validate_pins(manifest_digest, graph)?;
             }
-            let graph_bytes = asset::read_bounded(&parent.join(&graph.file), MAX_GRAPH_BYTES)?;
+            let expected_graph_sha256 = parse_sha256(&graph.sha256)?;
+            let graph_bytes = sources.read_graph(
+                &graph.role,
+                &graph.file,
+                expected_graph_sha256,
+                MAX_GRAPH_BYTES,
+            )?;
+            if graph_bytes.len() > MAX_GRAPH_BYTES {
+                return Err(fail(
+                    K::ResourceExhausted,
+                    S::Asset,
+                    "PALS graph source exceeded its bound",
+                ));
+            }
             total = total.checked_add(graph_bytes.len() as u64).ok_or_else(|| {
                 fail(
                     K::ResourceExhausted,
@@ -2648,7 +2779,7 @@ impl PalsOnnxBackend {
                 ));
             }
             let graph_digest = asset::sha256(&graph_bytes);
-            if graph_digest != parse_sha256(&graph.sha256)? {
+            if graph_digest != expected_graph_sha256 {
                 return Err(fail(
                     K::IdentityMismatch,
                     S::Asset,
@@ -2712,6 +2843,7 @@ impl PalsOnnxBackend {
             #[cfg(feature = "experimental-io-binding")]
             private_cuda_warm: None,
             runtime,
+            owned_sources: None,
             config,
             model_config: manifest.config,
             epoch,
@@ -4156,6 +4288,9 @@ impl Drop for PalsOnnxBackend {
             .flatten()
             {
                 std::mem::forget(session);
+            }
+            if let Some(sources) = self.owned_sources.take() {
+                std::mem::forget(sources);
             }
             if let Some(active) = self.active.take() {
                 std::mem::forget(active);

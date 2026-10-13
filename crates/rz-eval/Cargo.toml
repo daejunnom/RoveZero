@@ -59,6 +59,13 @@ name = "pals_model_check"
 required-features = ["onnx", "contracts"]
 
 [[example]]
+name = "virtual_review_numeric_capture"
+required-features = ["onnx", "contracts"]
+
+[dev-dependencies]
+rz-experiments.workspace = true
+
+[[example]]
 name = "device_packing_graph_check"
 required-features = ["onnx", "contracts"]
 

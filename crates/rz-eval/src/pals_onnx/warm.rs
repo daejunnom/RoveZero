@@ -16,13 +16,11 @@ pub(super) mod cuda;
 
 pub const PRIVATE_WARM_SCHEMA: &str = "rovezero.pals-private-warm.v1";
 const WARM_LAYOUT: &str = "shared_pc_if_approx_warm_v1";
-pub const PRIVATE_WARM_GRAPH_SEMANTICS: &str =
-    "rz-pals-private-native-warm/1;accepted-final-latent;no-query-double-add;fixed-2-iterations;private-self-kv-recomputed;fp32;pc-only";
+pub const PRIVATE_WARM_GRAPH_SEMANTICS: &str = "rz-pals-private-native-warm/1;accepted-final-latent;no-query-double-add;fixed-2-iterations;private-self-kv-recomputed;fp32;pc-only";
 /// This is the consumer's opt-in query meaning, not a change to legacy input.
 /// It requires the first actual 16 FP32 query bits to be consumed unchanged in
 /// later Warm calls. Actual record revision and original controls remain live.
-pub const FROZEN_QUERY_SEMANTICS_V1: &str =
-    "rz-pals-private-frozen-query/1;first-actual-query-fp32-bits;logical-game-search-situation-prefix-focus-role-isolated;records-revision-current;original-deadline-cancel-fixed;value-fresh";
+pub const FROZEN_QUERY_SEMANTICS_V1: &str = "rz-pals-private-frozen-query/1;first-actual-query-fp32-bits;logical-game-search-situation-prefix-focus-role-isolated;records-revision-current;original-deadline-cancel-fixed;value-fresh";
 const LATENT_ELEMENTS: usize = 16 * 384;
 const MANIFEST_LIMIT: usize = 64 * 1024;
 const GRAPH_LIMIT: usize = 256 * 1024 * 1024;
@@ -692,6 +690,7 @@ impl PalsOnnxBackend {
             layout: Layout::SharedPcIf,
             private_warm: Some(capability),
             runtime,
+            owned_sources: None,
             config,
             model_config: manifest.config,
             epoch: model_epoch,
@@ -778,7 +777,11 @@ fn capability_token(identity: PrivateModelIdentity, rules: [u8; 32], source: [u8
 fn validate_cpu(config: PalsOnnxConfig, bundle: Option<[u8; 32]>) -> Result<(), BackendError> {
     config.validate()?;
     if config.provider != Provider::Cpu || config.device_public_memory || bundle.is_some() {
-        return Err(fail(K::UnsupportedModel, S::Admission, "PALS private Warm v1 requires explicit CPU and host public memory; CUDA/device/V unsupported"));
+        return Err(fail(
+            K::UnsupportedModel,
+            S::Admission,
+            "PALS private Warm v1 requires explicit CPU and host public memory; CUDA/device/V unsupported",
+        ));
     }
     Ok(())
 }

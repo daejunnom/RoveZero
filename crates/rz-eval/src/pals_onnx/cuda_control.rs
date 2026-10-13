@@ -8,6 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+mod virtual_review;
+pub use virtual_review::{VirtualReviewControlLayout, VirtualReviewCudaPlacementWitness};
+
 const POLICY_SCHEMA: &str = "rovezero.pals-cuda-metadata-control.v2";
 const MAX_INVENTORY_BYTES: usize = 1024 * 1024;
 const MAX_PLACEMENT_BYTES: usize = 1024 * 1024;
@@ -27,6 +30,9 @@ pub struct PalsCudaControlPolicy {
     pub(super) manifest: [u8; 32],
     pub(super) inventory: [u8; 32],
     graphs: BTreeMap<String, GraphPolicy>,
+    /// Explicit V3 admission domain. Historical inventory construction remains
+    /// None and keeps its original P/C-only layout and witness checks.
+    virtual_layout: Option<VirtualReviewControlLayout>,
 }
 #[derive(Clone)]
 struct GraphPolicy {
@@ -254,6 +260,7 @@ impl PalsCudaControlPolicy {
             manifest: parse_sha256(&inventory.manifest_sha256)?,
             inventory: digest,
             graphs,
+            virtual_layout: None,
         })
     }
     pub(super) fn validate_pins(
@@ -346,6 +353,11 @@ impl PalsCudaControlPolicy {
         runtime: [u8; 32],
         bundle: [u8; 32],
     ) -> Result<PalsCudaPlacementWitness, BackendError> {
+        if self.virtual_layout.is_some() {
+            return Err(policy_error(
+                "V3 control policy requires its separate complete graph witness",
+            ));
+        }
         let mut roles = BTreeSet::new();
         if placements.len() != 2
             || placements.iter().any(|placement| {
@@ -2570,6 +2582,7 @@ mod tests {
             manifest: [2; 32],
             inventory: [3; 32],
             graphs: [("public".into(), graph()), ("shared_pc".into(), graph())].into(),
+            virtual_layout: None,
         };
         let profile = |node: &str, op: &str| serde_json::json!({"cat":"Node","name":format!("{node}_kernel_time"),"args":{"provider":CUDA,"op_name":op}});
         let public = serde_json::to_vec(&vec![profile("nn", "MatMul")]).unwrap();
