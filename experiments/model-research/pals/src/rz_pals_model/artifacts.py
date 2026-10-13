@@ -146,7 +146,7 @@ def read_rules_profile(path, config):
             "rules_input_declaration": declaration, "learned_input_compatibility": "unverified_declaration_only"}
 
 
-def output_directory(path):
+def output_directory(path, *, output_guard=None):
     """Refuse source-tree weights/reports and resolve symlinks before creation."""
     result = Path(path).expanduser().resolve()
     source = Path(__file__).resolve()
@@ -160,17 +160,20 @@ def output_directory(path):
         if owner.get("schema") != SCHEMA or owner.get("owner") != "rz-pals-model":
             raise ValueError("output directory belongs to another workload")
     else:
-        atomic_json(marker, {"schema": SCHEMA, "owner": "rz-pals-model"})
+        atomic_json(marker, {"schema": SCHEMA, "owner": "rz-pals-model"}, output_guard=output_guard)
     return result
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, *, output_guard=None):
     path = Path(path)
     if path.exists():
         raise FileExistsError(f"refusing to overwrite registered artifact: {path.name}")
     temporary = path.with_name(path.name + ".partial")
     if temporary.exists():
         raise FileExistsError("incomplete artifact already exists; inspect before retry")
+    if output_guard is not None:
+        raw = (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8")
+        output_guard(len(raw))
     with temporary.open("x", encoding="utf-8", newline="\n") as stream:
         json.dump(value, stream, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
         stream.write("\n")
@@ -478,7 +481,7 @@ def validate_virtual_export_manifest(manifest, metadata):
     return roles
 
 
-def export_virtual_checkpoint(model, metadata, directory, *, include_validator=False, rules_profile_json=None):
+def export_virtual_checkpoint(model, metadata, directory, *, include_validator=False, rules_profile_json=None, output_guard=None):
     """Build explicit V3 graphs without running a neural forward during export."""
     import onnx
     from .onnx_virtual_review import (SHARED_LAYOUT, LAYOUT_REVISION, virtual_io_spec,
@@ -486,7 +489,7 @@ def export_virtual_checkpoint(model, metadata, directory, *, include_validator=F
     if not model.config.virtual_review or rules_profile_json is None:
         raise ValueError("V3 export requires explicit source-pinned virtual Rules descriptor")
     rules_profile = read_rules_profile(rules_profile_json,model.config)
-    output = output_directory(directory)
+    output = output_directory(directory, output_guard=output_guard)
     spec, graphs, banks = virtual_io_spec(model.config), [], {}
     # P/C graph has no validator private initializer or role path. The optional
     # independent V graph is a collection artifact, omitted from Deployment.
@@ -503,7 +506,7 @@ def export_virtual_checkpoint(model, metadata, directory, *, include_validator=F
             "trained":str(metadata["trained"]).lower(),"training_steps":str(metadata["training_steps"]),
             "precision":"fp32","expected_ort":"1.22.0", **{key:rules_profile[key] for key in ("rules_input_profile","rules_input_semantic_sha256","rules_encoder_source_sha256")}})
         onnx.checker.check_model(document,full_check=True)
-        saved = _save(document,evidence,output/filename)
+        saved = _save(document,evidence,output/filename,output_guard=output_guard)
         declaration = spec[role]
         graphs.append({"role":role,"file":filename,"sha256":saved["sha256"],"opset":17,
             **{key:[{"name":name,"dtype":dtype,"shape":list(shape)} for name,dtype,shape in declaration[key]] for key in ("inputs","outputs")}})
@@ -518,7 +521,7 @@ def export_virtual_checkpoint(model, metadata, directory, *, include_validator=F
         "candidate_promotion":{"0":"none","1":"queen","2":"rook","3":"bishop","4":"knight"},
         "wdl_perspective":"input_side_to_move","numeric_status":"not_run","cuda_status":"not_run", **rules_profile}
     validate_virtual_export_manifest(manifest,metadata)
-    atomic_json(output/"export.json",manifest)
+    atomic_json(output/"export.json",manifest,output_guard=output_guard)
     return manifest
 
 

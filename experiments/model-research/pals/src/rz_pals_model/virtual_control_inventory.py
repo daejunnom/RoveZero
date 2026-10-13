@@ -360,11 +360,13 @@ def _private_dependencies(scope, bindings):
     return result
 
 
-def _write_exclusive(path, inventory):
+def _write_exclusive(path, inventory, *, output_guard=None):
     raw = (json.dumps(inventory, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
     if len(raw) > MAX_INVENTORY_BYTES:
         raise ValueError("inventory_output_bound_exceeded")
     path = legacy._external(path, output=True)
+    if output_guard is not None:
+        output_guard(len(raw))
     with path.open("xb") as stream:
         written = stream.write(raw)
         if written != len(raw):
@@ -384,13 +386,18 @@ def _admission_limits():
             "max_recursive_depth": MAX_RECURSIVE_DEPTH, "max_path_bytes": MAX_PATH_BYTES}
 
 
-def produce_virtual_control_inventory(export_manifest, export_manifest_sha256, output_json, *, opt_in=False, max_seconds=30):
+def produce_virtual_control_inventory(export_manifest, export_manifest_sha256, output_json, *, opt_in=False, max_seconds=30,
+                                      until_ns=None, output_guard=None):
     """Pin all bytes before ONNX import; never instantiate a runtime/session."""
     if opt_in is not True:
         raise ValueError("explicit_virtual_control_inventory_opt_in_required")
     if type(max_seconds) is not int or not 1 <= max_seconds <= 60:
         raise ValueError("explicit_finite_metadata_wall_required")
     deadline = time.monotonic() + max_seconds
+    if until_ns is not None:
+        if type(until_ns) is not int or until_ns <= time.monotonic_ns():
+            raise ValueError("original_inventory_deadline_expired_or_unregistered")
+        deadline = min(deadline, until_ns / 1_000_000_000)
     output = legacy._external(output_json, output=True)
     manifest_path = legacy._external(export_manifest)
     raw_manifest = legacy._read_pinned(manifest_path, export_manifest_sha256, MAX_MANIFEST_BYTES)
@@ -404,6 +411,8 @@ def produce_virtual_control_inventory(export_manifest, export_manifest_sha256, o
         if graph_bytes > MAX_TOTAL_GRAPH_BYTES:
             raise ValueError("total_pinned_graph_byte_bound_exceeded")
         raw_graphs.append(raw)
+    if time.monotonic() >= deadline:
+        raise ValueError("inventory_wall_deadline_exceeded")
     import onnx
     graphs, total_nodes = [], 0
     for entry, raw in zip(manifest["graphs"], raw_graphs):
@@ -429,7 +438,7 @@ def produce_virtual_control_inventory(export_manifest, export_manifest_sha256, o
                  "admission_limits": _admission_limits()}
     if time.monotonic() >= deadline:
         raise ValueError("inventory_wall_deadline_exceeded")
-    return _write_exclusive(output, inventory)
+    return _write_exclusive(output, inventory, output_guard=output_guard)
 
 
 def main(argv=None):

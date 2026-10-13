@@ -335,11 +335,14 @@ def verify_actual_generation_artifacts(directory, value, *, expected_sha256, exp
     return receipt
 
 
-def _atomic_json(path, value):
+def _atomic_json(path, value, *, output_guard=None):
     """Exclusive publication; on failure leave the owned partial file visible."""
     temporary = path.with_name(path.name + ".partial")
     if path.exists() or temporary.exists():
         raise FileExistsError("actual generation evidence already exists")
+    if output_guard is not None:
+        raw = (json.dumps(value, sort_keys=True, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+        output_guard(len(raw))
     with temporary.open("x", encoding="utf-8", newline="\n") as stream:
         json.dump(value, stream, sort_keys=True, ensure_ascii=False, indent=2, allow_nan=False)
         stream.write("\n")
@@ -381,7 +384,7 @@ def _export_descriptors(root, kind, manifest):
 
 def export_actual_generation(checkpoint_path, *, expected_checkpoint_sha256, model, optimizers, spec,
                              pc_dataset, v_dataset, frozen_pc_model_epoch, sampler_validator,
-                             rules_profile_json, directory, execute=False):
+                             rules_profile_json, directory, execute=False, output_guard=None):
     """Explicit owned-checkpoint export; never dispatches a training update.
 
     The caller must supply its already instantiated, eval-mode G1 model and the
@@ -409,11 +412,11 @@ def export_actual_generation(checkpoint_path, *, expected_checkpoint_sha256, mod
         import torch
         payload = torch.load(snapshot, map_location="cpu", weights_only=True)
         return _export_validated_snapshot(snapshot, size, identity, payload, model, optimizers, spec,
-            pc_dataset, v_dataset, frozen_pc_model_epoch, sampler_validator, rules_profile_json, directory)
+            pc_dataset, v_dataset, frozen_pc_model_epoch, sampler_validator, rules_profile_json, directory, output_guard)
 
 
 def _export_validated_snapshot(snapshot, size, identity, payload, model, optimizers, spec, pc_dataset, v_dataset,
-                               frozen_pc_model_epoch, sampler_validator, rules_profile_json, directory):
+                               frozen_pc_model_epoch, sampler_validator, rules_profile_json, directory, output_guard=None):
     from .generation_training import validate_checkpoint
     from .nonzero_training import _state_digest
     ledger = validate_checkpoint(payload, model, optimizers, spec, sampler_validator)
@@ -441,9 +444,11 @@ def _export_validated_snapshot(snapshot, size, identity, payload, model, optimiz
     root.mkdir(parents=True, exist_ok=False)
     try:
         _atomic_json(root / "generation-export-owner.json", {"schema": EXPORT_DOMAIN, "owner": "rz-pals-actual-generation",
-                     "generation_id": spec["generation_id"], "source_checkpoint_sha256": identity})
+                     "generation_id": spec["generation_id"], "source_checkpoint_sha256": identity}, output_guard=output_guard)
         temporary = root / "checkpoint.pt.partial"
         snapshot.seek(0)
+        if output_guard is not None:
+            output_guard(size)
         with temporary.open("xb") as writer:
             copied = hashlib.sha256()
             written = 0
@@ -451,6 +456,8 @@ def _export_validated_snapshot(snapshot, size, identity, payload, model, optimiz
                 written += len(block)
                 if written > size or ledger.cost["output_bytes"] + size + written > MAX_CORPUS_BYTES:
                     raise ValueError("pinned checkpoint copy exceeded registered size/output cap")
+                if output_guard is not None:
+                    output_guard(len(block))
                 copied.update(block)
                 writer.write(block)
             writer.flush()
@@ -463,7 +470,8 @@ def _export_validated_snapshot(snapshot, size, identity, payload, model, optimiz
                     "trained": True, "training_steps": sum(ledger.completed.values())}
         exports = {}
         for kind, include_v in (("collection", True), ("deployment", False)):
-            manifest = export_virtual_checkpoint(model, metadata, root / kind, include_validator=include_v, rules_profile_json=rules_profile_json)
+            manifest = export_virtual_checkpoint(model, metadata, root / kind, include_validator=include_v,
+                rules_profile_json=rules_profile_json, output_guard=output_guard)
             exports[kind] = _export_descriptors(root, kind, manifest)
             size_used = size + sum(entry["manifest"]["bytes"] + sum(g["bytes"] for g in entry["graphs"]) for entry in exports.values())
             if ledger.cost["output_bytes"] + size + size_used > MAX_CORPUS_BYTES:
@@ -476,7 +484,7 @@ def _export_validated_snapshot(snapshot, size, identity, payload, model, optimiz
         pin = provenance_digest(receipt)
         verify_actual_generation_artifacts(root, receipt, expected_sha256=pin,
              expected_spec_sha256=spec_digest(spec), expected_checkpoint_sha256=identity)
-        _atomic_json(root / "actual-generation.json", receipt)
+        _atomic_json(root / "actual-generation.json", receipt, output_guard=output_guard)
         file_sha256, file_bytes = _hash_file(root / "actual-generation.json", 4 * 1024**2)
         return {"provenance": receipt, "provenance_sha256": pin, "directory": str(root),
                 "provenance_file_sha256": file_sha256, "provenance_file_bytes": file_bytes,
@@ -485,6 +493,11 @@ def _export_validated_snapshot(snapshot, size, identity, payload, model, optimiz
         # Preserve both original evidence and any owned partial artifacts.
         failure = root / "export-incomplete.json"
         if not failure.exists() and not failure.with_name(failure.name + ".partial").exists():
-            _atomic_json(failure, {"schema": EXPORT_DOMAIN, "status": "incomplete", "error_type": type(error).__name__,
-                         "generation_id": spec["generation_id"], "source_checkpoint_sha256": identity, "arena_accepted": False})
+            try:
+                _atomic_json(failure, {"schema": EXPORT_DOMAIN, "status": "incomplete", "error_type": type(error).__name__,
+                             "generation_id": spec["generation_id"], "source_checkpoint_sha256": identity, "arena_accepted": False}, output_guard=output_guard)
+            except BaseException as evidence_error:
+                # Exhausted credit cannot erase the original export failure.
+                # Existing partial files and the child terminal remain owned.
+                raise error from evidence_error
         raise

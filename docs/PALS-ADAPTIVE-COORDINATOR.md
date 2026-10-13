@@ -144,9 +144,45 @@ V2 native 계수는 같은 실제 exclusive owner 호출 전후의 public cache�
 없다는 근거는 검증된 manifest와 실제 로드된 session 집합이다. 계수 포화·감소·혼합·
 물리 완료 불명은 알려진 0으로 표시하지 않으며, 검색 소비와 물리 완료도 따로 기록한다.
 
-2026-10-13의 CPU/mock 검사에서 Search는 639개 통과·2개 의도적 미실행,
-UCI는 527개 통과·1개 실패였다. 실패한 fixed trace의 상태·제한·score·PV·실제 node
-사용량은 같았으나 질문 식별값이 계산 조건에 포함된 차이가 있었다. 계산 조건과 private
-dispatch custody를 분리한 후속 수정은 원래 fixture와 판정 기준을 유지하며 재검사한다.
-신경망과 optimizer import를 차단한 새 trainer CLI metadata 검사 15개는 통과했다.
-이 결과는 실제 optimizer update·CUDA 완료·학습 checkpoint 재개 인수가 아니다.
+2026-10-13의 초기 Windows CPU/mock 검사에서 Search는 639개 통과·2개 의도적
+미실행, UCI는 527개 통과·1개 실패였다. 실패한 fixed trace의 상태·제한·score·PV·
+실제 node 사용량은 같았으나 질문 식별값이 계산 조건에 포함된 차이가 있었다. 계산
+조건과 private dispatch custody를 분리한 후 원래 fixture와 판정 기준을 유지한 Linux
+fixed trace 검사는 통과했다. 이어서 Linux feature 조합의 Search 675개 통과·2개
+의도적 미실행을 확인했다. 플랫폼·feature 조합이 다른 검사 수를 같은 실행으로 합산하지 않는다.
+
+후속 관리 실행에서 Windows 기본 adaptive feature 빌드, native owner 계수의 CPU
+검사 4개, runtime CPU 검사 69개가 통과했다. 신경망과 optimizer import를 차단한
+trainer CLI metadata 15개와 export CLI metadata 8개도 통과했다. metadata 검사는
+실제 optimizer update·ONNX export·CUDA 완료·학습 checkpoint 재개 인수가 아니다.
+원격 `77051c7`의 네 CI job은 source inventory 포맷과 선택적 serde 처리에서 실패했다.
+후속 `a9f5d17`은 이 두 수정만 공유했으며 네 CI job은 아직 실패 상태다. 모델 CI의
+기존 원문 fixture가 고정한 Rust source pin과 새 구현의 차이를 다시 검토하고 있다.
+source pin 검사를 완화하거나 hash만 자동 갱신하여 통과로 표시하지 않는다.
+
+## 실제 세대의 소유권과 수치 검증
+
+실제 세대 실행은 같은 원래 128판 archive 소유자를 P/C 학습·V action 수집·V 학습에
+유지한다. P/C 4,000 update의 `FrozenPcCollection`과 전체 5,000 update의 G1은
+다른 export domain이다. frozen 수집은 Collection과 외부 CPU_T, 최종 평가는
+Deployment와 own CPU_R·V-free 조건을 사용한다. 미래 가중치 hash를 사전 결과처럼
+등록하거나 JSON에서 완료 game·checkpoint·process 소유자를 재구성하지 않는다.
+
+각 export는 실제 새 graph에서 CUDA control inventory를 만들고, 같은 export와
+정확한 준비 입력을 대상으로 reference와 native 수치 검사를 수행해야 한다. G0·frozen·
+G1의 수치 증거는 서로 대체하지 않는다. actual trainer/export/numerical 소유자와
+수집 전 등록한 32개 opening·template 소유자를 같은 프로세스에 유지하여 최종 평가를
+연결한다. 실패한 child의 권한·원시 자료·실제 소비 비용은 보존한다. 새 CLI 호출로
+128판을 자동 재수집하지 않으며, 완료 단계 경계의 명시적 재개도 미해결 child를 넘지 않는다.
+
+자원 readback은 성공한 원래 모델 SessionBuilder·EP 등록·session commit의 설정과
+실제 caller·manager·worker·external process 관측을 구분한다. 전체 ORT helper 수,
+숨은 quota ancestry, 실제 external Threads/Hash 적용, SMT 배제 및 VRAM peak를
+확인하지 못하면 unknown이다. Linux topology probe는 원래 기한·취소와 읽기 상한을
+검사하고 Windows native 호출은 전후 제어 검사 범위만 표현한다.
+
+적응형 반환 예측은 정책의 예상 대기·반환 비용이며 실제 절약 시간이나 V utility가
+아니다. 완료 표본과 원래 질문·progress·소비 경계가 없으면 fixed 정책을 유지한다.
+초기 Collection+V 전용 own Yield 소비와 V-free P/C 또는 외부 CPU_T 소비는 별도
+연결·검사 대상이다. 이 문서의 소스 경로를 21개 항목의 실제 GPU·학습·대국 인수로
+표시하지 않는다.

@@ -501,7 +501,7 @@ def audit_virtual_warm_shared_pc_graph(document, fresh, fresh_evidence):
             "ort_prepack_copies": "unknown", "device_residency_sharing": "unknown"}
 
 
-def _save(document, evidence, destination):
+def _save(document, evidence, destination, *, output_guard=None):
     """Publish a complete artifact exclusively; retain failed partial writes.
 
     A same-directory hard link provides atomic no-replace publication. There is
@@ -510,11 +510,13 @@ def _save(document, evidence, destination):
     """
     from .artifacts import output_directory
     destination = Path(destination).expanduser().resolve()
-    destination = output_directory(destination.parent) / destination.name
+    destination = output_directory(destination.parent, output_guard=output_guard) / destination.name
     partial = destination.with_suffix(destination.suffix + ".partial")
     if destination.exists():
         raise FileExistsError(f"graph already exists: {destination.name}")
     raw = document.SerializeToString()
+    if output_guard is not None:
+        output_guard(len(raw))
     with partial.open("xb") as stream:
         written = stream.write(raw)
         if written != len(raw):

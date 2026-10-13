@@ -597,7 +597,7 @@ def validate_frozen_pc_boundary(ledger, *, model_epoch):
 
 def export_frozen_pc_collection(spec, checkpoint_path, expected_checkpoint_sha256, model, optimizers,
         pc_dataset, *, sampler_validator, model_epoch, directory, rules_profile_json, execute=False,
-        until_ns=None, clock=time.monotonic_ns):
+        until_ns=None, clock=time.monotonic_ns, output_guard=None):
     """Bridge the actual 4000-update checkpoint to Collection ONNX artifacts.
 
     This reuses the manual exporter. It does not execute a forward/update, issue
@@ -638,7 +638,7 @@ def export_frozen_pc_collection(spec, checkpoint_path, expected_checkpoint_sha25
         metadata = {"config": model.config.to_dict(), "checkpoint_sha256": expected_checkpoint_sha256,
                     "trained": True, "training_steps": 4000}
         manifest = export_virtual_checkpoint(model, metadata, target / "collection", include_validator=True,
-            rules_profile_json=rules_profile_json)
+            rules_profile_json=rules_profile_json, output_guard=output_guard)
         descriptors = _export_descriptors(target, "collection", manifest)
         output_bytes = descriptors["manifest"]["bytes"] + sum(g["bytes"] for g in descriptors["graphs"])
         if ledger.cost["output_bytes"] + size + output_bytes > MAX_CORPUS_BYTES:
@@ -653,7 +653,7 @@ def export_frozen_pc_collection(spec, checkpoint_path, expected_checkpoint_sha25
             "collection": descriptors, "validator_present": True, "validator_training_updates": 0,
             "deployment_exported": False, "native_loaded_assets_verified": False,
             "numeric_status": "not_run", "cuda_status": "not_run", "arena_eligible": False}
-        _atomic_json(target / "frozen-pc-collection.json", receipt)
+        _atomic_json(target / "frozen-pc-collection.json", receipt, output_guard=output_guard)
         receipt_sha256, receipt_bytes = _hash_file(target / "frozen-pc-collection.json", 4 * 1024**2)
         return {"receipt": receipt, "receipt_file_sha256": receipt_sha256, "receipt_file_bytes": receipt_bytes,
                 "actual_export_executed": True, "optimizer_updates_executed": 0, "arena_eligible": False}
@@ -796,6 +796,13 @@ def _active_source_readback(*, until_ns, clock=time.monotonic_ns):
     modules = []
     selected = sorted((name, module) for name, module in sys.modules.items()
         if name == "rz_pals_model" or name.startswith("rz_pals_model."))
+    main = sys.modules.get("__main__")
+    if main is not None:
+        path = Path(getattr(main, "__file__", "")).absolute()
+        package = root / "experiments/model-research/pals/src/rz_pals_model"
+        if path in (package / "generation_training_cli.py", package / "generation_export_cli.py"):
+            selected.append(("__main__", main))
+            selected.sort(key=lambda item: item[0])
     if not 1 <= len(selected) <= 128:
         raise ValueError("active original trainer source module cap exceeded")
     for name, module in selected:
