@@ -1138,11 +1138,9 @@ mod tests {
                 role_forward: 258_700_288
             }
         );
-        assert!(
-            config
-                .virtual_review_matmul_flops(PalsRole::Proposer, 3, 7, 0, 2, 24)
-                .is_err()
-        );
+        assert!(config
+            .virtual_review_matmul_flops(PalsRole::Proposer, 3, 7, 0, 2, 24)
+            .is_err());
     }
     fn input() -> PalsModelInput {
         PalsModelInput {
@@ -1240,11 +1238,9 @@ mod tests {
         ] {
             let config = PalsModelConfig::for_profile(profile);
             config.validate().unwrap();
-            assert!(
-                serde_json::to_string(&config)
-                    .unwrap()
-                    .contains(profile.as_str())
-            );
+            assert!(serde_json::to_string(&config)
+                .unwrap()
+                .contains(profile.as_str()));
             assert!(input().validate(&config).is_err() == profile.uses_full_line());
         }
         let bad = json.trim_end_matches('}').to_owned() + ",\"profile\":\"unknown_v2\"}";
@@ -1508,18 +1504,14 @@ mod tests {
                     .iter()
                     .all(|m| !*m)
             );
-            assert!(
-                lines.record_line_tokens
-                    [(slot * MAX_LINE_PLY + 3) * 3..(slot + 1) * MAX_LINE_PLY * 3]
-                    .iter()
-                    .all(|v| *v == 0)
-            );
-        }
-        assert!(
-            lines.query_line_mask[2 * MAX_LINE_PLY..]
+            assert!(lines.record_line_tokens
+                [(slot * MAX_LINE_PLY + 3) * 3..(slot + 1) * MAX_LINE_PLY * 3]
                 .iter()
-                .all(|m| !*m)
-        );
+                .all(|v| *v == 0));
+        }
+        assert!(lines.query_line_mask[2 * MAX_LINE_PLY..]
+            .iter()
+            .all(|m| !*m));
         let mut changed = original.clone();
         changed.full_line.as_mut().unwrap().records.pop();
         assert_eq!(
