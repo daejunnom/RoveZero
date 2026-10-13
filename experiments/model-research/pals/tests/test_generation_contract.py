@@ -254,9 +254,11 @@ class DataTests(SourceOnlyTests):
         self.assertEqual(report["cross_split_records_excluded"], 2)
 
     def test_duplicate_json_keys_and_nonfinite_are_rejected(self):
-        for text in ('{"a":1,"a":2}', '{"a":NaN}', '{"a":Infinity}'):
+        for text in ('{"a":1,"a":2}', '{"a":NaN}', '{"a":Infinity}',
+                     '{"a":1e9999}', '{"nested":[{"a":-1e9999}]}'):
             with self.assertRaises(ValueError):
                 data.strict_json(text)
+        self.assertEqual(data.strict_json('{"nested":[{"a":1e-8}]}'), {"nested": [{"a": 1e-8}]})
 
     def test_authority_trajectory_join_and_immutable_train_split(self):
         r = row()

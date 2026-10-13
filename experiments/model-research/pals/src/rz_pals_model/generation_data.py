@@ -25,7 +25,9 @@ BUCKETS = (8, 16, 32, 64, 128, 256)
 EVIDENCE_DOMAINS = frozenset(("rz-pals-generation-head-evidence/1", "rz-pals-generation-causal-evidence/1",
                             "rz-pals-generation-witness-evidence/1", "rz-pals-rules-outcome-evidence/1",
                             "rz-pals-generation-submission-evidence/1", "rz-pals-generation-native-completion-evidence/1",
-                            "rz-pals-generation-native-retirement-evidence/1", "rz-pals-generation-runtime-audit-evidence/1"))
+                            "rz-pals-generation-native-retirement-evidence/1", "rz-pals-generation-runtime-audit-evidence/1",
+                            "rz-pals-generation-action-authority-evidence/1", "rz-pals-generation-game-pgn-evidence/1",
+                            "rz-pals-generation-game-failure-evidence/1", "rz-pals-generation-frozen-action-group-evidence/1"))
 
 
 def fields(value, names, description):
@@ -70,6 +72,28 @@ def validate_evidence_receipt(evidence_sha256, receipt):
         parsed = strict_json(witness)
         if type(parsed) is not dict or not parsed:
             raise ValueError("raw runtime audit witness must be a strict JSON object")
+    elif receipt["schema"] == "rz-pals-generation-game-pgn-evidence/1":
+        fields(receipt, ("schema", "game_id", "opening_id", "engine_a_white", "pgn", "clock_audit"), "raw collection PGN")
+        identifier(receipt["game_id"])
+        identifier(receipt["opening_id"])
+        if type(receipt["engine_a_white"]) is not bool or type(receipt["pgn"]) is not str or not receipt["pgn"] or len(receipt["pgn"].encode()) > 1024 * 1024:
+            raise ValueError("bounded raw collection PGN and exact engine color required")
+        audit = fields(receipt["clock_audit"], ("schema", "base_ms", "increment_ms", "opening_plies", "accepted_plies",
+                      "white_remaining_ns", "black_remaining_ns", "white_wall_charged_ns", "black_wall_charged_ns",
+                      "white_increments", "black_increments"), "raw collection clock audit")
+        if audit["schema"] != "rz-pals-collection-clock/3":
+            raise ValueError("raw collection clock domain mismatch")
+        for name in set(audit) - {"schema"}:
+            uint(audit[name])
+        uint(audit["opening_plies"], 4096)
+        if uint(audit["accepted_plies"], 512) != audit["white_increments"] + audit["black_increments"]:
+            raise ValueError("raw collection accepted move/increment accounting mismatch")
+    elif receipt["schema"] == "rz-pals-generation-game-failure-evidence/1":
+        fields(receipt, ("schema", "game_id", "opening_id", "stage", "error"), "raw failed collection game")
+        for name in ("game_id", "opening_id", "stage"):
+            identifier(receipt[name])
+        if type(receipt["error"]) is not str or not receipt["error"] or len(receipt["error"].encode()) > 1024 * 1024:
+            raise ValueError("bounded actual game failure text required")
     return receipt
 
 
@@ -321,6 +345,9 @@ def task_pairs(snapshot, label):
     if label["source"] != "actual_action_witness" or type(label["outcomes"]) is not list or len(label["outcomes"]) > len(TASKS):
         raise ValueError("actual bounded causal action outcomes required")
     result = derive_task_targets(snapshot, label["outcomes"])
+    if any(witness["observed_sequence"] > label["observed_sequence"]
+           for outcome in label["outcomes"] for witness in outcome["new_witnesses"]):
+        raise ValueError("action target publication predates its collected witness")
     if (type(label["target_known_mask"]) is not list or len(label["target_known_mask"]) != len(TASKS)
             or any(type(v) is not bool for v in label["target_known_mask"]) or label["target_known_mask"] != result["target_known_mask"]):
         raise ValueError("V target-known mask differs from actual causal Pareto evidence")
@@ -331,13 +358,17 @@ def derive_task_targets(snapshot, observed_outcomes):
     """Derive a label mask after collection, without changing the sealed input."""
     if type(observed_outcomes) is not list or len(observed_outcomes) > len(TASKS):
         raise ValueError("bounded actual action outcomes required")
-    outcomes = {}
+    outcomes, seen_actions = {}, set()
     visible = {r["record_id"] for r in snapshot["selected_view"]["records"]}
     for outcome in observed_outcomes:
         fields(outcome, ("action", "execution_id", "completed", "wall_cost_ns", "new_witnesses", "causal_receipt_sha256"), "action outcome")
         action = outcome["action"]
-        if action not in TASKS or action in outcomes or not snapshot["action_support_mask"][TASKS.index(action)]:
+        if action not in TASKS or action in seen_actions or not snapshot["action_support_mask"][TASKS.index(action)]:
             raise ValueError("unsupported/duplicate action target")
+        # Completion and known exclusive cost determine supervision, not the
+        # identity of the action event. Unknown/incomplete events still cannot
+        # be repeated under the same immutable action context.
+        seen_actions.add(action)
         identifier(outcome["execution_id"])
         sha(outcome["causal_receipt_sha256"])
         if outcome["wall_cost_ns"] is not None:
@@ -535,12 +566,16 @@ class GenerationDataset:
             raise ValueError("target differs from independently recovered full head evidence")
         if head == "task":
             for outcome in target["outcomes"]:
-                causal = {"schema": "rz-pals-generation-causal-evidence/1", "input_sha256": input_sha256,
+                # Only the bounded actual chunk reader can resolve a sealed
+                # frozen-group alias. Legacy whole-JSON dictionaries retain
+                # the same-input rule and never rewrite source receipts.
+                origin = receipts.action_source_input(input_sha256, outcome) if hasattr(receipts, "action_source_input") else input_sha256
+                causal = {"schema": "rz-pals-generation-causal-evidence/1", "input_sha256": origin,
                           "outcome": {key: value for key, value in outcome.items() if key != "causal_receipt_sha256"}}
                 if receipts.get(outcome["causal_receipt_sha256"]) != causal:
                     raise ValueError("V action differs from recovered causal execution evidence")
                 for witness in outcome["new_witnesses"]:
-                    raw = {"schema": "rz-pals-generation-witness-evidence/1", "input_sha256": input_sha256,
+                    raw = {"schema": "rz-pals-generation-witness-evidence/1", "input_sha256": origin,
                            "witness": {key: value for key, value in witness.items() if key != "raw_evidence_sha256"},
                            "rules_validated": True}
                     if receipts.get(witness["raw_evidence_sha256"]) != raw:
@@ -589,4 +624,12 @@ def strict_json(text):
         return result
     def bad_constant(value):
         raise ValueError("nonfinite generation JSON: " + value)
-    return json.loads(text, object_pairs_hook=pairs, parse_constant=bad_constant)
+    def finite_float(value):
+        number = float(value)
+        # Exponent overflow uses valid JSON number syntax and therefore never
+        # invokes parse_constant. Reject it during decoding, including values
+        # inside a raw nested runtime witness that is not a model tensor.
+        if not math.isfinite(number):
+            raise ValueError("nonfinite generation JSON number")
+        return number
+    return json.loads(text, object_pairs_hook=pairs, parse_constant=bad_constant, parse_float=finite_float)

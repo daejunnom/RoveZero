@@ -7,7 +7,7 @@ import struct
 import tempfile
 from unittest import mock
 
-from test_generation_contract import SourceOnlyTests, row, policy
+from test_generation_contract import SourceOnlyTests, row, policy, wdl
 from rz_pals_model import generation_data as data
 from rz_pals_model import generation_training as train
 from rz_pals_model import generation_chunks as chunks
@@ -332,12 +332,126 @@ class ChunkTests(SourceOnlyTests):
         b["ticket"]["representation_history_sha256"] = "d" * 64
         self.assertNotEqual(chunks.semantic_sample_seal(masked, a), chunks.semantic_sample_seal(first, b))
 
+    def test_streamed_late_policy_hydrates_one_row_without_rewriting_input_or_publication(self):
+        published = record()
+        labelled, receipts = copy.deepcopy(published), {}
+        add_policy(labelled, receipts)
+        manifest = write_corpus(self.corpus, [published], evidence=receipts)
+        original = (self.corpus / manifest["chunks"][-1]["path"]).read_bytes()
+        with self.opened(manifest) as corpus:
+            rows = corpus.rows("train", optimization=True)
+            self.assertEqual(rows[0]["future_targets"], labelled["future_targets"])
+            self.assertEqual(list(rows)[0]["future_targets"], labelled["future_targets"])
+            self.assertEqual(rows[0]["input"], published["input"])
+            self.assertEqual(rows[0]["input_sha256"], published["input_sha256"])
+            self.assertEqual(data.coverage(rows)["proposer_valid_samples"], 1)
+            self.assertIsNone(published["future_targets"]["policy"])
+            with self.assertRaisesRegex(ValueError, "InsufficientValidTargets"):
+                corpus.admit("pc")
+        self.assertEqual((self.corpus / manifest["chunks"][-1]["path"]).read_bytes(), original)
+        self.assertIsNone(data.strict_json(original.decode())["future_targets"]["policy"])
+
+    def test_streamed_final_wdl_requires_exact_rules_trajectory_and_future_event(self):
+        published, receipts = record(), {}
+        result = {"schema": "rz-pals-rules-outcome-evidence/1", "game_id": "g1", "ending": "checkmate",
+                  "outcome": "white_win", "rules_terminal": True}
+        result_seal = data.digest(result["schema"], result)
+        receipts[result_seal] = result
+        trajectory = {"game_id": "g1", "ending": "checkmate", "outcome": "white_win",
+                      "anchors": [published["input"]["rules_anchor"]], "result_evidence_sha256": result_seal}
+        trajectory_seal = data.trajectory_digest(trajectory)
+        target = wdl(published)
+        target.update(trajectory_membership_sha256=trajectory_seal, rules_result_sha256=result_seal)
+        receipt = {"schema": chunks.HEAD_EVIDENCE_DOMAIN, "input_sha256": published["input_sha256"], "head": "wdl",
+                   "target": {k: v for k, v in target.items() if k != "raw_evidence_sha256"}}
+        receipt_seal = data.digest(receipt["schema"], receipt)
+        receipts[receipt_seal] = receipt
+        manifest = write_corpus(self.corpus, [published], evidence=receipts, trajectories={trajectory_seal: trajectory})
+        with self.opened(manifest) as corpus:
+            actual = corpus.rows("train")[0]
+            self.assertEqual(actual["future_targets"]["wdl"]["raw_evidence_sha256"], receipt_seal)
+            self.assertEqual(data.validate_record(actual)["wdl"], [1.0, 0.0, 0.0])
+            self.assertIsNone(published["future_targets"]["wdl"])
+        for mutation in (lambda v: v.update(observed_sequence=10),
+                         lambda v: v["anchor"].update(rules_state_sha256="3" * 64),
+                         lambda v: v.update(view_sha256="2" * 64)):
+            invalid_receipt = copy.deepcopy(receipt)
+            mutation(invalid_receipt["target"])
+            evidence = {result_seal: result, data.digest(invalid_receipt["schema"], invalid_receipt): invalid_receipt}
+            manifest = write_corpus(self.corpus, [published], evidence=evidence, trajectories={trajectory_seal: trajectory})
+            with self.subTest(target=invalid_receipt["target"]):
+                with self.assertRaises(ValueError):
+                    self.opened(manifest)
+
+    def test_streamed_head_conflict_duplicate_and_wrong_private_role_are_rejected(self):
+        published, receipts = record(), {}
+        add_policy(published, receipts)
+        original = copy.deepcopy(published)
+        conflicting = copy.deepcopy(next(iter(receipts.values())))
+        conflicting["target"]["ranked_moves"].reverse()
+        conflicting_seal = data.digest(conflicting["schema"], conflicting)
+        evidence = {conflicting_seal: conflicting}
+        manifest = write_corpus(self.corpus, [published], evidence=evidence)
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            self.opened(manifest)
+        self.assertEqual(published, original)
+        evidence.update(receipts)
+        manifest = write_corpus(self.corpus, [published], evidence=evidence)
+        with self.assertRaisesRegex(ValueError, "Integrity"):
+            self.opened(manifest)
+        validator = record()
+        validator["input"]["role"] = "validator"
+        validator["input"]["encoded_model_input"]["role"] = "validator"
+        validator["input_sha256"] = data.seal_input(validator["input"])
+        validator["future_targets"]["policy"] = None
+        invalid = copy.deepcopy(conflicting)
+        invalid["input_sha256"] = validator["input_sha256"]
+        invalid["target"]["question_id"] = validator["input"]["question_id"]
+        manifest = write_corpus(self.corpus, [validator], evidence={data.digest(invalid["schema"], invalid): invalid})
+        with self.assertRaisesRegex(ValueError, "private role"):
+            self.opened(manifest)
+
     def test_raw_runtime_audit_is_bounded_strict_metadata_without_label_authority(self):
         receipt = {"schema": "rz-pals-generation-runtime-audit-evidence/1", "witness_json": '{"status":"not_executed"}'}
         self.assertEqual(data.validate_evidence_receipt(data.digest(receipt["schema"], receipt), receipt), receipt)
-        for witness in ('{"key":1,"key":2}', '{"x":NaN}', '[]', '"text"', '{', " " * (1024 * 1024 + 1)):
+        for witness in ('{"key":1,"key":2}', '{"x":NaN}', '{"nested":{"x":1e9999}}',
+                        '{"x":[-1e9999]}', '[]', '"text"', '{', " " * (1024 * 1024 + 1)):
             invalid = dict(receipt, witness_json=witness)
             with self.subTest(witness=witness[:40]):
+                with self.assertRaises(ValueError):
+                    data.validate_evidence_receipt(data.digest(invalid["schema"], invalid), invalid)
+
+    def test_raw_game_pgn_failure_and_clock_metadata_cannot_mint_head_targets(self):
+        audit = {"schema": "rz-pals-collection-clock/3", "base_ms": 120000, "increment_ms": 1000,
+                 "opening_plies": 0, "accepted_plies": 0, "white_remaining_ns": 120000000000,
+                 "black_remaining_ns": 120000000000, "white_wall_charged_ns": 0, "black_wall_charged_ns": 0,
+                 "white_increments": 0, "black_increments": 0}
+        pgn = {"schema": "rz-pals-generation-game-pgn-evidence/1", "game_id": "g1", "opening_id": "o1",
+               "engine_a_white": True, "pgn": '[Event "schema-only failed game"]\n\n*', "clock_audit": audit}
+        failure = {"schema": "rz-pals-generation-game-failure-evidence/1", "game_id": "g1", "opening_id": "o1",
+                   "stage": "actual_decision", "error": "schema-only Infrastructure"}
+        receipts = {data.digest(value["schema"], value): value for value in (pgn, failure)}
+        published = record()
+        manifest = write_corpus(self.corpus, [published], evidence=receipts)
+        with self.opened(manifest) as corpus:
+            hydrated = corpus.rows("train")[0]
+            self.assertEqual(hydrated["future_targets"], dict.fromkeys(chunks.HEADS))
+            self.assertEqual(data.coverage([hydrated]).get("proposer_valid_samples", 0), 0)
+        for mutation in (lambda v: v.update(engine_a_white=1), lambda v: v.update(extra="unknown"),
+                         lambda v: v["clock_audit"].update(white_increments=1),
+                         lambda v: v["clock_audit"].update(base_ms=True),
+                         lambda v: v["clock_audit"].update(white_wall_charged_ns=-1),
+                         lambda v: v["clock_audit"].update(schema="unknown")):
+            invalid = copy.deepcopy(pgn)
+            mutation(invalid)
+            with self.subTest(raw=invalid):
+                with self.assertRaises(ValueError):
+                    data.validate_evidence_receipt(data.digest(invalid["schema"], invalid), invalid)
+        for mutation in (lambda v: v.update(error=""), lambda v: v.update(error=False),
+                         lambda v: v.update(stage="control\ncharacter"), lambda v: v.update(extra="unknown")):
+            invalid = copy.deepcopy(failure)
+            mutation(invalid)
+            with self.subTest(raw=invalid):
                 with self.assertRaises(ValueError):
                     data.validate_evidence_receipt(data.digest(invalid["schema"], invalid), invalid)
 
