@@ -3,6 +3,7 @@
 //! chunks; it neither reconstructs search authority nor runs inference.
 
 use super::*;
+#[cfg(target_os = "linux")]
 use sha2::{Digest as _, Sha256};
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
@@ -43,6 +44,9 @@ impl GenerationSeriesLimitsV3 {
 pub struct GenerationSeriesCollectorV3 {
     plan: SelfplayCollectionPlanV3,
     root_path: PathBuf,
+    // Retain the original directory owner in the public collector type; only
+    // Linux can construct the aggregation capability and inspect this FD.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     root_file: File,
     #[cfg(target_os = "linux")]
     root: cap_std::fs::Dir,
@@ -62,6 +66,9 @@ pub struct GenerationSeriesCollectorV3 {
     halted: bool,
     failure: Option<Box<GenerationGameProcessFailureV3>>,
     admission_error: Option<String>,
+    // Keep failed publication FD custody with its collector. Windows refuses
+    // construction rather than exposing another diagnostic publication path.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     diagnostic_files: Vec<File>,
     diagnostic_reserved_bytes: u64,
     partial_publication_ceiling: Option<u64>,
@@ -85,53 +92,54 @@ impl GenerationSeriesCollectorV3 {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = held_run_root;
-            return Err(invalid(
+            Err(invalid(
                 "whole-game retained archive aggregation requires Linux",
-            ));
+            ))
         }
         #[cfg(target_os = "linux")]
-        let root = {
-            let root = open_root(&run_root_path)?;
-            verify_root(&held_run_root, &root)?;
-            for name in [
-                GENERATION_SERIES_INDEX_FILE_V3,
-                GENERATION_SERIES_PARTIAL_FILE_V3,
-            ] {
-                check(
-                    root.symlink_metadata(name)
-                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
-                    "whole-game series publication names already occupied",
-                )?;
-            }
-            root
-        };
-        Ok(Self {
-            plan,
-            root_path: run_root_path,
-            root_file: held_run_root,
-            #[cfg(target_os = "linux")]
-            root,
-            limits,
-            publication_until,
-            accepted_games: 0,
-            archives: vec![],
-            child_names: BTreeSet::new(),
-            record_seals: BTreeSet::new(),
-            evidence_seals: BTreeSet::new(),
-            run_pins_sha256: None,
-            total_bytes: 0,
-            total_artifact_bytes: 0,
-            total_records: 0,
-            total_evidence_rows: 0,
-            total_chunks: 0,
-            halted: false,
-            failure: None,
-            admission_error: None,
-            diagnostic_files: vec![],
-            diagnostic_reserved_bytes: 0,
-            partial_publication_ceiling: None,
-            publication_read_bytes: 0,
-        })
+        {
+            let root = {
+                let root = open_root(&run_root_path)?;
+                verify_root(&held_run_root, &root)?;
+                for name in [
+                    GENERATION_SERIES_INDEX_FILE_V3,
+                    GENERATION_SERIES_PARTIAL_FILE_V3,
+                ] {
+                    check(
+                        root.symlink_metadata(name)
+                            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+                        "whole-game series publication names already occupied",
+                    )?;
+                }
+                root
+            };
+            Ok(Self {
+                plan,
+                root_path: run_root_path,
+                root_file: held_run_root,
+                root,
+                limits,
+                publication_until,
+                accepted_games: 0,
+                archives: vec![],
+                child_names: BTreeSet::new(),
+                record_seals: BTreeSet::new(),
+                evidence_seals: BTreeSet::new(),
+                run_pins_sha256: None,
+                total_bytes: 0,
+                total_artifact_bytes: 0,
+                total_records: 0,
+                total_evidence_rows: 0,
+                total_chunks: 0,
+                halted: false,
+                failure: None,
+                admission_error: None,
+                diagnostic_files: vec![],
+                diagnostic_reserved_bytes: 0,
+                partial_publication_ceiling: None,
+                publication_read_bytes: 0,
+            })
+        }
     }
     pub fn accepted_games(&self) -> usize {
         self.accepted_games

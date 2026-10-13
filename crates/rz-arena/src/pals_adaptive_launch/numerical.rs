@@ -20,6 +20,13 @@ pub use rz_experiments::{
 /// Arena retains its explicit ONNX admission feature boundary. The actual
 /// verifier performs no model load or inference, and callback failures retain
 /// their diagnostic text in the shared artifact error domain.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "Retain the public arena signature and its explicit feature-unsupported result on Windows; the native pinned launch consumer is Linux-only"
+    )
+)]
 pub fn validate_pals_numerical_acceptance_v5(
     config: &PalsAdaptiveStartupConfigV5,
     acceptance_bytes: &[u8],

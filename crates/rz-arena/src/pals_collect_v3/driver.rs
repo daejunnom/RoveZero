@@ -138,6 +138,7 @@ impl GenerationSavedActionRootV3 {
             _source_archive: None,
         })
     }
+    #[cfg(target_os = "linux")]
     pub(super) fn from_verified_archive(
         source: Arc<VerifiedGenerationGameArchiveV3>,
         position: Position,
@@ -904,7 +905,7 @@ impl GenerationSelfplayCollectorV3 {
             !self.halted
                 && Instant::now() < until
                 && self.next_game < 128
-                && self.next_game % 2 == 0,
+                && self.next_game.is_multiple_of(2),
             "collection requires next finite complete pair",
         )?;
         if self.next_game == 0 {
@@ -1201,25 +1202,26 @@ impl GenerationSelfplayCollectorV3 {
                 }
             }
             // A final legal move can be terminal at the exact ply bound.
-            if rules_authority.is_none() && termination == CollectionPgnTerminationV3::PlyLimit {
-                if matches!(
+            if rules_authority.is_none()
+                && termination == CollectionPgnTerminationV3::PlyLimit
+                && matches!(
                     trajectory
                         .position()
                         .classify_position()
                         .map_err(|e| invalid(e.to_string()))?
                         .play_status,
                     rz_position::PlayStatus::Terminal { .. }
-                ) {
-                    let (authority, receipt) = trajectory.terminate_rules()?;
-                    result = match authority.outcome {
-                        GenerationOutcomeV3::WhiteWin => CollectionPgnResultV3::WhiteWin,
-                        GenerationOutcomeV3::BlackWin => CollectionPgnResultV3::BlackWin,
-                        GenerationOutcomeV3::Draw => CollectionPgnResultV3::Draw,
-                    };
-                    termination = CollectionPgnTerminationV3::RulesAutomatic;
-                    rules_authority = Some(authority);
-                    rules_receipt = Some(receipt);
-                }
+                )
+            {
+                let (authority, receipt) = trajectory.terminate_rules()?;
+                result = match authority.outcome {
+                    GenerationOutcomeV3::WhiteWin => CollectionPgnResultV3::WhiteWin,
+                    GenerationOutcomeV3::BlackWin => CollectionPgnResultV3::BlackWin,
+                    GenerationOutcomeV3::Draw => CollectionPgnResultV3::Draw,
+                };
+                termination = CollectionPgnTerminationV3::RulesAutomatic;
+                rules_authority = Some(authority);
+                rules_receipt = Some(receipt);
             }
             Ok(())
         })();

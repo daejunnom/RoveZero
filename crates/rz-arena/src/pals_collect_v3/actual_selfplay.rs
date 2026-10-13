@@ -260,7 +260,7 @@ impl GenerationSelfplayFactoryV3 for ActualGenerationSelfplayFactoryV3 {
             !self.native_intakes_required || self.native_intakes.iter().all(Option::is_some),
             "whole-game native intake hooks were already consumed",
         )?;
-        let [intake_a, intake_b] = std::mem::replace(&mut self.native_intakes, [None, None]);
+        let [intake_a, intake_b] = std::mem::take(&mut self.native_intakes);
         let initial = exact_rules_anchor(initial)?;
         let first = reserve_actual_session_epochs_v3(2)?;
         let epochs = [first, ProcessEpoch(first.0 + 1)]; // range already checked

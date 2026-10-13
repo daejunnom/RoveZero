@@ -108,6 +108,53 @@ import 차단으로 시작 전에 거부됐으며 통과 검사에 포함하지 
 감사 114에서 두 legacy fixture의 각 두 source pin은 현재 파일과 일치했다.
 이 결과는 통합 작업 소스의 검사이며 정확한 공유 커밋 SHA의 CI 결과와 구분한다.
 
+후속 CPU 빌드 검증에서는 UCI 전체 feature/target의 엄격한 Clippy(115)와 Arena의
+엄격한 Clippy(117)가 통과했다. `35bf6a6`의 CI는 PALS model CPU job만 성공했고,
+Linux CPU·Windows CPU·독립 bindings job은 실패했다. 각 실패는 별도로 보존한다.
+독립 bindings lock에는 실제 path 의존성이 요구하는 capability 파일시스템 closure만
+추가했으며 기존 PyO3와 libc 버전은 유지했다. 온라인 metadata(119)와 bindings core
+빌드(120)는 통과했다. 이것은 Python 호출 성능이나 실제 학습의 검사가 아니다.
+
+Windows 실패는 Linux-native training 선언 테스트의 `/tmp` 절대 경로 가정이었다.
+fixture를 실제 플랫폼의 절대 경로로 구성하고 Windows drive prefix 거부를 그대로
+검사한다. 제품의 비밀 경로·상위 이동·지원하지 않는 플랫폼 거부를 완화하지 않는다.
+Linux CPU executable 실패는 관리 재현(121)에서 전체 실행 파일 해시의 128MiB
+한도 초과로 확인했다. stdout EOF뿐 아니라 bounded stderr·종료 상태·파일 크기를
+테스트에 보존했으며 193,004,120byte 파일의 exit 2를 기록했다.
+
+루트 dev profile의 debug 정보만 `1`로 제한했다. test는 dev 설정을 상속하고
+최적화·assertion·overflow·panic 설정은 기존 기본값을 유지한다. 타입·변수 수준의
+debug 정보는 줄지만 줄/모듈 정보는 유지한다. 이는 개발 빌드 준비 변경이며 탐색·모델
+성능 개선 자료가 아니다. 해시 한도·전체 bytes 해시·원래 실행 파일 소유권 검사는
+유지한다. 재빌드(122)의 실제 파일 크기는 113,719,080byte였고 원래 CPU UCI 실행
+검사 5개가 통과했다. 새 바이너리는 source commit·profile·실제 hash로 별도 등록하고
+이전 바이너리의 GPU·대국 증거를 자동 재사용하지 않는다.
+
+전체 Linux workspace/feature/target 검사(123)는 컴파일 중 관리 catalog의 12GiB
+상한에 도달하여 종료 코드 125로 중단했다. 원시 로그와 종료·정리 증거는 보존한다.
+관리기가 비활성 완료 cache를 회수한 뒤 같은 소스·조건으로 실행한 124는
+2,881개 통과·0 실패·18개 의도적 미실행, 종료 코드 0이었다. Arena 326개에는
+실패 출력의 원래 FD 보존 검사가 포함되며, ignored 검사는 실제 GPU 인수로 세지 않는다.
+이후 strict Clippy(125)가 지적한 V5 테스트의 두 default 재할당 표현만 초기화로
+정리했다. 제품 admission과 assertion은 동일하며 전체 strict Clippy(126)는 통과했다.
+124 종료 시 자신의 재생성 build slot이 8GiB를 넘어서 관리기가 이를 회수했고,
+cleanup verified와 작은 ownership record만 남긴 상태를 확인했다. 모델·원시 실행 자료·
+보고서를 삭제한 것이 아니며, 관리 cache 정리를 성능 인수로 해석하지 않는다.
+
+독립 bindings core의 Windows 기본 feature/전체 target strict Clippy(127)가
+통과했다. Windows training 경로 fixture(128)는 1개 통과했지만 Linux 전용
+구현의 미사용 경고 46개가 있어 strict Windows 인수로 보고하지 않는다.
+실제 Linux 소비자와 같은 `cfg`로 import·내부 helper·constructor를 좁게
+구분하고, 공개 compatibility signature와 원래 파일 보관 수명은 유지했다.
+공개 거부 접점과 custody 필드는 필요한 선언에만 이유가 있는 lint 예외를
+적용했으며 Windows에서 Linux-native 실행을 허용하지 않는다. 이후 V5의
+수정된 fixture 검사(129)는 42개 통과·0 실패, cleanup verified였다.
+
+Windows 전체 strict Clippy(130)는 원래 deadline을 축소하는 내부 helper의
+제품 Windows 미사용 오류 1개로 실패했다. 원래 판정과 테스트를 유지하며
+해당 helper에 실제 Linux 제품·단위 검사와 같은 빌드 조건을 적용했다.
+실패와 정리 로그는 보존하고 후속 전체 strict 검사를 별도로 기록한다.
+
 학습·export·수치 검증 실패 자료는 원래 등록 경로와 whole deadline·남은 read credit
 안에서 읽기 전용으로 회수한다. 열린 FD는 metadata·hash 검사보다 먼저 실패 전용
 owner에 보유하며, 빈 파일·여러 링크·partial을 성공 checkpoint·수치 인수 권한으로

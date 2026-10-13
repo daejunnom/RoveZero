@@ -259,6 +259,10 @@ impl FrozenActionGroupV3 {
     pub fn next_action(&self) -> Option<usize> {
         self.registration.actions.get(self.members.len()).copied()
     }
+    #[allow(
+        clippy::result_large_err,
+        reason = "A rejected action returns its original evidence and process owner inline without allocating or discarding failure custody"
+    )]
     pub fn push_actual(
         &mut self,
         member: GenerationIsolatedActionV3,

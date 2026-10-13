@@ -190,11 +190,14 @@ fn absolute_safe(path: &Path) -> bool {
         })
 }
 
+type FrozenIntakeOwner =
+    Arc<Mutex<Option<Result<VerifiedFrozenPcIntakeV3, Box<FrozenPcIntakeFailureV3>>>>>;
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct ActionCliOwnerV3 {
     archives: Vec<Arc<VerifiedGenerationGameArchiveV3>>,
     collector: Option<GenerationActionOutcomeCollectorV3>,
-    frozen: Arc<Mutex<Option<Result<VerifiedFrozenPcIntakeV3, Box<FrozenPcIntakeFailureV3>>>>>,
+    frozen: FrozenIntakeOwner,
     intake_process: Option<rz_uci::pals_adaptive_bootstrap::PreparedAdaptiveProcessV5>,
     factory: Option<ActualGenerationActionOutcomeFactoryV3>,
 }
@@ -278,7 +281,7 @@ pub struct VerifiedActionOutcomeArchiveV3 {
     manifest: GenerationChunkManifestV3,
     plan: ActionOutcomeCollectionPlanV3,
     archives: Vec<Arc<VerifiedGenerationGameArchiveV3>>,
-    frozen: Arc<Mutex<Option<Result<VerifiedFrozenPcIntakeV3, Box<FrozenPcIntakeFailureV3>>>>>,
+    frozen: FrozenIntakeOwner,
     #[cfg(target_os = "linux")]
     root: cap_std::fs::Dir,
     #[cfg(target_os = "linux")]
@@ -709,13 +712,13 @@ fn run_linux(
         let mut preservation_error = diagnostic_root.as_ref().and_then(|root| {
             preserve_failed_factory(owner.factory.as_ref(), root, diagnostic_remaining, until).err()
         });
-        if let Some(collector) = owner.collector.as_mut() {
-            if let Err(archive_error) = collector.preserve_partial(&error.to_string(), until) {
-                preservation_error = Some(match preservation_error {
-                    Some(raw_error) => invalid(format!("original action raw preservation: {raw_error}; partial archive: {archive_error}")),
-                    None => archive_error,
-                });
-            }
+        if let Some(collector) = owner.collector.as_mut()
+            && let Err(archive_error) = collector.preserve_partial(&error.to_string(), until)
+        {
+            preservation_error = Some(match preservation_error {
+                Some(raw_error) => invalid(format!("original action raw preservation: {raw_error}; partial archive: {archive_error}")),
+                None => archive_error,
+            });
         }
         (error, preservation_error)
     })

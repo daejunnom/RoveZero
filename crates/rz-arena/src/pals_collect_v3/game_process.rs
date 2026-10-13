@@ -4,24 +4,31 @@
 //! this module's private process-restart receipt. No JSON flag grants authority.
 
 use super::*;
-use crate::process::{
-    OriginalProcessInput, OriginalProcessOutput, OriginalProcessWindow, OwnedArtifactTreeWatch,
-    ProcessLimits,
-};
+#[cfg(target_os = "linux")]
+use crate::process::{OriginalProcessInput, OriginalProcessWindow};
+use crate::process::{OriginalProcessOutput, OwnedArtifactTreeWatch, ProcessLimits};
 use rz_eval::error::{BackendError, FailureKind, FailureStage};
+#[cfg(target_os = "linux")]
 use rz_eval::pals_model::virtual_review::{PalsVirtualReviewInput, ReviewExecutionIdentity};
+use rz_eval::pals_onnx::virtual_review::PalsVirtualReviewOnnxBackend;
+#[cfg(target_os = "linux")]
 use rz_eval::pals_onnx::virtual_review::{
-    PalsVirtualReviewOnnxBackend, VirtualReviewExecutionMode,
-    validate_virtual_review_export_manifest,
+    VirtualReviewExecutionMode, validate_virtual_review_export_manifest,
 };
-use rz_experiments::{ArtifactRef, PalsAdaptiveStartupConfigV5, PalsStartupAssetPurposeV5};
+#[cfg(target_os = "linux")]
+use rz_experiments::PalsStartupAssetPurposeV5;
+use rz_experiments::{ArtifactRef, PalsAdaptiveStartupConfigV5};
 use rz_search::time::TimeBudgetConfig;
 use rz_uci::pals_adaptive_startup::{PalsStartupOptionsV5, PinnedPalsStartupV5};
 use rz_uci::pals_native::startup_virtual::NativeVirtualReviewIntakeV5;
+#[cfg(target_os = "linux")]
 use sha2::{Digest as _, Sha256};
+#[cfg(target_os = "linux")]
 use std::ffi::OsString;
 use std::fs::File;
-use std::path::{Component, Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -30,12 +37,19 @@ pub const GENERATION_GAME_CHILD_ARGUMENT_V3: &str = "--generation-single-game-ch
 pub const GENERATION_GAME_CHILD_OUTPUT_V3: &str = "generation-game-output.json";
 pub const GENERATION_GAME_REQUEST_DOMAIN_V3: &str = "rz-pals-whole-game-child-input/1";
 const REQUEST_DOMAIN: &str = GENERATION_GAME_REQUEST_DOMAIN_V3;
+#[cfg(target_os = "linux")]
 const OUTPUT_DOMAIN: &str = "rz-pals-whole-game-child-output/1";
+#[cfg(target_os = "linux")]
 const RECEIPT_DOMAIN: &str = "rz-pals-whole-game-parent-observation/1";
+#[cfg(target_os = "linux")]
 const MAX_CONTROL_BYTES: u64 = 2 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_GAME_WINDOW_NS: u64 = 3_600_000_000_000;
+#[cfg(target_os = "linux")]
 const MAX_GAME_CLEANUP_NS: u64 = 30_000_000_000;
 static CHILD_GAME_BEGUN_V3: AtomicBool = AtomicBool::new(false);
 static NEXT_PROCESS_LAUNCH_V3: AtomicU64 = AtomicU64::new(1);
@@ -290,6 +304,7 @@ pub struct GenerationGameRawLimitsV3 {
     pub max_read_bytes: u64,
 }
 impl GenerationGameRawLimitsV3 {
+    #[cfg(target_os = "linux")]
     fn validate(&self) -> Result<(), ArenaError> {
         check(
             self.max_records > 0
@@ -305,6 +320,7 @@ impl GenerationGameRawLimitsV3 {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GameFilePin {
@@ -312,6 +328,7 @@ struct GameFilePin {
     sha256: String,
     bytes: u64,
 }
+#[cfg(target_os = "linux")]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChildOutput {
@@ -365,6 +382,9 @@ impl NativeLoadedReadback {
 /// controls and hashes its actual mapped executable. It may run one game once.
 pub struct GenerationGameChildAuthorityV3 {
     request: GenerationWholeGameRequestV3,
+    // Preserve canonical input custody in the cross-platform capability type;
+    // only the Linux loaded-image producer can seal or construct this owner.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     original_bytes: Vec<u8>,
     pinned: [Arc<PinnedPalsStartupV5>; 2],
     cwd: PathBuf,
@@ -452,21 +472,24 @@ pub fn begin_generation_game_child_v3(
         file
     };
     #[cfg(not(target_os = "linux"))]
-    let binary = {
+    {
         let _ = (until, &pinned);
-        return Err(invalid(
+        Err(invalid(
             "whole-game original loaded-image producer requires Linux",
-        ));
-    };
-    Ok(GenerationGameChildAuthorityV3 {
-        request,
-        original_bytes: bytes,
-        pinned,
-        cwd,
-        _binary: binary,
-        execution_deadline,
-        whole_deadline,
-    })
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Ok(GenerationGameChildAuthorityV3 {
+            request,
+            original_bytes: bytes,
+            pinned,
+            cwd,
+            _binary: binary,
+            execution_deadline,
+            whole_deadline,
+        })
+    }
 }
 
 /// Executes one actual in-process native game inside this new OS child, joins
@@ -677,7 +700,7 @@ fn seal_actual_child_output(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = until;
+        let _ = (until, &native_readbacks);
         Err(invalid(
             "whole-game child output requires Linux pinned files",
         ))
@@ -727,10 +750,9 @@ impl Drop for GenerationGameProcessFailureV3 {
         if self.process().is_some_and(|p| {
             p.process().pending_child.is_some()
                 || p.process().receipt.group_cleanup == crate::CleanupStatus::Unverified
-        }) {
-            if let Some(owner) = self.owner.take() {
-                let _quarantine = Box::leak(owner);
-            }
+        }) && let Some(owner) = self.owner.take()
+        {
+            let _quarantine = Box::leak(owner);
         }
     }
 }
@@ -1815,6 +1837,14 @@ fn read_unpinned_control(file: &File, bytes: u64, until: Instant) -> Result<Vec<
 }
 
 #[cfg(target_os = "linux")]
+type VerifiedGameRaw = (
+    BTreeMap<String, GenerationRecordV3>,
+    BTreeMap<String, serde_json::Value>,
+    Option<GenerationTrajectoryAuthorityV3>,
+    VerifiedGenerationGameSummaryV3,
+);
+
+#[cfg(target_os = "linux")]
 fn verify_raw(
     request: &GenerationWholeGameRequestV3,
     output: &ChildOutput,
@@ -1823,15 +1853,7 @@ fn verify_raw(
     held: &mut Vec<HeldGameArtifact>,
     credit: &mut ReadCredit<'_>,
     limits: GenerationGameRawLimitsV3,
-) -> Result<
-    (
-        BTreeMap<String, GenerationRecordV3>,
-        BTreeMap<String, serde_json::Value>,
-        Option<GenerationTrajectoryAuthorityV3>,
-        VerifiedGenerationGameSummaryV3,
-    ),
-    ArenaError,
-> {
+) -> Result<VerifiedGameRaw, ArenaError> {
     let mut records = BTreeMap::new();
     let mut evidence = BTreeMap::new();
     let mut inputs = BTreeSet::new();
@@ -2361,6 +2383,7 @@ fn verify_native_record(
     )
 }
 
+#[cfg(target_os = "linux")]
 fn parse_native_digest(sha: &str) -> Result<[u8; 32], ArenaError> {
     rz_eval::asset::parse_sha256(sha).map_err(|_| invalid("whole-game native digest syntax"))
 }
@@ -2368,6 +2391,7 @@ fn parse_native_digest(sha: &str) -> Result<[u8; 32], ArenaError> {
 /// Reverse only the public array-token transport ABI, then use the model's
 /// actual typed validation/preparation/digest. Roundtrip rejects a permissive
 /// projection or a second interpretation of the retained JSON input.
+#[cfg(target_os = "linux")]
 fn decode_native_input(input: &GenerationInputV3) -> Result<PalsVirtualReviewInput, ArenaError> {
     input.validate()?;
     fn tokens(value: &mut serde_json::Value) -> Result<(), ArenaError> {

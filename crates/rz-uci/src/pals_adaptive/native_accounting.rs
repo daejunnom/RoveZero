@@ -210,6 +210,9 @@ impl AdaptiveNativeAccountingSnapshot {
         *self = next;
         Ok(())
     }
+    // Only actual native bootstrap aggregates across roots; retain the focused
+    // accounting unit test in builds without that optional consumer.
+    #[cfg(any(test, all(feature = "pals-adaptive", feature = "onnx-cpu")))]
     pub(crate) fn checked_merge(&mut self, actual: Self) -> Result<(), AdaptiveManagerError> {
         let mut next = *self;
         macro_rules! merge {

@@ -3,24 +3,31 @@
 //! 실패·취소는 원래 파일, partial 출력과 자식 수명을 보존하고 재시도하지 않는다.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+#[cfg(target_os = "linux")]
+use super::GenerationExportKindV3;
 use super::{
-    GenerationExportKindV3, GenerationTrainingFilePinV3, GenerationTrainingPythonRuntimeV3,
+    GenerationTrainingFilePinV3, GenerationTrainingPythonRuntimeV3,
     PreparedFrozenActionStartupInputsV3, VerifiedGenerationExportV3, check, invalid,
 };
 use crate::{ArenaError, process::OriginalProcessOutput};
 use rz_experiments::{
-    ArtifactRef, PalsAdaptiveStartupConfigV5, PalsInputLockV5, PalsNumericalAcceptanceV5,
-    PalsNumericalAdmissionV5, PalsNumericalBindingsV5, PalsNumericalInvocationV5,
-    PalsNumericalRunPairV5, PalsStartupAssetPurposeV5 as Purpose, PalsStartupAssetV5,
+    ArtifactRef, PalsAdaptiveStartupConfigV5, PalsInputLockV5, PalsNumericalAdmissionV5,
+    PalsNumericalBindingsV5, PalsStartupAssetPurposeV5 as Purpose, PalsStartupAssetV5,
+};
+#[cfg(target_os = "linux")]
+use rz_experiments::{
+    PalsNumericalAcceptanceV5, PalsNumericalInvocationV5, PalsNumericalRunPairV5,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 const LAUNCH: &str = "rz-pals-generation-numerical-launch/1";
@@ -1151,8 +1158,10 @@ fn run_captures(
         .assets
         .push(raw_asset(&file.pin, relative, Purpose::NumericalAcceptance));
     owner.checkpoints.push(file);
-    let mut read =
-        |artifact: &ArtifactRef, limit: usize| -> Result<Vec<u8>, rz_experiments::ManifestError> {
+    let admission = {
+        let mut read = |artifact: &ArtifactRef,
+                        limit: usize|
+         -> Result<Vec<u8>, rz_experiments::ManifestError> {
             let asset = finalized
                 .assets
                 .iter()
@@ -1184,10 +1193,9 @@ fn run_captures(
             common::verify_bytes(found.1, found.0, true, &mut credit)
                 .map_err(|e| rz_experiments::ManifestError::Artifact(e.to_string()))
         };
-    let admission =
         rz_experiments::validate_pals_numerical_acceptance_v5(&finalized, &raw, &mut read)
-            .map_err(|e| invalid(e.to_string()))?;
-    drop(read);
+            .map_err(|e| invalid(e.to_string()))?
+    };
     finalized
         .validate_against(lock)
         .map_err(|e| invalid(e.to_string()))?;

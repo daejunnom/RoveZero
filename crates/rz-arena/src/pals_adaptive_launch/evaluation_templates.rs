@@ -3,7 +3,9 @@
 //! Only held actual G1 exporter/checkpoint and independent numerical owners may
 //! replace their explicitly registered future model fields.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
-use super::evaluation_series::{registration_pair, validate_series};
+use super::evaluation_series::registration_pair;
+#[cfg(target_os = "linux")]
+use super::evaluation_series::validate_series;
 use super::*;
 #[cfg(target_os = "linux")]
 use crate::pals_collect_v3::training_process::{self as io, ReadAccounting, ReadCredit};

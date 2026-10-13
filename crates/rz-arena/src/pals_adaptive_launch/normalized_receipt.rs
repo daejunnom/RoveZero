@@ -26,10 +26,10 @@ pub(super) fn begin_pals_run_timing_v5(lock: &LockedPalsArenaLaunchV5) -> Result
 pub(super) fn finish_pals_run_timing_v5(
     t: &std::sync::Arc<std::sync::Mutex<Option<PalsAdaptiveRunTimingV5>>>,
 ) {
-    if let Ok(mut t) = t.lock() {
-        if let Some(t) = t.as_mut() {
-            t.finished = Some(Instant::now());
-        }
+    if let Ok(mut t) = t.lock()
+        && let Some(t) = t.as_mut()
+    {
+        t.finished = Some(Instant::now());
     }
 }
 pub(super) fn pals_original_wall_deadline_v5(
@@ -113,19 +113,19 @@ fn native_receipt_belongs_to_owner(
 }
 
 #[cfg(target_os = "linux")]
+type PalsFailurePartsV5<'a> = (
+    &'a NativeLaunchOwner<LockedPalsArenaLaunchV5>,
+    &'a ArenaError,
+    Option<&'a crate::NativePairReceipt<PalsAdaptiveSessionAuditV5>>,
+    Option<&'a ArtifactRef>,
+    Option<&'a crate::ProcessOutput>,
+    bool,
+);
+
+#[cfg(target_os = "linux")]
 fn failure_parts(
     failure: &PalsAdaptivePairFailureV5,
-) -> Result<
-    (
-        &NativeLaunchOwner<LockedPalsArenaLaunchV5>,
-        &ArenaError,
-        Option<&crate::NativePairReceipt<PalsAdaptiveSessionAuditV5>>,
-        Option<&ArtifactRef>,
-        Option<&crate::ProcessOutput>,
-        bool,
-    ),
-    ArenaError,
-> {
+) -> Result<PalsFailurePartsV5<'_>, ArenaError> {
     match failure {
         PalsAdaptivePairFailureV5::Admission { cause, owner } => {
             Ok((owner, cause, None, None, None, true))
@@ -208,18 +208,17 @@ pub fn build_pals_failed_run_receipt_v5(
         }
     }
     let mut elapsed = PalsObservedV3::Unknown;
-    if let Ok(timing) = owner.spec.timing.lock() {
-        if let Some(timing) = timing.as_ref() {
-            if let Some(end) = timing.finished {
-                let ms = millis_ceil(end.duration_since(timing.started).as_nanos())?;
-                receipt.wall_time_ms = ms;
-                elapsed = PalsObservedV3::Observed {
-                    value: ms, method: "original run-entry Instant through failed executor return; excludes snapshot preparation".into(),
-                };
-                if ms > lock.manifest.window.wall_time_max_ms {
-                    receipt.failures.insert(PalsFailureV5::Expired);
-                }
-            }
+    if let Ok(timing) = owner.spec.timing.lock()
+        && let Some(timing) = timing.as_ref()
+        && let Some(end) = timing.finished
+    {
+        let ms = millis_ceil(end.duration_since(timing.started).as_nanos())?;
+        receipt.wall_time_ms = ms;
+        elapsed = PalsObservedV3::Observed {
+            value: ms, method: "original run-entry Instant through failed executor return; excludes snapshot preparation".into(),
+        };
+        if ms > lock.manifest.window.wall_time_max_ms {
+            receipt.failures.insert(PalsFailureV5::Expired);
         }
     }
     let mut cleanup = PalsObservedV3::Unknown;
@@ -302,35 +301,30 @@ pub fn build_pals_failed_run_receipt_v5(
     // No partial native result is aggregated into an endpoint accepted record.
     // Complete audited games may be represented only from an exact stored proof;
     // otherwise the raw native failure (including engine offender) remains linked.
-    if observed(&proof).is_some() {
-        if let Some(native) = native {
-            if let (Some(pgn), Some(audit), Some(clock), Some(pair)) = (
-                native
-                    .artifacts
-                    .iter()
-                    .find(|a| a.path.ends_with("/match.pgn")),
-                native.pgn_audit.as_ref(),
-                native.clock_audit.as_ref(),
-                lock.manifest.pair.as_ref(),
-            ) {
-                if native.pgn_audit_error.is_none()
-                    && native.clock_audit_error.is_none()
-                    && audit.games.len() <= 2
-                    && audit.games.len() == clock.games.len()
-                {
-                    for (index, game) in audit.games.iter().enumerate() {
-                        if game.game_id != clock.games[index].game_id {
-                            notes.push("Rules/clock game identity differed; raw game retained without normalized result".into());
-                            continue;
-                        }
-                        match game_receipt(game, index, pair, pgn, artifact.unwrap()) {
-                            Ok(game) => receipt.games.push(game),
-                            Err(error) => {
-                                notes.push(format!("unresolved game remains raw: {error}"))
-                            }
-                        }
-                    }
-                }
+    if observed(&proof).is_some()
+        && let Some(native) = native
+        && let (Some(pgn), Some(audit), Some(clock), Some(pair)) = (
+            native
+                .artifacts
+                .iter()
+                .find(|a| a.path.ends_with("/match.pgn")),
+            native.pgn_audit.as_ref(),
+            native.clock_audit.as_ref(),
+            lock.manifest.pair.as_ref(),
+        )
+        && native.pgn_audit_error.is_none()
+        && native.clock_audit_error.is_none()
+        && audit.games.len() <= 2
+        && audit.games.len() == clock.games.len()
+    {
+        for (index, game) in audit.games.iter().enumerate() {
+            if game.game_id != clock.games[index].game_id {
+                notes.push("Rules/clock game identity differed; raw game retained without normalized result".into());
+                continue;
+            }
+            match game_receipt(game, index, pair, pgn, artifact.unwrap()) {
+                Ok(game) => receipt.games.push(game),
+                Err(error) => notes.push(format!("unresolved game remains raw: {error}")),
             }
         }
     }

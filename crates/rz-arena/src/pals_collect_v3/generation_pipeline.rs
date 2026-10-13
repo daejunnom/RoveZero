@@ -524,6 +524,10 @@ pub fn run_generation_and_evaluation_owned_v3(
     expected_sha256: &str,
     cancel: Arc<AtomicBool>,
 ) -> Result<crate::pals_adaptive_launch::PalsEvaluationSeriesV5, Box<GenerationPipelineFailureV3>> {
+    // This sequential parent retains the original non-Send control owner.
+    // Arc preserves its identity through evaluation custody; this owner is
+    // never transferred to the CPU/GPU workers or made Send/Sync by the wrapper.
+    #[allow(clippy::arc_with_non_send_sync)]
     let pipeline = Arc::new(run_generation_pipeline_owned_v3(
         path,
         expected_sha256,

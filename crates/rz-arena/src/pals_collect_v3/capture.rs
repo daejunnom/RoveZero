@@ -489,6 +489,10 @@ impl TeacherBindingRegistryV3 {
         })
     }
 }
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The original teacher job, completion, chronology and separately pinned binary and profile authorities are validated independently"
+)]
 pub fn attach_completed_teacher_policy_v3(
     record: &mut GenerationRecordV3,
     binding: &TeacherInputBindingV3,

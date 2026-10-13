@@ -310,12 +310,12 @@ impl PalsArenaLaunchV5 {
         let mut unique = BTreeMap::new();
         for a in self.declared_artifacts() {
             a.validate()?;
-            if let Some(prior) = unique.insert(&a.path, a) {
-                if prior != a {
-                    return Err(ManifestError::Integrity(
-                        "logical source path has contradictory asset pins".into(),
-                    ));
-                }
+            if let Some(prior) = unique.insert(&a.path, a)
+                && prior != a
+            {
+                return Err(ManifestError::Integrity(
+                    "logical source path has contradictory asset pins".into(),
+                ));
             }
         }
         unique

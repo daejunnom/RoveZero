@@ -704,6 +704,8 @@ where
             )
         })
     }
+    // The actual native bootstrap alone owns the private collection context.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub(crate) fn collection_context_ready(&self) -> Result<(), ContractError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(poisoned("adaptive process admission closed"));
@@ -726,6 +728,7 @@ where
     }
     /// Revocation is owned by the UCI collection context wrapper. It grants no
     /// UCI publication observation and cannot acknowledge an emitted bestmove.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub(crate) fn retire_collection_output(
         &self,
         authority: SearchAuthority,

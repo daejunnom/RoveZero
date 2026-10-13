@@ -2,16 +2,21 @@
 //! prepared private directories; it creates neither mounts nor model assets.
 //! JSON is never promoted into a native or original-process capability.
 use super::*;
+#[cfg(target_os = "linux")]
 use crate::process::{OwnedArtifactTreeWatch, ProcessLimits};
 use rz_experiments::ArtifactRef;
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use sha2::Digest as _;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::Ordering;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 pub const SELFPLAY_CLI_DECLARATION_DOMAIN_V3: &str = "rz-pals-selfplay-cli-declaration/1";
+#[cfg(target_os = "linux")]
 const MAX_DECLARATION_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;

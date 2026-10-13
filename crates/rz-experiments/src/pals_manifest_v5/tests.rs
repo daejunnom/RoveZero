@@ -522,8 +522,10 @@ fn generation_domains_match_actual_producer_and_trainer() {
         domains["chunk_manifest"],
         "rz-pals-generation-chunk-manifest/1"
     );
-    let mut recipe = PalsGenerationRecipeV5::default();
-    recipe.record_domain = "rz-pals-training-record-v3/1".into();
+    let recipe = PalsGenerationRecipeV5 {
+        record_domain: "rz-pals-training-record-v3/1".into(),
+        ..PalsGenerationRecipeV5::default()
+    };
     assert!(recipe.validate().is_err());
 }
 
@@ -1001,11 +1003,15 @@ fn actual_updates_require_explicit_training_authorization() {
     let mut m = manifest();
     m.purpose = PalsRunPurposeV5::TrainingGeneration;
     assert!(m.validate().is_err());
-    let mut recipe = PalsGenerationRecipeV5::default();
-    recipe.shared_optimizer_owners = 2;
+    let recipe = PalsGenerationRecipeV5 {
+        shared_optimizer_owners: 2,
+        ..PalsGenerationRecipeV5::default()
+    };
     assert!(recipe.validate().is_err());
-    recipe = PalsGenerationRecipeV5::default();
-    recipe.all_masked_is_update = true;
+    let recipe = PalsGenerationRecipeV5 {
+        all_masked_is_update: true,
+        ..PalsGenerationRecipeV5::default()
+    };
     assert!(recipe.validate().is_err());
 }
 

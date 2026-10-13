@@ -230,7 +230,7 @@ fn fixed_thirty_two_pairs_and_bounded_pair_scores_cannot_be_changed_after_result
     for expected in [0, 1, 31, 33, usize::MAX] {
         assert!(summarize_scores(&[], expected).is_err());
     }
-    assert!(summarize_scores(&vec![Some(2); 33], 32).is_err());
+    assert!(summarize_scores(&[Some(2); 33], 32).is_err());
     for score in [5, u8::MAX] {
         assert!(summarize_scores(&[Some(score)], 32).is_err());
     }
@@ -256,7 +256,7 @@ fn complete_half_score_series_uses_predeclared_pair_cluster_hoeffding_radius() {
 #[test]
 fn zero_and_full_score_hoeffding_intervals_clamp_without_claiming_certainty() {
     let epsilon = (40.0_f64.ln() / 64.0).sqrt();
-    let zero = summarize_scores(&vec![Some(0); 32], 32).unwrap();
+    let zero = summarize_scores(&[Some(0); 32], 32).unwrap();
     assert_eq!(zero.score_rate, Some(0.0));
     assert_eq!(zero.counts, [32, 0, 0, 0, 0]);
     let zero_ci = zero.final_interval_95.unwrap();
@@ -264,7 +264,7 @@ fn zero_and_full_score_hoeffding_intervals_clamp_without_claiming_certainty() {
     assert!((zero_ci[1] - epsilon).abs() < 1e-12);
     assert!(zero_ci[1] > 0.0);
 
-    let full = summarize_scores(&vec![Some(4); 32], 32).unwrap();
+    let full = summarize_scores(&[Some(4); 32], 32).unwrap();
     assert_eq!(full.score_rate, Some(1.0));
     assert_eq!(full.counts, [0, 0, 0, 0, 32]);
     let full_ci = full.final_interval_95.unwrap();

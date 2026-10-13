@@ -16,6 +16,7 @@ use std::{
     },
 };
 
+#[cfg(any(test, target_os = "linux"))]
 fn clamp_original_wall(
     declared_ms: u64,
     deadline: Option<std::time::Instant>,
@@ -511,6 +512,10 @@ impl<S: NativeProviderDeclaration> NativePairOutput<S> {
     /// release only its exclusive execution lease. No serialized receipt can
     /// call this constructor. Unknown physical/process closure keeps `self`
     /// and its lease intact, preventing another pair from being admitted.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Refusal returns the original process/input/physical owner and lease without allocating on the closure failure path"
+    )]
     pub fn into_closed_archive(mut self) -> Result<ClosedNativePairArchive<S>, Self> {
         let original = self.bundle.receipt.as_ref();
         let process = self.bundle.process.as_ref();

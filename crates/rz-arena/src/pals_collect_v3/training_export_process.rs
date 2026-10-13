@@ -8,6 +8,7 @@ use super::training_process::{
 };
 use super::{check, invalid};
 use crate::{ArenaError, process::OriginalProcessOutput};
+#[cfg(target_os = "linux")]
 use rz_experiments::pals_data_v3::{generation_digest, generation_sha};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,11 +16,11 @@ use serde_json::Value;
 use std::sync::atomic::Ordering;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
-    time::Duration,
 };
+#[cfg(target_os = "linux")]
+use std::{fs::File, time::Duration};
 
 pub type GenerationExportLaunchV3 = GenerationTrainingLaunchV3;
 const REGISTRATION: &str = "rz-pals-generation-export-registration/1";

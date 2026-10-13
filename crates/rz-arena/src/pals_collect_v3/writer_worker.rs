@@ -155,6 +155,10 @@ impl GenerationWriterWorkerV3 {
     /// No manager serialization or archive write occurs here. On saturation the
     /// caller retains the owned command and stops admission rather than dropping
     /// an actual row or counting unpersisted evidence as published.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Saturated admission returns the original command inline without another allocation or losing unpublished evidence"
+    )]
     pub fn try_submit(
         &self,
         command: GenerationWriteCommandV3,

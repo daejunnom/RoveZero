@@ -6,14 +6,17 @@
 //! training as a side effect of parsing, importing, or preparing a command.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-use super::{
-    GenerationVerifiedSeriesArchiveV3, VerifiedActionOutcomeArchiveV3, check, hex, invalid,
-};
+#[cfg(target_os = "linux")]
+use super::hex;
+use super::{GenerationVerifiedSeriesArchiveV3, VerifiedActionOutcomeArchiveV3, check, invalid};
 use crate::ArenaError;
 use crate::process::{OriginalProcessOutput, ProcessLimits};
-use rz_experiments::pals_data_v3::{generation_digest, generation_identifier, generation_sha};
+#[cfg(target_os = "linux")]
+use rz_experiments::pals_data_v3::generation_identifier;
+use rz_experiments::pals_data_v3::{generation_digest, generation_sha};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(target_os = "linux")]
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -2339,15 +2342,24 @@ mod tests {
     use super::*;
     #[test]
     fn declarations_do_not_admit_secret_paths_or_unknown_summary_fields() {
-        for path in [
-            "/tmp/.env",
-            "/tmp/client_secret.json",
-            "/tmp/ssh-key.key",
-            "/tmp/a/../data.json",
-        ] {
-            assert!(!absolute_safe(Path::new(path)));
+        let owned = std::env::temp_dir().join("owned");
+        let baseline = owned.join("data.json");
+        assert!(baseline.is_absolute());
+        for name in [".env", "client_secret.json", "ssh-key.key"] {
+            let path = owned.join(name);
+            assert!(path.is_absolute());
+            assert!(!nonsecret(name));
+            assert!(!absolute_safe(&path));
         }
-        assert!(absolute_safe(Path::new("/tmp/owned/data.json")));
+        let parent = owned.join("a").join("..").join("data.json");
+        assert!(parent.is_absolute());
+        assert!(!absolute_safe(&parent));
+        // Actual training/process admission is Linux-native. A Windows drive
+        // prefix remains unsupported even when its fixture path is absolute.
+        #[cfg(windows)]
+        assert!(!absolute_safe(&baseline));
+        #[cfg(not(windows))]
+        assert!(absolute_safe(&baseline));
         let extra = br#"{"schema":"x","status":"failed","receipt":{"path":"/tmp/owned/receipt.json","sha256":"x","bytes":1},"actual_training_executed":false,"physical_completion":"unknown_quarantined","arena_eligible":false,"native_authority":true}"#;
         assert!(decode::<ChildSummary>(extra).is_err());
     }

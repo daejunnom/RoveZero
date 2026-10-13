@@ -41,6 +41,10 @@ pub struct GenerationCaptureReceiverV3 {
     audits: mpsc::Receiver<GenerationNativeCaptureEventV3>,
 }
 #[derive(Clone, Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Bounded capture channels retain the original submitted input and ticket inline without an additional per-event allocation"
+)]
 pub enum GenerationNativeCaptureEventV3 {
     RuntimeAudited {
         receipt: serde_json::Value,

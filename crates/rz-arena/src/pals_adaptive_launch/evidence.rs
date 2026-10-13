@@ -22,6 +22,10 @@ pub struct PalsAdaptiveSessionAuditV5 {
 }
 /// Both failure variants retain the private source/model pins. A pre-spawn
 /// validation failure cannot be converted into an empty successful pair.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Admission failure retains the original launch owner inline without a new allocation or changing source/model pin custody"
+)]
 pub enum PalsAdaptivePairFailureV5 {
     Admission {
         cause: ArenaError,
@@ -216,13 +220,11 @@ pub fn validate_prepared_pals_launch_v5(
         domain.numerical_acceptance_verified = true;
         artifact_domain_by_endpoint.insert(e.configuration.endpoint.id.clone(), domain);
         require(
-            actual
-                .get(
-                    &owner.spec.input.semantic_lock.manifest.engines[i]
-                        .binary
-                        .path,
-                )
-                .is_some(),
+            actual.contains_key(
+                &owner.spec.input.semantic_lock.manifest.engines[i]
+                    .binary
+                    .path,
+            ),
             "endpoint binary actual hash missing",
         )?;
     }
@@ -683,38 +685,38 @@ impl NativeProviderDeclaration for LockedPalsArenaLaunchV5 {
                     && format!("{:x}", Sha256::digest(&bytes)) == artifact.sha256,
                 "actual provider evidence content differs from observation",
             )?;
-            if let PalsObservedV3::Observed { value, .. } = &t.observation.model_verification {
-                if artifact == &value.evidence {
-                    validate_pals_model_verification_evidence_v5(
-                        &bytes,
-                        &t.endpoint_id,
-                        pid,
-                        &t.process_run_id,
-                        value,
-                    )?;
-                }
+            if let PalsObservedV3::Observed { value, .. } = &t.observation.model_verification
+                && artifact == &value.evidence
+            {
+                validate_pals_model_verification_evidence_v5(
+                    &bytes,
+                    &t.endpoint_id,
+                    pid,
+                    &t.process_run_id,
+                    value,
+                )?;
             }
-            if let PalsObservedV3::Observed { value, .. } = &t.observation.resource_readback {
-                if artifact == &value.evidence {
-                    validate_pals_resource_readback_evidence_v5(
-                        &bytes,
-                        &t.endpoint_id,
-                        pid,
-                        &t.process_run_id,
-                        value,
-                    )?;
-                }
+            if let PalsObservedV3::Observed { value, .. } = &t.observation.resource_readback
+                && artifact == &value.evidence
+            {
+                validate_pals_resource_readback_evidence_v5(
+                    &bytes,
+                    &t.endpoint_id,
+                    pid,
+                    &t.process_run_id,
+                    value,
+                )?;
             }
-            if let PalsObservedV3::Observed { value, .. } = &t.observation.coordinator {
-                if artifact == &value.evidence {
-                    validate_pals_coordinator_evidence_v5(
-                        &bytes,
-                        &t.endpoint_id,
-                        pid,
-                        &t.process_run_id,
-                        value,
-                    )?;
-                }
+            if let PalsObservedV3::Observed { value, .. } = &t.observation.coordinator
+                && artifact == &value.evidence
+            {
+                validate_pals_coordinator_evidence_v5(
+                    &bytes,
+                    &t.endpoint_id,
+                    pid,
+                    &t.process_run_id,
+                    value,
+                )?;
             }
             result.push((format!("{}/{name}", s.process_run_id), bytes));
         }

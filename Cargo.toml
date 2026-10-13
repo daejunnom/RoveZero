@@ -8,6 +8,11 @@ members = [
 ]
 resolver = "2"
 
+# Keep line/module debugging while fitting bounded executable identity hashing.
+# The test profile inherits this setting; assertions and optimization stay default.
+[profile.dev]
+debug = 1
+
 [workspace.package]
 edition = "2021"
 rust-version = "1.90"

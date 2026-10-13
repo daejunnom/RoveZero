@@ -22,6 +22,10 @@ impl AcceptedActionWitnessV3 {
     /// The actual integration consumer calls this after verified coordinator
     /// acceptance and Store commit with its exact old/new execution map.
     #[allow(dead_code)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Each independently validated input, execution, authority and Store acceptance seal must remain explicit at the owner commit boundary"
+    )]
     pub(crate) fn from_owner_commit(
         input_sha256: String,
         action_execution: ExecutionId,
@@ -738,8 +742,7 @@ fn capture_validator_action_inner_v3(
         serde_json::to_vec(&authority)
             .map_err(|e| invalid(e.to_string()))?
             .len()
-            + 1
-            <= GENERATION_MAX_ROW_BYTES,
+            < GENERATION_MAX_ROW_BYTES,
         "actual action authority receipt row capacity",
     )?;
     receipts.insert(sha, authority);

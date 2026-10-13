@@ -12,6 +12,13 @@ pub use rz_experiments::PalsArtifactDomainAdmissionV5;
 /// Retain the arena signature while delegating all domain checks to one owner.
 /// Small registered metadata reads remain the caller's responsibility; reader
 /// failures propagate as artifact failures and never become a metadata success.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "Retain the public read-only arena compatibility signature on Windows; the native pinned launch consumer is Linux-only"
+    )
+)]
 pub fn validate_pals_artifact_domain_v5(
     config: &PalsAdaptiveStartupConfigV5,
     export_bytes: &[u8],

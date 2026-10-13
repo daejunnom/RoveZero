@@ -124,6 +124,10 @@ struct CapturedQuestion {
     returned: FrozenActionRegistrationV3,
     retained: Arc<FrozenActionRegistrationV3>,
 }
+#[allow(
+    clippy::large_enum_variant,
+    reason = "One active root closure keeps its original probe or isolated action owner inline through physical close without another allocation"
+)]
 enum RootClosure {
     Probe {
         question: CapturedQuestion,
@@ -549,15 +553,14 @@ impl ActualGenerationActionOutcomeFactoryV3 {
                         &dispatch_pins,
                     )
                     .map_err(|e| AdaptiveManagerError::Semantic(e.to_string()))?;
-                    if let Some(expected) = &dispatch_expected {
-                        if registered.frozen_context_sha256() != expected.frozen_context_sha256()
+                    if dispatch_expected.as_ref().is_some_and(|expected| {
+                        registered.frozen_context_sha256() != expected.frozen_context_sha256()
                             || registered.action_support_mask() != expected.action_support_mask()
                             || registered.actions() != expected.actions()
-                        {
-                            return Err(AdaptiveManagerError::Invalid(
-                                "isolated process changed its preregistered actual question",
-                            ));
-                        }
+                    }) {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "isolated process changed its preregistered actual question",
+                        ));
                     }
                     let returned = FrozenActionRegistrationV3::from_actual_question(
                         &dispatch_plan,
@@ -998,6 +1001,17 @@ fn link_action_cancellation(
     }
 }
 
+impl Drop for ActualGenerationActionOutcomeFactoryV3 {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.context {
+            let until = owner.original_deadline;
+            // Drop is only a final attempt at the original bound. Successful
+            // receipts are kept; failed native owners retain their quarantine.
+            let _ = self.close_owned(until);
+        }
+    }
+}
+
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
@@ -1016,16 +1030,5 @@ mod cancellation_tests {
         assert_eq!(first.deadline, deadline);
         assert_eq!(next.deadline, deadline);
         assert_eq!(next.max_simulations, 65_536);
-    }
-}
-
-impl Drop for ActualGenerationActionOutcomeFactoryV3 {
-    fn drop(&mut self) {
-        if let Some(owner) = &self.context {
-            let until = owner.original_deadline;
-            // Drop is only a final attempt at the original bound. Successful
-            // receipts are kept; failed native owners retain their quarantine.
-            let _ = self.close_owned(until);
-        }
     }
 }

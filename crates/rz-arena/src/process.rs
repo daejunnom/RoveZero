@@ -77,6 +77,9 @@ pub struct OriginalProcessInput<'a> {
 /// 인증/검색 경로를 상속하는 접점이 아니며 기존 실행의 환경은 보존한다.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum OriginalNumericalEnvironment {
+    // Keep the closed policy constructible at the platform refusal boundary.
+    // Its actual original-process consumer is Linux-only.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Fp32Tf32Off,
 }
 

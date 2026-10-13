@@ -219,7 +219,6 @@ fn finalize_linux(
         rz_experiments::validate_pals_artifact_domain_v5(&config,&export,&mut read)?;
         let acceptance=read(&config.asset(Purpose::NumericalAcceptance)?.artifact,256<<10)?;
         rz_experiments::validate_pals_numerical_acceptance_v5(&config,&acceptance,&mut read)?;
-        drop(read);
         let mut declaration=prepared.declaration.clone();
         let named=open_directory(prepared.private_cwd())?;
         let held_cwd=directory_file(&prepared.cwd)?;let named_cwd=directory_file(&named)?;
@@ -446,7 +445,6 @@ fn prepare_linux(
             add(Purpose::CudaControlInventory,"collection/cuda-control-inventory.json",source.0,
                 source.1.try_clone().map_err(|_|invalid("frozen CUDA control inventory custody clone"))?)?;
         }
-        drop(add);
         config.assets.retain(|a|!matches!(a.purpose,Purpose::InitializationEvidence|Purpose::InitializationCheckpointMetadata));
         config.endpoint.model.weights=config.asset(Purpose::Weights)?.artifact.clone();
         config.endpoint.model.provenance=Some(config.asset(Purpose::Provenance)?.artifact.clone());
@@ -489,7 +487,6 @@ fn prepare_linux(
                 rz_experiments::ManifestError::Artifact(e.to_string()))
         };
         rz_experiments::validate_pals_artifact_domain_v5(&config,&export_raw,&mut metadata_reader)?;
-        drop(metadata_reader);
         // The template's numerical declarations remain explicitly pending.
         // This owner grants no numerical admission. A separate actual numeric
         // producer must retain these exact inputs and supply its own completed
