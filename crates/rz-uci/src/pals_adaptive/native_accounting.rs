@@ -8,9 +8,9 @@ use crate::pals_native::ticketed::{
 use rz_contracts::pals::Role;
 use rz_contracts::pals_adaptive::RoleTicketEnvelope;
 use rz_search::pals::coordinator::PhysicalRoleCompletion;
-use serde::Serialize;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "search-work-receipts", derive(serde::Serialize))]
 pub struct AdaptiveNativeAccountingSnapshot {
     completed_service_commands: u64,
     backend_run_invoked_commands: u64,
