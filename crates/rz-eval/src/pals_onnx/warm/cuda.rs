@@ -624,9 +624,10 @@ impl PalsOnnxBackend {
             graph_bytes.push(owned);
         }
         let mut sessions = BTreeMap::new();
+        let mut applied_session_settings = Vec::with_capacity(manifest.graphs.len());
         let mut placements = Vec::new();
         for (graph, owned) in manifest.graphs.iter().zip(graph_bytes) {
-            let (session, placement) = load_session(
+            let (session, placement, applied) = load_session(
                 owned,
                 config,
                 &graph.role,
@@ -635,6 +636,7 @@ impl PalsOnnxBackend {
                     .map(|(policy, root)| (policy, root.as_path())),
             )?;
             validate_cuda_session(&session, graph, &manifest)?;
+            applied_session_settings.push(applied);
             if let Some(placement) = placement {
                 placements.push(placement);
             }
@@ -709,11 +711,19 @@ impl PalsOnnxBackend {
             public_owner_bytes(2 * tokens * 64, 2 * tokens * 64, tokens),
         )
         .map_err(public_bank_error)?;
+        // CPU Warm과 별도의 검증된 CUDA manifest/실제 session 집합에 근거한다.
+        let validator_absence_verified = !manifest.validator_present
+            && sessions.len() == 2
+            && sessions.contains_key("public")
+            && sessions.contains_key("shared_pc")
+            && !sessions.contains_key("validator");
         Ok(Self {
             public: sessions.remove("public"),
             proposer: None,
             critic: None,
             shared_pc: sessions.remove("shared_pc"),
+            validator_absence_verified,
+            applied_session_settings: applied_session_settings.into(),
             layout: Layout::SharedPcIf,
             private_warm: None,
             private_cuda_warm: Some(capability),

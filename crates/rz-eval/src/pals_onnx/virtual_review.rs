@@ -467,6 +467,7 @@ pub struct PalsVirtualReviewOnnxBackend {
     public: Option<Session>,
     shared_pc: Option<Session>,
     validator: Option<Session>,
+    applied_session_settings: Arc<[PalsAppliedSessionSettings]>,
     runtime: Option<OrtRuntime>,
     config: PalsOnnxConfig,
     model_config: PalsModelConfig,
@@ -842,6 +843,7 @@ impl PalsVirtualReviewOnnxBackend {
             _ => {}
         }
         let mut sessions = BTreeMap::new();
+        let mut applied_session_settings = Vec::with_capacity(manifest.graphs.len());
         let mut placements = Vec::new();
         let mut identities = Vec::new();
         let mut total = 0_u64;
@@ -873,13 +875,14 @@ impl PalsVirtualReviewOnnxBackend {
                 sha256: digest,
                 serialized_bytes: data.len() as u64,
             });
-            let (session, placement) = load_session(
+            let (session, placement, applied) = load_session(
                 data,
                 config,
                 &graph.role,
                 graph_audit.map(|(p, r)| (p, r.as_path())),
             )?;
             manifest.validate_session(&session, graph)?;
+            applied_session_settings.push(applied);
             if let Some(placement) = placement {
                 placements.push(placement);
             }
@@ -897,6 +900,7 @@ impl PalsVirtualReviewOnnxBackend {
             public: sessions.remove("public"),
             shared_pc: sessions.remove(if warm { "shared_warm" } else { "shared_pc" }),
             validator: sessions.remove("validator"),
+            applied_session_settings: applied_session_settings.into(),
             runtime: Some(runtime),
             config,
             model_config: manifest.config,
@@ -959,6 +963,10 @@ impl PalsVirtualReviewOnnxBackend {
     }
     pub fn config(&self) -> PalsOnnxConfig {
         self.config
+    }
+    /// 성공한 원본 loader의 setter/EP 등록/commit 기록이며 OS/Run 관측과 다르다.
+    pub fn applied_session_settings(&self) -> Arc<[PalsAppliedSessionSettings]> {
+        Arc::clone(&self.applied_session_settings)
     }
     pub fn rules_input_semantic_digest(&self) -> [u8; 32] {
         self.rules_semantics

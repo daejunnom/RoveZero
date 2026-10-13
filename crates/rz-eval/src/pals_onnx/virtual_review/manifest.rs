@@ -782,7 +782,12 @@ impl<'de> Deserialize<'de> for UniqueJson {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        validate_virtual_review_export_manifest, validate_virtual_review_export_manifest_kind,
+        VirtualReviewArtifactKind, VirtualReviewExecutionMode,
+    };
     use super::*;
+    use crate::asset;
     fn fixture_manifest(validator: bool) -> Value {
         use serde_json::json;
         let config = PalsModelConfig::for_profile(PalsModelProfile::VirtualReviewV1);

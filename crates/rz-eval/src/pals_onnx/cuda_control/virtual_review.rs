@@ -507,6 +507,7 @@ impl PalsCudaControlPolicy {
 mod tests {
     use super::*;
     use serde_json::json;
+    use sha2::{Digest as _, Sha256};
 
     fn binding() -> WeightBindingV3 {
         WeightBindingV3 {
