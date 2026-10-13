@@ -24,12 +24,9 @@ pub const METADATA_FEATURES: usize = 16;
 pub const RECORD_FEATURES: usize = 16;
 /// Only the registered encoder's independent record projection, never the
 /// full observation/task identity or an assertion of numerical equivalence.
-pub const INDEPENDENT_RECORD_PROJECTION_SEMANTICS: &str =
-    "rz-pals-independent-record-fp32/1;16-feature-bits;four-fields;no-record-position;no-cross-record-context";
-pub const INDEPENDENT_RECORD_PROJECTION_SEMANTICS_V2: &str =
-    "rz-pals-independent-record-fp32/2;16-feature-bits;full-ordered-move-line;masked-256-ply;no-record-position;no-relationships;no-cross-record-context";
-pub const INDEPENDENT_RECORD_PROJECTION_SEMANTICS_V3: &str =
-    "rz-pals-independent-record-fp32/3;8-feature-bits;exact-anchor-board-and-rules-metadata;full-ordered-move-line;dynamic-approved-L-bucket;no-record-position;no-relationships;no-cross-record-context";
+pub const INDEPENDENT_RECORD_PROJECTION_SEMANTICS: &str = "rz-pals-independent-record-fp32/1;16-feature-bits;four-fields;no-record-position;no-cross-record-context";
+pub const INDEPENDENT_RECORD_PROJECTION_SEMANTICS_V2: &str = "rz-pals-independent-record-fp32/2;16-feature-bits;full-ordered-move-line;masked-256-ply;no-record-position;no-relationships;no-cross-record-context";
+pub const INDEPENDENT_RECORD_PROJECTION_SEMANTICS_V3: &str = "rz-pals-independent-record-fp32/3;8-feature-bits;exact-anchor-board-and-rules-metadata;full-ordered-move-line;dynamic-approved-L-bucket;no-record-position;no-relationships;no-cross-record-context";
 pub const QUERY_FEATURES: usize = 16;
 pub const DIVERGENCE_FEATURES: usize = 8;
 /// Same ordered vocabulary as the versioned verifier-data contract.
@@ -47,8 +44,7 @@ pub const V_TASK_NAMES: [&str; V_TASKS] = [
 /// Both model evidence pins below use exactly this byte framing. Lengths are
 /// UTF-8 byte counts, never character counts; there is no delimiter, terminator,
 /// JSON serialization, newline normalization or implicit final frame.
-pub const PALS_MODEL_PIN_FRAMING: &str =
-    "sha256(concat(u64_le(name_utf8.len),name_utf8,u64_le(payload.len),payload));ordered-named-frames;no-normalization";
+pub const PALS_MODEL_PIN_FRAMING: &str = "sha256(concat(u64_le(name_utf8.len),name_utf8,u64_le(payload.len),payload));ordered-named-frames;no-normalization";
 pub const PALS_REGISTERED_SEMANTICS_DOMAIN: &str = "rz-pals-registered-model-semantics/1";
 /// Each config payload is one unsigned 64-bit little-endian integer. The values
 /// come from `PalsModelConfig::for_profile`, never an unvalidated asset declaration.
@@ -155,20 +151,40 @@ pub const PALS_REGISTERED_VIRTUAL_LINE_DEFINITION: &str = concat!(
 );
 
 pub const PALS_VIRTUAL_MODEL_BOUNDARY_SOURCE_NAMES: [&str; 7] = [
-    "crates/rz-eval/src/pals_model.rs", "crates/rz-eval/src/pals_model/virtual_review.rs",
-    "experiments/model-research/pals/src/rz_pals_model/config.py", "experiments/model-research/pals/src/rz_pals_model/model.py",
-    "experiments/model-research/pals/src/rz_pals_model/virtual_review.py", "experiments/model-research/pals/src/rz_pals_model/onnx_virtual_review.py",
+    "crates/rz-eval/src/pals_model.rs",
+    "crates/rz-eval/src/pals_model/virtual_review.rs",
+    "experiments/model-research/pals/src/rz_pals_model/config.py",
+    "experiments/model-research/pals/src/rz_pals_model/model.py",
+    "experiments/model-research/pals/src/rz_pals_model/virtual_review.py",
+    "experiments/model-research/pals/src/rz_pals_model/onnx_virtual_review.py",
     "experiments/model-research/pals/src/rz_pals_model/artifacts.py",
 ];
-pub fn compiled_virtual_model_boundary_sha256() -> [u8;32] {
-    let mut hash=Sha256::new();hash_model_pin_frame(&mut hash,"domain",b"rz-pals-compiled-virtual-model-boundary-sources/1");
-    let sources=[include_str!("pals_model.rs"),include_str!("pals_model/virtual_review.rs"),
+pub fn compiled_virtual_model_boundary_sha256() -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash_model_pin_frame(
+        &mut hash,
+        "domain",
+        b"rz-pals-compiled-virtual-model-boundary-sources/1",
+    );
+    let sources = [
+        include_str!("pals_model.rs"),
+        include_str!("pals_model/virtual_review.rs"),
         include_str!("../../../experiments/model-research/pals/src/rz_pals_model/config.py"),
         include_str!("../../../experiments/model-research/pals/src/rz_pals_model/model.py"),
-        include_str!("../../../experiments/model-research/pals/src/rz_pals_model/virtual_review.py"),
-        include_str!("../../../experiments/model-research/pals/src/rz_pals_model/onnx_virtual_review.py"),
-        include_str!("../../../experiments/model-research/pals/src/rz_pals_model/artifacts.py")];
-    for(name,source)in PALS_VIRTUAL_MODEL_BOUNDARY_SOURCE_NAMES.into_iter().zip(sources){hash_model_pin_frame(&mut hash,name,source.as_bytes());}
+        include_str!(
+            "../../../experiments/model-research/pals/src/rz_pals_model/virtual_review.py"
+        ),
+        include_str!(
+            "../../../experiments/model-research/pals/src/rz_pals_model/onnx_virtual_review.py"
+        ),
+        include_str!("../../../experiments/model-research/pals/src/rz_pals_model/artifacts.py"),
+    ];
+    for (name, source) in PALS_VIRTUAL_MODEL_BOUNDARY_SOURCE_NAMES
+        .into_iter()
+        .zip(sources)
+    {
+        hash_model_pin_frame(&mut hash, name, source.as_bytes());
+    }
     hash.finalize().into()
 }
 
@@ -255,10 +271,13 @@ impl PalsModelProfile {
         matches!(self, Self::FullLineV2 | Self::FullLineInteractionV2)
     }
     pub const fn uses_interaction_head(self) -> bool {
-        matches!(self, Self::InteractionHeadV2 | Self::FullLineInteractionV2 | Self::VirtualReviewV1)
+        matches!(
+            self,
+            Self::InteractionHeadV2 | Self::FullLineInteractionV2 | Self::VirtualReviewV1
+        )
     }
     pub const fn uses_virtual_review(self) -> bool {
-        matches!(self,Self::VirtualReviewV1)
+        matches!(self, Self::VirtualReviewV1)
     }
     pub const fn model_semantics(self) -> &'static str {
         if self.uses_virtual_review() {
@@ -292,7 +311,14 @@ impl PalsModelProfile {
     /// Independent producers can hash these frames with the documented framing.
     /// This API is separate from the historical config JSON and all cache keys.
     pub fn registered_semantics_frames(self, mut consume: impl FnMut(&'static str, &[u8])) {
-        consume("domain", if self.uses_virtual_review(){b"rz-pals-registered-model-semantics/3"}else{PALS_REGISTERED_SEMANTICS_DOMAIN.as_bytes()});
+        consume(
+            "domain",
+            if self.uses_virtual_review() {
+                b"rz-pals-registered-model-semantics/3"
+            } else {
+                PALS_REGISTERED_SEMANTICS_DOMAIN.as_bytes()
+            },
+        );
         consume("model_profile", self.as_str().as_bytes());
         consume("model_semantics", self.model_semantics().as_bytes());
         consume("encoding_schema", self.encoding_schema().as_bytes());
@@ -318,7 +344,12 @@ impl PalsModelProfile {
         }
         consume(
             "structure.public_and_private",
-            if self.uses_virtual_review(){PALS_REGISTERED_VIRTUAL_REVIEW_DEFINITION}else{PALS_REGISTERED_BASE_DEFINITION}.as_bytes(),
+            if self.uses_virtual_review() {
+                PALS_REGISTERED_VIRTUAL_REVIEW_DEFINITION
+            } else {
+                PALS_REGISTERED_BASE_DEFINITION
+            }
+            .as_bytes(),
         );
         consume(
             "structure.line_encoder",
@@ -401,7 +432,11 @@ impl PalsModelConfig {
     pub const fn for_profile(profile: PalsModelProfile) -> Self {
         Self {
             profile,
-            max_records: if profile.uses_virtual_review(){64}else{128},
+            max_records: if profile.uses_virtual_review() {
+                64
+            } else {
+                128
+            },
             ..Self::baseline()
         }
     }
@@ -870,7 +905,7 @@ impl PalsRawOutput {
                     .map_err(|_| PalsModelError::Shape("task output"))?,
             ),
             (PalsRole::Validator, None) => {
-                return Err(PalsModelError::Shape("validator task output"))
+                return Err(PalsModelError::Shape("validator task output"));
             }
             (_, None) => None,
             _ => return Err(PalsModelError::PrivateRoleOutput),
@@ -918,7 +953,9 @@ impl PalsModelConfig {
     ) -> Result<PalsMatmulFlops, PalsModelError> {
         self.validate()?;
         if self.profile.uses_virtual_review() {
-            return Err(PalsModelError::Shape("V3 FLOPs requires physical anchors and L bucket"));
+            return Err(PalsModelError::Shape(
+                "V3 FLOPs requires physical anchors and L bucket",
+            ));
         }
         if records > self.max_records
             || candidates > self.max_candidates
@@ -976,24 +1013,73 @@ impl PalsModelConfig {
     }
     /// Same analytic GEMM/Conv products as Python, with explicitly observed
     /// physical A/L. This is not a latency, backward or peak-memory estimate.
-    pub fn virtual_review_matmul_flops(&self, role:PalsRole, records:usize, candidates:usize, divergences:usize, anchors:usize, length_bucket:usize) -> Result<PalsMatmulFlops,PalsModelError> {
+    pub fn virtual_review_matmul_flops(
+        &self,
+        role: PalsRole,
+        records: usize,
+        candidates: usize,
+        divergences: usize,
+        anchors: usize,
+        length_bucket: usize,
+    ) -> Result<PalsMatmulFlops, PalsModelError> {
         self.validate()?;
-        if !self.profile.uses_virtual_review() { return Err(PalsModelError::UnsupportedConfiguration); }
-        if records>64 || candidates>256 || divergences>128 || !(1..=4).contains(&anchors) || !virtual_review::LENGTH_BUCKETS.contains(&length_bucket) { return Err(PalsModelError::Capacity("V3 FLOPs actual shape")); }
-        let (w,kv,h,n)=(self.width as u64,(self.kv_heads*self.head_dimension)as u64,self.ffn_width as u64,self.latent_slots as u64);
-        let (r,c,d,a,l)=(records.max(1)as u64,candidates.max(1)as u64,divergences.max(1)as u64,anchors as u64,length_bucket as u64);
-        let s=66+r;let self_attn=|tokens:u64|2*tokens*w*(2*w+2*kv)+4*tokens*tokens*w;
-        let ffn=|tokens:u64|6*tokens*w*h;
-        let line=2*l*(3*64*64+2*3*64*64+64);
-        let public_encode=a*(2*16*2*w+self.board_blocks as u64*(self_attn(66)+ffn(66)))
-            +r*(2*8*w+self.record_blocks as u64*(self_attn(4)+ffn(4))+line+2*64*w+2*w*w)+4*s*w*kv;
-        let cross=4*n*w*w+4*n*s*w;
-        let mut role_forward=2*8*w+(self.recurrent_blocks*self.iterations)as u64*(cross+self_attn(n)+ffn(n))
-            +2*c*3*w*w+2*c*w+2*w*3+3*line+2*3*64*w+2*3*w*w+r*(2*3*2*kv*128+2*128*w)
-            +c*(2*2*w*128+2*128-2*w);
-        if role==PalsRole::Critic {role_forward+=2*d*8*w+2*d*w;}
-        if role==PalsRole::Validator {role_forward+=2*w*V_TASKS as u64;}
-        Ok(PalsMatmulFlops{public_encode,role_forward})
+        if !self.profile.uses_virtual_review() {
+            return Err(PalsModelError::UnsupportedConfiguration);
+        }
+        if records > 64
+            || candidates > 256
+            || divergences > 128
+            || !(1..=4).contains(&anchors)
+            || !virtual_review::LENGTH_BUCKETS.contains(&length_bucket)
+        {
+            return Err(PalsModelError::Capacity("V3 FLOPs actual shape"));
+        }
+        let (w, kv, h, n) = (
+            self.width as u64,
+            (self.kv_heads * self.head_dimension) as u64,
+            self.ffn_width as u64,
+            self.latent_slots as u64,
+        );
+        let (r, c, d, a, l) = (
+            records.max(1) as u64,
+            candidates.max(1) as u64,
+            divergences.max(1) as u64,
+            anchors as u64,
+            length_bucket as u64,
+        );
+        let s = 66 + r;
+        let self_attn = |tokens: u64| 2 * tokens * w * (2 * w + 2 * kv) + 4 * tokens * tokens * w;
+        let ffn = |tokens: u64| 6 * tokens * w * h;
+        let line = 2 * l * (3 * 64 * 64 + 2 * 3 * 64 * 64 + 64);
+        let public_encode = a
+            * (2 * 16 * 2 * w + self.board_blocks as u64 * (self_attn(66) + ffn(66)))
+            + r * (2 * 8 * w
+                + self.record_blocks as u64 * (self_attn(4) + ffn(4))
+                + line
+                + 2 * 64 * w
+                + 2 * w * w)
+            + 4 * s * w * kv;
+        let cross = 4 * n * w * w + 4 * n * s * w;
+        let mut role_forward = 2 * 8 * w
+            + (self.recurrent_blocks * self.iterations) as u64 * (cross + self_attn(n) + ffn(n))
+            + 2 * c * 3 * w * w
+            + 2 * c * w
+            + 2 * w * 3
+            + 3 * line
+            + 2 * 3 * 64 * w
+            + 2 * 3 * w * w
+            + r * (2 * 3 * 2 * kv * 128 + 2 * 128 * w)
+            + c * (2 * 2 * w * 128 + 2 * 128 - 2 * w);
+        if role == PalsRole::Critic {
+            role_forward += 2 * d * 8 * w + 2 * d * w;
+        }
+        if role == PalsRole::Validator {
+            role_forward += 2 * w * V_TASKS as u64;
+        }
+        Ok(PalsMatmulFlops {
+            public_encode,
+            role_forward,
+        })
     }
 }
 
@@ -1026,18 +1112,37 @@ mod tests {
     use super::*;
     #[test]
     fn virtual_profile_has_a_separate_abi_and_requires_explicit_physical_flops() {
-        let config=PalsModelConfig::for_profile(PalsModelProfile::VirtualReviewV1);
-        config.validate().unwrap();assert_eq!(config.max_records,64);
-        assert!(!config.profile.uses_full_line());assert!(config.profile.uses_virtual_review());
-        assert_eq!(config.profile.model_semantics(),PALS_MODEL_SEMANTICS_V3);
-        assert_eq!(config.profile.encoding_schema(),PALS_ENCODING_SCHEMA_V3);
+        let config = PalsModelConfig::for_profile(PalsModelProfile::VirtualReviewV1);
+        config.validate().unwrap();
+        assert_eq!(config.max_records, 64);
+        assert!(!config.profile.uses_full_line());
+        assert!(config.profile.uses_virtual_review());
+        assert_eq!(config.profile.model_semantics(), PALS_MODEL_SEMANTICS_V3);
+        assert_eq!(config.profile.encoding_schema(), PALS_ENCODING_SCHEMA_V3);
         assert!(input().validate(&config).is_err());
-        let mut base=Vec::new();config.profile.registered_semantics_frames(|name,payload|{if name=="structure.public_and_private"{base.extend_from_slice(payload);}});
-        assert_ne!(base,PALS_REGISTERED_BASE_DEFINITION.as_bytes());
+        let mut base = Vec::new();
+        config.profile.registered_semantics_frames(|name, payload| {
+            if name == "structure.public_and_private" {
+                base.extend_from_slice(payload);
+            }
+        });
+        assert_ne!(base, PALS_REGISTERED_BASE_DEFINITION.as_bytes());
         assert!(String::from_utf8(base).unwrap().contains("query-f32[B,8]"));
-        assert!(config.matmul_flops(PalsRole::Proposer,3,7,0).is_err());
-        assert_eq!(config.virtual_review_matmul_flops(PalsRole::Proposer,3,7,0,2,8).unwrap(),PalsMatmulFlops{public_encode:911_496_192,role_forward:258_700_288});
-        assert!(config.virtual_review_matmul_flops(PalsRole::Proposer,3,7,0,2,24).is_err());
+        assert!(config.matmul_flops(PalsRole::Proposer, 3, 7, 0).is_err());
+        assert_eq!(
+            config
+                .virtual_review_matmul_flops(PalsRole::Proposer, 3, 7, 0, 2, 8)
+                .unwrap(),
+            PalsMatmulFlops {
+                public_encode: 911_496_192,
+                role_forward: 258_700_288
+            }
+        );
+        assert!(
+            config
+                .virtual_review_matmul_flops(PalsRole::Proposer, 3, 7, 0, 2, 24)
+                .is_err()
+        );
     }
     fn input() -> PalsModelInput {
         PalsModelInput {
@@ -1135,9 +1240,11 @@ mod tests {
         ] {
             let config = PalsModelConfig::for_profile(profile);
             config.validate().unwrap();
-            assert!(serde_json::to_string(&config)
-                .unwrap()
-                .contains(profile.as_str()));
+            assert!(
+                serde_json::to_string(&config)
+                    .unwrap()
+                    .contains(profile.as_str())
+            );
             assert!(input().validate(&config).is_err() == profile.uses_full_line());
         }
         let bad = json.trim_end_matches('}').to_owned() + ",\"profile\":\"unknown_v2\"}";
@@ -1401,14 +1508,18 @@ mod tests {
                     .iter()
                     .all(|m| !*m)
             );
-            assert!(lines.record_line_tokens
-                [(slot * MAX_LINE_PLY + 3) * 3..(slot + 1) * MAX_LINE_PLY * 3]
-                .iter()
-                .all(|v| *v == 0));
+            assert!(
+                lines.record_line_tokens
+                    [(slot * MAX_LINE_PLY + 3) * 3..(slot + 1) * MAX_LINE_PLY * 3]
+                    .iter()
+                    .all(|v| *v == 0)
+            );
         }
-        assert!(lines.query_line_mask[2 * MAX_LINE_PLY..]
-            .iter()
-            .all(|m| !*m));
+        assert!(
+            lines.query_line_mask[2 * MAX_LINE_PLY..]
+                .iter()
+                .all(|m| !*m)
+        );
         let mut changed = original.clone();
         changed.full_line.as_mut().unwrap().records.pop();
         assert_eq!(
