@@ -170,10 +170,11 @@ class VirtualInventoryTests(unittest.TestCase):
         for raw in (b'{"schema":1,"schema":2}', b'{"schema":NaN}'):
             with self.assertRaises(ValueError): inventory._manifest(raw)
         self.assertEqual(inventory.legacy.SCHEMA, "rovezero.pals-static-control-inventory.v2")
+        self.assertEqual(inventory.legacy.MAX_MANIFEST_BYTES, 131072)
         self.assertEqual(inventory.legacy.MAX_NODES, 5000)
         self.assertEqual(inventory.legacy.MAX_INVENTORY_BYTES, 1048576)
         self.assertEqual((inventory.MAX_NODES, inventory.MAX_GRAPH_NODES, inventory.MAX_INVENTORY_BYTES), (12000,5000,4194304))
-        self.assertEqual(inventory._admission_limits(), {"max_manifest_bytes":131072,"max_graph_bytes":268435456,
+        self.assertEqual(inventory._admission_limits(), {"max_manifest_bytes":262144,"max_graph_bytes":268435456,
             "max_inventory_bytes":4194304,"max_nodes":12000,"max_graph_nodes":5000,
             "max_initializers_per_scope":5000,"max_attributes_per_node":32,"max_recursive_depth":32,"max_path_bytes":4096})
 

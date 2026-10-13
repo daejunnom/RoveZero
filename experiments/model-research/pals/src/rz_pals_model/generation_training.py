@@ -366,7 +366,24 @@ def checkpoint_payload(model, optimizers, ledger, sampler, bucket, *, cuda_devic
             "rng": capture_rng(cuda_devices), "cuda_devices": list(cuda_devices)}
 
 
-def atomic_checkpoint(path, payload):
+class _BoundedCheckpointWriter:
+    """Stop checkpoint serialization before it crosses declared disk credit."""
+    def __init__(self, stream, maximum):
+        self.stream, self.maximum = stream, uint(maximum)
+
+    def write(self, value):
+        if self.stream.tell() + len(value) > self.maximum:
+            raise ValueError("generation checkpoint exceeds remaining declared disk credit")
+        return self.stream.write(value)
+
+    def flush(self):
+        return self.stream.flush()
+
+    def tell(self):
+        return self.stream.tell()
+
+
+def atomic_checkpoint(path, payload, *, max_file_bytes=None):
     """Never overwrite a registered checkpoint; fsync then atomic rename."""
     import torch
     target = Path(path).resolve()
@@ -377,13 +394,18 @@ def atomic_checkpoint(path, payload):
     try:
         os.close(descriptor)
         base_bytes = payload["ledger"]["cost"]["output_bytes"]
+        available = 18 * 1024**3 - uint(base_bytes, 18 * 1024**3)
+        if max_file_bytes is not None:
+            available = min(available, uint(max_file_bytes, 18 * 1024**3))
+        if not available:
+            raise ValueError("generation checkpoint has no remaining declared disk credit")
         previous_size = 0
         for _ in range(8):
             payload["ledger"]["cost"]["output_bytes"] = base_bytes + previous_size
             if payload["ledger"]["cost"]["output_bytes"] > 18 * 1024**3:
                 raise ValueError("managed generation staging/cache 18GiB cap exceeded")
             with open(temporary, "wb") as stream:
-                torch.save(payload, stream)
+                torch.save(payload, _BoundedCheckpointWriter(stream, available))
                 stream.flush()
                 os.fsync(stream.fileno())
             size = os.path.getsize(temporary)
@@ -670,7 +692,8 @@ def deployment_state(model, ledger, *, checkpoint_sha256):
 def train_generation_window(spec, dataset, model, *, optimizers=None, ledger=None, sampler_states=None,
                             frozen_pc_sha256=None, model_epoch=None, checkpoint_directory,
                             max_wall_ns=60 * 60 * 10**9, execute=False, clock=time.monotonic_ns,
-                            collate_and_forward=compact_collate_and_forward):
+                            collate_and_forward=compact_collate_and_forward, output_guard=None,
+                            progress_observer=None, checkpoint_observer=None):
     """One bounded 250-update window of the real generation; never an auto-loop.
 
     Collection is a separate Rust producer. The caller resumes with validated
@@ -697,6 +720,12 @@ def train_generation_window(spec, dataset, model, *, optimizers=None, ledger=Non
     if sampler_states is not None and set(sampler_states) != set(roles):
         raise ValueError("sampler roles differ from generation phase")
     samplers = {role: GenerationSampler(records, role, state=None if sampler_states is None else sampler_states[role]) for role in roles}
+    def publish_owned_progress():
+        if progress_observer is not None:
+            # Same-process owner references retain cursors without copying a
+            # large permutation every update. Serialize only at a boundary.
+            progress_observer(samplers, ledger)
+    publish_owned_progress()
     started, start_completed = clock(), sum(ledger.completed.values())
     max_groups, groups, checkpoints = 65536, 0, []
     status = "window_complete"
@@ -713,18 +742,36 @@ def train_generation_window(spec, dataset, model, *, optimizers=None, ledger=Non
         if groups >= max_groups:
             raise ValueError("NoValidTargetProgress: bounded sampler groups exhausted")
         role = ledger.next_role
+        if output_guard is not None:
+            output_guard()
         group = samplers[role].next_accumulation()
         groups += 1
-        result = train_accumulation(model, optimizers, ledger, group, collate_and_forward, execute=True)
+        try:
+            # Original process transports use an absolute-deadline clock.
+            # Admission/collation before this point cannot renew that deadline.
+            clock()
+            result = train_accumulation(model, optimizers, ledger, group, collate_and_forward, execute=True)
+        finally:
+            # The original process owner retains exact consumed sampler cursors
+            # and charged partial work even if forward/backward/step fails.
+            publish_owned_progress()
         if result["optimizer_updated"] and ledger.checkpoint_boundary():
             from .virtual_review import validate_payload
             bucket = validate_payload(group[-1]["input"]["encoded_model_input"])["line_bucket"]
             sampler = {r: s.state() for r, s in samplers.items()}
             payload = checkpoint_payload(model, optimizers, ledger, sampler, bucket)
             path = Path(checkpoint_directory) / f"{spec['generation_id']}-{sum(ledger.completed.values()):05d}.pt"
-            saved = atomic_checkpoint(path, payload)
+            available = None if output_guard is None else output_guard()
+            saved = atomic_checkpoint(path, payload, max_file_bytes=available)
             ledger.cost["output_bytes"] = payload["ledger"]["cost"]["output_bytes"]
             checkpoints.append(str(saved))
+            # Publish the durable boundary before any later disk/deadline
+            # check can fail. Original process owners must retain this artifact
+            # even when a terminal check prevents a normal return.
+            if checkpoint_observer is not None:
+                checkpoint_observer(str(saved), ledger)
+            if output_guard is not None:
+                output_guard()
     if ledger.phase == "complete":
         status = "generation_updates_complete"
     elif ledger.phase == "v" and roles == ("proposer", "critic"):
@@ -774,13 +821,18 @@ the registered G0 dataset identity. No optimizer/model is created here.
 
 
 def main(argv=None):
-    """Validation-only command; this entry cannot dispatch an optimizer update.
+    """Metadata by default; actual dispatch uses the separate opt-in child.
 
-    Actual windows require the explicit Python runtime API with the registered
-    model, independent data authority, and its sole GPU owner. No smoke command
-    is reused and no execute flag is exposed before that native handoff exists.
+    The source-owned original-trainer child requires pinned startup bytes and
+    original deadlines from its process owner. A metadata receipt cannot issue
+    native game authority. No smoke command is reused for generation execution.
     """
     import argparse
+    import sys
+    actual = list(sys.argv[1:] if argv is None else argv)
+    if "--execute" in actual:
+        from .generation_training_cli import main as execute_generation
+        return execute_generation(actual)
     from .generation_data import strict_json
     parser = argparse.ArgumentParser(prog="train-generation", description="actual generation data/recipe registration; no updates")
     parser.add_argument("--spec", required=True)
@@ -788,7 +840,7 @@ def main(argv=None):
     parser.add_argument("--phase", choices=("pc", "v"), required=True)
     parser.add_argument("--frozen-pc-sha256")
     parser.add_argument("--model-epoch", type=int)
-    args = parser.parse_args(argv)
+    args = parser.parse_args(actual)
     def read(path):
         target = Path(path)
         if target.name.lower().startswith(".env") or target.suffix.lower() in (".key", ".pem"):

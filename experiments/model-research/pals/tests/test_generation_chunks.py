@@ -56,6 +56,22 @@ def write_corpus(root, records, *, splits=None, evidence=None, trajectories=None
     return manifest
 
 
+def append_chunk(root, manifest, kind, values):
+    """Append pinned raw fixture locations without deduplicating their rows."""
+    index = len(manifest["chunks"])
+    relative = f"{kind}-{index:06d}.jsonl"
+    raw = b"".join(json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode() + b"\n"
+                   for value in values)
+    (root / relative).write_bytes(raw)
+    entry = {"index": index, "kind": kind, "path": relative, "sha256": hashlib.sha256(raw).hexdigest(),
+             "bytes": len(raw), "rows": len(values)}
+    manifest["chunks"].append(entry)
+    manifest["total_bytes"] += len(raw)
+    if kind == "records":
+        manifest["total_records"] += len(values)
+    return entry
+
+
 def add_native_chain(record, receipts):
     """Schema fixture only; never executed and never fills real admission quota."""
     from rz_pals_model.virtual_review import input_digest
@@ -230,6 +246,98 @@ class ChunkTests(SourceOnlyTests):
         receipts[next(iter(receipts))]["target"]["completed_depth"] = 99
         manifest = write_corpus(self.corpus, [r], evidence=receipts)
         with self.assertRaisesRegex(ValueError, "receipt seal"):
+            self.opened(manifest)
+
+    def test_identical_evidence_definitions_keep_each_original_chunk_occurrence(self):
+        published, receipts = record(), {}
+        add_policy(published, receipts)
+        manifest = write_corpus(self.corpus, [published], evidence=receipts)
+        first = next(entry for entry in manifest["chunks"] if entry["kind"] == "evidence")
+        original_raw = (self.corpus / first["path"]).read_bytes()
+        original_rows = [data.strict_json(line) for line in original_raw.decode().splitlines()]
+        # Key order/raw bytes may differ; only canonical receipt content may
+        # reuse one dictionary definition. All original bytes stay pinned.
+        repeated = [{"sha256": row["sha256"], "receipt": dict(reversed(list(row["receipt"].items())))}
+                    for row in original_rows]
+        last = append_chunk(self.corpus, manifest, "evidence", repeated)
+        with self.opened(manifest) as dataset:
+            self.assertEqual(dataset._db.execute("SELECT COUNT(*) FROM evidence").fetchone()[0], len(original_rows))
+            self.assertEqual(dataset._db.execute("SELECT COUNT(*) FROM evidence_occurrences").fetchone()[0], 2 * len(original_rows))
+            self.assertEqual(dataset._db.execute("SELECT COUNT(*) FROM heads").fetchone()[0], 1)
+            self.assertEqual(dataset._db.execute("SELECT COUNT(*) FROM teacher_inputs").fetchone()[0], 1)
+            self.assertEqual(dataset._db.execute("SELECT COUNT(*) FROM native").fetchone()[0], 3)
+            self.assertEqual(data.coverage(dataset.rows("train"))["proposer_policy_valid"], 1)
+            for row in original_rows:
+                occurrences = list(dataset.evidence_occurrences(row["sha256"]))
+                self.assertEqual([item["chunk"] for item in occurrences], [first["index"], last["index"]])
+                for item in occurrences:
+                    self.assertEqual(item["chunk_sha256"], manifest["chunks"][item["chunk"]]["sha256"])
+                    raw = (self.corpus / item["path"]).read_bytes()[item["offset"]:item["offset"] + item["length"]]
+                    self.assertEqual(data.strict_json(raw.decode())["sha256"], row["sha256"])
+            self.assertEqual(list(dataset.evidence_occurrences("f" * 64)), [])
+            locations = dataset.evidence_occurrences(original_rows[0]["sha256"])
+        with self.assertRaisesRegex(ValueError, "closed"):
+            next(locations)
+        self.assertEqual((self.corpus / first["path"]).read_bytes(), original_raw)
+
+    def test_repeated_unsubmitted_retirement_retains_raw_causality_and_capacity(self):
+        published, receipts = record(), {}
+        _, _, retired = add_native_chain(published, receipts)
+        cancelled = copy.deepcopy(retired)
+        cancelled.update(input_sha256=None, submission_sha256=None, completion_sha256=None, accepted=False)
+        seal = data.digest(cancelled["schema"], cancelled)
+        receipts[seal] = cancelled
+        manifest = write_corpus(self.corpus, [published], evidence=receipts, native=False)
+        append_chunk(self.corpus, manifest, "evidence", [{"sha256": seal, "receipt": cancelled}])
+        with self.opened(manifest) as dataset:
+            self.assertEqual(len(list(dataset.evidence_occurrences(seal))), 2)
+            self.assertEqual(dataset._db.execute("SELECT COUNT(*) FROM native").fetchone()[0], 3)
+            self.assertEqual(len(dataset.rows("train")), 1)
+        # Unique definitions fit, but every raw occurrence consumes the row
+        # and byte budgets; dictionary reuse cannot hide its storage cost.
+        with mock.patch.object(chunks, "MAX_EVIDENCE", len(receipts)):
+            with self.assertRaisesRegex(ValueError, "entry capacity"):
+                self.opened(manifest)
+        with mock.patch.object(chunks, "MAX_CORPUS_BYTES", manifest["total_bytes"] - 1):
+            with self.assertRaises(ValueError):
+                self.opened(manifest)
+        malformed = copy.deepcopy(cancelled)
+        malformed["ticket"]["request_sequence"] = True
+        changed = copy.deepcopy(manifest)
+        append_chunk(self.corpus, changed, "evidence", [{"sha256": seal, "receipt": malformed}])
+        # Even a hypothetical digest collision cannot bypass the repeated
+        # receipt's domain-specific causal identity validation.
+        with mock.patch.object(chunks, "validate_evidence_receipt", side_effect=lambda _, value: value):
+            with self.assertRaises(ValueError):
+                self.opened(changed)
+
+    def test_identical_evidence_seal_with_different_canonical_content_is_rejected(self):
+        manifest = write_corpus(self.corpus, [record()])
+        first = next(entry for entry in manifest["chunks"] if entry["kind"] == "evidence")
+        row = data.strict_json((self.corpus / first["path"]).read_bytes().splitlines()[0].decode())
+        collision = copy.deepcopy(row)
+        collision["receipt"]["ticket"]["deadline_tick"] += 1
+        append_chunk(self.corpus, manifest, "evidence", [collision])
+        with self.assertRaisesRegex(ValueError, "receipt seal"):
+            self.opened(manifest)
+        # The full canonical comparison is an independent check, even if
+        # two distinct valid-shaped receipts had the same cryptographic seal.
+        with mock.patch.object(chunks, "validate_evidence_receipt", side_effect=lambda _, value: value):
+            with self.assertRaisesRegex(ValueError, "conflicting canonical receipt"):
+                self.opened(manifest)
+
+    def test_evidence_dictionary_reuse_does_not_relax_input_or_trajectory_uniqueness(self):
+        published = record()
+        manifest = write_corpus(self.corpus, [published])
+        append_chunk(self.corpus, manifest, "inputs", [{"input_sha256": published["input_sha256"]}])
+        with self.assertRaisesRegex(ValueError, "Integrity"):
+            self.opened(manifest)
+        trajectory = {"game_id": "g1", "ending": "checkmate", "outcome": "white_win",
+                      "anchors": [published["input"]["rules_anchor"]], "result_evidence_sha256": "d" * 64}
+        seal = data.trajectory_digest(trajectory)
+        manifest = write_corpus(self.corpus, [published], trajectories={seal: trajectory})
+        append_chunk(self.corpus, manifest, "trajectories", [{"sha256": seal, "trajectory": trajectory}])
+        with self.assertRaisesRegex(ValueError, "Integrity"):
             self.opened(manifest)
 
     def test_paths_row_count_storage_and_index_caps_do_not_fallback(self):

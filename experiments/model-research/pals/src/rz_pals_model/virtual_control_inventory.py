@@ -20,7 +20,7 @@ from .onnx_virtual_review import PUBLIC_LAYOUT, SHARED_LAYOUT, VALIDATOR_LAYOUT,
 
 SCHEMA = "rovezero.pals-virtual-static-control-inventory.v1"
 SCOPE = "read_only_serialized_graph_metadata_no_runtime"
-MAX_MANIFEST_BYTES = legacy.MAX_MANIFEST_BYTES
+MAX_MANIFEST_BYTES = 256 * 1024
 MAX_GRAPH_BYTES = legacy.MAX_GRAPH_BYTES
 MAX_TOTAL_GRAPH_BYTES = 512 * 1024 * 1024
 MAX_INVENTORY_BYTES = 4 * 1024 * 1024

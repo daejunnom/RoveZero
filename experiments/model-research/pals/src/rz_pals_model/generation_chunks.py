@@ -791,6 +791,9 @@ The index is regenerated in an explicitly supplied transient directory.
         self._db.executescript("""
             CREATE TABLE inputs(seal TEXT PRIMARY KEY);
             CREATE TABLE evidence(seal TEXT PRIMARY KEY,chunk INTEGER,offset INTEGER,length INTEGER);
+            CREATE TABLE evidence_occurrences(seal TEXT NOT NULL,chunk INTEGER NOT NULL,offset INTEGER NOT NULL,
+                                              length INTEGER NOT NULL,PRIMARY KEY(chunk,offset));
+            CREATE INDEX evidence_occurrences_by_seal ON evidence_occurrences(seal,chunk,offset);
             CREATE TABLE trajectories(seal TEXT PRIMARY KEY,chunk INTEGER,offset INTEGER,length INTEGER);
             CREATE TABLE native(input_seal TEXT,domain TEXT,seal TEXT,PRIMARY KEY(input_seal,domain,seal));
             CREATE TABLE action_authority(causal_seal TEXT PRIMARY KEY,seal TEXT UNIQUE);
@@ -832,21 +835,44 @@ The index is regenerated in an explicitly supplied transient directory.
                             validate_evidence_receipt(seal, value)
                         except ValueError as error:
                             raise ValueError("chunk full receipt seal/domain mismatch") from error
+                        # Every original occurrence is checked, including a
+                        # null retirement repeated after a fresh game resets
+                        # its native epoch. A dictionary definition is not a
+                        # second authority or a second accepted completion.
+                        has_native_input = False
                         if value["schema"] in NATIVE_DOMAINS:
                             _native_ticket(value.get("ticket"))
-                            if value["schema"] == NATIVE_DOMAINS[2] and not _native_retirement(value):
-                                pass  # Complete pre-submission failure is retained, never a row.
-                            else:
-                                self._db.execute("INSERT INTO native VALUES(?,?,?)", (sha(value.get("input_sha256")), value["schema"], seal))
+                            has_native_input = value["schema"] != NATIVE_DOMAINS[2] or _native_retirement(value)
+                            if has_native_input:
+                                sha(value.get("input_sha256"))
                         elif value["schema"] == ACTION_AUTHORITY_DOMAIN:
                             _action_authority(value)
-                            self._db.execute("INSERT INTO action_authority VALUES(?,?)", (value["causal_receipt_sha256"], seal))
                         elif value["schema"] == ACTION_GROUP_DOMAIN:
                             _frozen_action_group(value)
+                        elif value["schema"] == HEAD_EVIDENCE_DOMAIN:
+                            _head_receipt(value)
+
+                        first = self._db.execute("SELECT chunk,offset,length FROM evidence WHERE seal=?", (seal,)).fetchone()
+                        if first is not None:
+                            original = self._read_row(*first)
+                            if (original["sha256"] != seal or
+                                    self._canonical_receipt(original["receipt"]) != self._canonical_receipt(value)):
+                                raise ValueError("conflicting canonical receipt content for identical evidence seal")
+                        self._db.execute("INSERT INTO evidence_occurrences VALUES(?,?,?,?)", (seal, index, offset, length))
+                        if first is not None:
+                            # Do not reregister native/head/teacher/action
+                            # causal keys for one identical sealed definition.
+                            # Raw count and byte caps above still count this
+                            # occurrence, and its immutable location is kept.
+                            continue
+                        if value["schema"] in NATIVE_DOMAINS and has_native_input:
+                            self._db.execute("INSERT INTO native VALUES(?,?,?)", (value["input_sha256"], value["schema"], seal))
+                        elif value["schema"] == ACTION_AUTHORITY_DOMAIN:
+                            self._db.execute("INSERT INTO action_authority VALUES(?,?)", (value["causal_receipt_sha256"], seal))
+                        elif value["schema"] == ACTION_GROUP_DOMAIN:
                             self._db.execute("INSERT INTO action_groups VALUES(?,?,?)",
                                              (value["input_sha256"], value["group_sha256"], seal))
                         elif value["schema"] == HEAD_EVIDENCE_DOMAIN:
-                            _head_receipt(value)
                             self._db.execute("INSERT INTO heads VALUES(?,?,?)", (value["input_sha256"], value["head"], seal))
                         elif value["schema"] == TEACHER_INPUT_BINDING_DOMAIN:
                             self._db.execute("INSERT INTO teacher_inputs VALUES(?,?,?)",
@@ -1001,6 +1027,25 @@ The index is regenerated in an explicitly supplied transient directory.
         if split not in SPLITS or optimization and split != "train":
             raise ValueError("holdout/validation corpus cannot be an optimization pool")
         return ChunkRows(self, split)
+
+    @staticmethod
+    def _canonical_receipt(value):
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+    def evidence_occurrences(self, evidence_sha256):
+        """Stream original immutable receipt locations, not new authorities.
+
+        Repeated definitions retain their chunk pin, offset and exact raw
+        length. Only the evidence dictionary reuses a canonical definition;
+        published input/trajectory keys and record admission are unchanged.
+        """
+        self._check_index()
+        seal = sha(evidence_sha256)
+        for chunk, offset, length in self._db.execute(
+                "SELECT chunk,offset,length FROM evidence_occurrences WHERE seal=? ORDER BY chunk,offset", (seal,)):
+            self._check_index()
+            yield {"sha256": seal, "chunk": chunk, "path": self._manifest["chunks"][chunk]["path"],
+                   "chunk_sha256": self._manifest["chunks"][chunk]["sha256"], "offset": offset, "length": length}
 
     def admit(self, phase):
         # SQL selected already removes semantic repeats and publication conflicts;

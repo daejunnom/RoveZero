@@ -189,16 +189,25 @@ class NumericCaptureTests(unittest.TestCase):
                     capture.capture_reference(ForbiddenModel(),{},"not_read",plan,"not_written",checkpoint_path="not_read",
                         expected_reference_source_sha256=actual["model_reference"],max_seconds=seconds,execute=True)
 
-    def test_source_named_byte_framing_reads_sources_without_model_import(self):
+    def test_common_source_inventory_and_framing_without_model_import(self):
+        from rz_pals_model import v5_source_registry as registry
         actual = capture.source_pins()
-        folder = Path(capture.__file__).parent
-        def reference(domain, names):
-            framed = []
-            for item in [domain.encode(),*[part for name in sorted(names) for part in (name.encode(),(folder/name).read_bytes())]]:
-                framed.append(struct.pack("<Q",len(item))+item)
-            return hashlib.sha256(b"".join(framed)).hexdigest()
-        self.assertEqual(actual["model_reference"],reference("rz-pals-numeric-reference-source-v5/1",capture._REFERENCE_FILES))
-        self.assertEqual(actual["model_export"],reference("rz-pals-numeric-export-source-v5/1",capture._EXPORT_FILES))
+        self.assertEqual(set(actual),capture._SOURCE)
+        self.assertEqual(actual,registry.source_pins(capture._SOURCE))
+        root = Path(capture.__file__).absolute().parents[5]
+        catalog = json.loads((root/registry.CATALOG).read_text(encoding="utf-8"))
+        for component, pin in actual.items():
+            rows = []
+            for logical in sorted(catalog["components"][component]):
+                raw = (root/logical).read_bytes()
+                rows.append((logical,len(raw),hashlib.sha256(raw).digest()))
+            domain = registry.DOMAIN.encode()
+            framed = struct.pack("<Q",len(domain))+domain
+            for logical,size,raw_hash in rows:
+                path = logical.encode()
+                framed += struct.pack("<Q",len(path))+path+struct.pack("<Q",size)+raw_hash
+            self.assertEqual(pin,hashlib.sha256(framed).hexdigest())
+            self.assertEqual(pin,registry.component_digest(rows))
         self.assertNotEqual(actual["model_reference"],hashlib.sha256(Path(capture.__file__).read_bytes()).hexdigest())
 
     def test_registered_encoding_vocabulary_and_digest_match_rust_source(self):

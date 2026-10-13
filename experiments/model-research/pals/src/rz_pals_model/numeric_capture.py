@@ -37,34 +37,18 @@ _SOURCE = {"model_native", "model_encoding", "nn_runtime", "model_reference", "m
 _INTEGER = {"anchor_board", "record_anchor", "record_line_tokens", "candidates", "query_anchor",
             "query_line_tokens", "record_relations"}
 _BOOL = {"anchor_mask", "record_line_mask", "record_mask", "candidate_mask", "divergence_mask", "query_line_mask"}
-_REFERENCE_FILES = ("artifacts.py", "config.py", "model.py", "numeric_capture.py", "onnx_shared.py", "virtual_review.py")
-_EXPORT_FILES = ("artifacts.py", "config.py", "onnx_shared.py", "onnx_virtual_review.py")
-
-
 def source_pins():
-    """Hash bounded actual reference/export sources without importing a model.
+    """Read the same five bounded actual components the native binary embeds.
 
-    The native example embeds the same named bytes at compilation. A filename
-    is framed separately from contents; these domains are not the legacy model
-    or Rules encoder source digest. They identify this raw capture producer.
+    The V5 manifest, native producer and reference all use the single registered
+    logical-path/size/raw-SHA inventory and its common component framing. This
+    registration never imports a model or certifies that the component ran.
     """
-    def pin(domain, names):
-        digest = hashlib.sha256()
-        def frame(raw):
-            digest.update(struct.pack("<Q", len(raw))); digest.update(raw)
-        frame(domain.encode())
-        for name in sorted(names):
-            path = Path(__file__).parent / name
-            if path.is_symlink() or not path.is_file():
-                raise ValueError("registered regular source file required")
-            with path.open("rb") as stream:
-                raw = stream.read(2 * 1024 * 1024 + 1)
-            if not raw or len(raw) > 2 * 1024 * 1024:
-                raise ValueError("registered source byte bound exceeded")
-            frame(name.encode()); frame(raw)
-        return digest.hexdigest()
-    return {"model_reference": pin("rz-pals-numeric-reference-source-v5/1", _REFERENCE_FILES),
-            "model_export": pin("rz-pals-numeric-export-source-v5/1", _EXPORT_FILES)}
+    from .v5_source_registry import source_pins as registered_source_pins
+    result = registered_source_pins(_SOURCE)
+    if set(result) != _SOURCE or not all(_sha(value) for value in result.values()):
+        raise ValueError("complete registered numerical source roster required")
+    return result
 
 
 def _sha(value):
@@ -409,7 +393,7 @@ def capture_reference(model, metadata, export_directory, plan, output_root, *, c
     actual_sources = source_pins()
     if (not _sha(expected_reference_source_sha256) or bindings["source_components"]["model_reference"] != expected_reference_source_sha256
             or expected_reference_source_sha256 != actual_sources["model_reference"]
-            or bindings["source_components"]["model_export"] != actual_sources["model_export"]):
+            or bindings["source_components"] != actual_sources):
         raise ValueError("current registered reference source differs")
     if type(max_seconds) is not int or not 1 <= max_seconds <= 3600:
         raise ValueError("finite reference capture window required")

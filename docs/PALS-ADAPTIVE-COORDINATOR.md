@@ -87,3 +87,66 @@ progress만 coalesce한다. manager가 forward·archive I/O·외부 drain을 동
 각 행은 실제 통합 소스·검사 결과와 연결되기 전에는 완료가 아니다. M0→M1/M2→고정
 coordinator→adaptive/compact→외부·자료→GPU 순서를 따른다. 실제 학습은 사용자 지시로
 보류하며 구현·CPU 검사에 계속 진척한다. 본격적 학습·기력 개선·새 PR 병합은 별도 인수다.
+
+## 실제 수집 실행 접점과 보존 범위
+
+`rz-arena`의 `pals-collection-onnx` feature는 `rz-pals-selfplay-collect` 부모와
+`rz-pals-generation-game-worker` 단일 게임 child를 제공한다. 부모는
+`--declaration <등록한 절대 경로> --declaration-sha256 <원래 파일 SHA-256>`만 받는다.
+선언 형식은 `rz-pals-selfplay-cli-declaration/1`이며, 128개 게임의 ordinal, 시작 상태,
+원래 실행·정리 창, 바이너리, private cwd, startup config/lock, 자원·출력 상한을
+실행 전에 고정한다. 이 진입점은 학습·cloud 생성·mount·자산 복제를 암묵적으로 실행하지 않는다.
+
+자산을 담은 private cwd는 미리 준비해야 한다. 실제 동일 inode가 공유되는 경우에는
+양쪽 alias의 읽기 전용 mount 관측을 요구한다. 고유 inode bytes와 logical alias bytes를
+따로 기록하고, 고유 staging과 실행 출력은 18GiB 상한을 지킨다. 전체 모델/runtime을
+128번 복제한 준비 자료가 상한을 넘으면 용량 오류다. 공유되었다는 선언으로 실제 관측을
+대신하거나 symlink/hardlink 검사를 완화하지 않는다.
+
+각 게임은 새 OS child를 한 번 실행한다. 부모는 원래 바이너리·입력·실제 loaded-image,
+물리 종료·process group 정리, 저장된 입력·관측, Rules 재생과 시계·SAN 기보를 대조한다.
+native session epoch의 변화는 OS 재시작 증거가 아니다. 제출·완료·수락·해제와 원래 child
+실행 증거를 가진 opaque 결과만 최종 집계에 넣으며 JSON에서 실행 권한을 재구성하지 않는다.
+
+검증이 끝난 게임은 큰 원시 record/evidence 맵을 RAM에서 해제하고 원래 파일 핸들과
+무결성 pin, 실행·종료 소유자와 작은 seal 목록을 유지한다. 최종 집계는 정확히 128판,
+64개 흑백 교환 쌍, 사전 등록 train/validation/holdout 48/8/8을 확인한다. 최종 index의
+domain은 `rz-pals-whole-game-series-index/1`이다. 포함된 dataset manifest는 기존
+`rz-pals-generation-chunk-manifest/1`의 의미를 유지하며 원래 게임별 JSONL의 상대 경로를
+참조한다. 동일 evidence가 반복되면 내용·seal을 검증한 뒤 정의만 재사용하고 모든 원래
+발생 위치를 보존한다. 반복 관측을 새 물리 완료·새 witness·새 학습 sample로 세지 않는다.
+
+출판 재검증의 시간·누적 읽기 credit은 선언에서 따로 고정한다. 이 읽기 전용 창은 원래
+child의 실행·정리 창을 연장하지 않는다. 각 게임의 읽기 상한도 그대로 적용하며 실제
+소비량을 누적한다. 재검증 중 실패한 소비량을 확인할 수 없으면 남은 예약 credit을
+보수적으로 소진하고 추가 read allowance를 지급하지 않는다. 저장 용량과 누적 I/O bytes는
+다른 값이다. 이 소스 연결은 실행 시간이나 메모리 개선의 측정 증거가 아니다.
+
+첫 실패에서 해당 series를 중단하고 완료 index를 발급하지 않는다. 원시 stdout/stderr,
+부분 index와 소유자는 보존하며 저장 자체의 오류도 별도 기록한다. GPU 수치·물리 수명,
+실제 128판, optimizer update·resume, G1 export와 최종 32쌍은 각각 별도 인수다.
+
+## 기존 V2 호환 경로와 현재 인수 상태
+
+실제 startup factory는 V2 `FullLineInteractionV2`의 Full/Selected와 V3
+`virtual_review_v1`을 구별한다. Full은 Search가 제출 시 고정한 원래 RoleRecord
+순서·값·수열·관계와 Store lease를 사용하고, Selected는 선택된 ReviewView만 받는다.
+Fresh pair의 두 endpoint는 같은 원래 Full snapshot을 소유해야 한다. 모델과 입력의
+기존 의미 식별·고정 L ABI·cache namespace를 새 compact 의미로 바꾸지 않는다.
+
+Full 경로도 coordinator의 bounded ReviewView 승인을 거치므로 일부 큰 원본 문맥은
+`Unknown/ViewCapacity`로 보류될 수 있다. 원본 full 입력의 의미·수명 보존은 원래 동기
+full 경로의 모든 문맥이 같은 조건에서 제출된다는 보장과 구분한다. compact/selected
+기본 경로에는 full record scan과 snapshot pin을 추가하지 않는다.
+
+V2 native 계수는 같은 실제 exclusive owner 호출 전후의 public cache·public/private
+실행 차이에서 얻는다. 여러 record-page 실행은 각각 물리 NN 입력으로 센다. V 실행이
+없다는 근거는 검증된 manifest와 실제 로드된 session 집합이다. 계수 포화·감소·혼합·
+물리 완료 불명은 알려진 0으로 표시하지 않으며, 검색 소비와 물리 완료도 따로 기록한다.
+
+2026-10-13의 CPU/mock 검사에서 Search는 639개 통과·2개 의도적 미실행,
+UCI는 527개 통과·1개 실패였다. 실패한 fixed trace의 상태·제한·score·PV·실제 node
+사용량은 같았으나 질문 식별값이 계산 조건에 포함된 차이가 있었다. 계산 조건과 private
+dispatch custody를 분리한 후속 수정은 원래 fixture와 판정 기준을 유지하며 재검사한다.
+신경망과 optimizer import를 차단한 새 trainer CLI metadata 검사 15개는 통과했다.
+이 결과는 실제 optimizer update·CUDA 완료·학습 checkpoint 재개 인수가 아니다.
