@@ -117,9 +117,9 @@ impl VirtualReviewProfileDirectory {
                     .components()
                     .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
                 || path.parent() != Some(self.path())
-                || !exact
+                || exact
                     .as_ref()
-                    .is_some_and(|expected| path.as_os_str() == expected.as_os_str())
+                    .is_none_or(|expected| path.as_os_str() != expected.as_os_str())
                 || !path
                     .file_name()
                     .and_then(|name| name.to_str())

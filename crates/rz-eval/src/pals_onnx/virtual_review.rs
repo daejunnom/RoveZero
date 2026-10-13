@@ -423,6 +423,10 @@ impl VirtualReviewTicketOwnerAccounting {
     }
 }
 
+// Completion owns the original output/error and its single-owner accounting.
+// Keep them in the same bounded worker message instead of adding a separate
+// allocation on every physical completion solely to equalize variant sizes.
+#[allow(clippy::large_enum_variant)]
 pub enum VirtualReviewNativeResult {
     Evaluation(PalsRawOutput),
     TicketEvaluationWithEvidence {

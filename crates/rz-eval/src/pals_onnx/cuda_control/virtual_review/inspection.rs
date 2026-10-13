@@ -7,6 +7,14 @@ const WARM_MODE: &str = "private_virtual_warm_mode";
 const WARM_ANNOTATION: &str = "virtual_warm_if_dispatch_candidate";
 const WARM_SEED: &str = "consume_complete_virtual_private_seed";
 
+type PrivateKernelInventory = BTreeMap<String, String>;
+type InspectedGraphPolicy = (GraphPolicy, PrivateKernelInventory, PrivateKernelInventory);
+type InspectedPrivateBindings = (
+    BTreeMap<String, Origin>,
+    PrivateKernelInventory,
+    PrivateKernelInventory,
+);
+
 struct Route {
     root: String,
     mode: Option<String>,
@@ -19,14 +27,7 @@ struct Route {
 pub(super) fn inspect(
     graph: &InventoryGraphV3,
     count: &mut usize,
-) -> Result<
-    (
-        GraphPolicy,
-        BTreeMap<String, String>,
-        BTreeMap<String, String>,
-    ),
-    BackendError,
-> {
+) -> Result<InspectedGraphPolicy, BackendError> {
     if !matches!(
         graph.role.as_str(),
         "public" | "shared_pc" | "shared_warm" | "validator"
@@ -144,14 +145,7 @@ type DependencyKey = (String, usize, String, String, String, String);
 /// still determined later by initialization placement and actual kernel events.
 fn inspect_private_bindings(
     graph: &InventoryGraphV3,
-) -> Result<
-    (
-        BTreeMap<String, Origin>,
-        BTreeMap<String, String>,
-        BTreeMap<String, String>,
-    ),
-    BackendError,
-> {
+) -> Result<InspectedPrivateBindings, BackendError> {
     let mut weights = BTreeMap::new();
     let mut origins = BTreeMap::new();
     if graph.weight_bindings.is_empty()
@@ -169,7 +163,7 @@ fn inspect_private_bindings(
             || weight.dtype != "FLOAT"
             || weight.shape.is_empty()
             || weight.shape.len() > 8
-            || weight.shape.iter().any(|dimension| *dimension == 0)
+            || weight.shape.contains(&0)
             || (weight.initializer != weight.parameter
                 && weight.initializer != format!("{}.linear_transpose", weight.parameter))
             || weights
@@ -305,9 +299,9 @@ fn inspect_scope_v3(
 ) -> Result<(), BackendError> {
     if depth > 32
         || scope.path.len() > 4096
-        || !scope
+        || scope
             .initializer_count
-            .is_some_and(|value| value <= MAX_NODES)
+            .is_none_or(|value| value > MAX_NODES)
         || !descriptors(&scope.inputs)
         || !descriptors(&scope.outputs)
         || scope.integral_initializers.len() > scope.initializer_count.unwrap_or(0)
