@@ -39,6 +39,30 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .fresh_pending
                 .get(&query.question_digest)
                 .ok_or(RoleError::InvalidOutput)?;
+            // The legacy full-context baseline freezes the original raw rows
+            // once for both endpoints. Equal selected views do not authorize
+            // substituting a later raw snapshot for the second Fresh value.
+            let same_raw_context = match (
+                &query.legacy_full_records,
+                &next.question.legacy_full_records,
+            ) {
+                (None, None) => true,
+                (Some(first), Some(second)) => {
+                    Arc::ptr_eq(first, second)
+                        && first.authority() == self.authority
+                        && second.authority() == self.authority
+                        && first.digest() == second.digest()
+                        && first.validates(&self.engine.stores)
+                        && second.validates(&self.engine.stores)
+                }
+                _ => false,
+            };
+            if !same_raw_context {
+                return Err(StoreError::InvalidEvidence(
+                    "Fresh pair legacy raw context differs from frozen submission",
+                )
+                .into());
+            }
             let seal = FreshPairSeal::from_ticket(
                 ticket,
                 work.input.public_context,
@@ -583,24 +607,15 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     .ok_or(RoleError::InvalidOutput)?
                     .to_vec();
                 let node = self.replay_node(&prefix)?;
-                if self.engine.nodes[node].terminal.is_some() {
-                    return Ok(AdaptivePortTransition::Unknown {
-                        reason: "Repair begins at Rules terminal",
-                    });
-                }
-                Ok(AdaptivePortTransition::Continue(self.blueprint(
+                self.begin_repair_continuation(
                     node,
-                    RefinementStage::Repair,
                     query.first,
                     prefix,
                     query.proposal.clone(),
-                    Some(counter.clone()),
-                    None,
-                    Some(ply),
-                    false,
-                    None,
-                    None,
-                )?))
+                    counter.clone(),
+                    ply,
+                    query.counter_source,
+                )
             }
             RefinementStage::RepairValidation | RefinementStage::RepairValueFresh => {
                 self.publish_supported_repair(query)?;
@@ -643,6 +658,114 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             }
             _ => Err(RoleError::InvalidOutput.into()),
         }
+    }
+
+    /// Mirrors synchronous `follow(Call::Repair)`: a full or terminal prefix
+    /// is a zero-step Repair, not permission to append one more model move.
+    /// The caller already admitted this Repair under the per-first-move cap.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn begin_repair_continuation(
+        &mut self,
+        node: usize,
+        first: Option<BoardMove>,
+        prefix: Vec<BoardMove>,
+        proposal: Vec<BoardMove>,
+        counter: Vec<BoardMove>,
+        attack: usize,
+        source: Option<ObservationId>,
+    ) -> Result<AdaptivePortTransition, PalsError> {
+        self.check_live()?;
+        let first = first.ok_or(RoleError::InvalidOutput)?;
+        if prefix.len() > self.engine.config.line_plies
+            || proposal.len() > self.engine.config.line_plies
+            || counter.len() > self.engine.config.line_plies
+            || prefix.first() != Some(&first)
+            || proposal.first() != Some(&first)
+            || counter.first() != Some(&first)
+            || counter.get(..=attack) != Some(prefix.as_slice())
+            || proposal.get(..attack) != prefix.get(..attack)
+            || proposal.get(attack) == counter.get(attack)
+            || self.replay_node(&prefix)? != node
+        {
+            return Err(ReviewError::AnchorMismatch.into());
+        }
+        let zero_step = prefix.len() == self.engine.config.line_plies
+            || self.engine.nodes[node].terminal.is_some();
+        if !zero_step {
+            return Ok(AdaptivePortTransition::Continue(
+                self.blueprint(
+                    node,
+                    RefinementStage::Repair,
+                    Some(first),
+                    prefix,
+                    proposal,
+                    Some(counter),
+                    None,
+                    Some(attack),
+                    false,
+                    None,
+                    None,
+                )?
+                .with_counter_source(source),
+            ));
+        }
+
+        // Retain the unchanged line's actual Repair record and genealogy. No
+        // accepted Repair output, revised own move or new witness is invented.
+        self.record_hot(RecordKind::Repair, &prefix, None)?;
+        self.counters.repairs = self
+            .counters
+            .repairs
+            .checked_add(1)
+            .ok_or(PalsError::Capacity)?;
+        if self.engine.nodes[node].terminal.is_some() {
+            return Ok(AdaptivePortTransition::Complete {
+                scope: FrameCompletionScope::NoRepairContinuation,
+            });
+        }
+        let cached_cpu = self.has_reusable_completed_cpu(node, prefix.len())?;
+        if cached_cpu {
+            // One new semantic verification lookup consumes the already
+            // accepted exact estimate. It adds no physical execution or record.
+            self.counters.evidence_cache_hits = self
+                .counters
+                .evidence_cache_hits
+                .checked_add(1)
+                .ok_or(PalsError::Capacity)?;
+            self.counters.consumed_cached_cpu_values = self
+                .counters
+                .consumed_cached_cpu_values
+                .checked_add(1)
+                .ok_or(PalsError::Capacity)?;
+            if !self.engine.uses_model_resolver() {
+                return Ok(AdaptivePortTransition::Complete {
+                    scope: FrameCompletionScope::NoRepairContinuation,
+                });
+            }
+        }
+        let next = if cached_cpu {
+            // A model-resolver value must still be Fresh for the new record
+            // revision, even though own CPU verification used exact evidence.
+            RefinementStage::RepairValueFresh
+        } else {
+            RefinementStage::RepairValidation
+        };
+        Ok(AdaptivePortTransition::Continue(
+            self.blueprint(
+                node,
+                next,
+                Some(first),
+                prefix.clone(),
+                proposal,
+                Some(counter),
+                Some(prefix),
+                Some(attack),
+                false,
+                None,
+                None,
+            )?
+            .with_counter_source(source),
+        ))
     }
 
     /// The extra Fresh endpoint was already accepted. Continue to the actual

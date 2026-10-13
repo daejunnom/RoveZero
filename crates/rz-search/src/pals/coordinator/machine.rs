@@ -126,12 +126,18 @@ impl RefinementStage {
                 next,
                 Self::CounterValueFresh
                     | Self::Repair
+                    | Self::RepairValidation
+                    | Self::RepairValueFresh
                     | Self::CounterContinuation
                     | Self::CounterValidation
             ),
             Self::CounterValueFresh => matches!(
                 next,
-                Self::Repair | Self::CounterContinuation | Self::CounterValidation
+                Self::Repair
+                    | Self::RepairValidation
+                    | Self::RepairValueFresh
+                    | Self::CounterContinuation
+                    | Self::CounterValidation
             ),
             Self::Repair => matches!(next, Self::Repair | Self::RepairValidation),
             Self::RepairValidation => matches!(
@@ -141,6 +147,7 @@ impl RefinementStage {
                     | Self::RecheckRepairedValueFresh
                     | Self::CounterContinuation
                     | Self::CounterValidation
+                    | Self::RepairValidation
             ),
             Self::RepairValueFresh => matches!(
                 next,
@@ -148,6 +155,8 @@ impl RefinementStage {
                     | Self::RecheckRepairedValueFresh
                     | Self::CounterContinuation
                     | Self::CounterValidation
+                    | Self::RepairValidation
+                    | Self::RepairValueFresh
             ),
             Self::CriticRecheck => {
                 matches!(
@@ -157,6 +166,8 @@ impl RefinementStage {
                         | Self::CounterContinuation
                         | Self::CounterValidation
                         | Self::Repair
+                        | Self::RepairValidation
+                        | Self::RepairValueFresh
                 )
             }
             Self::RecheckCounterValidation => matches!(
@@ -165,12 +176,18 @@ impl RefinementStage {
                     | Self::CounterContinuation
                     | Self::CounterValidation
                     | Self::Repair
+                    | Self::RepairValidation
+                    | Self::RepairValueFresh
             ),
             Self::RecheckRepairedValueFresh => next == Self::CriticRecheck,
             Self::FreshRepairedEndpoint => next == Self::FreshCounterEndpoint,
             Self::FreshCounterEndpoint => matches!(
                 next,
-                Self::CounterContinuation | Self::CounterValidation | Self::Repair
+                Self::CounterContinuation
+                    | Self::CounterValidation
+                    | Self::Repair
+                    | Self::RepairValidation
+                    | Self::RepairValueFresh
             ),
         }
     }
@@ -344,6 +361,9 @@ pub enum FrameCompletionScope {
     NoDivergence,
     NoAlternative,
     RepairNotAdmitted,
+    /// The admitted Repair prefix already filled its bounded line or reached
+    /// a Rules terminal. No Repair policy output or new witness was produced.
+    NoRepairContinuation,
     /// Actual C continuation ends in a pair of Rules terminal endpoints. The
     /// consumer retains both exact endpoint proofs; no Fresh NN was executed.
     CompletedRulesPair,
@@ -368,12 +388,23 @@ impl FrameCompletionScope {
                 RefinementStage::CpuDiscovery
                     | RefinementStage::CriticReply
                     | RefinementStage::RepairValidation
+                    | RefinementStage::RepairValueFresh
                     | RefinementStage::CriticRecheck
                     | RefinementStage::RecheckRepairedValueFresh
             ),
             Self::RepairNotAdmitted => matches!(
                 stage,
                 RefinementStage::CounterValidation | RefinementStage::CounterValueFresh
+            ),
+            Self::NoRepairContinuation => matches!(
+                stage,
+                RefinementStage::CounterValidation
+                    | RefinementStage::CounterValueFresh
+                    | RefinementStage::RepairValidation
+                    | RefinementStage::RepairValueFresh
+                    | RefinementStage::CriticRecheck
+                    | RefinementStage::RecheckCounterValidation
+                    | RefinementStage::FreshCounterEndpoint
             ),
             Self::CompletedFreshPair => stage == RefinementStage::FreshCounterEndpoint,
             Self::CompletedRulesPair => matches!(
@@ -909,7 +940,20 @@ impl<V, Q> RefinementMachine<V, Q> {
             }
         }
         let repair_key = match &transition {
-            FrameTransition::Continue(next) if next.stage == RefinementStage::Repair => {
+            FrameTransition::Continue(next)
+                if next.stage == RefinementStage::Repair
+                    || (matches!(
+                        next.stage,
+                        RefinementStage::RepairValidation | RefinementStage::RepairValueFresh
+                    ) && matches!(
+                        current.input.stage,
+                        RefinementStage::CounterValidation
+                            | RefinementStage::CounterValueFresh
+                            | RefinementStage::CriticRecheck
+                            | RefinementStage::RecheckCounterValidation
+                            | RefinementStage::FreshCounterEndpoint
+                    )) =>
+            {
                 let current = self
                     .frame(frame_id)
                     .ok_or(CoordinatorError::UnknownRequest)?;
@@ -924,6 +968,17 @@ impl<V, Q> RefinementMachine<V, Q> {
                 } else {
                     None
                 }
+            }
+            FrameTransition::Complete {
+                scope: FrameCompletionScope::NoRepairContinuation,
+            } => {
+                let key = (
+                    current.original_first_move,
+                    current.input.question_digest,
+                    current.input.view_seal.view_digest,
+                );
+                self.check_repair_key(key)?;
+                Some(key)
             }
             _ => None,
         };
@@ -955,13 +1010,17 @@ impl<V, Q> RefinementMachine<V, Q> {
                         | RefinementStage::RecheckCounterValidation
                         | RefinementStage::FreshCounterEndpoint
                 );
-                let next_repair = next.stage == RefinementStage::Repair
-                    && matches!(
-                        frame.input.stage,
-                        RefinementStage::CriticRecheck
-                            | RefinementStage::RecheckCounterValidation
-                            | RefinementStage::FreshCounterEndpoint
-                    );
+                let next_repair = matches!(
+                    next.stage,
+                    RefinementStage::Repair
+                        | RefinementStage::RepairValidation
+                        | RefinementStage::RepairValueFresh
+                ) && matches!(
+                    frame.input.stage,
+                    RefinementStage::CriticRecheck
+                        | RefinementStage::RecheckCounterValidation
+                        | RefinementStage::FreshCounterEndpoint
+                );
                 if (next_branch || next_repair)
                     && next.question_digest == frame.input.question_digest
                 {
@@ -1068,6 +1127,9 @@ impl<V, Q> RefinementMachine<V, Q> {
                         .entry(queue_key)
                         .or_insert(seal)
                         .committed = true;
+                }
+                if let Some(key) = repair_key {
+                    self.remember_repair_key(key);
                 }
                 Ok(Some(closed))
             }
@@ -2031,6 +2093,10 @@ impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
                         )
                         | (RefinementStage::CounterValidation, RefinementStage::Repair)
                         | (
+                            RefinementStage::CounterValidation,
+                            RefinementStage::RepairValidation
+                        )
+                        | (
                             RefinementStage::RepairValidation,
                             RefinementStage::CriticRecheck
                         )
@@ -2066,6 +2132,9 @@ impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
                 ) | (
                     RefinementStage::CounterValidation,
                     FrameCompletionScope::RepairNotAdmitted
+                ) | (
+                    RefinementStage::CounterValidation,
+                    FrameCompletionScope::NoRepairContinuation
                 ) | (
                     RefinementStage::RepairValidation,
                     FrameCompletionScope::NoAlternative

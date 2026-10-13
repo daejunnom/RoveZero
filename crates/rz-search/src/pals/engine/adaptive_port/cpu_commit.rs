@@ -502,21 +502,20 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .map(|movement| format!("{:04x}", movement.bits()))
             .collect();
         let base_condition = self.engine.cpu_condition();
-        let question_hex: String = work
-            .input
-            .question_digest
-            .0
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let task_condition = format!(
-            "{};question={:?};ordered-root-mask={};prefix-plies={};adaptive-question={}",
-            base_condition,
-            task_question,
-            ordered_mask,
-            question.context.prefix.len(),
-            question_hex
-        );
+        // Keep the original calculation namespace. Logical question/view/job
+        // authority belongs to the private admission and physical dispatch
+        // handle, not the CPU implementation's exact evaluation condition.
+        let task_condition = if task_question == TaskQuestion::AnalyzePosition {
+            base_condition.clone()
+        } else {
+            format!(
+                "{};question={:?};ordered-root-mask={};prefix-plies={}",
+                base_condition,
+                task_question,
+                ordered_mask,
+                question.context.prefix.len(),
+            )
+        };
         let profile = stable_id(descriptor.config.profile.identity());
         let condition = stable_id(&format!(
             "{};q={}",
@@ -549,6 +548,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 context: question.context.clone(),
                 first_move: work.original_first_move,
                 execution: None,
+                dispatch: None,
                 consumer: None,
                 original_consumer: None,
                 target_depth,
@@ -574,7 +574,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     epoch: 0,
                     profile,
                     condition,
-                    input_revision: question.context.prefix.len() as u64,
+                    input_revision: if task_question == TaskQuestion::AnalyzePosition {
+                        0
+                    } else {
+                        question.context.prefix.len() as u64
+                    },
                     requested_depth: target_depth,
                     node_budget: credit,
                 },
@@ -676,7 +680,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             generation: admission.generation,
             deadline_tick,
         };
-        let store_admission = if admission.continuation_retained {
+        let (store_admission, dispatch) = if admission.continuation_retained {
             let previous = admission.execution.ok_or(StoreError::InvalidConditions(
                 "CPU resume has no original Store execution",
             ))?;
@@ -692,16 +696,27 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             {
                 return Err(StoreError::StaleConsumer.into());
             }
-            self.engine.stores.hot_resume_sealed_cpu_task(
-                previous,
-                original,
+            let dispatch = admission
+                .dispatch
+                .as_ref()
+                .ok_or(StoreError::InvalidConditions(
+                    "CPU resume has no original dispatch custody",
+                ))?;
+            if !dispatch.identifies(previous, original) {
+                return Err(StoreError::InvalidConditions(
+                    "CPU resume dispatch differs from original execution and consumer",
+                )
+                .into());
+            }
+            self.engine.stores.hot_resume_cpu_instance(
+                dispatch,
                 admission.task_key.clone(),
                 consumer,
                 &admission.position.snapshot(),
                 now_tick,
             )?
         } else {
-            self.engine.stores.hot_request_task(
+            self.engine.stores.hot_request_cpu_instance(
                 admission.task_key.clone(),
                 next_consumer,
                 now_tick,
@@ -744,6 +759,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .get_mut(&work.input.question_digest)
             .expect("prepared CPU admission");
         stored.execution = Some(execution);
+        stored.dispatch = Some(dispatch);
         stored.consumer = Some(consumer);
         stored.original_consumer = Some(next_consumer);
         stored.job = Some(*job);

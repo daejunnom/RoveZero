@@ -105,6 +105,76 @@ impl PalsStores {
         self.request_task_once(key, consumer, now_tick)
     }
 
+    /// A separately reserved worker job starts a physical instance even when
+    /// another job has the same exact computation key. Its opaque custody is
+    /// independent of the semantic cache index and is never serialized.
+    pub(crate) fn hot_request_cpu_instance(
+        &mut self,
+        key: TaskKey,
+        consumer: TaskConsumer,
+        now_tick: u64,
+    ) -> Result<(TaskAdmission, CpuTaskDispatch), StoreError> {
+        self.validate_task_request(&key, consumer)?;
+        let admission = self
+            .tasks
+            .request_cpu_instance(key, consumer, now_tick, None)?;
+        let TaskAdmission::Start(execution) = admission else {
+            unreachable!("new owned CPU instance never joins, reuses or resumes")
+        };
+        Ok((
+            admission,
+            CpuTaskDispatch {
+                owner: self.read_owner(),
+                generation: self.generation,
+                execution,
+                consumer,
+            },
+        ))
+    }
+
+    /// Resume only this process-local dispatch's same paused execution. A
+    /// newer semantic-cache entry for another job cannot replace this owner.
+    pub(crate) fn hot_resume_cpu_instance(
+        &mut self,
+        dispatch: &CpuTaskDispatch,
+        expected_key: TaskKey,
+        next_consumer_id: u64,
+        exact_state: &PositionSnapshot,
+        now_tick: u64,
+    ) -> Result<(TaskAdmission, CpuTaskDispatch), StoreError> {
+        if !dispatch.owner.matches(self) || dispatch.generation != self.generation {
+            return Err(StoreError::StaleConsumer);
+        }
+        let admission = self.resume_sealed_cpu_task(
+            dispatch.execution,
+            dispatch.consumer,
+            expected_key,
+            next_consumer_id,
+            exact_state,
+            now_tick,
+            true,
+        )?;
+        let TaskAdmission::Resume { execution, .. } = admission else {
+            unreachable!("owned CPU instance resumes only its sealed checkpoint")
+        };
+        // A copied old handle cannot issue a second successor. Retirement of
+        // the paused record remains the caller's explicit physical-owner step.
+        self.tasks
+            .cancel_consumer(dispatch.execution, dispatch.consumer.id)?;
+        Ok((
+            admission,
+            CpuTaskDispatch {
+                owner: self.read_owner(),
+                generation: self.generation,
+                execution,
+                consumer: TaskConsumer {
+                    id: next_consumer_id,
+                    ..dispatch.consumer
+                },
+            },
+        ))
+    }
+
     /// Retire only a checkpoint whose actual same-worker successor or confirmed
     /// cancellation has already been established by the manager. Evidence and
     /// historical checkpoint provenance survive; other paused owners do not
@@ -142,6 +212,7 @@ impl PalsStores {
         for consumer in &mut previous.consumers {
             consumer.cancelled = true;
         }
+        self.tasks.owned_instances.remove(&execution);
         Ok(())
     }
 
@@ -159,6 +230,27 @@ impl PalsStores {
         exact_state: &PositionSnapshot,
         now_tick: u64,
     ) -> Result<TaskAdmission, StoreError> {
+        self.resume_sealed_cpu_task(
+            previous,
+            original,
+            expected_key,
+            next_consumer_id,
+            exact_state,
+            now_tick,
+            false,
+        )
+    }
+
+    fn resume_sealed_cpu_task(
+        &mut self,
+        previous: ExecutionId,
+        original: TaskConsumer,
+        expected_key: TaskKey,
+        next_consumer_id: u64,
+        exact_state: &PositionSnapshot,
+        now_tick: u64,
+        owned_instance: bool,
+    ) -> Result<TaskAdmission, StoreError> {
         let task = self.tasks.get(previous)?;
         if task.key != expected_key
             || task.key.value_identity.is_none()
@@ -166,7 +258,9 @@ impl PalsStores {
                 task.key.checker_identity,
                 Some(CheckerIdentity::ExternalUci(_))
             )
-            || self.tasks.latest.get(&expected_key) != Some(&previous)
+            || (!owned_instance
+                && (self.tasks.latest.get(&expected_key) != Some(&previous)
+                    || self.tasks.owned_instances.contains(&previous)))
         {
             return Err(StoreError::InvalidConditions(
                 "adaptive resume requires original owned CPU task",
@@ -237,14 +331,16 @@ impl PalsStores {
         // The new slice has a distinct consumer ID but exactly the original
         // situation/revision/generation/deadline. It does not receive current
         // conclusion authority, extend the deadline or replace the job state.
-        self.tasks.request(
-            expected_key,
-            TaskConsumer {
-                id: next_consumer_id,
-                ..original
-            },
-            now_tick,
-        )
+        let consumer = TaskConsumer {
+            id: next_consumer_id,
+            ..original
+        };
+        if owned_instance {
+            self.tasks
+                .request_cpu_instance(expected_key, consumer, now_tick, Some(previous))
+        } else {
+            self.tasks.request(expected_key, consumer, now_tick)
+        }
     }
 
     /// Completion is revalidated exactly as in the legacy consumer. Only an
@@ -723,6 +819,279 @@ impl PalsStores {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cpu_instance_fixture() -> (PalsStores, Position, TaskKey, TaskConsumer) {
+        let mut stores = PalsStores::new(StoreLimits::default());
+        let position = Position::startpos();
+        let root = stores.hot_focus_actual_moves(position.snapshot()).unwrap();
+        let situation = stores.situations.get(root).unwrap();
+        let cpu = crate::cpu::CpuEngine::new(crate::cpu::CpuConfig {
+            tt_entries: 16,
+            ..crate::cpu::CpuConfig::default()
+        })
+        .unwrap();
+        let key = TaskKey {
+            state: situation.state,
+            line: None,
+            question: TaskQuestion::AnalyzePosition,
+            root_moves: Vec::new(),
+            model: 0,
+            epoch: 0,
+            value_identity: Some(cpu.value_identity().clone()),
+            checker_identity: None,
+            cpu_condition: Some("owned-instance-fixture".into()),
+            profile: 1,
+            condition: 2,
+            input_revision: 0,
+            requested_depth: 2,
+            node_budget: 100,
+        };
+        let consumer = TaskConsumer {
+            id: 1,
+            situation: root,
+            revision: situation.revision,
+            generation: stores.generation(),
+            deadline_tick: 100,
+        };
+        (stores, position, key, consumer)
+    }
+
+    fn complete_cpu_instance(
+        stores: &mut PalsStores,
+        key: &TaskKey,
+        execution: ExecutionId,
+    ) -> ObservationId {
+        let observation = stores
+            .hot_append_observation(Observation {
+                state: key.state,
+                line: key.line,
+                source: 1,
+                epoch: 0,
+                value_identity: key.value_identity.clone(),
+                checker_identity: None,
+                checker_work: None,
+                external_report: None,
+                model_value_identity: None,
+                model_value_input: None,
+                cpu_condition: key.cpu_condition.clone(),
+                cpu_pv: None,
+                scope: EvidenceScope::DepthLimited {
+                    depth: key.requested_depth,
+                    profile: key.profile,
+                    condition: key.condition,
+                },
+                score: RawScore::Cpu {
+                    value: 0,
+                    perspective: Color::White,
+                    bound: BoundKind::ExactWithinSearch,
+                },
+                budget: 3,
+                kind: ObservationKind::CpuAnalysis,
+                supersedes: None,
+                execution: Some(execution),
+            })
+            .unwrap();
+        stores.complete_task(execution, observation).unwrap();
+        observation
+    }
+
+    #[test]
+    fn same_computation_instances_resume_only_their_original_paused_execution() {
+        let (mut stores, position, key, first) = cpu_instance_fixture();
+        let (TaskAdmission::Start(a), dispatch_a) = stores
+            .hot_request_cpu_instance(key.clone(), first, 0)
+            .unwrap()
+        else {
+            panic!("first physical instance")
+        };
+        let second = TaskConsumer { id: 2, ..first };
+        let (TaskAdmission::Start(b), dispatch_b) = stores
+            .hot_request_cpu_instance(key.clone(), second, 0)
+            .unwrap()
+        else {
+            panic!("second independent physical instance")
+        };
+        assert_ne!(a, b);
+        assert_eq!(
+            stores.tasks.get(a).unwrap().key,
+            stores.tasks.get(b).unwrap().key
+        );
+        stores.pause_task(a, 7, None).unwrap();
+        stores.pause_task(b, 8, None).unwrap();
+        // Public/shared admission cannot borrow the private paused lineage,
+        // even when that physical instance is the latest equal computation.
+        assert!(matches!(
+            stores.hot_resume_sealed_cpu_task(b, second, key.clone(), 9, &position.snapshot(), 0),
+            Err(StoreError::InvalidConditions(
+                "adaptive resume requires original owned CPU task"
+            ))
+        ));
+        let TaskAdmission::Start(shared) = stores
+            .hot_request_task(key.clone(), TaskConsumer { id: 9, ..first }, 0)
+            .unwrap()
+        else {
+            panic!("shared request must not resume a private paused owner")
+        };
+        assert_ne!(shared, a);
+        assert_ne!(shared, b);
+        let (
+            TaskAdmission::Resume {
+                execution: next_a,
+                previous,
+                checkpoint,
+            },
+            next_dispatch_a,
+        ) = stores
+            .hot_resume_cpu_instance(&dispatch_a, key.clone(), 3, &position.snapshot(), 0)
+            .unwrap()
+        else {
+            panic!("same-owner first resume")
+        };
+        assert_eq!((previous, checkpoint), (a, 7));
+        assert!(next_dispatch_a.identifies(next_a, TaskConsumer { id: 3, ..first }));
+        assert_eq!(
+            stores.tasks.get(b).unwrap().status,
+            TaskStatus::Paused {
+                checkpoint: 8,
+                evidence: None
+            }
+        );
+        let count = stores.tasks.len();
+        assert!(matches!(
+            stores.hot_resume_cpu_instance(&dispatch_a, key.clone(), 4, &position.snapshot(), 0),
+            Err(StoreError::CancelledConsumer)
+        ));
+        assert_eq!(stores.tasks.len(), count);
+        stores.hot_retire_paused(a).unwrap();
+        assert!(!stores.tasks.owned_instances.contains(&a));
+        let (
+            TaskAdmission::Resume {
+                previous,
+                checkpoint,
+                ..
+            },
+            _,
+        ) = stores
+            .hot_resume_cpu_instance(&dispatch_b, key, 4, &position.snapshot(), 0)
+            .unwrap()
+        else {
+            panic!("same-owner second resume despite newer equal computation")
+        };
+        assert_eq!((previous, checkpoint), (b, 8));
+        stores.hot_retire_paused(b).unwrap();
+        assert!(!stores.tasks.owned_instances.contains(&b));
+    }
+
+    #[test]
+    fn shared_cpu_request_does_not_join_an_independent_in_flight_job() {
+        let (mut stores, _, key, consumer) = cpu_instance_fixture();
+        let (TaskAdmission::Start(private), _) = stores
+            .hot_request_cpu_instance(key.clone(), consumer, 0)
+            .unwrap()
+        else {
+            panic!("private physical instance")
+        };
+        let TaskAdmission::Start(shared) = stores
+            .hot_request_task(key, TaskConsumer { id: 2, ..consumer }, 0)
+            .unwrap()
+        else {
+            panic!("shared consumer cannot join another private job")
+        };
+        assert_ne!(private, shared);
+        assert!(stores.tasks.owned_instances.contains(&private));
+        assert!(!stores.tasks.owned_instances.contains(&shared));
+        assert!(stores.tasks.get(shared).unwrap().resumed_from.is_none());
+    }
+
+    #[test]
+    fn independent_cpu_completion_keeps_original_exact_semantic_cache() {
+        let (mut stores, position, key, consumer) = cpu_instance_fixture();
+        let (TaskAdmission::Start(a), dispatch_a) = stores
+            .hot_request_cpu_instance(key.clone(), consumer, 0)
+            .unwrap()
+        else {
+            panic!("first instance")
+        };
+        let (TaskAdmission::Start(b), _) = stores
+            .hot_request_cpu_instance(key.clone(), TaskConsumer { id: 2, ..consumer }, 0)
+            .unwrap()
+        else {
+            panic!("second instance")
+        };
+        let raw_a = complete_cpu_instance(&mut stores, &key, a);
+        let raw_b = complete_cpu_instance(&mut stores, &key, b);
+        assert!(stores.tasks.owned_instances.is_empty());
+        assert_ne!(raw_a, raw_b);
+        assert_eq!(stores.observations.get(raw_a).unwrap().execution, Some(a));
+        assert_eq!(stores.observations.get(raw_b).unwrap().execution, Some(b));
+        assert_eq!(
+            stores
+                .hot_request_task(key.clone(), TaskConsumer { id: 3, ..consumer }, 0)
+                .unwrap(),
+            TaskAdmission::Reuse {
+                execution: b,
+                observation: raw_b
+            }
+        );
+        assert!(matches!(
+            stores.hot_resume_cpu_instance(&dispatch_a, key.clone(), 4, &position.snapshot(), 0),
+            Err(StoreError::InvalidConditions(
+                "adaptive resume requires live paused task"
+            ))
+        ));
+        let (TaskAdmission::Start(c), _) = stores
+            .hot_request_cpu_instance(key, TaskConsumer { id: 4, ..consumer }, 0)
+            .unwrap()
+        else {
+            panic!("reserved physical instance is not fabricated cache reuse")
+        };
+        assert_ne!(c, a);
+        assert_ne!(c, b);
+        assert_eq!(stores.tasks.get(c).unwrap().status, TaskStatus::InFlight);
+    }
+
+    #[test]
+    fn cpu_dispatch_custody_rejects_other_store_condition_cancel_and_new_root() {
+        let (mut stores, position, key, consumer) = cpu_instance_fixture();
+        let (TaskAdmission::Start(execution), dispatch) = stores
+            .hot_request_cpu_instance(key.clone(), consumer, 0)
+            .unwrap()
+        else {
+            panic!("owned instance")
+        };
+        stores.pause_task(execution, 7, None).unwrap();
+        let (mut other, _, _, _) = cpu_instance_fixture();
+        assert!(matches!(
+            other.hot_resume_cpu_instance(&dispatch, key.clone(), 2, &position.snapshot(), 0),
+            Err(StoreError::StaleConsumer)
+        ));
+        let mut changed = key.clone();
+        changed
+            .cpu_condition
+            .as_mut()
+            .unwrap()
+            .push_str(";different-search");
+        assert!(matches!(
+            stores.hot_resume_cpu_instance(&dispatch, changed, 2, &position.snapshot(), 0),
+            Err(StoreError::InvalidConditions(
+                "adaptive resume requires original owned CPU task"
+            ))
+        ));
+        stores
+            .tasks
+            .cancel_consumer(execution, consumer.id)
+            .unwrap();
+        assert!(matches!(
+            stores.hot_resume_cpu_instance(&dispatch, key.clone(), 2, &position.snapshot(), 0),
+            Err(StoreError::CancelledConsumer)
+        ));
+        stores.hot_focus_actual_moves(position.snapshot()).unwrap();
+        assert!(matches!(
+            stores.hot_resume_cpu_instance(&dispatch, key, 2, &position.snapshot(), 0),
+            Err(StoreError::StaleConsumer)
+        ));
+        assert_eq!(stores.tasks.len(), 1);
+    }
 
     struct TestArchiveRoot {
         root: std::path::PathBuf,

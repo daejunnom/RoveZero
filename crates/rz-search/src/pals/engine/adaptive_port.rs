@@ -20,6 +20,7 @@ mod cpu_commit;
 mod external_commit;
 #[cfg(test)]
 mod fixed_trace_tests;
+mod legacy_full_context;
 mod model_namespace;
 #[cfg(test)]
 mod port_tests;
@@ -30,6 +31,7 @@ pub use continuation_blueprint::{
     AdaptiveContinuationBlueprint, AdaptivePortMaterializedStep, AdaptivePortTransition,
 };
 pub use external_commit::{AdaptiveForeignPublication, AdaptivePortExternalQuestion};
+pub use legacy_full_context::LegacyFullRoleRecords;
 pub use model_namespace::AdaptiveModelNamespace;
 pub mod archive_worker;
 /// The process registry remains owned by UCI. Search cannot invent an owner
@@ -101,13 +103,18 @@ impl RoleModel for AdaptivePortModel {
     }
 }
 
-/// Search owns the opaque continuation fields. Native consumes only the three
-/// public fields; it cannot substitute a new line or revision on delivery.
+/// Search owns the opaque continuation fields. Native consumes the submitted
+/// Rules/context/deadline and an optional legacy raw snapshot; it cannot
+/// substitute a newer line, raw projection, or revision on delivery.
 #[derive(Clone)]
 pub struct AdaptivePortQuestion {
     pub position: Position,
     pub context: RoleLogicalContext,
     pub deadline: Instant,
+    /// Present only for the explicitly registered V2Full native baseline.
+    /// Search captured every raw row before dispatch; the native worker never
+    /// reads or scans mutable engine memory to reconstruct this input.
+    pub legacy_full_records: Option<Arc<LegacyFullRoleRecords>>,
     node: usize,
     stage: RefinementStage,
     first: Option<BoardMove>,
@@ -140,6 +147,9 @@ impl AdaptivePortQuestion {
         }
         if let Some(view) = &self.frozen_counter {
             bytes = bytes.checked_add(usize::try_from(view.owned_host_bytes()?).ok()?)?;
+        }
+        if let Some(records) = &self.legacy_full_records {
+            bytes = bytes.checked_add(usize::try_from(records.owned_host_bytes()?).ok()?)?;
         }
         u64::try_from(bytes).ok()
     }
@@ -429,6 +439,9 @@ pub struct AdaptiveEnginePort<M: RoleModel> {
     branch_receipts: Vec<branch_queue::AdaptiveBranchReceipt>,
     queued_questions: HashSet<ContractDigest>,
     validator_state: validator_port::ValidatorPortState,
+    /// A weak cache shares an identical raw snapshot without extending a
+    /// completed ticket's Store lease. Only the opt-in legacy route uses it.
+    last_legacy_full_snapshot: Option<std::sync::Weak<LegacyFullRoleRecords>>,
 }
 #[derive(Clone)]
 struct CpuPortAdmission {
@@ -439,6 +452,7 @@ struct CpuPortAdmission {
     context: RoleLogicalContext,
     first_move: rz_contracts::pals::Move16,
     execution: Option<ExecutionId>,
+    dispatch: Option<crate::pals::store::CpuTaskDispatch>,
     consumer: Option<u64>,
     original_consumer: Option<TaskConsumer>,
     target_depth: u16,
@@ -647,6 +661,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             branch_receipts: Vec::new(),
             queued_questions: HashSet::new(),
             validator_state: validator_port::ValidatorPortState::default(),
+            last_legacy_full_snapshot: None,
         })
     }
     pub fn root_rules(&self) -> Arc<ContractState> {
@@ -1531,6 +1546,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         };
         let sequence = self.next_question;
         self.next_question = sequence.checked_add(1).ok_or(PalsError::Capacity)?;
+        let legacy_full_records = self.prepare_legacy_full_records(&context, &view)?;
         let mut hash = Sha256::new();
         hash.update(b"rz-pals-adaptive-checked-question/1\0");
         hash.update(sequence.to_le_bytes());
@@ -1538,11 +1554,16 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         hash.update(view.digest());
         hash.update(view.seal_digest());
         hash.update(context.focus_prefix_sha256());
+        if let Some(records) = &legacy_full_records {
+            hash.update(b"legacy-full-raw-snapshot\0");
+            hash.update(records.digest());
+        }
         let question_digest = ContractDigest(hash.finalize().into());
         let query = AdaptivePortQuestion {
             position: self.engine.nodes[node].position.clone(),
             context,
             deadline: self.limits.deadline,
+            legacy_full_records,
             node,
             stage,
             first,

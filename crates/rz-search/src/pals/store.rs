@@ -1340,10 +1340,23 @@ pub enum TaskAdmission {
 pub struct TaskTable {
     tasks: HotRecords<TaskRecord>,
     latest: BTreeMap<TaskKey, ExecutionId>,
+    /// Only active private worker instances live here. Existing archive pins
+    /// retain them, so this index is bounded by the hot execution capacity.
+    owned_instances: BTreeSet<ExecutionId>,
     consumers: BTreeSet<u64>,
     execution_limit: usize,
     consumer_limit: usize,
     root_move_limit: usize,
+}
+
+/// An owned physical CPU job may share its exact computation key with another
+/// job without joining that job's execution or borrowing its paused stack.
+/// This admission mode is process-local; archived task records keep their
+/// original semantic key and execution provenance without a new codec field.
+#[derive(Clone, Copy)]
+enum TaskDispatch {
+    Shared,
+    OwnedCpu { previous: Option<ExecutionId> },
 }
 
 fn valid_cpu_condition(value: &String, external: bool) -> bool {
@@ -1359,6 +1372,7 @@ impl TaskTable {
         Self {
             tasks: HotRecords::new(),
             latest: BTreeMap::new(),
+            owned_instances: BTreeSet::new(),
             consumers: BTreeSet::new(),
             execution_limit: executions,
             consumer_limit: consumers,
@@ -1371,6 +1385,26 @@ impl TaskTable {
         key: TaskKey,
         consumer: TaskConsumer,
         now_tick: u64,
+    ) -> Result<TaskAdmission, StoreError> {
+        self.request_dispatch(key, consumer, now_tick, TaskDispatch::Shared)
+    }
+
+    fn request_cpu_instance(
+        &mut self,
+        key: TaskKey,
+        consumer: TaskConsumer,
+        now_tick: u64,
+        previous: Option<ExecutionId>,
+    ) -> Result<TaskAdmission, StoreError> {
+        self.request_dispatch(key, consumer, now_tick, TaskDispatch::OwnedCpu { previous })
+    }
+
+    fn request_dispatch(
+        &mut self,
+        key: TaskKey,
+        consumer: TaskConsumer,
+        now_tick: u64,
+        dispatch: TaskDispatch,
     ) -> Result<TaskAdmission, StoreError> {
         if consumer.deadline_tick <= now_tick {
             return Err(StoreError::ExpiredConsumer);
@@ -1449,12 +1483,23 @@ impl TaskTable {
         if self.consumers.len() >= self.consumer_limit {
             return Err(StoreError::Capacity("task consumers"));
         }
-        let reusable = self.latest.get(&key).copied().filter(|id| {
-            matches!(
-                self.tasks[id.0].status,
-                TaskStatus::InFlight | TaskStatus::Completed(_)
-            )
-        });
+        if matches!(dispatch, TaskDispatch::OwnedCpu { .. })
+            && (!cpu_question || external || key.value_identity.is_none())
+        {
+            return Err(StoreError::InvalidConditions(
+                "independent dispatch requires an owned CPU task",
+            ));
+        }
+        let reusable = match dispatch {
+            TaskDispatch::Shared => self.latest.get(&key).copied().filter(|id| {
+                !self.owned_instances.contains(id)
+                    && matches!(
+                        self.tasks[id.0].status,
+                        TaskStatus::InFlight | TaskStatus::Completed(_)
+                    )
+            }),
+            TaskDispatch::OwnedCpu { .. } => None,
+        };
         let (execution, admission) = if let Some(id) = reusable {
             let admission = match self.tasks[id.0].status {
                 TaskStatus::Completed(observation) => TaskAdmission::Reuse {
@@ -1469,13 +1514,34 @@ impl TaskTable {
                 return Err(StoreError::Capacity("task executions"));
             }
             let id = ExecutionId(self.tasks.next_id());
-            let paused =
-                self.latest
-                    .get(&key)
-                    .and_then(|previous| match self.tasks[previous.0].status {
+            let paused = match dispatch {
+                TaskDispatch::Shared => self.latest.get(&key).and_then(|previous| {
+                    if self.owned_instances.contains(previous) {
+                        return None;
+                    }
+                    match self.tasks[previous.0].status {
                         TaskStatus::Paused { checkpoint, .. } => Some((*previous, checkpoint)),
                         _ => None,
-                    });
+                    }
+                }),
+                TaskDispatch::OwnedCpu { previous: None } => None,
+                TaskDispatch::OwnedCpu {
+                    previous: Some(previous),
+                } => {
+                    let task = self.get(previous)?;
+                    if task.key != key {
+                        return Err(StoreError::InvalidConditions(
+                            "independent CPU resume changed its semantic key",
+                        ));
+                    }
+                    let TaskStatus::Paused { checkpoint, .. } = task.status else {
+                        return Err(StoreError::InvalidConditions(
+                            "independent CPU resume requires its live paused execution",
+                        ));
+                    };
+                    Some((previous, checkpoint))
+                }
+            };
             self.tasks.push(TaskRecord {
                 key: key.clone(),
                 status: TaskStatus::InFlight,
@@ -1483,6 +1549,9 @@ impl TaskTable {
                 consumers: Vec::new(),
             })?;
             self.latest.insert(key, id);
+            if matches!(dispatch, TaskDispatch::OwnedCpu { .. }) {
+                self.owned_instances.insert(id);
+            }
             let admission = match paused {
                 Some((previous, checkpoint)) => TaskAdmission::Resume {
                     execution: id,
@@ -1530,6 +1599,7 @@ impl TaskTable {
             return Err(StoreError::InvalidConditions("execution already terminal"));
         }
         task.status = TaskStatus::Completed(observation);
+        self.owned_instances.remove(&execution);
         Ok(())
     }
 
@@ -1545,6 +1615,7 @@ impl TaskTable {
             return Err(StoreError::InvalidConditions("execution already terminal"));
         }
         task.status = TaskStatus::Failed;
+        self.owned_instances.remove(&execution);
         Ok(())
     }
 
@@ -1747,6 +1818,7 @@ impl TaskTable {
             for c in &mut task.consumers {
                 c.cancelled = true;
             }
+            self.owned_instances.remove(&ExecutionId(*id));
         }
         Ok(ids.len())
     }
@@ -1925,6 +1997,23 @@ impl StoreReadOwner {
     pub fn matches(&self, stores: &PalsStores) -> bool {
         self.states.ptr_eq(&Arc::downgrade(&stores.states.identity))
             && self.lines.ptr_eq(&Arc::downgrade(&stores.lines.identity))
+    }
+}
+
+/// Process-local custody of one actual CPU dispatch. Numeric execution IDs and
+/// equal computation keys alone cannot authorize an independent stack resume.
+/// Active/paused records use the existing archive protected-pins closure; this
+/// handle cannot reconstruct a worker or resume authority from a cold record.
+#[derive(Clone, Debug)]
+pub(crate) struct CpuTaskDispatch {
+    owner: StoreReadOwner,
+    generation: u64,
+    execution: ExecutionId,
+    consumer: TaskConsumer,
+}
+impl CpuTaskDispatch {
+    pub(crate) fn identifies(&self, execution: ExecutionId, consumer: TaskConsumer) -> bool {
+        self.execution == execution && self.consumer == consumer
     }
 }
 
@@ -2861,6 +2950,22 @@ impl PalsStores {
         consumer: TaskConsumer,
         now_tick: u64,
     ) -> Result<TaskAdmission, StoreError> {
+        self.validate_task_request(&key, consumer)?;
+        // Low-level tables are exposed for inspection. A caller must not turn
+        // retained partial evidence into reusable completion via raw mutation.
+        if let Some(execution) = self.tasks.latest.get(&key).copied()
+            && let TaskStatus::Completed(observation) = self.tasks.get(execution)?.status
+        {
+            self.validate_completed_task(execution, observation)?;
+        }
+        self.tasks.request(key, consumer, now_tick)
+    }
+
+    fn validate_task_request(
+        &self,
+        key: &TaskKey,
+        consumer: TaskConsumer,
+    ) -> Result<(), StoreError> {
         self.states.get(key.state)?;
         if matches!(key.checker_identity, Some(CheckerIdentity::ExternalUci(_))) {
             let position = self.position_for_state(key.state)?;
@@ -2885,14 +2990,7 @@ impl PalsStores {
         {
             return Err(StoreError::StaleConsumer);
         }
-        // Low-level tables are exposed for inspection. A caller must not turn
-        // retained partial evidence into reusable completion via raw mutation.
-        if let Some(execution) = self.tasks.latest.get(&key).copied()
-            && let TaskStatus::Completed(observation) = self.tasks.get(execution)?.status
-        {
-            self.validate_completed_task(execution, observation)?;
-        }
-        self.tasks.request(key, consumer, now_tick)
+        Ok(())
     }
 
     pub fn complete_task(

@@ -1311,6 +1311,9 @@ pub struct PalsEngine<M: RoleModel> {
     records: Vec<RoleRecord>,
     review_index: Option<ReviewContextIndex>,
     review_policy: Option<ReviewSelectionPolicy>,
+    /// Explicit legacy-baseline input ownership. Selected/compact consumers
+    /// never allocate or scan this separate immutable raw-record snapshot.
+    legacy_full_native_context: bool,
     last_review_issue: Option<ReviewError>,
     revision: u64,
     // Store handles may restart from zero after reset; this checked namespace
@@ -1331,6 +1334,30 @@ pub struct PalsEngine<M: RoleModel> {
     new_game_transition_error: Option<PalsError>,
 }
 impl<M: RoleModel> PalsEngine<M> {
+    /// Retain the original full-context encoder's raw public-memory input in
+    /// each adaptive question. The bounded ReviewView remains an independent
+    /// authorization envelope; its selected rows are not renamed full context.
+    /// Startup selects this once, after selecting CurrentRootOnly review
+    /// authorization and before any root/Store generation is registered.
+    pub fn with_legacy_full_native_context(mut self) -> Result<Self, PalsError> {
+        if self.stores.generation() != 0
+            || !self.nodes.is_empty()
+            || !self.records.is_empty()
+            || self.legacy_full_native_context
+            || self.review_index.is_none()
+            || !self.review_policy.is_some_and(|policy| {
+                policy.mode == crate::pals::review_context::ReviewAnchorMode::CurrentRootOnly
+            })
+        {
+            return Err(StoreError::InvalidConditions(
+                "legacy full native context is selected once before search",
+            )
+            .into());
+        }
+        self.legacy_full_native_context = true;
+        Ok(self)
+    }
+
     /// An explicit A profile. Old constructors retain their full-context
     /// synchronous behavior and unsupported native consumers fail before search.
     pub fn with_selected_review_context(
@@ -1561,6 +1588,7 @@ impl<M: RoleModel> PalsEngine<M> {
             records,
             review_index: None,
             review_policy: None,
+            legacy_full_native_context: false,
             last_review_issue: None,
             revision: 0,
             game_generation: Some(0),

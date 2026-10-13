@@ -29,6 +29,10 @@ mod tests {
     }
 
     fn port(position: Position) -> Port {
+        port_with_line_plies(position, 4)
+    }
+
+    fn port_with_line_plies(position: Position, line_plies: usize) -> Port {
         let cpu = CpuEngine::new(crate::cpu::CpuConfig {
             tt_entries: 16,
             max_depth: 8,
@@ -37,7 +41,7 @@ mod tests {
         .unwrap();
         let engine = PalsEngine::new(
             PalsConfig {
-                line_plies: 4,
+                line_plies,
                 ..Default::default()
             },
             LegalOrderRoleMock,
@@ -108,13 +112,10 @@ mod tests {
             epoch: 0,
             value_identity: Some(identity.clone()),
             checker_identity: None,
-            cpu_condition: Some(format!(
-                "{};question=AnalyzePosition;contract-fixture",
-                port.engine.cpu_condition()
-            )),
+            cpu_condition: Some(port.engine.cpu_condition()),
             profile,
             condition,
-            input_revision: moves.len() as u64,
+            input_revision: 0,
             requested_depth: port.limits.cpu_depth,
             node_budget: 100,
         };
@@ -240,6 +241,173 @@ mod tests {
             line(&["e2e4", "c7c5", "g1f3", "b8c6"]),
             line(&["e2e4", "c7c5", "d2d4", "b8c6"]),
         )
+    }
+
+    #[test]
+    fn full_zero_step_repair_reuses_checked_cpu_without_new_execution_or_witness() {
+        let mut port = port_with_line_plies(Position::startpos(), 2);
+        let proposal = line(&["e2e4", "e7e5"]);
+        let counter = line(&["e2e4", "c7c5"]);
+        accepted_raw(&mut port, &counter, -100, 2);
+        port.record_hot(RecordKind::Proposal, &proposal, None)
+            .unwrap();
+        port.record_hot(RecordKind::Counterexample, &counter, None)
+            .unwrap();
+        let node = port.replay_node(&counter).unwrap();
+        let observations = port.engine.stores.observations.len();
+        let executions = port.engine.stores.tasks.len();
+        assert!(port.engine.admit_iterative_repair(counter[0]));
+        let transition = port
+            .begin_repair_continuation(
+                node,
+                Some(counter[0]),
+                counter.clone(),
+                proposal,
+                counter.clone(),
+                1,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            transition,
+            AdaptivePortTransition::Complete {
+                scope: FrameCompletionScope::NoRepairContinuation
+            }
+        ));
+        assert_eq!(port.engine.stores.tasks.len(), executions);
+        assert_eq!(port.engine.stores.observations.len(), observations + 1);
+        let repair = port.engine.records.last().unwrap();
+        assert_eq!(repair.kind, RecordKind::Repair);
+        assert_eq!(repair.line, counter);
+        assert!(repair.parent_revision.is_some());
+        assert_eq!(port.counters.repairs, 1);
+        assert_eq!(port.counters.evidence_cache_hits, 1);
+        assert_eq!(port.counters.consumed_cached_cpu_values, 1);
+        assert_eq!(port.counters.cpu_tasks_requested, 0);
+        assert_eq!(port.counters.role_calls, 0);
+        assert_eq!(port.counters.accepted_repair_outputs, 0);
+        assert_eq!(port.counters.supported_repairs, 0);
+    }
+
+    #[test]
+    fn zero_step_model_resolver_still_requires_fresh_value_for_new_revision() {
+        let mut port = port_with_line_plies(Position::startpos(), 2);
+        let proposal = line(&["e2e4", "e7e5"]);
+        let counter = line(&["e2e4", "c7c5"]);
+        accepted_raw(&mut port, &counter, -100, 2);
+        port.record_hot(RecordKind::Proposal, &proposal, None)
+            .unwrap();
+        port.record_hot(RecordKind::Counterexample, &counter, None)
+            .unwrap();
+        // Authored metadata variation checks the consumer boundary; no model
+        // output, physical execution or WDL value is created in this fixture.
+        port.engine.resolver = ResolverPolicy::ModelWdlRestricted;
+        let node = port.replay_node(&counter).unwrap();
+        let transition = port
+            .begin_repair_continuation(
+                node,
+                Some(counter[0]),
+                counter.clone(),
+                proposal,
+                counter,
+                1,
+                None,
+            )
+            .unwrap();
+        let materialized = port
+            .materialize_step(AdaptivePortStep {
+                evidence: ContractDigest([8; 32]),
+                transition,
+                fresh_pair: None,
+                rules_pair: None,
+                consumption_gate: None,
+                feedback_gate: None,
+                queue_question: None,
+            })
+            .unwrap();
+        let FrameTransition::Continue(next) = materialized.transition else {
+            panic!("zero-step model value requires actual Fresh continuation")
+        };
+        assert_eq!(next.stage, RefinementStage::RepairValueFresh);
+        assert!(next.question.repaired.is_some());
+        assert_eq!(port.counters.evidence_cache_hits, 1);
+        assert_eq!(port.counters.value_calls, 0);
+        assert_eq!(port.counters.accepted_repair_outputs, 0);
+    }
+
+    #[test]
+    fn zero_step_retained_stack_does_not_reuse_completed_iteration_as_completion() {
+        let mut port = port_with_line_plies(Position::startpos(), 2);
+        let proposal = line(&["e2e4", "e7e5"]);
+        let counter = line(&["e2e4", "c7c5"]);
+        raw_fixture(&mut port, &counter, -100, 2, true);
+        port.record_hot(RecordKind::Proposal, &proposal, None)
+            .unwrap();
+        port.record_hot(RecordKind::Counterexample, &counter, None)
+            .unwrap();
+        let node = port.replay_node(&counter).unwrap();
+        let transition = port
+            .begin_repair_continuation(
+                node,
+                Some(counter[0]),
+                counter.clone(),
+                proposal,
+                counter,
+                1,
+                None,
+            )
+            .unwrap();
+        let materialized = port
+            .materialize_step(AdaptivePortStep {
+                evidence: ContractDigest([9; 32]),
+                transition,
+                fresh_pair: None,
+                rules_pair: None,
+                consumption_gate: None,
+                feedback_gate: None,
+                queue_question: None,
+            })
+            .unwrap();
+        let FrameTransition::Continue(next) = materialized.transition else {
+            panic!("retained stack is not settled cache authority")
+        };
+        assert_eq!(next.stage, RefinementStage::RepairValidation);
+        assert_eq!(port.counters.evidence_cache_hits, 0);
+        assert_eq!(port.counters.consumed_cached_cpu_values, 0);
+    }
+
+    #[test]
+    fn terminal_zero_step_repair_keeps_rules_endpoint_without_model_or_cpu_work() {
+        let mut position = Position::startpos();
+        for movement in line(&["f2f3", "e7e5"]) {
+            position.make_move(movement).unwrap();
+        }
+        let mut port = port_with_line_plies(position, 4);
+        let proposal = line(&["g2g4", "a7a6"]);
+        let counter = line(&["g2g4", "d8h4"]);
+        let node = port.replay_node(&counter).unwrap();
+        assert!(port.engine.nodes[node].terminal.is_some());
+        let transition = port
+            .begin_repair_continuation(
+                node,
+                Some(counter[0]),
+                counter.clone(),
+                proposal,
+                counter,
+                1,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            transition,
+            AdaptivePortTransition::Complete {
+                scope: FrameCompletionScope::NoRepairContinuation
+            }
+        ));
+        assert_eq!(port.counters.repairs, 1);
+        assert_eq!(port.counters.role_calls, 0);
+        assert_eq!(port.counters.cpu_tasks_requested, 0);
+        assert_eq!(port.counters.evidence_cache_hits, 0);
     }
 
     #[test]
@@ -853,14 +1021,55 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if self.engine.is_external() || self.engine.uses_model_resolver() {
             return Ok(None);
         }
+        self.checked_completed_cpu_endpoint(node, plies)
+    }
+
+    /// Exact accepted own-CPU evidence can skip another physical verification
+    /// at the same endpoint. This does not reuse model WDL, count a new CPU
+    /// execution, or turn that finite estimate into a game result.
+    pub(super) fn has_reusable_completed_cpu(
+        &self,
+        node: usize,
+        plies: usize,
+    ) -> Result<bool, PalsError> {
+        if self.engine.is_external() {
+            return Ok(false);
+        }
+        Ok(self.checked_completed_cpu_endpoint(node, plies)?.is_some())
+    }
+
+    fn checked_completed_cpu_endpoint(
+        &self,
+        node: usize,
+        plies: usize,
+    ) -> Result<Option<ConditionalEndpoint>, PalsError> {
+        let endpoint = &self.engine.nodes[node];
+        if endpoint.terminal.is_some() {
+            return Ok(None);
+        }
+        if !self
+            .engine
+            .stores
+            .states
+            .get(endpoint.state)?
+            .same_state(&endpoint.position.snapshot())
+            || self.engine.stores.situations.get(endpoint.situation)?.state != endpoint.state
+        {
+            return Err(ReviewError::AnchorMismatch.into());
+        }
         let Some(accepted) = &endpoint.evidence else {
             return Ok(None);
         };
-        let Some(root_value) = self
-            .engine
-            .completed_line_value(node, plies, self.limits.cpu_depth)
-        else {
+        if accepted.scope != CpuScoreScope::CompletedIteration
+            || accepted.depth < self.limits.cpu_depth
+            || Some(&accepted.value_identity) != self.engine.cpu_registered_value.as_ref()
+        {
             return Ok(None);
+        }
+        let root_value = if plies % 2 == 0 {
+            accepted.score
+        } else {
+            -accepted.score
         };
         let Some((observation_id, execution)) = accepted.provenance else {
             return Ok(None);
@@ -868,7 +1077,6 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let observation = self.engine.stores.observations.get(observation_id)?;
         let task = self.engine.stores.tasks.get(execution)?;
         let base_condition = self.engine.cpu_condition();
-        let condition_prefix = format!("{base_condition};question=");
         let descriptor = self.engine.owned_descriptor()?;
         let profile = stable_id(descriptor.config.profile.identity());
         let condition = stable_id(&format!(
@@ -895,12 +1103,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .key
                 .cpu_condition
                 .as_ref()
-                .is_some_and(|actual| actual.starts_with(&condition_prefix))
+                .is_some_and(|actual| actual == &base_condition)
             || task.key.state != endpoint.state
             || task.key.line.is_some()
             || task.key.question != TaskQuestion::AnalyzePosition
             || !task.key.root_moves.is_empty()
-            || task.key.input_revision != plies as u64
+            || task.key.input_revision != 0
             || task.key.profile != profile
             || task.key.condition != condition
             || task.key.requested_depth != self.limits.cpu_depth

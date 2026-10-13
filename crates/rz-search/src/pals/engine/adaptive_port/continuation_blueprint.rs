@@ -784,6 +784,17 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                             Some(pair.1),
                             None,
                         )?;
+                        // Full-baseline endpoints must retain the very same
+                        // submission-time raw scope, not merely two equal
+                        // selected views rebuilt around newer public rows.
+                        match (
+                            &first_input.question.legacy_full_records,
+                            &second_input.question.legacy_full_records,
+                        ) {
+                            (Some(first), Some(second)) if Arc::ptr_eq(first, second) => {}
+                            (None, None) => {}
+                            _ => return Err(RoleError::InvalidOutput.into()),
+                        }
                         if first_input.public_context != second_input.public_context
                             || self
                                 .fresh_pending

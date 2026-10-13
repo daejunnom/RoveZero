@@ -513,27 +513,15 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .ok_or(RoleError::InvalidOutput)?
                 .to_vec();
             let anchor = self.replay_node(&prefix)?;
-            if self.engine.nodes[anchor].terminal.is_some() {
-                return Ok(AdaptivePortTransition::Unknown {
-                    reason: "Repair begins at Rules terminal",
-                });
-            }
-            return Ok(AdaptivePortTransition::Continue(
-                self.blueprint(
-                    anchor,
-                    RefinementStage::Repair,
-                    Some(pending.first),
-                    prefix,
-                    pending.proposal,
-                    Some(pending.counter),
-                    None,
-                    Some(pending.attack),
-                    false,
-                    None,
-                    None,
-                )?
-                .with_counter_source(pending.source),
-            ));
+            return self.begin_repair_continuation(
+                anchor,
+                Some(pending.first),
+                prefix,
+                pending.proposal,
+                pending.counter,
+                pending.attack,
+                pending.source,
+            );
         }
         let done = pending.counter.len() >= self.engine.config.line_plies
             || self.engine.nodes[node].terminal.is_some();

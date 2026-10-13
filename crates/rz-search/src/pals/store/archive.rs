@@ -2762,6 +2762,9 @@ impl PalsStores {
             self.tasks
                 .latest
                 .retain(|_, id| !selection.executions.contains(id));
+            self.tasks
+                .owned_instances
+                .retain(|id| !selection.executions.contains(id));
             self.states.snapshots.compact();
             self.states.index.shrink_to_fit();
             self.lines.chunks.compact();
