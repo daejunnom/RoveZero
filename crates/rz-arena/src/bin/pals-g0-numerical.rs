@@ -54,7 +54,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(failure) => {
-            eprintln!("G0 original numerical halted: {}", failure.error);
+            eprintln!("G0 original numerical halted: {:?}", failure);
             println!(
                 "{}",
                 serde_json::json!({"schema":"rz-pals-original-g0-numerical-failure/1",
