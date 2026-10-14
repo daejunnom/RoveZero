@@ -753,7 +753,10 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         };
         match endpoint {
             CpuEndpoint::Own => {
-                let question = self.hot()?.cpu_question(work, profiles).map_err(semantic)?;
+                let port = self.hot()?;
+                let question = port.cpu_question(work, profiles).map_err(|error| {
+                    AdaptiveManagerError::Semantic(port.cpu_question_failure_detail(work, &error))
+                })?;
                 Ok(CpuQuestion::Own(OwnCpuQuestion {
                     position: question.position,
                     root_moves: question.root_moves,

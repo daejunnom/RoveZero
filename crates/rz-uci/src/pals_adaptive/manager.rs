@@ -4347,12 +4347,23 @@ where
                     .iter()
                     .filter_map(|slot| slot.worker.as_ref().map(CpuWorker::profile))
                     .collect();
-                let question = self.driver.cpu_question(
-                    &work,
-                    &profiles,
-                    self.external.as_ref().map(|external| &external.config),
-                    self.registration.endpoints,
-                )?;
+                let question = self
+                    .driver
+                    .cpu_question(
+                        &work,
+                        &profiles,
+                        self.external.as_ref().map(|external| &external.config),
+                        self.registration.endpoints,
+                    )
+                    .map_err(|error| match error {
+                        AdaptiveManagerError::Semantic(detail) => {
+                            let usage = self.ledger.global_usage();
+                            AdaptiveManagerError::Semantic(format!(
+                                "CPU question dispatch manager_spent_reserved={usage:?}; {detail}"
+                            ))
+                        }
+                        other => other,
+                    })?;
                 match question {
                     CpuQuestion::Own(question) => {
                         let Some(slot) = self

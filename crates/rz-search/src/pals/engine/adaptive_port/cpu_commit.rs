@@ -481,6 +481,31 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         Ok(())
     }
 
+    /// Failure-only metadata: semantic work and declarations are not the
+    /// manager's physical spent/reserved ledger. No Rules/PV/view body is copied.
+    pub fn cpu_question_failure_detail(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        error: &PalsError,
+    ) -> String {
+        let checker_max_depth = self
+            .engine
+            .owned_descriptor()
+            .ok()
+            .map(|descriptor| descriptor.config.max_depth);
+        format!(
+            "CPU question stage={:?}; frame_sequence={}; question={:?}; view={:?}; original_cpu_limit={}; semantic_cpu_nodes={}; per_task_cpu_limit={}; target_depth={}; checker_max_depth={checker_max_depth:?}; source_error={error}",
+            work.input.stage,
+            work.frame.sequence,
+            work.input.question_digest,
+            work.input.view_seal.view_digest,
+            self.limits.max_cpu_nodes,
+            self.counters.cpu_nodes,
+            self.engine.config.cpu_nodes_per_task,
+            self.limits.cpu_depth,
+        )
+    }
+
     /// Prepare immutable conditions without claiming that a worker accepted or
     /// executed anything. The ledger remains the owner of outstanding credit.
     pub fn cpu_question(
@@ -1675,6 +1700,38 @@ mod tests {
             search_conditions,
         };
         (port, work, profile)
+    }
+
+    #[test]
+    fn cpu_question_failure_detail_preserves_exhausted_credit_and_original_error() {
+        let (mut port, work, profile) = port_and_work(RefinementStage::CpuValidation, 2);
+        port.counters.cpu_nodes = port.limits.max_cpu_nodes;
+        let before = port.counters();
+        let Err(error) = port.cpu_question(&work, &[profile]) else {
+            panic!("exhausted credit must retain the original failure");
+        };
+        assert!(matches!(error, PalsError::InvalidLimits));
+        let detail = port.cpu_question_failure_detail(&work, &error);
+        assert!(detail.contains("stage=CpuValidation"));
+        assert!(detail.contains("original_cpu_limit=2000; semantic_cpu_nodes=2000"));
+        assert!(detail.contains("target_depth=2; checker_max_depth=Some(8)"));
+        assert!(detail.contains("source_error=PALS: InvalidLimits"));
+        assert_eq!(port.counters(), before);
+        assert!(port.cpu_admissions.is_empty());
+    }
+
+    #[test]
+    fn cpu_question_failure_detail_distinguishes_depth_from_credit() {
+        let (mut port, work, profile) = port_and_work(RefinementStage::CpuValidation, 9);
+        let Err(error) = port.cpu_question(&work, &[profile]) else {
+            panic!("unsupported depth must retain the original failure");
+        };
+        assert!(matches!(error, PalsError::InvalidLimits));
+        let detail = port.cpu_question_failure_detail(&work, &error);
+        assert!(detail.contains("original_cpu_limit=2000; semantic_cpu_nodes=0"));
+        assert!(detail.contains("target_depth=9; checker_max_depth=Some(8)"));
+        assert!(detail.contains("source_error=PALS: InvalidLimits"));
+        assert!(port.cpu_admissions.is_empty());
     }
 
     #[test]
