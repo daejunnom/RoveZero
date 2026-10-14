@@ -604,7 +604,7 @@ fn run_captures(
     receipt_files: &mut Vec<FailureOnlyOutputFileV3>,
     receipt_preservation_errors: &mut Vec<String>,
 ) -> Result<VerifiedNumericalCoreV3, ArenaError> {
-    use super::training_process::{self as common, ObservedFile, ReadCredit};
+    use super::training_process::{self as common, ReadCredit};
     use crate::process::{
         OriginalNumericalEnvironment, OriginalProcessInput, OriginalProcessWindow,
         OwnedArtifactTreeWatch, ProcessLimits, supervise_numerical_input_in_original_window,
@@ -958,35 +958,13 @@ fn run_captures(
             == Some(original.registration().training_runtime.torch.as_str()),
         "reference Torch version differs from original actual trainer runtime",
     )?;
-    let artifacts = receipt["artifact_pins"]
-        .as_array()
-        .ok_or_else(|| invalid("reference original artifact readback absent"))?;
-    let mut references = BTreeMap::new();
-    for value in artifacts {
-        let observed: ObservedFile =
-            serde_json::from_value(value.clone()).map_err(|e| invalid(e.to_string()))?;
-        check(
-            observed.path.parent() == Some(registration.reference_output_root.as_path()),
-            "reference raw output outside original root",
-        )?;
-        let (file, _) = common::read_observed_output(observed.pin(), MAX_JSON, &mut credit, false)?;
-        check(
-            common::readback_matches(&observed, &file),
-            "reference original raw inode changed",
-        )?;
-        let name = file
-            .pin
-            .path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| invalid("reference raw name"))?
-            .to_owned();
-        check(
-            references.insert(name, file.pin.clone()).is_none(),
-            "duplicate original reference raw file",
-        )?;
-        owner.checkpoints.push(file);
-    }
+    let references = hold_reference_outputs(
+        &registration.reference_output_root,
+        receipt,
+        &plan,
+        owner,
+        &mut credit,
+    )?;
     // 두 실행은 같은 원래 창을 공유한다. reference 준비 비용 이후 새 시계를
     // 발급하지 않고 남은 정수 초만 native 내부 cooperative 기한으로 전달한다.
     credit.until = until;
@@ -1982,6 +1960,293 @@ fn verify_reference_receipt(
         )?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const MAX_REFERENCE_OWNER_BYTES: u64 = 1024;
+
+#[cfg(target_os = "linux")]
+fn verify_reference_owner_marker(
+    file: &File,
+    pin: &GenerationTrainingFilePinV3,
+    credit: &mut super::training_process::ReadCredit<'_>,
+) -> Result<(), ArenaError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OwnerMarker {
+        schema: String,
+        owner: String,
+    }
+    pin.validate(MAX_REFERENCE_OWNER_BYTES)?;
+    let raw = super::training_process::verify_bytes(file, pin, true, credit)?;
+    let marker: OwnerMarker = super::training_process::decode(&raw)?;
+    check(
+        marker.schema == "rovezero.pals-model.v1" && marker.owner == "rz-pals-model",
+        "numerical reference original artifact owner marker differs",
+    )
+}
+
+#[cfg(target_os = "linux")]
+struct ReferenceOutputRoster<'a> {
+    owner: &'a Value,
+    groups: Vec<(String, &'a Value)>,
+}
+
+#[cfg(target_os = "linux")]
+fn reference_output_roster<'a>(
+    root: &Path,
+    receipt: &'a Value,
+    plan: &Value,
+) -> Result<ReferenceOutputRoster<'a>, ArenaError> {
+    let rows = receipt["artifact_pins"]
+        .as_array()
+        .ok_or_else(|| invalid("numerical reference original raw roster absent"))?;
+    let groups = plan["groups"]
+        .as_array()
+        .ok_or_else(|| invalid("numerical original groups absent"))?;
+    // The capture producer publishes an ownership marker alongside its raw
+    // groups. It is retained metadata, not another numerical group.
+    check(
+        groups.len().checked_add(1) == Some(rows.len()),
+        "numerical reference exact group coverage",
+    )?;
+    let owner_path = root.join("pals-artifact-owner.json");
+    let owner = rows
+        .iter()
+        .find(|row| row["path"] == owner_path.to_string_lossy().as_ref())
+        .ok_or_else(|| invalid("numerical reference original owner marker absent"))?;
+    let mut seen = BTreeSet::new();
+    let mut ordered = Vec::with_capacity(groups.len());
+    for group in groups {
+        let id = group["id"]
+            .as_str()
+            .ok_or_else(|| invalid("numerical original group ID absent"))?;
+        let name = format!("reference.{id}.json");
+        check(
+            seen.insert(name.clone()),
+            "duplicate numerical reference group",
+        )?;
+        let path = root.join(&name);
+        let row = rows
+            .iter()
+            .find(|row| row["path"] == path.to_string_lossy().as_ref())
+            .ok_or_else(|| invalid("numerical original raw output group absent"))?;
+        ordered.push((name, row));
+    }
+    // Exact count plus all distinct expected paths excludes duplicate,
+    // missing and unknown rows without changing the submitted group order.
+    Ok(ReferenceOutputRoster {
+        owner,
+        groups: ordered,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn retain_reference_output_row(
+    row: &Value,
+    path: &Path,
+    cap: u64,
+    owner: &mut super::training_process::LinuxHeld,
+    credit: &mut super::training_process::ReadCredit<'_>,
+) -> Result<GenerationTrainingFilePinV3, ArenaError> {
+    use super::training_process::{self as common, ObservedFile};
+    let observed: ObservedFile =
+        serde_json::from_value(row.clone()).map_err(|e| invalid(e.to_string()))?;
+    check(
+        observed.path == path,
+        "numerical reference exact output path differs",
+    )?;
+    let (file, _) = common::read_observed_output(observed.pin(), cap, credit, false)?;
+    check(
+        common::readback_matches(&observed, &file),
+        "numerical reference original inode changed",
+    )?;
+    let pin = file.pin.clone();
+    owner.checkpoints.push(file);
+    Ok(pin)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn hold_reference_outputs(
+    root: &Path,
+    receipt: &Value,
+    plan: &Value,
+    owner: &mut super::training_process::LinuxHeld,
+    credit: &mut super::training_process::ReadCredit<'_>,
+) -> Result<BTreeMap<String, GenerationTrainingFilePinV3>, ArenaError> {
+    let roster = reference_output_roster(root, receipt, plan)?;
+    let owner_pin = retain_reference_output_row(
+        roster.owner,
+        &root.join("pals-artifact-owner.json"),
+        MAX_REFERENCE_OWNER_BYTES,
+        owner,
+        credit,
+    )?;
+    let marker = owner
+        .checkpoints
+        .last()
+        .ok_or_else(|| invalid("numerical reference original owner descriptor absent"))?;
+    check(
+        marker.pin == owner_pin,
+        "numerical reference original owner descriptor differs",
+    )?;
+    verify_reference_owner_marker(&marker.file, &marker.pin, credit)?;
+    let mut references = BTreeMap::new();
+    for (name, row) in roster.groups {
+        let pin = retain_reference_output_row(row, &root.join(&name), MAX_JSON, owner, credit)?;
+        check(
+            references.insert(name, pin).is_none(),
+            "duplicate numerical reference group",
+        )?;
+    }
+    Ok(references)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod reference_roster_tests {
+    use super::super::training_process::{self as common, ReadAccounting, ReadCredit};
+    use super::*;
+
+    #[test]
+    fn reference_roster_keeps_plan_order_and_exact_group_plus_owner_coverage() {
+        let root = Path::new("/owned/reference");
+        let plan = serde_json::json!({"groups":[
+            {"id":"proposer_L8"}, {"id":"critic_L8"}
+        ]});
+        let receipt = serde_json::json!({"artifact_pins":[
+            {"path":"/owned/reference/pals-artifact-owner.json"},
+            {"path":"/owned/reference/reference.critic_L8.json"},
+            {"path":"/owned/reference/reference.proposer_L8.json"}
+        ]});
+        let frozen_plan = plan.clone();
+        let roster = reference_output_roster(root, &receipt, &plan).unwrap();
+        assert_eq!(
+            roster.owner["path"],
+            "/owned/reference/pals-artifact-owner.json"
+        );
+        assert_eq!(
+            roster
+                .groups
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["reference.proposer_L8.json", "reference.critic_L8.json"]
+        );
+        assert_eq!(plan, frozen_plan);
+
+        let mut extra = receipt.clone();
+        extra["artifact_pins"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"path":"/owned/reference/unexpected.json"}));
+        let mut missing_raw = receipt.clone();
+        missing_raw["artifact_pins"].as_array_mut().unwrap().pop();
+        let mut missing_owner = receipt.clone();
+        missing_owner["artifact_pins"][0]["path"] =
+            serde_json::json!("/unowned/pals-artifact-owner.json");
+        let mut duplicate_raw = receipt.clone();
+        duplicate_raw["artifact_pins"][1] = duplicate_raw["artifact_pins"][2].clone();
+        let mut duplicate_owner = receipt.clone();
+        duplicate_owner["artifact_pins"][1] = duplicate_owner["artifact_pins"][0].clone();
+        for bad in [
+            extra,
+            missing_raw,
+            missing_owner,
+            duplicate_raw,
+            duplicate_owner,
+        ] {
+            assert!(reference_output_roster(root, &bad, &plan).is_err());
+        }
+        let duplicate_plan = serde_json::json!({"groups":[
+            {"id":"proposer_L8"}, {"id":"proposer_L8"}
+        ]});
+        assert!(reference_output_roster(root, &receipt, &duplicate_plan).is_err());
+    }
+    #[test]
+    fn owner_marker_content_uses_original_fd_credit_and_strict_two_field_schema() {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        struct MarkerDirectory(PathBuf);
+        impl Drop for MarkerDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(self.0.join("pals-artifact-owner.json"));
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let new_directory = || {
+            let parent = std::env::temp_dir().canonicalize().unwrap();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = parent.join(format!(
+                "rz-g0-owner-marker-{}-{}-{nonce}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            MarkerDirectory(path)
+        };
+        let cancel = AtomicBool::new(false);
+        let mut credit = ReadCredit {
+            remaining: 16 * MAX_REFERENCE_OWNER_BYTES,
+            maximum: 16 * MAX_REFERENCE_OWNER_BYTES,
+            until: Instant::now() + Duration::from_secs(5),
+            cancel: &cancel,
+            account: ReadAccounting::new(),
+        };
+        let directory = new_directory();
+        let path = directory.0.join("pals-artifact-owner.json");
+        let valid = br#"{"schema":"rovezero.pals-model.v1","owner":"rz-pals-model"}"#;
+        let original = common::write_owned_new(&path, valid).unwrap();
+        let before = credit.remaining;
+        verify_reference_owner_marker(&original.file, &original.pin, &mut credit).unwrap();
+        assert_eq!(before - credit.remaining, valid.len() as u64);
+        assert_eq!(
+            credit.account.charged.load(Ordering::Acquire),
+            valid.len() as u64
+        );
+        credit.remaining = 0;
+        assert!(verify_reference_owner_marker(&original.file, &original.pin, &mut credit).is_err());
+        // A replacement pathname never authorizes the retained original FD.
+        std::fs::remove_file(&path).unwrap();
+        let replacement = common::write_owned_new(&path, valid).unwrap();
+        let mut remaining = ReadCredit {
+            remaining: 16 * MAX_REFERENCE_OWNER_BYTES,
+            maximum: 16 * MAX_REFERENCE_OWNER_BYTES,
+            until: Instant::now() + Duration::from_secs(5),
+            cancel: &cancel,
+            account: ReadAccounting::new(),
+        };
+        assert!(
+            verify_reference_owner_marker(&original.file, &original.pin, &mut remaining).is_err()
+        );
+        drop(replacement);
+        for raw in [
+            br#"{"schema":"rovezero.pals-model.v3","owner":"rz-pals-model"}"#.as_slice(),
+            br#"{"schema":"rovezero.pals-model.v1","owner":"other"}"#,
+            br#"{"schema":"rovezero.pals-model.v1","owner":"rz-pals-model","extra":true}"#,
+            br#"{"schema":"rovezero.pals-model.v1","owner":"rz-pals-model","owner":"other"}"#,
+            br#"{"schema":"rovezero.pals-model.v1"}"#,
+            b"not-json",
+        ] {
+            let directory = new_directory();
+            let held = common::write_owned_new(&directory.0.join("pals-artifact-owner.json"), raw)
+                .unwrap();
+            assert!(verify_reference_owner_marker(&held.file, &held.pin, &mut remaining).is_err());
+        }
+        let oversized = new_directory();
+        let held = common::write_owned_new(
+            &oversized.0.join("pals-artifact-owner.json"),
+            &vec![b' '; MAX_REFERENCE_OWNER_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(verify_reference_owner_marker(&held.file, &held.pin, &mut remaining).is_err());
+    }
 }
 
 #[cfg(test)]

@@ -1597,34 +1597,7 @@ pub(super) mod linux {
         held: &mut LinuxHeld,
         credit: &mut ReadCredit<'_>,
     ) -> Result<BTreeMap<String, Pin>, ArenaError> {
-        let rows = receipt["artifact_pins"]
-            .as_array()
-            .ok_or_else(|| invalid("G0 reference original raw roster absent"))?;
-        let groups = plan["groups"]
-            .as_array()
-            .ok_or_else(|| invalid("G0 original groups absent"))?;
-        check(
-            rows.len() == groups.len(),
-            "G0 reference exact group coverage",
-        )?;
-        let mut result = BTreeMap::new();
-        for group in groups {
-            let id = group["id"]
-                .as_str()
-                .ok_or_else(|| invalid("G0 original group ID absent"))?;
-            let name = format!("reference.{id}.json");
-            let path = r.reference_output_root.join(&name);
-            let row = rows
-                .iter()
-                .find(|row| row["path"] == path.to_string_lossy().as_ref())
-                .ok_or_else(|| invalid("G0 original raw output group absent"))?;
-            let pin = hold_observed(row, &path, MAX_JSON, held, credit)?;
-            check(
-                result.insert(name, pin).is_none(),
-                "G0 duplicate reference group",
-            )?;
-        }
-        Ok(result)
+        numerical::hold_reference_outputs(&r.reference_output_root, receipt, plan, held, credit)
     }
 
     #[allow(
