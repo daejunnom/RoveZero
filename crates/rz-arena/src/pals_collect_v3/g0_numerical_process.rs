@@ -1106,12 +1106,7 @@ pub(super) mod linux {
         })
     }
     pub(in crate::pals_collect_v3) fn watch(r: &OriginalG0Scope) -> OwnedArtifactTreeWatch {
-        OwnedArtifactTreeWatch {
-            max_total_bytes: r.max_output_bytes,
-            max_file_bytes: MAX_FILE,
-            max_files: 65_536,
-            max_depth: 32,
-        }
+        OwnedArtifactTreeWatch::bounded_output(r.max_output_bytes, MAX_FILE)
     }
     fn observed_matches(value: &Value, held: &LinuxHeld) -> Result<(), ArenaError> {
         let observed: ObservedFile =

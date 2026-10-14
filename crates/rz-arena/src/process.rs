@@ -482,11 +482,26 @@ pub struct OwnedArtifactTreeWatch {
 }
 
 impl OwnedArtifactTreeWatch {
+    const MAX_FILES: usize = 4096;
+    const MAX_DEPTH: usize = 32;
+
+    /// Use the supervisor's finite traversal bounds with the caller's original
+    /// byte budgets. Admission still validates positive byte limits before spawn.
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn bounded_output(max_total_bytes: u64, max_file_bytes: u64) -> Self {
+        Self {
+            max_total_bytes,
+            max_file_bytes,
+            max_files: Self::MAX_FILES,
+            max_depth: Self::MAX_DEPTH,
+        }
+    }
+
     fn validate(&self) -> Result<(), ArenaError> {
         if self.max_total_bytes == 0
             || self.max_file_bytes == 0
-            || !(1..=4096).contains(&self.max_files)
-            || self.max_depth > 32
+            || !(1..=Self::MAX_FILES).contains(&self.max_files)
+            || self.max_depth > Self::MAX_DEPTH
         {
             return Err(ArenaError::Budget(
                 "artifact tree requires positive bytes, 1..4096 files and depth at most 32".into(),
@@ -2064,6 +2079,70 @@ mod linux {
                 // through a replacement entry or remove another test's tree.
                 let _ = std::fs::remove_dir(&self.0);
             }
+        }
+
+        #[test]
+        fn bounded_output_watch_reaches_original_supervisor_and_keeps_owned_tree_guards() {
+            struct TreeEntries(std::path::PathBuf);
+            impl Drop for TreeEntries {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(self.0.join("artifact.bin"));
+                    let _ = std::fs::remove_dir(&self.0);
+                }
+            }
+
+            let directory = OriginalTestDirectory::new();
+            let entries = TreeEntries(directory.0.join("outputs"));
+            std::fs::create_dir(&entries.0).unwrap();
+            let artifact = entries.0.join("artifact.bin");
+            std::fs::write(&artifact, b"12345678").unwrap();
+            let cwd = directory.file();
+            // This is the same production constructor used by both numerical
+            // owners, with small byte budgets so the real tree limits are tested.
+            let watch = OwnedArtifactTreeWatch::bounded_output(16, 8);
+            let program = File::open("/bin/cat").unwrap();
+            let input = b"original-numerical-input";
+            let started = Instant::now();
+            let window = OriginalProcessWindow::new(
+                started,
+                started + Duration::from_secs(5),
+                started + Duration::from_millis(5500),
+            )
+            .unwrap();
+            let output = supervise_input_in_original_window(
+                &program,
+                &[],
+                &cwd,
+                original_limits(),
+                None,
+                &watch,
+                OriginalProcessInput {
+                    bytes: input,
+                    window,
+                },
+            )
+            .unwrap();
+            assert!(output.transport_complete(), "{output:?}");
+            assert_eq!(output.process().stdout, input);
+            assert_eq!(output.process().receipt.watched_artifact_bytes, Some(8));
+            assert_eq!(output.checked_timing().unwrap().original_started(), started);
+
+            let total_cap = OwnedArtifactTreeWatch::bounded_output(7, 8);
+            total_cap.validate().unwrap();
+            let failure = watched_tree_size(&cwd, &total_cap).unwrap_err();
+            assert_eq!(failure.stop, ProcessStop::ArtifactLimit);
+            assert_eq!(failure.code, "process.artifact_tree.total_bytes");
+
+            std::fs::write(&artifact, b"123456789").unwrap();
+            let failure = watched_tree_size(&cwd, &watch).unwrap_err();
+            assert_eq!(failure.stop, ProcessStop::ArtifactLimit);
+            assert_eq!(failure.code, "process.artifact_tree.file_bytes");
+
+            std::fs::remove_file(&artifact).unwrap();
+            std::os::unix::fs::symlink("/nonexistent-unowned-artifact", &artifact).unwrap();
+            let failure = watched_tree_size(&cwd, &watch).unwrap_err();
+            assert_eq!(failure.stop, ProcessStop::IoFailure);
+            assert_eq!(failure.code, "process.artifact_tree.kind");
         }
 
         #[test]

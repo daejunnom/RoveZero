@@ -846,12 +846,7 @@ fn run_captures(
         max_child_processes: 1,
     };
     let window = OriginalProcessWindow::new(started, until, cleanup_until)?;
-    let watch = OwnedArtifactTreeWatch {
-        max_total_bytes: staging_cap,
-        max_file_bytes: MAX_FILE,
-        max_files: 65_536,
-        max_depth: 32,
-    };
+    let watch = OwnedArtifactTreeWatch::bounded_output(staging_cap, MAX_FILE);
     common::revalidate(owner, &mut credit)?;
     let mut mapped_credit = reserve_image(
         &registration.python_runtime.executable,
