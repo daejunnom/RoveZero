@@ -381,6 +381,47 @@ parent receipt의 `charged_read_bytes`는 자체 publication/readback 전 snapsh
 수치·GPU 인수는 각각 따로 기록한다. 최초 bootstrap 성공을 실제 학습 세대 완료나
 전체 UCI readiness·대국 인수로 바꾸지 않는다.
 
+### 같은 원 G0의 Collection과 Deployment 수치 검사
+
+[별도 thin CLI](../crates/rz-arena/src/bin/pals-g0-collection-deployment-numerical.rs)는
+다음 명시적 인수로만 두 수치 단계를 실행한다. 기본 호출과 미지원 OS는 입력 읽기나
+신경망 실행 전에 거부한다.
+
+```text
+rz-pals-g0-collection-deployment-numerical --execute
+  --collection-registration <Collection 등록 절대 경로>
+  --collection-registration-sha256 <실제 SHA-256>
+  --deployment-intent <사전 intent 절대 경로>
+  --deployment-intent-sha256 <실제 SHA-256>
+```
+
+[Deployment intent](../crates/rz-arena/src/pals_collect_v3/g0_deployment_numerical_process.rs)는
+`rz-pals-g0-deployment-numerical-intent/1`이며 새 출력 경로와 유한 예산을 등록한다.
+아직 없는 Collection acceptance·새 가중치·owner를 받지 않는다. Collection NN 전에
+최대 64KiB의 원 intent를 30초·16MiB 읽기 예산 안에서 검증하고 opaque preflight
+owner가 첫 FD를 보유한다. 잘못된 SHA·정적 구조는 Collection을 시작하기 전에 거부한다.
+
+Collection의 기존 18 group·150 사례를 바꾸지 않는다. 같은 프로세스에서 성공한 live
+Collection owner·원 checkpoint FD를 유지한 뒤, 별도 30초·16MiB metadata 단계에서
+실제 acceptance pin을 넣은 `rz-pals-g0-deployment-numerical-launch/1`을 create-new로
+봉인한다. 원 staging parent FD 아래의 새 registration과 실제 실행이 연 첫 FD의
+정확한 pin·inode/device/length/UID/single-link를 연결한다. JSON으로 owner를 복원하거나
+종료된 Collection 시간·read credit을 연장하지 않는다.
+
+Deployment 단계는 원 plan의 P/C 입력·순서·bytes를 보존한 12 group·100 사례를 사용한다.
+[독립 Python 소비자](../experiments/model-research/pals/src/rz_pals_model/g0_deployment_numerical_cli.py)는
+같은 원 G0 checkpoint에서 기존 `include_validator=false` export를 호출하고
+public/shared_pc 두 graph만 허용한다. 새 initializer·optimizer를 실행하지 않는다.
+오프라인 strict checkpoint 복원은 전체 모델을 일시적으로 구성할 수 있으며 이 비용도
+기록한다. 이 수치 인수와 실제 Deployment 엔진 시작의 V 생성·로딩·호출 0 증거는 별개다.
+
+실패 영수증·원 stdout/stderr byte·read 계수와 파일 custody를 유지한다. pending child나
+group cleanup unknown이면 CLI는 전체 opaque 실패 owner를 process 종료까지 격리하고
+`quarantine_required`를 기록한다. 상위 감독자의 실제 종료·회수 확인 없이 정상 물리
+완료로 표시하거나 자동 재시도하지 않는다. 두 단계가 모두 성공해도 numerical-only이며
+startup·실제 수집·학습·arena 권한을 발급하지 않는다. CPU 순수 검사·CI·실제 NN·GPU와
+대국 인수는 각각 실제 실행 SHA와 결과를 확인한다.
+
 2026-10-14 소스 검사에서는 Linux의 experiments default/types/admission 215/237/238개와
 bootstrap 6개, Windows arena all-features 263개가 통과했다. 두 OS의 strict Clippy와
 framework 실행을 차단한 Python metadata 17/16개도 통과했다. Linux 전체 arena의

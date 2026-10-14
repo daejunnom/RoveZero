@@ -23,6 +23,7 @@ use std::{
 
 pub const G0_DEPLOYMENT_NUMERICAL_LAUNCH_V5: &str = "rz-pals-g0-deployment-numerical-launch/1";
 pub const G0_DEPLOYMENT_NUMERICAL_INTENT_V5: &str = "rz-pals-g0-deployment-numerical-intent/1";
+#[cfg(target_os = "linux")]
 const MAX_JSON: u64 = 4 << 20;
 const MAX_STAGING: u64 = 18 << 30;
 #[cfg(target_os = "linux")]
@@ -1043,192 +1044,6 @@ mod linux {
         )
     }
 
-    #[cfg(test)]
-    mod seal_join_tests {
-        use super::*;
-        use std::{
-            io::Write,
-            os::unix::fs::{DirBuilderExt, OpenOptionsExt},
-            sync::atomic::AtomicU64,
-        };
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        struct Fixture(PathBuf);
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                for name in ["registration.json", "copy.json", "prior.json"] {
-                    let _ = std::fs::remove_file(self.0.join(name));
-                }
-                let _ = std::fs::remove_dir(&self.0);
-            }
-        }
-        #[test]
-        fn sealed_stage_join_refuses_same_bytes_from_another_inode_or_replaced_name() {
-            let root = std::env::temp_dir().join(format!(
-                "g0-seal-join-{}-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&root)
-                .unwrap();
-            let fixture = Fixture(root);
-            let path = fixture.0.join("registration.json");
-            let copy_path = fixture.0.join("copy.json");
-            let mut original = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o400)
-                .open(&path)
-                .unwrap();
-            original.write_all(b"g0\n").unwrap();
-            original.sync_all().unwrap();
-            let mut copy = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o400)
-                .open(&copy_path)
-                .unwrap();
-            copy.write_all(b"g0\n").unwrap();
-            copy.sync_all().unwrap();
-            // Only inode handoff is under test; this fixture never parses a
-            // registration, dispatches a child, or creates an admitted owner.
-            let pin = Pin {
-                path: path.clone(),
-                sha256: "a".repeat(64),
-                bytes: 3,
-            };
-            check_sealed_registration_join(&pin, &common::open_file(&path).unwrap(), &original)
-                .expect("the exact sealed inode may hand off to a new read FD");
-            assert!(check_sealed_registration_join(&pin, &copy, &original).is_err());
-            std::fs::rename(&path, fixture.0.join("prior.json")).unwrap();
-            std::fs::rename(&copy_path, &path).unwrap();
-            assert!(
-                check_sealed_registration_join(&pin, &common::open_file(&path).unwrap(), &original)
-                    .is_err()
-            );
-        }
-
-        #[test]
-        fn intent_preflight_checks_sha_static_shape_and_cap_without_a_collection_owner() {
-            use sha2::{Digest, Sha256};
-            let root = std::env::temp_dir().join(format!(
-                "g0-preflight-{}-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&root)
-                .unwrap();
-            let fixture = Fixture(root);
-            let path = fixture.0.join("registration.json");
-            let intent = G0DeploymentNumericalIntentV5 {
-                schema: G0_DEPLOYMENT_NUMERICAL_INTENT_V5.into(),
-                numerical_id: "preflight_metadata_only".into(),
-                registration_path: fixture.0.join("new-registration.json"),
-                export_directory: fixture.0.join("export"),
-                reference_output_root: fixture.0.join("reference"),
-                native_output_root: fixture.0.join("native"),
-                export_receipt_path: fixture.0.join("export-receipt.json"),
-                reference_receipt_path: fixture.0.join("reference-receipt.json"),
-                acceptance_path: fixture.0.join("acceptance.json"),
-                parent_receipt_path: fixture.0.join("parent.json"),
-                max_wall_ns: 1_000_000_000,
-                max_output_bytes: MAX_STAGING,
-                max_read_bytes: 4 * MAX_STAGING,
-            };
-            let raw = serde_json::to_vec(&intent).unwrap();
-            let sha = |bytes: &[u8]| {
-                Sha256::digest(bytes)
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            };
-            let write = |path: &Path, bytes: &[u8]| {
-                let mut file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o400)
-                    .open(path)
-                    .unwrap();
-                file.write_all(bytes).unwrap();
-                file.sync_all().unwrap();
-                file
-            };
-            let original = write(&path, &raw);
-            let cancel = Arc::new(AtomicBool::new(false));
-            let mut changed_sha = sha(&raw);
-            let replacement = if changed_sha.starts_with('a') {
-                "b"
-            } else {
-                "a"
-            };
-            changed_sha.replace_range(..1, replacement);
-            let wrong_sha = match preflight_g0_deployment_intent_original_v5(
-                &path,
-                &changed_sha,
-                Arc::clone(&cancel),
-            ) {
-                Ok(_) => panic!("wrong intent SHA cannot preflight"),
-                Err(failure) => failure,
-            };
-            assert!(wrong_sha._intent.is_some());
-            assert!(wrong_sha.charged_read_bytes > 0);
-            let preflight =
-                preflight_g0_deployment_intent_original_v5(&path, &sha(&raw), Arc::clone(&cancel))
-                    .unwrap();
-            assert_eq!(preflight.pin().bytes, raw.len() as u64);
-            assert_eq!(
-                preflight.observation()["status"],
-                "intent_preflighted_metadata_only"
-            );
-            assert_eq!(preflight.observation()["numerical_authority_issued"], false);
-            check_original_file_join(
-                preflight.pin(),
-                &original,
-                &preflight.intent,
-                "fixture original intent join",
-            )
-            .unwrap();
-            let bad_path = fixture.0.join("copy.json");
-            let bad_raw = b"{\"schema\":\"wrong-static-domain\"}";
-            let _bad = write(&bad_path, bad_raw);
-            let malformed = match preflight_g0_deployment_intent_original_v5(
-                &bad_path,
-                &sha(bad_raw),
-                Arc::clone(&cancel),
-            ) {
-                Ok(_) => panic!("invalid static intent cannot preflight"),
-                Err(failure) => failure,
-            };
-            assert!(malformed._intent.is_some());
-            let large_path = fixture.0.join("prior.json");
-            let _large = write(&large_path, &vec![b' '; MAX_INTENT as usize + 1]);
-            let oversized = match preflight_g0_deployment_intent_original_v5(
-                &large_path,
-                &"a".repeat(64),
-                cancel,
-            ) {
-                Ok(_) => panic!("oversized metadata cannot preflight"),
-                Err(failure) => failure,
-            };
-            assert!(oversized._intent.is_some());
-            assert_eq!(oversized.charged_read_bytes, 0);
-        }
-    }
-
     fn execute(
         path: &Path,
         sha: &str,
@@ -1957,6 +1772,191 @@ mod linux {
         credit.remaining = cleanup.remaining;
         result
     }
+    #[cfg(test)]
+    mod seal_join_tests {
+        use super::*;
+        use std::{
+            io::Write,
+            os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+            sync::atomic::AtomicU64,
+        };
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                for name in ["registration.json", "copy.json", "prior.json"] {
+                    let _ = std::fs::remove_file(self.0.join(name));
+                }
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        #[test]
+        fn sealed_stage_join_refuses_same_bytes_from_another_inode_or_replaced_name() {
+            let root = std::env::temp_dir().join(format!(
+                "g0-seal-join-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
+            let fixture = Fixture(root);
+            let path = fixture.0.join("registration.json");
+            let copy_path = fixture.0.join("copy.json");
+            let mut original = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o400)
+                .open(&path)
+                .unwrap();
+            original.write_all(b"g0\n").unwrap();
+            original.sync_all().unwrap();
+            let mut copy = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o400)
+                .open(&copy_path)
+                .unwrap();
+            copy.write_all(b"g0\n").unwrap();
+            copy.sync_all().unwrap();
+            // Only inode handoff is under test; this fixture never parses a
+            // registration, dispatches a child, or creates an admitted owner.
+            let pin = Pin {
+                path: path.clone(),
+                sha256: "a".repeat(64),
+                bytes: 3,
+            };
+            check_sealed_registration_join(&pin, &common::open_file(&path).unwrap(), &original)
+                .expect("the exact sealed inode may hand off to a new read FD");
+            assert!(check_sealed_registration_join(&pin, &copy, &original).is_err());
+            std::fs::rename(&path, fixture.0.join("prior.json")).unwrap();
+            std::fs::rename(&copy_path, &path).unwrap();
+            assert!(
+                check_sealed_registration_join(&pin, &common::open_file(&path).unwrap(), &original)
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn intent_preflight_checks_sha_static_shape_and_cap_without_a_collection_owner() {
+            use sha2::{Digest, Sha256};
+            let root = std::env::temp_dir().join(format!(
+                "g0-preflight-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
+            let fixture = Fixture(root);
+            let path = fixture.0.join("registration.json");
+            let intent = G0DeploymentNumericalIntentV5 {
+                schema: G0_DEPLOYMENT_NUMERICAL_INTENT_V5.into(),
+                numerical_id: "preflight_metadata_only".into(),
+                registration_path: fixture.0.join("new-registration.json"),
+                export_directory: fixture.0.join("export"),
+                reference_output_root: fixture.0.join("reference"),
+                native_output_root: fixture.0.join("native"),
+                export_receipt_path: fixture.0.join("export-receipt.json"),
+                reference_receipt_path: fixture.0.join("reference-receipt.json"),
+                acceptance_path: fixture.0.join("acceptance.json"),
+                parent_receipt_path: fixture.0.join("parent.json"),
+                max_wall_ns: 1_000_000_000,
+                max_output_bytes: MAX_STAGING,
+                max_read_bytes: 4 * MAX_STAGING,
+            };
+            let raw = serde_json::to_vec(&intent).unwrap();
+            let sha = |bytes: &[u8]| {
+                Sha256::digest(bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            };
+            let write = |path: &Path, bytes: &[u8]| {
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o400)
+                    .open(path)
+                    .unwrap();
+                file.write_all(bytes).unwrap();
+                file.sync_all().unwrap();
+                file
+            };
+            let original = write(&path, &raw);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let mut changed_sha = sha(&raw);
+            let replacement = if changed_sha.starts_with('a') {
+                "b"
+            } else {
+                "a"
+            };
+            changed_sha.replace_range(..1, replacement);
+            let wrong_sha = match preflight_g0_deployment_intent_original_v5(
+                &path,
+                &changed_sha,
+                Arc::clone(&cancel),
+            ) {
+                Ok(_) => panic!("wrong intent SHA cannot preflight"),
+                Err(failure) => failure,
+            };
+            assert!(wrong_sha._intent.is_some());
+            assert!(wrong_sha.charged_read_bytes > 0);
+            let preflight =
+                preflight_g0_deployment_intent_original_v5(&path, &sha(&raw), Arc::clone(&cancel))
+                    .unwrap();
+            assert_eq!(preflight.pin().bytes, raw.len() as u64);
+            assert_eq!(
+                preflight.observation()["status"],
+                "intent_preflighted_metadata_only"
+            );
+            assert_eq!(preflight.observation()["numerical_authority_issued"], false);
+            check_original_file_join(
+                preflight.pin(),
+                &original,
+                &preflight.intent,
+                "fixture original intent join",
+            )
+            .unwrap();
+            let bad_path = fixture.0.join("copy.json");
+            let bad_raw = b"{\"schema\":\"wrong-static-domain\"}";
+            let _bad = write(&bad_path, bad_raw);
+            let malformed = match preflight_g0_deployment_intent_original_v5(
+                &bad_path,
+                &sha(bad_raw),
+                Arc::clone(&cancel),
+            ) {
+                Ok(_) => panic!("invalid static intent cannot preflight"),
+                Err(failure) => failure,
+            };
+            assert!(malformed._intent.is_some());
+            let large_path = fixture.0.join("prior.json");
+            let _large = write(&large_path, &vec![b' '; MAX_INTENT as usize + 1]);
+            let oversized = match preflight_g0_deployment_intent_original_v5(
+                &large_path,
+                &"a".repeat(64),
+                cancel,
+            ) {
+                Ok(_) => panic!("oversized metadata cannot preflight"),
+                Err(failure) => failure,
+            };
+            assert!(oversized._intent.is_some());
+            assert_eq!(oversized.charged_read_bytes, 0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2043,7 +2043,7 @@ mod tests {
                                 },
                                 perspective: if white { 1 } else { -1 },
                                 prefix: Vec::new(),
-                                proposal: vec![candidate.clone(); bucket],
+                                proposal: vec![candidate; bucket],
                                 counter: Vec::new(),
                                 counter_present: false,
                                 anchors: [0, 0, 0],
