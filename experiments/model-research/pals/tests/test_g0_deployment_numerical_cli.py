@@ -214,8 +214,8 @@ class DeploymentPureTests(unittest.TestCase):
     def test_export_dispatch_is_separate_vfree_existing_api_and_never_initializer(self):
         from rz_pals_model import artifacts, virtual_control_inventory
         row = registration(self.cli, self.root)
-        outputs = {"export_manifest": {"path": str(Path(row["export_directory"]) / "export.json"), "sha256": "6" * 64, "bytes": 32},
-                   "export_graphs": [], "cuda_control_inventory": {"path": str(Path(row["export_directory"]) / "cuda-control-inventory.json"), "sha256": "8" * 64, "bytes": 32}}
+        outputs = {"export_manifest": {"path": str(Path(row["export_directory"]) / "export.json"), "sha256": "6" * 64, "bytes": 32, "device": 3, "inode": 11},
+                   "export_graphs": [], "cuda_control_inventory": {"path": str(Path(row["export_directory"]) / "cuda-control-inventory.json"), "sha256": "8" * 64, "bytes": 32, "device": 3, "inode": 12}}
         manifest = {"roles": ["proposer", "critic"], "validator_present": False,
                     "graphs": [{"role": role} for role in self.cli.GRAPH_FILES],
                     "initializer_banks": {role: {} for role in self.cli.GRAPH_FILES}}
@@ -231,10 +231,13 @@ class DeploymentPureTests(unittest.TestCase):
         def registered(module, name, file):
             self.assertNotIn("initialize", name)
             return fake_export if name == "export_virtual_checkpoint" else fake_inventory
+        def json_artifact(pin, *args, **kwargs):
+            self.assertEqual(set(pin), {"path", "sha256", "bytes"})
+            return control if pin["sha256"] == "8" * 64 else {}
         with contextlib.ExitStack() as stack:
             for name, value in (("_registered_function", registered), ("_require_empty_output_directory", lambda path: Path(path)),
                     ("_original_metadata", lambda *a, **k: {}), ("_load_original_g0_model", lambda *a, **k: object()),
-                    ("_model_bits_digest", lambda *a, **k: "a" * 64), ("_json_pin", lambda pin, *a, **k: control if pin["sha256"] == "8" * 64 else {}),
+                    ("_model_bits_digest", lambda *a, **k: "a" * 64), ("_json_pin", json_artifact),
                     ("_pin", lambda *a, **k: outputs["export_manifest"]), ("_export_outputs", lambda *a, **k: outputs),
                     ("_output_credit", lambda *a, **k: 1 << 30), ("_validate_vfree_manifest", lambda manifest, metadata: self.cli.validate_vfree_manifest_roles(manifest))):
                 stack.enter_context(patch.object(self.cli, name, value))
@@ -247,7 +250,7 @@ class DeploymentPureTests(unittest.TestCase):
         self.assertIs(observed["actual_export_executed"], True)
         self.assertNotIn("native_numeric_authority_issued", result)
 
-    def test_actual_export_readbacks_are_strict_artifacts_for_inventory_and_reference(self):
+    def test_actual_export_readbacks_preserve_identity_and_project_inventory_reference_pins(self):
         row = registration(self.cli, self.root)
         output = Path(row["export_directory"]); output.mkdir(parents=True)
         control = {"manifest_sha256": "6" * 64, "scope": "read_only_serialized_graph_metadata_no_runtime"}
@@ -258,13 +261,20 @@ class DeploymentPureTests(unittest.TestCase):
         observed = self.cli._pin(output / "cuda-control-inventory.json", 4 * 1024 ** 2, **options)
         self.assertEqual(set(observed), {"path", "sha256", "bytes", "device", "inode"})
         outputs = self.cli._export_outputs(row, **options)
+        def artifact(pin):
+            return {key: pin[key] for key in ("path", "sha256", "bytes")}
         for name in ("export_manifest", "cuda_control_inventory"):
-            self.assertEqual(set(outputs[name]), {"path", "sha256", "bytes"})
+            self.assertEqual(set(outputs[name]), {"path", "sha256", "bytes", "device", "inode"})
         for graph in outputs["export_graphs"]:
-            self.assertEqual(set(graph), {"path", "sha256", "bytes", "role", "file"})
-        self.assertEqual(self.cli._json_pin(outputs["cuda_control_inventory"], 4 * 1024 ** 2, **options), control)
+            self.assertEqual(set(graph), {"path", "sha256", "bytes", "device", "inode", "role", "file"})
+        self.assertEqual(outputs["cuda_control_inventory"], observed)
+        self.assertEqual(self.cli._json_pin(artifact(outputs["cuda_control_inventory"]), 4 * 1024 ** 2, **options), control)
         reference = registration(self.cli, self.root, "reference")
-        reference["inputs"].update(outputs)
+        # Mirror the parent's ObservedFile -> registration pin boundary.
+        reference["inputs"].update(export_manifest=artifact(outputs["export_manifest"]),
+            cuda_control_inventory=artifact(outputs["cuda_control_inventory"]),
+            export_graphs=[dict(artifact(graph), role=graph["role"], file=graph["file"])
+                           for graph in outputs["export_graphs"]])
         self.assertEqual(self.cli.validate_registration(reference), reference)
 
     def test_projected_output_pin_keeps_strict_fields_and_byte_hash_checks(self):
@@ -273,7 +283,8 @@ class DeploymentPureTests(unittest.TestCase):
         for file in ("export.json", "cuda-control-inventory.json", *self.cli.GRAPH_FILES.values()):
             (output / file).write_bytes(b"{}")
         options = {"until_ns": 60 * 10 ** 9, "clock": lambda: 0}
-        pin = self.cli._export_outputs(row, **options)["cuda_control_inventory"]
+        observed = self.cli._export_outputs(row, **options)["cuda_control_inventory"]
+        pin = {key: observed[key] for key in ("path", "sha256", "bytes")}
         with self.assertRaisesRegex(ValueError, "training artifact pin fields mismatch"):
             self.cli._json_pin(dict(pin, inode=123), 4 * 1024 ** 2, **options)
         (output / "cuda-control-inventory.json").write_bytes(b"[]")

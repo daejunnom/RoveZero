@@ -315,14 +315,11 @@ def validate_vfree_manifest_roles(manifest):
 
 def _export_outputs(registration, *, until_ns, clock):
     root = Path(registration["export_directory"])
-    def artifact(path, maximum):
-        observed = _pin(path, maximum, until_ns=until_ns, clock=clock)
-        # Device/inode describe the readback, not the strict reusable file pin.
-        return {name: observed[name] for name in ("path", "sha256", "bytes")}
-    return {"export_manifest": artifact(root / "export.json", 256 * 1024),
-            "export_graphs": [dict(artifact(root / filename, MAX_GRAPH_BYTES), role=role, file=filename)
+    # The original Rust parent joins each output to its retained file identity.
+    return {"export_manifest": _pin(root / "export.json", 256 * 1024, until_ns=until_ns, clock=clock),
+            "export_graphs": [dict(_pin(root / filename, MAX_GRAPH_BYTES, until_ns=until_ns, clock=clock), role=role, file=filename)
                               for role, filename in GRAPH_FILES.items()],
-            "cuda_control_inventory": artifact(root / "cuda-control-inventory.json", 4 * 1024 ** 2)}
+            "cuda_control_inventory": _pin(root / "cuda-control-inventory.json", 4 * 1024 ** 2, until_ns=until_ns, clock=clock)}
 
 
 def _export(registration, *, until_ns, clock, check_original, execution_observation):
@@ -350,7 +347,9 @@ def _export(registration, *, until_ns, clock, check_original, execution_observat
         opt_in=True, max_seconds=min(30, remaining), until_ns=until_ns,
         output_guard=lambda amount: _write_credit(registration, amount, check_original))
     outputs = _export_outputs(registration, until_ns=until_ns, clock=clock)
-    control = _json_pin(outputs["cuda_control_inventory"], 4 * 1024 ** 2, until_ns=until_ns, clock=clock)
+    # JSON consumes a strict artifact pin; retain device/inode in parent outputs.
+    control_pin = {name: outputs["cuda_control_inventory"][name] for name in ("path", "sha256", "bytes")}
+    control = _json_pin(control_pin, 4 * 1024 ** 2, until_ns=until_ns, clock=clock)
     if (produced["inventory_sha256"] != outputs["cuda_control_inventory"]["sha256"]
             or produced["inventory_bytes"] != outputs["cuda_control_inventory"]["bytes"]
             or control.get("manifest_sha256") != outputs["export_manifest"]["sha256"]
