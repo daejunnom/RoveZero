@@ -1688,6 +1688,57 @@ pub(super) mod linux {
         )
     }
 
+    /// Readback only from the same original directory FD already held by G0.
+    /// The serialized observation cannot reconstruct this parent owner.
+    pub(super) fn original_empty_native_output_root(
+        path: &Path,
+        held: &LinuxHeld,
+    ) -> Result<numerical::OriginalEmptyNativeOutputRoot, ArenaError> {
+        use std::os::unix::fs::MetadataExt;
+        let mut owners = held
+            .directories
+            .iter()
+            .filter(|(named, _, _)| named == path);
+        let (_, original, admitted) = owners
+            .next()
+            .ok_or_else(|| invalid("G0 original native output directory is not retained"))?;
+        check(
+            owners.next().is_none(),
+            "G0 original native output directory is ambiguous",
+        )?;
+        let metadata = original
+            .metadata()
+            .map_err(|_| invalid("G0 native output FD metadata"))?;
+        check(
+            admitted.same_inode(common::FileIdentity::from(&metadata))
+                && metadata.is_dir()
+                && metadata.uid() == nix::unistd::Uid::effective().as_raw(),
+            "G0 native output original inode/current owner differs",
+        )?;
+        let named = common::open_directory(path)?;
+        let named_metadata = common::directory_file(&named)?
+            .metadata()
+            .map_err(|_| invalid("G0 native output named metadata"))?;
+        check(
+            admitted.same_inode(common::FileIdentity::from(&named_metadata))
+                && named_metadata.uid() == metadata.uid()
+                && named_metadata.gid() == metadata.gid()
+                && named
+                    .entries()
+                    .map_err(|_| invalid("G0 native output entries"))?
+                    .next()
+                    .is_none(),
+            "G0 native output requires the retained original empty directory",
+        )?;
+        Ok(numerical::OriginalEmptyNativeOutputRoot {
+            schema: "rz-pals-original-empty-native-output-root/1".into(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        })
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "Original process clock and custody are shared, not reconstructed from JSON"
@@ -1706,6 +1757,15 @@ pub(super) mod linux {
         credit.until = until;
         credit.take(0)?;
         let held = running.held.as_mut().expect("G0 original native custody");
+        check(
+            capture.output_root == r.native_output_root && capture.output_root_admission.is_none(),
+            "G0 native output admission must come from the original parent FD",
+        )?;
+        let mut capture = capture;
+        capture.output_root_admission = Some(original_empty_native_output_root(
+            &r.native_output_root,
+            held,
+        )?);
         let raw = serde_json::to_vec(&capture).map_err(|e| invalid(e.to_string()))?;
         numerical::ensure_output_credit(
             &held.staging,
@@ -2038,6 +2098,223 @@ pub(super) mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_output_admission_omission_roundtrips_without_a_new_null_field() {
+        use super::super::numerical_process::NativeCaptureConfig;
+        let old_config = serde_json::json!({
+            "case_plan":"cases.json", "case_plan_sha256":"a".repeat(64),
+            "export_manifest":"export.json", "runtime_library":"runtime.so",
+            "runtime_cache":"cache", "output_root":"native", "provider":"cpu",
+            "cuda_bundle":null, "cuda_inventory":null, "cuda_inventory_sha256":null,
+            "cudnn_conv_search":null, "gpu_device_id":0, "gpu_arena_bytes":0,
+            "deadline_seconds":1, "cleanup_seconds":1
+        });
+        let decoded: NativeCaptureConfig = serde_json::from_value(old_config.clone()).unwrap();
+        assert!(decoded.output_root_admission.is_none());
+        let serialized = serde_json::to_value(decoded).unwrap();
+        assert!(serialized.get("output_root_admission").is_none());
+        assert_eq!(serialized, old_config);
+    }
+
+    #[cfg(target_os = "linux")]
+    struct OwnedOutputRootTestDirectory {
+        path: PathBuf,
+        parent: PathBuf,
+        device: u64,
+        inode: u64,
+        parent_device: u64,
+        parent_inode: u64,
+    }
+    #[cfg(target_os = "linux")]
+    impl OwnedOutputRootTestDirectory {
+        fn new() -> Self {
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let parent = std::env::temp_dir().canonicalize().unwrap();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = parent.join(format!(
+                "rz-g0-parent-output-root-test-{}-{}-{nonce}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            let identity = std::fs::symlink_metadata(&path).unwrap();
+            let parent_identity = std::fs::symlink_metadata(&parent).unwrap();
+            Self {
+                path,
+                parent,
+                device: identity.dev(),
+                inode: identity.ino(),
+                parent_device: parent_identity.dev(),
+                parent_inode: parent_identity.ino(),
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    impl Drop for OwnedOutputRootTestDirectory {
+        fn drop(&mut self) {
+            use std::os::unix::fs::MetadataExt;
+            let (Ok(identity), Ok(parent_identity)) = (
+                std::fs::symlink_metadata(&self.path),
+                std::fs::symlink_metadata(&self.parent),
+            ) else {
+                return;
+            };
+            if self.path.is_absolute()
+                && self.path.parent() == Some(self.parent.as_path())
+                && self
+                    .path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|name| name.starts_with("rz-g0-parent-output-root-test-"))
+                && identity.is_dir()
+                && !identity.file_type().is_symlink()
+                && (identity.dev(), identity.ino()) == (self.device, self.inode)
+                && parent_identity.is_dir()
+                && !parent_identity.file_type().is_symlink()
+                && (parent_identity.dev(), parent_identity.ino())
+                    == (self.parent_device, self.parent_inode)
+            {
+                // Only the create-new directory this fixture owns is removed.
+                // A replaced root or ancestor is preserved instead of followed.
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn original_output_fixture(
+        root: &Path,
+        native: &Path,
+    ) -> super::super::training_process::LinuxHeld {
+        super::super::training_process::prepare_original_root(
+            root,
+            root.join("not-yet-installed-source"),
+            &root.join("receipt.json"),
+            &[native],
+        )
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn original_output_admission_uses_only_the_retained_fd_and_refuses_an_unowned_or_nonempty_root()
+    {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = OwnedOutputRootTestDirectory::new();
+        let native = fixture.path.join("native");
+        std::fs::create_dir(&native).unwrap();
+        let held = original_output_fixture(&fixture.path, &native);
+        let proof = linux::original_empty_native_output_root(&native, &held).unwrap();
+        let (_, original, _) = held
+            .directories
+            .iter()
+            .find(|(path, _, _)| path == &native)
+            .unwrap();
+        let metadata = original.metadata().unwrap();
+        assert_eq!(
+            (proof.device, proof.inode, proof.uid, proof.gid),
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.uid(),
+                metadata.gid()
+            )
+        );
+        let unowned = fixture.path.join("not-retained");
+        std::fs::create_dir(&unowned).unwrap();
+        assert!(linux::original_empty_native_output_root(&unowned, &held).is_err());
+        let preserved = native.join("preserved.txt");
+        std::fs::write(&preserved, b"original evidence").unwrap();
+        assert!(linux::original_empty_native_output_root(&native, &held).is_err());
+        assert_eq!(std::fs::read(&preserved).unwrap(), b"original evidence");
+        assert_eq!(original.metadata().unwrap().ino(), proof.inode);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn original_output_caller_admission_is_rejected_before_any_native_dispatch() {
+        use super::super::{numerical_process::NativeCaptureConfig, training_process as common};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fixture = OwnedOutputRootTestDirectory::new();
+        let native = fixture.path.join("native");
+        std::fs::create_dir(&native).unwrap();
+        let held = original_output_fixture(&fixture.path, &native);
+        let proof = linux::original_empty_native_output_root(&native, &held).unwrap();
+        let capture = NativeCaptureConfig {
+            case_plan: fixture.path.join("must-not-be-read-plan.json"),
+            case_plan_sha256: "a".repeat(64),
+            export_manifest: fixture.path.join("must-not-be-read-export.json"),
+            runtime_library: fixture.path.join("must-not-be-loaded-runtime.so"),
+            runtime_cache: fixture.path.join("must-not-be-created-cache"),
+            output_root: native.clone(),
+            output_root_admission: Some(proof),
+            provider: "cpu".into(),
+            cuda_bundle: None,
+            cuda_inventory: None,
+            cuda_inventory_sha256: None,
+            cudnn_conv_search: Some("legacy_implicit_exhaustive".into()),
+            gpu_device_id: 0,
+            gpu_arena_bytes: 0,
+            deadline_seconds: 1,
+            cleanup_seconds: 1,
+        };
+        let account = common::ReadAccounting::new();
+        let mut running = linux::Running {
+            registration_pin: None,
+            registration: None,
+            held: Some(held),
+            processes: Vec::new(),
+            receipts: Vec::new(),
+            preservation: Vec::new(),
+            account: Arc::clone(&account),
+        };
+        let mut registration = metadata_launch();
+        registration.native_output_root = native.clone();
+        registration.staging_root = fixture.path.clone();
+        let scope = linux::OriginalG0Scope::from(&registration);
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let until = started + Duration::from_secs(5);
+        let mut credit = common::ReadCredit {
+            remaining: 4096,
+            maximum: 4096,
+            until,
+            cancel: &cancel,
+            account: Arc::clone(&account),
+        };
+        let error = linux::execute_native(
+            &scope,
+            capture,
+            &serde_json::json!({"groups":[]}),
+            started,
+            until,
+            until + Duration::from_secs(1),
+            &cancel,
+            &mut running,
+            &mut credit,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("G0 native output admission must come from the original parent FD")
+        );
+        assert!(running.processes.is_empty() && running.receipts.is_empty());
+        assert!(running.held.as_ref().unwrap().checkpoints.is_empty());
+        assert_eq!(credit.remaining, 4096);
+        assert_eq!(account.charged.load(Ordering::Acquire), 0);
+        assert!(std::fs::read_dir(&native).unwrap().next().is_none());
+        assert!(!fixture.path.join("must-not-be-created-cache").exists());
+    }
     #[test]
     fn original_g0_launch_rejects_unknown_authority_fields() {
         let raw = br#"{"schema":"rz-pals-g0-numerical-launch/1","training_authorized":true}"#;

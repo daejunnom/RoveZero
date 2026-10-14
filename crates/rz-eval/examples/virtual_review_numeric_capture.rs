@@ -174,6 +174,118 @@ struct Plan {
     bindings: Bindings,
     groups: Vec<Group>,
 }
+#[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "Original directory FD handoff is refused outside Linux"
+    )
+)]
+#[serde(deny_unknown_fields)]
+struct OriginalEmptyNativeOutputRoot {
+    schema: String,
+    device: u64,
+    inode: u64,
+    uid: u32,
+    gid: u32,
+}
+
+struct CaptureOutputRoot {
+    path: PathBuf,
+    admission: Option<OriginalEmptyNativeOutputRoot>,
+    #[cfg(target_os = "linux")]
+    original: Option<fs::File>,
+}
+impl CaptureOutputRoot {
+    fn verify(&self) -> Result<()> {
+        let Some(admission) = &self.admission else {
+            return Ok(());
+        };
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let original = self
+                .original
+                .as_ref()
+                .ok_or("original output directory FD absent")?;
+            let held = original.metadata()?;
+            let named = fs::symlink_metadata(&self.path)?;
+            if admission.schema != "rz-pals-original-empty-native-output-root/1"
+                || admission.inode == 0
+                || !held.is_dir()
+                || !named.is_dir()
+                || named.file_type().is_symlink()
+                || (held.dev(), held.ino(), held.uid(), held.gid())
+                    != (
+                        admission.device,
+                        admission.inode,
+                        admission.uid,
+                        admission.gid,
+                    )
+                || (named.dev(), named.ino(), named.uid(), named.gid())
+                    != (
+                        admission.device,
+                        admission.inode,
+                        admission.uid,
+                        admission.gid,
+                    )
+                || outside_git(&self.path)? != self.path
+            {
+                return Err(
+                    "original admitted output directory inode/owner/ancestry changed".into(),
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = admission;
+            Err("original existing output directory admission requires Linux".into())
+        }
+    }
+}
+fn capture_output_root(
+    path: &Path,
+    admission: Option<&OriginalEmptyNativeOutputRoot>,
+) -> Result<CaptureOutputRoot> {
+    let parent = outside_git(path.parent().ok_or("output parent absent")?)?;
+    let root = parent.join(path.file_name().ok_or("output root absent")?);
+    if admission.is_none() {
+        // Preserve the independent CLI's original create-new behavior.
+        fs::create_dir(&root)?;
+        return Ok(CaptureOutputRoot {
+            path: root,
+            admission: None,
+            #[cfg(target_os = "linux")]
+            original: None,
+        });
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Ancestry and leaf-link refusal precede opening; the held and named
+        // inode are checked again after opening and after worker join.
+        if outside_git(&root)? != root {
+            return Err("original output directory must use its canonical path".into());
+        }
+        let owner = CaptureOutputRoot {
+            original: Some(fs::File::open(&root)?),
+            path: root,
+            admission: admission.cloned(),
+        };
+        owner.verify()?;
+        if fs::read_dir(&owner.path)?.next().transpose()?.is_some() {
+            return Err("original admitted output directory must be empty".into());
+        }
+        owner.verify()?;
+        Ok(owner)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("original existing output directory admission requires Linux".into())
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -183,6 +295,8 @@ struct Config {
     runtime_library: PathBuf,
     runtime_cache: PathBuf,
     output_root: PathBuf,
+    #[serde(default)]
+    output_root_admission: Option<OriginalEmptyNativeOutputRoot>,
     provider: String,
     /// Omission retains the original CUDA EP option without calling a setter.
     /// This is execution-policy provenance, outside the unchanged raw V5 ABI.
@@ -819,9 +933,9 @@ fn execute(config: Config) -> Result<()> {
         return Err("actual loaded ORT pin differs".into());
     }
     selected.validate_execution_selection(runtime.native_loading_profile(), control.is_some())?;
-    let parent = outside_git(config.output_root.parent().ok_or("output parent absent")?)?;
-    let root = parent.join(config.output_root.file_name().ok_or("output root absent")?);
-    fs::create_dir(&root)?;
+    let output_owner =
+        capture_output_root(&config.output_root, config.output_root_admission.as_ref())?;
+    let root = &output_owner.path;
     if Instant::now() >= until {
         return Err("capture window expired before model/session load".into());
     }
@@ -972,6 +1086,7 @@ fn execute(config: Config) -> Result<()> {
             return Err(format!("physical cleanup failed: {join}; pending files retained").into())
         }
     };
+    output_owner.verify()?;
     // This separate, small policy observation is never part of the unchanged
     // numerical V5 payload. Publish only after all captured physical results,
     // the placement/runtime audits, and normal worker join have succeeded.
@@ -997,6 +1112,7 @@ fn execute(config: Config) -> Result<()> {
         }
         publish_pending(&pending, &final_path)?;
     }
+    output_owner.verify()?;
     println!("RZ_NUMERIC_CAPTURE_STATUS={{\"status\":\"captured\",\"numerical_acceptance\":false,\"rules_legality_certified\":false,\"native_worker_joined\":true}}");
     Ok(())
 }
@@ -1025,6 +1141,218 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    struct OwnedOutputRootTestDirectory {
+        path: PathBuf,
+        parent: PathBuf,
+        device: u64,
+        inode: u64,
+        parent_device: u64,
+        parent_inode: u64,
+    }
+    #[cfg(target_os = "linux")]
+    impl OwnedOutputRootTestDirectory {
+        fn new() -> Self {
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let parent = std::env::temp_dir().canonicalize().unwrap();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = parent.join(format!(
+                "rz-g0-native-output-root-test-{}-{}-{nonce}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            let identity = std::fs::symlink_metadata(&path).unwrap();
+            let parent_identity = std::fs::symlink_metadata(&parent).unwrap();
+            Self {
+                path,
+                parent,
+                device: identity.dev(),
+                inode: identity.ino(),
+                parent_device: parent_identity.dev(),
+                parent_inode: parent_identity.ino(),
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    impl Drop for OwnedOutputRootTestDirectory {
+        fn drop(&mut self) {
+            use std::os::unix::fs::MetadataExt;
+            let (Ok(identity), Ok(parent_identity)) = (
+                std::fs::symlink_metadata(&self.path),
+                std::fs::symlink_metadata(&self.parent),
+            ) else {
+                return;
+            };
+            if self.path.is_absolute()
+                && self.path.parent() == Some(self.parent.as_path())
+                && self
+                    .path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|name| name.starts_with("rz-g0-native-output-root-test-"))
+                && identity.is_dir()
+                && !identity.file_type().is_symlink()
+                && (identity.dev(), identity.ino()) == (self.device, self.inode)
+                && parent_identity.is_dir()
+                && !parent_identity.file_type().is_symlink()
+                && (parent_identity.dev(), parent_identity.ino())
+                    == (self.parent_device, self.parent_inode)
+            {
+                // Only the create-new directory this fixture owns is removed.
+                // A replaced root or ancestor is preserved instead of followed.
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn output_admission(path: &Path) -> OriginalEmptyNativeOutputRoot {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path).unwrap();
+        OriginalEmptyNativeOutputRoot {
+            schema: "rz-pals-original-empty-native-output-root/1".into(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn output_root_none_creates_new_but_still_refuses_an_existing_empty_directory() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = OwnedOutputRootTestDirectory::new();
+        let path = fixture.path.join("native");
+        let owner = capture_output_root(&path, None).unwrap();
+        assert_eq!(owner.path, path);
+        assert!(owner.admission.is_none());
+        let inode = fs::metadata(&path).unwrap().ino();
+        owner.verify().unwrap();
+        drop(owner);
+        let error = capture_output_root(&path, None)
+            .err()
+            .expect("existing root must remain refused");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert!(fs::read_dir(&path).unwrap().next().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn output_root_original_empty_admission_retains_the_same_inode_through_publication() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = OwnedOutputRootTestDirectory::new();
+        let path = fixture.path.join("native");
+        fs::create_dir(&path).unwrap();
+        let proof = output_admission(&path);
+        let owner = capture_output_root(&path, Some(&proof)).unwrap();
+        assert_eq!(
+            owner.original.as_ref().unwrap().metadata().unwrap().ino(),
+            proof.inode
+        );
+        assert_eq!(fs::metadata(&path).unwrap().ino(), proof.inode);
+        // Once admitted, the capture may publish its own output; final verify
+        // checks original identity, not an incorrectly repeated emptiness test.
+        fs::write(path.join("owned-output.json"), b"owned capture output").unwrap();
+        owner.verify().unwrap();
+        assert_eq!(
+            fs::read(path.join("owned-output.json")).unwrap(),
+            b"owned capture output"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn output_root_original_admission_refuses_nonempty_stale_schema_and_owner_without_removal() {
+        let fixture = OwnedOutputRootTestDirectory::new();
+        let path = fixture.path.join("native");
+        fs::create_dir(&path).unwrap();
+        let proof = output_admission(&path);
+        let preserved = path.join("preserved.txt");
+        fs::write(&preserved, b"do not delete").unwrap();
+        assert!(capture_output_root(&path, Some(&proof)).is_err());
+        assert_eq!(fs::read(&preserved).unwrap(), b"do not delete");
+        // Remove only this fixture's explicit marker to test each independent
+        // admission failure against the same still-existing empty directory.
+        fs::remove_file(&preserved).unwrap();
+        let mut bad_schema = proof.clone();
+        bad_schema.schema.push_str("-unknown");
+        let mut stale_inode = proof.clone();
+        stale_inode.inode = stale_inode.inode.wrapping_add(1);
+        let mut wrong_uid = proof.clone();
+        wrong_uid.uid = wrong_uid.uid.wrapping_add(1);
+        let mut wrong_gid = proof.clone();
+        wrong_gid.gid = wrong_gid.gid.wrapping_add(1);
+        for invalid in [bad_schema, stale_inode, wrong_uid, wrong_gid] {
+            assert!(capture_output_root(&path, Some(&invalid)).is_err());
+            assert!(path.is_dir());
+            assert!(fs::read_dir(&path).unwrap().next().is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn output_root_original_admission_refuses_symlink_leaf_and_ancestor() {
+        use std::os::unix::fs::symlink;
+        let fixture = OwnedOutputRootTestDirectory::new();
+        let parent = fixture.path.join("actual");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("native");
+        fs::create_dir(&path).unwrap();
+        let proof = output_admission(&path);
+        let linked_leaf = fixture.path.join("linked-native");
+        symlink(&path, &linked_leaf).unwrap();
+        assert!(capture_output_root(&linked_leaf, Some(&proof)).is_err());
+        let linked_parent = fixture.path.join("linked-parent");
+        symlink(&parent, &linked_parent).unwrap();
+        assert!(capture_output_root(&linked_parent.join("native"), Some(&proof)).is_err());
+        assert!(fs::read_dir(&path).unwrap().next().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn output_root_replacement_after_admission_is_refused_and_original_files_survive() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = OwnedOutputRootTestDirectory::new();
+        let path = fixture.path.join("native");
+        let moved = fixture.path.join("original-native");
+        fs::create_dir(&path).unwrap();
+        let proof = output_admission(&path);
+        let owner = capture_output_root(&path, Some(&proof)).unwrap();
+        fs::write(path.join("preserved.txt"), b"original evidence").unwrap();
+        fs::rename(&path, &moved).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("replacement.txt"), b"replacement must survive").unwrap();
+        assert!(owner.verify().is_err());
+        assert_eq!(
+            owner.original.as_ref().unwrap().metadata().unwrap().ino(),
+            proof.inode
+        );
+        assert_eq!(fs::metadata(&moved).unwrap().ino(), proof.inode);
+        assert_ne!(fs::metadata(&path).unwrap().ino(), proof.inode);
+        assert_eq!(
+            fs::read(moved.join("preserved.txt")).unwrap(),
+            b"original evidence"
+        );
+        assert_eq!(
+            fs::read(path.join("replacement.txt")).unwrap(),
+            b"replacement must survive"
+        );
+    }
+
     fn selection_config(provider: &str) -> Config {
         Config {
             case_plan: PathBuf::new(),
@@ -1033,6 +1361,7 @@ mod tests {
             runtime_library: PathBuf::new(),
             runtime_cache: PathBuf::new(),
             output_root: PathBuf::new(),
+            output_root_admission: None,
             provider: provider.to_owned(),
             cudnn_conv_search: None,
             cuda_bundle: Some(PathBuf::new()),
@@ -1071,6 +1400,7 @@ mod tests {
         )
         .unwrap();
         assert!(config.cudnn_conv_search.is_none());
+        assert!(config.output_root_admission.is_none());
         assert_eq!(
             config.execution_config().unwrap().cudnn_conv_search,
             PalsCuDnnConvSearch::LegacyImplicitExhaustive,

@@ -1317,6 +1317,7 @@ mod linux {
             runtime_library: n.runtime_library.path.clone(),
             runtime_cache: n.runtime_cache.clone(),
             output_root: r.native_output_root.clone(),
+            output_root_admission: None,
             provider: if cuda { "cuda-control" } else { "cpu" }.into(),
             cuda_bundle: n.cuda_bundle.as_ref().map(|p| p.path.clone()),
             cuda_inventory: inventory.map(|a| cwd.join(&a.snapshot_path)),

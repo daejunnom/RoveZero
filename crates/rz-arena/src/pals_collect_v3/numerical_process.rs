@@ -73,6 +73,16 @@ pub struct GenerationNumericalLaunchRegistrationV3 {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct OriginalEmptyNativeOutputRoot {
+    pub(super) schema: String,
+    pub(super) device: u64,
+    pub(super) inode: u64,
+    pub(super) uid: u32,
+    pub(super) gid: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct NativeCaptureConfig {
     pub(super) case_plan: PathBuf,
     pub(super) case_plan_sha256: String,
@@ -80,6 +90,9 @@ pub(super) struct NativeCaptureConfig {
     pub(super) runtime_library: PathBuf,
     pub(super) runtime_cache: PathBuf,
     pub(super) output_root: PathBuf,
+    /// Original G0 parent descriptor readback, never a caller-issued capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) output_root_admission: Option<OriginalEmptyNativeOutputRoot>,
     pub(super) provider: String,
     pub(super) cuda_bundle: Option<PathBuf>,
     pub(super) cuda_inventory: Option<PathBuf>,
@@ -1420,7 +1433,8 @@ pub(super) fn validate_capture_inputs(
             && super::training_process::absolute_safe(&capture.runtime_cache)
             && capture.provider == if cuda { "cuda-control" } else { "cpu" }
             && !config.native_options.approximate_warm
-            && !config.native_options.device_public_memory,
+            && !config.native_options.device_public_memory
+            && capture.output_root_admission.is_none(),
         "native numerical original runtime/provider/Fresh capability",
     )?;
     if cuda {
