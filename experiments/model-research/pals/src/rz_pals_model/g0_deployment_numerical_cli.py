@@ -315,10 +315,14 @@ def validate_vfree_manifest_roles(manifest):
 
 def _export_outputs(registration, *, until_ns, clock):
     root = Path(registration["export_directory"])
-    return {"export_manifest": _pin(root / "export.json", 256 * 1024, until_ns=until_ns, clock=clock),
-            "export_graphs": [dict(_pin(root / filename, MAX_GRAPH_BYTES, until_ns=until_ns, clock=clock), role=role, file=filename)
+    def artifact(path, maximum):
+        observed = _pin(path, maximum, until_ns=until_ns, clock=clock)
+        # Device/inode describe the readback, not the strict reusable file pin.
+        return {name: observed[name] for name in ("path", "sha256", "bytes")}
+    return {"export_manifest": artifact(root / "export.json", 256 * 1024),
+            "export_graphs": [dict(artifact(root / filename, MAX_GRAPH_BYTES), role=role, file=filename)
                               for role, filename in GRAPH_FILES.items()],
-            "cuda_control_inventory": _pin(root / "cuda-control-inventory.json", 4 * 1024 ** 2, until_ns=until_ns, clock=clock)}
+            "cuda_control_inventory": artifact(root / "cuda-control-inventory.json", 4 * 1024 ** 2)}
 
 
 def _export(registration, *, until_ns, clock, check_original, execution_observation):

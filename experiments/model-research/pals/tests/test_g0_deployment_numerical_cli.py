@@ -247,6 +247,39 @@ class DeploymentPureTests(unittest.TestCase):
         self.assertIs(observed["actual_export_executed"], True)
         self.assertNotIn("native_numeric_authority_issued", result)
 
+    def test_actual_export_readbacks_are_strict_artifacts_for_inventory_and_reference(self):
+        row = registration(self.cli, self.root)
+        output = Path(row["export_directory"]); output.mkdir(parents=True)
+        control = {"manifest_sha256": "6" * 64, "scope": "read_only_serialized_graph_metadata_no_runtime"}
+        for file in ("export.json", "cuda-control-inventory.json", *self.cli.GRAPH_FILES.values()):
+            # Tiny byte fixtures only; these do not construct or validate ONNX.
+            (output / file).write_bytes(json.dumps(control if file == "cuda-control-inventory.json" else {}).encode())
+        options = {"until_ns": 60 * 10 ** 9, "clock": lambda: 0}
+        observed = self.cli._pin(output / "cuda-control-inventory.json", 4 * 1024 ** 2, **options)
+        self.assertEqual(set(observed), {"path", "sha256", "bytes", "device", "inode"})
+        outputs = self.cli._export_outputs(row, **options)
+        for name in ("export_manifest", "cuda_control_inventory"):
+            self.assertEqual(set(outputs[name]), {"path", "sha256", "bytes"})
+        for graph in outputs["export_graphs"]:
+            self.assertEqual(set(graph), {"path", "sha256", "bytes", "role", "file"})
+        self.assertEqual(self.cli._json_pin(outputs["cuda_control_inventory"], 4 * 1024 ** 2, **options), control)
+        reference = registration(self.cli, self.root, "reference")
+        reference["inputs"].update(outputs)
+        self.assertEqual(self.cli.validate_registration(reference), reference)
+
+    def test_projected_output_pin_keeps_strict_fields_and_byte_hash_checks(self):
+        row = registration(self.cli, self.root)
+        output = Path(row["export_directory"]); output.mkdir(parents=True)
+        for file in ("export.json", "cuda-control-inventory.json", *self.cli.GRAPH_FILES.values()):
+            (output / file).write_bytes(b"{}")
+        options = {"until_ns": 60 * 10 ** 9, "clock": lambda: 0}
+        pin = self.cli._export_outputs(row, **options)["cuda_control_inventory"]
+        with self.assertRaisesRegex(ValueError, "training artifact pin fields mismatch"):
+            self.cli._json_pin(dict(pin, inode=123), 4 * 1024 ** 2, **options)
+        (output / "cuda-control-inventory.json").write_bytes(b"[]")
+        with self.assertRaisesRegex(ValueError, "training artifact bytes/identity changed"):
+            self.cli._json_pin(pin, 4 * 1024 ** 2, **options)
+
     def test_reference_uses_borrowed_pc_view_and_preserves_unknown_failed_work(self):
         from rz_pals_model import numeric_capture
         row = registration(self.cli, self.root, "reference")
