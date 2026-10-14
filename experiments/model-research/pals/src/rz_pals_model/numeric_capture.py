@@ -234,7 +234,7 @@ def make_g0_bootstrap_case_spec(immutable_bindings):
 
 
 def _make_case_groups(roles):
-    """Model-independent math cases; do not invent generated asset identities."""
+    """Math cases with native plain-name IDs; retain dotted historical parsing."""
     groups = []
     for role in roles:
         for bucket in BUCKETS:
@@ -250,16 +250,16 @@ def _make_case_groups(roles):
                         "query": {"purpose": "task_policy" if role == "validator" else "reply_policy", "perspective": 1 if white else -1,
                                   "prefix": [], "proposal": line, "counter": [], "counter_present": False, "anchors": [0, anchors - 1, 0]},
                         "candidates": [[48, 56, p] for p in (1, 2, 3, 4)], "divergences": [[0.] * 8] if role == "critic" else [], "token_budget": 512}
-                    cases.append({"id": f"{role}.L{bucket}.A{anchors}.W{white}", "input": {"model_input_kind": "virtual_review", "input": rust_input(payload)}})
+                    cases.append({"id": f"{role}_L{bucket}_A{anchors}_W{white}", "input": {"model_input_kind": "virtual_review", "input": rust_input(payload)}})
             if bucket == 8:
                 for name in ("empty", "order_reversed"):
-                    extra = copy.deepcopy(cases[0]); extra["id"] = role + "." + name
+                    extra = copy.deepcopy(cases[0]); extra["id"] = role + "_" + name
                     if name == "empty":
                         extra["input"]["input"]["records"] = []
                     else:
                         extra["input"]["input"]["candidates"].reverse()
                     cases.append(extra)
-            groups.append({"id": f"{role}.L{bucket}", "role": role, "line_bucket": bucket, "cases": cases})
+            groups.append({"id": f"{role}_L{bucket}", "role": role, "line_bucket": bucket, "cases": cases})
     return groups
 
 

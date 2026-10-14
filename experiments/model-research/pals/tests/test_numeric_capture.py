@@ -94,7 +94,7 @@ class NumericCaptureTests(unittest.TestCase):
             self.assertEqual(plan["invocation"],"fresh"); self.assertEqual(plan["batch"],1)
             ids = []
             for group in plan["groups"]:
-                canonical = [case for case in group["cases"] if ".L" in case["id"]]
+                canonical = [case for case in group["cases"] if "_L" in case["id"]]
                 self.assertEqual(len(canonical),8)
                 coverage = {(len(case["input"]["input"]["anchors"]), case["input"]["input"]["anchors"][0]["metadata"][0]) for case in canonical}
                 self.assertEqual(coverage,{(anchor,float(white)) for anchor in range(1,5) for white in (0,1)})
@@ -104,8 +104,8 @@ class NumericCaptureTests(unittest.TestCase):
                     self.assertEqual(len(payload["query"]["proposal"]),group["line_bucket"])
                     self.assertEqual([move["promotion"] for move in payload["candidates"]],[1,2,3,4])
                 if group["line_bucket"] == 8:
-                    empty = next(case for case in group["cases"] if case["id"].endswith(".empty"))
-                    reversed_case = next(case for case in group["cases"] if case["id"].endswith(".order_reversed"))
+                    empty = next(case for case in group["cases"] if case["id"].endswith("_empty"))
+                    reversed_case = next(case for case in group["cases"] if case["id"].endswith("_order_reversed"))
                     self.assertEqual(empty["input"]["input"]["records"],[])
                     self.assertEqual(reversed_case["input"]["input"]["candidates"],list(reversed(canonical[0]["input"]["input"]["candidates"])))
                 ids.extend(case["id"] for case in group["cases"])
@@ -130,15 +130,15 @@ class NumericCaptureTests(unittest.TestCase):
             result["immutable_bindings"]["source_components"]["model_native"] = "aa"*32
             self.assertNotEqual(result["immutable_bindings"],original)
 
-    def test_g0_groups_preserve_legacy_collection_case_content_and_order(self):
+    def test_g0_groups_preserve_collection_case_content_and_order(self):
         spec = capture.make_g0_bootstrap_case_spec(g0_immutable_bindings())
         legacy = capture.make_case_plan(bindings(collection=True))
         canonical = lambda value: json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=False,allow_nan=False).encode("utf-8")
         self.assertEqual(canonical(spec["groups"]),canonical(legacy["groups"]))
         self.assertEqual([group["id"] for group in spec["groups"]],
-                         [f"{role}.L{bucket}" for role in ("proposer","critic","validator") for bucket in (8,16,32,64,128,256)])
+                         [f"{role}_L{bucket}" for role in ("proposer","critic","validator") for bucket in (8,16,32,64,128,256)])
         self.assertEqual(sum(len(group["cases"]) for group in spec["groups"]),150)
-        self.assertEqual(sum(".L" in case["id"] for group in spec["groups"] for case in group["cases"]),144)
+        self.assertEqual(sum("_L" in case["id"] for group in spec["groups"] for case in group["cases"]),144)
         self.assertEqual(list(legacy),["schema_version","domain","bindings","invocation","batch","groups"])
         self.assertEqual(legacy["domain"],"rz-pals-numerical-case-plan-v5/1")
         self.assertEqual(capture.validate_case_plan(legacy),150)
@@ -147,11 +147,35 @@ class NumericCaptureTests(unittest.TestCase):
             self.assertEqual(list(group),["id","role","line_bucket","cases"])
             if group["line_bucket"] == 8:
                 self.assertEqual([case["id"] for case in group["cases"][-2:]],
-                                 [group["role"]+".empty",group["role"]+".order_reversed"])
+                                 [group["role"]+"_empty",group["role"]+"_order_reversed"])
             for case in group["cases"]:
                 capture.python_input(case["input"]["input"])
         spec["groups"][0]["cases"][0]["input"]["input"]["candidates"].reverse()
         self.assertNotEqual(spec["groups"],capture.make_g0_bootstrap_case_spec(g0_immutable_bindings())["groups"])
+
+    def test_produced_ids_fit_native_plain_names_without_rewriting_historical_plans(self):
+        # This is an output-contract regression, not a Rust-source text check.
+        # Root's separate native consumer check must still admit the real JSON.
+        native_plain_name = r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}"
+        for collection in (False, True):
+            plan = capture.make_case_plan(bindings(collection))
+            for group in plan["groups"]:
+                for identity in [group["id"], *(case["id"] for case in group["cases"])]:
+                    self.assertIsNotNone(re.fullmatch(native_plain_name, identity), identity)
+        spec = capture.make_g0_bootstrap_case_spec(g0_immutable_bindings())
+        for group in spec["groups"]:
+            for identity in [group["id"], *(case["id"] for case in group["cases"])]:
+                self.assertIsNotNone(re.fullmatch(native_plain_name, identity), identity)
+
+        historical = capture.make_case_plan(bindings(collection=True))
+        for group in historical["groups"]:
+            group["id"] = group["id"].replace("_L", ".L")
+            for case in group["cases"]:
+                case["id"] = (case["id"].replace("_L", ".L").replace("_A", ".A").replace("_W", ".W")
+                              .replace("_empty", ".empty").replace("_order_reversed", ".order_reversed"))
+        before = copy.deepcopy(historical)
+        self.assertEqual(capture.validate_case_plan(historical), 150)
+        self.assertEqual(historical, before)
 
     def test_g0_bootstrap_rejects_generated_fields_and_incomplete_immutable_identity(self):
         for field in ("model_epoch","weights_sha256","export_manifest_sha256","graphs"):
