@@ -463,6 +463,16 @@ impl VerifiedG0BootstrapNumericalV5 {
     pub fn processes(&self) -> &[OriginalProcessOutput] {
         &self.processes
     }
+    /// Internal original-directory join for the metadata-only Deployment seal.
+    /// This exposes neither a public constructor nor a serialized capability.
+    #[cfg(target_os = "linux")]
+    pub(super) fn held_directory_file(&self, path: &Path) -> Option<&File> {
+        self.held
+            .directories
+            .iter()
+            .find(|(named, _, _)| named == path)
+            .map(|(_, file, _)| file)
+    }
     pub fn held_files(&self) -> impl Iterator<Item = (&Pin, &File)> {
         #[cfg(target_os = "linux")]
         {
