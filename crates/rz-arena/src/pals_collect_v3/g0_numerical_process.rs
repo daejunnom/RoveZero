@@ -305,6 +305,103 @@ pub(super) mod linux {
     const RESULT: &str = "rz-pals-g0-numerical-cli-window/1";
     const PACKAGE: &str = "experiments/model-research/pals/src";
     const MODULE: &str = "rz_pals_model.g0_numerical_cli";
+    /// A closed execution profile, never selected by decoded child output.
+    /// Collection retains its original initializer and three-role domain.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum G0ChildProfile {
+        Collection,
+        Deployment,
+    }
+    impl G0ChildProfile {
+        fn registration(self) -> &'static str {
+            match self {
+                Self::Collection => REGISTRATION,
+                Self::Deployment => "rz-pals-g0-deployment-registration/1",
+            }
+        }
+        fn startup(self) -> &'static str {
+            match self {
+                Self::Collection => STARTUP,
+                Self::Deployment => "rz-pals-g0-deployment-original-startup/1",
+            }
+        }
+        fn result(self) -> &'static str {
+            match self {
+                Self::Collection => RESULT,
+                Self::Deployment => "rz-pals-g0-deployment-original-result/1",
+            }
+        }
+        fn module(self) -> &'static str {
+            match self {
+                Self::Collection => MODULE,
+                Self::Deployment => "rz_pals_model.g0_deployment_numerical_cli",
+            }
+        }
+        fn module_file(self) -> &'static str {
+            match self {
+                Self::Collection => "rz_pals_model/g0_numerical_cli.py",
+                Self::Deployment => "rz_pals_model/g0_deployment_numerical_cli.py",
+            }
+        }
+        fn producer_phase(self) -> &'static str {
+            match self {
+                Self::Collection => "prepare",
+                Self::Deployment => "export",
+            }
+        }
+        fn status(self, phase: &str) -> Result<&'static str, ArenaError> {
+            match (self, phase) {
+                (Self::Collection, "prepare") => Ok("prepared"),
+                (Self::Deployment, "export") => Ok("exported"),
+                (_, "reference") => Ok("captured"),
+                _ => Err(invalid("G0 closed child profile/phase")),
+            }
+        }
+        fn validate_inputs(self, phase: &str, inputs: &Value) -> Result<(), ArenaError> {
+            self.status(phase)?;
+            if self == Self::Collection {
+                return Ok(());
+            }
+            let expected: &[&str] = if phase == "export" {
+                &[
+                    "checkpoint",
+                    "checkpoint_metadata",
+                    "initialization_evidence",
+                    "rules_profile",
+                ]
+            } else {
+                &[
+                    "case_plan",
+                    "checkpoint",
+                    "checkpoint_metadata",
+                    "initialization_evidence",
+                    "export_manifest",
+                    "export_graphs",
+                    "cuda_control_inventory",
+                ]
+            };
+            let inputs = inputs
+                .as_object()
+                .ok_or_else(|| invalid("G0 Deployment inputs"))?;
+            check(
+                inputs.len() == expected.len()
+                    && expected.iter().all(|key| inputs.contains_key(*key)),
+                "G0 Deployment exact original input roster",
+            )?;
+            if phase == "reference" {
+                let graphs = inputs["export_graphs"]
+                    .as_array()
+                    .ok_or_else(|| invalid("G0 Deployment graph inputs"))?;
+                check(
+                    graphs.len() == 2
+                        && graphs[0]["role"] == "public"
+                        && graphs[1]["role"] == "shared_pc",
+                    "G0 Deployment P/C graph roster",
+                )?;
+            }
+            Ok(())
+        }
+    }
     const BOOTSTRAP: &str = "import sys,runpy; package=sys.argv.pop(1); module=sys.argv.pop(1); sys.path.insert(0,package); sys.argv[0]=module; runpy.run_module(module,run_name='__main__',alter_sys=True)";
     const COMPONENTS: [&str; 5] = [
         "model_native",
@@ -828,27 +925,96 @@ pub(super) mod linux {
         running: &mut Running,
         credit: &mut ReadCredit<'_>,
     ) -> Result<Value, ArenaError> {
-        check(
-            matches!(phase, "prepare" | "reference"),
-            "G0 closed child phase",
-        )?;
+        child_for_profile(
+            G0ChildProfile::Collection,
+            r,
+            phase,
+            inputs,
+            sources,
+            initialization_sources,
+            dependencies,
+            started,
+            until,
+            cleanup_until,
+            cancel,
+            running,
+            credit,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Same original process/FD custody as Collection"
+    )]
+    pub(in crate::pals_collect_v3) fn deployment_child(
+        r: &OriginalG0Scope,
+        phase: &str,
+        inputs: Value,
+        sources: &BTreeMap<String, String>,
+        initialization_sources: &Value,
+        dependencies: &Value,
+        started: Instant,
+        until: Instant,
+        cleanup_until: Instant,
+        cancel: &AtomicBool,
+        running: &mut Running,
+        credit: &mut ReadCredit<'_>,
+    ) -> Result<Value, ArenaError> {
+        child_for_profile(
+            G0ChildProfile::Deployment,
+            r,
+            phase,
+            inputs,
+            sources,
+            initialization_sources,
+            dependencies,
+            started,
+            until,
+            cleanup_until,
+            cancel,
+            running,
+            credit,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "A closed profile shares original custody without a new clock or credit"
+    )]
+    fn child_for_profile(
+        profile: G0ChildProfile,
+        r: &OriginalG0Scope,
+        phase: &str,
+        inputs: Value,
+        sources: &BTreeMap<String, String>,
+        initialization_sources: &Value,
+        dependencies: &Value,
+        started: Instant,
+        until: Instant,
+        cleanup_until: Instant,
+        cancel: &AtomicBool,
+        running: &mut Running,
+        credit: &mut ReadCredit<'_>,
+    ) -> Result<Value, ArenaError> {
+        profile.validate_inputs(phase, &inputs)?;
         credit.until = until;
         credit.take(0)?;
-        let receipt_path = if phase == "prepare" {
+        let receipt_path = if phase == profile.producer_phase() {
             &r.prepare_receipt_path
         } else {
             &r.reference_receipt_path
         };
-        let registration = serde_json::json!({"schema":REGISTRATION,"numerical_id":r.numerical_id,"phase":phase,
+        let registration = serde_json::json!({"schema":profile.registration(),"numerical_id":r.numerical_id,"phase":phase,
             "source_components":sources,"source_commit":r.source_commit,"initialization_sources":initialization_sources,
             "staging_root":r.staging_root,"initialization_directory":r.initialization_directory,"export_directory":r.export_directory,
             "reference_output_root":r.reference_output_root,"receipt_path":receipt_path,
             "max_wall_ns":r.max_wall_ns,"max_output_bytes":r.max_output_bytes,"inputs":inputs});
-        let sha = rz_experiments::pals_data_v3::generation_digest(REGISTRATION, &registration)
-            .map_err(|e| invalid(e.to_string()))?;
+        let sha =
+            rz_experiments::pals_data_v3::generation_digest(profile.registration(), &registration)
+                .map_err(|e| invalid(e.to_string()))?;
         let (start_ns, execution_ns, whole_ns) =
             common::original_window_ticks(started, until, cleanup_until)?;
-        let startup = serde_json::json!({"schema":STARTUP,"execution_id":r.numerical_id,"phase":phase,
+        let startup = serde_json::json!({"schema":profile.startup(),"execution_id":r.numerical_id,"phase":phase,
             "registration_sha256":sha,"registration":registration,"original_started_ns":start_ns,"execution_until_ns":execution_ns,
             "whole_until_ns":whole_ns,"dependency_directories":dependencies,"python_runtime":r.python_runtime,"runtime_module_pins":r.runtime_module_pins});
         let stdin = serde_json::to_vec(&startup).map_err(|e| invalid(e.to_string()))?;
@@ -860,7 +1026,7 @@ pub(super) mod linux {
         // Freeze only registered output names from the already held original
         // plan before dispatch. A post-child plan pathname/read failure must
         // never prevent custody of the child's receipt or partial outputs.
-        let output_targets = freeze_child_output_targets(r, phase, &inputs, held, credit)?;
+        let output_targets = freeze_child_output_targets(profile, r, phase, &inputs, held, credit)?;
         numerical::ensure_output_credit(
             &held.staging,
             r.max_output_bytes,
@@ -882,7 +1048,7 @@ pub(super) mod linux {
             OsString::from("-c"),
             OsString::from(BOOTSTRAP),
             held.source_root.join(PACKAGE).into_os_string(),
-            OsString::from(MODULE),
+            OsString::from(profile.module()),
             OsString::from("--execute"),
             OsString::from("--original-g0-child"),
             OsString::from("--startup-sha256"),
@@ -932,8 +1098,9 @@ pub(super) mod linux {
         let result = (|| -> Result<Value, ArenaError> {
             let credit = &mut cleanup_credit;
             let original = running.processes.last().expect("actual original G0 child");
-            let checkpoint_temporary =
-                (phase == "prepare").then(|| r.initialization_directory.join("untrained.pt"));
+            let checkpoint_temporary = (profile == G0ChildProfile::Collection
+                && phase == "prepare")
+                .then(|| r.initialization_directory.join("untrained.pt"));
             let preservation = common::preserve_original_outputs(
                 &output_targets,
                 checkpoint_temporary.as_deref(),
@@ -960,19 +1127,37 @@ pub(super) mod linux {
                 .push(receipt_file);
             let receipt: Value = common::decode(&raw)?;
             running.receipts.push(receipt.clone());
-            verify_child(
-                r,
-                phase,
-                &summary,
-                &receipt,
-                &registration,
-                &sha,
-                dependencies,
-                execution_ns,
-                whole_ns,
-                original,
-                running.held.as_ref().expect("G0 original source custody"),
-            )?;
+            let source_custody = running.held.as_ref().expect("G0 original source custody");
+            if profile == G0ChildProfile::Collection {
+                verify_child(
+                    r,
+                    phase,
+                    &summary,
+                    &receipt,
+                    &registration,
+                    &sha,
+                    dependencies,
+                    execution_ns,
+                    whole_ns,
+                    original,
+                    source_custody,
+                )?;
+            } else {
+                verify_child_for_profile(
+                    profile,
+                    r,
+                    phase,
+                    &summary,
+                    &receipt,
+                    &registration,
+                    &sha,
+                    dependencies,
+                    execution_ns,
+                    whole_ns,
+                    original,
+                    source_custody,
+                )?;
+            }
             if let Some(error) = preservation.error {
                 return Err(error);
             }
@@ -983,13 +1168,15 @@ pub(super) mod linux {
     }
 
     fn freeze_child_output_targets(
+        profile: G0ChildProfile,
         r: &OriginalG0Scope,
         phase: &str,
         inputs: &Value,
         held: &LinuxHeld,
         credit: &mut ReadCredit<'_>,
     ) -> Result<Vec<(PathBuf, u64)>, ArenaError> {
-        let receipt_path = if phase == "prepare" {
+        profile.status(phase)?;
+        let receipt_path = if phase == profile.producer_phase() {
             &r.prepare_receipt_path
         } else {
             &r.reference_receipt_path
@@ -998,7 +1185,9 @@ pub(super) mod linux {
             (receipt_path.clone(), MAX_JSON),
             (receipt_path.with_extension("json.partial"), MAX_JSON),
         ];
-        if phase == "prepare" {
+        if profile == G0ChildProfile::Deployment && phase == "export" {
+            targets.extend(deployment_export_output_targets(&r.export_directory));
+        } else if phase == "prepare" {
             for (directory, names) in [
                 (
                     &r.initialization_directory,
@@ -1060,6 +1249,25 @@ pub(super) mod linux {
             targets.extend(reference_output_targets(&r.reference_output_root, &plan)?);
         }
         Ok(targets)
+    }
+
+    fn deployment_export_output_targets(export_directory: &Path) -> Vec<(PathBuf, u64)> {
+        // The original checkpoint is an input owned by the Collection stage.
+        // Failure preservation must never classify it as a temporary output.
+        [
+            "public_memory.onnx",
+            "public_memory.onnx.partial",
+            "shared_pc_if.onnx",
+            "shared_pc_if.onnx.partial",
+            "export.json",
+            "export.json.partial",
+            "cuda-control-inventory.json",
+            "cuda-control-inventory.json.partial",
+            "pals-artifact-owner.json",
+        ]
+        .into_iter()
+        .map(|name| (export_directory.join(name), MAX_FILE))
+        .collect()
     }
 
     pub(super) fn reference_output_targets(
@@ -1137,18 +1345,49 @@ pub(super) mod linux {
         process: &OriginalProcessOutput,
         held: &LinuxHeld,
     ) -> Result<(), ArenaError> {
+        verify_child_for_profile(
+            G0ChildProfile::Collection,
+            r,
+            phase,
+            summary,
+            receipt,
+            registration,
+            sha,
+            dependencies,
+            execution_ns,
+            whole_ns,
+            process,
+            held,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Exact original child process/FD evidence is shared across closed profiles"
+    )]
+    fn verify_child_for_profile(
+        profile: G0ChildProfile,
+        r: &OriginalG0Scope,
+        phase: &str,
+        summary: &Value,
+        receipt: &Value,
+        registration: &Value,
+        sha: &str,
+        dependencies: &Value,
+        execution_ns: u64,
+        whole_ns: u64,
+        process: &OriginalProcessOutput,
+        held: &LinuxHeld,
+    ) -> Result<(), ArenaError> {
+        let status = profile.status(phase)?;
+        profile.validate_inputs(phase, &registration["inputs"])?;
         process.checked_loaded_image()?;
         process.checked_timing()?;
-        let status = if phase == "prepare" {
-            "prepared"
-        } else {
-            "captured"
-        };
         check(
             process.transport_complete()
-                && summary["schema"] == RESULT
+                && summary["schema"] == profile.result()
                 && summary["status"] == status
-                && receipt["schema"] == RESULT
+                && receipt["schema"] == profile.result()
                 && receipt["status"] == status
                 && receipt["phase"] == phase
                 && receipt["execution_id"] == r.numerical_id
@@ -1197,11 +1436,7 @@ pub(super) mod linux {
             )?;
             if name == "__main__" {
                 check(
-                    observed.path
-                        == held
-                            .source_root
-                            .join(PACKAGE)
-                            .join("rz_pals_model/g0_numerical_cli.py"),
+                    observed.path == held.source_root.join(PACKAGE).join(profile.module_file()),
                     "G0 fixed child module differs",
                 )?;
             }
@@ -1216,14 +1451,22 @@ pub(super) mod linux {
             .all(|name| names.contains(name)),
             "G0 required loaded source absent",
         )?;
-        check(
-            names.contains(if phase == "prepare" {
-                "rz_pals_model.initialization_evidence"
-            } else {
-                "rz_pals_model.numeric_capture"
-            }),
-            "G0 phase producer source absent",
-        )?;
+        if profile == G0ChildProfile::Collection {
+            check(
+                names.contains(if phase == "prepare" {
+                    "rz_pals_model.initialization_evidence"
+                } else {
+                    "rz_pals_model.numeric_capture"
+                }),
+                "G0 phase producer source absent",
+            )?;
+        } else {
+            check(
+                names.contains("rz_pals_model.artifacts")
+                    && (phase != "reference" || names.contains("rz_pals_model.numeric_capture")),
+                "G0 Deployment phase producer source absent",
+            )?;
+        }
         let python = &receipt["interpreter_readback"];
         observed_matches(&python["executable"], held)?;
         let py: ObservedFile = serde_json::from_value(python["executable"].clone())
@@ -1328,7 +1571,12 @@ pub(super) mod linux {
                 check(pin_value(row)? == *pin, "G0 original input pin changed")?;
             }
         }
-        if phase == "reference" {
+        if profile == G0ChildProfile::Deployment {
+            verify_deployment_phase(phase, summary, receipt)?;
+            if phase == "export" {
+                verify_deployment_export_outputs(r, receipt)?;
+            }
+        } else if phase == "reference" {
             check(
                 receipt["original_model_bits_preserved"] == true
                     && receipt["actual_reference_executed"] == true
@@ -1350,6 +1598,89 @@ pub(super) mod linux {
                     && summary["actual_initialization_executed"] == true
                     && summary["actual_export_executed"] == true,
                 "G0 prepare cannot substitute for reference or optimizer execution",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn verify_deployment_phase(
+        phase: &str,
+        summary: &Value,
+        receipt: &Value,
+    ) -> Result<(), ArenaError> {
+        G0ChildProfile::Deployment.status(phase)?;
+        let reference = phase == "reference";
+        check(
+            receipt["original_model_bits_preserved"] == true
+                && receipt["optimizer_updates_executed"] == 0
+                && receipt["native_numeric_authority_issued"] == false
+                && receipt["arena_accepted"] == false,
+            "G0 Deployment must preserve original checkpoint without training/arena authority",
+        )?;
+        for observation in [summary, receipt] {
+            check(
+                observation["actual_initialization_executed"] == false
+                    && observation["actual_export_executed"] == !reference
+                    && observation["actual_reference_executed"] == reference,
+                "G0 Deployment phase cannot reinitialize or substitute export/reference execution",
+            )?;
+        }
+        if reference {
+            check(
+                receipt["physical_completion"] == "reference_completed_cpu"
+                    && receipt["reference_dispatch_started"] == true
+                    && receipt["reference_neural_forwards_executed"] == 100
+                    && receipt["capture_result"]["cases"] == 100,
+                "G0 Deployment requires exactly 100 original P/C reference forwards",
+            )
+        } else {
+            check(
+                receipt["reference_neural_forwards_executed"] == 0,
+                "G0 Deployment export cannot substitute for reference execution",
+            )
+        }
+    }
+
+    fn verify_deployment_export_outputs(
+        r: &OriginalG0Scope,
+        receipt: &Value,
+    ) -> Result<(), ArenaError> {
+        let outputs = receipt["outputs"]
+            .as_object()
+            .ok_or_else(|| invalid("G0 Deployment export outputs"))?;
+        check(
+            outputs.len() == 3
+                && ["export_manifest", "export_graphs", "cuda_control_inventory"]
+                    .iter()
+                    .all(|key| outputs.contains_key(*key)),
+            "G0 Deployment exact export output roster",
+        )?;
+        for (key, name) in [
+            ("export_manifest", "export.json"),
+            ("cuda_control_inventory", "cuda-control-inventory.json"),
+        ] {
+            check(
+                outputs[key]["path"]
+                    .as_str()
+                    .is_some_and(|path| Path::new(path) == r.export_directory.join(name)),
+                "G0 Deployment exact export output path",
+            )?;
+        }
+        let graphs = outputs["export_graphs"]
+            .as_array()
+            .ok_or_else(|| invalid("G0 Deployment export graph outputs"))?;
+        check(graphs.len() == 2, "G0 Deployment has no validator graph")?;
+        for (graph, (role, file)) in graphs.iter().zip([
+            ("public", "public_memory.onnx"),
+            ("shared_pc", "shared_pc_if.onnx"),
+        ]) {
+            check(
+                graph["role"] == role
+                    && graph["file"] == file
+                    && graph["path"]
+                        .as_str()
+                        .is_some_and(|path| Path::new(path) == r.export_directory.join(file)),
+                "G0 Deployment exact P/C export graph output",
             )?;
         }
         Ok(())
@@ -2065,6 +2396,127 @@ pub(super) mod linux {
         credit.remaining = cleanup_credit.remaining;
         credit.until = until;
         result
+    }
+
+    #[cfg(test)]
+    mod deployment_profile_tests {
+        use super::*;
+
+        #[test]
+        fn closed_profiles_keep_collection_domains_and_refuse_cross_phase_dispatch() {
+            let c = G0ChildProfile::Collection;
+            let d = G0ChildProfile::Deployment;
+            assert_eq!(
+                (c.registration(), c.startup(), c.result(), c.module()),
+                (REGISTRATION, STARTUP, RESULT, MODULE)
+            );
+            assert_ne!(d.registration(), c.registration());
+            assert_ne!(d.startup(), c.startup());
+            assert_ne!(d.result(), c.result());
+            assert_ne!(d.module_file(), c.module_file());
+            assert_eq!(c.status("prepare").unwrap(), "prepared");
+            assert_eq!(d.status("export").unwrap(), "exported");
+            assert_eq!(d.status("reference").unwrap(), "captured");
+            assert!(c.status("export").is_err());
+            assert!(d.status("prepare").is_err());
+            for profile in [c, d] {
+                assert!(profile.status("unknown").is_err());
+            }
+        }
+
+        #[test]
+        fn deployment_export_preservation_never_owns_checkpoint_or_validator_outputs() {
+            let root = Path::new("/owned/deployment/export");
+            let targets = deployment_export_output_targets(root);
+            assert_eq!(targets.len(), 9);
+            assert_eq!(
+                targets
+                    .iter()
+                    .map(|(path, _)| path)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                9
+            );
+            for name in [
+                "public_memory.onnx",
+                "shared_pc_if.onnx",
+                "export.json",
+                "cuda-control-inventory.json",
+            ] {
+                assert!(targets.contains(&(root.join(name), MAX_FILE)));
+                assert!(targets.contains(&(root.join(format!("{name}.partial")), MAX_FILE)));
+            }
+            assert!(targets.iter().all(|(path, _)| path.parent() == Some(root)));
+            for forbidden in [
+                "untrained.pt",
+                "checkpoint.json",
+                "g0-initialization-evidence.json",
+                "role_validator.onnx",
+                "role_validator.onnx.partial",
+            ] {
+                assert!(
+                    !targets
+                        .iter()
+                        .any(|(path, _)| path.file_name().unwrap() == forbidden)
+                );
+            }
+        }
+
+        #[test]
+        fn deployment_phase_evidence_requires_no_initializer_and_exact_reference_work() {
+            let summary = serde_json::json!({"actual_initialization_executed":false,
+                "actual_export_executed":true,"actual_reference_executed":false});
+            let mut receipt = summary.clone();
+            receipt["original_model_bits_preserved"] = true.into();
+            receipt["optimizer_updates_executed"] = 0.into();
+            receipt["native_numeric_authority_issued"] = false.into();
+            receipt["arena_accepted"] = false.into();
+            receipt["reference_neural_forwards_executed"] = 0.into();
+            assert!(verify_deployment_phase("export", &summary, &receipt).is_ok());
+            for (field, invalid) in [
+                ("actual_initialization_executed", true.into()),
+                ("actual_reference_executed", true.into()),
+                ("optimizer_updates_executed", 1.into()),
+                ("original_model_bits_preserved", false.into()),
+            ] {
+                let mut bad = receipt.clone();
+                bad[field] = invalid;
+                assert!(verify_deployment_phase("export", &summary, &bad).is_err());
+            }
+            let summary = serde_json::json!({"actual_initialization_executed":false,
+                "actual_export_executed":false,"actual_reference_executed":true});
+            receipt["actual_export_executed"] = false.into();
+            receipt["actual_reference_executed"] = true.into();
+            receipt["physical_completion"] = "reference_completed_cpu".into();
+            receipt["reference_dispatch_started"] = true.into();
+            receipt["reference_neural_forwards_executed"] = 100.into();
+            receipt["capture_result"] = serde_json::json!({"cases":100});
+            assert!(verify_deployment_phase("reference", &summary, &receipt).is_ok());
+            for n in [0, 99, 101, 150] {
+                let mut bad = receipt.clone();
+                bad["reference_neural_forwards_executed"] = n.into();
+                assert!(verify_deployment_phase("reference", &summary, &bad).is_err());
+            }
+        }
+
+        #[test]
+        fn deployment_input_rosters_refuse_collection_or_validator_inputs() {
+            let d = G0ChildProfile::Deployment;
+            let mut inputs = serde_json::json!({"checkpoint":{},"checkpoint_metadata":{},
+                "initialization_evidence":{},"rules_profile":{}});
+            assert!(d.validate_inputs("export", &inputs).is_ok());
+            inputs["case_plan_template"] = serde_json::json!({});
+            assert!(d.validate_inputs("export", &inputs).is_err());
+            let mut inputs = serde_json::json!({"case_plan":{},"checkpoint":{},
+                "checkpoint_metadata":{},"initialization_evidence":{},"export_manifest":{},
+                "cuda_control_inventory":{},"export_graphs":[{"role":"public"},{"role":"shared_pc"}]});
+            assert!(d.validate_inputs("reference", &inputs).is_ok());
+            inputs["export_graphs"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"role":"validator"}));
+            assert!(d.validate_inputs("reference", &inputs).is_err());
+        }
     }
 }
 

@@ -141,7 +141,7 @@ impl G0NumericalImmutableBindingsV5 {
         })
     }
     #[cfg(any(target_os = "linux", test))]
-    fn from_actual(b: &PalsNumericalBindingsV5) -> Self {
+    pub(super) fn from_actual(b: &PalsNumericalBindingsV5) -> Self {
         Self {
             model_profile: b.model_profile.clone(),
             model_schema: b.model_schema.clone(),
@@ -508,7 +508,7 @@ pub fn run_g0_bootstrap_numerical_original_v5(
 }
 
 #[cfg(target_os = "linux")]
-mod linux {
+pub(super) mod linux {
     use super::super::{
         g0_numerical_process::linux as original, numerical_process as numerical,
         training_process as common,
@@ -1093,7 +1093,7 @@ mod linux {
     fn hex(bytes: [u8; 32]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
-    fn asset(
+    pub(in crate::pals_collect_v3) fn asset(
         pin: &Pin,
         cwd: &Path,
         purpose: Purpose,
@@ -1258,7 +1258,7 @@ mod linux {
         scope.validate_pre_acceptance()?;
         Ok(scope)
     }
-    fn validate_prepared(
+    pub(in crate::pals_collect_v3) fn validate_prepared(
         s: &PalsNumericalScopeV5,
         cwd: &Path,
         r: &G0NumericalBootstrapRegistrationV5,
@@ -1294,7 +1294,7 @@ mod linux {
         }
         Ok(())
     }
-    fn materialize_native(
+    pub(in crate::pals_collect_v3) fn materialize_native(
         n: &G0NativeCaptureRecipeV5,
         s: &PalsNumericalScopeV5,
         cwd: &Path,
