@@ -311,11 +311,11 @@ class InitializationContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             owned(directory)
-            original_link = init.os.link
+            original_publish = init.publish_noreplace
             def race(source, target):
                 Path(target).write_bytes(b"other publisher won")
-                return original_link(source, target)
-            with mock.patch.object(init.os, "link", side_effect=race), self.assertRaises(FileExistsError):
+                return original_publish(source, target)
+            with mock.patch.object(init, "publish_noreplace", side_effect=race), self.assertRaises(FileExistsError):
                 init._atomic_publish_bytes(directory, b'{"contract_only":true}')
             self.assertEqual((directory / init.EVIDENCE_NAME).read_bytes(), b"other publisher won")
             self.assertTrue((directory / (init.EVIDENCE_NAME + ".partial")).exists())

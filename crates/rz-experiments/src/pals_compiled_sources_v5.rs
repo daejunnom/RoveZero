@@ -633,6 +633,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
         &[
             source!("crates/rz-arena/src/pals_collect_v3/training_export_process.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/training_process.rs"),
+            source!("experiments/model-research/pals/src/rz_pals_model/artifacts.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/config.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_chunks.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_data.py"),
@@ -667,6 +668,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
     (
         "loss_recipe",
         &[
+            source!("experiments/model-research/pals/src/rz_pals_model/artifacts.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/config.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_data.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_export_cli.py"),

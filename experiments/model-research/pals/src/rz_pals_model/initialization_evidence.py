@@ -18,6 +18,7 @@ import sys
 import time
 import types
 
+from .artifacts import publish_noreplace
 from .config import (ENCODING_V3, MODEL_SCHEMA_V3, MODEL_SEMANTICS_V3,
                      ModelConfig, ROLES, SCHEMA as OWNER_SCHEMA,
                      VIRTUAL_REVIEW_PROFILE)
@@ -499,24 +500,13 @@ def _atomic_publish_bytes(directory, encoded, *, name=EVIDENCE_NAME):
     temporary = directory / (name + ".partial")
     if target.exists() or temporary.exists():
         raise FileExistsError("initialization evidence already exists; preserve it rather than overwrite")
-    # Publish with a same-filesystem hard link, whose creation is atomic and
-    # refuses an existing destination. replace() could overwrite a race winner.
+    # The native no-replace rename never exposes a second hard link. Failed
+    # publication retains the owned partial evidence for diagnosis.
     with temporary.open("xb") as stream:
         stream.write(encoded)
         stream.flush()
         os.fsync(stream.fileno())
-    try:
-        os.link(temporary, target)
-    except BaseException:
-        # Keep the owned partial evidence for diagnosis; no successful receipt.
-        raise
-    temporary.unlink()
-    if os.name == "posix":
-        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+    publish_noreplace(temporary, target)
     return target
 
 

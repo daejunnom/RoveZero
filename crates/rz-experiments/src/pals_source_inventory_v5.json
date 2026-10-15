@@ -510,6 +510,7 @@
     "trainer": [
       "crates/rz-arena/src/pals_collect_v3/training_export_process.rs",
       "crates/rz-arena/src/pals_collect_v3/training_process.rs",
+      "experiments/model-research/pals/src/rz_pals_model/artifacts.py",
       "experiments/model-research/pals/src/rz_pals_model/config.py",
       "experiments/model-research/pals/src/rz_pals_model/generation_chunks.py",
       "experiments/model-research/pals/src/rz_pals_model/generation_data.py",
@@ -534,6 +535,7 @@
       "experiments/model-research/pals/src/rz_pals_model/initialization_evidence.py"
     ],
     "loss_recipe": [
+      "experiments/model-research/pals/src/rz_pals_model/artifacts.py",
       "experiments/model-research/pals/src/rz_pals_model/config.py",
       "experiments/model-research/pals/src/rz_pals_model/generation_data.py",
       "experiments/model-research/pals/src/rz_pals_model/generation_export_cli.py",

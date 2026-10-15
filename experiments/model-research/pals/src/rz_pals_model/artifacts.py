@@ -1,8 +1,11 @@
 """Owned external artifacts, initialization provenance and independent export."""
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
+import stat
+import sys
 
 from .config import (DEFAULT_INIT_PROFILE, MAX_LINE_PLIES, MODEL_SEMANTICS_V2, MODEL_SEMANTICS_V3, MODEL_SCHEMA_V3, ModelConfig,
                      SCHEMA, TASKS, public_tensor_names, role_tensor_names)
@@ -18,6 +21,116 @@ VIRTUAL_RULES_FEATURES = ["review.anchor_board", "review.anchor_rules_metadata",
 VIRTUAL_RULES_BOUNDS = {"max_records": 64, "max_anchors": 4, "max_line_plies": 256,
                       "line_buckets": [8,16,32,64,128,256], "max_candidates": 256,
                       "token_budgets": [128,256,512], "root_anchor": 0}
+
+
+class AtomicPublicationError(OSError):
+    """A publication failed validation; already published bytes are retained."""
+    def __init__(self, code, message, *, publication_state="not_published"):
+        super().__init__(errno.EIO, message)
+        self.code = code
+        self.publication_state = publication_state
+
+
+class AtomicPublicationUnsupported(AtomicPublicationError):
+    """No known link-free, atomic no-replace primitive is available."""
+    def __init__(self, native_errno=None):
+        super().__init__("artifact.publication.unsupported",
+                         "link-free atomic no-replace publication is unsupported")
+        self.native_errno = native_errno
+
+
+def _publication_identity(details, *, directory=False):
+    expected = stat.S_ISDIR if directory else stat.S_ISREG
+    if (not expected(details.st_mode) or stat.S_ISLNK(details.st_mode)
+            or getattr(details, "st_file_attributes", 0) & 0x400
+            or not directory and details.st_nlink != 1):
+        raise AtomicPublicationError("artifact.publication.identity", "publication requires a plain owned directory and a single-link regular partial")
+    return ((details.st_dev, details.st_ino) if directory else
+            (details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns))
+
+
+def _linux_rename_noreplace(directory_fd, source_name, target_name):
+    """The only Linux FFI: libc's typed renameat2, without a syscall fallback."""
+    import ctypes
+    try:
+        rename = ctypes.CDLL(None, use_errno=True).renameat2
+    except (AttributeError, OSError) as error:
+        raise AtomicPublicationUnsupported(errno.ENOSYS) from error
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = rename(directory_fd, os.fsencode(source_name), directory_fd, os.fsencode(target_name), 1)  # RENAME_NOREPLACE
+    if result != 0:
+        native_errno = ctypes.get_errno() or errno.EIO
+        if native_errno in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
+            raise AtomicPublicationUnsupported(native_errno)
+        raise OSError(native_errno, os.strerror(native_errno), target_name)
+
+
+def publish_noreplace(partial, destination):
+    """Move a complete, caller-fsynced partial without hard links or overwrite.
+
+    Linux uses one retained parent FD and renameat2(RENAME_NOREPLACE); Windows
+    uses os.rename, whose native operation refuses an existing destination.
+    Unknown OS/kernel/filesystem support fails closed, with no replace/link
+    fallback. The caller retains its partial cleanup policy on failure. A
+    post-rename identity/fsync failure retains the final and remains an error.
+    This does not grant ownership of ancestors or of concurrently mutated data.
+    """
+    partial, destination = Path(partial).absolute(), Path(destination).absolute()
+    if (partial.parent != destination.parent or partial == destination
+            or any(name in ("", ".", "..") or "\x00" in name for name in (partial.name, destination.name))):
+        raise ValueError("publication requires distinct names in the same directory")
+    directory = partial.parent
+    directory_fd = None
+    primary_error = None
+    publication_state = "not_published"
+    try:
+        parent_identity = _publication_identity(directory.lstat(), directory=True)
+        if sys.platform == "linux":
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            if _publication_identity(os.fstat(directory_fd), directory=True) != parent_identity:
+                raise AtomicPublicationError("artifact.publication.parent_changed", "publication parent changed before opening")
+        elif os.name != "nt":
+            raise AtomicPublicationUnsupported()
+        original = _publication_identity(partial.lstat())
+        if directory_fd is not None:
+            if _publication_identity(os.stat(partial.name, dir_fd=directory_fd, follow_symlinks=False)) != original:
+                raise AtomicPublicationError("artifact.publication.partial_changed", "publication partial changed before rename")
+        if _publication_identity(directory.lstat(), directory=True) != parent_identity:
+            raise AtomicPublicationError("artifact.publication.parent_changed", "publication parent changed before rename")
+        publication_state = "unknown"
+        if directory_fd is not None:
+            _linux_rename_noreplace(directory_fd, partial.name, destination.name)
+        else:
+            os.rename(partial, destination)
+        publication_state = "published"
+        if directory_fd is not None:
+            published = os.stat(destination.name, dir_fd=directory_fd, follow_symlinks=False)
+        else:
+            published = destination.lstat()
+        if _publication_identity(published) != original:
+            raise AtomicPublicationError("artifact.publication.partial_changed", "published file identity differs from the completed partial", publication_state="published")
+        if _publication_identity(directory.lstat(), directory=True) != parent_identity:
+            raise AtomicPublicationError("artifact.publication.parent_changed", "publication parent changed after rename", publication_state="published")
+        if directory_fd is not None:
+            os.fsync(directory_fd)
+    except BaseException as error:
+        primary_error = error
+        if isinstance(error, (FileExistsError, AtomicPublicationUnsupported)):
+            publication_state = "not_published"
+        error.publication_state = publication_state
+        raise
+    finally:
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError as cleanup_error:
+                if primary_error is not None:
+                    primary_error.publication_cleanup_error = cleanup_error
+                else:
+                    error = AtomicPublicationError("artifact.publication.close", "could not close retained publication parent", publication_state=publication_state)
+                    raise error from cleanup_error
 
 
 def validate_virtual_rules_declaration(declaration, config):

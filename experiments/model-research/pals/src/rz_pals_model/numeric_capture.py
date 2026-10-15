@@ -301,7 +301,7 @@ def _publish(value, destination, total):
     if not raw or len(raw) > MAX_FILE_BYTES or total + len(raw) > MAX_TOTAL_BYTES:
         raise ValueError("raw numerical evidence output bound exceeded")
     path = Path(destination).expanduser().resolve()
-    from .artifacts import output_directory
+    from .artifacts import output_directory, publish_noreplace
     output_directory(path.parent)
     partial = path.with_suffix(path.suffix + ".partial")
     if path.exists():
@@ -310,7 +310,7 @@ def _publish(value, destination, total):
         if stream.write(raw) != len(raw):
             raise OSError("incomplete numerical evidence write")
         stream.flush(); os.fsync(stream.fileno())
-    os.link(partial, path); partial.unlink()
+    publish_noreplace(partial, path)
     return {"path": str(path), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
 
 

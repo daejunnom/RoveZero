@@ -15,6 +15,7 @@ import stat
 import tempfile
 from contextlib import contextmanager
 
+from .artifacts import publish_noreplace
 from .generation_data import ACTUAL_SOURCE, digest, fields, identifier, sha, uint, strict_json, _admit_coverage
 from .config import MODEL_SCHEMA_V3, MODEL_SEMANTICS_V3, ENCODING_V3, ModelConfig
 from .generation_chunks import MANIFEST_DOMAIN, MAX_CORPUS_BYTES, ChunkGenerationDataset
@@ -348,8 +349,7 @@ def _atomic_json(path, value, *, output_guard=None):
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
-    os.link(temporary, path)
-    temporary.unlink()
+    publish_noreplace(temporary, path)
 
 
 def _summary(payload, ledger, config, checkpoint_sha256, checkpoint_bytes, frozen_pc_model_epoch):
@@ -464,8 +464,7 @@ def _export_validated_snapshot(snapshot, size, identity, payload, model, optimiz
             os.fsync(writer.fileno())
         if copied.hexdigest() != identity or temporary.stat().st_size != size:
             raise ValueError("independent actual checkpoint copy failed integrity")
-        os.link(temporary, root / "checkpoint.pt")
-        temporary.unlink()
+        publish_noreplace(temporary, root / "checkpoint.pt")
         metadata = {"config": model.config.to_dict(), "checkpoint_sha256": identity,
                     "trained": True, "training_steps": sum(ledger.completed.values())}
         exports = {}

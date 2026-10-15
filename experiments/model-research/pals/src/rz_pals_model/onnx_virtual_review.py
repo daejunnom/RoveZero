@@ -504,11 +504,10 @@ def audit_virtual_warm_shared_pc_graph(document, fresh, fresh_evidence):
 def _save(document, evidence, destination, *, output_guard=None):
     """Publish a complete artifact exclusively; retain failed partial writes.
 
-    A same-directory hard link provides atomic no-replace publication. There is
-    no rename race that could overwrite an artifact another writer published.
+    A link-free native rename provides atomic no-replace publication.
     The caller owns the managed output root and cleanup of preserved partials.
     """
-    from .artifacts import output_directory
+    from .artifacts import output_directory, publish_noreplace
     destination = Path(destination).expanduser().resolve()
     destination = output_directory(destination.parent, output_guard=output_guard) / destination.name
     partial = destination.with_suffix(destination.suffix + ".partial")
@@ -523,8 +522,7 @@ def _save(document, evidence, destination, *, output_guard=None):
             raise OSError("incomplete serialized graph write")
         stream.flush()
         os.fsync(stream.fileno())
-    os.link(partial, destination)
-    partial.unlink()
+    publish_noreplace(partial, destination)
     return {"file": destination.name, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
             "evidence": evidence, "numeric_status": "not_run", "cuda_status": "not_run"}
 

@@ -520,13 +520,13 @@ class BoundedArtifactFileTests(SourceOnlyTests):
     def test_registration_race_preserves_prior_final_and_own_partial(self):
         with tempfile.TemporaryDirectory(prefix="rz-generation-export-contract-") as temporary:
             path = Path(temporary) / "registered-contract.json"
-            original_link = os.link
+            original_publish = self.export.publish_noreplace
 
             def concurrent_registration(source, destination):
                 Path(destination).write_text("concurrent contract owner", encoding="ascii")
-                return original_link(source, destination)
+                return original_publish(source, destination)
 
-            with mock.patch.object(self.export.os, "link", side_effect=concurrent_registration):
+            with mock.patch.object(self.export, "publish_noreplace", side_effect=concurrent_registration):
                 with self.assertRaises(FileExistsError):
                     self.export._atomic_json(path, {"contract": "own pending evidence"})
             self.assertEqual(path.read_text(encoding="ascii"), "concurrent contract owner")

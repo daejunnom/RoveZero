@@ -13,6 +13,7 @@ from pathlib import Path
 import tempfile
 import time
 
+from .artifacts import publish_noreplace
 from .generation_data import (ROLES, TASKS, GenerationDataset, admit_phase, digest, fields, identifier,
     sha, uint, validate_record, coverage)
 from .generation_chunks import ChunkGenerationDataset, ChunkRows, MANIFEST_DOMAIN
@@ -383,42 +384,46 @@ class _BoundedCheckpointWriter:
         return self.stream.tell()
 
 
-def atomic_checkpoint(path, payload, *, max_file_bytes=None):
-    """Never overwrite a registered checkpoint; fsync then atomic rename."""
+def _serialize_checkpoint(payload, stream):
+    """The existing serializer; publication tests can use small ASCII bytes."""
     import torch
+    torch.save(payload, stream)
+
+
+def atomic_checkpoint(path, payload, *, max_file_bytes=None):
+    """Fsync then no-replace rename; preserve failed partials within output credit.
+
+    Never unlink the old temporary name after publication: it may have been
+    recreated by another owner, including after a known/unknown publish error.
+    """
     target = Path(path).resolve()
     if target.exists():
         raise FileExistsError("generation checkpoint already registered")
     target.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=target.parent)
-    try:
-        os.close(descriptor)
-        base_bytes = payload["ledger"]["cost"]["output_bytes"]
-        available = 18 * 1024**3 - uint(base_bytes, 18 * 1024**3)
-        if max_file_bytes is not None:
-            available = min(available, uint(max_file_bytes, 18 * 1024**3))
-        if not available:
-            raise ValueError("generation checkpoint has no remaining declared disk credit")
-        previous_size = 0
-        for _ in range(8):
-            payload["ledger"]["cost"]["output_bytes"] = base_bytes + previous_size
-            if payload["ledger"]["cost"]["output_bytes"] > 18 * 1024**3:
-                raise ValueError("managed generation staging/cache 18GiB cap exceeded")
-            with open(temporary, "wb") as stream:
-                torch.save(payload, _BoundedCheckpointWriter(stream, available))
-                stream.flush()
-                os.fsync(stream.fileno())
-            size = os.path.getsize(temporary)
-            if size == previous_size:
-                break
-            previous_size = size
-        else:
-            raise ValueError("generation checkpoint byte accounting did not stabilize")
-        # Exclusive link prevents a race overwriting another boundary.
-        os.link(temporary, target)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    os.close(descriptor)
+    base_bytes = payload["ledger"]["cost"]["output_bytes"]
+    available = 18 * 1024**3 - uint(base_bytes, 18 * 1024**3)
+    if max_file_bytes is not None:
+        available = min(available, uint(max_file_bytes, 18 * 1024**3))
+    if not available:
+        raise ValueError("generation checkpoint has no remaining declared disk credit")
+    previous_size = 0
+    for _ in range(8):
+        payload["ledger"]["cost"]["output_bytes"] = base_bytes + previous_size
+        if payload["ledger"]["cost"]["output_bytes"] > 18 * 1024**3:
+            raise ValueError("managed generation staging/cache 18GiB cap exceeded")
+        with open(temporary, "wb") as stream:
+            _serialize_checkpoint(payload, _BoundedCheckpointWriter(stream, available))
+            stream.flush()
+            os.fsync(stream.fileno())
+        size = os.path.getsize(temporary)
+        if size == previous_size:
+            break
+        previous_size = size
+    else:
+        raise ValueError("generation checkpoint byte accounting did not stabilize")
+    publish_noreplace(temporary, target)
     return target
 
 
