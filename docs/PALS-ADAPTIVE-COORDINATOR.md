@@ -516,7 +516,7 @@ GPU·성능·학습·대국 인수를 대신하지 않는다. 실제 학습은 �
 ## 66aff9f 실제 CPU 수정 인수
 
 `66aff9fb522a0a3f656049da486f2e39c7f39164`에서 정상 CPU 예산 소진을 수정한 뒤,
-같은 CPU 1024/작업당 128/depth 2와 Fresh·B1·P/C·V-free·Frozen WDL 조건으로
+같은 CPU 1024/작업당 128/depth 2와 Fresh·B1·P/C·V-free 조건으로
 단일 `position startpos` → `go movetime 1000`을 다시 실행했다. 새 native build의
 552개 Git-LF source·25개 component·6개 ELF·22개 원 child 종료, 별도 caller의
 원 source 3개·lock·ELF·11개 child 종료와 등록한 notebook 코드/count 1을 대조했다.
@@ -539,6 +539,11 @@ unknown이다. 해당 source 분기와 원 counter가 일치한다는 추론을 
 서로 다른 구간이다. cgroup은 미적용, peak·VRAM·managed VM teardown은 unknown이며
 이 기능 검사를 성능 개선 자료로 사용하지 않는다. Repair·Yield·동시 pending 두 개,
 GPU·학습·대국은 이 실행에서 인수하지 않았다. 실제 학습은 계속 보류한다.
+
+이 실행의 resolver는 `pals-cpu-raw-restricted/0.1`이고 재검토 정책 선언은
+`iterative_frozen_model_wdl_v2`다. 정책 선언과 실제 Repair 실행을 구분하며,
+이번 결과를 ModelWDL resolver나 Frozen WDL 재검토의 실제 실행 증거로 사용하지 않는다.
+외부 checker만 바꾸는 통제 비교는 별도 own ModelWDL 기준을 먼저 등록한다.
 
 별도 L4 load/mapping 진단에서는 정제한 환경의 libcuda/NVML 기본 soname 탐색이
 실패했지만 retained-FD 절대 load와 매핑은 확인됐다. CUDA API·provider·NN 성공으로
