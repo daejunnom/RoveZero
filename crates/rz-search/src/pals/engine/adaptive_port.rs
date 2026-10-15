@@ -705,6 +705,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     pub fn counters(&self) -> PalsCounters {
         self.counters
     }
+    /// Root-wide logical role admission ceiling, including root rankings.
+    /// The physical manager reserves this before preparing a question; it is
+    /// independent of NN input counts and successful semantic consumption.
+    pub fn role_call_limit(&self) -> u64 {
+        self.engine.config.max_role_calls
+    }
     pub(super) fn role_action_committed(
         &self,
         question: ContractDigest,
@@ -850,6 +856,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         self.check_live()?;
         if self.root_fanout != AdaptiveRootFanoutPolicy::SequentialFixed
             || self.root_ranking_pending
+            || self.counters.role_calls >= self.engine.config.max_role_calls
             || self
                 .round_candidates
                 .values()
@@ -964,6 +971,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             return Err(RoleError::InvalidOutput.into());
         }
         self.verify_registered_ticket_namespace(&ranking.source().ticket)?;
+        if self.counters.role_calls >= self.engine.config.max_role_calls {
+            return Err(PalsError::RoleCallLimit);
+        }
         let mut ranked = Vec::new();
         for movement in ranking.ranked_candidates() {
             ranked.push(
@@ -997,7 +1007,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         self.counters.accepted_proposer_outputs += 1;
         self.counters.role_calls += 1;
         self.counters.consumed_role_outputs += 1;
-        let mut remaining: VecDeque<_> = frontier.into();
+        // The root ranking itself spends one call. Do not issue zero-credit
+        // candidate frames when it consumes the final root-wide admission.
+        let mut remaining: VecDeque<_> =
+            if self.counters.role_calls >= self.engine.config.max_role_calls {
+                VecDeque::new()
+            } else {
+                frontier.into()
+            };
         let issue_count = if self.root_fanout == AdaptiveRootFanoutPolicy::SequentialFixed {
             1.min(remaining.len())
         } else {
@@ -1094,7 +1111,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             input,
             budget: FrameBudget {
                 original_cpu_credit: self.limits.max_cpu_nodes,
-                role_submissions_remaining: self.engine.config.max_role_calls,
+                // A frame ceiling never replenishes the root ranking or an
+                // earlier candidate's consumed calls. Concurrent frames still
+                // share the manager's single admission/reservation ceiling.
+                role_submissions_remaining: self
+                    .engine
+                    .config
+                    .max_role_calls
+                    .saturating_sub(self.counters.role_calls),
                 original_store_byte_limit: 8 * 1024 * 1024,
             },
             deferred: None,

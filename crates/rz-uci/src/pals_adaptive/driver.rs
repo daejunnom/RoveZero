@@ -492,6 +492,14 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
     fn root_rules(&self) -> Arc<ContractState> {
         Arc::clone(&self.rules)
     }
+    fn root_role_call_limit(&self) -> Result<Option<u64>, AdaptiveManagerError> {
+        Ok(Some(
+            self.port
+                .as_ref()
+                .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+                .role_call_limit(),
+        ))
+    }
     fn collection_before_dispatch(
         &mut self,
         ticket: &RoleTicketEnvelope,

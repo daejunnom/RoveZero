@@ -66,6 +66,14 @@ progress 누적값을 다시 합산하지 않고 terminal/ack의 실제 delta를
 관측이며 native credit으로 환산하지 않는다. soft lease의 안전 경계 초과는 실제
 시간으로 기록하고 원 hard deadline·취소 의미를 바꾸지 않는다.
 
+논리 role 호출 한도는 root ranking을 포함한 root 전체의 admission 한도다.
+manager는 누적 ticket admission과 아직 admission되지 않은 준비 예약을 함께 계수한다.
+후보 frame은 이미 소비한 호출을 뺀 잔액만 받으며 새 후보가 전역 한도를 보충하지 않는다.
+한도에 도달하면 새 작업을 막고 이미 제출한 role의 원 완료·수락·해제를 마친 뒤
+`RoleCallLimit`으로 종료한다. 남은 CPU 작업은 원래 quiesce·취소·정산 경로를 따른다.
+실제 commit 오류·물리 완료 unknown은 이 정상 소진으로 바꾸지 않으며, 논리 호출·
+검색 소비 평가·물리 NN 입력 수는 별도로 기록한다.
+
 ## 초기 등록 조건
 
 - Review: token 512, 비교용 128/256; selected record 64; 활성 bundle 256; anchor 4.

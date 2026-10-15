@@ -270,6 +270,63 @@ fn accepted_root_ranking(
 }
 
 #[test]
+fn root_ranking_spends_the_only_call_without_issuing_zero_credit_candidates() {
+    let mut port = setup(Position::startpos(), 3);
+    port.engine.config.max_role_calls = 1;
+    port.configure_root_fanout(AdaptiveRootFanoutPolicy::SequentialFixed)
+        .unwrap();
+    let (ranking, _) = accepted_root_ranking(&mut port);
+    assert!(port.ranking_published(&ranking).unwrap().is_empty());
+    assert_eq!(port.counters.role_calls, 1);
+    assert_eq!(port.counters.consumed_role_outputs, 1);
+    assert!(port.next_fixed_root_candidate().unwrap().is_none());
+    assert!(port.next_root_round_input().unwrap().is_none());
+    assert!(port.lazy_frontier.is_empty());
+    assert!(port.round_candidates.is_empty());
+}
+
+#[test]
+fn root_frame_ceiling_excludes_ranking_and_final_reserved_role_still_commits() {
+    let mut port = setup(Position::startpos(), 3);
+    port.engine.config.max_role_calls = 2;
+    port.engine.config.beam_width = 2;
+    let (ranking, _) = accepted_root_ranking(&mut port);
+    let candidates = port.ranking_published(&ranking).unwrap();
+    assert_eq!(candidates.len(), 2);
+    let works = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            assert_eq!(candidate.budget.role_submissions_remaining, 1);
+            Work {
+                frame: FrameId {
+                    authority: port.authority,
+                    sequence: index as u64 + 1,
+                },
+                original_first_move: candidate.first_move,
+                original_deadline: port.deadline,
+                input: candidate.input,
+                budget: candidate.budget,
+            }
+        })
+        .collect::<Vec<_>>();
+    let (ticket, result) = output(&works[0], 2);
+    port.commit_role(&works[0], &ticket, &result, None).unwrap();
+    assert_eq!(port.counters.role_calls, 2);
+    assert_eq!(port.counters.consumed_role_outputs, 2);
+    // This is a genuine unreserved overrun, retained as an error. The manager
+    // regression separately verifies it cannot be submitted in production.
+    let (overrun, result) = output(&works[1], 3);
+    assert!(matches!(
+        port.commit_role(&works[1], &overrun, &result, None),
+        Err(PalsError::RoleCallLimit)
+    ));
+    assert_eq!(port.counters.role_calls, 2);
+    assert_eq!(port.counters.consumed_role_outputs, 2);
+    assert!(!port.accepted.contains(&overrun.id));
+}
+
+#[test]
 fn actual_one_ply_ranking_enters_cpu_without_another_policy_forward() {
     let mut port = setup(Position::startpos(), 1);
     let (ranking, mut registry) = accepted_root_ranking(&mut port);

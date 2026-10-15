@@ -122,24 +122,41 @@ impl<Q: Clone + Send + Sync + 'static> TicketNativeBackend<ReviewView, Q> for Na
                 id: ticket.id,
                 authority: ticket.authority,
                 key: ticket.representation,
-                payload: RolePayload::Proposal {
-                    candidate_logits: (0..question.view.query().legal.len())
-                        .map(|i| i as f32)
-                        .collect(),
-                    wdl: Wdl::try_new(0.25, 0.5, 0.25, 1e-4).unwrap(),
+                payload: match ticket.role {
+                    rz_contracts::pals::Role::Proposer => RolePayload::Proposal {
+                        candidate_logits: (0..question.view.query().legal.len())
+                            .map(|i| i as f32)
+                            .collect(),
+                        wdl: Wdl::try_new(0.25, 0.5, 0.25, 1e-4).unwrap(),
+                    },
+                    rz_contracts::pals::Role::Critic => RolePayload::Counterexample {
+                        candidate_logits: (0..question.view.query().legal.len())
+                            .map(|i| i as f32)
+                            .collect(),
+                        divergence_logits: vec![0.0; question.view.query().divergences.len()],
+                        wdl: Wdl::try_new(0.25, 0.5, 0.25, 1e-4).unwrap(),
+                    },
+                    rz_contracts::pals::Role::Validator => RolePayload::TaskRanking {
+                        task_logits: vec![0.0; 7],
+                    },
                 },
                 private_latent: vec![0.; 16 * 384],
             }),
         }
     }
     fn output_host_bytes(&self, output: &Self::Output) -> u64 {
-        let RolePayload::Proposal {
-            candidate_logits, ..
-        } = &output.payload
-        else {
-            unreachable!("fixture emits proposer output only")
+        let payload_values = match &output.payload {
+            RolePayload::Proposal {
+                candidate_logits, ..
+            } => candidate_logits.len(),
+            RolePayload::Counterexample {
+                candidate_logits,
+                divergence_logits,
+                ..
+            } => candidate_logits.len() + divergence_logits.len(),
+            RolePayload::TaskRanking { task_logits } => task_logits.len(),
         };
-        ((candidate_logits.len() + output.private_latent.len()) * 4) as u64
+        ((payload_values + output.private_latent.len()) * 4) as u64
     }
     fn acceptance_output_digest(&self, output: &Self::Output) -> Option<Digest> {
         rz_search::pals::coordinator::native_acceptance_output_digest(output).ok()
@@ -198,6 +215,7 @@ enum FixtureScope {
 }
 struct DriverFixture {
     authority: SearchAuthority,
+    role_call_limit: Option<u64>,
     rules: Arc<ContractState>,
     stores: PalsStores,
     index: ReviewContextIndex,
@@ -272,6 +290,9 @@ impl DriverFixture {
 impl AdaptiveSearchDriver<u64> for DriverFixture {
     fn root_rules(&self) -> Arc<ContractState> {
         Arc::clone(&self.rules)
+    }
+    fn root_role_call_limit(&self) -> Result<Option<u64>, AdaptiveManagerError> {
+        Ok(self.role_call_limit)
     }
     fn ranking_published(
         &mut self,
@@ -527,6 +548,20 @@ fn fixture_with_resource_limits(
     FrameInput<ReviewView, u64>,
     Instant,
 ) {
+    fixture_with_registered_role_limit(scope, finish_ok, credit, limits, None)
+}
+fn fixture_with_registered_role_limit(
+    scope: FixtureScope,
+    finish_ok: bool,
+    credit: u64,
+    limits: Option<AdaptiveExecutionLimits>,
+    role_call_limit: Option<u64>,
+) -> (
+    Manager,
+    Arc<NativeFacts>,
+    FrameInput<ReviewView, u64>,
+    Instant,
+) {
     let position = Position::from_fen("3rk3/8/8/3p4/4P3/8/8/4K3 w - - 0 1").unwrap();
     let mut expected_cpu = BTreeMap::new();
     if matches!(scope, FixtureScope::OwnCpuResume) {
@@ -572,6 +607,7 @@ fn fixture_with_resource_limits(
     let state = stores.situations.get(root).unwrap().state;
     let mut driver = DriverFixture {
         authority,
+        role_call_limit,
         rules,
         stores,
         index: ReviewContextIndex::default(),
@@ -700,6 +736,119 @@ fn explicit_lower_caps_bound_actual_admission_and_complete_both_independent_ques
 }
 
 #[test]
+fn root_role_budget_reserves_both_pending_questions_before_native_preparation() {
+    for limit in [2, 3] {
+        let (mut manager, facts, root, until) = fixture_with_registered_role_limit(
+            FixtureScope::TwoIndependentRoles,
+            true,
+            4096,
+            None,
+            Some(limit),
+        );
+        assert_eq!(manager.role_call_limit, Some(limit));
+        manager.prepare_root_ranking(root).unwrap();
+        assert_eq!(manager.role_call_budget_usage(), (0, 1));
+        pump(&mut manager, until, |manager| {
+            manager.counters().consumed_role_outputs == 1 && manager.roles.len() as u64 == limit - 1
+        });
+        // Both candidates carry four frame calls. Their copied ceilings do
+        // not mint eight root calls: root ranking + pending reservations wins.
+        assert_eq!(manager.role_call_budget_usage(), (1, limit - 1));
+        assert!(!manager.role_call_limit_reached());
+        let binding = &manager.roles[0];
+        let work = binding.work.clone();
+        let input = binding.input.clone();
+        assert!(matches!(
+            manager.prepare_role(work, input, RolePurpose::Refinement),
+            Err(AdaptiveManagerError::RoleCallLimit)
+        ));
+        pump(&mut manager, until, |manager| {
+            manager.role_call_budget_usage() == (limit, 0)
+        });
+        assert_eq!(manager.phase(), ManagerPhase::Running);
+        assert_eq!(manager.counters().consumed_role_outputs, 1);
+        assert_eq!(manager.counters().unused_role_results, 0);
+        assert!(!manager.roles.is_empty());
+        // Spend exhaustion cannot revoke the admitted physical/semantic
+        // obligations. Open the original worker gate and accept each once.
+        facts.child_gate.store(true, Ordering::Release);
+        let receipt = manager
+            .run_root_until(until, &AtomicBool::new(false))
+            .unwrap();
+        assert!(receipt.permits_root_reuse());
+        assert!(manager.failures().next().is_none());
+        assert!(manager.role_call_limit_reached());
+        assert_eq!(manager.role_call_budget_usage(), (limit, 0));
+        assert_eq!(manager.counters().submitted_role_tickets, limit);
+        assert_eq!(manager.counters().physical_role_completions, limit);
+        assert_eq!(manager.counters().consumed_role_outputs, limit);
+        assert_eq!(manager.counters().unused_role_results, 0);
+        assert_eq!(manager.driver().consumed.len() as u64, limit);
+        assert_eq!(facts.accepted.lock().unwrap().len() as u64, limit);
+        assert_eq!(manager.native_cpu_usage().unwrap(), (0, 0));
+    }
+}
+
+#[test]
+fn exhausted_root_role_budget_preserves_actual_commit_failure() {
+    let (mut manager, facts, root, until) = fixture_with_registered_role_limit(
+        FixtureScope::TwoIndependentRoles,
+        true,
+        4096,
+        None,
+        Some(2),
+    );
+    manager.driver_mut().fail_role_once = true;
+    facts.child_gate.store(true, Ordering::Release);
+    manager.prepare_root_ranking(root).unwrap();
+    let receipt = manager.run_until(until, &AtomicBool::new(false)).unwrap();
+    assert!(receipt.permits_archive_close());
+    assert!(manager.role_call_limit_reached());
+    assert_eq!(manager.counters().submitted_role_tickets, 2);
+    assert_eq!(manager.counters().consumed_role_outputs, 1);
+    assert_eq!(manager.counters().unused_role_results, 1);
+    assert!(manager.failures().any(|error| matches!(error,
+        AdaptiveManagerError::Semantic(message) if message == "authored role hot-commit failure")));
+    assert!(manager.roles.is_empty());
+    assert_eq!(manager.native_cpu_usage().unwrap(), (0, 0));
+}
+
+#[test]
+fn failed_frame_binding_keeps_one_registry_charge_without_double_reserving() {
+    let (mut manager, _, root, until) = fixture_with_registered_role_limit(
+        FixtureScope::TwoIndependentRoles,
+        true,
+        4096,
+        None,
+        Some(2),
+    );
+    manager.prepare_root_ranking(root).unwrap();
+    pump(&mut manager, until, |manager| {
+        manager.counters().consumed_role_outputs == 1 && manager.roles.len() == 1
+    });
+    assert_eq!(manager.role_call_budget_usage(), (1, 1));
+    // The original immutable preparation remains real, but its frame binding
+    // is deliberately invalid. Registry admission must stay charged once even
+    // though the native executable ticket is never installed on this binding.
+    manager.roles[0].work.as_mut().unwrap().frame.sequence += 1_000_000;
+    pump(&mut manager, until, |manager| {
+        manager.failures().next().is_some()
+    });
+    assert_eq!(manager.role_call_budget_usage(), (2, 0));
+    assert!(
+        manager
+            .failures()
+            .any(|error| matches!(error, AdaptiveManagerError::Coordinator(_)))
+    );
+    let receipt = shutdown(&mut manager, until);
+    assert!(receipt.permits_archive_close());
+    assert_eq!(receipt.pending_tickets, 0);
+    assert_eq!(manager.role_call_budget_usage(), (2, 0));
+    assert_eq!(manager.counters().consumed_role_outputs, 1);
+    assert_eq!(manager.counters().physical_role_completions, 1);
+}
+
+#[test]
 fn explicit_resource_limits_reject_each_out_of_range_axis() {
     let defaults = AdaptiveExecutionLimits::default();
     assert!(defaults.validate().is_ok());
@@ -789,18 +938,38 @@ fn shutdown(manager: &mut Manager, until: Instant) -> AdaptiveShutdownReceipt {
     manager.shutdown_receipt().unwrap()
 }
 
-#[test]
-fn actual_search_port_commits_native_and_private_cpu_without_inline_model_calls() {
+type ActualPortManager = AdaptiveExecutionManager<
+    rz_search::pals::engine::adaptive_port::AdaptivePortQuestion,
+    NativeFixture,
+    AdaptivePortDriver<rz_search::pals::engine::adaptive_port::AdaptivePortModel>,
+>;
+fn actual_search_port_fixture(
+    config: rz_search::pals::engine::PalsConfig,
+    model_wdl: bool,
+) -> (
+    ActualPortManager,
+    Arc<NativeFacts>,
+    FrameInput<ReviewView, rz_search::pals::engine::adaptive_port::AdaptivePortQuestion>,
+    Instant,
+    Position,
+) {
     use rz_runtime::contracts::ContractClock as _;
     use rz_search::pals::engine::adaptive_port::{
         AdaptiveEnginePort, AdaptiveModelNamespace, AdaptivePortModel, AdaptivePortQuestion,
     };
-    use rz_search::pals::engine::{PalsCompletion, PalsConfig, PalsEngine, PalsLimits};
+    use rz_search::pals::engine::{
+        PalsEngine, PalsLimits, PostRepairRecheckPolicy, ResolverPolicy,
+    };
     use rz_search::pals::review_context::ReviewIndexLimits;
     use rz_search::pals::value::{MODEL_WDL_VALUE_SEMANTICS, ModelValueIdentity};
     use std::sync::atomic::AtomicU64;
 
-    let position = Position::from_fen("3rk3/8/8/3p4/4P3/8/8/4K3 w - - 0 1").unwrap();
+    let position = if model_wdl {
+        Position::startpos()
+    } else {
+        Position::from_fen("3rk3/8/8/3p4/4P3/8/8/4K3 w - - 0 1").unwrap()
+    };
+    let node_limit = if model_wdl { 1024 } else { TOTAL_NODES };
     let clock = ContractSystemClock::new(ProcessEpoch(221));
     let until = clock.origin() + WINDOW;
     let authority = SearchAuthority {
@@ -828,15 +997,17 @@ fn actual_search_port_commits_native_and_private_cpu_without_inline_model_calls(
     .unwrap();
     let model =
         AdaptivePortModel::new_with_namespace(value.model.clone(), Some(value), namespace).unwrap();
-    let mut engine = PalsEngine::new(
-        PalsConfig {
-            beam_width: 1,
-            line_plies: 1,
-            ..PalsConfig::default()
-        },
-        model,
-        cpu_engine(),
-    )
+    let mut engine = if model_wdl {
+        PalsEngine::new_with_boxed_checker_and_policies(
+            config,
+            model,
+            Box::new(rz_search::cpu_checker::OwnedCpuChecker::new(Box::new(cpu_engine())).unwrap()),
+            ResolverPolicy::ModelWdlRestricted,
+            PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+        )
+    } else {
+        PalsEngine::new(config, model, cpu_engine())
+    }
     .unwrap()
     .with_selected_review_context(
         ReviewSelectionPolicy::default(),
@@ -855,9 +1026,9 @@ fn actual_search_port_commits_native_and_private_cpu_without_inline_model_calls(
         },
         PalsLimits {
             deadline: until,
-            max_rounds: 1,
-            max_cpu_nodes: TOTAL_NODES,
-            cpu_depth: 1,
+            max_rounds: if model_wdl { 4 } else { 1 },
+            max_cpu_nodes: node_limit,
+            cpu_depth: if model_wdl { 2 } else { 1 },
         },
         Arc::new(move || Ok(OwnerId(issuer.fetch_add(1, Ordering::Relaxed)))),
     )
@@ -886,14 +1057,14 @@ fn actual_search_port_commits_native_and_private_cpu_without_inline_model_calls(
     )
     .unwrap();
     let root = driver.root_input().unwrap();
-    let mut manager = AdaptiveExecutionManager::new(
+    let manager = AdaptiveExecutionManager::new(
         AdaptiveManagerRegistration {
             authority,
             hard_deadline: until,
             token_budget: 512,
             policy: CoordinatorPolicy::Fixed,
             first_request_sequence: 1,
-            native_cpu_node_limit: TOTAL_NODES,
+            native_cpu_node_limit: node_limit,
             endpoints: CpuEndpointSelection::deployment(),
             controller: ControllerConfig::default(),
             device_digest: Digest([90; 32]),
@@ -906,6 +1077,20 @@ fn actual_search_port_commits_native_and_private_cpu_without_inline_model_calls(
         driver,
     )
     .unwrap();
+    (manager, facts, root, until, position)
+}
+
+#[test]
+fn actual_search_port_commits_native_and_private_cpu_without_inline_model_calls() {
+    use rz_search::pals::engine::{PalsCompletion, PalsConfig};
+    let (mut manager, _, root, until, position) = actual_search_port_fixture(
+        PalsConfig {
+            beam_width: 1,
+            line_plies: 1,
+            ..PalsConfig::default()
+        },
+        false,
+    );
     manager.prepare_root_ranking(root).unwrap();
     while manager.has_pending_work() {
         assert!(
@@ -930,6 +1115,59 @@ fn actual_search_port_commits_native_and_private_cpu_without_inline_model_calls(
         thread::sleep(Duration::from_millis(1));
     }
     assert!(manager.shutdown_receipt().unwrap().permits_archive_close());
+}
+
+#[test]
+fn actual_model_wdl_fixed_root_role_budget_stops_before_a_seventeenth_call() {
+    use rz_search::pals::engine::{PalsCompletion, PalsConfig};
+    for limit in [1, 2, 16] {
+        // Match the bounded CPU source profile's search shape and budgets.
+        // Outputs remain authored fixtures, never actual neural/GPU evidence.
+        let (mut manager, facts, root, until, position) = actual_search_port_fixture(
+            PalsConfig {
+                beam_width: 1,
+                line_plies: 4,
+                max_nodes: 4096,
+                max_records: 64,
+                max_role_calls: limit,
+                cpu_nodes_per_task: 128,
+            },
+            true,
+        );
+        assert_eq!(manager.role_call_limit, Some(limit));
+        manager.prepare_root_ranking(root).unwrap();
+        let receipt = manager
+            .run_root_until_observed(until, &AtomicBool::new(false), &mut |manager| {
+                let (spent, reserved) = manager.role_call_budget_usage();
+                assert!(spent + reserved <= limit);
+                Ok(())
+            })
+            .unwrap();
+        assert!(receipt.permits_root_reuse());
+        assert!(
+            manager.failures().next().is_none(),
+            "{:?}",
+            manager.failures().collect::<Vec<_>>()
+        );
+        assert!(manager.role_call_limit_reached());
+        assert_eq!(manager.role_call_budget_usage(), (limit, 0));
+        assert_eq!(manager.counters().submitted_role_tickets, limit);
+        assert_eq!(manager.counters().physical_role_completions, limit);
+        assert_eq!(manager.counters().consumed_role_outputs, limit);
+        assert_eq!(manager.counters().unused_role_results, 0);
+        assert_eq!(facts.accepted.lock().unwrap().len() as u64, limit);
+        let result = manager
+            .driver()
+            .result(PalsCompletion::RoleCallLimit)
+            .unwrap();
+        assert_eq!(result.completion, PalsCompletion::RoleCallLimit);
+        assert_eq!(result.counters.role_calls, limit);
+        assert_eq!(result.counters.consumed_role_outputs, limit);
+        assert!(position.legal_moves().contains(&result.best_move.unwrap()));
+        let (cpu_spent, cpu_reserved) = manager.native_cpu_usage().unwrap();
+        assert!(cpu_spent <= 1024);
+        assert_eq!(cpu_reserved, 0);
+    }
 }
 
 #[test]
@@ -1503,6 +1741,7 @@ mod adaptive_partial_feedback {
         let mut driver = PartialDriver {
             inner: DriverFixture {
                 authority,
+                role_call_limit: None,
                 rules,
                 stores,
                 index: ReviewContextIndex::default(),

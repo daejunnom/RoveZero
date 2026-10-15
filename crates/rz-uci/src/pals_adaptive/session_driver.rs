@@ -1360,6 +1360,8 @@ where
             PalsCompletion::Terminal
         } else if manager.cpu_node_limit_reached() {
             PalsCompletion::CpuNodeLimit
+        } else if manager.role_call_limit_reached() {
+            PalsCompletion::RoleCallLimit
         } else {
             PalsCompletion::RoundLimit
         };

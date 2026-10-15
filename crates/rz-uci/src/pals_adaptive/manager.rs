@@ -111,6 +111,7 @@ pub enum AdaptiveManagerError {
     PhysicalUnknown,
     Deadline,
     AuxiliaryPending,
+    RoleCallLimit,
 }
 impl From<CoordinatorError> for AdaptiveManagerError {
     fn from(error: CoordinatorError) -> Self {
@@ -191,6 +192,11 @@ pub struct CandidateFrame<Q> {
 /// remain with the independent archive owner and finish after worker fences.
 pub trait AdaptiveSearchDriver<Q> {
     fn root_rules(&self) -> Arc<ContractState>;
+    /// Immutable root registration, separate from per-frame ceilings, CPU
+    /// credit, semantic consumption and physical NN/cache accounting.
+    fn root_role_call_limit(&self) -> Result<Option<u64>, AdaptiveManagerError> {
+        Ok(None)
+    }
     fn collection_before_dispatch(
         &mut self,
         _: &RoleTicketEnvelope,
@@ -833,6 +839,10 @@ struct RoleBinding<Q, O> {
     work: Option<CoordinatorWork<ReviewView, Q>>,
     input: FrameInput<ReviewView, Q>,
     ticket: Option<RoleTicketEnvelope>,
+    // Registry admission spends the reservation before subsequent fallible
+    // frame binding. Keep that charge even if the original preparation must
+    // drain without ever becoming an executable native ticket.
+    admission_charged: bool,
     dispatch_pending: bool,
     collection_registered: bool,
     physical: Option<TicketExecutionEvidence>,
@@ -1076,6 +1086,7 @@ where
     registry: RoleTicketRegistry<ReviewView, Arc<B::Output>>,
     machine: RefinementMachine<ReviewView, Q>,
     driver: D,
+    role_call_limit: Option<u64>,
     roles: Vec<RoleBinding<Q, B::Output>>,
     acknowledgements: VecDeque<NativeAck>,
     own: Vec<OwnSlot<Q>>,
@@ -1193,6 +1204,10 @@ where
         let external = &sources.external;
         let prepared = (|| -> Result<_, AdaptiveManagerError> {
             limits.validate()?;
+            let role_call_limit = sources.driver.root_role_call_limit()?;
+            if role_call_limit == Some(0) {
+                return Err(AdaptiveManagerError::Invalid("root role call limit"));
+            }
             if check_native_limits
                 && (native.pending_capacity() != limits.role_tickets_max
                     || native.command_capacity() != limits.worker_commands_max)
@@ -1329,6 +1344,7 @@ where
                 ready,
                 costs,
                 controller,
+                role_call_limit,
             ))
         })();
         let (
@@ -1342,6 +1358,7 @@ where
             ready,
             costs,
             controller,
+            role_call_limit,
         ) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1368,6 +1385,7 @@ where
             registry,
             machine,
             driver,
+            role_call_limit,
             roles: Vec::with_capacity(limits.role_tickets_max),
             acknowledgements: VecDeque::with_capacity(limits.role_tickets_max),
             own: own_workers
@@ -1765,6 +1783,30 @@ where
     pub fn cpu_node_limit_reached(&self) -> bool {
         self.cpu_node_limit_reached
     }
+    /// Root-wide logical calls spent and reserved for preparation. Registry
+    /// admission charges a call once; semantic acceptance and NN input counts
+    /// are separate observations. A binding without a ticket reserves one
+    /// place before the asynchronous native preparation can finish. Conversion
+    /// to a registry charge precedes fallible frame binding, so an error does
+    /// not count the same original call as both spent and reserved.
+    pub fn role_call_budget_usage(&self) -> (u64, u64) {
+        (
+            self.registry.cumulative_observation().admitted,
+            self.roles
+                .iter()
+                .filter(|binding| !binding.admission_charged)
+                .count() as u64,
+        )
+    }
+    pub fn role_call_limit_reached(&self) -> bool {
+        let (spent, _) = self.role_call_budget_usage();
+        self.role_call_limit.is_some_and(|limit| spent >= limit)
+    }
+    fn role_call_admission_available(&self) -> bool {
+        let (spent, reserved) = self.role_call_budget_usage();
+        self.role_call_limit
+            .is_none_or(|limit| spent.saturating_add(reserved) < limit)
+    }
     pub fn has_pending_work(&self) -> bool {
         !self.roles.is_empty()
             || self.machine.frames().next().is_some()
@@ -1875,6 +1917,9 @@ where
             }
         }
         let now = self.check_running()?;
+        if !self.role_call_admission_available() {
+            return Err(AdaptiveManagerError::RoleCallLimit);
+        }
         let role = input.stage.role().ok_or(AdaptiveManagerError::Invalid(
             "CPU stage sent to native owner",
         ))?;
@@ -1913,6 +1958,7 @@ where
             work,
             input,
             ticket: None,
+            admission_charged: false,
             dispatch_pending: false,
             collection_registered: false,
             physical: None,
@@ -2053,17 +2099,26 @@ where
                         }
                     }
                 }
+                let exclusive_completed = self
+                    .exclusive_scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.completed);
                 if self.failures.is_empty()
-                    && self
-                        .exclusive_scope
-                        .as_ref()
-                        .is_some_and(|scope| scope.completed)
+                    && (exclusive_completed
+                        // Every admitted role retains its original physical
+                        // completion/ack/semantic commit obligations. Budget
+                        // exhaustion only closes new work; it cannot discard
+                        // an already reserved output to manufacture success.
+                        || (self.role_call_limit_reached() && self.roles.is_empty()))
                 {
-                    self.begin_root_quiesce(
-                        Instant::now()
-                            .checked_add(Duration::from_secs(30))
-                            .ok_or(AdaptiveManagerError::Deadline)?,
-                    )?;
+                    let until = Instant::now()
+                        .checked_add(Duration::from_secs(30))
+                        .ok_or(AdaptiveManagerError::Deadline)?;
+                    if exclusive_completed {
+                        self.begin_root_quiesce(until)?;
+                    } else {
+                        self.begin_selected_shutdown(until)?;
+                    }
                 }
                 if !self.failures.is_empty() {
                     self.begin_selected_shutdown(
@@ -2094,6 +2149,7 @@ where
             || self.has_pending_work()
             || !self.failures.is_empty()
             || self.exclusive_scope.is_some()
+            || !self.role_call_admission_available()
         {
             return Ok(false);
         }
@@ -2219,6 +2275,7 @@ where
                     .ok_or(AdaptiveManagerError::Invalid("unknown native preparation"))?;
                 let binding = &self.roles[index];
                 if binding.ticket.is_some()
+                    || binding.admission_charged
                     || prepared.question != binding.input.question_digest
                     || prepared.view != binding.input.view_seal
                     || Some(prepared.role) != binding.input.stage.role()
@@ -2246,7 +2303,10 @@ where
                     self.clock.domain(),
                     now,
                 )?;
-                if let Some(work) = &binding.work {
+                let work = binding.work.clone();
+                let preparation_elapsed = binding.prepared_at.elapsed();
+                self.roles[index].admission_charged = true;
+                if let Some(work) = &work {
                     if matches!(
                         work.input.stage,
                         RefinementStage::FreshRepairedEndpoint
@@ -2269,7 +2329,6 @@ where
                 let class = role_cost_class(&ticket, self.registration.device_digest);
                 // Cache/Fresh ownership is known only at the actual completion.
                 // Retain this duration rather than training an assumed Miss.
-                let preparation_elapsed = binding.prepared_at.elapsed();
                 self.roles[index].ticket = Some(ticket);
                 self.roles[index].class = Some(class);
                 self.roles[index].preparation_elapsed = Some(preparation_elapsed);
@@ -3957,6 +4016,9 @@ where
         Ok(())
     }
     fn schedule(&mut self) -> Result<bool, AdaptiveManagerError> {
+        if !self.role_call_admission_available() {
+            return Ok(false);
+        }
         if !self.driver.prepare_semantic_commit()? {
             return Ok(false);
         }
@@ -4071,6 +4133,9 @@ where
             }
         }
         for index in 0..self.own.len() {
+            if !self.role_call_admission_available() {
+                break;
+            }
             if self.own[index].binding.as_ref().is_some_and(|binding| {
                 binding.feedback_forwarded
                     && binding.resume_pending
@@ -4176,7 +4241,9 @@ where
             return Ok(changed);
         }
         for _ in 0..64 {
-            if self.roles.len() >= self.role_pending_limit() {
+            if self.roles.len() >= self.role_pending_limit()
+                || !self.role_call_admission_available()
+            {
                 break;
             }
             let own_available = self
