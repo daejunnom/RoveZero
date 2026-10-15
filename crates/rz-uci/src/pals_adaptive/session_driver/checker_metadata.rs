@@ -12,7 +12,8 @@ use rz_search::cpu_checker::{
     CheckerShutdown, CpuChecker, ExternalProcessIdentity, OwnedCheckerDescriptor,
 };
 use rz_search::external_cpu::worker::{
-    ExternalCpuWorker, ExternalNewGameFence, external_evaluation_namespace,
+    ExternalCpuWorker, ExternalInitialGameBinding, ExternalNewGameFence,
+    external_evaluation_namespace,
 };
 use rz_search::external_cpu::{ExternalCpuConfig, ExternalUciCpuChecker};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,6 +53,7 @@ struct ResetState {
 )]
 enum MetadataResetArm {
     Owned { deadline: Instant },
+    InitialExternal { deadline: Instant },
     External { fence: ExternalNewGameFence },
 }
 
@@ -297,6 +299,56 @@ impl AdaptiveCheckerMetadata {
             last_reset_high_water: 0,
             last_authority: None,
         });
+        Ok(())
+    }
+
+    /// The first semantic game may adopt a physically pristine startup owner.
+    /// This token certifies that binding only, never a reset or old-root fence.
+    pub fn arm_external_initial_game(
+        &self,
+        worker: &ExternalCpuWorker,
+        config: &ExternalCpuConfig,
+        proof: ExternalInitialGameBinding,
+    ) -> Result<(), CheckerError> {
+        self.matches_external_config(config)?;
+        if !worker.configuration_matches(config, proof.owner())
+            || proof.source() != external_evaluation_namespace(&config.identity)?
+        {
+            return Err(CheckerError::Invalid(
+                "external initial game actual owner differs",
+            ));
+        }
+        let mut reset = self
+            .reset
+            .lock()
+            .map_err(|_| CheckerError::Invalid("metadata reset owner poisoned"))?;
+        if reset.pending.is_some() {
+            return Err(CheckerError::Invalid("metadata reset already armed"));
+        }
+        let sequence = reset
+            .sequence
+            .checked_add(1)
+            .ok_or(CheckerError::Invalid("metadata reset sequence exhausted"))?;
+        let binding = reset.external.as_mut().ok_or(CheckerError::Unsupported(
+            "actual external metadata owner was not bound",
+        ))?;
+        let next = proof.authority();
+        if binding.owner != proof.owner()
+            || binding.configuration != *config
+            || binding.epoch != next.epoch
+            || binding.implementation != next.implementation
+            || binding.process_identity != proof.process_identity()
+            || binding.last_authority.is_some()
+            || binding.last_reset_high_water != 0
+        {
+            return Err(CheckerError::Invalid(
+                "external initial game binding already used or foreign",
+            ));
+        }
+        let deadline = worker.consume_initial_game_binding(proof)?;
+        binding.last_authority = Some(next);
+        reset.sequence = sequence;
+        reset.pending = Some(MetadataResetArm::InitialExternal { deadline });
         Ok(())
     }
 
@@ -631,6 +683,7 @@ impl CpuChecker for AdaptiveCheckerMetadataMirror {
         ))?;
         let effective_deadline = match arm {
             MetadataResetArm::Owned { deadline: owner } => deadline.min(owner),
+            MetadataResetArm::InitialExternal { deadline: owner } => deadline.min(owner),
             MetadataResetArm::External { .. } => deadline,
         };
         check_controls(effective_deadline, cancel)

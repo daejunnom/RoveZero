@@ -328,6 +328,38 @@ impl ExternalRootFence {
     }
 }
 
+/// One-shot first-game binding of the actual pristine startup owner. This is
+/// neither an old-root fence nor evidence that ucinewgame/reset was performed.
+/// Only the retained worker can issue it before any Job or lifecycle request.
+/// Startup evidence and an unjoined controller are not a new child-liveness
+/// probe: a later child exit still fails at the original task/pipe boundary.
+#[derive(Debug)]
+pub struct ExternalInitialGameBinding {
+    record: InitialGameRecord,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InitialGameRecord {
+    authority: SearchAuthority,
+    owner: CpuWorkerId,
+    source: Digest,
+    process: ExternalProcessIdentity,
+    until: Instant,
+}
+impl ExternalInitialGameBinding {
+    pub fn authority(&self) -> SearchAuthority {
+        self.record.authority
+    }
+    pub fn owner(&self) -> CpuWorkerId {
+        self.record.owner
+    }
+    pub fn source(&self) -> Digest {
+        self.record.source
+    }
+    pub fn process_identity(&self) -> ExternalProcessIdentity {
+        self.record.process
+    }
+}
+
 /// Actual game reset by the same retained owner, never a caller metadata arm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExternalNewGameFence {
@@ -387,6 +419,8 @@ struct GameRequest {
 #[derive(Default)]
 struct RootLifecycle {
     authority: Option<SearchAuthority>,
+    initial_game: Option<InitialGameRecord>,
+    initial_game_consumed: bool,
     request: Option<RootRequest>,
     result: Option<Result<ExternalRootFence, CheckerError>>,
     game_request: Option<GameRequest>,
@@ -396,6 +430,19 @@ struct RootLifecycle {
     execution_high_water: u64,
     last_job: Option<ExternalCpuJobEnvelope>,
     control_high_water: u64,
+}
+impl RootLifecycle {
+    fn no_initial_game_work(&self) -> bool {
+        self.request.is_none()
+            && self.result.is_none()
+            && self.game_request.is_none()
+            && self.game_result.is_none()
+            && self.game_sequence == 0
+            && self.fence_sequence == 0
+            && self.execution_high_water == 0
+            && self.last_job.is_none()
+            && self.control_high_water == 0
+    }
 }
 
 fn physical_fence(
@@ -1121,6 +1168,138 @@ impl ExternalCpuWorker {
         drop(roots);
         self.mailbox.signal().notify();
         Ok(())
+    }
+
+    /// Bind the first game only while the actual startup owner is pristine.
+    /// None means a previous binding/work/lifecycle exists: callers must use
+    /// the normal old-root fence/reset path, never infer freshness themselves.
+    /// This reads retained evidence only; the manager performs no pipe work.
+    pub fn bind_initial_game(
+        &self,
+        next: SearchAuthority,
+        until: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<Option<ExternalInitialGameBinding>, CheckerError> {
+        if cancel.load(Ordering::Acquire)
+            || Instant::now() >= until
+            || self.shutdown.load(Ordering::Acquire)
+            || self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+        {
+            return Err(error("initial_game", "closed_or_revoked"));
+        }
+        if next.epoch != self.clock.domain.0 || next.game.0 == 0 || next.root.0 == 0 {
+            return Err(error("initial_game", "authority_mismatch"));
+        }
+        let startup = self
+            .startup
+            .lock()
+            .map_err(|_| error("initial_game", "startup_owner_poisoned"))?
+            .clone()
+            .ok_or_else(|| error("initial_game", "actual_startup_missing"))?;
+        startup.result?;
+        let attempt = startup
+            .attempt
+            .ok_or_else(|| error("initial_game", "actual_startup_attempt_missing"))?;
+        let external = attempt
+            .external
+            .ok_or_else(|| error("initial_game", "actual_startup_process_missing"))?;
+        let process = external.process;
+        let identity = process
+            .process_identity
+            .filter(|id| {
+                id.pid != 0
+                    && id.process_group != 0
+                    && id.proc_start_ticks != 0
+                    && !process.quit_sent
+                    && !process.exit_observed
+                    && !process.cleanup_complete
+                    && !process.quarantined
+                    && !process.ownership_lost
+            })
+            .ok_or_else(|| error("initial_game", "actual_startup_not_reusable"))?;
+        if attempt.work != CheckerWork::default()
+            || external.request_id != 0
+            || external.partial_report.is_some()
+        {
+            return Err(error("initial_game", "startup_contains_search_work"));
+        }
+        let source = external_evaluation_namespace(&self.config.identity)?;
+        let mut roots = self
+            .roots
+            .lock()
+            .map_err(|_| error("initial_game", "root_owner_poisoned"))?;
+        let occupancy = self.mailbox.occupancy();
+        if roots.authority.is_some()
+            || roots.initial_game.is_some()
+            || !roots.no_initial_game_work()
+            || self.last_execution != 0
+            || occupancy.commands != 0
+            || occupancy.reliable_queued != 0
+            || occupancy.reliable_reserved != 0
+            || occupancy.progress_present
+            || occupancy.closed
+        {
+            return Ok(None);
+        }
+        if cancel.load(Ordering::Acquire)
+            || Instant::now() >= until
+            || self.shutdown.load(Ordering::Acquire)
+            || self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+        {
+            return Err(error("initial_game", "closed_or_revoked"));
+        }
+        let record = InitialGameRecord {
+            authority: next,
+            owner: self.owner,
+            source,
+            process: identity,
+            until,
+        };
+        roots.authority = Some(next);
+        roots.initial_game = Some(record);
+        Ok(Some(ExternalInitialGameBinding { record }))
+    }
+
+    /// Consume the non-cloneable token once against this retained pristine
+    /// owner. A new metadata object cannot replay it. No root/reset fence,
+    /// physical reset or new readiness/liveness observation is issued; the
+    /// returned deadline bounds only the semantic mirror delivery.
+    pub fn consume_initial_game_binding(
+        &self,
+        binding: ExternalInitialGameBinding,
+    ) -> Result<Instant, CheckerError> {
+        if self.shutdown.load(Ordering::Acquire)
+            || self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+            || self.last_execution != 0
+        {
+            return Err(error("initial_game", "owner_no_longer_pristine"));
+        }
+        let mut roots = self
+            .roots
+            .lock()
+            .map_err(|_| error("initial_game", "root_owner_poisoned"))?;
+        let record = binding.record;
+        let occupancy = self.mailbox.occupancy();
+        if roots.initial_game != Some(record)
+            || roots.initial_game_consumed
+            || roots.authority != Some(record.authority)
+            || !roots.no_initial_game_work()
+            || Instant::now() >= record.until
+            || occupancy.commands != 0
+            || occupancy.reliable_queued != 0
+            || occupancy.reliable_reserved != 0
+            || occupancy.progress_present
+            || occupancy.closed
+            || self.shutdown.load(Ordering::Acquire)
+            || self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+        {
+            return Err(error(
+                "initial_game",
+                "binding_used_foreign_or_no_longer_pristine",
+            ));
+        }
+        roots.initial_game_consumed = true;
+        Ok(record.until)
     }
 
     /// Register a finite game reset after a real root fence. The worker sends

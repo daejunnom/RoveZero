@@ -73,6 +73,20 @@ pub type AdaptiveCompletedRootObserver<B> = Arc<
         + Sync,
 >;
 
+// Declare after taking the session state lock: failure closes admission before
+// that lock is released, including unwinding and an already waiting next go.
+struct InitialGameFailureGuard<'a> {
+    closed: &'a AtomicBool,
+    armed: bool,
+}
+impl Drop for InitialGameFailureGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.closed.store(true, Ordering::Release);
+        }
+    }
+}
+
 pub struct AdaptiveSessionCollectionHooks<B>
 where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
@@ -1014,6 +1028,13 @@ where
                 }
             }
         };
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SearchSessionFailure::physical_completion_unknown());
+        }
+        let mut initial_game = InitialGameFailureGuard {
+            closed: &self.closed,
+            armed: false,
+        };
         let mut owners = match std::mem::replace(&mut *state, SessionState::Moving) {
             SessionState::Idle(owners) => owners,
             retained => {
@@ -1055,7 +1076,8 @@ where
             }
         };
         if game != context.authority.game {
-            if let Err(error) = self.reset_actual_cpu(&mut owners, context) {
+            if let Err(error) = self.reset_actual_cpu(&mut owners, context, &mut initial_game.armed)
+            {
                 // A failed reset may have changed an actual external game or
                 // cleared a CPU owner. Retain it for process cleanup instead
                 // of retrying against the old semantic Store authority.
@@ -1455,6 +1477,7 @@ where
                 progress(movement);
             }
         }
+        initial_game.armed = false;
         Ok(SearchSessionReport {
             best_move: result.best_move,
             work: pals_work(result.counters),
@@ -1512,31 +1535,80 @@ where
         &self,
         owners: &mut IdleOwners<B>,
         context: &SearchSessionContext,
+        initial_game_bound: &mut bool,
     ) -> Result<(), SearchSessionFailure> {
         if let Some(external) = &owners.external {
-            external
+            if !external
                 .worker
-                .request_new_game(context.authority, context.control.deadline)
-                .map_err(|e| SearchSessionFailure::debug("AdaptiveExternalNewGame", &e))?;
-            loop {
-                match external.worker.new_game_fence() {
-                    Some(Ok(proof)) => {
-                        if matches!(self.registration.identity, CheckerIdentity::ExternalUci(_)) {
-                            self.checker_metadata
-                                .arm_external_new_game(&external.config, &proof)
-                                .map_err(|e| {
-                                    SearchSessionFailure::debug("AdaptiveExternalResetProof", &e)
-                                })?;
+                .clock_matches(self.clock.domain(), self.clock.runtime_clock().origin())
+            {
+                return Err(failure(
+                    "AdaptiveExternalClock",
+                    "actual external owner clock differs before game binding",
+                ));
+            }
+            if !context.accepts().unwrap_or(false) {
+                return Err(failure(
+                    "AdaptiveExternalNewGame",
+                    "root revoked before reset",
+                ));
+            }
+            let initial = external
+                .worker
+                .bind_initial_game(
+                    context.authority,
+                    context.control.deadline,
+                    &context.control.cancellation,
+                )
+                .map_err(|e| SearchSessionFailure::debug("AdaptiveExternalInitialGame", &e))?;
+            if let Some(proof) = initial {
+                *initial_game_bound = true;
+                if matches!(self.registration.identity, CheckerIdentity::ExternalUci(_)) {
+                    self.checker_metadata
+                        .arm_external_initial_game(&external.worker, &external.config, proof)
+                        .map_err(|e| {
+                            SearchSessionFailure::debug("AdaptiveExternalInitialGameProof", &e)
+                        })?;
+                } else {
+                    external
+                        .worker
+                        .consume_initial_game_binding(proof)
+                        .map_err(|e| {
+                            SearchSessionFailure::debug("AdaptiveExternalInitialGameProof", &e)
+                        })?;
+                }
+            } else {
+                external
+                    .worker
+                    .request_new_game(context.authority, context.control.deadline)
+                    .map_err(|e| SearchSessionFailure::debug("AdaptiveExternalNewGame", &e))?;
+                loop {
+                    match external.worker.new_game_fence() {
+                        Some(Ok(proof)) => {
+                            if matches!(self.registration.identity, CheckerIdentity::ExternalUci(_))
+                            {
+                                self.checker_metadata
+                                    .arm_external_new_game(&external.config, &proof)
+                                    .map_err(|e| {
+                                        SearchSessionFailure::debug(
+                                            "AdaptiveExternalResetProof",
+                                            &e,
+                                        )
+                                    })?;
+                            }
+                            break;
                         }
-                        break;
+                        Some(Err(error)) => {
+                            return Err(SearchSessionFailure::debug(
+                                "AdaptiveExternalReset",
+                                &error,
+                            ));
+                        }
+                        None if context.accepts().unwrap_or(false) => {
+                            std::thread::sleep(Duration::from_millis(1))
+                        }
+                        None => return Err(SearchSessionFailure::physical_completion_unknown()),
                     }
-                    Some(Err(error)) => {
-                        return Err(SearchSessionFailure::debug("AdaptiveExternalReset", &error));
-                    }
-                    None if context.accepts().unwrap_or(false) => {
-                        std::thread::sleep(Duration::from_millis(1))
-                    }
-                    None => return Err(SearchSessionFailure::physical_completion_unknown()),
                 }
             }
         }

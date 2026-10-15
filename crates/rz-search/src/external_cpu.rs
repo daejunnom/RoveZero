@@ -2812,6 +2812,99 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn initial_game_binding_cannot_cross_workers_or_survive_root_quiesce() {
+        use rz_contracts::pals::SearchAuthority;
+        use rz_contracts::pals_adaptive::CpuWorkerId;
+        use rz_contracts::{
+            ClockDomain, Digest as ContractDigest, GameGeneration, ProcessEpoch, RootGeneration,
+        };
+        use worker::*;
+        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let mut config = fixture_config("fake_uci_waits_for_stop");
+        config.stop_grace = EXTERNAL_STOP_DRAIN_RESERVE;
+        let epoch = ProcessEpoch(29);
+        let clock = ExternalWorkerClock {
+            domain: ClockDomain(epoch),
+            origin: Instant::now(),
+        };
+        let until = Instant::now() + Duration::from_secs(10);
+        fn ready(worker: &ExternalCpuWorker, until: Instant) {
+            while worker.startup_report().is_none() {
+                let version = worker.signal().version();
+                assert!(Instant::now() < until);
+                worker
+                    .signal()
+                    .wait_changed(version, Duration::from_millis(20));
+            }
+            assert!(worker.startup_report().unwrap().result.is_ok());
+        }
+        fn close(worker: &mut ExternalCpuWorker, until: Instant) {
+            worker.request_shutdown(until);
+            let closed = loop {
+                let version = worker.signal().version();
+                if let Some(closed) = worker.try_join() {
+                    break closed.unwrap();
+                }
+                assert!(Instant::now() < until);
+                worker
+                    .signal()
+                    .wait_changed(version, Duration::from_millis(20));
+            };
+            assert!(closed.cleanup_complete && closed.exit_observed && !closed.quarantined);
+        }
+        let mut first =
+            ExternalCpuWorker::spawn(config.clone(), CpuWorkerId(0), clock, until).unwrap();
+        ready(&first, until);
+        let authority = SearchAuthority {
+            epoch,
+            game: GameGeneration(1),
+            root: RootGeneration(1),
+            implementation: ContractDigest([7; 32]),
+        };
+        let proof = first
+            .bind_initial_game(authority, until, &AtomicBool::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(
+            first
+                .bind_initial_game(authority, until, &AtomicBool::new(false))
+                .unwrap()
+                .is_none()
+        );
+        assert!(first.root_fence().is_none());
+        assert!(first.new_game_fence().is_none());
+        // The production process slot admits one external child at a time.
+        // Keep only the stale token while fully closing the original owner.
+        close(&mut first, until);
+        let mut second = ExternalCpuWorker::spawn(config, CpuWorkerId(1), clock, until).unwrap();
+        ready(&second, until);
+        assert!(second.consume_initial_game_binding(proof).is_err());
+
+        let proof = second
+            .bind_initial_game(authority, until, &AtomicBool::new(false))
+            .unwrap()
+            .unwrap();
+        second.request_root_quiesce(authority, until).unwrap();
+        assert!(second.consume_initial_game_binding(proof).is_err());
+        let fence = loop {
+            let version = second.signal().version();
+            if let Some(fence) = second.root_fence() {
+                break fence.unwrap();
+            }
+            assert!(Instant::now() < until);
+            second
+                .signal()
+                .wait_changed(version, Duration::from_millis(20));
+        };
+        assert!(fence.permits_reuse());
+        assert_eq!(fence.execution_high_water(), 0);
+        assert_eq!(fence.game_reset_high_water(), 0);
+        assert!(second.new_game_fence().is_none());
+        close(&mut second, until);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn external_private_worker_seals_progress_report_and_joins_owned_process() {
         use rz_contracts::pals::SearchAuthority;
         use rz_contracts::pals_adaptive::{
@@ -2868,6 +2961,59 @@ mod tests {
             execution,
             owner,
         };
+        let first_until = Instant::now() + Duration::from_secs(3);
+        assert!(
+            worker
+                .bind_initial_game(job.authority, first_until, &AtomicBool::new(true))
+                .is_err()
+        );
+        assert!(
+            worker
+                .bind_initial_game(job.authority, Instant::now(), &AtomicBool::new(false))
+                .is_err()
+        );
+        let wrong_epoch = SearchAuthority {
+            epoch: ProcessEpoch(epoch.0 + 1),
+            ..job.authority
+        };
+        assert!(
+            worker
+                .bind_initial_game(wrong_epoch, first_until, &AtomicBool::new(false))
+                .is_err()
+        );
+        let initial = worker
+            .bind_initial_game(job.authority, first_until, &AtomicBool::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.authority(), job.authority);
+        assert_eq!(initial.owner(), owner);
+        assert_eq!(initial.source(), evaluation);
+        assert!(initial.process_identity().pid > 0);
+        assert!(worker.root_fence().is_none());
+        assert!(worker.new_game_fence().is_none());
+        assert!(
+            worker
+                .bind_initial_game(job.authority, first_until, &AtomicBool::new(false))
+                .unwrap()
+                .is_none()
+        );
+        worker.consume_initial_game_binding(initial).unwrap();
+        // First-game binding is not an old-root fence. The real subsequent
+        // game reset must still wait for actual root quiesce/ready evidence.
+        assert!(matches!(
+            worker.request_new_game(
+                SearchAuthority {
+                    game: GameGeneration(2),
+                    root: RootGeneration(2),
+                    ..job.authority
+                },
+                first_until,
+            ),
+            Err(CheckerError::External {
+                stage: "new_game",
+                code: "actual_root_fence_missing",
+            })
+        ));
         let control = rz_runtime::adaptive::ControlMailbox::new(scope, worker.signal());
         control.request_publish_progress(1).unwrap();
         let at = u64::try_from((Instant::now() - clock.origin).as_nanos()).unwrap() + 3_000_000_000;
@@ -2902,6 +3048,12 @@ mod tests {
             control: control.clone(),
         };
         let submitted = worker.submit_attested(template.clone()).unwrap();
+        assert!(
+            worker
+                .bind_initial_game(job.authority, first_until, &AtomicBool::new(false))
+                .unwrap()
+                .is_none()
+        );
         assert!(submitted.matches_job(&template));
         assert_eq!(submitted.scope(), scope);
         assert_eq!(submitted.evaluation_namespace(), evaluation);

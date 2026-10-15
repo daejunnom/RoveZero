@@ -248,6 +248,43 @@ fn context(clock: &ProcessClock, root: u64, game: u64) -> SearchSessionContext {
     }
 }
 #[test]
+fn initial_game_failure_guard_closes_admission_and_retains_owner() {
+    let (driver, facts, clock, _) = fixture();
+    let driver = Arc::new(driver);
+    let mate = Position::from_fen("7k/6Q1/5K2/8/8/8/8/8 b - - 0 1").unwrap();
+    let context = context(&clock, 1, 0);
+    let until = context.shutdown_deadline;
+    let state = driver.state.lock().unwrap();
+    // Inject only the failed-initial-binding close boundary. This verifies
+    // sticky close and owner retention; begin alone does not prove that the
+    // other run has already passed its pre-lock check and started waiting.
+    let failed_initial = InitialGameFailureGuard {
+        closed: &driver.closed,
+        armed: true,
+    };
+    let waiting_driver = Arc::clone(&driver);
+    let waiting = std::thread::spawn(move || {
+        waiting_driver.run(&mate, &context, &mut |_| {
+            panic!("closed waiting root must never publish a move")
+        })
+    });
+    while driver.work_receipt().unwrap().unwrap().active_invocations != 1 {
+        assert!(Instant::now() < until);
+        std::thread::yield_now();
+    }
+    drop(failed_initial);
+    assert!(driver.closed.load(Ordering::Acquire));
+    drop(state);
+    let error = waiting.join().unwrap().unwrap_err();
+    assert_eq!(error.code, "PhysicalCompletionUnknown");
+    assert!(driver.latest_root_receipt().unwrap().is_none());
+    assert_eq!(facts.quiesces.load(Ordering::Acquire), 0);
+    let closed = driver.finish_process(until).unwrap();
+    assert!(closed.permits_process_close());
+    assert_eq!(facts.finishes.load(Ordering::Acquire), 1);
+}
+
+#[test]
 fn terminal_roots_and_new_game_preserve_actual_session_and_cpu_owner_then_finish_once() {
     let (driver, facts, clock, actual_owner) = fixture();
     let mate = Position::from_fen("7k/6Q1/5K2/8/8/8/8/8 b - - 0 1").unwrap();
