@@ -549,3 +549,24 @@ GPU·학습·대국은 이 실행에서 인수하지 않았다. 실제 학습은
 실패했지만 retained-FD 절대 load와 매핑은 확인됐다. CUDA API·provider·NN 성공으로
 해석하지 않는다. 뒤의 단일 API 요청은 코드 실행 전 capacity 실패로 종료됐으며,
 원 실패와 실행하지 못한 범위를 보존하고 기존 runtime/ambient guard를 유지한다.
+
+## Fresh 값의 의미 개수와 실제 NN 입력 계수
+
+ModelWDL resolver의 Fresh 값 하나와 물리 NN 입력 개수를 구분한다. 현재
+`virtual_review_v1`은 public cache miss에서 public graph와 private role graph를
+각각 실행하므로 NN 입력 2개를 완료한다. public cache hit에서는 public 실행만
+생략하고 Fresh private role graph를 실행하므로 NN 입력 1개를 완료한다. 공통
+Search 접점에서 이 물리 개수를 항상 1로 제한하거나 항상 2로 대체하지 않는다.
+
+Fresh 값 수락에는 원 실행 ID·측정 완료·Fresh 여부·알려진 양의 실제 완료량을
+요구한다. 0·unknown·불완전 측정·Warm 결과를 Fresh 값으로 수락하지 않는다.
+모델별 graph 계수와 cache 사용은 원 native owner의 실제 accounting으로 남기며,
+Search의 값 하나·Store 관측 하나·ticket 소비 한 번으로 환산해 덮어쓰지 않는다.
+원 namespace·정확 질문과 view·representation·WDL 관점·중복 commit 검사는 유지한다.
+
+`66aff9f`의 별도 own ModelWDL 실제 실행은 ticket 5개/NN 입력 10개를 완료했지만,
+의미 소비 4개/NN 입력 8개 뒤 `Role(InvalidOutput)`으로 실패했다. 원 stderr·
+fallback 착수·정상 종료 자료를 보존하며 정상 검색으로 인수하지 않는다. 소스와
+counter의 대조로 Fresh 값의 `Some(1)` 고정 검사를 원인으로 좁혔고, CPU/mock
+회귀에서 count 1은 통과하고 count 2는 Store commit 전에 거부되는 것을 재현했다.
+수정 후의 실제 신경망 검색과 외부 CPU_R 검사는 새 바이너리로 별도 인수한다.

@@ -485,7 +485,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::port_tests::{output, setup, work};
+    use super::super::port_tests::{output, setup, setup_with_resolver, work};
     use super::*;
 
     #[test]
@@ -610,13 +610,46 @@ mod tests {
 
     #[test]
     fn fresh_physical_admission_failure_does_not_consume_a_semantic_attempt() {
-        let mut port = setup(Position::startpos(), 3);
+        let mut port =
+            setup_with_resolver(Position::startpos(), 3, ResolverPolicy::ModelWdlRestricted);
         let submitted = work(&mut port, "e2e4", RefinementStage::ProposalValueFresh, 1);
         let (ticket, response) = output(&submitted, 1);
         let observations = port.engine.stores.observations.next_observation_sequence();
-        for _ in 0..2 {
+        let completed = AdaptivePortRoleEvidence {
+            execution: Some(rz_contracts::ExecutionId::new(ticket.id.epoch, 1)),
+            completed_nn_inputs: Some(2),
+            measurement_complete: true,
+            physical_fresh: Some(true),
+        };
+        for physical in [
+            None,
+            Some(AdaptivePortRoleEvidence {
+                completed_nn_inputs: None,
+                ..completed
+            }),
+            Some(AdaptivePortRoleEvidence {
+                completed_nn_inputs: Some(0),
+                ..completed
+            }),
+            Some(AdaptivePortRoleEvidence {
+                measurement_complete: false,
+                ..completed
+            }),
+            Some(AdaptivePortRoleEvidence {
+                physical_fresh: None,
+                ..completed
+            }),
+            Some(AdaptivePortRoleEvidence {
+                physical_fresh: Some(false),
+                ..completed
+            }),
+            Some(AdaptivePortRoleEvidence {
+                execution: None,
+                ..completed
+            }),
+        ] {
             assert!(matches!(
-                port.commit_role(&submitted, &ticket, &response, None),
+                port.commit_role(&submitted, &ticket, &response, physical),
                 Err(PalsError::Role(RoleError::InvalidOutput))
             ));
             assert!(!port.attempted_role_commits.contains(&ticket.id));
@@ -625,6 +658,53 @@ mod tests {
                 port.engine.stores.observations.next_observation_sequence(),
                 observations
             );
+        }
+    }
+
+    #[test]
+    fn fresh_value_consumes_one_output_with_one_or_two_completed_graph_inputs() {
+        // Authored completion metadata isolates the semantic admission boundary;
+        // this is not a native NN, provider, or physical-completion attestation.
+        for completed_nn_inputs in [1, 2] {
+            let mut port =
+                setup_with_resolver(Position::startpos(), 3, ResolverPolicy::ModelWdlRestricted);
+            let submitted = work(&mut port, "e2e4", RefinementStage::ProposalValueFresh, 1);
+            let (ticket, response) = output(&submitted, 1);
+            let observations = port.engine.stores.observations.next_observation_sequence();
+            let physical = Some(AdaptivePortRoleEvidence {
+                execution: Some(rz_contracts::ExecutionId::new(ticket.id.epoch, 1)),
+                completed_nn_inputs: Some(completed_nn_inputs),
+                measurement_complete: true,
+                physical_fresh: Some(true),
+            });
+            let step = port
+                .commit_role(&submitted, &ticket, &response, physical)
+                .unwrap_or_else(|error| {
+                    panic!("{completed_nn_inputs} completed inputs: {error:?}")
+                });
+            let observation = port.engine.nodes[submitted.input.question.node]
+                .model_observation
+                .expect("one committed model value");
+            let stored = port.engine.stores.observations.get(observation).unwrap();
+            assert!(matches!(stored.score, RawScore::ContextWdl { .. }));
+            assert_eq!(stored.model_value_input, Some(response.key.input.0));
+            assert!(port.attempted_role_commits.contains(&ticket.id));
+            assert!(port.accepted.contains(&ticket.id));
+            let committed = port.engine.stores.observations.next_observation_sequence();
+            assert_eq!(committed, observations + 1);
+            assert!(
+                port.commit_role(&submitted, &ticket, &response, physical)
+                    .is_err()
+            );
+            assert_eq!(
+                port.engine.stores.observations.next_observation_sequence(),
+                committed
+            );
+            port.role_consumed(&ticket, &submitted.input.view).unwrap();
+            let consumed = port.counters.consumed_role_outputs;
+            port.role_consumed(&ticket, &submitted.input.view).unwrap();
+            assert_eq!(port.counters.consumed_role_outputs, consumed);
+            port.materialize_step(step).unwrap();
         }
     }
 

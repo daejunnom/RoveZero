@@ -14,20 +14,34 @@ use rz_runtime::adaptive::CoordinatorPolicy;
 type Port = AdaptiveEnginePort<LegalOrderRoleMock>;
 type Work = CoordinatorWork<ReviewView, AdaptivePortQuestion>;
 pub(super) fn setup(position: Position, line_plies: usize) -> Port {
+    setup_with_resolver(position, line_plies, ResolverPolicy::OwnRawRestricted)
+}
+pub(super) fn setup_with_resolver(
+    position: Position,
+    line_plies: usize,
+    resolver: ResolverPolicy,
+) -> Port {
     let cpu = CpuEngine::new(crate::cpu::CpuConfig {
         tt_entries: 16,
         max_depth: 8,
         ..Default::default()
     })
     .unwrap();
-    let engine = PalsEngine::new(
-        PalsConfig {
-            line_plies,
-            ..Default::default()
-        },
-        LegalOrderRoleMock,
-        cpu,
-    )
+    let config = PalsConfig {
+        line_plies,
+        ..Default::default()
+    };
+    let engine = match resolver {
+        // Keep the original fixture's legacy followup-lane/default identity.
+        ResolverPolicy::OwnRawRestricted => PalsEngine::new(config, LegalOrderRoleMock, cpu),
+        ResolverPolicy::ModelWdlRestricted => PalsEngine::new_with_boxed_checker_and_policies(
+            config,
+            LegalOrderRoleMock,
+            Box::new(OwnedCpuChecker::new(Box::new(cpu)).unwrap()),
+            resolver,
+            PostRepairRecheckPolicy::Disabled,
+        ),
+    }
     .unwrap()
     .with_selected_review_context(
         ReviewSelectionPolicy::default(),

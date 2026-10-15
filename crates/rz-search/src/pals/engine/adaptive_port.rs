@@ -380,6 +380,8 @@ impl AdaptiveRulesPairProof {
 #[derive(Clone, Copy, Debug)]
 pub struct AdaptivePortRoleEvidence {
     pub execution: Option<rz_contracts::ExecutionId>,
+    /// Actual completed physical NN inputs, not semantic value/output count.
+    /// A Fresh role may execute both a public graph and a private role graph.
     pub completed_nn_inputs: Option<u64>,
     pub measurement_complete: bool,
     pub physical_fresh: Option<bool>,
