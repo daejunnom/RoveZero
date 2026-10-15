@@ -1065,46 +1065,43 @@ impl CpuWorker {
             // Construct the non-Send/non-Sync guard on this exact worker.
             // No closure capture or JoinHandle result contains that guard.
             let mut affinity_owner = match cpus {
-                Some(cpus) => match {
+                Some(cpus) => {
                     #[cfg(test)]
-                    {
-                        hooks
-                            .affinity_start_failure
-                            .take()
-                            .map_or_else(|| CurrentCpuThreadAffinityOwner::begin(cpus), Err)
-                    }
+                    let started = hooks
+                        .affinity_start_failure
+                        .take()
+                        .map_or_else(|| CurrentCpuThreadAffinityOwner::begin(cpus), Err);
                     #[cfg(not(test))]
-                    {
-                        CurrentCpuThreadAffinityOwner::begin(cpus)
+                    let started = CurrentCpuThreadAffinityOwner::begin(cpus);
+                    match started {
+                        Ok(guard) => {
+                            let _ = worker_affinity_ready
+                                .as_ref()
+                                .expect("opt-in affinity owns its ready slot")
+                                .set(Ok(guard.applied().clone()));
+                            Some(guard)
+                        }
+                        Err(error) => {
+                            let recoverable = error.permits_unstarted_engine_recovery();
+                            let _ = worker_affinity_ready
+                                .as_ref()
+                                .expect("opt-in affinity owns its ready slot")
+                                .set(Err(error));
+                            let _ = worker_readback.set(Err(CpuResourceError::InvalidReadback));
+                            worker_mailbox.close();
+                            worker_mailbox.signal().notify();
+                            // A rejected search did not consume CPU work, but
+                            // failed/unknown mutation rollback cannot authorize
+                            // recovery of this worker owner. Preserve its original
+                            // typed error; only pre-mutation/verified rollback can
+                            // return the same engine after a known join.
+                            return CpuWorkerExit {
+                                engine: recoverable.then_some(engine),
+                                affinity_finished: None,
+                            };
+                        }
                     }
-                } {
-                    Ok(guard) => {
-                        let _ = worker_affinity_ready
-                            .as_ref()
-                            .expect("opt-in affinity owns its ready slot")
-                            .set(Ok(guard.applied().clone()));
-                        Some(guard)
-                    }
-                    Err(error) => {
-                        let recoverable = error.permits_unstarted_engine_recovery();
-                        let _ = worker_affinity_ready
-                            .as_ref()
-                            .expect("opt-in affinity owns its ready slot")
-                            .set(Err(error));
-                        let _ = worker_readback.set(Err(CpuResourceError::InvalidReadback));
-                        worker_mailbox.close();
-                        worker_mailbox.signal().notify();
-                        // A rejected search did not consume CPU work, but
-                        // failed/unknown mutation rollback cannot authorize
-                        // recovery of this worker owner. Preserve its original
-                        // typed error; only pre-mutation/verified rollback can
-                        // return the same engine after a known join.
-                        return CpuWorkerExit {
-                            engine: recoverable.then_some(engine),
-                            affinity_finished: None,
-                        };
-                    }
-                },
+                }
                 None => None,
             };
             // Observe this actual OS thread once, before accepting search
