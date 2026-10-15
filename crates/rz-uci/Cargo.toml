@@ -30,6 +30,10 @@ required-features = ["search-work-receipts"]
 name = "pals_private_warm_cpu_check"
 required-features = ["onnx-cpu"]
 
+[[example]]
+name = "pals_continuation_diagnostic"
+required-features = ["pals-adaptive-diagnostics"]
+
 [features]
 experimental-batch = ["rz-search/experimental-batch", "rz-eval/experimental-batch"]
 experimental-io-buffers = ["rz-eval/experimental-io-buffers"]
