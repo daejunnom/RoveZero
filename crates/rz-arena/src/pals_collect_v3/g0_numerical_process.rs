@@ -641,30 +641,33 @@ pub(super) mod linux {
         for input in &registration.runtime_module_pins {
             common::hold_input(input.clone(), false, held, &mut credit)?;
         }
-        // Validate the unchanged runtime/cache part before any child starts.
-        // Generated model paths are still materialized by the original G0 flow.
-        let capture_raw = common::hold_input(
-            registration.native_capture_config.clone(),
-            true,
-            held,
-            &mut credit,
-        )?;
-        let capture: numerical::NativeCaptureConfig = common::decode(&capture_raw)?;
-        numerical::validate_capture_inputs(
-            &capture,
-            &template.config,
-            &template.private_cwd,
-            &registration.staging_root,
-        )?;
-        common::retain_directory(capture.runtime_cache.clone(), held)?;
-        super::super::g0_cuda_artifact_tree::prepare(
-            held,
-            &capture.runtime_cache,
-            &capture.runtime_library,
-            capture.cuda_bundle.as_deref(),
-            registration.max_output_bytes,
-            &mut credit,
-        )?;
+        if template.config.endpoint.model.backend == PalsModelBackendV3::OrtCuda {
+            // Validate the unchanged CUDA runtime/cache before any child.
+            // CPU keeps its original deferred capture/cache preparation.
+            let original = held
+                .inputs
+                .iter()
+                .find(|input| input.pin == registration.native_capture_config)
+                .ok_or_else(|| invalid("G0 original native recipe owner absent"))?;
+            let capture_raw =
+                common::verify_bytes(&original.file, &original.pin, true, &mut credit)?;
+            let capture: numerical::NativeCaptureConfig = common::decode(&capture_raw)?;
+            numerical::validate_capture_inputs(
+                &capture,
+                &template.config,
+                &template.private_cwd,
+                &registration.staging_root,
+            )?;
+            common::retain_directory(capture.runtime_cache.clone(), held)?;
+            super::super::g0_cuda_artifact_tree::prepare(
+                held,
+                &capture.runtime_cache,
+                &capture.runtime_library,
+                capture.cuda_bundle.as_deref(),
+                registration.max_output_bytes,
+                &mut credit,
+            )?;
+        }
         super::super::g0_cuda_artifact_tree::ensure_output_credit(
             held,
             registration.max_output_bytes,

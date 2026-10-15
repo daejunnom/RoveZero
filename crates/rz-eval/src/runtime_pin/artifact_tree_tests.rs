@@ -1,7 +1,7 @@
 //! 작은 regular 텍스트 fixture만 사용한다. native 코드나 신경망은 실행하지 않는다.
 
 use super::*;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{symlink, PermissionsExt};
 
 const BYTES: &[u8] = b"authored non-executable bytes for bounded runtime cache custody and read accounting; no ELF or CUDA library is used by this fixture.";
 static NEXT: AtomicU64 = AtomicU64::new(0);
