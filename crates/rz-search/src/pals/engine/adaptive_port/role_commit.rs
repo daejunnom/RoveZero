@@ -988,7 +988,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             // Fresh WDL needs a known completed evaluation. Its physical graph
             // input count belongs to the producer, not this semantic output:
             // e.g. public cache miss + role graph completes two NN inputs.
-            || !physical.completed_nn_inputs.is_some_and(|inputs| inputs > 0)
+            || physical.completed_nn_inputs.is_none_or(|inputs| inputs == 0)
             || physical.execution.is_none()
         {
             return Err(RoleError::InvalidOutput.into());
