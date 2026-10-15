@@ -280,10 +280,9 @@ fn child_observation(
         if tree
             .matches_directory(&file)
             .map_err(|_| invalid("G0 CUDA entry owner changed"))?
+            && matched.replace((path, file)).is_some()
         {
-            if matched.replace((path, file)).is_some() {
-                return Err(invalid("G0 CUDA duplicate cache directory"));
-            }
+            return Err(invalid("G0 CUDA duplicate cache directory"));
         }
     }
     let (path, file) = matched.ok_or_else(|| invalid("G0 CUDA exact prepared entry absent"))?;
