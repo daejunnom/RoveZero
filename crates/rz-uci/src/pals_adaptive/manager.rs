@@ -4312,9 +4312,7 @@ where
             FrameTransition::Complete { scope } => {
                 ContinuationTransitionKind::Complete { scope: *scope }
             }
-            FrameTransition::Unknown { reason } => {
-                ContinuationTransitionKind::Unknown { reason: *reason }
-            }
+            FrameTransition::Unknown { reason } => ContinuationTransitionKind::Unknown { reason },
         };
         #[cfg(feature = "pals-adaptive-diagnostics")]
         let checked_rules_pair = checked.rules_pair.is_some();
