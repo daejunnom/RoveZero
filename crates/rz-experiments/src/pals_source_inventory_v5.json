@@ -137,6 +137,7 @@
       "crates/rz-runtime/src/adaptive/cost.rs",
       "crates/rz-runtime/src/adaptive/mailbox.rs",
       "crates/rz-runtime/src/adaptive/ready.rs",
+      "crates/rz-runtime/src/adaptive/thread_owner.rs",
       "crates/rz-runtime/src/adaptive/topology.rs",
       "crates/rz-runtime/src/notification.rs"
     ],
@@ -147,6 +148,7 @@
       "crates/rz-platform/src/placement.rs",
       "crates/rz-platform/src/windows.rs",
       "crates/rz-runtime/Cargo.toml",
+      "crates/rz-runtime/src/adaptive/thread_owner.rs",
       "crates/rz-runtime/src/adaptive/topology.rs",
       "crates/rz-uci/src/pals_adaptive/session_driver.rs",
       "crates/rz-uci/src/pals_adaptive/session_driver/completion_observation.rs",
@@ -341,6 +343,7 @@
       "crates/rz-runtime/src/adaptive/cost.rs",
       "crates/rz-runtime/src/adaptive/mailbox.rs",
       "crates/rz-runtime/src/adaptive/ready.rs",
+      "crates/rz-runtime/src/adaptive/thread_owner.rs",
       "crates/rz-runtime/src/adaptive/topology.rs",
       "crates/rz-runtime/src/boundary.rs",
       "crates/rz-runtime/src/contracts.rs",

@@ -515,6 +515,7 @@ dependencies = [
  "cap-std",
  "nix",
  "rz-contracts",
+ "rz-platform",
  "rz-position",
  "rz-runtime",
  "rz-telemetry",

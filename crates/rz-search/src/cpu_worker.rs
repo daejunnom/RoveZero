@@ -17,7 +17,9 @@ use rz_position::contracts::ContractPosition;
 use rz_position::{BoardMove, Position};
 use rz_runtime::CompletionSignal;
 use rz_runtime::adaptive::{
-    ControlSnapshot, CpuActor, CpuResourceError, CpuThreadReadback, MailboxError, ReliablePermit,
+    ControlSnapshot, CpuActor, CpuResourceError, CpuThreadAffinityApplied,
+    CpuThreadAffinityFinishError, CpuThreadAffinityObservation, CpuThreadAffinityStartError,
+    CpuThreadReadback, CurrentCpuThreadAffinityOwner, LogicalCpu, MailboxError, ReliablePermit,
     WorkerMailbox, observe_current_cpu_thread,
 };
 use sha2::{Digest as _, Sha256};
@@ -334,6 +336,9 @@ pub struct CpuWorkerShutdown {
     /// None is not observed; Err retains a startup probe/role failure and never
     /// attests a complete inventory or an applied resource setting.
     pub ready_readback: Option<Result<CpuThreadReadback, CpuResourceError>>,
+    /// Opt-in current-thread ownership evidence. A joined or recovered CPU
+    /// engine does not substitute for successful explicit restoration.
+    pub thread_affinity: CpuWorkerThreadAffinityShutdown,
     /// The actual engine may be taken only after this known joined exit. This
     /// does not replace settlement of the returned reliable event receipts.
     pub engine_recoverable: bool,
@@ -727,8 +732,32 @@ impl CpuSubmissionFence {
     }
 }
 
+/// Engine owner IDs remain opaque here. In particular, this receipt does
+/// not convert the existing 1-based bootstrap owner into runtime's 0-based
+/// actor slot or attest manager/native/ORT placement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CpuWorkerThreadAffinityShutdown {
+    NotRequested,
+    Requested {
+        ready: Option<Result<CpuThreadAffinityApplied, CpuThreadAffinityStartError>>,
+        /// None after a started owner means explicit restoration was not
+        /// observed (for example, an uncaught unwind), never restored=true.
+        finished: Option<Result<CpuThreadAffinityObservation, CpuThreadAffinityFinishError>>,
+    },
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CpuWorkerTestHooks {
+    before_paused_command_poll: Option<Box<dyn FnOnce() + Send + 'static>>,
+    affinity_start_failure: Option<CpuThreadAffinityStartError>,
+    affinity_finish_failure: Option<CpuThreadAffinityFinishError>,
+    panic_after_affinity_ready: bool,
+}
+
 struct CpuWorkerExit {
     engine: Option<CpuEngine>,
+    affinity_finished: Option<Result<CpuThreadAffinityObservation, CpuThreadAffinityFinishError>>,
 }
 struct ActiveJob {
     job: CpuJob,
@@ -837,6 +866,9 @@ pub struct CpuWorker {
     mailbox: CpuWorkerMailbox,
     shutdown: Arc<AtomicBool>,
     ready_readback: Arc<OnceLock<Result<CpuThreadReadback, CpuResourceError>>>,
+    affinity_ready:
+        Option<Arc<OnceLock<Result<CpuThreadAffinityApplied, CpuThreadAffinityStartError>>>>,
+    affinity_finished: Option<Result<CpuThreadAffinityObservation, CpuThreadAffinityFinishError>>,
     pub signal: CompletionSignal,
     submission: Mutex<CpuSubmissionFence>,
     join: Option<JoinHandle<CpuWorkerExit>>,
@@ -896,6 +928,33 @@ impl CpuWorker {
             None,
         )
     }
+    /// Explicit, opt-in ownership for this actual own-CPU worker only. The
+    /// default constructors remain observe-only. The guard is constructed
+    /// inside the new thread and remains there through token/engine cleanup;
+    /// callers receive cloned receipts, never the non-Send owner itself.
+    /// Admission remains closed until a successful apply+readback is published.
+    /// This is not connected to the production bootstrap and cannot enable
+    /// DedicatedControl or change the spawning thread/process affinity.
+    #[allow(clippy::result_large_err)]
+    pub fn spawn_notified_retaining_with_thread_affinity(
+        owner: CpuWorkerId,
+        engine: CpuEngine,
+        signal: CompletionSignal,
+        command_capacity: usize,
+        cpus: Vec<LogicalCpu>,
+    ) -> Result<Self, (CpuEngine, CpuWorkerError)> {
+        Self::spawn_notified_with_capacity_launcher_and_affinity(
+            owner,
+            engine,
+            signal,
+            command_capacity,
+            Some(cpus),
+            |builder, task| builder.spawn(task),
+            #[cfg(test)]
+            CpuWorkerTestHooks::default(),
+        )
+    }
+
     // The private launcher lets a source test exercise a real pre-start
     // ownership failure without exhausting process/OS resources. An Err must
     // drop, rather than invoke, the submitted task, as Thread::Builder does.
@@ -929,7 +988,35 @@ impl CpuWorker {
             thread::Builder,
             Box<dyn FnOnce() -> CpuWorkerExit + Send + 'static>,
         ) -> std::io::Result<JoinHandle<CpuWorkerExit>>,
-        #[cfg(test)] mut before_paused_command_poll: Option<Box<dyn FnOnce() + Send + 'static>>,
+        #[cfg(test)] before_paused_command_poll: Option<Box<dyn FnOnce() + Send + 'static>>,
+    ) -> Result<Self, (CpuEngine, CpuWorkerError)> {
+        Self::spawn_notified_with_capacity_launcher_and_affinity(
+            owner,
+            engine,
+            signal,
+            command_capacity,
+            None,
+            launcher,
+            #[cfg(test)]
+            CpuWorkerTestHooks {
+                before_paused_command_poll,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn spawn_notified_with_capacity_launcher_and_affinity(
+        owner: CpuWorkerId,
+        engine: CpuEngine,
+        signal: CompletionSignal,
+        command_capacity: usize,
+        cpus: Option<Vec<LogicalCpu>>,
+        launcher: impl FnOnce(
+            thread::Builder,
+            Box<dyn FnOnce() -> CpuWorkerExit + Send + 'static>,
+        ) -> std::io::Result<JoinHandle<CpuWorkerExit>>,
+        #[cfg(test)] mut hooks: CpuWorkerTestHooks,
     ) -> Result<Self, (CpuEngine, CpuWorkerError)> {
         if !(1..=CPU_WORKER_COMMAND_CAPACITY).contains(&command_capacity) {
             return Err((engine, CpuWorkerError::Invalid("CPU command capacity")));
@@ -961,6 +1048,8 @@ impl CpuWorker {
         let worker_mailbox = mailbox.clone();
         let ready_readback = Arc::new(OnceLock::new());
         let worker_readback = ready_readback.clone();
+        let affinity_ready = cpus.as_ref().map(|_| Arc::new(OnceLock::new()));
+        let worker_affinity_ready = affinity_ready.clone();
         // Builder::spawn drops its FnOnce argument when OS creation fails. A
         // shared one-use gate retains the engine on that branch; no engine or
         // TT is cloned. Successful threads take ownership before any work.
@@ -973,6 +1062,51 @@ impl CpuWorker {
                 .take()
                 .expect("CPU startup gate contains its unique engine");
             drop(worker_engine);
+            // Construct the non-Send/non-Sync guard on this exact worker.
+            // No closure capture or JoinHandle result contains that guard.
+            let mut affinity_owner = match cpus {
+                Some(cpus) => match {
+                    #[cfg(test)]
+                    {
+                        hooks
+                            .affinity_start_failure
+                            .take()
+                            .map_or_else(|| CurrentCpuThreadAffinityOwner::begin(cpus), Err)
+                    }
+                    #[cfg(not(test))]
+                    {
+                        CurrentCpuThreadAffinityOwner::begin(cpus)
+                    }
+                } {
+                    Ok(guard) => {
+                        let _ = worker_affinity_ready
+                            .as_ref()
+                            .expect("opt-in affinity owns its ready slot")
+                            .set(Ok(guard.applied().clone()));
+                        Some(guard)
+                    }
+                    Err(error) => {
+                        let recoverable = error.permits_unstarted_engine_recovery();
+                        let _ = worker_affinity_ready
+                            .as_ref()
+                            .expect("opt-in affinity owns its ready slot")
+                            .set(Err(error));
+                        let _ = worker_readback.set(Err(CpuResourceError::InvalidReadback));
+                        worker_mailbox.close();
+                        worker_mailbox.signal().notify();
+                        // A rejected search did not consume CPU work, but
+                        // failed/unknown mutation rollback cannot authorize
+                        // recovery of this worker owner. Preserve its original
+                        // typed error; only pre-mutation/verified rollback can
+                        // return the same engine after a known join.
+                        return CpuWorkerExit {
+                            engine: recoverable.then_some(engine),
+                            affinity_finished: None,
+                        };
+                    }
+                },
+                None => None,
+            };
             // Observe this actual OS thread once, before accepting search
             // work. A failed probe remains explicit and does not install
             // affinity or promote SharedControl to DedicatedControl.
@@ -981,6 +1115,10 @@ impl CpuWorker {
                 .and_then(|id| observe_current_cpu_thread(CpuActor::OwnWorker(id)));
             let _ = worker_readback.set(observed);
             worker_mailbox.signal().notify();
+            #[cfg(test)]
+            if affinity_owner.is_some() && hooks.panic_after_affinity_ready {
+                panic!("injected uncaught worker unwind after affinity readiness");
+            }
             let mut active: Option<ActiveJob> = None;
             let mut progress_sequence = 0u64;
             let mut engine_reusable = true;
@@ -1034,7 +1172,7 @@ impl CpuWorker {
                 // The hook does not exist in non-test worker builds.
                 #[cfg(test)]
                 if active.is_some()
-                    && let Some(observe) = before_paused_command_poll.take()
+                    && let Some(observe) = hooks.before_paused_command_poll.take()
                 {
                     observe();
                 }
@@ -1338,9 +1476,23 @@ impl CpuWorker {
             }
             engine.discard_paused_stack();
             engine_reusable &= engine.validate_frozen_value_namespace().is_ok();
+            // Restore only after this own-CPU task has stopped and discarded
+            // its paused token. An explicit failure stays failed even if the
+            // guard's later Drop best-effort cleanup manages to restore it.
+            let affinity_finished = affinity_owner.as_mut().map(|guard| {
+                #[cfg(test)]
+                if let Some(error) = hooks.affinity_finish_failure.take() {
+                    return Err(error);
+                }
+                guard.finish()
+            });
+            if affinity_finished.as_ref().is_some_and(Result::is_err) {
+                engine_reusable = false;
+            }
             worker_mailbox.signal().notify();
             CpuWorkerExit {
                 engine: engine_reusable.then_some(engine),
+                affinity_finished,
             }
         });
         let join = match launcher(
@@ -1366,6 +1518,8 @@ impl CpuWorker {
             paused_bytes_limit,
             shutdown,
             ready_readback,
+            affinity_ready,
+            affinity_finished: None,
             mailbox,
             signal,
             submission: Mutex::new(CpuSubmissionFence::default()),
@@ -1420,6 +1574,17 @@ impl CpuWorker {
     pub fn ready_readback(&self) -> Option<&Result<CpuThreadReadback, CpuResourceError>> {
         self.ready_readback.get()
     }
+    /// None is either the unchanged observe-only profile, or an opted-in
+    /// worker whose install has not returned. Check `thread_affinity_requested`
+    /// first; neither case means successful application.
+    pub fn thread_affinity_requested(&self) -> bool {
+        self.affinity_ready.is_some()
+    }
+    pub fn thread_affinity_ready(
+        &self,
+    ) -> Option<&Result<CpuThreadAffinityApplied, CpuThreadAffinityStartError>> {
+        self.affinity_ready.as_ref().and_then(|slot| slot.get())
+    }
     fn submit(&self, command: CpuCommand) -> Result<(), CpuSubmissionRejected> {
         let mut fence = match self.submission.lock() {
             Ok(fence) => fence,
@@ -1437,6 +1602,14 @@ impl CpuWorker {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(CpuSubmissionRejected::from_command(
                 CpuWorkerError::Disconnected,
+                command,
+                true,
+            ));
+        }
+        if self.thread_affinity_requested() && !matches!(self.thread_affinity_ready(), Some(Ok(_)))
+        {
+            return Err(CpuSubmissionRejected::from_command(
+                CpuWorkerError::Invalid("CPU worker affinity apply/readback not ready"),
                 command,
                 true,
             ));
@@ -1589,6 +1762,7 @@ impl CpuWorker {
     fn collect_joined(&mut self, join: JoinHandle<CpuWorkerExit>) -> CpuWorkerShutdown {
         let thread_panicked = match join.join() {
             Ok(exit) => {
+                self.affinity_finished = exit.affinity_finished;
                 self.recovered_engine = exit.engine;
                 self.joined_known = self.recovered_engine.is_some();
                 false
@@ -1611,6 +1785,14 @@ impl CpuWorker {
             thread_panicked,
             mailbox: self.mailbox.occupancy(),
             ready_readback: self.ready_readback().cloned(),
+            thread_affinity: if self.thread_affinity_requested() {
+                CpuWorkerThreadAffinityShutdown::Requested {
+                    ready: self.thread_affinity_ready().cloned(),
+                    finished: self.affinity_finished.clone(),
+                }
+            } else {
+                CpuWorkerThreadAffinityShutdown::NotRequested
+            },
             engine_recoverable: self.joined_known,
         }
     }

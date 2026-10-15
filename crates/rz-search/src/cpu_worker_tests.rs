@@ -1842,3 +1842,387 @@ fn invalid_command_limit_returns_unchanged_engine_before_os_owner_start() {
         );
     }
 }
+
+#[test]
+fn observe_only_worker_does_not_claim_affinity_application_or_restoration() {
+    let cpu = engine(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+    let worker = CpuWorker::spawn(CpuWorkerId(0), cpu).unwrap();
+    assert!(!worker.thread_affinity_requested());
+    assert!(worker.thread_affinity_ready().is_none());
+    let stopped = worker.shutdown().unwrap();
+    assert_eq!(
+        stopped.thread_affinity,
+        CpuWorkerThreadAffinityShutdown::NotRequested
+    );
+    assert!(!stopped.thread_panicked);
+    assert!(stopped.engine_recoverable);
+}
+
+#[test]
+fn invalid_opt_in_affinity_preserves_failure_and_never_claims_restoration() {
+    let cpu = engine(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+    let worker = CpuWorker::spawn_notified_retaining_with_thread_affinity(
+        CpuWorkerId(0),
+        cpu,
+        CompletionSignal::default(),
+        1,
+        Vec::new(),
+    )
+    .unwrap_or_else(|(_, error)| panic!("opt-in startup failed before the worker: {error:?}"));
+    assert!(worker.thread_affinity_requested());
+    let stopped = worker.shutdown().unwrap();
+    assert_eq!(
+        stopped.thread_affinity,
+        CpuWorkerThreadAffinityShutdown::Requested {
+            ready: Some(Err(CpuThreadAffinityStartError::InvalidRequest)),
+            finished: None,
+        }
+    );
+    assert!(!stopped.thread_panicked);
+    assert!(stopped.engine_recoverable);
+    assert!(stopped.events.is_empty());
+}
+
+#[test]
+fn opt_in_affinity_rejects_submission_before_actual_apply_readback_without_enqueue() {
+    let cpu = engine(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+    let clock = clock();
+    let owner = CpuWorkerId(0);
+    let initial = job(&cpu, Position::startpos(), None, &clock, owner, 100);
+    let envelope = initial.envelope();
+    let first = grant(envelope, owner, 1, 1);
+    let (release, held) = std::sync::mpsc::sync_channel(1);
+    let worker = CpuWorker::spawn_notified_with_capacity_launcher_and_affinity(
+        owner,
+        cpu,
+        CompletionSignal::default(),
+        1,
+        Some(Vec::new()),
+        |builder, task| {
+            builder.spawn(move || {
+                held.recv_timeout(FIXTURE_WINDOW)
+                    .expect("affinity readiness test must release the staged owner");
+                task()
+            })
+        },
+        CpuWorkerTestHooks::default(),
+    )
+    .unwrap_or_else(|(_, error)| panic!("could not stage actual worker: {error:?}"));
+    assert!(worker.thread_affinity_requested());
+    assert!(worker.thread_affinity_ready().is_none());
+    let rejected = worker.begin_retaining(initial, first).unwrap_err();
+    assert!(rejected.proof().is_verified_unqueued());
+    assert_eq!(
+        rejected.reason(),
+        &CpuWorkerError::Invalid("CPU worker affinity apply/readback not ready")
+    );
+    assert_eq!(worker.occupancy().commands, 0);
+    // The existing fence still owns declined IDs. A duplicate is not another
+    // pre-enqueue refund receipt, even while worker startup is pending.
+    let duplicate = worker.resume_attested(first).unwrap_err();
+    assert_eq!(duplicate.reason(), &CpuWorkerError::Duplicate);
+    assert!(!duplicate.proof().is_verified_unqueued());
+    release.send(()).unwrap();
+    let stopped = worker.shutdown().unwrap();
+    assert!(matches!(
+        stopped.thread_affinity,
+        CpuWorkerThreadAffinityShutdown::Requested {
+            ready: Some(Err(CpuThreadAffinityStartError::InvalidRequest)),
+            finished: None,
+        }
+    ));
+    assert!(stopped.events.is_empty());
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[test]
+fn opt_in_current_worker_affinity_restores_on_its_own_thread_and_leaves_caller_unchanged() {
+    // An unavailable/ambiguous host probe is not placement evidence. That
+    // environment cannot exercise this actual-OS branch; pure failure tests
+    // and the platform guard's deterministic fault-injection tests remain.
+    let Ok(caller) = observe_current_cpu_thread(CpuActor::Manager) else {
+        return;
+    };
+    let Some(caller_mask) = caller.affinity.value() else {
+        return;
+    };
+    let Some(first_cpu) = caller_mask.first().copied() else {
+        return;
+    };
+    let cpu = engine(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+    let signal = CompletionSignal::default();
+    let until = Instant::now() + FIXTURE_WINDOW;
+    let worker = CpuWorker::spawn_notified_retaining_with_thread_affinity(
+        CpuWorkerId(0),
+        cpu,
+        signal.clone(),
+        1,
+        vec![first_cpu],
+    )
+    .unwrap_or_else(|(_, error)| panic!("could not create opt-in worker: {error:?}"));
+    let ready = loop {
+        let version = signal.version();
+        if let Some(ready) = worker.thread_affinity_ready() {
+            break ready.clone();
+        }
+        let remaining = until
+            .checked_duration_since(Instant::now())
+            .expect("actual current-thread install must return within the fixture window");
+        signal.wait_changed(version, remaining.min(Duration::from_millis(10)));
+    };
+    let after_caller = observe_current_cpu_thread(CpuActor::Manager).unwrap();
+    assert_eq!(after_caller.thread_id, caller.thread_id);
+    assert_eq!(after_caller.affinity.value(), caller.affinity.value());
+    let stopped = worker.shutdown().unwrap();
+    match ready {
+        Ok(applied) => {
+            assert_eq!(applied.original.process_id, std::process::id());
+            assert_eq!(applied.applied.process_id, std::process::id());
+            assert_ne!(applied.original.thread_id, caller.thread_id);
+            assert_eq!(applied.applied.thread_id, applied.original.thread_id);
+            assert!(applied.original.identity_stable && applied.applied.identity_stable);
+            assert_eq!(applied.applied.cpus, vec![first_cpu]);
+            assert!(
+                applied
+                    .applied
+                    .cpus
+                    .iter()
+                    .all(|cpu| applied.original.cpus.contains(cpu))
+            );
+            let CpuWorkerThreadAffinityShutdown::Requested {
+                ready: Some(Ok(receipt)),
+                finished: Some(restored),
+            } = stopped.thread_affinity
+            else {
+                panic!("successful owner must publish explicit finish");
+            };
+            assert_eq!(receipt, applied);
+            let restored =
+                restored.expect("successful fixture must explicitly restore original affinity");
+            assert_eq!(restored, applied.original);
+            assert!(stopped.engine_recoverable);
+        }
+        Err(error) => {
+            // A native permission/platform failure is explicit and cannot be
+            // promoted to successful application or restoration by shutdown.
+            let recoverable = error.permits_unstarted_engine_recovery();
+            assert_eq!(
+                stopped.thread_affinity,
+                CpuWorkerThreadAffinityShutdown::Requested {
+                    ready: Some(Err(error)),
+                    finished: None,
+                }
+            );
+            assert_eq!(stopped.engine_recoverable, recoverable);
+        }
+    }
+    assert!(!stopped.thread_panicked);
+    assert!(stopped.events.is_empty());
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn injected_affinity_snapshot() -> rz_platform::ThreadAffinitySnapshot {
+    rz_platform::ThreadAffinitySnapshot::Linux(rz_platform::LinuxThreadAffinity {
+        process_id: 201,
+        thread_id: 202,
+        cpu_ids: vec![0, 1],
+        identity_stable: true,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn injected_affinity_failure_record() -> rz_platform::ThreadAffinityFailureRecord {
+    rz_platform::ThreadAffinityFailureRecord {
+        stage: rz_platform::ThreadAffinityStage::Rollback,
+        failure: rz_platform::ThreadAffinityFailure::ReadbackMismatch,
+        observed: None,
+        set_conflict: None,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn injected_affinity_start_error(
+    rollback: rz_platform::ThreadAffinityRollback,
+) -> CpuThreadAffinityStartError {
+    CpuThreadAffinityStartError::Native(Box::new(rz_platform::ThreadAffinityApplyError {
+        primary: rz_platform::ThreadAffinityFailureRecord {
+            stage: rz_platform::ThreadAffinityStage::VerifyApplied,
+            ..injected_affinity_failure_record()
+        },
+        requested: rz_platform::ThreadAffinityMask::Linux { cpu_ids: vec![0] },
+        original: Some(injected_affinity_snapshot()),
+        rollback_target: Some(rz_platform::ThreadAffinityMask::Linux {
+            cpu_ids: vec![0, 1],
+        }),
+        rollback,
+    }))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[test]
+fn injected_start_rollback_failure_quarantines_actual_worker_engine_after_join() {
+    // These are explicitly injected typed fixtures. No real OS rollback is
+    // performed, and the fixture PID/TID is never live placement evidence.
+    let cases = [
+        (CpuThreadAffinityStartError::InvalidRequest, true),
+        (
+            injected_affinity_start_error(rz_platform::ThreadAffinityRollback::Restored(
+                injected_affinity_snapshot(),
+            )),
+            true,
+        ),
+        (
+            injected_affinity_start_error(
+                rz_platform::ThreadAffinityRollback::OriginalAlreadyObserved(
+                    injected_affinity_snapshot(),
+                ),
+            ),
+            true,
+        ),
+        (
+            injected_affinity_start_error(rz_platform::ThreadAffinityRollback::NotAttempted),
+            false,
+        ),
+        (
+            injected_affinity_start_error(rz_platform::ThreadAffinityRollback::Failed(
+                injected_affinity_failure_record(),
+            )),
+            false,
+        ),
+    ];
+    for (error, recoverable) in cases {
+        let cpu = engine(CpuOrderingPolicy::LegacyMvvLvaV1, 16);
+        let namespace = cpu_evaluation_namespace_digest(&cpu).unwrap();
+        let signal = CompletionSignal::default();
+        let until = Instant::now() + FIXTURE_WINDOW;
+        let mut worker = CpuWorker::spawn_notified_with_capacity_launcher_and_affinity(
+            CpuWorkerId(0),
+            cpu,
+            signal,
+            1,
+            Some(Vec::new()),
+            |builder, task| builder.spawn(task),
+            CpuWorkerTestHooks {
+                affinity_start_failure: Some(error.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|(_, error)| panic!("could not start injected worker: {error:?}"));
+        let stopped = wait_join(&mut worker, until);
+        assert!(stopped.thread_joined && !stopped.thread_panicked);
+        assert_eq!(
+            stopped.ready_readback,
+            Some(Err(CpuResourceError::InvalidReadback))
+        );
+        assert_eq!(
+            stopped.thread_affinity,
+            CpuWorkerThreadAffinityShutdown::Requested {
+                ready: Some(Err(error)),
+                finished: None,
+            }
+        );
+        assert_eq!(stopped.engine_recoverable, recoverable);
+        assert!(stopped.events.is_empty());
+        if recoverable {
+            let recovered = worker.take_engine().unwrap();
+            assert_eq!(
+                cpu_evaluation_namespace_digest(&recovered).unwrap(),
+                namespace
+            );
+            assert_eq!(recovered.config().tt_entries, 16);
+        } else {
+            assert!(matches!(
+                worker.take_engine(),
+                Err(CpuWorkerError::Quarantined)
+            ));
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[test]
+fn explicit_finish_failure_and_uncaught_unwind_never_recover_worker_engine() {
+    let Ok(caller) = observe_current_cpu_thread(CpuActor::Manager) else {
+        return;
+    };
+    let Some(mask) = caller.affinity.value() else {
+        return;
+    };
+    let Some(first_cpu) = mask.first().copied() else {
+        return;
+    };
+    for panic_after_ready in [false, true] {
+        let finish_error = CpuThreadAffinityFinishError::Native(Box::new(
+            rz_platform::ThreadAffinityRestoreError {
+                failure: rz_platform::ThreadAffinityFailureRecord {
+                    stage: rz_platform::ThreadAffinityStage::Restore,
+                    ..injected_affinity_failure_record()
+                },
+                original: injected_affinity_snapshot(),
+                applied: rz_platform::ThreadAffinitySnapshot::Linux(
+                    rz_platform::LinuxThreadAffinity {
+                        process_id: 201,
+                        thread_id: 202,
+                        cpu_ids: vec![0],
+                        identity_stable: true,
+                    },
+                ),
+            },
+        ));
+        let cpu = engine(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+        let until = Instant::now() + FIXTURE_WINDOW;
+        let mut worker = CpuWorker::spawn_notified_with_capacity_launcher_and_affinity(
+            CpuWorkerId(0),
+            cpu,
+            CompletionSignal::default(),
+            1,
+            Some(vec![first_cpu]),
+            |builder, task| builder.spawn(task),
+            CpuWorkerTestHooks {
+                affinity_finish_failure: (!panic_after_ready).then_some(finish_error.clone()),
+                panic_after_affinity_ready: panic_after_ready,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|(_, error)| panic!("could not start lifecycle fixture: {error:?}"));
+        // Normal closure triggers explicit finish. The panic fixture ignores
+        // the closure request and leaves no successful explicit finish receipt.
+        worker.request_shutdown();
+        let stopped = wait_join(&mut worker, until);
+        match stopped.thread_affinity {
+            CpuWorkerThreadAffinityShutdown::Requested {
+                ready: Some(Ok(_)),
+                finished,
+            } => {
+                assert_eq!(stopped.thread_panicked, panic_after_ready);
+                assert!(!stopped.engine_recoverable);
+                assert!(matches!(
+                    worker.take_engine(),
+                    Err(CpuWorkerError::Quarantined)
+                ));
+                if panic_after_ready {
+                    assert!(finished.is_none());
+                } else {
+                    assert_eq!(finished, Some(Err(finish_error)));
+                }
+            }
+            CpuWorkerThreadAffinityShutdown::Requested {
+                ready: Some(Err(error)),
+                finished: None,
+            } => {
+                // The host refused actual install; retain that original error,
+                // never claim that this fixture exercised finish or unwind.
+                assert!(!stopped.thread_panicked);
+                assert_eq!(
+                    stopped.engine_recoverable,
+                    error.permits_unstarted_engine_recovery()
+                );
+            }
+            other => panic!("actual fixture did not publish an install result: {other:?}"),
+        }
+        assert!(stopped.events.is_empty());
+    }
+    let after = observe_current_cpu_thread(CpuActor::Manager).unwrap();
+    assert_eq!(after.thread_id, caller.thread_id);
+    assert_eq!(after.affinity.value(), caller.affinity.value());
+}

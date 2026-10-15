@@ -109,6 +109,8 @@ jobs:
       - run: python scripts/run_managed.py -- cargo test --workspace --all-targets --all-features --locked
       - name: Check current-thread affinity owner cannot cross threads
         run: python scripts/run_managed.py -- cargo test -p rz-platform --doc --locked
+      - name: Check runtime affinity owner cannot cross threads
+        run: python scripts/run_managed.py -- cargo test -p rz-runtime --doc --locked
       - name: Check default-feature CLI refusal before native loading
         run: python scripts/run_managed.py -- cargo test -p rz-uci --bin rz-uci --locked
       - name: Check frozen replay caller without native feature

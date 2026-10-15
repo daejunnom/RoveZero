@@ -8,10 +8,12 @@ mod controller;
 mod cost;
 mod mailbox;
 mod ready;
+mod thread_owner;
 mod topology;
 
 pub use controller::*;
 pub use cost::*;
 pub use mailbox::*;
 pub use ready::*;
+pub use thread_owner::*;
 pub use topology::*;
