@@ -392,6 +392,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-eval/src/pals_onnx/warm/cuda_observation.rs"),
             source!("crates/rz-eval/src/runtime_pin.rs"),
             source!("crates/rz-eval/src/runtime_pin/aliases.rs"),
+            source!("crates/rz-eval/src/runtime_pin/artifact_tree.rs"),
             source!("crates/rz-eval/src/runtime_pin/cache.rs"),
             source!("crates/rz-native-loader/Cargo.toml"),
             source!("crates/rz-native-loader/src/lib.rs"),

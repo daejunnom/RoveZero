@@ -317,6 +317,7 @@
       "crates/rz-eval/src/pals_onnx/warm/cuda_observation.rs",
       "crates/rz-eval/src/runtime_pin.rs",
       "crates/rz-eval/src/runtime_pin/aliases.rs",
+      "crates/rz-eval/src/runtime_pin/artifact_tree.rs",
       "crates/rz-eval/src/runtime_pin/cache.rs",
       "crates/rz-native-loader/Cargo.toml",
       "crates/rz-native-loader/src/lib.rs",
