@@ -231,6 +231,8 @@ struct DriverFixture {
     fail_raw_once: bool,
     fail_role_once: bool,
     fail_after_role_consumption_once: bool,
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    fail_publish_closed_once: bool,
     raw_cpu_receipts: Vec<ExecutionId>,
 }
 impl DriverFixture {
@@ -488,6 +490,12 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
     fn publish_closed(&mut self, closed: &ClosedFrame) -> Result<(), AdaptiveManagerError> {
         assert!(closed.unknown.is_some());
         assert!(closed.completion_scope.is_none());
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        if std::mem::take(&mut self.fail_publish_closed_once) {
+            return Err(AdaptiveManagerError::Semantic(
+                "authored closed-frame publication failure".into(),
+            ));
+        }
         self.closed.push(closed.clone());
         Ok(())
     }
@@ -623,6 +631,8 @@ fn fixture_with_registered_role_limit(
         fail_raw_once: false,
         fail_role_once: false,
         fail_after_role_consumption_once: false,
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        fail_publish_closed_once: false,
         raw_cpu_receipts: Vec::new(),
     };
     let root_input = driver.input(RefinementStage::ProposerRanking, None);
@@ -1935,6 +1945,8 @@ mod adaptive_partial_feedback {
                 fail_raw_once: false,
                 fail_role_once: false,
                 fail_after_role_consumption_once: false,
+                #[cfg(feature = "pals-adaptive-diagnostics")]
+                fail_publish_closed_once: false,
                 raw_cpu_receipts: Vec::new(),
             },
             admissions: Vec::new(),
@@ -2345,4 +2357,235 @@ mod adaptive_partial_feedback {
         ));
         assert_eq!(live.snapshot(), requested);
     }
+}
+
+// Diagnostic regressions reuse the actual manager/native service/CPU fixture.
+// Authored neural outputs remain fixtures, never actual model/Y1/T1/R1 admission.
+#[cfg(feature = "pals-adaptive-diagnostics")]
+#[test]
+fn diagnostic_machine_acceptance_survives_original_closed_publication_failure() {
+    use crate::pals_adaptive::{
+        ContinuationDiagnostic, ContinuationDiagnosticOptions, ContinuationResolutionSource,
+    };
+    for observe in [false, true] {
+        let (mut manager, facts, root, until) =
+            fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+        let diagnostic = observe.then(|| {
+            ContinuationDiagnostic::new(ContinuationDiagnosticOptions {
+                pending_snapshots_max: 0,
+                resolution_records_max: 64,
+                role_consumption: false,
+            })
+            .unwrap()
+        });
+        if let Some(diagnostic) = &diagnostic {
+            manager.install_continuation_diagnostic(diagnostic.clone());
+        }
+        manager.driver_mut().fail_publish_closed_once = true;
+        facts.child_gate.store(true, Ordering::Release);
+        manager.prepare_root_ranking(root).unwrap();
+        let receipt = manager.run_until(until, &AtomicBool::new(false)).unwrap();
+        // run_until returns the actual drained receipt even when it retained a
+        // semantic failure. The original error must not become a normal result.
+        assert!(manager.failures().any(|error| matches!(error,
+            AdaptiveManagerError::Semantic(message)
+                if message == "authored closed-frame publication failure")));
+        assert!(receipt.permits_archive_close());
+        assert_eq!(receipt.pending_tickets, 0);
+        assert_eq!(receipt.native_cpu_reserved, 0);
+        assert!(manager.roles.is_empty());
+        assert_eq!(facts.factories.load(Ordering::Acquire), 1);
+        assert!(facts.finish_called.load(Ordering::Acquire));
+        if let Some(diagnostic) = diagnostic {
+            let observed = diagnostic.snapshot().unwrap();
+            assert_eq!(observed.unavailable_bits, 0);
+            let pair = observed
+                .resolutions
+                .windows(2)
+                .find(|pair| {
+                    matches!(
+                        pair[0].source,
+                        ContinuationResolutionSource::MachineTransition {
+                            checked_rules_pair: false,
+                            accepted: true
+                        }
+                    ) && matches!(
+                        pair[1].source,
+                        ContinuationResolutionSource::ClosedFramePublication { published: false }
+                    ) && pair[0].evidence == pair[1].evidence
+                })
+                .expect(
+                    "actual machine acceptance and later failed publication must remain distinct",
+                );
+            assert_eq!(pair[0].authority, pair[1].authority);
+            assert_eq!(pair[0].closed_frame, Some(pair[0].evidence.frame));
+            assert_eq!(pair[1].closed_frame, pair[0].closed_frame);
+            assert!(pair[0].closed_unknown.is_some());
+            assert!(pair[1].closed_unknown.is_some());
+            assert!(
+                manager
+                    .driver()
+                    .closed
+                    .iter()
+                    .all(|frame| Some(frame.id) != pair[1].closed_frame)
+            );
+        }
+    }
+}
+
+#[cfg(feature = "pals-adaptive-diagnostics")]
+fn assert_diagnostic_question_identity(
+    before: &AdaptivePendingQuestionRow,
+    after: &AdaptivePendingQuestionRow,
+) {
+    assert_eq!(before.preparation, after.preparation);
+    assert_eq!(before.frame, after.frame);
+    assert_eq!(before.stage, after.stage);
+    assert_eq!(before.question, after.question);
+    assert_eq!(before.ticket, after.ticket);
+    assert_eq!(before.view, after.view);
+    assert_eq!(before.retained_view_digest, after.retained_view_digest);
+    assert_eq!(
+        before.retained_view_seal_digest,
+        after.retained_view_seal_digest
+    );
+    assert_eq!(
+        before.selected_record_revisions,
+        after.selected_record_revisions
+    );
+}
+
+#[cfg(feature = "pals-adaptive-diagnostics")]
+#[test]
+fn diagnostic_actual_native_queue_admissions_keep_other_pending_question_identity() {
+    use crate::pals_adaptive::{
+        ContinuationDiagnostic, ContinuationDiagnosticOptions, ContinuationPendingSource,
+    };
+    use rz_search::pals::coordinator::TicketPhase;
+    let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    let diagnostic = ContinuationDiagnostic::new(ContinuationDiagnosticOptions {
+        pending_snapshots_max: 16,
+        resolution_records_max: 0,
+        role_consumption: false,
+    })
+    .unwrap();
+    manager.install_continuation_diagnostic(diagnostic.clone());
+    manager.prepare_root_ranking(root).unwrap();
+    // Reuse the existing finite fixture gate, never add a production barrier.
+    // Two bound tickets alone are insufficient: require both actual queue clocks.
+    pump(&mut manager, until, |manager| {
+        manager.roles.len() == 2
+            && manager.roles.iter().all(|binding| {
+                binding.work.is_some()
+                    && binding.ticket.is_some()
+                    && binding.queue_admitted_at.is_some()
+                    && !binding.service_completed
+                    && !binding.consumption_recorded
+            })
+    });
+    let before = diagnostic.snapshot().unwrap();
+    assert_eq!(before.unavailable_bits, 0);
+    let queued: Vec<_> = before
+        .pending
+        .iter()
+        .filter(|event| {
+            event.source == ContinuationPendingSource::QueueAdmitted
+                && event.snapshot.as_ref().is_ok_and(|snapshot| {
+                    snapshot.questions.iter().any(|row| {
+                        row.frame.is_some()
+                            && row.ticket.is_some_and(|ticket| ticket.id == event.trigger)
+                    })
+                })
+        })
+        .collect();
+    assert_eq!(queued.len(), 2);
+    assert_ne!(queued[0].trigger, queued[1].trigger);
+    assert!(queued[0].queue_admitted_at.is_some());
+    assert!(queued[1].queue_admitted_at.is_some());
+    assert!(queued[0].queue_admitted_at <= queued[1].queue_admitted_at);
+    let both = queued[1].snapshot.as_ref().unwrap();
+    assert_eq!(both.questions.len(), 2);
+    for row in &both.questions {
+        assert!(row.frame.is_some());
+        assert!(
+            row.ticket
+                .is_some_and(|ticket| queued.iter().any(|event| event.trigger == ticket.id))
+        );
+        assert!(matches!(
+            row.registry_observed_phase,
+            Some(TicketPhase::Submitted | TicketPhase::PhysicallyRunning)
+        ));
+        assert!(!row.completion_received && !row.consumption_recorded);
+        let binding = manager
+            .roles
+            .iter()
+            .find(|binding| binding.ticket == row.ticket)
+            .unwrap();
+        assert!(binding.queue_admitted_at.is_some());
+        assert_eq!(row.question, binding.input.question_digest);
+        assert_eq!(row.view, binding.input.view_seal);
+    }
+    let first = queued[0]
+        .snapshot
+        .as_ref()
+        .unwrap()
+        .questions
+        .iter()
+        .find(|row| {
+            row.ticket
+                .is_some_and(|ticket| ticket.id == queued[0].trigger)
+        })
+        .unwrap();
+    let same_first = both
+        .questions
+        .iter()
+        .find(|row| row.ticket == first.ticket)
+        .unwrap();
+    assert_diagnostic_question_identity(first, same_first);
+    assert_eq!(manager.counters().consumed_role_outputs, 1);
+    // Allow the same original service to complete its two authored outputs.
+    facts.child_gate.store(true, Ordering::Release);
+    pump(&mut manager, until, |manager| {
+        manager.driver().closed.len() == 2 && !manager.has_pending_work()
+    });
+    let after = diagnostic.snapshot().unwrap();
+    assert_eq!(after.unavailable_bits, 0);
+    let (event, pending) = after
+        .pending
+        .iter()
+        .filter(|event| event.source == ContinuationPendingSource::CompletionProcessed)
+        .find_map(|event| {
+            let snapshot = event.snapshot.as_ref().ok()?;
+            let completed = snapshot.questions.iter().find(|row| {
+                row.frame.is_some()
+                    && row.ticket.is_some_and(|ticket| ticket.id == event.trigger)
+                    && row.completion_received
+            })?;
+            let pending = snapshot.questions.iter().find(|row| {
+                row.frame.is_some()
+                    && row.ticket.is_some_and(|ticket| ticket.id != event.trigger)
+                    && !row.completion_received
+                    && !row.consumption_recorded
+            })?;
+            assert!(!completed.consumption_recorded);
+            Some((event, pending))
+        })
+        .expect("first original completion source must preserve the other queued question");
+    let snapshot = event.snapshot.as_ref().unwrap();
+    assert_eq!(snapshot.authority, both.authority);
+    assert_eq!(snapshot.original_deadline, both.original_deadline);
+    let original = both
+        .questions
+        .iter()
+        .find(|row| row.ticket == pending.ticket)
+        .unwrap();
+    assert_diagnostic_question_identity(original, pending);
+    assert_eq!(manager.counters().consumed_role_outputs, 3);
+    assert_eq!(facts.accepted.lock().unwrap().len(), 3);
+    assert_eq!(facts.factories.load(Ordering::Acquire), 1);
+    assert!(manager.failures().next().is_none());
+    let receipt = shutdown(&mut manager, until);
+    assert!(receipt.permits_archive_close());
+    assert_eq!(receipt.pending_tickets, 0);
+    assert_eq!(receipt.native_cpu_reserved, 0);
 }
