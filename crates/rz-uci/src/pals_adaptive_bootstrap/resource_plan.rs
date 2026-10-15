@@ -238,8 +238,10 @@ mod tests {
     fn invalid_resource_or_slice_input_is_rejected_before_owner_creation() {
         let now = Instant::now();
         let resources = PalsResourcePlanV5::default();
-        let mut slices = PalsCpuSlicesV5::default();
-        slices.workers = 2;
+        let mut slices = PalsCpuSlicesV5 {
+            workers: 2,
+            ..PalsCpuSlicesV5::default()
+        };
         assert!(matches!(
             prepare(
                 &resources,

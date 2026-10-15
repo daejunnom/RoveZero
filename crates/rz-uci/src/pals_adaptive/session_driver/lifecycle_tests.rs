@@ -22,7 +22,7 @@ use rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace;
 use rz_search::pals::engine::{PalsConfig, PostRepairRecheckPolicy, ResolverPolicy};
 use rz_search::pals::review_context::{ReviewIndexLimits, ReviewSelectionPolicy};
 use rz_search::pals::value::{MODEL_WDL_VALUE_SEMANTICS, ModelValueIdentity};
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 #[derive(Default)]
 struct OwnerFacts {
