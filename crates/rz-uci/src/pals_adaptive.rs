@@ -4,6 +4,8 @@
 //! owns admission, credit and message order; encoding, neural calls, CPU search,
 //! external pipe drain and model teardown stay on their private owners.
 
+mod cpu_slice_observation;
+pub use cpu_slice_observation::*;
 mod manager;
 pub use manager::*;
 mod driver;
@@ -31,6 +33,10 @@ pub fn adaptive_execution_manager_source_digest() -> [u8; 32] {
         (
             "pals_adaptive/manager.rs",
             include_bytes!("pals_adaptive/manager.rs").as_slice(),
+        ),
+        (
+            "pals_adaptive/cpu_slice_observation.rs",
+            include_bytes!("pals_adaptive/cpu_slice_observation.rs").as_slice(),
         ),
         (
             "pals_adaptive/projection.rs",

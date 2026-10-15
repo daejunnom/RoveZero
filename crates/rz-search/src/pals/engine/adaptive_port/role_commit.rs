@@ -10,6 +10,50 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         output: &RoleOutput,
         physical: Option<AdaptivePortRoleEvidence>,
     ) -> Result<AdaptivePortStep, PalsError> {
+        self.role_consumption_observation_started = true;
+        let prior_semantic_attempt = self
+            .role_consumption_observation
+            .as_ref()
+            .map(|_| self.attempted_role_commits.contains(&ticket.id));
+        let returned = self.commit_role_unobserved(work, ticket, output, physical);
+        if let Some(journal) = &mut self.role_consumption_observation {
+            let (outcome, completed_evidence) = match &returned {
+                Ok(step) => (
+                    AdaptiveRoleConsumptionOutcome::SemanticResult,
+                    Some(step.evidence),
+                ),
+                Err(error) => (
+                    AdaptiveRoleConsumptionOutcome::Rejected(
+                        AdaptiveRoleConsumptionRejection::from_error(error),
+                    ),
+                    None,
+                ),
+            };
+            journal.record(AdaptiveRoleConsumptionEvent {
+                authority: ticket.authority,
+                request: ticket.id,
+                role: ticket.role,
+                question: ticket.question,
+                submitted_question: Some(work.input.question_digest),
+                ticket_view: ticket.view.view_digest,
+                submitted_view: work.input.view_seal.view_digest,
+                frame: Some(work.frame),
+                stage: AdaptiveRoleConsumptionStage::SemanticCommit,
+                outcome,
+                completed_evidence,
+                prior_semantic_attempt,
+            });
+        }
+        returned
+    }
+
+    fn commit_role_unobserved(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        ticket: &RoleTicketEnvelope,
+        output: &RoleOutput,
+        physical: Option<AdaptivePortRoleEvidence>,
+    ) -> Result<AdaptivePortStep, PalsError> {
         self.validate_role(work, ticket, output)?;
         let observations_before = self.engine.stores.observations.next_observation_sequence();
         if self.counters.role_calls >= self.engine.config.max_role_calls {

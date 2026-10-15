@@ -937,3 +937,180 @@ fn immediate_rules_terminal_scan_precedes_every_model_beam() {
     port.prepare_root_rules().unwrap();
     assert_eq!(port.counters.examined_edges, first_edges);
 }
+
+#[test]
+fn opt_in_role_consumption_copies_semantic_result_and_first_consume_separately() {
+    let mut port = setup(Position::startpos(), 2);
+    assert!(port.role_consumption_observation().is_none());
+    assert!(port.enable_role_consumption_observation());
+    assert!(!port.enable_role_consumption_observation());
+    let original = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
+    let (ticket, out) = output(&original, 1);
+    let step = port.commit_role(&original, &ticket, &out, None).unwrap();
+    let observed = port.role_consumption_observation().unwrap();
+    assert_eq!(observed.authority(), port.authority);
+    assert_eq!(observed.events().len(), 1);
+    let semantic = observed.events()[0];
+    assert_eq!(semantic.request, ticket.id);
+    assert_eq!(semantic.authority, ticket.authority);
+    assert_eq!(semantic.question, ticket.question);
+    assert_eq!(
+        semantic.submitted_question,
+        Some(original.input.question_digest)
+    );
+    assert_eq!(semantic.ticket_view, ticket.view.view_digest);
+    assert_eq!(
+        semantic.submitted_view,
+        original.input.view_seal.view_digest
+    );
+    assert_eq!(semantic.frame, Some(original.frame));
+    assert_eq!(
+        semantic.outcome,
+        AdaptiveRoleConsumptionOutcome::SemanticResult
+    );
+    assert_eq!(semantic.completed_evidence, Some(step.evidence));
+    assert_eq!(semantic.prior_semantic_attempt, Some(false));
+    assert!(
+        !port
+            .role_consumption_recorded(&ticket, &original.input.view)
+            .unwrap()
+    );
+
+    port.role_consumed(&ticket, &original.input.view).unwrap();
+    port.role_consumed(&ticket, &original.input.view).unwrap();
+    let observed = port.role_consumption_observation().unwrap();
+    assert_eq!(observed.events().len(), 3);
+    assert_eq!(
+        observed.events()[1].outcome,
+        AdaptiveRoleConsumptionOutcome::ConsumedView
+    );
+    assert_eq!(
+        observed.events()[1].stage,
+        AdaptiveRoleConsumptionStage::ViewConsumption
+    );
+    assert_eq!(observed.events()[1].completed_evidence, None);
+    assert_eq!(
+        observed.events()[1].submitted_question,
+        Some(ticket.question)
+    );
+    assert_eq!(
+        observed.events()[2].outcome,
+        AdaptiveRoleConsumptionOutcome::DuplicateNoNewConsumption
+    );
+    assert!(
+        port.role_consumption_recorded(&ticket, &original.input.view)
+            .unwrap()
+    );
+    assert!(matches!(
+        port.commit_role(&original, &ticket, &out, None),
+        Err(PalsError::Role(RoleError::InvalidOutput))
+    ));
+    let observed = port.role_consumption_observation().unwrap();
+    assert_eq!(observed.events()[3].prior_semantic_attempt, Some(true));
+    assert_eq!(
+        observed.events()[3].outcome,
+        AdaptiveRoleConsumptionOutcome::Rejected(AdaptiveRoleConsumptionRejection::InvalidOutput)
+    );
+    assert_eq!(
+        observed
+            .events()
+            .iter()
+            .filter(|event| event.outcome == AdaptiveRoleConsumptionOutcome::ConsumedView)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn role_consumption_observation_preserves_rejections_and_refuses_late_enable() {
+    let mut port = setup(Position::startpos(), 2);
+    assert!(port.enable_role_consumption_observation());
+    let original = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
+    let (ticket, out) = output(&original, 1);
+    let mut foreign = ticket;
+    foreign.authority.root.0 += 1;
+    assert!(matches!(
+        port.commit_role(&original, &foreign, &out, None),
+        Err(PalsError::Role(RoleError::InvalidOutput))
+    ));
+    let event = port.role_consumption_observation().unwrap().events()[0];
+    assert_eq!(event.authority, foreign.authority);
+    assert_eq!(
+        event.outcome,
+        AdaptiveRoleConsumptionOutcome::Rejected(AdaptiveRoleConsumptionRejection::InvalidOutput)
+    );
+    port.engine.game_generation = Some(port.authority.game.0 + 1);
+    assert!(matches!(
+        port.commit_role(&original, &ticket, &out, None),
+        Err(PalsError::Store(StoreError::StaleConsumer))
+    ));
+    assert_eq!(
+        port.role_consumption_observation().unwrap().events()[1].outcome,
+        AdaptiveRoleConsumptionOutcome::Rejected(AdaptiveRoleConsumptionRejection::StaleConsumer)
+    );
+    port.engine.game_generation = Some(port.authority.game.0);
+    port.limits.deadline = Instant::now();
+    assert!(matches!(
+        port.commit_role(&original, &ticket, &out, None),
+        Err(PalsError::Role(RoleError::Deadline))
+    ));
+    assert_eq!(
+        port.role_consumption_observation().unwrap().events()[2].outcome,
+        AdaptiveRoleConsumptionOutcome::Rejected(AdaptiveRoleConsumptionRejection::Deadline)
+    );
+    assert!(port.consumed_role_views.is_empty());
+
+    let mut unobserved = setup(Position::startpos(), 2);
+    let original = work(
+        &mut unobserved,
+        "e2e4",
+        RefinementStage::ProposalContinuation,
+        1,
+    );
+    let (mut ticket, out) = output(&original, 1);
+    ticket.authority.root.0 += 1;
+    assert!(
+        unobserved
+            .commit_role(&original, &ticket, &out, None)
+            .is_err()
+    );
+    assert!(!unobserved.enable_role_consumption_observation());
+    assert!(unobserved.role_consumption_observation().is_none());
+}
+
+#[test]
+fn role_consumption_observation_overflow_cannot_change_idempotent_search_behavior() {
+    let mut port = setup(Position::startpos(), 2);
+    assert!(port.enable_role_consumption_observation());
+    let original = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
+    let (ticket, out) = output(&original, 1);
+    port.commit_role(&original, &ticket, &out, None).unwrap();
+    port.role_consumed(&ticket, &original.input.view).unwrap();
+    let counters = port.counters;
+    let revision = port.engine.revision;
+    let observations = port.engine.stores.observations.len();
+    for _ in 0..MAX_ROLE_CONSUMPTION_EVENTS + 3 {
+        port.role_consumed(&ticket, &original.input.view).unwrap();
+    }
+    let observed = port.role_consumption_observation().unwrap();
+    assert_eq!(observed.events().len(), MAX_ROLE_CONSUMPTION_EVENTS);
+    assert_eq!(
+        observed.unavailable(),
+        Some(AdaptiveRoleConsumptionUnavailable::EventCapacity)
+    );
+    assert_eq!(
+        observed
+            .events()
+            .iter()
+            .filter(|event| event.outcome == AdaptiveRoleConsumptionOutcome::ConsumedView)
+            .count(),
+        1
+    );
+    assert_eq!(port.counters, counters);
+    assert_eq!(port.engine.revision, revision);
+    assert_eq!(port.engine.stores.observations.len(), observations);
+    assert!(
+        port.role_consumption_recorded(&ticket, &original.input.view)
+            .unwrap()
+    );
+}

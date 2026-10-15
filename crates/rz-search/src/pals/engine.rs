@@ -148,6 +148,10 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 include_str!("engine/adaptive_port/role_commit.rs"),
             ),
             (
+                "pals/engine/adaptive_port/consumption_observation.rs",
+                include_str!("engine/adaptive_port/consumption_observation.rs"),
+            ),
+            (
                 "pals/engine/adaptive_port/continuation_blueprint.rs",
                 include_str!("engine/adaptive_port/continuation_blueprint.rs"),
             ),

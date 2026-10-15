@@ -15,6 +15,7 @@ use rz_position::contracts::{ContractPosition, ContractState};
 use std::collections::{HashMap, HashSet, VecDeque};
 mod branch_queue;
 mod conditional_evidence;
+mod consumption_observation;
 mod continuation_blueprint;
 mod cpu_commit;
 mod external_commit;
@@ -27,6 +28,11 @@ mod port_tests;
 mod role_commit;
 pub mod validator_port;
 pub use branch_queue::{AdaptiveDeferredRepair, AdaptiveQueuedRecheck};
+pub use consumption_observation::{
+    AdaptiveRoleConsumptionEvent, AdaptiveRoleConsumptionObservation,
+    AdaptiveRoleConsumptionOutcome, AdaptiveRoleConsumptionRejection, AdaptiveRoleConsumptionStage,
+    AdaptiveRoleConsumptionUnavailable, MAX_ROLE_CONSUMPTION_EVENTS,
+};
 pub use continuation_blueprint::{
     AdaptiveContinuationBlueprint, AdaptivePortMaterializedStep, AdaptivePortTransition,
 };
@@ -422,6 +428,8 @@ pub struct AdaptiveEnginePort<M: RoleModel> {
     accepted: HashSet<RequestId>,
     attempted_role_commits: HashSet<RequestId>,
     consumed_role_views: HashMap<RequestId, ContractDigest>,
+    role_consumption_observation: Option<AdaptiveRoleConsumptionObservation>,
+    role_consumption_observation_started: bool,
     committed_role_questions: HashMap<RequestId, ContractDigest>,
     last_role_commit: Option<(ContractDigest, RequestId, usize, usize)>,
     closed: HashSet<crate::pals::coordinator::FrameId>,
@@ -651,6 +659,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             accepted: HashSet::new(),
             attempted_role_commits: HashSet::new(),
             consumed_role_views: HashMap::new(),
+            role_consumption_observation: None,
+            role_consumption_observation_started: false,
             committed_role_questions: HashMap::new(),
             last_role_commit: None,
             closed: HashSet::new(),
@@ -669,6 +679,23 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             validator_state: validator_port::ValidatorPortState::default(),
             last_legacy_full_snapshot: None,
         })
+    }
+    /// Explicit root-local diagnostic opt-in before the first observed call.
+    /// No callback, worker, acceptance or coordinator-transition authority.
+    /// False prevents resetting history or silently starting a partial journal.
+    pub fn enable_role_consumption_observation(&mut self) -> bool {
+        if self.role_consumption_observation_started || self.role_consumption_observation.is_some()
+        {
+            return false;
+        }
+        self.role_consumption_observation =
+            Some(AdaptiveRoleConsumptionObservation::new(self.authority));
+        true
+    }
+    /// Borrow only the bounded copied facts. None means not opted in; an
+    /// unavailable journal never certifies complete or exactly-once coverage.
+    pub fn role_consumption_observation(&self) -> Option<&AdaptiveRoleConsumptionObservation> {
+        self.role_consumption_observation.as_ref()
     }
     pub fn root_rules(&self) -> Arc<ContractState> {
         Arc::clone(&self.rules)
@@ -1345,6 +1372,25 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         ticket: &RoleTicketEnvelope,
         view: &Arc<ReviewView>,
     ) -> Result<(), PalsError> {
+        self.role_consumption_observation_started = true;
+        let returned = self.role_consumed_unobserved(ticket, view);
+        if let Err(error) = &returned {
+            self.observe_role_view(
+                ticket,
+                view,
+                AdaptiveRoleConsumptionOutcome::Rejected(
+                    AdaptiveRoleConsumptionRejection::from_error(error),
+                ),
+            );
+        }
+        returned
+    }
+
+    fn role_consumed_unobserved(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        view: &Arc<ReviewView>,
+    ) -> Result<(), PalsError> {
         if ticket.authority != self.authority
             || ticket.view.view_digest.0 != view.seal_digest()
             || ticket.view != self.seal(view)
@@ -1354,11 +1400,15 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             return Err(RoleError::InvalidOutput.into());
         }
         if let Some(original) = self.consumed_role_views.get(&ticket.id) {
-            return if *original == ticket.view.view_digest {
-                Ok(())
-            } else {
-                Err(RoleError::InvalidOutput.into())
-            };
+            if *original == ticket.view.view_digest {
+                self.observe_role_view(
+                    ticket,
+                    view,
+                    AdaptiveRoleConsumptionOutcome::DuplicateNoNewConsumption,
+                );
+                return Ok(());
+            }
+            return Err(RoleError::InvalidOutput.into());
         }
         self.engine
             .review_index
@@ -1367,7 +1417,34 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .consume(view, &self.engine.stores)?;
         self.consumed_role_views
             .insert(ticket.id, ticket.view.view_digest);
+        // This is the original first successful consume+insert, not a native
+        // acceptance or a count inferred from a later completion callback.
+        self.observe_role_view(ticket, view, AdaptiveRoleConsumptionOutcome::ConsumedView);
         Ok(())
+    }
+
+    fn observe_role_view(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        view: &ReviewView,
+        outcome: AdaptiveRoleConsumptionOutcome,
+    ) {
+        if let Some(journal) = &mut self.role_consumption_observation {
+            journal.record(AdaptiveRoleConsumptionEvent {
+                authority: ticket.authority,
+                request: ticket.id,
+                role: ticket.role,
+                question: ticket.question,
+                submitted_question: self.committed_role_questions.get(&ticket.id).copied(),
+                ticket_view: ticket.view.view_digest,
+                submitted_view: ContractDigest(view.seal_digest()),
+                frame: None,
+                stage: AdaptiveRoleConsumptionStage::ViewConsumption,
+                outcome,
+                completed_evidence: None,
+                prior_semantic_attempt: None,
+            });
+        }
     }
 
     /// Observe an already recorded semantic consumption after a later

@@ -1200,6 +1200,110 @@ fn root_ranking_fans_out_two_original_views_without_staling_or_double_consumptio
     assert_eq!(receipt.pending_tickets, 0);
 }
 
+#[cfg(feature = "search-work-receipts")]
+#[test]
+fn pending_snapshot_reads_two_original_questions_without_staling_or_consuming_them() {
+    let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    manager.prepare_root_ranking(root).unwrap();
+    pump(&mut manager, until, |manager| {
+        manager.roles.len() == 2 && manager.roles.iter().all(|binding| binding.ticket.is_some())
+    });
+    let before = manager.pending_question_snapshot().unwrap();
+    assert_eq!(before.questions.len(), 2);
+    let first = before.questions[0].ticket.unwrap();
+    let second = before.questions[1].ticket.unwrap();
+    assert_eq!(first.authority, second.authority);
+    assert_ne!(first.id, second.id);
+    assert_ne!(first.question, second.question);
+    assert_ne!(first.view.view_digest, second.view.view_digest);
+    for (row, binding) in before.questions.iter().zip(&manager.roles) {
+        assert!(!row.consumption_recorded);
+        assert_eq!(row.question, binding.input.question_digest);
+        assert_eq!(row.view, binding.input.view_seal);
+        assert_eq!(
+            row.retained_view_digest,
+            Digest(binding.input.view.digest())
+        );
+        assert_eq!(row.retained_view_seal_digest, row.view.view_digest);
+        assert_eq!(
+            row.selected_record_revisions,
+            binding
+                .input
+                .view
+                .records()
+                .iter()
+                .map(|record| record.revision)
+                .collect::<Vec<_>>()
+        );
+    }
+    // Reading twice changes no registry/manager transition. Native work can
+    // progress independently while its last processed manager state is stable.
+    assert_eq!(
+        manager.pending_question_snapshot().unwrap().questions,
+        before.questions
+    );
+    assert_eq!(manager.counters().consumed_role_outputs, 1);
+    facts.child_gate.store(true, Ordering::Release);
+    pump(&mut manager, until, |manager| {
+        manager.driver().closed.len() == 2 && !manager.has_pending_work()
+    });
+    assert!(manager.driver().consumed.contains(&first));
+    assert!(manager.driver().consumed.contains(&second));
+    assert!(
+        manager
+            .pending_question_snapshot()
+            .unwrap()
+            .questions
+            .is_empty()
+    );
+    assert!(manager.failures().next().is_none());
+    assert!(shutdown(&mut manager, until).permits_archive_close());
+}
+
+#[cfg(feature = "search-work-receipts")]
+#[test]
+fn pending_snapshot_capacity_loss_is_observation_only() {
+    let (mut manager, _, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    manager.prepare_root_ranking(root).unwrap();
+    let before = manager.pending_question_snapshot().unwrap();
+    assert_eq!(before.questions.len(), 1);
+    assert!(before.questions[0].ticket.is_none());
+    let limit = manager.limits.role_tickets_max;
+    manager.limits.role_tickets_max = 0; // Authored corrupt-observation boundary.
+    assert_eq!(
+        manager.pending_question_snapshot(),
+        Err(AdaptivePendingSnapshotUnavailable::Capacity)
+    );
+    manager.limits.role_tickets_max = limit;
+    assert_eq!(manager.phase(), ManagerPhase::Running);
+    assert!(manager.failures().next().is_none());
+    assert_eq!(
+        manager.pending_question_snapshot().unwrap().questions,
+        before.questions
+    );
+    assert!(shutdown(&mut manager, until).permits_archive_close());
+}
+
+#[cfg(feature = "search-work-receipts")]
+#[test]
+fn pending_snapshot_never_hides_a_registry_charge_without_a_bound_ticket() {
+    let (mut manager, _, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    manager.prepare_root_ranking(root).unwrap();
+    let before = manager.pending_question_snapshot().unwrap();
+    manager.roles[0].admission_charged = true; // Model a retained failed-bind gap.
+    assert_eq!(
+        manager.pending_question_snapshot(),
+        Err(AdaptivePendingSnapshotUnavailable::RegistryBindingMismatch)
+    );
+    manager.roles[0].admission_charged = false;
+    assert!(manager.failures().next().is_none());
+    assert_eq!(
+        manager.pending_question_snapshot().unwrap().questions,
+        before.questions
+    );
+    assert!(shutdown(&mut manager, until).permits_archive_close());
+}
+
 #[test]
 fn two_actual_root_fences_reuse_one_native_factory_and_preserve_cpu_engine_work() {
     // This case observes a completed attempt across root reuse. Yield and its
@@ -1286,6 +1390,21 @@ fn two_actual_root_fences_reuse_one_native_factory_and_preserve_cpu_engine_work(
 fn actual_private_cpu_yield_resume_settles_exact_work_and_leaves_no_reservation() {
     // One native node forces a real checkpoint before this fixed job completes.
     let (mut manager, facts, root, until) = fixture(FixtureScope::OwnCpuResume, true, 1);
+    assert!(manager.cpu_slice_diagnostic.get().is_none());
+    let diagnostic =
+        AdaptiveCpuSliceDiagnostic::new(AdaptiveCpuSliceDiagnosticOptions { records_max: 1 })
+            .unwrap();
+    assert!(diagnostic.snapshot().unwrap().authority.is_none());
+    manager
+        .install_cpu_slice_diagnostic(diagnostic.clone())
+        .unwrap();
+    let unused =
+        AdaptiveCpuSliceDiagnostic::new(AdaptiveCpuSliceDiagnosticOptions { records_max: 1 })
+            .unwrap();
+    assert_eq!(
+        manager.install_cpu_slice_diagnostic(unused),
+        Err(AdaptiveCpuSliceDiagnosticError::AlreadyInstalled)
+    );
     facts.child_gate.store(true, Ordering::Release);
     manager.prepare_root_ranking(root).unwrap();
     pump(&mut manager, until, |manager| {
@@ -1307,6 +1426,48 @@ fn actual_private_cpu_yield_resume_settles_exact_work_and_leaves_no_reservation(
     );
     assert_eq!(manager.counters().consumed_role_outputs, 2);
     assert!(manager.failures().next().is_none());
+    // At least one Yield and its terminal receipt exceed the explicit cap1.
+    // Keep the first actual settled sample; overflow must not affect search,
+    // credit, continuation custody, semantic consume or the physical fence.
+    let observed = diagnostic.snapshot().unwrap();
+    assert_eq!(observed.authority, Some(actual.grant.job.authority));
+    assert_eq!(
+        observed.unavailable,
+        Some(AdaptiveCpuSliceDiagnosticUnavailable::Overflow)
+    );
+    assert_eq!(observed.records.len(), 1);
+    let first = &observed.records[0];
+    assert_eq!(first.sequence, 1);
+    assert_eq!(first.grant.job, actual.grant.job);
+    assert_eq!(first.grant.owner, actual.grant.owner);
+    assert_eq!(first.scope.job.id, actual.grant.job);
+    assert_eq!(first.scope.view.authority, actual.grant.job.authority);
+    assert!(first.continuation_retained && !first.terminal);
+    assert!(matches!(
+        first.result,
+        AdaptiveCpuSliceResultObservation::Report {
+            completion: CpuCompletion::Yielded,
+            yield_ack_sequence: None,
+            ..
+        }
+    ));
+    // Fixed scheduling requested no Yield. A node/lease checkpoint alone
+    // must not become a claimed request acknowledgement.
+    assert!(
+        first
+            .controls
+            .is_some_and(|controls| { controls.yield_sequence == 0 && controls.yield_ack == 0 })
+    );
+    let accounting = first.accounting_after_settlement.unwrap();
+    assert_eq!(accounting.global_spent, first.actual_work.unwrap().nodes);
+    assert_eq!(accounting.job_spent, first.cumulative_nodes);
+    assert_eq!(accounting.global_reserved, 0);
+    assert_eq!(accounting.job_reserved, 0);
+    assert!(!accounting.job_quarantined);
+    assert_eq!(
+        manager.install_cpu_slice_diagnostic(diagnostic.clone()),
+        Err(AdaptiveCpuSliceDiagnosticError::AdmissionAlreadyStarted)
+    );
     let spent = actual.cumulative_nodes;
     let receipt = shutdown(&mut manager, until);
     assert_eq!(receipt.native_cpu_spent, spent);
@@ -1508,6 +1669,13 @@ fn cancel_during_actual_cpu_slice_preserves_final_receipts_before_archive_close(
 #[test]
 fn failed_hot_yield_commit_retains_actual_receipt_until_cancel_settlement() {
     let (mut manager, facts, root, until) = fixture(FixtureScope::OwnCpuResume, true, 1);
+    let diagnostic = AdaptiveCpuSliceDiagnostic::new(AdaptiveCpuSliceDiagnosticOptions {
+        records_max: CPU_SLICE_DIAGNOSTIC_RECORDS_MAX,
+    })
+    .unwrap();
+    manager
+        .install_cpu_slice_diagnostic(diagnostic.clone())
+        .unwrap();
     manager.driver_mut().fail_raw_once = true;
     facts.child_gate.store(true, Ordering::Release);
     manager.prepare_root_ranking(root).unwrap();
@@ -1518,6 +1686,16 @@ fn failed_hot_yield_commit_retains_actual_receipt_until_cancel_settlement() {
         manager.failures().next(),
         Some(AdaptiveManagerError::Semantic(_))
     ));
+    // A settled observation precedes semantic handoff. It cannot replace the
+    // original failed handoff with success or claim its receipt was consumed.
+    assert!(
+        diagnostic
+            .snapshot()
+            .unwrap()
+            .records
+            .iter()
+            .any(|record| { record.continuation_retained && !record.terminal })
+    );
     let receipt = shutdown(&mut manager, until);
     assert_eq!(receipt.native_cpu_reserved, 0);
     assert!(receipt.permits_archive_close());
@@ -1895,6 +2073,13 @@ mod adaptive_partial_feedback {
     fn real_completed_iteration_handoff_resumes_only_original_custody() {
         let (mut manager, facts, root, until) =
             partial_fixture(CoordinatorPolicy::Adaptive, RootGeneration(1));
+        let diagnostic = AdaptiveCpuSliceDiagnostic::new(AdaptiveCpuSliceDiagnosticOptions {
+            records_max: CPU_SLICE_DIAGNOSTIC_RECORDS_MAX,
+        })
+        .unwrap();
+        manager
+            .install_cpu_slice_diagnostic(diagnostic.clone())
+            .unwrap();
         start_cpu(&mut manager, &facts, root, until);
         let first = forward_first(&mut manager, until);
         let original = manager.own[0].binding.as_ref().unwrap().work.clone();
@@ -1984,12 +2169,16 @@ mod adaptive_partial_feedback {
             manager.counters.cpu_yields + 1
         );
 
-        // A duplicate terminal is rejected before another semantic consumption.
-        assert!(
-            manager
-                .own_event(0, CpuWorkerEvent::Slice(terminal))
-                .is_err()
-        );
+        // A duplicate terminal is rejected before another semantic consumption
+        // or diagnostic record. Its original ledger error remains unchanged.
+        let observed_before = diagnostic.snapshot().unwrap().records.len();
+        assert!(matches!(
+            manager.own_event(0, CpuWorkerEvent::Slice(terminal)),
+            Err(AdaptiveManagerError::Cpu(CpuWorkerError::Duplicate))
+        ));
+        let observed_after = diagnostic.snapshot().unwrap();
+        assert_eq!(observed_after.records.len(), observed_before);
+        assert!(observed_after.unavailable.is_some());
         assert_eq!(frame_fingerprint(&manager, original.frame), fingerprint);
         assert_eq!(manager.driver.partial_commits.len(), 1);
         assert!(manager.driver.terminal_commits.is_empty());

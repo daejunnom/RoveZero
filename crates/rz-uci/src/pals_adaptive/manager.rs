@@ -1,3 +1,8 @@
+use super::cpu_slice_observation::{
+    AdaptiveCpuSliceAccountingObservation, AdaptiveCpuSliceDiagnostic,
+    AdaptiveCpuSliceDiagnosticError, AdaptiveCpuSliceDiagnosticUnavailable,
+    AdaptiveCpuSliceScopeObservation,
+};
 use super::native_accounting::AdaptiveNativeAccountingSnapshot;
 use super::validator::{AcceptedValidator, CompletedValidatorAction};
 use crate::pals_native::ticketed::{
@@ -56,8 +61,8 @@ use rz_search::pals::engine::adaptive_port::{
 use rz_search::pals::review_context::ReviewView;
 use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const MAX_EVENT_DRAIN: usize = 256;
@@ -585,6 +590,49 @@ pub enum AdaptiveCloseMode {
     RootQuiesce,
 }
 
+/// Diagnostic data only. It grants no ticket, admission, completion or control
+/// authority. Native queues and physical execution can change independently.
+#[cfg(feature = "search-work-receipts")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdaptivePendingQuestionSnapshot {
+    pub authority: SearchAuthority,
+    pub phase: ManagerPhase,
+    pub sampled_at: MonotonicTick,
+    pub original_deadline: Deadline,
+    pub questions: Vec<AdaptivePendingQuestionRow>,
+}
+
+/// One actual retained manager binding, not a counter delta or native phase.
+/// A ticket-less row is a preparation reservation, not a submitted question.
+#[cfg(feature = "search-work-receipts")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdaptivePendingQuestionRow {
+    pub preparation: PreparationId,
+    pub frame: Option<FrameId>,
+    pub stage: RefinementStage,
+    pub question: Digest,
+    pub view: ReviewViewSeal,
+    pub retained_view_digest: Digest,
+    pub retained_view_seal_digest: Digest,
+    pub selected_record_revisions: Vec<u64>,
+    pub ticket: Option<RoleTicketEnvelope>,
+    /// Last phase processed by the manager, not the native owner's live state.
+    pub registry_observed_phase: Option<rz_search::pals::coordinator::TicketPhase>,
+    pub dispatch_pending: bool,
+    pub completion_received: bool,
+    pub consumption_recorded: bool,
+}
+
+/// Observation loss never enters AdaptiveManagerError or changes Search work.
+#[cfg(feature = "search-work-receipts")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptivePendingSnapshotUnavailable {
+    Capacity,
+    ClockUnavailable,
+    ViewSealMismatch,
+    RegistryBindingMismatch,
+}
+
 /// One immutable root closure observation, issued from actual settled owners.
 /// The raw lifecycle counters retain their producer's scope: ticket dispatch
 /// or zero-NN consumption never becomes an NN forward/cache-hit assertion.
@@ -1093,6 +1141,7 @@ where
     external: Option<ExternalManagerWorker>,
     foreign: Option<ForeignBinding<Q>>,
     ledger: CpuCreditLedger,
+    cpu_slice_diagnostic: OnceLock<AdaptiveCpuSliceDiagnostic>,
     ready: ReadySelector<FrameId, Move16, Digest>,
     costs: CostEstimator,
     controller: AdaptiveController,
@@ -1403,6 +1452,7 @@ where
             external,
             foreign: None,
             ledger,
+            cpu_slice_diagnostic: OnceLock::new(),
             ready,
             costs,
             controller,
@@ -1652,6 +1702,34 @@ where
     pub fn counters(&self) -> AdaptiveManagerCounters {
         self.counters
     }
+    /// Explicit diagnostic opt-in before root/CPU admission. This can be used
+    /// from the read-only diagnostic root hook: it installs observation only,
+    /// never a callback, worker control, credit or semantic acceptance permit.
+    /// Snapshot is available solely through the caller's explicit handle.
+    pub fn install_cpu_slice_diagnostic(
+        &self,
+        diagnostic: AdaptiveCpuSliceDiagnostic,
+    ) -> Result<(), AdaptiveCpuSliceDiagnosticError> {
+        if self.phase != ManagerPhase::Running
+            || self.root_started
+            || !self.roles.is_empty()
+            || self.own.iter().any(|slot| slot.binding.is_some())
+            || self.counters.cpu_slice_receipts != 0
+        {
+            return Err(AdaptiveCpuSliceDiagnosticError::AdmissionAlreadyStarted);
+        }
+        if self.cpu_slice_diagnostic.get().is_some() {
+            return Err(AdaptiveCpuSliceDiagnosticError::AlreadyInstalled);
+        }
+        diagnostic.bind(self.registration.authority)?;
+        self.cpu_slice_diagnostic
+            .set(diagnostic)
+            .map_err(|rejected| {
+                rejected
+                    .mark_unavailable(AdaptiveCpuSliceDiagnosticUnavailable::InstallationRejected);
+                AdaptiveCpuSliceDiagnosticError::AlreadyInstalled
+            })
+    }
     /// Actual service-held preparations, pending and physically completed but
     /// unacknowledged outputs. Logical counter differences cannot replace it.
     pub fn native_occupancy(&self) -> usize {
@@ -1849,6 +1927,114 @@ where
         }
         self.prepare_role(None, input, RolePurpose::Validator)
     }
+    /// Opt-in bounded observation of this manager's retained questions only.
+    /// The immutable borrow excludes all manager/registry transitions through
+    /// the complete copy; sampled_at is a point inside that borrow. No service
+    /// lock, event drain, current-view publication, backend, I/O or callback is
+    /// entered. Physical execution may proceed concurrently and is not sampled.
+    /// Every row is returned or the whole observation is unavailable. Callers
+    /// must not turn diagnostic failure into admission, cancellation or retry.
+    #[cfg(feature = "search-work-receipts")]
+    pub fn pending_question_snapshot(
+        &self,
+    ) -> Result<AdaptivePendingQuestionSnapshot, AdaptivePendingSnapshotUnavailable> {
+        use AdaptivePendingSnapshotUnavailable as Unavailable;
+        if self.roles.len() > self.limits.role_tickets_max
+            || self.roles.len() > MAX_ROLE_PENDING
+            || self.registry.occupancy() > MAX_ROLE_PENDING
+        {
+            return Err(Unavailable::Capacity);
+        }
+        let sampled_at = self
+            .clock
+            .try_now()
+            .map_err(|_| Unavailable::ClockUnavailable)?;
+        let mut questions: Vec<AdaptivePendingQuestionRow> = Vec::new();
+        questions
+            .try_reserve_exact(self.roles.len())
+            .map_err(|_| Unavailable::Capacity)?;
+        for binding in &self.roles {
+            if questions.iter().any(|row| {
+                row.preparation == binding.preparation
+                    || row.ticket.is_some_and(|ticket| {
+                        binding.ticket.is_some_and(|other| ticket.id == other.id)
+                    })
+            }) {
+                return Err(Unavailable::RegistryBindingMismatch);
+            }
+            validate_view(
+                &binding.input.view,
+                &binding.input.view_seal,
+                self.registration.authority,
+                self.registration.token_budget,
+            )
+            .map_err(|_| Unavailable::ViewSealMismatch)?;
+            let registry_observed_phase = if let Some(ticket) = binding.ticket {
+                if !binding.admission_charged
+                    || self.registry.ticket(ticket.id) != Some(&ticket)
+                    || ticket.authority != self.registration.authority
+                    || ticket.question != binding.input.question_digest
+                    || ticket.view != binding.input.view_seal
+                    || Some(ticket.role) != binding.input.stage.role()
+                    || ticket.original_deadline != self.deadline
+                {
+                    return Err(Unavailable::RegistryBindingMismatch);
+                }
+                Some(
+                    self.registry
+                        .phase(ticket.id)
+                        .ok_or(Unavailable::RegistryBindingMismatch)?,
+                )
+            } else {
+                // Failed frame binding can retain an admitted registry charge
+                // before RoleBinding::ticket is assigned. Do not invent zero
+                // pending tickets or silently present an incomplete ID join.
+                if binding.admission_charged {
+                    return Err(Unavailable::RegistryBindingMismatch);
+                }
+                None
+            };
+            let mut selected_record_revisions = Vec::new();
+            selected_record_revisions
+                .try_reserve_exact(binding.input.view.records().len())
+                .map_err(|_| Unavailable::Capacity)?;
+            selected_record_revisions.extend(
+                binding
+                    .input
+                    .view
+                    .records()
+                    .iter()
+                    .map(|record| record.revision),
+            );
+            questions.push(AdaptivePendingQuestionRow {
+                preparation: binding.preparation,
+                frame: binding.work.as_ref().map(|work| work.frame),
+                stage: binding.input.stage,
+                question: binding.input.question_digest,
+                view: binding.input.view_seal,
+                retained_view_digest: Digest(binding.input.view.digest()),
+                retained_view_seal_digest: Digest(binding.input.view.seal_digest()),
+                selected_record_revisions,
+                ticket: binding.ticket,
+                registry_observed_phase,
+                dispatch_pending: binding.dispatch_pending,
+                completion_received: binding.service_completed,
+                consumption_recorded: binding.consumption_recorded,
+            });
+        }
+        if questions.iter().filter(|row| row.ticket.is_some()).count() != self.registry.occupancy()
+        {
+            return Err(Unavailable::RegistryBindingMismatch);
+        }
+        Ok(AdaptivePendingQuestionSnapshot {
+            authority: self.registration.authority,
+            phase: self.phase,
+            sampled_at,
+            original_deadline: self.deadline,
+            questions,
+        })
+    }
+
     fn check_running(&self) -> Result<MonotonicTick, AdaptiveManagerError> {
         if self.phase != ManagerPhase::Running {
             return Err(AdaptiveManagerError::Invalid("admission is closed"));
@@ -3368,6 +3554,11 @@ where
             CpuWorkerEvent::Slice(report) => {
                 self.counters.cpu_slice_receipts += 1;
                 if let Err(error) = self.ledger.settle(&report) {
+                    if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
+                        diagnostic.mark_unavailable(
+                            AdaptiveCpuSliceDiagnosticUnavailable::OriginalReceiptRejected,
+                        );
+                    }
                     self.quarantined_cpu_receipts
                         .push(CpuWorkerEvent::Slice(report));
                     self.phase = ManagerPhase::Quarantined;
@@ -3375,6 +3566,11 @@ where
                 }
                 self.own[slot].settled_execution = Some(report.grant.execution);
                 let Some(mut binding) = self.own[slot].binding.take() else {
+                    if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
+                        diagnostic.mark_unavailable(
+                            AdaptiveCpuSliceDiagnosticUnavailable::OriginalReceiptRejected,
+                        );
+                    }
                     self.quarantined_cpu_receipts
                         .push(CpuWorkerEvent::Slice(report));
                     self.phase = ManagerPhase::Quarantined;
@@ -3383,6 +3579,11 @@ where
                     ));
                 };
                 if report.grant != binding.grant {
+                    if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
+                        diagnostic.mark_unavailable(
+                            AdaptiveCpuSliceDiagnosticUnavailable::OriginalReceiptRejected,
+                        );
+                    }
                     self.own[slot].binding = Some(binding);
                     self.quarantined_cpu_receipts
                         .push(CpuWorkerEvent::Slice(report));
@@ -3390,6 +3591,51 @@ where
                     return Err(AdaptiveManagerError::Invalid(
                         "CPU slice grant echo mismatch",
                     ));
+                }
+                // Copy only after the original ledger and binding/grant
+                // checks. This is prior to timing/semantic/yield processing;
+                // those paths may still fail with their original errors.
+                if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
+                    let accounting = self
+                        .ledger
+                        .global_usage()
+                        .ok()
+                        .zip(self.ledger.usage(report.grant.job).ok())
+                        .map(
+                            |(
+                                (global_spent, global_reserved),
+                                (job_spent, job_reserved, job_quarantined),
+                            )| {
+                                AdaptiveCpuSliceAccountingObservation {
+                                    global_spent,
+                                    global_reserved,
+                                    job_spent,
+                                    job_reserved,
+                                    job_quarantined,
+                                }
+                            },
+                        );
+                    diagnostic.record_settled(
+                        AdaptiveCpuSliceScopeObservation {
+                            authority: self.registration.authority,
+                            frame: binding.work.frame,
+                            stage: binding.work.input.stage,
+                            question: binding.work.input.question_digest,
+                            view: binding.work.input.view_seal,
+                            public_context: binding.work.input.public_context,
+                            job: binding.envelope,
+                            requested_yield_sequence: binding
+                                .requested_yield
+                                .map(|(sequence, _)| sequence),
+                            prior_yield_ack: binding.last_yield_ack,
+                            binding_progress_sequence: binding.progress_sequence,
+                            progress_since_slice: binding.progress_since_slice,
+                            feedback_already_forwarded: binding.feedback_forwarded,
+                        },
+                        &report,
+                        accounting,
+                        timing,
+                    );
                 }
                 // Original worker boundaries only. Queue delivery, paused
                 // residence and manager processing are outside these scopes.
