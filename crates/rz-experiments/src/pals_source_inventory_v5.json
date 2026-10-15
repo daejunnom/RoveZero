@@ -140,6 +140,7 @@
       "crates/rz-platform/Cargo.toml",
       "crates/rz-platform/src/lib.rs",
       "crates/rz-platform/src/linux.rs",
+      "crates/rz-platform/src/placement.rs",
       "crates/rz-platform/src/windows.rs",
       "crates/rz-runtime/Cargo.toml",
       "crates/rz-runtime/src/adaptive/topology.rs",

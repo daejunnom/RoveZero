@@ -1,7 +1,8 @@
-//! Small read-only OS observations. No model, search, scheduler, or settings.
+//! Small OS CPU observations and explicit current-thread affinity ownership.
 //!
-//! Native calls are confined to Windows kernel32 and keep requested resource
-//! declarations out of the returned facts. No affinity or quota is installed.
+//! Native calls stay in the platform boundary. Existing observation functions
+//! remain read-only. Only an explicitly requested current-thread guard changes
+//! affinity; it grants no process-tree quota, placement or startup authority.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(target_os = "windows")]
@@ -12,7 +13,25 @@ pub use windows::{observe_windows_cpu, observe_windows_thread_affinity};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{observe_linux_thread_affinity, LinuxThreadAffinity};
+pub use linux::observe_linux_thread_affinity;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod placement;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub use placement::{
+    apply_current_thread_affinity, CurrentThreadAffinityGuard, ThreadAffinityApplyError,
+    ThreadAffinityCause, ThreadAffinityCompensationOutcome, ThreadAffinityFailure,
+    ThreadAffinityFailureRecord, ThreadAffinityMask, ThreadAffinityRestoreError,
+    ThreadAffinityRollback, ThreadAffinitySetConflict, ThreadAffinitySnapshot, ThreadAffinityStage,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinuxThreadAffinity {
+    pub process_id: u32,
+    pub thread_id: u64,
+    pub cpu_ids: Vec<u16>,
+    pub identity_stable: bool,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlatformCpuError {

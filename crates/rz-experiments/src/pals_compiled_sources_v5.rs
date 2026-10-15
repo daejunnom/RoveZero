@@ -190,6 +190,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-platform/Cargo.toml"),
             source!("crates/rz-platform/src/lib.rs"),
             source!("crates/rz-platform/src/linux.rs"),
+            source!("crates/rz-platform/src/placement.rs"),
             source!("crates/rz-platform/src/windows.rs"),
             source!("crates/rz-runtime/Cargo.toml"),
             source!("crates/rz-runtime/src/adaptive/topology.rs"),

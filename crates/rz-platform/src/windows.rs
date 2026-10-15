@@ -1,6 +1,7 @@
-//! Auditable kernel32 CPU-query boundary. All handles are current-process/thread
-//! pseudo handles, and all calls are read-only. Variable native buffers are
-//! bounded, aligned, length checked, then decoded without pointer casts.
+//! Auditable kernel32 CPU boundary using current-process/thread pseudo handles.
+//! Existing observations remain read-only; the explicit affinity owner alone
+//! uses SetThreadGroupAffinity. Variable query buffers remain bounded/aligned.
+use crate::placement::{ThreadAffinityAccess, ThreadAffinityMask, ThreadAffinitySnapshot};
 use crate::{PlatformCpuError, WindowsCpuSnapshot, WindowsDirectCpuQuota, WindowsThreadAffinity};
 use std::ffi::c_void;
 
@@ -40,6 +41,11 @@ extern "system" {
     ) -> i32;
     fn GetProcessGroupAffinity(process: Handle, group_count: *mut u16, groups: *mut u16) -> i32;
     fn GetThreadGroupAffinity(thread: Handle, affinity: *mut GroupAffinity) -> i32;
+    fn SetThreadGroupAffinity(
+        thread: Handle,
+        affinity: *const GroupAffinity,
+        previous: *mut GroupAffinity,
+    ) -> i32;
     fn GetLogicalProcessorInformationEx(
         relationship: u32,
         buffer: *mut c_void,
@@ -331,6 +337,53 @@ pub fn observe_windows_thread_affinity() -> Result<WindowsThreadAffinity, Platfo
         group_mask: before,
         identity_stable: true,
     })
+}
+
+pub(crate) struct NativeThreadAffinity;
+impl ThreadAffinityAccess for NativeThreadAffinity {
+    fn accepts(&self, mask: &ThreadAffinityMask) -> bool {
+        matches!(mask, ThreadAffinityMask::Windows { .. })
+    }
+    fn observe(&mut self) -> Result<ThreadAffinitySnapshot, PlatformCpuError> {
+        observe_windows_thread_affinity().map(ThreadAffinitySnapshot::Windows)
+    }
+    fn set(
+        &mut self,
+        mask: &ThreadAffinityMask,
+    ) -> Result<Option<ThreadAffinityMask>, PlatformCpuError> {
+        let ThreadAffinityMask::Windows { group, mask } = *mask else {
+            return Err(PlatformCpuError::UnsupportedArchitecture);
+        };
+        // Preserve the existing incomplete-primary-group rejection. Neither
+        // application nor restoration flattens an arbitrary group into group 0.
+        // SAFETY: scalar read-only native query with no pointer arguments.
+        if unsafe { GetActiveProcessorGroupCount() } != 1 {
+            return Err(PlatformCpuError::AmbiguousProcessGroups);
+        }
+        let mask = usize::try_from(mask).map_err(|_| PlatformCpuError::UnsupportedArchitecture)?;
+        if mask == 0 || usize::from(group) >= MAX_GROUPS {
+            return Err(PlatformCpuError::InvalidNativeBuffer);
+        }
+        let requested = GroupAffinity {
+            mask,
+            group,
+            reserved: [0; 3],
+        };
+        let mut previous = GroupAffinity::default();
+        // SAFETY: only the calling thread pseudo handle is used. Both repr(C)
+        // GROUP_AFFINITY values have native KAFFINITY/WORD layout and valid
+        // synchronous lifetimes; the reserved request words are zeroed.
+        if unsafe { SetThreadGroupAffinity(GetCurrentThread(), &requested, &mut previous) } == 0 {
+            return Err(native_error("SetThreadGroupAffinity"));
+        }
+        if previous.mask == 0 || usize::from(previous.group) >= MAX_GROUPS {
+            return Err(PlatformCpuError::InvalidNativeBuffer);
+        }
+        Ok(Some(ThreadAffinityMask::Windows {
+            group: previous.group,
+            mask: previous.mask as u64,
+        }))
+    }
 }
 
 #[cfg(test)]
