@@ -1,7 +1,7 @@
 //! 작은 regular 텍스트 fixture만 사용한다. native 코드나 신경망은 실행하지 않는다.
 
 use super::*;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 const BYTES: &[u8] = b"authored non-executable bytes for bounded runtime cache custody and read accounting; no ELF or CUDA library is used by this fixture.";
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -239,7 +239,9 @@ fn named_entry_and_parent_replacement_are_not_restored_by_original_fds() {
         } else {
             fixture.entry(&tree)
         };
-        let renamed = fixture.root.join("renamed-original");
+        // Keep the same parent so moving a readonly directory does not need
+        // permission to rewrite `..`. Exercise named binding as a normal user.
+        let renamed = original.parent().unwrap().join("renamed-original");
         fs::rename(&original, &renamed).unwrap();
         fs::create_dir(&original).unwrap();
         fs::set_permissions(

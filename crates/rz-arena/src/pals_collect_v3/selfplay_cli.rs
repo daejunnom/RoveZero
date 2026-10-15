@@ -697,6 +697,56 @@ pub(crate) fn scan_staging(
     until: Instant,
     cancel: &AtomicBool,
 ) -> Result<SelfplayCliStagingObservationV3, ArenaError> {
+    Ok(scan_staging_inner(root, cap, None, until, cancel)?.0)
+}
+
+/// Only the G0 CUDA parent's already prepared, exact-FD tree may contribute
+/// validated alias metadata. It is kept separate from ordinary regular-file
+/// observations; a provider file count is not relabelled as a regular count.
+#[cfg(target_os = "linux")]
+pub(crate) struct DelegatedStagingObservation {
+    pub(crate) ordinary: SelfplayCliStagingObservationV3,
+    pub(crate) delegated: crate::process::DelegatedTreeSnapshot,
+}
+#[cfg(target_os = "linux")]
+impl DelegatedStagingObservation {
+    pub(crate) fn accounted_bytes(&self) -> Result<u64, ArenaError> {
+        self.ordinary
+            .unique_inode_bytes
+            .checked_add(self.delegated.bytes)
+            .ok_or_else(|| invalid("selfplay delegated staging byte sum overflow"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn scan_staging_delegated(
+    root: &cap_std::fs::Dir,
+    cap: u64,
+    delegated: &dyn crate::process::DelegatedArtifactTreeWatch,
+    until: Instant,
+    cancel: &AtomicBool,
+) -> Result<DelegatedStagingObservation, ArenaError> {
+    let (ordinary, delegated) = scan_staging_inner(root, cap, Some(delegated), until, cancel)?;
+    Ok(DelegatedStagingObservation {
+        ordinary,
+        delegated: delegated.ok_or_else(|| invalid("selfplay delegated staging tree absent"))?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn scan_staging_inner(
+    root: &cap_std::fs::Dir,
+    cap: u64,
+    delegated: Option<&dyn crate::process::DelegatedArtifactTreeWatch>,
+    until: Instant,
+    cancel: &AtomicBool,
+) -> Result<
+    (
+        SelfplayCliStagingObservationV3,
+        Option<crate::process::DelegatedTreeSnapshot>,
+    ),
+    ArenaError,
+> {
     use cap_fs_ext::DirExt;
     use std::os::unix::fs::MetadataExt;
     let mut todo = vec![(
@@ -712,7 +762,47 @@ pub(crate) fn scan_staging(
     let mut directories = 1usize;
     let mut max_depth = 0usize;
     let mut max_file_bytes = 0u64;
+    let mut delegated_snapshot: Option<crate::process::DelegatedTreeSnapshot> = None;
     while let Some((directory, depth)) = todo.pop() {
+        if let Some(watch) = delegated {
+            check_live(until, cancel)?;
+            let file = directory
+                .try_clone()
+                .map_err(|_| invalid("selfplay delegated directory clone"))?
+                .into_std_file();
+            let matched = watch.matches_directory(&file).map_err(invalid)?;
+            check_live(until, cancel)?;
+            if matched {
+                check(
+                    depth > 0 && delegated_snapshot.is_none(),
+                    "selfplay delegated tree must match exactly once below staging root",
+                )?;
+                let observed = watch.observe_directory(&file).map_err(invalid)?;
+                check_live(until, cancel)?;
+                observed.validate().map_err(invalid)?;
+                entries = entries
+                    .checked_add(observed.entries)
+                    .ok_or_else(|| invalid("selfplay delegated staging entry sum overflow"))?;
+                check(entries <= 65_536, "selfplay staging bounded entry count")?;
+                check(
+                    directories
+                        .checked_add(observed.directories)
+                        .is_some_and(|count| count <= 4096)
+                        && depth
+                            .checked_add(observed.depth)
+                            .is_some_and(|count| count <= 32),
+                    "selfplay delegated staging directory/depth count",
+                )?;
+                check(
+                    unique_bytes
+                        .checked_add(observed.bytes)
+                        .is_some_and(|bytes| bytes <= cap),
+                    "selfplay delegated staging Capacity exceeded",
+                )?;
+                delegated_snapshot = Some(observed);
+                continue;
+            }
+        }
         for entry in directory
             .entries()
             .map_err(|_| invalid("selfplay staging entries"))?
@@ -729,7 +819,14 @@ pub(crate) fn scan_staging(
                 directories += 1;
                 max_depth = max_depth.max(depth + 1);
                 check(
-                    depth < 32 && directories <= 4096,
+                    depth < 32
+                        && directories
+                            .checked_add(
+                                delegated_snapshot
+                                    .as_ref()
+                                    .map_or(0, |observed| observed.directories),
+                            )
+                            .is_some_and(|count| count <= 4096),
                     "selfplay staging directory/depth count",
                 )?;
                 todo.push((
@@ -767,22 +864,38 @@ pub(crate) fn scan_staging(
                     unique_bytes = unique_bytes
                         .checked_add(metadata.len())
                         .ok_or_else(|| invalid("selfplay staging inode sum overflow"))?;
-                    check(unique_bytes <= cap, "selfplay staging Capacity exceeded")?;
+                    check(
+                        unique_bytes
+                            .checked_add(
+                                delegated_snapshot
+                                    .as_ref()
+                                    .map_or(0, |observed| observed.bytes),
+                            )
+                            .is_some_and(|bytes| bytes <= cap),
+                        "selfplay staging Capacity exceeded",
+                    )?;
                     seen.insert(key, (metadata.len(), readonly));
                 }
             }
         }
     }
-    Ok(SelfplayCliStagingObservationV3 {
-        unique_inode_bytes: unique_bytes,
-        logical_alias_bytes: logical_bytes,
-        unique_regular_files: seen.len(),
-        readonly_shared_aliases: aliases,
-        observed_max_file_bytes: max_file_bytes,
-        observed_directories: directories,
-        observed_max_depth: max_depth,
-        enforcement: "held regular-file lengths; readonly-mount readback; bounded periodic observation",
-    })
+    check(
+        delegated.is_none() || delegated_snapshot.is_some(),
+        "selfplay delegated staging tree absent",
+    )?;
+    Ok((
+        SelfplayCliStagingObservationV3 {
+            unique_inode_bytes: unique_bytes,
+            logical_alias_bytes: logical_bytes,
+            unique_regular_files: seen.len(),
+            readonly_shared_aliases: aliases,
+            observed_max_file_bytes: max_file_bytes,
+            observed_directories: directories,
+            observed_max_depth: max_depth,
+            enforcement: "held regular-file lengths; readonly-mount readback; bounded periodic observation",
+        },
+        delegated_snapshot,
+    ))
 }
 
 #[cfg(test)]
@@ -809,5 +922,276 @@ mod tests {
         }
         assert!(nonsecret_name("generation-request.json"));
         assert!(nonsecret_name("runtime.so"));
+    }
+
+    #[cfg(target_os = "linux")]
+    mod delegated_scan {
+        use super::*;
+        use crate::process::{DelegatedArtifactTreeWatch, DelegatedTreeSnapshot};
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        struct Fixture {
+            path: PathBuf,
+            directory: cap_std::fs::Dir,
+            parent: PathBuf,
+            identity: (u64, u64),
+            parent_identity: (u64, u64),
+        }
+        impl Fixture {
+            fn new() -> Self {
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                let parent = std::env::temp_dir().canonicalize().unwrap();
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let path = parent.join(format!(
+                    "rz-delegated-staging-test-{}-{}-{nonce}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&path)
+                    .unwrap();
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                let parent_metadata = std::fs::symlink_metadata(&parent).unwrap();
+                Self {
+                    directory: open_directory(&path).unwrap(),
+                    path,
+                    parent,
+                    identity: (metadata.dev(), metadata.ino()),
+                    parent_identity: (parent_metadata.dev(), parent_metadata.ino()),
+                }
+            }
+            fn subdir(&self, name: &str) -> (u64, u64) {
+                let path = self.path.join(name);
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&path)
+                    .unwrap();
+                let metadata = std::fs::symlink_metadata(path).unwrap();
+                (metadata.dev(), metadata.ino())
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let (Ok(metadata), Ok(parent)) = (
+                    std::fs::symlink_metadata(&self.path),
+                    std::fs::symlink_metadata(&self.parent),
+                ) else {
+                    return;
+                };
+                if self.path.is_absolute()
+                    && self.path.parent() == Some(self.parent.as_path())
+                    && metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && (metadata.dev(), metadata.ino()) == self.identity
+                    && (parent.dev(), parent.ino()) == self.parent_identity
+                {
+                    std::fs::remove_dir_all(&self.path).unwrap();
+                }
+            }
+        }
+        struct MockWatch {
+            directories: Vec<(u64, u64)>,
+            snapshot: DelegatedTreeSnapshot,
+        }
+        impl DelegatedArtifactTreeWatch for MockWatch {
+            fn matches_directory(&self, file: &std::fs::File) -> Result<bool, &'static str> {
+                let metadata = file.metadata().map_err(|_| "fixture directory metadata")?;
+                Ok(self.directories.contains(&(metadata.dev(), metadata.ino())))
+            }
+            fn observe_directory(
+                &self,
+                file: &std::fs::File,
+            ) -> Result<DelegatedTreeSnapshot, &'static str> {
+                if !self.matches_directory(file)? {
+                    return Err("fixture exact directory required");
+                }
+                Ok(self.snapshot)
+            }
+        }
+        fn one_file() -> DelegatedTreeSnapshot {
+            DelegatedTreeSnapshot {
+                bytes: 1,
+                files: 1,
+                directories: 0,
+                entries: 1,
+                max_file_bytes: 1,
+                depth: 0,
+            }
+        }
+        fn scan(
+            fixture: &Fixture,
+            cap: u64,
+            watch: &MockWatch,
+        ) -> Result<DelegatedStagingObservation, ArenaError> {
+            scan_staging_delegated(
+                &fixture.directory,
+                cap,
+                watch,
+                Instant::now() + Duration::from_secs(5),
+                &AtomicBool::new(false),
+            )
+        }
+
+        #[test]
+        fn exact_delegated_alias_metadata_stays_separate_and_charged() {
+            let fixture = Fixture::new();
+            let identity = fixture.subdir("prepared");
+            let root = fixture.path.join("prepared");
+            for index in 0..19 {
+                std::fs::write(root.join(format!("data-{index:02}")), b"abc").unwrap();
+            }
+            for index in 0..8 {
+                std::os::unix::fs::symlink("data-00", root.join(format!("alias-{index:02}")))
+                    .unwrap();
+            }
+            std::fs::write(fixture.path.join("ordinary"), b"12345").unwrap();
+            // Mock-only owner observation: this is not a CUDA admission.
+            let watch = MockWatch {
+                directories: vec![identity],
+                snapshot: DelegatedTreeSnapshot {
+                    bytes: 19 * 3 + 8 * 7,
+                    files: 27,
+                    directories: 0,
+                    entries: 27,
+                    max_file_bytes: 7,
+                    depth: 0,
+                },
+            };
+            let observed = scan(&fixture, 118, &watch).unwrap();
+            assert_eq!(observed.ordinary.unique_inode_bytes, 5);
+            assert_eq!(observed.ordinary.unique_regular_files, 1);
+            assert_eq!(observed.delegated.files, 27);
+            assert_eq!(observed.delegated.bytes, 113);
+            assert_eq!(observed.accounted_bytes().unwrap(), 118);
+            assert!(scan(&fixture, 117, &watch).is_err());
+            assert!(
+                scan_staging(
+                    &fixture.directory,
+                    118,
+                    Instant::now() + Duration::from_secs(5),
+                    &AtomicBool::new(false)
+                )
+                .is_err()
+            );
+            std::os::unix::fs::symlink("ordinary", fixture.path.join("unregistered-alias"))
+                .unwrap();
+            assert!(scan(&fixture, 1024, &watch).is_err());
+        }
+
+        #[test]
+        fn delegated_directory_must_be_exactly_one_nonroot_match() {
+            let fixture = Fixture::new();
+            let first = fixture.subdir("first");
+            let second = fixture.subdir("second");
+            for directories in [vec![], vec![fixture.identity], vec![first, second]] {
+                let watch = MockWatch {
+                    directories,
+                    snapshot: one_file(),
+                };
+                assert!(scan(&fixture, 1024, &watch).is_err());
+            }
+        }
+
+        #[test]
+        fn delegated_snapshot_counts_depth_and_overflow_keep_original_limits() {
+            let fixture = Fixture::new();
+            let identity = fixture.subdir("prepared");
+            std::fs::write(fixture.path.join("ordinary"), b"12345").unwrap();
+            let cases = [
+                DelegatedTreeSnapshot {
+                    entries: 65_536,
+                    ..one_file()
+                },
+                DelegatedTreeSnapshot {
+                    directories: 4096,
+                    entries: 4097,
+                    depth: 1,
+                    ..one_file()
+                },
+                DelegatedTreeSnapshot {
+                    directories: 32,
+                    entries: 33,
+                    depth: 32,
+                    ..one_file()
+                },
+                DelegatedTreeSnapshot {
+                    bytes: u64::MAX,
+                    max_file_bytes: u64::MAX,
+                    ..one_file()
+                },
+                DelegatedTreeSnapshot {
+                    entries: 0,
+                    ..one_file()
+                },
+            ];
+            for snapshot in cases {
+                let watch = MockWatch {
+                    directories: vec![identity],
+                    snapshot,
+                };
+                assert!(scan(&fixture, u64::MAX, &watch).is_err());
+            }
+        }
+
+        #[test]
+        fn delegated_scan_preserves_original_deadline_and_cancel() {
+            let fixture = Fixture::new();
+            let watch = MockWatch {
+                directories: vec![fixture.subdir("prepared")],
+                snapshot: one_file(),
+            };
+            for (until, canceled) in [
+                (Instant::now(), false),
+                (Instant::now() + Duration::from_secs(5), true),
+            ] {
+                assert!(
+                    scan_staging_delegated(
+                        &fixture.directory,
+                        1024,
+                        &watch,
+                        until,
+                        &AtomicBool::new(canceled)
+                    )
+                    .is_err()
+                );
+            }
+            struct CancelOnObserve<'a> {
+                watch: &'a MockWatch,
+                cancel: &'a AtomicBool,
+            }
+            impl DelegatedArtifactTreeWatch for CancelOnObserve<'_> {
+                fn matches_directory(&self, file: &std::fs::File) -> Result<bool, &'static str> {
+                    self.watch.matches_directory(file)
+                }
+                fn observe_directory(
+                    &self,
+                    file: &std::fs::File,
+                ) -> Result<DelegatedTreeSnapshot, &'static str> {
+                    let observed = self.watch.observe_directory(file)?;
+                    self.cancel.store(true, Ordering::Relaxed);
+                    Ok(observed)
+                }
+            }
+            let cancel = AtomicBool::new(false);
+            assert!(
+                scan_staging_delegated(
+                    &fixture.directory,
+                    1024,
+                    &CancelOnObserve {
+                        watch: &watch,
+                        cancel: &cancel,
+                    },
+                    Instant::now() + Duration::from_secs(5),
+                    &cancel
+                )
+                .is_err()
+            );
+        }
     }
 }

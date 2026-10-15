@@ -24,8 +24,12 @@ import time
 from .generation_data import digest, fields, identifier, sha, strict_json, uint
 from .generation_training_cli import (
     MAX_JSON_BYTES, MAX_WALL_NS, _artifact, _file_identifier,
-    _install_original_dependencies, _output_credit, _pinned_bytes,
-    _regular_readback, _safe_absolute, _staging_bytes, _terminal_receipt,
+    _install_original_dependencies, _pinned_bytes,
+    _regular_readback, _safe_absolute,
+)
+from .g0_cuda_artifact_tree import (
+    output_credit as _output_credit, staging_bytes as _staging_bytes,
+    terminal_receipt as _terminal_receipt, validate_prepared_cuda_tree,
 )
 from .generation_numerical_cli import (
     _model_bits_digest, _readback_pin, _runtime_readbacks, _torch_runtime_readback,
@@ -51,9 +55,10 @@ REFERENCE_INPUTS = ("case_plan", "checkpoint", "checkpoint_metadata", "initializ
 
 def validate_registration(value):
     """Pure exact declarations; JSON cannot reconstruct the Collection owner."""
+    optional = ("prepared_cuda_tree",) if type(value) is dict and "prepared_cuda_tree" in value else ()
     fields(value, ("schema", "numerical_id", "phase", "source_components", "source_commit",
         "initialization_sources", "staging_root", "initialization_directory", "export_directory",
-        "reference_output_root", "receipt_path", "max_wall_ns", "max_output_bytes", "inputs"),
+        "reference_output_root", "receipt_path", "max_wall_ns", "max_output_bytes", "inputs", *optional),
         "original G0 Deployment registration")
     if value["schema"] != REGISTRATION_DOMAIN or value["phase"] not in PHASES:
         raise ValueError("separate original Deployment export/reference domain required")
@@ -70,6 +75,8 @@ def validate_registration(value):
             or value["max_output_bytes"] <= MAX_JSON_BYTES):
         raise ValueError("finite original Deployment time/output ceilings required")
     root = _safe_absolute(value["staging_root"])
+    if optional:
+        validate_prepared_cuda_tree(value["prepared_cuda_tree"], root)
     initial = _safe_absolute(value["initialization_directory"])
     outputs = [_safe_absolute(value[name]) for name in ("export_directory", "reference_output_root", "receipt_path")]
     if any(path == root or not path.is_relative_to(root) for path in outputs):

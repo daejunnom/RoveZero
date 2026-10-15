@@ -528,6 +528,7 @@ mod linux {
         g0_bootstrap_process::{
             self as bootstrap, G0NativeCaptureRecipeV5, G0NumericalPreInitScopeV5,
         },
+        g0_cuda_artifact_tree as cuda_tree,
         g0_numerical_process::linux as original,
         numerical_process as numerical, training_process as common,
     };
@@ -804,6 +805,8 @@ mod linux {
             let custody = held
                 .as_mut()
                 .expect("intent seal original directory custody");
+            custody.cuda_artifact_tree = collection.cuda_artifact_tree();
+            custody.cuda_artifact_tree_observation = collection.cuda_artifact_tree_observation();
             // Keep original Collection root descriptor continuity in the new
             // seal owner. The original owner itself remains borrowed/alive.
             let root_clone = original_root
@@ -825,8 +828,8 @@ mod linux {
                 !raw.is_empty() && raw.len() as u64 <= MAX_INTENT,
                 "Deployment bounded actual sealed registration",
             )?;
-            numerical::ensure_output_credit(
-                &custody.staging,
+            cuda_tree::ensure_output_credit(
+                custody,
                 actual.max_output_bytes,
                 raw.len() as u64,
                 until,
@@ -1196,6 +1199,8 @@ mod linux {
             ],
         )?);
         let held = running.held.as_mut().expect("Deployment directory custody");
+        held.cuda_artifact_tree = collection.cuda_artifact_tree();
+        held.cuda_artifact_tree_observation = collection.cuda_artifact_tree_observation();
         for directory in [
             &d.export_directory,
             &d.reference_output_root,
@@ -1431,13 +1436,7 @@ mod linux {
             "Deployment materialized plan byte cap",
         )?;
         let held = running.held.as_mut().expect("Deployment plan custody");
-        numerical::ensure_output_credit(
-            &held.staging,
-            r.max_output_bytes,
-            raw.len() as u64,
-            until,
-            cancel,
-        )?;
+        cuda_tree::ensure_output_credit(held, r.max_output_bytes, raw.len() as u64, until, cancel)?;
         let actual_plan = common::write_original_owned_new(
             &r.staging_root
                 .join(format!("g0-deployment-plan-{}.json", r.numerical_id)),
@@ -1655,8 +1654,8 @@ mod linux {
                         .ok_or_else(|| invalid("Deployment total raw payload cap"))?;
                     let original_file = common::open_file(&pin.path)?;
                     let raw = common::verify_bytes(&original_file, pin, true, credit)?;
-                    numerical::ensure_output_credit(
-                        &held.staging,
+                    cuda_tree::ensure_output_credit(
+                        held,
                         r.max_output_bytes,
                         raw.len() as u64,
                         cleanup_until,
@@ -1697,8 +1696,8 @@ mod linux {
             };
             let raw = serde_json::to_vec(&acceptance).map_err(|e| invalid(e.to_string()))?;
             check(raw.len() <= 256 << 10, "Deployment bounded acceptance")?;
-            numerical::ensure_output_credit(
-                &held.staging,
+            cuda_tree::ensure_output_credit(
+                held,
                 r.max_output_bytes,
                 raw.len() as u64,
                 cleanup_until,
@@ -1728,17 +1727,13 @@ mod linux {
                 "Deployment numerical cannot issue startup or training/game authority",
             )?;
             common::revalidate(held, credit)?;
-            super::super::selfplay_cli::scan_staging(
-                &held.staging,
-                r.max_output_bytes,
-                cleanup_until,
-                &preserve_cancel,
-            )?;
+            let staging_observation =
+                cuda_tree::scan_staging(held, r.max_output_bytes, cleanup_until, &preserve_cancel)?;
             check(
                 running.processes.len() == 3,
                 "Deployment exact original export/reference/native chain",
             )?;
-            let parent = serde_json::json!({"schema":"rz-pals-original-g0-deployment-numerical-parent/1","numerical_id":d.numerical_id,
+            let mut parent = serde_json::json!({"schema":"rz-pals-original-g0-deployment-numerical-parent/1","numerical_id":d.numerical_id,
                 "launch_registration":running.registration_pin,"collection_acceptance":collection.acceptance_pin(),"collection_plan":collection_plan,
                 "scope":scope,"admission":admission,"artifact_domain":domain,"acceptance":acceptance_pin,
                 "trained":false,"optimizer_updates_executed":0,"actual_initialization_executed":false,
@@ -1753,13 +1748,16 @@ mod linux {
                 "child_receipts":running.receipts,"charged_read_bytes":running.account.charged.load(Ordering::Acquire),
                 "charged_read_bytes_scope":"before_parent_receipt_publication","parent_receipt_readback_counted_in_live_owner":true,
                 "read_usage_uncertain":running.account.uncertain.load(Ordering::Acquire),"physical_completion":"confirmed_native_join","automatic_retry":false});
+            if held.cuda_artifact_tree.is_some() {
+                parent["managed_staging_observation"] = staging_observation;
+            }
             let raw = serde_json::to_vec(&parent).map_err(|e| invalid(e.to_string()))?;
             check(
                 raw.len() as u64 <= MAX_JSON,
                 "Deployment bounded parent receipt",
             )?;
-            numerical::ensure_output_credit(
-                &held.staging,
+            cuda_tree::ensure_output_credit(
+                held,
                 r.max_output_bytes,
                 raw.len() as u64,
                 cleanup_until,

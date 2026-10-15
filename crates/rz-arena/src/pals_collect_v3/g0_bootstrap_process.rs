@@ -473,6 +473,16 @@ impl VerifiedG0BootstrapNumericalV5 {
             .find(|(named, _, _)| named == path)
             .map(|(_, file, _)| file)
     }
+    #[cfg(target_os = "linux")]
+    pub(super) fn cuda_artifact_tree(
+        &self,
+    ) -> Option<rz_eval::runtime_pin::PreparedCudaArtifactTree> {
+        self.held.cuda_artifact_tree.clone()
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn cuda_artifact_tree_observation(&self) -> Option<Value> {
+        self.held.cuda_artifact_tree_observation.clone()
+    }
     pub fn held_files(&self) -> impl Iterator<Item = (&Pin, &File)> {
         #[cfg(target_os = "linux")]
         {
@@ -735,8 +745,16 @@ pub(super) mod linux {
         for input in &r.runtime_module_pins {
             common::hold_input(input.clone(), false, held, &mut credit)?;
         }
-        numerical::ensure_output_credit(
-            &held.staging,
+        super::super::g0_cuda_artifact_tree::prepare(
+            held,
+            &native.runtime_cache,
+            &native.runtime_library.path,
+            native.cuda_bundle.as_ref().map(|pin| pin.path.as_path()),
+            r.max_output_bytes,
+            &mut credit,
+        )?;
+        super::super::g0_cuda_artifact_tree::ensure_output_credit(
+            held,
             r.max_output_bytes,
             36 << 20,
             until,
@@ -811,8 +829,8 @@ pub(super) mod linux {
             .held
             .as_mut()
             .expect("bootstrap actual plan custody");
-        numerical::ensure_output_credit(
-            &held.staging,
+        super::super::g0_cuda_artifact_tree::ensure_output_credit(
+            held,
             r.max_output_bytes,
             raw.len() as u64,
             until,
@@ -1421,8 +1439,8 @@ pub(super) mod linux {
                         .ok_or_else(|| invalid("bootstrap total raw payload cap"))?;
                     let file = common::open_file(&pin.path)?;
                     let raw = common::verify_bytes(&file, pin, true, credit)?;
-                    numerical::ensure_output_credit(
-                        &held.staging,
+                    super::super::g0_cuda_artifact_tree::ensure_output_credit(
+                        held,
                         r.max_output_bytes,
                         raw.len() as u64,
                         cleanup_until,
@@ -1463,8 +1481,8 @@ pub(super) mod linux {
                 raw.len() <= 256 << 10,
                 "bootstrap bounded actual acceptance",
             )?;
-            numerical::ensure_output_credit(
-                &held.staging,
+            super::super::g0_cuda_artifact_tree::ensure_output_credit(
+                held,
                 r.max_output_bytes,
                 raw.len() as u64,
                 cleanup_until,
@@ -1493,8 +1511,8 @@ pub(super) mod linux {
                 "bootstrap numerical cannot issue startup/trained/game authority",
             )?;
             common::revalidate(held, credit)?;
-            super::super::selfplay_cli::scan_staging(
-                &held.staging,
+            let staging_observation = super::super::g0_cuda_artifact_tree::scan_staging(
+                held,
                 r.max_output_bytes,
                 cleanup_until,
                 &preserve_cancel,
@@ -1503,7 +1521,7 @@ pub(super) mod linux {
                 running.processes.len() == 3,
                 "bootstrap exact original prepare/reference/native process chain",
             )?;
-            let parent = serde_json::json!({"schema":"rz-pals-original-g0-bootstrap-numerical-parent/2","numerical_id":r.numerical_id,
+            let mut parent = serde_json::json!({"schema":"rz-pals-original-g0-bootstrap-numerical-parent/2","numerical_id":r.numerical_id,
                 "launch_registration":running.registration_pin,"pre_init_scope":r.pre_init_scope,"case_spec":r.case_spec,"native_recipe":r.native_recipe,
                 "scope":s,"admission":admission,"artifact_domain":domain,"acceptance":acceptance_pin,"resources_declared":i.resources,"resources_applied":"unknown",
                 "initialization_seed":23,"initial_model_namespace_epoch":1,"trained":false,"optimizer_updates_executed":0,"training_authority_issued":false,"collection_authority_issued":false,
@@ -1514,13 +1532,16 @@ pub(super) mod linux {
                 "staging_cap_bytes":r.max_output_bytes,"original_deadline_preserved":true,"first_original_registration_descriptor_retained":true,
                 "original_g0_initializer_export_process_and_fds_retained":true,"physical_completion":"confirmed_native_join","automatic_retry":false,
                 "cuda_actual_plan":"unknown","actual_tf32":"unknown","sole_gpu_lease_observed_here":false});
+            if held.cuda_artifact_tree.is_some() {
+                parent["managed_staging_observation"] = staging_observation;
+            }
             let raw = serde_json::to_vec(&parent).map_err(|e| invalid(e.to_string()))?;
             check(
                 raw.len() as u64 <= MAX_JSON,
                 "bootstrap bounded parent receipt",
             )?;
-            numerical::ensure_output_credit(
-                &held.staging,
+            super::super::g0_cuda_artifact_tree::ensure_output_credit(
+                held,
                 r.max_output_bytes,
                 raw.len() as u64,
                 cleanup_until,

@@ -507,6 +507,10 @@ pub(super) struct LinuxHeld {
     pub(super) receipt: Option<HeldFile>,
     pub(super) startup: Option<HeldFile>,
     pub(super) consumed_read_bytes: u64,
+    // G0-only live cache custody. No JSON or pathname can restore this owner.
+    pub(super) cuda_artifact_tree: Option<rz_eval::runtime_pin::PreparedCudaArtifactTree>,
+    // Child quota observation only; this value cannot reconstruct the FD owner.
+    pub(super) cuda_artifact_tree_observation: Option<Value>,
     // Keep partial/uncertain output descriptors separate from admitted input,
     // receipt and checkpoint files. No success getter exposes these owners.
     _failure_artifacts: Vec<FailureArtifact>,
@@ -824,6 +828,8 @@ pub(super) fn prepare_original_root(
         receipt: None,
         startup: None,
         consumed_read_bytes: 0,
+        cuda_artifact_tree: None,
+        cuda_artifact_tree_observation: None,
         _failure_artifacts: Vec::new(),
     };
     retain_directory(staging_root.to_path_buf(), &mut held)?;
@@ -2615,6 +2621,8 @@ mod tests {
             receipt: None,
             startup: None,
             consumed_read_bytes: 0,
+            cuda_artifact_tree: None,
+            cuda_artifact_tree_observation: None,
             _failure_artifacts: Vec::new(),
         };
         retain_directory(root.clone(), &mut held).unwrap();

@@ -290,8 +290,7 @@ pub(super) mod linux {
     use super::*;
     use crate::process::{
         OriginalNumericalEnvironment, OriginalProcessInput, OriginalProcessWindow,
-        OwnedArtifactTreeWatch, ProcessLimits, supervise_numerical_input_in_original_window,
-        supervise_verified_input_in_original_window,
+        OwnedArtifactTreeWatch, ProcessLimits,
     };
     use common::{LinuxHeld, ObservedFile, ReadAccounting, ReadCredit};
     use rz_experiments::{
@@ -642,8 +641,32 @@ pub(super) mod linux {
         for input in &registration.runtime_module_pins {
             common::hold_input(input.clone(), false, held, &mut credit)?;
         }
-        numerical::ensure_output_credit(
-            &held.staging,
+        // Validate the unchanged runtime/cache part before any child starts.
+        // Generated model paths are still materialized by the original G0 flow.
+        let capture_raw = common::hold_input(
+            registration.native_capture_config.clone(),
+            true,
+            held,
+            &mut credit,
+        )?;
+        let capture: numerical::NativeCaptureConfig = common::decode(&capture_raw)?;
+        numerical::validate_capture_inputs(
+            &capture,
+            &template.config,
+            &template.private_cwd,
+            &registration.staging_root,
+        )?;
+        common::retain_directory(capture.runtime_cache.clone(), held)?;
+        super::super::g0_cuda_artifact_tree::prepare(
+            held,
+            &capture.runtime_cache,
+            &capture.runtime_library,
+            capture.cuda_bundle.as_deref(),
+            registration.max_output_bytes,
+            &mut credit,
+        )?;
+        super::super::g0_cuda_artifact_tree::ensure_output_credit(
+            held,
             registration.max_output_bytes,
             36 << 20,
             until,
@@ -745,8 +768,8 @@ pub(super) mod linux {
             "G0 must retain preregistered numerical cases",
         )?;
         let plan_raw = serde_json::to_vec(&plan).map_err(|e| invalid(e.to_string()))?;
-        numerical::ensure_output_credit(
-            &held.staging,
+        super::super::g0_cuda_artifact_tree::ensure_output_credit(
+            held,
             registration.max_output_bytes,
             plan_raw.len() as u64,
             until,
@@ -1004,11 +1027,18 @@ pub(super) mod linux {
         } else {
             &r.reference_receipt_path
         };
-        let registration = serde_json::json!({"schema":profile.registration(),"numerical_id":r.numerical_id,"phase":phase,
+        let mut registration = serde_json::json!({"schema":profile.registration(),"numerical_id":r.numerical_id,"phase":phase,
             "source_components":sources,"source_commit":r.source_commit,"initialization_sources":initialization_sources,
             "staging_root":r.staging_root,"initialization_directory":r.initialization_directory,"export_directory":r.export_directory,
             "reference_output_root":r.reference_output_root,"receipt_path":receipt_path,
             "max_wall_ns":r.max_wall_ns,"max_output_bytes":r.max_output_bytes,"inputs":inputs});
+        if let Some(observation) =
+            super::super::g0_cuda_artifact_tree::child_observation_for_dispatch(
+                running.held.as_ref().expect("G0 original child custody"),
+            )?
+        {
+            registration["prepared_cuda_tree"] = observation;
+        }
         let sha =
             rz_experiments::pals_data_v3::generation_digest(profile.registration(), &registration)
                 .map_err(|e| invalid(e.to_string()))?;
@@ -1027,8 +1057,8 @@ pub(super) mod linux {
         // plan before dispatch. A post-child plan pathname/read failure must
         // never prevent custody of the child's receipt or partial outputs.
         let output_targets = freeze_child_output_targets(profile, r, phase, &inputs, held, credit)?;
-        numerical::ensure_output_credit(
-            &held.staging,
+        super::super::g0_cuda_artifact_tree::ensure_output_credit(
+            held,
             r.max_output_bytes,
             stdin.len() as u64,
             until,
@@ -1072,7 +1102,7 @@ pub(super) mod linux {
         };
         running
             .processes
-            .push(supervise_verified_input_in_original_window(
+            .push(super::super::g0_cuda_artifact_tree::supervise_verified(
                 &program,
                 &args,
                 &cwd,
@@ -1084,6 +1114,7 @@ pub(super) mod linux {
                     window: OriginalProcessWindow::new(started, until, cleanup_until)?,
                 },
                 &mut image,
+                held.cuda_artifact_tree.as_ref(),
             )?);
         // Pin every registered output before trusting even the stdout status.
         // Hash/metadata failures leave the original failure-only FD quarantined.
@@ -1315,6 +1346,30 @@ pub(super) mod linux {
     }
     pub(in crate::pals_collect_v3) fn watch(r: &OriginalG0Scope) -> OwnedArtifactTreeWatch {
         OwnedArtifactTreeWatch::bounded_output(r.max_output_bytes, MAX_FILE)
+    }
+    /// G0's retained CUDA capability is the only delegated alias boundary.
+    /// Ordinary CPU/training callers keep the original symlink-rejecting scan.
+    pub(in crate::pals_collect_v3) fn ensure_output_credit_delegated(
+        root: &cap_std::fs::Dir,
+        cap: u64,
+        additional: u64,
+        delegated: Option<&dyn crate::process::DelegatedArtifactTreeWatch>,
+        until: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), ArenaError> {
+        let Some(delegated) = delegated else {
+            return numerical::ensure_output_credit(root, cap, additional, until, cancel);
+        };
+        let observed = super::super::selfplay_cli::scan_staging_delegated(
+            root, cap, delegated, until, cancel,
+        )?;
+        check(
+            observed
+                .accounted_bytes()?
+                .checked_add(additional)
+                .is_some_and(|bytes| bytes <= cap),
+            "numerical original staging credit must be available before publication",
+        )
     }
     fn observed_matches(value: &Value, held: &LinuxHeld) -> Result<(), ArenaError> {
         let observed: ObservedFile =
@@ -2071,8 +2126,8 @@ pub(super) mod linux {
             held,
         )?);
         let raw = serde_json::to_vec(&capture).map_err(|e| invalid(e.to_string()))?;
-        numerical::ensure_output_credit(
-            &held.staging,
+        super::super::g0_cuda_artifact_tree::ensure_output_credit(
+            held,
             r.max_output_bytes,
             raw.len() as u64,
             until,
@@ -2096,7 +2151,7 @@ pub(super) mod linux {
         };
         running
             .processes
-            .push(supervise_numerical_input_in_original_window(
+            .push(super::super::g0_cuda_artifact_tree::supervise_numerical(
                 &native,
                 &[file_pin.path.into_os_string()],
                 &cwd,
@@ -2109,6 +2164,7 @@ pub(super) mod linux {
                 },
                 &mut image,
                 OriginalNumericalEnvironment::Fp32Tf32Off,
+                held.cuda_artifact_tree.as_ref(),
             )?);
         let preserve_cancel = AtomicBool::new(false);
         let mut cleanup_credit = ReadCredit {
@@ -2287,8 +2343,8 @@ pub(super) mod linux {
                         .ok_or_else(|| invalid("G0 combined raw payload cap"))?;
                     let file = common::open_file(&pin.path)?;
                     let raw = common::verify_bytes(&file, pin, true, credit)?;
-                    numerical::ensure_output_credit(
-                        &held.staging,
+                    super::super::g0_cuda_artifact_tree::ensure_output_credit(
+                        held,
                         r.max_output_bytes,
                         raw.len() as u64,
                         cleanup_until,
@@ -2319,8 +2375,8 @@ pub(super) mod linux {
             };
             let raw = serde_json::to_vec(&acceptance).map_err(|e| invalid(e.to_string()))?;
             check(raw.len() <= 256 << 10, "G0 bounded V5 acceptance")?;
-            numerical::ensure_output_credit(
-                &held.staging,
+            super::super::g0_cuda_artifact_tree::ensure_output_credit(
+                held,
                 r.max_output_bytes,
                 raw.len() as u64,
                 cleanup_until,
@@ -2356,8 +2412,8 @@ pub(super) mod linux {
                 "G0 numerical cannot mint trained/game authority",
             )?;
             common::revalidate(held, credit)?;
-            super::super::selfplay_cli::scan_staging(
-                &held.staging,
+            let staging_observation = super::super::g0_cuda_artifact_tree::scan_staging(
+                held,
                 r.max_output_bytes,
                 cleanup_until,
                 &preserve_cancel,
@@ -2366,7 +2422,7 @@ pub(super) mod linux {
                 running.processes.len() == 3,
                 "G0 exact original prepare/reference/native process chain",
             )?;
-            let parent = serde_json::json!({"schema":"rz-pals-original-g0-numerical-parent/1","numerical_id":r.numerical_id,
+            let mut parent = serde_json::json!({"schema":"rz-pals-original-g0-numerical-parent/1","numerical_id":r.numerical_id,
             "launch_registration":running.registration_pin,"acceptance":acceptance_pin,"admission":admission,
             "artifact_domain":domain,"initialization_seed":23,"trained":false,"optimizer_updates_executed":0,
             "processes":running.processes.iter().map(|p|serde_json::json!({"receipt":p.process().receipt,"transport":p.observation()})).collect::<Vec<_>>(),
@@ -2378,10 +2434,13 @@ pub(super) mod linux {
             "original_deadline_preserved":true,"automatic_retry":false,"collection_authority_issued":false,
             "numerical_only":true,"startup_admission_not_issued":true,
             "training_authority_issued":false,"arena_accepted":false,"sole_gpu_lease_observed_here":false});
+            if held.cuda_artifact_tree.is_some() {
+                parent["managed_staging_observation"] = staging_observation;
+            }
             let raw = serde_json::to_vec(&parent).map_err(|e| invalid(e.to_string()))?;
             check(raw.len() as u64 <= MAX_JSON, "G0 bounded parent receipt")?;
-            numerical::ensure_output_credit(
-                &held.staging,
+            super::super::g0_cuda_artifact_tree::ensure_output_credit(
+                held,
                 r.max_output_bytes,
                 raw.len() as u64,
                 cleanup_until,

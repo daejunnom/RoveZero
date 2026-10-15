@@ -16,6 +16,30 @@ CPU/mock·schema·diagnostic 자료로 대신하지 않는다. 전체 구현 목
 재사용한다. 새 모델, context 선택은 A, slice·event order·adaptive는 S, 동일 의미의
 복제 제거와 버퍼 재사용만 E로 구분한다. PALS 전체에 5% 성능 문턱을 적용하지 않는다.
 
+## CUDA cache의 원 소유권과 생성물 감시
+
+2026-10-15의 `66aff9f` CUDA 수치 실행은 prepare/export와 CPU reference를 마쳤으나,
+native child에서 `process.artifact_tree.kind`로 종료됐다. 회수 inventory는 원 CUDA
+library 19개와 검증된 상대 alias 8개를 확인한다. provider 준비·NN 실행·GPU 물리 완료는
+unknown이며, 이 실패를 수치 인수나 성능 자료로 사용하지 않는다.
+
+후속 G0 경로는 첫 child 전에 기존 cache publish/hash 구현으로 최종 항목을 준비한다.
+같은 원 ReadCredit·deadline·cancel에 모든 bounded read와 EOF probe를 선청구하며,
+별도 예산·시계를 만들지 않는다. 준비는 DSO load나 추론을 하지 않는다. 불투명 owner는
+cache parent/entry와 regular/alias의 원 FD를 보유하고 매 관측에서 정확 roster·named
+binding·inode·mode·길이를 대조한다. 일반 process/staging/training 감시는 계속 링크를 거부한다.
+
+이 owner 하나만 typed G0 감시에 연결하고 기존 bytes/file/entry/directory/depth 한도에
+합산한다. library payload와 alias 문자열 크기를 구분하며 alias target을 중복 계수하지
+않는다. Collection에서 Deployment seal·실행으로 동일 live owner를 전달하고, Python
+prepare/reference·native·최종 output credit와 scan이 모두 같은 경계를 사용한다. 자식에
+봉인해 전달하는 metadata는 용량 관측 자료이며 Rust capability를 복원하지 않는다.
+CPU의 기존 등록·receipt 형식은 보존하고 CUDA에만 별도 staging 관측을 남긴다.
+
+작은 CPU fixture·타입 검사·CI와 실제 CUDA/NN 인수를 구분한다. WSL 검사 중단과
+PowerShell OOM은 원 실패로 보존하며 성능 개선 증거로 사용하지 않는다. 새 코드·바이너리의
+수치·물리 수명·정상 종료를 확인하기 전에는 이전 `66aff9f` 결과를 새 성공으로 재표시하지 않는다.
+
 ## M0 공통 접점
 
 `rz-contracts::pals_adaptive`는 검색/runtime 실행 envelope를 추가한다.

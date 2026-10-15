@@ -78,6 +78,10 @@ pub use frozen_startup::*;
 mod numerical_process;
 #[cfg(feature = "pals-collection-onnx")]
 pub use numerical_process::*;
+#[cfg(all(feature = "pals-collection-onnx", target_os = "linux"))]
+mod g0_cuda_artifact_tree;
+#[cfg(all(test, feature = "pals-collection-onnx", target_os = "linux"))]
+mod g0_cuda_artifact_tree_tests;
 #[cfg(feature = "pals-collection-onnx")]
 mod g0_numerical_process;
 #[cfg(feature = "pals-collection-onnx")]

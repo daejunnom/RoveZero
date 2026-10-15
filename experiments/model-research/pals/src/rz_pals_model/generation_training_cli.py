@@ -318,7 +318,7 @@ def _check_runtime(spec, expected):
         "runtime_registration_checked": True}
 
 
-def _staging_bytes(registration):
+def _staging_bytes(registration, *, delegated_tree=None):
     """Bound the expressly registered generated root, without reading contents."""
     root = _safe_absolute(registration["staging_root"])
     for parent in (root, *root.parents):
@@ -327,15 +327,33 @@ def _staging_bytes(registration):
             raise ValueError("managed staging root has a link/reparse ancestor")
     if root.is_symlink() or not root.is_dir():
         raise ValueError("explicit existing unlinked managed staging root required")
-    total, entries, seen = 0, 0, set()
+    total, entries, seen, delegated_matches = 0, 0, set(), 0
     for directory, directories, files in os.walk(root, followlinks=False):
-        for name in directories + files:
+        for name in list(directories) + files:
             entries += 1
             if entries > 131072:
                 raise ValueError("managed training staging entry cap exceeded")
             path = Path(directory) / name
             _safe_absolute(str(path))
             info = path.lstat()
+            if delegated_tree is not None and stat.S_ISDIR(info.st_mode):
+                observation = delegated_tree.inspect(path, info)
+                if observation is not None:
+                    # 명시적으로 검증된 단일 하위 tree만 위임한다. 일반 경로는
+                    # 기본 None이며 링크·alias 거부를 그대로 유지한다.
+                    directories.remove(name)
+                    delegated_matches += 1
+                    entries += observation["entries"]
+                    if entries > 131072:
+                        raise ValueError("managed training staging entry cap exceeded")
+                    for identity in observation["identities"]:
+                        if identity in seen:
+                            raise ValueError("delegated staging contains aliased files")
+                        seen.add(identity)
+                    total += observation["bytes"]
+                    if total > registration["max_output_bytes"]:
+                        raise ValueError("managed training staging byte cap exceeded")
+                    continue
             if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
                 raise ValueError("managed training staging contains a link/reparse point")
             if stat.S_ISREG(info.st_mode):
@@ -348,11 +366,14 @@ def _staging_bytes(registration):
                 raise ValueError("managed training staging contains a nonregular artifact")
             if total > registration["max_output_bytes"]:
                 raise ValueError("managed training staging byte cap exceeded")
+    if delegated_tree is not None:
+        delegated_tree.finish(delegated_matches)
     return total
 
 
-def _output_credit(registration, *, reserved_bytes=0):
-    available = registration["max_output_bytes"] - _staging_bytes(registration) - MAX_JSON_BYTES - uint(reserved_bytes, MAX_CORPUS_BYTES)
+def _output_credit(registration, *, reserved_bytes=0, delegated_tree=None):
+    observed = _staging_bytes(registration) if delegated_tree is None else _staging_bytes(registration, delegated_tree=delegated_tree)
+    available = registration["max_output_bytes"] - observed - MAX_JSON_BYTES - uint(reserved_bytes, MAX_CORPUS_BYTES)
     if available <= 0:
         raise ValueError("managed training staging has no artifact credit after terminal receipt reserve")
     return available
@@ -813,11 +834,12 @@ def _active_source_readback(*, until_ns, clock=time.monotonic_ns):
     return {"source_components": source_pins(SOURCE_COMPONENTS), "source_modules": modules}
 
 
-def _terminal_receipt(registration, result):
+def _terminal_receipt(registration, result, *, delegated_tree=None):
     from .generation_export import _atomic_json
     path = _safe_absolute(registration["receipt_path"])
     raw = (json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
-    if len(raw) > MAX_JSON_BYTES or _staging_bytes(registration) + len(raw) > registration["max_output_bytes"]:
+    observed = _staging_bytes(registration) if delegated_tree is None else _staging_bytes(registration, delegated_tree=delegated_tree)
+    if len(raw) > MAX_JSON_BYTES or observed + len(raw) > registration["max_output_bytes"]:
         raise ValueError("original terminal receipt exceeds reserved staging credit")
     _atomic_json(path, result)
     return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
