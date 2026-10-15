@@ -1,11 +1,15 @@
 //! Actual CPU owner/native command-loop lifecycle on terminal Rules inputs.
-//! The backend cannot prepare or infer: this is not NN/GPU evidence.
+//! Terminal lifecycle and one opt-in authored root ranking; no NN/GPU inference.
 use super::*;
 use crate::contracts::SessionScope;
-use crate::pals_native::ticketed::{TicketPhysicalResult, TicketPreparation, TicketServiceLimits};
-use rz_contracts::pals::{RepresentationKey, RoleOutput};
+use crate::pals_native::ticketed::{
+    TicketExecutionEvidence, TicketPhysicalResult, TicketPreparation, TicketServiceLimits,
+};
+use rz_contracts::pals::{Move16, RepresentationKey, RoleOutput, RolePayload};
 use rz_contracts::pals_adaptive::{CpuWorkerId, RoleTicketEnvelope};
-use rz_contracts::{CancelToken, GameGeneration, OwnerId, PrecisionProfile, RootGeneration};
+use rz_contracts::{
+    CancelToken, ExecutionId, GameGeneration, OwnerId, PrecisionProfile, RootGeneration, Wdl,
+};
 use rz_runtime::contracts::ContractSystemClock;
 use rz_search::cpu::{CpuConfig, CpuEngine, CpuOrderingPolicy, CpuResumePolicy};
 use rz_search::cpu_value::BootstrapCpuValue;
@@ -18,6 +22,7 @@ use rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace;
 use rz_search::pals::engine::{PalsConfig, PostRepairRecheckPolicy, ResolverPolicy};
 use rz_search::pals::review_context::{ReviewIndexLimits, ReviewSelectionPolicy};
 use rz_search::pals::value::{MODEL_WDL_VALUE_SEMANTICS, ModelValueIdentity};
+use sha2::{Digest as _, Sha256};
 
 #[derive(Default)]
 struct OwnerFacts {
@@ -25,54 +30,128 @@ struct OwnerFacts {
     quiesces: AtomicU64,
     finishes: AtomicU64,
     finish_ok: AtomicBool,
+    root_ranking: AtomicBool,
+    role_runs: AtomicU64,
 }
 struct TerminalOwner {
     clock: ContractSystemClock,
     facts: Arc<OwnerFacts>,
 }
 impl TicketNativeBackend<ReviewView, AdaptivePortQuestion> for TerminalOwner {
-    type Prepared = ();
+    type Prepared = RepresentationKey;
     type Output = RoleOutput;
     fn clock(&self) -> ContractSystemClock {
         self.clock.clone()
     }
     fn prepare(
         &mut self,
-        _: &TicketPreparation<ReviewView, AdaptivePortQuestion>,
+        question: &TicketPreparation<ReviewView, AdaptivePortQuestion>,
         _: &AtomicBool,
-    ) -> Result<((), RepresentationKey), RoleFailure> {
-        Err(RoleFailure::Backend(
-            "terminal lifecycle fixture forbids model preparation".into(),
-        ))
+    ) -> Result<(Self::Prepared, RepresentationKey), RoleFailure> {
+        if !self.facts.root_ranking.load(Ordering::Acquire)
+            || !question.view.query().prefix.is_empty()
+        {
+            return Err(RoleFailure::Backend(
+                "terminal lifecycle fixture forbids non-root model preparation".into(),
+            ));
+        }
+        let mut candidates = Sha256::new();
+        for movement in &question.view.query().legal {
+            candidates.update(
+                Move16::encode(rz_contracts::Move::try_from(*movement).unwrap())
+                    .bits()
+                    .to_le_bytes(),
+            );
+        }
+        let key = RepresentationKey {
+            input: Digest(question.view.digest()),
+            history: question.seal.root_state.semantic,
+            candidates: Digest(candidates.finalize().into()),
+            mask_positions: Digest([4; 32]),
+            model: Digest([5; 32]),
+            encoding: Digest([6; 32]),
+            precision: PrecisionProfile::Fp32,
+            frozen_epoch: 1,
+            record_revision: 0,
+            role: question.role,
+        };
+        Ok((key, key))
     }
-    fn prepared_host_bytes(&self, _: &()) -> u64 {
-        0
+    fn prepared_host_bytes(&self, _: &Self::Prepared) -> u64 {
+        std::mem::size_of::<RepresentationKey>() as u64
     }
     fn run(
         &mut self,
-        _: &RoleTicketEnvelope,
-        _: &TicketPreparation<ReviewView, AdaptivePortQuestion>,
-        _: &(),
+        ticket: &RoleTicketEnvelope,
+        question: &TicketPreparation<ReviewView, AdaptivePortQuestion>,
+        _: &Self::Prepared,
         _: &AtomicBool,
     ) -> TicketPhysicalResult<RoleOutput> {
+        self.facts.role_runs.fetch_add(1, Ordering::AcqRel);
         TicketPhysicalResult {
             physical: PhysicalRoleCompletion::Confirmed,
-            output: Err(RoleFailure::Backend(
-                "terminal lifecycle fixture has no neural model".into(),
-            )),
+            output: Ok(RoleOutput {
+                id: ticket.id,
+                authority: ticket.authority,
+                key: ticket.representation,
+                payload: RolePayload::Proposal {
+                    candidate_logits: (0..question.view.query().legal.len())
+                        .map(|i| i as f32)
+                        .collect(),
+                    wdl: Wdl::try_new(0.25, 0.5, 0.25, 1e-4).unwrap(),
+                },
+                private_latent: vec![0.; 16 * 384],
+            }),
         }
     }
-    fn output_host_bytes(&self, _: &RoleOutput) -> u64 {
-        0
+    fn output_host_bytes(&self, output: &RoleOutput) -> u64 {
+        let values = match &output.payload {
+            RolePayload::Proposal {
+                candidate_logits, ..
+            } => candidate_logits.len(),
+            RolePayload::Counterexample {
+                candidate_logits,
+                divergence_logits,
+                ..
+            } => candidate_logits.len() + divergence_logits.len(),
+            RolePayload::TaskRanking { task_logits } => task_logits.len(),
+        };
+        ((values + output.private_latent.len()) * 4) as u64
+    }
+    fn acceptance_output_digest(&self, output: &Self::Output) -> Option<Digest> {
+        rz_search::pals::coordinator::native_acceptance_output_digest(output).ok()
+    }
+    fn execution_evidence(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+    ) -> Option<TicketExecutionEvidence> {
+        Some(TicketExecutionEvidence {
+            execution: Some(ExecutionId {
+                epoch: ticket.id.epoch,
+                sequence: ticket.id.sequence,
+            }),
+            // Authored mock service accounting, never actual NN/GPU evidence.
+            completed_nn_inputs: Some(1),
+            measurement_complete: true,
+            physical_fresh: Some(true),
+            accounting: None,
+        })
     }
     fn accept(
         &mut self,
-        _: &RoleTicketEnvelope,
-        _: &TicketPreparation<ReviewView, AdaptivePortQuestion>,
-        _: &(),
-        _: &RoleOutput,
+        ticket: &RoleTicketEnvelope,
+        question: &TicketPreparation<ReviewView, AdaptivePortQuestion>,
+        _: &Self::Prepared,
+        output: &RoleOutput,
     ) -> Result<(), RoleFailure> {
-        Err(RoleFailure::InvalidOutput)
+        if output.id != ticket.id
+            || output.authority != ticket.authority
+            || output.key != ticket.representation
+            || ticket.view.view_digest.0 != question.view.seal_digest()
+        {
+            return Err(RoleFailure::InvalidOutput);
+        }
+        Ok(())
     }
     fn discard(&mut self, _: &RoleTicketEnvelope) -> Result<(), RoleFailure> {
         Ok(())
@@ -102,9 +181,23 @@ fn fixture_with_startup_gate(
     ProcessClock,
     u64,
 ) {
+    fixture_with_role_budget(startup_gate, None)
+}
+fn fixture_with_role_budget(
+    startup_gate: Option<std::sync::mpsc::Receiver<()>>,
+    role_limit: Option<u64>,
+) -> (
+    AdaptiveSessionDriver<TerminalOwner>,
+    Arc<OwnerFacts>,
+    ProcessClock,
+    u64,
+) {
     let clock = ProcessClock::new(ProcessEpoch(31));
     let facts = Arc::new(OwnerFacts::default());
     facts.finish_ok.store(true, Ordering::Release);
+    facts
+        .root_ranking
+        .store(role_limit.is_some(), Ordering::Release);
     let factory_facts = Arc::clone(&facts);
     let native_clock = clock.runtime_clock();
     let native = TicketedNativeService::spawn(
@@ -177,6 +270,7 @@ fn fixture_with_startup_gate(
             beam_width: 1,
             line_plies: 1,
             cpu_nodes_per_task: 8,
+            max_role_calls: role_limit.unwrap_or_else(|| PalsConfig::default().max_role_calls),
             ..Default::default()
         },
         model,
@@ -248,6 +342,46 @@ fn context(clock: &ProcessClock, root: u64, game: u64) -> SearchSessionContext {
     }
 }
 #[test]
+fn actual_session_projects_final_role_limit_without_a_caller_supplied_reason() {
+    let (driver, facts, clock, _) = fixture_with_role_budget(None, Some(1));
+    let position = Position::startpos();
+    let first = context(&clock, 1, 0);
+    let report = driver.run(&position, &first, &mut |_| {}).unwrap();
+    assert!(position.legal_moves().contains(&report.best_move.unwrap()));
+    assert_eq!(facts.role_runs.load(Ordering::Acquire), 1);
+    let actual = driver.completion_diagnostic().unwrap();
+    let last = actual.last.unwrap();
+    assert_eq!(last.authority, first.authority);
+    assert_eq!(
+        last.semantic_completion,
+        Some(PalsCompletion::RoleCallLimit)
+    );
+    assert_eq!(last.driver_return, AdaptiveCompletionReturn::Ok);
+    assert!(last.failure.is_none());
+    assert_eq!(
+        actual
+            .successful_driver_return_reason_counts
+            .unwrap()
+            .role_call_limit,
+        1
+    );
+    assert_eq!(actual.observed_driver_returns, Some(1));
+    assert!(
+        driver
+            .latest_root_receipt()
+            .unwrap()
+            .unwrap()
+            .permits_root_reuse()
+    );
+    assert!(
+        driver
+            .finish_process(first.shutdown_deadline)
+            .unwrap()
+            .permits_process_close()
+    );
+}
+
+#[test]
 fn initial_game_failure_guard_closes_admission_and_retains_owner() {
     let (driver, facts, clock, _) = fixture();
     let driver = Arc::new(driver);
@@ -297,6 +431,19 @@ fn terminal_roots_and_new_game_preserve_actual_session_and_cpu_owner_then_finish
             })
             .unwrap();
         assert_eq!(report.best_move, None);
+        let completion = driver.completion_diagnostic().unwrap();
+        let last = completion.last.as_ref().unwrap();
+        assert_eq!(last.authority, context.authority);
+        assert_eq!(last.semantic_completion, Some(PalsCompletion::Terminal));
+        assert_eq!(last.driver_return, AdaptiveCompletionReturn::Ok);
+        assert_eq!(completion.observed_driver_returns, Some(root));
+        assert_eq!(
+            completion
+                .successful_driver_return_reason_counts
+                .unwrap()
+                .terminal,
+            root
+        );
         let receipt = driver.latest_root_receipt().unwrap().unwrap();
         assert_eq!(receipt.authority, context.authority);
         assert!(receipt.permits_root_reuse());
@@ -408,6 +555,122 @@ fn actual_native_ready_after_terminal_quiesce_keeps_revoked_admission_closed_and
     );
     assert_eq!(facts.finishes.load(Ordering::Acquire), 1);
 }
+#[test]
+fn final_semantic_completion_survives_a_later_collection_failure() {
+    let (mut driver, _, clock, _) = fixture();
+    driver.closure_observer = Some(Arc::new(|_| {
+        Err(AdaptiveManagerError::Invalid(
+            "fixture after final semantic result",
+        ))
+    }));
+    let mate = Position::from_fen("7k/6Q1/5K2/8/8/8/8/8 b - - 0 1").unwrap();
+    let first = context(&clock, 1, 0);
+    let failure = driver
+        .run(&mate, &first, &mut |_| panic!("terminal root"))
+        .unwrap_err();
+    assert_eq!(failure.code, "AdaptiveCollectionClosure");
+    let actual = driver.completion_diagnostic().unwrap();
+    assert_eq!(actual.semantic_observed_but_driver_failed, Some(1));
+    assert_eq!(
+        actual
+            .successful_driver_return_reason_counts
+            .unwrap()
+            .terminal,
+        0
+    );
+    let last = actual.last.unwrap();
+    assert_eq!(last.semantic_completion, Some(PalsCompletion::Terminal));
+    assert_eq!(last.driver_return, AdaptiveCompletionReturn::Err);
+    let observed_failure = last.failure.unwrap();
+    assert_eq!(observed_failure.code, failure.code);
+    assert_eq!(
+        observed_failure.physical_completion,
+        failure.physical_completion
+    );
+
+    // A later root rejected before admission must not inherit Terminal.
+    let second = context(&clock, 2, 0);
+    second.cancellation.cancel();
+    assert!(
+        driver
+            .run(&mate, &second, &mut |_| panic!("canceled root"))
+            .is_err()
+    );
+    let actual = driver.completion_diagnostic().unwrap();
+    assert_eq!(actual.last.unwrap().semantic_completion, None);
+    assert_eq!(actual.unobserved_completion_returns, Some(1));
+    assert!(
+        driver
+            .finish_process(first.shutdown_deadline)
+            .unwrap()
+            .permits_process_close()
+    );
+}
+
+#[test]
+fn terminal_port_reason_is_preserved_when_final_selector_and_work_observe_cancel() {
+    let (mut driver, _, clock, _) = fixture();
+    let mate = Position::from_fen("7k/6Q1/5K2/8/8/8/8/8 b - - 0 1").unwrap();
+    let first = context(&clock, 1, 0);
+    let canceled = Arc::clone(&first.control.cancellation);
+    driver.collection_hooks.root_admission = Some(Arc::new(move |manager| {
+        manager.driver_mut().prepare_root_rules()?;
+        assert!(manager.driver().root_is_terminal()?);
+        canceled.store(true, Ordering::Release);
+        Ok(())
+    }));
+    assert!(
+        driver
+            .run(&mate, &first, &mut |_| panic!("terminal root"))
+            .is_ok()
+    );
+    let actual = driver.completion_diagnostic().unwrap();
+    assert_eq!(
+        actual.last.unwrap().semantic_completion,
+        Some(PalsCompletion::Terminal)
+    );
+    let counts = actual.successful_driver_return_reason_counts.unwrap();
+    assert_eq!(counts.terminal, 1);
+    assert_eq!(counts.canceled, 0);
+    assert_eq!(driver.work_receipt().unwrap().unwrap().canceled_returns, 1);
+    assert!(
+        driver
+            .finish_process(first.shutdown_deadline)
+            .unwrap()
+            .permits_process_close()
+    );
+}
+
+#[test]
+fn poisoned_completion_diagnostic_does_not_change_search_or_physical_finish() {
+    let (driver, _, clock, _) = fixture();
+    std::thread::scope(|scope| {
+        assert!(
+            scope
+                .spawn(|| {
+                    let _guard = driver.completion.lock().unwrap();
+                    panic!("fixture poisons only the optional diagnostic owner");
+                })
+                .join()
+                .is_err()
+        );
+    });
+    let mate = Position::from_fen("7k/6Q1/5K2/8/8/8/8/8 b - - 0 1").unwrap();
+    let first = context(&clock, 1, 0);
+    assert!(
+        driver
+            .run(&mate, &first, &mut |_| panic!("terminal root"))
+            .is_ok()
+    );
+    assert!(driver.completion_diagnostic().is_err());
+    assert!(
+        driver
+            .finish_process(first.shutdown_deadline)
+            .unwrap()
+            .permits_process_close()
+    );
+}
+
 #[test]
 fn physical_finish_unknown_is_retained_and_never_a_process_receipt() {
     let (driver, facts, _, _) = fixture();

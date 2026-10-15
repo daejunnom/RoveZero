@@ -5,6 +5,12 @@
 
 mod checker_metadata;
 pub use checker_metadata::*;
+mod completion_observation;
+use completion_observation::CompletionJournal;
+pub use completion_observation::{
+    AdaptiveCompletionDiagnostic, AdaptiveCompletionFailure, AdaptiveCompletionObservation,
+    AdaptiveCompletionReasonCounts, AdaptiveCompletionReturn,
+};
 
 use super::{
     AdaptiveCollectionDispatchObserver, AdaptiveExecutionLimits, AdaptiveExecutionManager,
@@ -303,6 +309,7 @@ where
     external_metadata_bound: AtomicBool,
     state: Mutex<SessionState<B>>,
     work: ProcessWorkJournal,
+    completion: Mutex<CompletionJournal>,
     reset_requests: AtomicU64,
     closed: AtomicBool,
     dispatch_observer: Option<AdaptiveCollectionDispatchObserver>,
@@ -582,6 +589,10 @@ where
             checker_metadata,
         } = sources;
         Ok(Self {
+            completion: Mutex::new(CompletionJournal::new(
+                clock.epoch(),
+                options.implementation,
+            )),
             options,
             limits,
             explicit_native_limits,
@@ -618,6 +629,15 @@ where
     }
     pub fn execution_limits(&self) -> AdaptiveExecutionLimits {
         self.limits
+    }
+    /// Last returned run's actual final semantic reason and driver return,
+    /// in a separate bounded diagnostic. Compare its authority before use;
+    /// an active root has not returned yet. This grants no output/close authority.
+    pub fn completion_diagnostic(&self) -> Result<AdaptiveCompletionDiagnostic, ContractError> {
+        self.completion
+            .lock()
+            .map(|journal| journal.snapshot())
+            .map_err(|_| poisoned("adaptive completion diagnostic unavailable"))
     }
     /// A nonblocking metadata read of the original idle native owner. This
     /// does not observe the bootstrap caller as the native thread, start any
@@ -989,6 +1009,7 @@ where
         context: &SearchSessionContext,
         progress: &mut dyn FnMut(BoardMove),
         observation: &mut AttemptObservation,
+        semantic_completion: &mut Option<PalsCompletion>,
     ) -> Result<SearchSessionReport, SearchSessionFailure> {
         if context.control.max_simulations == 0
             || context.control.max_simulations > self.options.max_cpu_nodes
@@ -1396,6 +1417,7 @@ where
             }
         };
         if let Ok(result) = &semantic {
+            *semantic_completion = Some(result.completion);
             *observation = AttemptObservation::Pals {
                 counters: result.counters,
                 root_coverage_observed: result.counters.root_scope_observation_complete,
@@ -1957,17 +1979,38 @@ where
         context: &SearchSessionContext,
         progress: &mut dyn FnMut(BoardMove),
     ) -> Result<SearchSessionReport, SearchSessionFailure> {
-        self.work
-            .begin()
-            .map_err(|e| SearchSessionFailure::debug("AdaptiveWorkJournal", &e))?;
+        if let Err(error) = self.work.begin() {
+            let failure = SearchSessionFailure::debug("AdaptiveWorkJournal", &error);
+            if let Ok(mut journal) = self.completion.lock() {
+                journal.record(context.authority, None, Err(&failure));
+            }
+            return Err(failure);
+        }
         let mut observation = AttemptObservation::NoWork;
-        let result = self.execute(position, context, progress, &mut observation);
+        let mut semantic_completion = None;
+        let result = self.execute(
+            position,
+            context,
+            progress,
+            &mut observation,
+            &mut semantic_completion,
+        );
         let recorded = self.work.finish(context, &result, observation);
-        match (result, recorded) {
+        let returned = match (result, recorded) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(SearchSessionFailure::debug("AdaptiveWorkJournal", &error)),
             (Ok(result), Ok(())) => Ok(result),
+        };
+        // Diagnostics cannot replace the original return or make an Err into
+        // bounded success. Poison is exposed by the getter, never as a count 0.
+        if let Ok(mut journal) = self.completion.lock() {
+            journal.record(
+                context.authority,
+                semantic_completion,
+                returned.as_ref().map(|_| ()),
+            );
         }
+        returned
     }
 }
 

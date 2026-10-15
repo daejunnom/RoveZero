@@ -6,8 +6,9 @@ use super::resource_readback::{
 };
 use super::startup_snapshot::ActualStartupSnapshotV5;
 use crate::pals_adaptive::{
-    AdaptiveCloseMode, AdaptiveManagerCounters, AdaptiveNativeAccountingSnapshot,
-    AdaptiveRootObservationSnapshot, AdaptiveSessionProcessReceipt, AdaptiveSessionRetention,
+    AdaptiveCloseMode, AdaptiveCompletionDiagnostic, AdaptiveManagerCounters,
+    AdaptiveNativeAccountingSnapshot, AdaptiveRootObservationSnapshot,
+    AdaptiveSessionProcessReceipt, AdaptiveSessionRetention,
 };
 use crate::pals_adaptive_startup::PinnedPalsStartupV5;
 use crate::pals_native::startup_legacy::NativeLegacySelectedStartupSnapshotV5;
@@ -702,6 +703,7 @@ impl PalsAdaptiveObservationBridgeV5 {
     pub(crate) fn publish_termination(
         &self,
         finish: &AdaptiveSessionProcessReceipt,
+        completion: Option<&AdaptiveCompletionDiagnostic>,
     ) -> Result<ArtifactRef, ManifestError> {
         need(
             finish.epoch().0 == self.snapshot.process_epoch()
@@ -725,6 +727,8 @@ impl PalsAdaptiveObservationBridgeV5 {
             .lock()
             .map_err(|_| fail("evidence writer poisoned"))?;
         let mut raw_metadata = aggregate.metadata();
+        raw_metadata["pals_completion_diagnostic"] =
+            completion_diagnostic_metadata(completion, self.snapshot.process_epoch());
         raw_metadata["applied_resource_readback"] = serde_json::json!({
             "producer":"actual native loader, original ready thread owners, bounded read-only OS probe",
             "diagnostic":resources.diagnostic(),
@@ -806,6 +810,7 @@ impl PalsAdaptiveObservationBridgeV5 {
         finish: Option<&AdaptiveSessionProcessReceipt>,
         failure: &SearchSessionFailure,
         retained: Option<&AdaptiveSessionRetention>,
+        completion: Option<&AdaptiveCompletionDiagnostic>,
     ) -> Result<ArtifactRef, ManifestError> {
         if let Some(receipt) = finish {
             need(
@@ -834,12 +839,55 @@ impl PalsAdaptiveObservationBridgeV5 {
             "normal_termination_receipt":false,
             "training_executed":false,
             "observations":facts,
+            "pals_completion_diagnostic":completion_diagnostic_metadata(completion, self.snapshot.process_epoch()),
         });
         self.writer
             .lock()
             .map_err(|_| fail("evidence writer poisoned"))?
             .write_json(OutputKind::FailedTermination, &record)
     }
+}
+
+fn completion_diagnostic_metadata(
+    actual: Option<&AdaptiveCompletionDiagnostic>,
+    process_epoch: u64,
+) -> serde_json::Value {
+    if let Some(actual) = actual.filter(|actual| actual.process_epoch.0 == process_epoch) {
+        return actual.as_json();
+    }
+    serde_json::json!({
+        "schema":"rz-pals-semantic-completion-diagnostic/1",
+        "scope":"latest returned adaptive run's final semantic result and driver return; not an active-root observation",
+        "status":"unavailable",
+        "last":null,
+        "observed_driver_returns":null,
+        "successful_driver_return_reason_counts":null,
+        "semantic_observed_but_driver_failed":null,
+        "unobserved_completion_returns":null,
+        "unavailable_reason":"driver_diagnostic_unavailable_or_epoch_mismatch",
+        "grants_output_or_acceptance_authority":false
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn missing_or_foreign_completion_is_unavailable_without_default_reason_or_authority() {
+    let missing = completion_diagnostic_metadata(None, 31);
+    assert_eq!(missing["status"], "unavailable");
+    assert!(missing["last"].is_null());
+    assert!(missing["successful_driver_return_reason_counts"].is_null());
+    assert_eq!(missing["grants_output_or_acceptance_authority"], false);
+    let foreign = AdaptiveCompletionDiagnostic {
+        process_epoch: rz_contracts::ProcessEpoch(32),
+        implementation: rz_contracts::Digest([4; 32]),
+        last: None,
+        observed_driver_returns: Some(0),
+        successful_driver_return_reason_counts: Some(Default::default()),
+        semantic_observed_but_driver_failed: Some(0),
+        unobserved_completion_returns: Some(0),
+        unavailable_reason: None,
+    };
+    assert_eq!(completion_diagnostic_metadata(Some(&foreign), 31), missing);
 }
 
 /// Pure serialization of caller-owned actual failure readbacks. Authored

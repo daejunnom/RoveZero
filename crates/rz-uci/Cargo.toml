@@ -51,6 +51,7 @@ onnx-cpu = [
 search-work-receipts = ["dep:serde", "dep:serde_json", "dep:cap-std", "dep:cap-fs-ext", "dep:nix"]
 onnx-cuda = ["onnx-cpu"]
 pals-adaptive = ["dep:rz-experiments", "rz-experiments/pals-content-admission", "search-work-receipts"]
+pals-adaptive-diagnostics = ["pals-adaptive", "onnx-cpu"]
 
 [dependencies]
 rz-search.workspace = true

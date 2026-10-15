@@ -1,10 +1,13 @@
 //! Explicit source-pinned V5 process assembly. Models are loaded once on the
 //! native owner; root fences keep the same model, Store and CPU/TT owners.
 //! Neither metadata preflight nor a successful UCI handshake is NN acceptance.
+#[cfg(feature = "pals-adaptive-diagnostics")]
+pub mod diagnostic;
 pub mod external;
 mod native_backend;
 mod observations;
 mod protocol;
+mod resource_plan;
 mod resource_readback;
 pub mod runtime_assets;
 mod startup_snapshot;
@@ -12,7 +15,7 @@ mod startup_snapshot;
 use crate::EngineIdentity;
 use crate::engine::{EngineSettings, OwnerRegistry, ProcessClock};
 use crate::pals_adaptive::{
-    AdaptiveCollectionDispatchObserver, AdaptiveCompletedRootObserver, AdaptiveExecutionLimits,
+    AdaptiveCollectionDispatchObserver, AdaptiveCompletedRootObserver,
     AdaptiveExternalTeacherObserver, AdaptiveRootAdmissionObserver, AdaptiveRootClosureObserver,
     AdaptiveSessionCollectionHooks, AdaptiveSessionDriver, AdaptiveSessionOptions,
     AdaptiveSessionSources, ExternalManagerWorker, PersistentCpuOwner, ProjectedNativeBackend,
@@ -35,9 +38,9 @@ use crate::search_driver::{
 use cap_fs_ext::DirExt;
 pub use native_backend::ActualNativeBackendV5;
 use observations::PalsAdaptiveObservationBridgeV5;
+use resource_plan::{BootstrapResourceIntentV5, ResourceIntentErrorV5};
 use resource_readback::NativeResourceOwnerV5;
 use rz_contracts::pals::SearchAuthority;
-use rz_contracts::pals_adaptive::CpuWorkerId;
 use rz_contracts::{CancelToken, Digest, GameGeneration, ProcessEpoch, RootGeneration};
 use rz_eval::asset::parse_sha256;
 use rz_experiments::{
@@ -97,6 +100,15 @@ pub struct AdaptiveCollectionHooksV5 {
     pub root_admission: AdaptiveRootAdmissionObserver<ActualAdaptiveBackendV5>,
     pub root_closure: AdaptiveCompletedRootObserver<ActualAdaptiveBackendV5>,
     pub native_intake: Option<crate::pals_native::startup_virtual::NativeVirtualReviewIntakeV5>,
+}
+
+// A diagnostic installs observations on the same actual Deployment owners.
+// It carries neither Collection intake nor an external teacher admission.
+struct DeploymentDiagnosticHooksV5 {
+    native_observer: Box<dyn VirtualReviewCollectionObserver>,
+    dispatch_observer: AdaptiveCollectionDispatchObserver,
+    root_admission: AdaptiveRootAdmissionObserver<ActualAdaptiveBackendV5>,
+    root_closure: AdaptiveCompletedRootObserver<ActualAdaptiveBackendV5>,
 }
 
 #[derive(Debug)]
@@ -244,6 +256,7 @@ pub fn prepare_collection_actual_with_cancellation(
         started,
         Some(until),
         Some(hooks),
+        None,
         startup_cancel,
     )?;
     let published = prepared
@@ -376,6 +389,7 @@ pub fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapError> {
         started,
         None,
         None,
+        None,
         // Ordinary CLI startup precedes the existing stdin/protocol owner.
         // Preserve that non-interactive startup behavior while sharing this
         // single original CLI signal through all bounded startup stages.
@@ -409,20 +423,24 @@ pub fn run_cli(arguments: Vec<String>) -> Result<(), AdaptiveBootstrapError> {
         .checked_add(settings.shutdown_limit)
         .ok_or_else(|| boundary("ProcessDrainDeadline"))?;
     let finish = prepared.finish_process(until);
+    // The concrete driver preserves the actual final typed semantic result.
+    // Missing/poisoned diagnostics stay unavailable, independently of finish.
+    let completion = prepared.driver.completion_diagnostic().ok();
     match &finish {
         Ok(receipt) => {
             prepared
                 .observations
-                .publish_termination(receipt)
+                .publish_termination(receipt, completion.as_ref())
                 .map_err(|e| failure("TerminationReceipt", &e))?;
         }
         Err(error) => {
             let retained = prepared.driver.retained_owner_status().ok();
-            if let Err(record_error) =
-                prepared
-                    .observations
-                    .publish_failed_termination(None, error, retained.as_ref())
-            {
+            if let Err(record_error) = prepared.observations.publish_failed_termination(
+                None,
+                error,
+                retained.as_ref(),
+                completion.as_ref(),
+            ) {
                 eprintln!(
                     "pals_v5_failure_record {}",
                     failure("FailureReceipt", &record_error)
@@ -482,8 +500,9 @@ impl PreparedAdaptiveProcessV5 {
     pub fn clock(&self) -> ProcessClock {
         self.clock.clone()
     }
-    /// Only this UCI owner constructs the private current-scope capability.
-    /// One prepared process is one game; each actual turn has a new root.
+    /// Only this actual in-process owner constructs the private current scope.
+    /// Explicit Collection/diagnostic preparation enables this path; ordinary
+    /// CLI preparation does not. One process is one game with fresh turn roots.
     pub fn context(
         &self,
         hard_deadline: Instant,
@@ -652,6 +671,7 @@ fn prepare_actual(
     started: Instant,
     startup_ceiling: Option<Instant>,
     hooks: Option<AdaptiveCollectionHooksV5>,
+    diagnostic_hooks: Option<DeploymentDiagnosticHooksV5>,
     startup_cancel: Arc<AtomicBool>,
 ) -> Result<PreparedAdaptiveProcessV5, AdaptiveBootstrapError> {
     let process_cleanup_ceiling = match startup_ceiling {
@@ -679,6 +699,17 @@ fn prepare_actual(
     }
     let declaration = &pinned.config.endpoint;
     let view_selection = declaration.context.selection;
+    if diagnostic_hooks.is_some()
+        && (hooks.is_some()
+            || declaration.mode != PalsEngineModeV5::Deployment
+            || view_selection != PalsViewSelectionV5::VirtualReview
+            || declaration.v_generate
+            || declaration.v_load
+            || declaration.v_call
+            || pinned.config.training_executed)
+    {
+        return Err(boundary("DeploymentDiagnosticProfile"));
+    }
     let registered_profile = match view_selection {
         PalsViewSelectionV5::VirtualReview => declaration.model.profile == "virtual_review_v1",
         PalsViewSelectionV5::V2Full | PalsViewSelectionV5::V2Selected => {
@@ -697,40 +728,59 @@ fn prepare_actual(
         return Err(boundary("CooperativeCpuRequiresDeclaredPausedStack"));
     }
     let slices = &declaration.coordinator.slices;
-    let resource_limits = AdaptiveExecutionLimits {
-        waiting_jobs_max: slices.waiting_jobs_max as usize,
-        worker_commands_max: slices.worker_commands_max as usize,
-        role_tickets_max: slices.role_tickets_max as usize,
-        paused_bytes_per_worker_max: slices.paused_bytes_per_worker_max as usize,
-    };
+    let resource_intent = Arc::new(
+        BootstrapResourceIntentV5::prepare(
+            &declaration.resources,
+            slices,
+            declaration.cpu.external.is_some(),
+            clock.epoch(),
+            startup_until,
+            Arc::clone(&startup_cancel),
+            Instant::now(),
+        )
+        .map_err(|e| failure("ResourceIntent", &e))?,
+    );
+    let resource_limits = resource_intent.execution_limits();
     let external = external::load_external_cpu_v5(&pinned, startup_until, &startup_cancel)
         .map_err(|e| failure("ExternalSnapshot", &e))?;
+    resource_intent
+        .check_external_loaded(external.is_some(), clock.epoch(), Instant::now())
+        .map_err(|e| failure("ResourceIntentExternal", &e))?;
     let collection_enabled = hooks.is_some();
-    let (native_observer, dispatch_observer, native_intake, collection_hooks) = match hooks {
-        None => (None, None, None, AdaptiveSessionCollectionHooks::default()),
-        Some(hooks) => {
-            let admitted = external
-                .as_ref()
-                .ok_or_else(|| boundary("CollectionExternalTeacher"))?;
-            if admitted.selection().execution_use
-                != rz_search::external_cpu::CpuExecutionUse::Collection
-                || admitted.selection().cpu_t != rz_search::external_cpu::CpuEndpoint::ExternalUci
-            {
-                return Err(boundary("CollectionExternalTeacher"));
+    let diagnostic_enabled = diagnostic_hooks.is_some();
+    let (mut native_observer, mut dispatch_observer, native_intake, mut collection_hooks) =
+        match hooks {
+            None => (None, None, None, AdaptiveSessionCollectionHooks::default()),
+            Some(hooks) => {
+                let admitted = external
+                    .as_ref()
+                    .ok_or_else(|| boundary("CollectionExternalTeacher"))?;
+                if admitted.selection().execution_use
+                    != rz_search::external_cpu::CpuExecutionUse::Collection
+                    || admitted.selection().cpu_t
+                        != rz_search::external_cpu::CpuEndpoint::ExternalUci
+                {
+                    return Err(boundary("CollectionExternalTeacher"));
+                }
+                (hooks.teacher_admission)(admitted)?;
+                (
+                    Some(hooks.native_observer),
+                    Some(hooks.dispatch_observer),
+                    hooks.native_intake,
+                    AdaptiveSessionCollectionHooks {
+                        root_admission: Some(hooks.root_admission),
+                        root_closure: Some(hooks.root_closure),
+                        external_teacher: Some(hooks.teacher_observer),
+                    },
+                )
             }
-            (hooks.teacher_admission)(admitted)?;
-            (
-                Some(hooks.native_observer),
-                Some(hooks.dispatch_observer),
-                hooks.native_intake,
-                AdaptiveSessionCollectionHooks {
-                    root_admission: Some(hooks.root_admission),
-                    root_closure: Some(hooks.root_closure),
-                    external_teacher: Some(hooks.teacher_observer),
-                },
-            )
-        }
-    };
+        };
+    if let Some(diagnostic) = diagnostic_hooks {
+        native_observer = Some(diagnostic.native_observer);
+        dispatch_observer = Some(diagnostic.dispatch_observer);
+        collection_hooks.root_admission = Some(diagnostic.root_admission);
+        collection_hooks.root_closure = Some(diagnostic.root_closure);
+    }
     let endpoints = external.as_ref().map_or_else(
         || match declaration.mode {
             PalsEngineModeV5::Collection => CpuEndpointSelection::collection(),
@@ -739,9 +789,9 @@ fn prepare_actual(
         |external| external.selection(),
     );
     let mut cpu = Vec::new();
-    cpu.try_reserve_exact(declaration.coordinator.slices.workers as usize)
+    cpu.try_reserve_exact(resource_intent.own_worker_count())
         .map_err(|e| failure("CpuOwnerAllocation", &e))?;
-    for index in 0..declaration.coordinator.slices.workers {
+    for index in 0..resource_intent.own_worker_count() {
         require_original_startup_window(startup_until, &startup_cancel)?;
         let evaluator = Arc::new(BootstrapCpuValue::default());
         let mut engine = if selections.paused_side_scope {
@@ -763,7 +813,9 @@ fn prepare_actual(
             .set_paused_stack_max_bytes(resource_limits.paused_bytes_per_worker_max)
             .map_err(|e| failure("PausedOwnerCapacity", &e))?;
         let profile = CpuWorkerProfile {
-            owner: CpuWorkerId((index + 1) as u16),
+            owner: resource_intent
+                .own_worker_owner(index, clock.epoch(), Instant::now())
+                .map_err(|e| failure("CpuOwnerIntent", &e))?,
             max_depth: engine.config().max_depth,
             evaluation_namespace: cpu_evaluation_namespace_digest(&engine)
                 .map_err(|e| failure("CpuValueNamespace", &e))?,
@@ -797,6 +849,7 @@ fn prepare_actual(
     let factory_process_clock = clock.clone();
     let factory_epoch = clock.epoch();
     let factory_startup_cancel = Arc::clone(&startup_cancel);
+    let factory_resource_intent = Arc::clone(&resource_intent);
     let (sender, receiver) = mpsc::sync_channel::<
         Result<
             (ActualStartupSnapshotV5, NativeResourceOwnerV5),
@@ -810,12 +863,17 @@ fn prepare_actual(
                 // Recheck on the actual factory thread, closing the race
                 // between caller admission and thread scheduling. A started
                 // native owner is still drained by StartupNativeGuard.
-                if factory_startup_cancel.load(Ordering::Acquire) {
-                    return Err(rz_search::pals::coordinator::RoleFailure::Canceled);
-                }
-                if Instant::now() >= startup_until {
-                    return Err(rz_search::pals::coordinator::RoleFailure::Expired);
-                }
+                factory_resource_intent
+                    .require_active(factory_epoch, Instant::now())
+                    .map_err(|error| match error {
+                        ResourceIntentErrorV5::StartupCanceled => {
+                            rz_search::pals::coordinator::RoleFailure::Canceled
+                        }
+                        ResourceIntentErrorV5::StartupExpired => {
+                            rz_search::pals::coordinator::RoleFailure::Expired
+                        }
+                        _ => rz_search::pals::coordinator::RoleFailure::InvalidOutput,
+                    })?;
                 let runtime_pin = runtime_assets::pin_runtime_v5(&factory_pinned).map_err(|e| {
                     rz_search::pals::coordinator::RoleFailure::Backend(e.to_string())
                 })?;
@@ -1015,7 +1073,9 @@ fn prepare_actual(
         None => None,
         Some(external) => {
             require_original_startup_window(startup_until, &startup_cancel)?;
-            let owner = CpuWorkerId((declaration.coordinator.slices.workers + 1) as u16);
+            let owner = resource_intent
+                .external_worker_owner(clock.epoch(), Instant::now())
+                .map_err(|e| failure("ExternalOwnerIntent", &e))?;
             let runtime = clock.runtime_clock();
             let worker = ExternalCpuWorker::spawn_pinned(
                 external.config().clone(),
@@ -1113,7 +1173,7 @@ fn prepare_actual(
         cleanup_deadline: Mutex::new(None),
         clock,
         collection_context: Mutex::new(CollectionContextOwnerV5 {
-            enabled: collection_enabled,
+            enabled: collection_enabled || diagnostic_enabled,
             next_root: 0,
             current: Arc::new(Mutex::new(initial_scope)),
             active: None,
