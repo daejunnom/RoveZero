@@ -155,6 +155,12 @@ pub struct ForeignCpuQuestion {
 pub enum CpuQuestion {
     Own(OwnCpuQuestion),
     External(ForeignCpuQuestion),
+    /// Validated own question with no further native work credit. No physical
+    /// job or completed evidence is manufactured at this boundary.
+    OwnBudgetExhausted {
+        semantic_limit: u64,
+        semantic_spent: u64,
+    },
 }
 
 /// Commit result is produced by the Rules/store owner from the ORIGINAL view.
@@ -314,6 +320,7 @@ pub trait AdaptiveSearchDriver<Q> {
         profiles: &[CpuWorkerProfile],
         external: Option<&ExternalCpuConfig>,
         selection: CpuEndpointSelection,
+        physical_budget_exhausted: bool,
     ) -> Result<CpuQuestion, AdaptiveManagerError>;
     fn commit_cpu(
         &mut self,
@@ -1111,6 +1118,7 @@ where
     deferred: VecDeque<DeferredCommit<Q>>,
     validator_waiting: Vec<FrameId>,
     root_started: bool,
+    cpu_node_limit_reached: bool,
     root_ranking_proof: Option<ProposerRankingPublished>,
     exclusive_requested: bool,
     registered_action: Option<AdaptiveValidatorAction>,
@@ -1410,6 +1418,7 @@ where
             deferred: VecDeque::with_capacity(128),
             validator_waiting: Vec::with_capacity(limits.waiting_jobs_max),
             root_started: false,
+            cpu_node_limit_reached: false,
             root_ranking_proof: None,
             exclusive_requested: false,
             registered_action: None,
@@ -1752,6 +1761,9 @@ where
     }
     pub fn native_cpu_usage(&self) -> Result<(u64, u64), AdaptiveManagerError> {
         Ok(self.ledger.global_usage()?)
+    }
+    pub fn cpu_node_limit_reached(&self) -> bool {
+        self.cpu_node_limit_reached
     }
     pub fn has_pending_work(&self) -> bool {
         !self.roles.is_empty()
@@ -4347,6 +4359,34 @@ where
                     .iter()
                     .filter_map(|slot| slot.worker.as_ref().map(CpuWorker::profile))
                     .collect();
+                let (spent, reserved) = self.ledger.global_usage()?;
+                let total = spent
+                    .checked_add(reserved)
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "native CPU spent/reserved overflow",
+                    ))?;
+                if total > self.registration.native_cpu_node_limit {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "native CPU root credit overrun",
+                    ));
+                }
+                let endpoint =
+                    if self.registration.endpoints.execution_use == CpuExecutionUse::Collection {
+                        self.registration.endpoints.cpu_t
+                    } else {
+                        self.registration.endpoints.cpu_r
+                    };
+                // Outstanding reservations are not completed work. Leave the
+                // still-ready frame for the next tick after its real receipt.
+                if endpoint == CpuEndpoint::Own
+                    && total == self.registration.native_cpu_node_limit
+                    && reserved != 0
+                {
+                    continue;
+                }
+                let physical_budget_exhausted = endpoint == CpuEndpoint::Own
+                    && spent == self.registration.native_cpu_node_limit
+                    && reserved == 0;
                 let question = self
                     .driver
                     .cpu_question(
@@ -4354,6 +4394,7 @@ where
                         &profiles,
                         self.external.as_ref().map(|external| &external.config),
                         self.registration.endpoints,
+                        physical_budget_exhausted,
                     )
                     .map_err(|error| match error {
                         AdaptiveManagerError::Semantic(detail) => {
@@ -4365,6 +4406,28 @@ where
                         other => other,
                     })?;
                 match question {
+                    CpuQuestion::OwnBudgetExhausted {
+                        semantic_limit,
+                        semantic_spent,
+                    } => {
+                        if !physical_budget_exhausted
+                            || semantic_limit != self.registration.native_cpu_node_limit
+                            || semantic_spent > spent
+                            || !self.failures.is_empty()
+                            || !self.quarantined_cpu_receipts.is_empty()
+                        {
+                            return Err(AdaptiveManagerError::Invalid(
+                                "semantic CPU budget boundary lacks settled physical credit",
+                            ));
+                        }
+                        self.cpu_node_limit_reached = true;
+                        self.begin_root_quiesce(
+                            Instant::now()
+                                .checked_add(Duration::from_secs(30))
+                                .ok_or(AdaptiveManagerError::Deadline)?,
+                        )?;
+                        return Ok(true);
+                    }
                     CpuQuestion::Own(question) => {
                         let Some(slot) = self
                             .own

@@ -494,16 +494,22 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .ok()
             .map(|descriptor| descriptor.config.max_depth);
         format!(
-            "CPU question stage={:?}; frame_sequence={}; question={:?}; view={:?}; original_cpu_limit={}; semantic_cpu_nodes={}; per_task_cpu_limit={}; target_depth={}; checker_max_depth={checker_max_depth:?}; source_error={error}",
+            "CPU question stage={:?}; original_cpu_limit={}; semantic_cpu_nodes={}; per_task_cpu_limit={}; target_depth={}; checker_max_depth={checker_max_depth:?}; source_error={error}; frame_sequence={}; question={:?}; view={:?}",
             work.input.stage,
-            work.frame.sequence,
-            work.input.question_digest,
-            work.input.view_seal.view_digest,
             self.limits.max_cpu_nodes,
             self.counters.cpu_nodes,
             self.engine.config.cpu_nodes_per_task,
             self.limits.cpu_depth,
+            work.frame.sequence,
+            work.input.question_digest,
+            work.input.view_seal.view_digest,
         )
+    }
+
+    /// Semantic ledger only. Physical settlement is owned and checked by the
+    /// coordinator before this pair may authorize a normal root budget end.
+    pub fn semantic_cpu_budget(&self) -> (u64, u64) {
+        (self.limits.max_cpu_nodes, self.counters.cpu_nodes)
     }
 
     /// Prepare immutable conditions without claiming that a worker accepted or
@@ -513,6 +519,20 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
         profiles: &[CpuWorkerProfile],
     ) -> Result<AdaptivePortCpuQuestion, PalsError> {
+        self.prepare_cpu_question(work, profiles, false)?
+            .ok_or(PalsError::InvalidLimits)
+    }
+
+    /// None is a validated native-budget boundary, not a CPU report or frame
+    /// completion. The manager still owns the physical ledger and root drain.
+    /// Logical admission checks precede this boundary so exhausted work cannot
+    /// hide stale/depth/namespace/overrun failures.
+    pub fn prepare_cpu_question(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        profiles: &[CpuWorkerProfile],
+        physical_budget_exhausted: bool,
+    ) -> Result<Option<AdaptivePortCpuQuestion>, PalsError> {
         self.check_work(work)?;
         let question = &work.input.question;
         if !is_cpu_stage(question.stage) || self.closed.contains(&work.frame) {
@@ -546,6 +566,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     StoreError::InvalidConditions("CPU question cannot be replaced").into(),
                 );
             }
+            if self.counters.cpu_nodes > self.limits.max_cpu_nodes {
+                return Err(PalsError::InvalidLimits);
+            }
+            if physical_budget_exhausted || self.counters.cpu_nodes == self.limits.max_cpu_nodes {
+                return Ok(None);
+            }
             let position = self.issue_rules_position(admission.position.clone())?;
             let identity = position
                 .export()
@@ -556,12 +582,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .get_mut(&work.input.question_digest)
                 .expect("prepared CPU question")
                 .rules_identity = identity;
-            return Ok(AdaptivePortCpuQuestion {
+            return Ok(Some(AdaptivePortCpuQuestion {
                 position,
                 root_moves: admission.restriction.clone(),
                 target_depth: admission.target_depth,
                 total_native_node_credit: admission.credit,
-            });
+            }));
         }
         // Retired questions are not reusable cache entries. Removing metadata
         // never removes Store evidence or a still-retained worker continuation.
@@ -598,7 +624,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .checked_sub(self.counters.cpu_nodes)
             .ok_or(PalsError::InvalidLimits)?;
         let credit = remaining.min(self.engine.config.cpu_nodes_per_task);
-        if credit == 0 {
+        if self.engine.config.cpu_nodes_per_task == 0 {
             return Err(PalsError::InvalidLimits);
         }
         let restriction = if let Some(moves) = &question.validator_root_moves {
@@ -677,6 +703,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 question.context.prefix.len(),
             )
         };
+        if physical_budget_exhausted || remaining == 0 {
+            return Ok(None);
+        }
         let profile = stable_id(descriptor.config.profile.identity());
         let condition = stable_id(&format!(
             "{};q={}",
@@ -762,7 +791,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 quarantined: false,
             },
         );
-        Ok(result)
+        Ok(Some(result))
     }
 
     /// Call only after ledger reservation and before dispatch. Store admission

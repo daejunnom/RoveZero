@@ -384,7 +384,14 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
         _: &[CpuWorkerProfile],
         _: Option<&ExternalCpuConfig>,
         _: CpuEndpointSelection,
+        physical_budget_exhausted: bool,
     ) -> Result<CpuQuestion, AdaptiveManagerError> {
+        if physical_budget_exhausted {
+            return Ok(CpuQuestion::OwnBudgetExhausted {
+                semantic_limit: TOTAL_NODES,
+                semantic_spent: TOTAL_NODES,
+            });
+        }
         let mut endpoint = Position::from_snapshot(
             self.rules.rules().snapshot(),
             rz_position::PositionLimits::default(),
@@ -1330,8 +1337,15 @@ mod adaptive_partial_feedback {
             profiles: &[CpuWorkerProfile],
             external: Option<&ExternalCpuConfig>,
             selection: CpuEndpointSelection,
+            physical_budget_exhausted: bool,
         ) -> Result<CpuQuestion, AdaptiveManagerError> {
-            self.inner.cpu_question(work, profiles, external, selection)
+            self.inner.cpu_question(
+                work,
+                profiles,
+                external,
+                selection,
+                physical_budget_exhausted,
+            )
         }
         fn cpu_admitted(
             &mut self,

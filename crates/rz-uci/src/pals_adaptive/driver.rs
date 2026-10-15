@@ -745,6 +745,7 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         profiles: &[CpuWorkerProfile],
         external: Option<&ExternalCpuConfig>,
         selection: CpuEndpointSelection,
+        physical_budget_exhausted: bool,
     ) -> Result<CpuQuestion, AdaptiveManagerError> {
         let endpoint = if selection.execution_use == CpuExecutionUse::Collection {
             selection.cpu_t
@@ -754,9 +755,20 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         match endpoint {
             CpuEndpoint::Own => {
                 let port = self.hot()?;
-                let question = port.cpu_question(work, profiles).map_err(|error| {
-                    AdaptiveManagerError::Semantic(port.cpu_question_failure_detail(work, &error))
-                })?;
+                let question = port
+                    .prepare_cpu_question(work, profiles, physical_budget_exhausted)
+                    .map_err(|error| {
+                        AdaptiveManagerError::Semantic(
+                            port.cpu_question_failure_detail(work, &error),
+                        )
+                    })?;
+                let Some(question) = question else {
+                    let (semantic_limit, semantic_spent) = port.semantic_cpu_budget();
+                    return Ok(CpuQuestion::OwnBudgetExhausted {
+                        semantic_limit,
+                        semantic_spent,
+                    });
+                };
                 Ok(CpuQuestion::Own(OwnCpuQuestion {
                     position: question.position,
                     root_moves: question.root_moves,

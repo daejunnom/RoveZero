@@ -480,3 +480,35 @@ own 반환·resume 비용과 외부 stop/drain 비용을 따로 사용하고 필
 근거가 없는 현재 `PhysicalCompletionWait`는 unknown으로 남긴다. 반환 예측을 실제
 절약 시간·유효 witness·V utility로 바꾸지 않는다. 이 문서의 소스 경로를 21개 항목의
 실제 GPU·학습·대국 인수로 표시하지 않는다.
+
+## 동일 round의 own CPU 예산 소진
+
+own CPU의 root 한도는 실제 native node의 `spent + outstanding_reserved`로 관리한다.
+다음 round의 시작 검사만으로 같은 round 안의 CounterValidation·Repair 등 후속
+질문을 제한할 수는 없다. 다음 CPU 질문 직전에도 settled 물리 예산과 해당 질문의
+논리 조건을 대조한다. 정상 소진 시 새 작업이나 완료 증거를 만들지 않고 기존 root
+quiesce·질문 권한 폐기·cancel·physical drain·owner 종료 경로로 닫는다. 결과의 완료
+이유는 기존 `PalsCompletion::CpuNodeLimit`이며 마지막 유효 합법 착수를 유지한다.
+
+물리 사용량이 원 한도에 도달하고 예약이 0인 상태와 예약만 한도에 도달한 상태를
+구분한다. 후자는 실제 결과와 ack를 계속 수신하며 질문을 보류한다. 정상 종료로
+인정하려면 port와 manager의 원 한도가 같고 semantic 사용량이 실제 settled 사용량을
+초과하지 않아야 한다. ledger 오류·한도 초과·unknown·격리된 결과·잘못된 질문이나
+depth·namespace를 예산 소진으로 숨기지 않는다. 외부 엔진의 reported nodes는 이
+native credit 판정으로 환산하지 않는다.
+
+`1e00c9e`의 단일 root CPU 실행에서 실제 한도 1,024·semantic 소비 1,024·manager
+소비 1,024·예약 0 뒤 CounterValidation 질문이 `InvalidLimits`로 실패한 원자료를
+보존했다. 이는 기본 128/256 한도가 적용된 실행이 아니다. 원 실행은 role 출력 14개와
+NN 입력 28개를 소비했고 정상 process/archive 종료를 확인했지만, 검색 인수는 실패다.
+두 root를 실행한 이전 기록의 CPU 256 진단을 이 실패 root의 사용량으로 연결하지
+않는다. 실패 경로의 `SearchDiagnostic`와 성공 반환의 `DriverWork` 귀속은 다르다.
+
+같은 SHA의 새 비학습 G0에서는 Collection 150사례·Deployment 100사례, NN 입력
+300개·200개, 두 physical join과 원 자식 6개의 종료를 독립 검증했다. 새 checkpoint의
+실제 바이트는 이전 G0와 같았다. 이 수치 자료는 CPU 검색 수정의 실제 재실행이나
+GPU·성능·학습·대국 인수를 대신하지 않는다. 실제 학습은 계속 보류한다.
+
+수정 소스는 CPU/mock 69개와 `pals-adaptive,onnx-cpu` 실행 파일의 타입 검사를
+통과했다. 새 회귀는 실제 CpuWorker/PausedStack과 role mock의 자연 소진을 사용하며
+실제 Frozen WDL 경로의 수정 후 인수는 새 바이너리 실행으로 별도 확인한다.

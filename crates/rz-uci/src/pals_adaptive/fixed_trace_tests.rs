@@ -979,3 +979,176 @@ fn complete_line_two_fixed_manager_matches_synchronous_question_tensor_and_work_
     );
     assert!(position.legal_moves().contains(&actual.best_move.unwrap()));
 }
+
+#[test]
+fn natural_own_cpu_budget_end_drains_same_round_continuation_and_keeps_legal_move() {
+    // Run real finite CPU jobs and the existing role/encoding mock. No spent
+    // counter, CPU report or node count is injected into the manager or port.
+    const CREDIT: u64 = 1024;
+    let position = Position::startpos();
+    let legal = position.legal_moves();
+    let clock = ContractSystemClock::new(ProcessEpoch(335));
+    let until = clock.origin() + WINDOW;
+    let authority = SearchAuthority {
+        epoch: clock.domain().0,
+        game: GameGeneration(1),
+        root: RootGeneration(1),
+        implementation: Digest([65; 32]),
+    };
+    let make_cpu = || {
+        CpuEngine::with_resume_policy(
+            rz_search::cpu::CpuConfig {
+                tt_entries: 1024,
+                max_depth: 4,
+                quiescence_ply: 4,
+                ..Default::default()
+            },
+            rz_search::cpu::CpuResumePolicy::PausedStack,
+        )
+        .unwrap()
+    };
+    let value = value_identity();
+    let namespace = AdaptiveModelNamespace::new(
+        value.clone(),
+        Digest(MODEL_EPOCH),
+        Digest(encoding()),
+        PrecisionProfile::Fp32,
+        1,
+    )
+    .unwrap();
+    let mirror =
+        AdaptivePortModel::new_with_namespace(value.model.clone(), Some(value), namespace).unwrap();
+    let mut engine = PalsEngine::new(
+        PalsConfig {
+            beam_width: 1,
+            line_plies: 4,
+            max_role_calls: 64,
+            cpu_nodes_per_task: 128,
+            ..PalsConfig::default()
+        },
+        mirror,
+        make_cpu(),
+    )
+    .unwrap()
+    .with_selected_review_context(policy(), ReviewIndexLimits::default())
+    .unwrap();
+    engine.new_game();
+    let next_owner = Arc::new(AtomicU64::new(1));
+    let port = AdaptiveEnginePort::new(
+        engine,
+        position,
+        authority,
+        rz_contracts::Deadline {
+            clock: clock.domain(),
+            at: rz_contracts::MonotonicTick(WINDOW.as_nanos() as u64),
+        },
+        PalsLimits {
+            deadline: until,
+            max_rounds: 4,
+            max_cpu_nodes: CREDIT,
+            cpu_depth: 2,
+        },
+        Arc::new(move || Ok(OwnerId(next_owner.fetch_add(1, Ordering::Relaxed)))),
+    )
+    .unwrap();
+    let facts = Arc::new(TraceFacts::default());
+    let owner_facts = Arc::clone(&facts);
+    let owner_clock = clock.clone();
+    let native = TicketedNativeService::spawn(
+        move || {
+            Ok(TraceNative {
+                clock: owner_clock,
+                inner: LegalOrderRoleMock,
+                facts: owner_facts,
+                pending: BTreeSet::new(),
+            })
+        },
+        TicketServiceLimits::default(),
+    )
+    .unwrap();
+    let worker = CpuWorker::spawn_notified(CpuWorkerId(0), make_cpu(), native.signal()).unwrap();
+    let mut driver = AdaptivePortDriver::new(
+        port,
+        until,
+        Arc::new(native.signal()),
+        ExternalSlicePolicy::default(),
+    )
+    .unwrap();
+    driver.prepare_root_rules().unwrap();
+    let root = driver.root_input().unwrap();
+    let mut manager = AdaptiveExecutionManager::new(
+        AdaptiveManagerRegistration {
+            authority,
+            hard_deadline: until,
+            token_budget: 512,
+            policy: CoordinatorPolicy::Fixed,
+            first_request_sequence: 1,
+            native_cpu_node_limit: CREDIT,
+            endpoints: CpuEndpointSelection::deployment(),
+            controller: ControllerConfig::default(),
+            device_digest: Digest([66; 32]),
+            cpu_device_digest: Digest([67; 32]),
+        },
+        clock,
+        native,
+        vec![worker],
+        None,
+        driver,
+    )
+    .unwrap();
+    manager.prepare_root_ranking(root).unwrap();
+    let receipt = manager
+        .run_root_until(until, &AtomicBool::new(false))
+        .unwrap();
+    assert!(
+        manager.failures().next().is_none(),
+        "{:?}",
+        manager.failures().collect::<Vec<_>>()
+    );
+    assert!(
+        manager.cpu_node_limit_reached(),
+        "fixture must hit a new CPU frame after natural credit exhaustion"
+    );
+    assert_eq!(manager.native_cpu_usage().unwrap(), (CREDIT, 0));
+    assert!(receipt.permits_root_reuse());
+    assert!(
+        !receipt.permits_archive_close(),
+        "root fence is not a process shutdown"
+    );
+    let result = manager
+        .driver()
+        .result(PalsCompletion::CpuNodeLimit)
+        .unwrap();
+    assert_eq!(result.completion, PalsCompletion::CpuNodeLimit);
+    assert!(
+        result
+            .best_move
+            .is_some_and(|movement| legal.contains(&movement))
+    );
+    assert_eq!(result.counters.cpu_nodes, CREDIT);
+    assert!(manager.counters().cpu_slice_receipts > 1);
+    assert!(manager.counters().consumed_role_outputs > 1);
+    assert!(!facts.native_finished.load(Ordering::Acquire));
+    // Actual root fence returns the original owners. Finish the process in a
+    // distinct operation; no pending ticket or same-owner stack is leaked.
+    let parts = manager
+        .into_persistent_parts()
+        .unwrap_or_else(|rejected| panic!("{}", rejected.error));
+    let (mut native, cpu, external, driver, _, _) = parts.into_components();
+    assert!(external.is_none());
+    assert_eq!(cpu.len(), 1);
+    assert!(
+        cpu[0]
+            .engine
+            .paused_stack_snapshot()
+            .is_some_and(|stack| stack.tokens_retained == 0)
+    );
+    assert!(driver.port().is_some());
+    native.begin_shutdown(until);
+    while !native.try_join().unwrap() {
+        while native.poll().is_some() {}
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(facts.native_finished.load(Ordering::Acquire));
+}

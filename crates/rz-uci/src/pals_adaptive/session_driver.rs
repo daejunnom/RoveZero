@@ -1358,6 +1358,8 @@ where
             PalsCompletion::Deadline
         } else if manager.driver().root_is_terminal().unwrap_or(false) {
             PalsCompletion::Terminal
+        } else if manager.cpu_node_limit_reached() {
+            PalsCompletion::CpuNodeLimit
         } else {
             PalsCompletion::RoundLimit
         };
