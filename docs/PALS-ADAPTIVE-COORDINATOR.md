@@ -512,3 +512,35 @@ GPU·성능·학습·대국 인수를 대신하지 않는다. 실제 학습은 �
 수정 소스는 CPU/mock 69개와 `pals-adaptive,onnx-cpu` 실행 파일의 타입 검사를
 통과했다. 새 회귀는 실제 CpuWorker/PausedStack과 role mock의 자연 소진을 사용하며
 실제 Frozen WDL 경로의 수정 후 인수는 새 바이너리 실행으로 별도 확인한다.
+
+## 66aff9f 실제 CPU 수정 인수
+
+`66aff9fb522a0a3f656049da486f2e39c7f39164`에서 정상 CPU 예산 소진을 수정한 뒤,
+같은 CPU 1024/작업당 128/depth 2와 Fresh·B1·P/C·V-free·Frozen WDL 조건으로
+단일 `position startpos` → `go movetime 1000`을 다시 실행했다. 새 native build의
+552개 Git-LF source·25개 component·6개 ELF·22개 원 child 종료, 별도 caller의
+원 source 3개·lock·ELF·11개 child 종료와 등록한 notebook 코드/count 1을 대조했다.
+이 SHA의 Linux·Windows·CPU bindings·PALS model CI 네 job도 모두 성공했다.
+
+새 G0는 Collection 150사례/NN 300개, Deployment 100사례/NN 200개와 입력 tensor
+bytes·raw/policy/WDL 허용 오차·원 자식 종료·두 물리 join을 독립 대조했다.
+404개 archive member를 해시 검증했으며 새 checkpoint bytes는 직전 G0와 같았다.
+이는 새 producer 실행의 결과이며 옛 실행을 새 source의 증거로 재표시하지 않는다.
+
+실제 검색은 CPU spent 1024/reserved 0, role 결과 14개와 NN 입력 28개를 소비하고
+합법 수 `a2a4`를 반환했다. `SearchFailed`와 late canceled result가 없었고,
+ticket 14개의 수락·물리 완료·해제, root quiesce 1회, 반복 stop·새 게임·quit,
+정상 process/archive 종료를 원 18개 파일과 대조했다. 원 stderr의
+`SearchDiagnostic` 1개는 정상 PALS 작업량 요약이며 오류로 숨기거나 삭제하지 않았다.
+Deployment 영수증에 완료 enum이 직렬화되지 않으므로 `CpuNodeLimit` 직접 관측은
+unknown이다. 해당 source 분기와 원 counter가 일치한다는 추론을 별도로 보존한다.
+
+원 부모 관측의 go→bestmove 약 0.3103초와 준비를 포함한 전체 약 19.61초는
+서로 다른 구간이다. cgroup은 미적용, peak·VRAM·managed VM teardown은 unknown이며
+이 기능 검사를 성능 개선 자료로 사용하지 않는다. Repair·Yield·동시 pending 두 개,
+GPU·학습·대국은 이 실행에서 인수하지 않았다. 실제 학습은 계속 보류한다.
+
+별도 L4 load/mapping 진단에서는 정제한 환경의 libcuda/NVML 기본 soname 탐색이
+실패했지만 retained-FD 절대 load와 매핑은 확인됐다. CUDA API·provider·NN 성공으로
+해석하지 않는다. 뒤의 단일 API 요청은 코드 실행 전 capacity 실패로 종료됐으며,
+원 실패와 실행하지 못한 범위를 보존하고 기존 runtime/ambient guard를 유지한다.
