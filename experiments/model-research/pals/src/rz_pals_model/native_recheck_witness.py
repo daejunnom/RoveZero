@@ -190,6 +190,16 @@ _REVIEWED_OPT_IN_SOURCE_PROFILES = (
         "crates/rz-arena/src/pals_collect/native.rs": {
             "bytes": 233208, "sha256": "02af59b9edbc350e6e1a204eb6543033bb4a859729eb2ed79c8b470cc6823a01"},
     }),
+    # Reviewed compiled-source inventory-only successor, same legacy SingleReply
+    # policy. Only engine's implementation-digest source tuple changes; collector
+    # and runtime control bodies do not. No adaptive consumption, selected view,
+    # build, execution, value, utility or training authority is admitted here.
+    ("opt_in_single_reply_followup_compiled_consumption_0ba7c9e4_native_02af59b9", {
+        "crates/rz-search/src/pals/engine.rs": {
+            "bytes": 414554, "sha256": "0ba7c9e41b106f35516b8b234872a839f5b2f4227153ed79aa7ff1c503d12837"},
+        "crates/rz-arena/src/pals_collect/native.rs": {
+            "bytes": 233208, "sha256": "02af59b9edbc350e6e1a204eb6543033bb4a859729eb2ed79c8b470cc6823a01"},
+    }),
 )
 _POLICY = {
     "version": "pals-post-repair-recheck/1",

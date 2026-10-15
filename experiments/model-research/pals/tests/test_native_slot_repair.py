@@ -83,12 +83,21 @@ REVIEWED_ORDERED_SCOPE_SOURCE_PINS = {
 }
 
 
-# Independently reissued live fixture after the legacy-only source review.
-# The new bank seals this exact pair before admission, never a past receipt.
-# Optional selected/adaptive code and Err/Review add no fixture authority.
-REVIEWED_CURRENT_SOURCE_PINS = {
+# Historical optional-review pair, independent of the production closed table.
+# This preserves enrollment only, never a historical build or execution claim.
+REVIEWED_OPTIONAL_REVIEW_SOURCE_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
         "bytes": 414372, "sha256": "ce40b6f9ff8d13a41da8c9482b48528c1437896e9571c9630790c4b11b262726"},
+    "crates/rz-arena/src/pals_collect/native.rs": {
+        "bytes": 233208, "sha256": "02af59b9edbc350e6e1a204eb6543033bb4a859729eb2ed79c8b470cc6823a01"},
+}
+
+
+# Independent live-fixture pins after the compiled-source inventory-only review.
+# Only the engine digest's source tuple changes; the collector body is unchanged.
+REVIEWED_CURRENT_SOURCE_PINS = {
+    "crates/rz-search/src/pals/engine.rs": {
+        "bytes": 414554, "sha256": "0ba7c9e41b106f35516b8b234872a839f5b2f4227153ed79aa7ff1c503d12837"},
     "crates/rz-arena/src/pals_collect/native.rs": {
         "bytes": 233208, "sha256": "02af59b9edbc350e6e1a204eb6543033bb4a859729eb2ed79c8b470cc6823a01"},
 }
@@ -523,6 +532,14 @@ class NativeSlotRepairTests(unittest.TestCase):
             {"bytes": 224380, "sha256": "a286a2403317be7f5f058b65488e7c9722d2b7f4b9bf683ea95e5c9f51a7aaf8"})))
         self.assertEqual(slot_witness._reviewed_source_pair(earlier_revision_fixture), earlier_revision_fixture)
         self.assertNotEqual(earlier_revision_fixture, old)
+
+    def test_optional_review_pair_remains_a_separate_historical_profile(self):
+        reviewed = slot_witness._reviewed_source_pair(REVIEWED_OPTIONAL_REVIEW_SOURCE_PINS)
+        self.assertEqual(reviewed, REVIEWED_OPTIONAL_REVIEW_SOURCE_PINS)
+        self.assertNotEqual(reviewed, REVIEWED_CURRENT_SOURCE_PINS)
+        reviewed[slot_witness._SOURCE_PATHS[0]]["sha256"] = "0" * 64
+        self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_OPTIONAL_REVIEW_SOURCE_PINS),
+                         REVIEWED_OPTIONAL_REVIEW_SOURCE_PINS)
 
     def test_unknown_engine_or_native_source_pair_remains_unsupported(self):
         for name, index in (("engine_source", 0), ("native_source", 1)):

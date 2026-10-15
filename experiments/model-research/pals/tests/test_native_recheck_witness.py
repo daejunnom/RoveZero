@@ -301,6 +301,15 @@ class NativeRecheckBoundaryTests(unittest.TestCase):
             with self.assertRaises(witness.UnsupportedNativeRecheck):
                 witness._reviewed_source_pair(changed)
 
+    def test_optional_review_pair_remains_a_separate_historical_profile(self):
+        name, reviewed = witness._reviewed_source_pair(REVIEWED_OPTIONAL_REVIEW_WHOLE_SOURCE_PINS)
+        self.assertEqual(name, "opt_in_single_reply_followup_optional_review_ce40b6f9_native_02af59b9")
+        self.assertEqual(reviewed, REVIEWED_OPTIONAL_REVIEW_WHOLE_SOURCE_PINS)
+        self.assertNotEqual(reviewed, REVIEWED_CURRENT_WHOLE_SOURCE_PINS)
+        reviewed[witness._SOURCE_PATHS[0]]["sha256"] = "0" * 64
+        self.assertEqual(witness._reviewed_source_pair(REVIEWED_OPTIONAL_REVIEW_WHOLE_SOURCE_PINS)[1],
+                         REVIEWED_OPTIONAL_REVIEW_WHOLE_SOURCE_PINS)
+
     def test_followup_core_review_preserves_history_and_rejects_component_hybrids(self):
         _, historical = witness._reviewed_source_pair(REVIEWED_WHOLE_SOURCE_PINS)
         _, current = witness._reviewed_source_pair(REVIEWED_CURRENT_WHOLE_SOURCE_PINS)
@@ -804,13 +813,26 @@ REVIEWED_ORDERED_SCOPE_WHOLE_SOURCE_PINS = {
 }
 
 
-# Independent current-fixture registration after the legacy-only source review.
+# Independent historical pair; preserving the profile certifies no old build.
+REVIEWED_OPTIONAL_REVIEW_WHOLE_SOURCE_PINS = {
+    "crates/rz-search/src/pals/engine.rs": {
+        "bytes": 414372,
+        "sha256": "ce40b6f9ff8d13a41da8c9482b48528c1437896e9571c9630790c4b11b262726",
+    },
+    "crates/rz-arena/src/pals_collect/native.rs": {
+        "bytes": 233208,
+        "sha256": "02af59b9edbc350e6e1a204eb6543033bb4a859729eb2ed79c8b470cc6823a01",
+    },
+}
+
+
+# Independent current fixture after the compiled-source inventory-only review.
 # Source/build/roster/trace bytes are sealed for a new synthetic bank before its
 # admission. No old receipt is re-sealed and no adaptive execution is certified.
 REVIEWED_CURRENT_WHOLE_SOURCE_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
-        "bytes": 414372,
-        "sha256": "ce40b6f9ff8d13a41da8c9482b48528c1437896e9571c9630790c4b11b262726",
+        "bytes": 414554,
+        "sha256": "0ba7c9e41b106f35516b8b234872a839f5b2f4227153ed79aa7ff1c503d12837",
     },
     "crates/rz-arena/src/pals_collect/native.rs": {
         "bytes": 233208,

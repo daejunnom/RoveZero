@@ -5,7 +5,10 @@
 mod fixed_trace;
 
 use super::*;
-use crate::pals_adaptive::AdaptivePortDriver;
+use crate::pals_adaptive::{
+    AdaptiveCpuSliceDiagnosticOptions, AdaptiveCpuSliceResultObservation, AdaptivePortDriver,
+    CPU_SLICE_DIAGNOSTIC_RECORDS_MAX,
+};
 use crate::pals_native::ticketed::{
     TicketExecutionEvidence, TicketNativeBackend, TicketPhysicalResult, TicketPreparation,
     TicketServiceLimits, TicketedNativeService,
