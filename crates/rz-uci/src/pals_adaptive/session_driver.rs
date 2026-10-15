@@ -315,6 +315,8 @@ where
     dispatch_observer: Option<AdaptiveCollectionDispatchObserver>,
     closure_observer: Option<AdaptiveRootClosureObserver<B>>,
     collection_hooks: AdaptiveSessionCollectionHooks<B>,
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    continuation_diagnostic: std::sync::OnceLock<super::ContinuationDiagnostic>,
     latest_root: Mutex<Option<AdaptiveShutdownReceipt>>,
     archive_receipts: Mutex<VecDeque<ArchiveWorkReceipt>>,
     pending_output: Mutex<Option<PendingOutput>>,
@@ -617,6 +619,8 @@ where
             dispatch_observer,
             closure_observer,
             collection_hooks,
+            #[cfg(feature = "pals-adaptive-diagnostics")]
+            continuation_diagnostic: std::sync::OnceLock::new(),
             latest_root: Mutex::new(None),
             archive_receipts: Mutex::new(VecDeque::with_capacity(64)),
             pending_output: Mutex::new(None),
@@ -629,6 +633,33 @@ where
     }
     pub fn execution_limits(&self) -> AdaptiveExecutionLimits {
         self.limits
+    }
+    /// Opt-in metadata only, once while the original retained process is idle.
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    pub fn install_continuation_diagnostic(
+        &self,
+        diagnostic: super::ContinuationDiagnostic,
+    ) -> Result<(), super::ContinuationDiagnosticError> {
+        use super::ContinuationDiagnosticError as Error;
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Err(Error::Busy),
+            Err(TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
+        };
+        let latest = match self.latest_root.try_lock() {
+            Ok(latest) => latest,
+            Err(TryLockError::WouldBlock) => return Err(Error::Busy),
+            Err(TryLockError::Poisoned(_)) => return Err(Error::Poisoned),
+        };
+        if self.closed.load(Ordering::Acquire)
+            || !matches!(&*state, SessionState::Idle(_))
+            || latest.is_some()
+        {
+            return Err(Error::AdmissionAlreadyStarted);
+        }
+        self.continuation_diagnostic
+            .set(diagnostic)
+            .map_err(|_| Error::AlreadyInstalled)
     }
     /// Last returned run's actual final semantic reason and driver return,
     /// in a separate bounded diagnostic. Compare its authority before use;
@@ -1304,6 +1335,13 @@ where
         };
         *observation = AttemptObservation::PalsStarted;
         let admitted = catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(feature = "pals-adaptive-diagnostics")]
+            if let Some(diagnostic) = self.continuation_diagnostic.get() {
+                manager.install_continuation_diagnostic(diagnostic.clone());
+                manager
+                    .driver_mut()
+                    .install_role_consumption_diagnostic(diagnostic);
+            }
             if let Some(observer) = &self.collection_hooks.root_admission {
                 observer(&mut manager)?;
             }
@@ -1377,6 +1415,12 @@ where
             }));
             // Even cleanup panic retains the whole actual manager before any
             // caller-visible failure; a local owner must not unwind and drop.
+            #[cfg(feature = "pals-adaptive-diagnostics")]
+            if let Some(diagnostic) = self.continuation_diagnostic.get() {
+                manager
+                    .driver()
+                    .copy_role_consumption_diagnostic(diagnostic, false);
+            }
             *state = SessionState::Manager(manager);
             return Err(
                 SearchSessionFailure::debug("AdaptiveRootExecution", &error).unknown_if_unclosed()
@@ -1392,6 +1436,12 @@ where
         if !receipt.permits_root_reuse() || manager.phase() != ManagerPhase::Finished {
             *state = SessionState::Manager(manager);
             return Err(SearchSessionFailure::physical_completion_unknown());
+        }
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        if let Some(diagnostic) = self.continuation_diagnostic.get() {
+            manager
+                .driver()
+                .copy_role_consumption_diagnostic(diagnostic, true);
         }
         let completion = if context.cancellation.is_canceled()
             || context.control.cancellation.load(Ordering::Acquire)

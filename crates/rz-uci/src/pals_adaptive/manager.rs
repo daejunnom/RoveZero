@@ -5,6 +5,12 @@ use super::cpu_slice_observation::{
 };
 use super::native_accounting::AdaptiveNativeAccountingSnapshot;
 use super::validator::{AcceptedValidator, CompletedValidatorAction};
+#[cfg(feature = "pals-adaptive-diagnostics")]
+use super::{
+    ContinuationDiagnostic, ContinuationDiagnosticUnavailable, ContinuationPendingObservation,
+    ContinuationPendingSource, ContinuationResolutionObservation, ContinuationResolutionSource,
+    ContinuationTransitionKind,
+};
 use crate::pals_native::ticketed::{
     NativeRootFence, PreparationId, TicketExecutionEvidence, TicketNativeBackend,
     TicketNativeEvent, TicketOwnerRunWitness, TicketPreparation, TicketServiceError,
@@ -1142,6 +1148,8 @@ where
     foreign: Option<ForeignBinding<Q>>,
     ledger: CpuCreditLedger,
     cpu_slice_diagnostic: OnceLock<AdaptiveCpuSliceDiagnostic>,
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    continuation_diagnostic: Option<ContinuationDiagnostic>,
     ready: ReadySelector<FrameId, Move16, Digest>,
     costs: CostEstimator,
     controller: AdaptiveController,
@@ -1453,6 +1461,8 @@ where
             foreign: None,
             ledger,
             cpu_slice_diagnostic: OnceLock::new(),
+            #[cfg(feature = "pals-adaptive-diagnostics")]
+            continuation_diagnostic: None,
             ready,
             costs,
             controller,
@@ -1759,6 +1769,41 @@ where
             validator_loaded: self.registration.endpoints.load_v,
             receipt,
         })
+    }
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    pub(super) fn install_continuation_diagnostic(&mut self, diagnostic: ContinuationDiagnostic) {
+        if self.phase != ManagerPhase::Running
+            || self.root_started
+            || !self.roles.is_empty()
+            || self.own.iter().any(|slot| slot.binding.is_some())
+            || self.continuation_diagnostic.is_some()
+        {
+            diagnostic.unavailable(ContinuationDiagnosticUnavailable::ScopeMismatch);
+            return;
+        }
+        diagnostic.bind(self.registration.authority);
+        self.continuation_diagnostic = Some(diagnostic);
+    }
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    fn observe_pending_diagnostic(
+        &self,
+        source: ContinuationPendingSource,
+        trigger: RequestId,
+        queue_admitted_at: Option<Instant>,
+    ) {
+        if let Some(diagnostic) = &self.continuation_diagnostic {
+            if diagnostic.pending_enabled() {
+                diagnostic.pending(
+                    self.registration.authority,
+                    ContinuationPendingObservation {
+                        source,
+                        trigger,
+                        queue_admitted_at,
+                        snapshot: self.pending_question_snapshot(),
+                    },
+                );
+            }
+        }
     }
     pub fn driver(&self) -> &D {
         &self.driver
@@ -2573,6 +2618,8 @@ where
                     owner_run,
                     owner_service_elapsed,
                 };
+                #[cfg(feature = "pals-adaptive-diagnostics")]
+                let diagnostic_completion_ticket = completion.ticket.id;
                 let outcome = (|| -> Result<(), AdaptiveManagerError> {
                     let ticket = completion.ticket;
                     let physical = completion.physical;
@@ -2740,6 +2787,12 @@ where
                     self.retained_native_completions.push(retained);
                     return Err(error);
                 }
+                #[cfg(feature = "pals-adaptive-diagnostics")]
+                self.observe_pending_diagnostic(
+                    ContinuationPendingSource::CompletionProcessed,
+                    diagnostic_completion_ticket,
+                    None,
+                );
             }
             TicketNativeEvent::PreparationFailed {
                 preparation,
@@ -3273,6 +3326,12 @@ where
                 Ok(admitted_at) => {
                     self.roles[index].queue_admitted_at = Some(admitted_at);
                     self.roles[index].dispatch_pending = false;
+                    #[cfg(feature = "pals-adaptive-diagnostics")]
+                    self.observe_pending_diagnostic(
+                        ContinuationPendingSource::QueueAdmitted,
+                        ticket.id,
+                        Some(admitted_at),
+                    );
                     changed = true;
                 }
                 Err(TicketServiceError::Capacity) => break,
@@ -4245,19 +4304,75 @@ where
             submitted_view: work.input.view_seal,
             completed_evidence: checked.evidence,
         };
-        let closed = match checked.rules_pair {
-            Some(proof) => self.machine.resolve_checked_rules_pair(
-                evidence,
-                &proof,
-                self.clock.domain(),
-                now,
-            )?,
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        let diagnostic_transition = match &checked.transition {
+            FrameTransition::Continue(next) => ContinuationTransitionKind::Continue {
+                next_stage: next.stage,
+            },
+            FrameTransition::Complete { scope } => {
+                ContinuationTransitionKind::Complete { scope: *scope }
+            }
+            FrameTransition::Unknown { reason } => {
+                ContinuationTransitionKind::Unknown { reason: *reason }
+            }
+        };
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        let checked_rules_pair = checked.rules_pair.is_some();
+        let resolved = match checked.rules_pair {
+            Some(proof) => {
+                self.machine
+                    .resolve_checked_rules_pair(evidence, &proof, self.clock.domain(), now)
+            }
             None => self
                 .machine
-                .resolve(evidence, checked.transition, self.clock.domain(), now)?,
+                .resolve(evidence, checked.transition, self.clock.domain(), now),
         };
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        if let Some(diagnostic) = &self.continuation_diagnostic {
+            diagnostic.resolution(ContinuationResolutionObservation {
+                authority: self.registration.authority,
+                evidence,
+                transition: diagnostic_transition,
+                checked_at: now,
+                clock: self.clock.domain(),
+                source: ContinuationResolutionSource::MachineTransition {
+                    checked_rules_pair,
+                    accepted: resolved.is_ok(),
+                },
+                closed_frame: resolved
+                    .as_ref()
+                    .ok()
+                    .and_then(|closed| closed.as_ref().map(|frame| frame.id)),
+                closed_scope: resolved
+                    .as_ref()
+                    .ok()
+                    .and_then(|closed| closed.as_ref().and_then(|frame| frame.completion_scope)),
+                closed_unknown: resolved
+                    .as_ref()
+                    .ok()
+                    .and_then(|closed| closed.as_ref().and_then(|frame| frame.unknown)),
+            });
+        }
+        let closed = resolved?;
         if let Some(closed) = closed {
-            self.publish_closed_frame(&closed)?;
+            let published = self.publish_closed_frame(&closed);
+            #[cfg(feature = "pals-adaptive-diagnostics")]
+            if let Some(diagnostic) = &self.continuation_diagnostic {
+                diagnostic.resolution(ContinuationResolutionObservation {
+                    authority: self.registration.authority,
+                    evidence,
+                    transition: diagnostic_transition,
+                    checked_at: now,
+                    clock: self.clock.domain(),
+                    source: ContinuationResolutionSource::ClosedFramePublication {
+                        published: published.is_ok(),
+                    },
+                    closed_frame: Some(closed.id),
+                    closed_scope: closed.completion_scope,
+                    closed_unknown: closed.unknown,
+                });
+            }
+            published?;
         }
         Ok(())
     }

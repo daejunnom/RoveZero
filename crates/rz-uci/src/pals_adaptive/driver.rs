@@ -245,6 +245,33 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
             registered_action: None,
         })
     }
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    pub(super) fn install_role_consumption_diagnostic(
+        &mut self,
+        diagnostic: &ContinuationDiagnostic,
+    ) {
+        if !diagnostic.options().role_consumption {
+            return;
+        }
+        let authority = self.authority;
+        let installed = self
+            .hot()
+            .is_ok_and(|port| port.enable_role_consumption_observation());
+        diagnostic.role_install(authority, installed);
+    }
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    pub(super) fn copy_role_consumption_diagnostic(
+        &self,
+        diagnostic: &ContinuationDiagnostic,
+        original_root_fence: bool,
+    ) {
+        diagnostic.role_readback(
+            self.authority,
+            self.port()
+                .and_then(|port| port.role_consumption_observation()),
+            original_root_fence,
+        );
+    }
     pub fn port(&self) -> Option<&AdaptiveEnginePort<M>> {
         self.port.as_deref()
     }
