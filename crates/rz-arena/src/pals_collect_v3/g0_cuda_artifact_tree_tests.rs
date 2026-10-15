@@ -38,6 +38,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_separate_manifest(false)
+    }
+    fn with_separate_manifest(separate_manifest: bool) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let parent = std::env::temp_dir().canonicalize().unwrap();
         let nonce = SystemTime::now()
@@ -52,8 +55,22 @@ impl Fixture {
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
         let root_metadata = fs::symlink_metadata(&root).unwrap();
         let parent_metadata = fs::symlink_metadata(&parent).unwrap();
-        let source = root.join("source");
-        fs::DirBuilder::new().mode(0o700).create(&source).unwrap();
+        let kit = root.join(if separate_manifest {
+            "cuda-kit"
+        } else {
+            "source"
+        });
+        fs::DirBuilder::new().mode(0o700).create(&kit).unwrap();
+        let source = if separate_manifest {
+            let libraries = kit.join("libraries");
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&libraries)
+                .unwrap();
+            libraries
+        } else {
+            kit.clone()
+        };
         let cache = root.join("cache");
         let names = [
             ("core", CORE),
@@ -109,7 +126,11 @@ impl Fixture {
         .unwrap();
         rz_eval::runtime_pin::CudaRuntimeBundleSpec::from_json(std::str::from_utf8(&raw).unwrap())
             .unwrap();
-        let manifest = source.join("cuda-bundle.json");
+        let manifest = kit.join(if separate_manifest {
+            "cuda-runtime-bundle.json"
+        } else {
+            "cuda-bundle.json"
+        });
         fs::write(&manifest, &raw).unwrap();
         pins.push(pin(&manifest, &raw));
         Self {
@@ -286,6 +307,34 @@ fn actual_g0_prepare_scans_exact_bytes_and_transfers_only_live_capability() {
     assert!(json_only.cuda_artifact_tree.is_none());
     assert!(cuda_tree::child_observation_for_dispatch(&json_only).is_err());
     assert!(cuda_tree::scan_staging(&json_only, OUTPUT_CAP, until, &cancel).is_err());
+}
+
+#[test]
+fn actual_g0_prepare_accepts_manifest_beside_libraries_without_flat_shadow_inputs() {
+    let fixture = Fixture::with_separate_manifest(true);
+    let kit = fixture.root.join("cuda-kit");
+    assert_eq!(fixture.manifest, kit.join("cuda-runtime-bundle.json"));
+    assert_eq!(fixture.source, kit.join("libraries"));
+    let cancel = AtomicBool::new(false);
+    let until = Instant::now() + Duration::from_secs(30);
+    let mut credit = read_credit(&cancel, until, READ_CAP);
+    let mut held = fixture.held("separate-manifest");
+    fixture.hold_inputs(&mut held, &mut credit);
+    assert!(held.inputs.iter().all(|input| {
+        input.pin.path == fixture.manifest
+            || input.pin.path.parent() == Some(fixture.source.as_path())
+    }));
+    assert!(!kit.join(CORE).exists());
+    fixture.prepare(&mut held, &mut credit).unwrap();
+    let tree = held.cuda_artifact_tree.as_ref().unwrap().observe().unwrap();
+    assert_eq!((tree.regular_files(), tree.aliases()), (19, 8));
+    let observation = cuda_tree::child_observation_for_dispatch(&held)
+        .unwrap()
+        .unwrap();
+    assert_eq!(observation["files"].as_array().unwrap().len(), 19);
+    assert_eq!(observation["aliases"].as_array().unwrap().len(), 8);
+    cuda_tree::scan_staging(&held, OUTPUT_CAP, until, &cancel).unwrap();
+    assert!(selfplay_cli::scan_staging(&held.staging, OUTPUT_CAP, until, &cancel).is_err());
 }
 
 #[test]

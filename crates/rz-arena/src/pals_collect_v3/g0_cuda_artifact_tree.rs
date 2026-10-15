@@ -162,9 +162,11 @@ pub(super) fn prepare(
         std::str::from_utf8(&raw).map_err(|_| invalid("G0 CUDA manifest UTF-8"))?,
     )
     .map_err(|_| invalid("G0 CUDA manifest validation"))?;
-    let source_root = manifest_path
+    // The manifest is an independent held input and may be beside libraries/.
+    // Match the native consumer: DSO basenames belong to the core's parent.
+    let source_root = runtime_library
         .parent()
-        .ok_or_else(|| invalid("G0 CUDA source parent"))?;
+        .ok_or_else(|| invalid("G0 CUDA runtime library source parent"))?;
     let mut original_files = Vec::with_capacity(spec.files.len());
     let mut incoming = 0u64;
     let mut core = false;
