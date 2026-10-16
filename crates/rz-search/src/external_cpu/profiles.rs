@@ -214,6 +214,17 @@ impl ExternalEngineProfile {
                 "external query constraint exceeds finite bounds",
             ));
         }
+        // Reckless v0.9.0 parses all paired limit values as i32. A larger
+        // positive node number is skipped and can fall through to Infinite.
+        if self == Self::Reckless090EmbeddedNnue
+            && constraint
+                .requested_nodes()
+                .is_some_and(|nodes| nodes > i32::MAX as u64)
+        {
+            return Err(CheckerError::Invalid(
+                "Reckless node limit exceeds its signed parser range",
+            ));
+        }
         Ok(())
     }
 
@@ -579,6 +590,28 @@ mod tests {
                 "go movetime 550".into(),
                 ExternalGoConstraint::MoveTime { milliseconds: 550 }
             )
+        );
+        let reckless = ExternalEngineProfile::Reckless090EmbeddedNnue;
+        assert!(
+            reckless
+                .require_query(
+                    ExternalGoConstraint::Nodes {
+                        reported_nodes: i32::MAX as u64
+                    },
+                    false
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            reckless.require_query(
+                ExternalGoConstraint::Nodes {
+                    reported_nodes: i32::MAX as u64 + 1
+                },
+                false
+            ),
+            Err(CheckerError::Invalid(
+                "Reckless node limit exceeds its signed parser range"
+            ))
         );
         let combined = ExternalGoConstraint::Combined {
             depth: 4,
