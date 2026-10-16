@@ -16,6 +16,8 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::sync::Arc;
 
+pub mod nnuec;
+
 pub const CPU_VALUE_SCHEMA: &str = "rz-cpu-float-value-v2";
 pub const CPU_VALUE_ARCHITECTURE: &str = "piece-square-metadata-exact192-acc256-hidden32-fp32-v1";
 pub const CPU_ACCUMULATOR_WIDTH: usize = 256;
