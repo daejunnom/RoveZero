@@ -166,6 +166,13 @@ class NnuecReferenceTests(unittest.TestCase):
         black = evaluate(checkpoint, input_mapping(boards=((0,), (1,)), side="black"))
         self.assertEqual(black["board_accumulators"], result["board_accumulators"])
         self.assertIn("not_rules", result["reference_scope"])
+        # A non-symmetric head directly observes B_stm before B_opponent.
+        parameters["hidden_weights"][:7] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        parameters["hidden_bias"][0] = 0.0
+        white = evaluate(checkpoint, input_mapping(boards=((0,), (1,))))
+        black = evaluate(checkpoint, input_mapping(boards=((0,), (1,)), side="black"))
+        self.assertEqual(white["hidden"][0], 1.0)
+        self.assertEqual(black["hidden"][0], 0.25)
 
     def test_weights_digest_is_binary32_ordered_and_excludes_training_declaration(self):
         checkpoint = checkpoint_mapping()
