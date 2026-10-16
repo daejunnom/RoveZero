@@ -7,8 +7,8 @@
 mod evaluation;
 pub mod pals;
 pub mod pals_adaptive;
-pub mod rovent;
 mod primitives;
+pub mod rovent;
 mod state;
 
 pub use evaluation::*;
