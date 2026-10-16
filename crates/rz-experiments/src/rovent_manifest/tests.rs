@@ -1,0 +1,684 @@
+use super::*;
+
+fn sha_value(c: char) -> String {
+    c.to_string().repeat(64)
+}
+fn artifact(name: &str) -> ArtifactRef {
+    ArtifactRef {
+        path: format!("fixture/{name}"),
+        sha256: sha_value('a'),
+        bytes: 32,
+        source: "https://example.org/rovent-fixture".into(),
+        license: "MIT".into(),
+    }
+}
+fn model() -> RoventModelPin {
+    RoventModelPin {
+        semantics: "fixture-model/1".into(),
+        encoding: "fixture-input/1".into(),
+        policy_head: "legal-candidates/1".into(),
+        value_head: "side-to-move-wdl/1".into(),
+        implementation_sha256: sha_value('b'),
+        weights: artifact("weights.bin"),
+        provenance: artifact("provenance.json"),
+        diagnostic: false,
+    }
+}
+fn manifest() -> RoventExecutionManifest {
+    RoventExecutionManifest {
+        domain: ROVENT_EXECUTION_DOMAIN.into(),
+        contract_revision: ROVENT_SEARCH_REVISION.into(),
+        run_id: "rovent-fixture-1".into(),
+        purpose: RoventPurpose::Validation,
+        engine: RoventEngineDeclaration {
+            source_commit: "a".repeat(40),
+            source_components: BTreeMap::from([("control".into(), sha_value('c'))]),
+            binary: artifact("rovent"),
+            mode: ExecutionMode::CpuPc,
+            pc: RoventPcConfiguration {
+                proposer: model(),
+                critic: model(),
+                validator: None,
+                backend: RoventBackend::RustCpu,
+                device: RoventDevice::Cpu,
+                backend_configuration_sha256: sha_value('d'),
+                runtime_artifacts: vec![],
+                fp32: true,
+                tf32: false,
+                batch_width: 1,
+                ort_intra_threads: None,
+                ort_inter_threads: None,
+                ort_spinning: None,
+            },
+            researcher: None,
+            teachers: vec![],
+            nnuec: None,
+            search: RoventSearchDeclaration {
+                node_unit: ROVENT_POSITION_VISIT_UNIT.into(),
+                requested_nodes: None,
+                depth_plies: None,
+                mate_moves: None,
+                registered_max_chess_plies: NonZeroU16::new(64).unwrap(),
+                searchmoves: None,
+                search_configuration_sha256: sha_value('e'),
+                root_state_and_history_sha256: sha_value('f'),
+                rules_profile_sha256: sha_value('1'),
+            },
+        },
+        resources: RoventResourcePlan {
+            cpu_quota_millicpus: 2000,
+            pools: vec![RoventThreadPool {
+                actors: BTreeSet::from([RoventActor::Manager, RoventActor::PcCaller]),
+                max_threads: 1,
+                cpu_charge_millicpus: 1000,
+            }],
+            memory_high_bytes: 6 << 30,
+            memory_max_bytes: 12 << 30,
+            gpu_devices: 0,
+            physical_nn_concurrency: 1,
+            topology_policy: "shared-control/1".into(),
+        },
+        coordinator: RoventCoordinatorDeclaration {
+            policy_sha256: sha_value('2'),
+            questions_max: 1024,
+            ancestor_depth_max: 64,
+            waiting_jobs_max: 64,
+            role_tickets_max: 16,
+            cpu_credit_limit: 100_000,
+            original_root_budget_sha256: sha_value('3'),
+            original_deadline_seal_sha256: sha_value('4'),
+        },
+        wall_time_max_ms: 60_000,
+        cleanup_max_ms: 30_000,
+        output_bytes_max: 1 << 20,
+        agent_renewable: true,
+        provenance: vec![artifact("registration.json")],
+    }
+}
+fn observed<T>(value: T) -> RoventObserved<T> {
+    RoventObserved::Observed {
+        value,
+        method: "fixture-owner/1".into(),
+    }
+}
+fn external(purpose: RoventExternalPurpose) -> RoventExternalProfilePin {
+    RoventExternalProfilePin {
+        domain: ROVENT_EXTERNAL_PROFILE_DOMAIN.into(),
+        profile: artifact("external-profile.json"),
+        canonical_sha256: sha_value('8'),
+        capability_sha256: sha_value('9'),
+        purpose,
+        binary: artifact("external-engine"),
+        source_commit: "b".repeat(40),
+        requested_threads: 1,
+        requested_hash_mib: 256,
+    }
+}
+fn receipt(lock: &RoventInputLock) -> RoventExecutionReceipt {
+    let m = &lock.manifest;
+    RoventExecutionReceipt {
+        domain: ROVENT_RECEIPT_DOMAIN.into(),
+        run_id: m.run_id.clone(),
+        input_lock_sha256: lock.canonical_sha256.clone(),
+        functional_accepted: true,
+        controlled_comparison_eligible: false,
+        source_content_verified: observed(true),
+        source_and_binary_evidence: observed(artifact("source.json")),
+        model_content_verified: observed(true),
+        model_configuration_sha256: observed(m.model_configuration_sha256().unwrap()),
+        model_content_evidence: observed(artifact("models.json")),
+        pc_device: observed(m.engine.pc.device.clone()),
+        backend_configuration_sha256: observed(m.engine.pc.backend_configuration_sha256.clone()),
+        calls: observed(RoventExecutedCalls {
+            r_calls: 0,
+            native_nodes: 0,
+            qsearch_nodes: 0,
+            see_calls: Some(0),
+            external_teacher_queries: 0,
+            external_research_queries: 0,
+            nnuec_readouts: 0,
+            validator_models_loaded: 0,
+            validator_models_generated: 0,
+            validator_calls: 0,
+            completed_nn_inputs: 0,
+            search_consumed_evaluations: 0,
+        }),
+        nodes: observed(RoventNodeObservation {
+            unit: ROVENT_POSITION_VISIT_UNIT.into(),
+            requested_nodes: m.engine.search.requested_nodes,
+            root_entries: 1,
+            checked_transitions: 0,
+            native_nodes: 0,
+            total_node_visits: 1,
+        }),
+        lifecycle: observed(RoventLifecycleObservation {
+            submitted: 0,
+            terminal_before_dispatch: 0,
+            cache_completed: 0,
+            dispatched: 0,
+            queued: 0,
+            physically_completed: 0,
+            in_flight: 0,
+            completion_unknown: 0,
+            released: 0,
+            nn_inputs_completed: 0,
+            nn_inputs_accepted: 0,
+            cache_evaluations_accepted: 0,
+            search_evaluations_consumed: 0,
+            cpu_spent: 0,
+            cpu_outstanding_reserved: 0,
+            root_budget_sha256: m.coordinator.original_root_budget_sha256.clone(),
+            original_deadline_seal_sha256: m.coordinator.original_deadline_seal_sha256.clone(),
+            authority_anchor_view_and_owner_verified: true,
+            archive_closed: true,
+            evidence: artifact("lifecycle.json"),
+        }),
+        goal: observed(RoventGoalObservation {
+            completed_chess_plies: None,
+            depth_target_satisfied: false,
+            rules_terminal_closed_early: false,
+            open_required_obligations: 0,
+            completed_boundary_evaluations: 0,
+            mate: None,
+            emitted_score_mate: None,
+            bestmove_emitted: false,
+            bestmove_output_authorized: false,
+            evidence: artifact("goal.json"),
+        }),
+        root_moves_rules_seal: observed(sha_value('5')),
+        external_profiles_verified: observed(vec![]),
+        physical_state: observed(RoventPhysicalState::Complete),
+        worker_joined_and_processes_closed: observed(true),
+        resources: RoventResourceObservation {
+            limits_applied: RoventObserved::Unknown,
+            process_tree_quota_millicpus: RoventObserved::Unknown,
+            memory_high_bytes: RoventObserved::Unknown,
+            memory_max_bytes: RoventObserved::Unknown,
+            inventory_complete: RoventObserved::Unknown,
+            kernel_threads: RoventObserved::Unknown,
+            verified_plan_readback_sha256: RoventObserved::Unknown,
+            host_peak_bytes: RoventObserved::Unknown,
+            vram_peak_bytes: RoventObserved::Unknown,
+            evidence: artifact("resources.json"),
+        },
+        failures: BTreeSet::new(),
+        full_gc_requested: false,
+        memory_contention: false,
+        wall_time_ms: 1000,
+        cleanup_ms: 10,
+        output_bytes: 1024,
+        execution_evidence: artifact("execution.json"),
+    }
+}
+
+#[test]
+fn strict_new_domain_and_lock_do_not_convert_legacy_or_tampered_input() {
+    let m = manifest();
+    let encoded = serde_json::to_string(&m).unwrap();
+    assert!(encoded.contains("\"mode\":\"cpu_pc\""));
+    let roundtrip = RoventExecutionManifest::from_json(&encoded).unwrap();
+    assert_eq!(roundtrip, m);
+    assert!(
+        RoventExecutionManifest::from_json(&encoded.replacen(
+            "\"domain\":",
+            "\"extra\":0,\"domain\":",
+            1
+        ))
+        .is_err()
+    );
+    assert!(
+        RoventExecutionManifest::from_json(&encoded.replacen(
+            "\"run_id\":",
+            "\"run_id\":\"duplicate\",\"run_id\":",
+            1
+        ))
+        .is_err()
+    );
+    assert!(
+        RoventExecutionManifest::from_json(
+            &encoded.replace(ROVENT_EXECUTION_DOMAIN, "rz-pals-execution-v5/1")
+        )
+        .is_err()
+    );
+    let mut lock = m.lock().unwrap();
+    let lock_json = serde_json::to_string(&lock).unwrap();
+    assert_eq!(RoventInputLock::from_json(&lock_json).unwrap(), lock);
+    lock.manifest.run_id = "different".into();
+    assert!(lock.validate().is_err());
+}
+
+#[test]
+fn all_four_modes_require_the_actual_device_and_researcher_assembly() {
+    for mode in [
+        ExecutionMode::CpuPc,
+        ExecutionMode::CpuPcr,
+        ExecutionMode::HybridPc,
+        ExecutionMode::HybridPcr,
+    ] {
+        let mut m = manifest();
+        m.engine.mode = mode;
+        if mode.has_native_r() {
+            m.engine.researcher = Some(RoventResearcher::Own {
+                implementation_sha256: sha_value('6'),
+                search_configuration_sha256: sha_value('7'),
+            });
+            m.resources.pools.push(RoventThreadPool {
+                actors: BTreeSet::from([RoventActor::OwnR]),
+                max_threads: 1,
+                cpu_charge_millicpus: 1000,
+            });
+        }
+        if mode.pc_compute() == PcCompute::Accelerator {
+            m.engine.pc.backend = RoventBackend::OrtCuda;
+            m.engine.pc.device = RoventDevice::Cuda {
+                ordinal: 0,
+                registered_device: "test-gpu/1".into(),
+            };
+            m.engine.pc.runtime_artifacts = vec![artifact("ort.so")];
+            m.engine.pc.ort_intra_threads = Some(1);
+            m.engine.pc.ort_inter_threads = Some(1);
+            m.engine.pc.ort_spinning = Some(false);
+            m.resources.gpu_devices = 1;
+        }
+        m.validate().unwrap();
+        let mut wrong = m.clone();
+        wrong.engine.pc.device = if wrong.engine.pc.device == RoventDevice::Cpu {
+            RoventDevice::Cuda {
+                ordinal: 0,
+                registered_device: "test-gpu/1".into(),
+            }
+        } else {
+            RoventDevice::Cpu
+        };
+        assert!(wrong.validate().is_err());
+        let mut wrong_r = m;
+        wrong_r.engine.researcher = if mode.has_native_r() {
+            None
+        } else {
+            Some(RoventResearcher::Own {
+                implementation_sha256: sha_value('6'),
+                search_configuration_sha256: sha_value('7'),
+            })
+        };
+        assert!(wrong_r.validate().is_err());
+    }
+}
+
+#[test]
+fn root_limits_and_selective_depth_do_not_become_empty_unrestricted_or_local_depth() {
+    let mut m = manifest();
+    for moves in [
+        vec![],
+        vec!["e2e2".into()],
+        vec!["0000".into()],
+        vec!["e2e4".into(), "e2e4".into()],
+    ] {
+        m.engine.search.searchmoves = Some(moves);
+        assert!(m.validate().is_err());
+    }
+    m.engine.search.searchmoves = Some(vec!["e2e4".into()]);
+    m.engine.search.depth_plies = NonZeroU16::new(3);
+    let lock = m.lock().unwrap();
+    let mut r = receipt(&lock);
+    let RoventObserved::Observed { value: goal, .. } = &mut r.goal else {
+        unreachable!()
+    };
+    goal.completed_chess_plies = Some(3);
+    goal.depth_target_satisfied = true;
+    assert!(r.validate(&lock).is_err());
+    let RoventObserved::Observed { value: goal, .. } = &mut r.goal else {
+        unreachable!()
+    };
+    goal.completed_boundary_evaluations = 1;
+    goal.open_required_obligations = 1;
+    assert!(r.validate(&lock).is_err());
+    let RoventObserved::Observed { value: goal, .. } = &mut r.goal else {
+        unreachable!()
+    };
+    goal.open_required_obligations = 0;
+    r.validate(&lock).unwrap();
+}
+
+#[test]
+fn r_free_and_deployment_reject_observed_hidden_calls_or_v_generation() {
+    let lock = manifest().lock().unwrap();
+    for which in 0..5 {
+        let mut r = receipt(&lock);
+        let RoventObserved::Observed { value: calls, .. } = &mut r.calls else {
+            unreachable!()
+        };
+        match which {
+            0 => calls.r_calls = 1,
+            1 => calls.native_nodes = 1,
+            2 => calls.qsearch_nodes = 1,
+            3 => calls.see_calls = Some(1),
+            _ => calls.external_teacher_queries = 1,
+        }
+        assert!(r.validate(&lock).is_err());
+    }
+    let mut m = manifest();
+    m.purpose = RoventPurpose::Deployment;
+    m.engine.pc.validator = Some(model());
+    assert!(m.validate().is_err());
+    m.engine.pc.validator = None;
+    let lock = m.lock().unwrap();
+    let mut r = receipt(&lock);
+    let RoventObserved::Observed { value: calls, .. } = &mut r.calls else {
+        unreachable!()
+    };
+    calls.validator_models_generated = 1;
+    assert!(r.validate(&lock).is_err());
+}
+
+#[test]
+fn physical_reservations_and_overflow_cannot_become_accepted_shutdown() {
+    let lock = manifest().lock().unwrap();
+    let mut r = receipt(&lock);
+    r.validate(&lock).unwrap();
+    let RoventObserved::Observed { value: l, .. } = &mut r.lifecycle else {
+        unreachable!()
+    };
+    l.cpu_outstanding_reserved = 1;
+    assert!(r.validate(&lock).is_err());
+    r.functional_accepted = false;
+    r.validate(&lock).unwrap();
+    let RoventObserved::Observed { value: l, .. } = &mut r.lifecycle else {
+        unreachable!()
+    };
+    l.cpu_spent = u64::MAX;
+    assert!(r.validate(&lock).is_err());
+    let mut r = receipt(&lock);
+    r.functional_accepted = false;
+    r.physical_state = observed(RoventPhysicalState::QuarantinedUnknown);
+    assert!(r.validate(&lock).is_err());
+    r.failures.insert(RoventFailure::PhysicalCompletionUnknown);
+    r.validate(&lock).unwrap();
+
+    let mut r = receipt(&lock);
+    r.functional_accepted = false;
+    let RoventObserved::Observed { value: l, .. } = &mut r.lifecycle else {
+        unreachable!()
+    };
+    l.submitted = 1;
+    l.dispatched = 1;
+    l.in_flight = 1;
+    l.released = 1;
+    assert!(r.validate(&lock).is_err());
+    let mut r = receipt(&lock);
+    r.functional_accepted = false;
+    let RoventObserved::Observed { value: l, .. } = &mut r.lifecycle else {
+        unreachable!()
+    };
+    l.nn_inputs_completed = 1;
+    assert!(r.validate(&lock).is_err());
+    let mut r = receipt(&lock);
+    r.functional_accepted = false;
+    let RoventObserved::Observed { value: l, .. } = &mut r.lifecycle else {
+        unreachable!()
+    };
+    l.cache_evaluations_accepted = 1;
+    assert!(r.validate(&lock).is_err());
+}
+
+#[test]
+fn model_and_backend_content_unknown_cannot_inherit_acceptance() {
+    let lock = manifest().lock().unwrap();
+    let mut r = receipt(&lock);
+    r.model_content_verified = RoventObserved::Unknown;
+    assert!(r.validate(&lock).is_err());
+    r.functional_accepted = false;
+    r.validate(&lock).unwrap();
+    let mut r = receipt(&lock);
+    r.model_configuration_sha256 = observed(sha_value('9'));
+    assert!(r.validate(&lock).is_err());
+    let mut r = receipt(&lock);
+    r.pc_device = observed(RoventDevice::Cuda {
+        ordinal: 0,
+        registered_device: "other-device".into(),
+    });
+    assert!(r.validate(&lock).is_err());
+}
+
+#[test]
+fn thread_inventory_and_millicpu_demand_are_distinct_and_bounded() {
+    let mut m = manifest();
+    m.resources.pools[0].max_threads = 20;
+    m.validate().unwrap();
+    m.resources.pools[0].cpu_charge_millicpus = 2001;
+    assert!(m.validate().is_err());
+    m.resources.pools[0].cpu_charge_millicpus = 1000;
+    m.resources.pools.push(m.resources.pools[0].clone());
+    assert!(m.validate().is_err());
+    let mut m = manifest();
+    m.engine.pc.backend = RoventBackend::OrtCpu;
+    m.engine.pc.runtime_artifacts = vec![artifact("ort.so")];
+    m.engine.pc.ort_intra_threads = Some(4);
+    m.engine.pc.ort_inter_threads = Some(1);
+    m.engine.pc.ort_spinning = Some(false);
+    assert!(m.validate().is_err());
+    m.resources.pools.push(RoventThreadPool {
+        actors: BTreeSet::from([RoventActor::OrtIntra]),
+        max_threads: 3,
+        cpu_charge_millicpus: 1000,
+    });
+    m.validate().unwrap();
+}
+
+#[test]
+fn unknown_resources_gc_and_contention_never_support_controlled_comparison() {
+    let lock = manifest().lock().unwrap();
+    let mut r = receipt(&lock);
+    r.controlled_comparison_eligible = true;
+    assert!(r.validate(&lock).is_err());
+    r.resources.limits_applied = observed(true);
+    r.resources.process_tree_quota_millicpus = observed(2000);
+    r.resources.memory_high_bytes = observed(6 << 30);
+    r.resources.memory_max_bytes = observed(12 << 30);
+    r.resources.inventory_complete = observed(true);
+    r.resources.kernel_threads = observed(1);
+    r.resources.verified_plan_readback_sha256 =
+        observed(lock.manifest.resources.canonical_sha256().unwrap());
+    r.resources.host_peak_bytes = observed(1024);
+    r.validate(&lock).unwrap();
+    assert_eq!(r.resources.vram_peak_bytes, RoventObserved::Unknown);
+    r.full_gc_requested = true;
+    assert!(r.validate(&lock).is_err());
+    r.full_gc_requested = false;
+    r.memory_contention = true;
+    assert!(r.validate(&lock).is_err());
+}
+
+#[test]
+fn forced_mate_upper_bound_is_distinct_from_exact_uci_score_and_restricted_loss() {
+    let mut m = manifest();
+    m.engine.search.mate_moves = NonZeroU16::new(2);
+    let lock = m.lock().unwrap();
+    let mut r = receipt(&lock);
+    let RoventObserved::Observed { value: goal, .. } = &mut r.goal else {
+        unreachable!()
+    };
+    goal.mate = Some(RoventMateObservation::ForcedMateWithin {
+        root_wins: true,
+        upper_plies: 3,
+        restricted_loss: false,
+        evidence: artifact("proof.json"),
+    });
+    r.validate(&lock).unwrap();
+    let RoventObserved::Observed { value: goal, .. } = &mut r.goal else {
+        unreachable!()
+    };
+    goal.emitted_score_mate = Some(2);
+    assert!(r.validate(&lock).is_err());
+    let RoventObserved::Observed { value: goal, .. } = &mut r.goal else {
+        unreachable!()
+    };
+    goal.mate = Some(RoventMateObservation::ExactMateDistance {
+        root_wins: true,
+        plies: 3,
+        restricted_loss: false,
+        evidence: artifact("proof.json"),
+    });
+    r.validate(&lock).unwrap();
+    let mut m = manifest();
+    m.engine.search.searchmoves = Some(vec!["e2e4".into()]);
+    let lock = m.lock().unwrap();
+    let mut r = receipt(&lock);
+    let RoventObserved::Observed { value: goal, .. } = &mut r.goal else {
+        unreachable!()
+    };
+    goal.mate = Some(RoventMateObservation::ForcedMateWithin {
+        root_wins: false,
+        upper_plies: 2,
+        restricted_loss: false,
+        evidence: artifact("proof.json"),
+    });
+    assert!(r.validate(&lock).is_err());
+}
+
+#[test]
+fn external_profiles_keep_teacher_checker_opponent_purpose_and_verified_pin_separate() {
+    let mut m = manifest();
+    m.purpose = RoventPurpose::Collection;
+    m.engine
+        .teachers
+        .push(external(RoventExternalPurpose::Teacher));
+    assert!(m.validate().is_err()); // P-C cannot secretly add CPU_T.
+    m.engine.mode = ExecutionMode::CpuPcr;
+    m.engine.researcher = Some(RoventResearcher::External {
+        profile: Box::new(external(RoventExternalPurpose::ArenaOpponent)),
+    });
+    m.resources.pools.push(RoventThreadPool {
+        actors: BTreeSet::from([RoventActor::ExternalR, RoventActor::Teacher]),
+        max_threads: 2,
+        cpu_charge_millicpus: 1000,
+    });
+    assert!(m.validate().is_err());
+    let mut research_profile = external(RoventExternalPurpose::ResearchChecker);
+    research_profile.canonical_sha256 = sha_value('7');
+    m.engine.researcher = Some(RoventResearcher::External {
+        profile: Box::new(research_profile),
+    });
+    m.validate().unwrap();
+    let lock = m.lock().unwrap();
+    let mut r = receipt(&lock);
+    assert!(r.validate(&lock).is_err());
+    r.external_profiles_verified = observed(vec![sha_value('8'), sha_value('7')]);
+    r.validate(&lock).unwrap();
+    r.external_profiles_verified = RoventObserved::Unknown;
+    assert!(r.validate(&lock).is_err());
+}
+
+#[test]
+fn pcr_mode_does_not_authorize_unregistered_teacher_or_nnuec_work() {
+    let mut m = manifest();
+    m.engine.mode = ExecutionMode::CpuPcr;
+    m.engine.researcher = Some(RoventResearcher::Own {
+        implementation_sha256: sha_value('6'),
+        search_configuration_sha256: sha_value('7'),
+    });
+    m.resources.pools.push(RoventThreadPool {
+        actors: BTreeSet::from([RoventActor::OwnR]),
+        max_threads: 1,
+        cpu_charge_millicpus: 1000,
+    });
+    let lock = m.lock().unwrap();
+    let mut r = receipt(&lock);
+    let RoventObserved::Observed { value: calls, .. } = &mut r.calls else {
+        unreachable!()
+    };
+    calls.external_teacher_queries = 1;
+    assert!(r.validate(&lock).is_err());
+    let mut r = receipt(&lock);
+    let RoventObserved::Observed { value: calls, .. } = &mut r.calls else {
+        unreachable!()
+    };
+    calls.nnuec_readouts = 1;
+    assert!(r.validate(&lock).is_err());
+}
+
+#[test]
+fn original_position_visit_limit_is_not_a_simulation_or_native_only_budget() {
+    let mut m = manifest();
+    m.engine.search.requested_nodes = Some(2);
+    let lock = m.lock().unwrap();
+    let mut r = receipt(&lock);
+    let RoventObserved::Observed { value: nodes, .. } = &mut r.nodes else {
+        unreachable!()
+    };
+    nodes.checked_transitions = 1;
+    nodes.total_node_visits = 2;
+    r.validate(&lock).unwrap();
+    let RoventObserved::Observed { value: nodes, .. } = &mut r.nodes else {
+        unreachable!()
+    };
+    nodes.checked_transitions = 2;
+    nodes.total_node_visits = 3;
+    assert!(r.validate(&lock).is_err());
+    let mut r = receipt(&lock);
+    let RoventObserved::Observed { value: nodes, .. } = &mut r.nodes else {
+        unreachable!()
+    };
+    nodes.checked_transitions = u64::MAX;
+    nodes.total_node_visits = 0;
+    assert!(r.validate(&lock).is_err());
+    let mut r = receipt(&lock);
+    let RoventObserved::Observed { value: nodes, .. } = &mut r.nodes else {
+        unreachable!()
+    };
+    nodes.unit = "simulations".into();
+    assert!(r.validate(&lock).is_err());
+}
+
+#[test]
+fn early_rules_terminal_satisfies_depth_without_fabricating_unreached_plies() {
+    let mut m = manifest();
+    m.engine.search.depth_plies = NonZeroU16::new(8);
+    let lock = m.lock().unwrap();
+    let mut r = receipt(&lock);
+    let RoventObserved::Observed { value: goal, .. } = &mut r.goal else {
+        unreachable!()
+    };
+    goal.completed_chess_plies = Some(1);
+    goal.depth_target_satisfied = true;
+    goal.completed_boundary_evaluations = 1;
+    assert!(r.validate(&lock).is_err()); // A short NN/PV line cannot close the target.
+    let RoventObserved::Observed { value: goal, .. } = &mut r.goal else {
+        unreachable!()
+    };
+    goal.rules_terminal_closed_early = true;
+    r.validate(&lock).unwrap();
+    let roundtrip =
+        RoventExecutionReceipt::from_json(&serde_json::to_string(&r).unwrap(), &lock).unwrap();
+    let RoventObserved::Observed { value: goal, .. } = roundtrip.goal else {
+        unreachable!()
+    };
+    assert_eq!(goal.completed_chess_plies, Some(1));
+    assert!(goal.depth_target_satisfied && goal.rules_terminal_closed_early);
+    let RoventObserved::Observed { value: goal, .. } = &mut r.goal else {
+        unreachable!()
+    };
+    goal.open_required_obligations = 1;
+    assert!(r.validate(&lock).is_err()); // A terminal on one branch cannot hide open duties.
+    let RoventObserved::Observed { value: goal, .. } = &mut r.goal else {
+        unreachable!()
+    };
+    goal.open_required_obligations = 0;
+    goal.completed_chess_plies = Some(8);
+    assert!(r.validate(&lock).is_err()); // Early closure must retain the real reached ply.
+}
+
+#[test]
+fn failed_mode_observations_are_preserved_only_with_explicit_failure() {
+    let lock = manifest().lock().unwrap();
+    let mut r = receipt(&lock);
+    let RoventObserved::Observed { value: calls, .. } = &mut r.calls else {
+        unreachable!()
+    };
+    calls.external_teacher_queries = 1;
+    r.functional_accepted = false;
+    assert!(r.validate(&lock).is_err());
+    r.failures.insert(RoventFailure::ModeViolation);
+    r.validate(&lock).unwrap();
+    r.functional_accepted = true;
+    assert!(r.validate(&lock).is_err());
+}

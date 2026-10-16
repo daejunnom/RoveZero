@@ -17,6 +17,7 @@ mod pals_manifest_v4;
 mod pals_manifest_v5;
 mod pals_source_pins_v5;
 mod pals_startup_v5;
+mod rovent_manifest;
 mod validation;
 
 pub use manifest::*;
@@ -34,6 +35,7 @@ pub use pals_manifest_v4::*;
 pub use pals_manifest_v5::*;
 pub use pals_source_pins_v5::*;
 pub use pals_startup_v5::*;
+pub use rovent_manifest::*;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
