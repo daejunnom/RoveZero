@@ -257,7 +257,8 @@ impl ExternalEngineProfile {
                 );
                 // SyzygyPath is compile-feature-dependent and not required.
                 // No path is supplied to a fresh process, so no tablebase is
-                // loaded. A declared optional empty SyzygyPath is checked below.
+                // loaded. v0.9.0's setter requires a nonempty token; sending
+                // an empty value would only produce an Unknown option report.
             }
         }
         Ok(options)
@@ -336,12 +337,7 @@ impl ExternalEngineProfile {
             multipv: numeric("MultiPV")?,
             move_overhead_ms: numeric(overhead)?,
         };
-        let mut expected = self.options(purpose, resources)?;
-        // Reckless may advertise this option only in a syzygy-enabled build.
-        // If requested, the regular handshake must confirm its advertisement.
-        if self == Self::Reckless090EmbeddedNnue && options.contains_key("SyzygyPath") {
-            expected.insert("SyzygyPath".into(), String::new());
-        }
+        let expected = self.options(purpose, resources)?;
         if options != &expected {
             return Err(CheckerError::Invalid(
                 "external engine required/optional option profile mismatch",
@@ -428,7 +424,7 @@ mod tests {
         }
         let mut optional = options.clone();
         optional.insert("SyzygyPath".into(), String::new());
-        assert!(profile.validate_options(purpose, &optional).is_ok());
+        assert!(profile.validate_options(purpose, &optional).is_err());
         optional.insert("SyzygyPath".into(), "/unregistered/tablebase".into());
         assert!(profile.validate_options(purpose, &optional).is_err());
         let mut unsupported = options;
