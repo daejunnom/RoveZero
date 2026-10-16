@@ -81,6 +81,60 @@ def _bits(values):
     return data, hashlib.sha256(SEED_DOMAIN + struct.pack("<Q", 6144) + data).hexdigest()
 
 
+def _canonical_keys(raw):
+    """Independent Rust execution_prefix/context/approximate_warm_key framing.
+
+    The historical Python execution_keys uses a different JSON frame; it must
+    not certify a Rust invocation. Only the existing typed tensor input_digest
+    is shared here. Product key domains and accepted seed bits are unchanged.
+    """
+    from .numeric_capture import python_input
+    from .virtual_review import input_digest, PURPOSES
+    value = python_input(raw["input"])
+    identity = raw["identity"]
+    histories = identity["anchor_history_seals"]
+    if (identity["fp32"] is not True or type(histories) is not list
+            or len(histories) != len(value["anchors"])
+            or histories[0] != identity["rules_history"]
+            or not all(_sha(v) for v in [identity["model_epoch"], identity["rules_history"],
+                                       identity["backend"], *histories])):
+        raise ValueError("canonical execution requires every ordered original identity digest")
+    role = ("proposer", "critic", "validator").index(value["role"])
+    def prefix(domain):
+        return (domain + bytes.fromhex(identity["model_epoch"])
+                + bytes.fromhex(identity["rules_history"]) + bytes.fromhex(identity["backend"])
+                + b"fp32" + struct.pack("<Q", len(histories))
+                + b"".join(bytes.fromhex(v) for v in histories) + bytes([role]))
+    tensor = bytes.fromhex(input_digest(value))
+    fresh = hashlib.sha256(prefix(b"rovezero.pals-review-fresh.v1\0") + tensor).hexdigest()
+    seed = raw.get("accepted_seed_digest")
+    if seed is None:
+        return {"fresh_key": fresh, "warm_key": None}
+    query = value["query"]
+    if not _sha(seed) or value["role"] == "validator" or query["purpose"] == "value_fresh":
+        raise ValueError("canonical ApproxWarm requires an eligible P/C query and actual seed digest")
+    context = hashlib.sha256(prefix(b"rovezero.pals-review-context.v1\0"))
+    context.update(bytes([PURPOSES.index(query["purpose"]), query["perspective"] & 0xff,
+                          int(query["counter_present"])]))
+    for name, index in zip(("prefix", "proposal", "counter"), query["anchors"]):
+        line = query[name]
+        context.update(struct.pack("<Q", len(line)))
+        for movement in line:
+            context.update(bytes(movement))
+        anchor = value["anchors"][index]
+        context.update(bytes(anchor["board"]))
+        context.update(struct.pack("<16f", *anchor["metadata"]))
+    context.update(struct.pack("<Q", len(value["candidates"])))
+    for movement in value["candidates"]:
+        context.update(bytes(movement))
+    context.update(struct.pack("<Q", len(value["divergences"])))
+    for fields in value["divergences"]:
+        context.update(struct.pack("<8f", *fields))
+    warm = hashlib.sha256(prefix(b"rovezero.pals-review-approx-warm.v1\0")
+                          + context.digest() + tensor + bytes.fromhex(seed)).hexdigest()
+    return {"fresh_key": fresh, "warm_key": warm}
+
+
 def _validate_raw(raw):
     if (raw.get("domain") != DOMAIN or raw.get("scope") != SCOPE
             or raw.get("physical_completion_known") is not True or raw.get("numerical_acceptance") is not False):
@@ -126,8 +180,11 @@ def _validate_raw(raw):
                        "validator_nn_runs_attempted", "validator_nn_runs_completed", "validator_nn_runs_failed_known"))
             or raw["completed_nn_inputs"] != counters["public_nn_runs_completed"] + 1):
         raise ValueError("original completed P/C-only owner accounting differs")
-    if (not _sha(raw["invocation_key"])
-            or (raw["physical_fresh"] is True and raw["invocation_key"] != ticket["representation"]["input"])):
+    keys = _canonical_keys(raw)
+    if (type(raw["physical_fresh"]) is not bool
+            or ticket["representation"]["input"] != keys["fresh_key"]
+            or raw["invocation_key"] != (keys["fresh_key"] if raw["physical_fresh"] else keys["warm_key"])
+            or (not raw["physical_fresh"] and keys["warm_key"] is None)):
         raise ValueError("original physical invocation identity differs")
     return digest
 

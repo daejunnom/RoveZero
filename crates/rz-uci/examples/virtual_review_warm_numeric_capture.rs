@@ -818,6 +818,13 @@ fn run_cases(
                         .into(),
                 );
             }
+            let canonical_invocation = match invocation.accepted_seed_digest {
+                Some(seed) => input.approximate_warm_key(&identity, seed.0)?.0,
+                None => input.fresh_key(&identity)?.0,
+            };
+            if invocation.invocation_key.0 != canonical_invocation {
+                return Err("physical invocation differs from canonical Fresh/Warm key".into());
+            }
             let evidence = evidence.ok_or("actual NN evidence absent")?;
             let execution = evidence
                 .execution
@@ -1177,6 +1184,63 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_keys_match_independent_byte_framing_and_separate_fresh_from_warm() {
+        let movement = rz_eval::pals_model::PalsCandidateToken {
+            from: 12,
+            to: 28,
+            promotion: 0,
+        };
+        let mut metadata = [0.0; 16];
+        metadata[0] = -0.0;
+        let input = model::PalsVirtualReviewInput {
+            schema: model::INPUT_SCHEMA.to_owned(),
+            role: PalsRole::Proposer,
+            anchors: vec![model::ReviewAnchorInput {
+                board: vec![0; 64],
+                metadata,
+            }],
+            records: vec![],
+            query: model::ReviewQueryInput {
+                purpose: model::ReviewQueryPurpose::ProposePolicy,
+                perspective: -1,
+                prefix: vec![movement],
+                proposal: vec![],
+                counter: vec![],
+                counter_present: false,
+                anchors: [0; 3],
+            },
+            candidates: vec![movement],
+            divergences: vec![],
+            token_budget: 512,
+        };
+        let identity = model::ReviewExecutionIdentity {
+            model_epoch: [1; 32],
+            rules_history: [3; 32],
+            backend: [2; 32],
+            anchor_history_seals: vec![[3; 32]],
+            fp32: true,
+        };
+        let seed = parse_digest("c6c71f043f19cd8d880510cb2416396e8e59a83070608e1a9e5a59ffaba5c159")
+            .unwrap();
+        let fresh = input.fresh_key(&identity).unwrap().0;
+        let warm = input.approximate_warm_key(&identity, seed).unwrap().0;
+        // Independent Python stdlib vector includes f32 -0.0 and i8 -1 framing.
+        assert_eq!(
+            hex(fresh),
+            "b038382273247dd0eec43bb7b86d5a57335bdbedac6ee7c696b3b0a2bb9cf278"
+        );
+        assert_eq!(
+            hex(warm),
+            "f8a64059ec1d4391366b17d90c28e2dcdc1a5f5146ec9c5bfe26c08add7782b6"
+        );
+        assert_ne!(fresh, warm);
+        assert_ne!(
+            warm,
+            input.approximate_warm_key(&identity, [0; 32]).unwrap().0
+        );
+    }
 
     #[test]
     fn original_rules_views_cover_both_roles_and_six_buckets_without_a_backend() {
