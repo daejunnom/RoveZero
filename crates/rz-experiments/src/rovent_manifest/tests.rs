@@ -1,5 +1,50 @@
 use super::*;
 
+#[test]
+fn source_aggregate_has_independent_fixed_vector_and_commit_scope() {
+    let components = BTreeMap::from([
+        ("model_native".into(), "b".repeat(64)),
+        ("control".into(), "c".repeat(64)),
+    ]);
+    let value = rovent_source_aggregate_sha256(&"a".repeat(40), &components).unwrap();
+    // Independently framed with Python hashlib + struct.pack('<I', ...).
+    assert_eq!(
+        value,
+        "7907bf84fed557a761623040c773f826bf3424a628ebfe289eb1d7ec6663de13"
+    );
+    assert_ne!(
+        value,
+        rovent_source_aggregate_sha256(&"b".repeat(40), &components).unwrap()
+    );
+    let mut changed = components.clone();
+    changed.insert("control".into(), "d".repeat(64));
+    assert_ne!(
+        value,
+        rovent_source_aggregate_sha256(&"a".repeat(40), &changed).unwrap()
+    );
+}
+
+#[test]
+fn source_aggregate_rejects_unbounded_or_placeholder_identity() {
+    let valid = BTreeMap::from([("control".into(), "c".repeat(64))]);
+    assert!(rovent_source_aggregate_sha256(&"A".repeat(40), &valid).is_err());
+    assert!(rovent_source_aggregate_sha256(&"a".repeat(40), &BTreeMap::new()).is_err());
+    let too_many = (0..65)
+        .map(|i| (format!("component-{i}"), "c".repeat(64)))
+        .collect();
+    assert!(rovent_source_aggregate_sha256(&"a".repeat(40), &too_many).is_err());
+    for (name, hash) in [
+        ("unknown".into(), "c".repeat(64)),
+        ("x".repeat(4097), "c".repeat(64)),
+        ("control".into(), "0".repeat(64)),
+    ] {
+        assert!(
+            rovent_source_aggregate_sha256(&"a".repeat(40), &BTreeMap::from([(name, hash)]))
+                .is_err()
+        );
+    }
+}
+
 fn sha_value(c: char) -> String {
     c.to_string().repeat(64)
 }

@@ -17,6 +17,38 @@ pub const ROVENT_RECEIPT_DOMAIN: &str = "rz-rovent-execution-receipt/1";
 pub const ROVENT_CANONICAL_DOMAIN: &str = "rz-rovent-execution-canonical/1";
 pub const ROVENT_EXTERNAL_PROFILE_DOMAIN: &str = "rz-rovent-external-engine-profile/1";
 pub const ROVENT_POSITION_VISIT_UNIT: &str = "rovent-position-visits/1";
+pub const ROVENT_SOURCE_AGGREGATE_DOMAIN: &str = "rz-rovent-source-aggregate/1";
+
+/// Identifies the declared exact source set; it does not attest that a binary
+/// was built from it. Callers retain the original component map and separately
+/// compare it with the compiled and pinned sources.
+///
+/// Canonical bytes are domain UTF-8, NUL, the 40 lowercase ASCII commit bytes,
+/// component count as u32 LE, then each BTreeMap entry in key order: UTF-8 key
+/// byte length as u32 LE, key bytes and 64 lowercase ASCII SHA-256 bytes. This
+/// is a new Rovent domain, not the legacy V5 component digest algorithm.
+pub fn rovent_source_aggregate_sha256(
+    source_commit: &str,
+    source_components: &BTreeMap<String, String>,
+) -> Result<String, ManifestError> {
+    require(
+        hex(source_commit, 40)
+            && (1..=64).contains(&source_components.len())
+            && source_components.iter().all(|(k, v)| text(k) && sha(v)),
+        "invalid exact source/component identity",
+    )?;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(ROVENT_SOURCE_AGGREGATE_DOMAIN.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(source_commit.as_bytes());
+    bytes.extend_from_slice(&(source_components.len() as u32).to_le_bytes());
+    for (name, component) in source_components {
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(component.as_bytes());
+    }
+    Ok(digest(&bytes))
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(remote = "ExecutionMode", rename_all = "snake_case")]
