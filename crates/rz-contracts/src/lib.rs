@@ -7,6 +7,7 @@
 mod evaluation;
 pub mod pals;
 pub mod pals_adaptive;
+pub mod rovent;
 mod primitives;
 mod state;
 
