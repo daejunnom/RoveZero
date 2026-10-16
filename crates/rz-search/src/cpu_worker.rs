@@ -37,6 +37,12 @@ pub use prepared_value::{
     InstallId, InstallRejected, PreparedValueInstallation, ValueInstallReadback,
     ValueInstallReceipt,
 };
+#[path = "cpu_worker/deferred_value.rs"]
+pub(crate) mod deferred_value;
+pub use deferred_value::{
+    DeferredNnuecCpuPlan, DeferredNnuecRSource, MaterializationCompletion, MaterializationHandoff,
+    MaterializationRequest, MaterializedNnuecEngine, NnuecReadyRegistration, StartingNnuecWorker,
+};
 
 pub const CPU_WORKER_COMMAND_CAPACITY: usize = 8;
 pub const CPU_JOB_CAPACITY: usize = 64;
@@ -163,6 +169,7 @@ pub fn compiled_cooperative_cpu_owner_sha256() -> [u8; 32] {
         include_bytes!("cpu/stack.rs").as_slice(),
         include_bytes!("cpu_worker.rs").as_slice(),
         include_bytes!("cpu_worker/prepared_value.rs").as_slice(),
+        include_bytes!("cpu_worker/deferred_value.rs").as_slice(),
     ] {
         hash.update((bytes.len() as u64).to_be_bytes());
         hash.update(bytes);
@@ -203,7 +210,7 @@ impl CpuJob {
             target_depth,
             clock,
             engine.config().max_depth,
-            cpu_evaluation_namespace_digest(engine)?,
+            prepared_value::registered_namespace(engine, None)?,
             cpu_search_conditions_digest(engine),
             owner,
             signal,
@@ -1229,10 +1236,15 @@ impl CpuWorker {
         }
         let max_depth = engine.config().max_depth;
         let paused_bytes_limit = engine.paused_stack_max_bytes();
-        let evaluation_namespace = match cpu_evaluation_namespace_digest(&engine) {
-            Ok(namespace) => namespace,
-            Err(reason) => return Err((engine, reason)),
+        let initial_value_binding = match engine.job_binding_digest() {
+            Ok(binding) => binding,
+            Err(error) => return Err((engine, CpuWorkerError::Cpu(error))),
         };
+        let evaluation_namespace =
+            match prepared_value::registered_namespace(&engine, initial_value_binding) {
+                Ok(namespace) => namespace,
+                Err(reason) => return Err((engine, reason)),
+            };
         let search_conditions = cpu_search_conditions_digest(&engine);
         let shutdown = Arc::new(AtomicBool::new(false));
         // One terminal seat belongs to the paused Job. A one-command profile
@@ -1320,7 +1332,7 @@ impl CpuWorker {
             let mut active: Option<ActiveJob> = None;
             let mut progress_sequence = 0u64;
             let mut engine_reusable = true;
-            let mut value_binding = None;
+            let mut value_binding = initial_value_binding;
             loop {
                 let observed = worker_mailbox.signal().version();
                 // A paused owner keeps a reliable terminal seat. Atomic
@@ -1424,9 +1436,10 @@ impl CpuWorker {
                                     job: grant.job,
                                     owner,
                                 }
-                            && job.envelope.evaluation_namespace
-                                == prepared_value::registered_namespace(&engine, value_binding)
-                                    .unwrap_or(Digest([0; 32]))
+                            && prepared_value::registered_namespace(&engine, value_binding)
+                                .is_ok_and(|namespace| {
+                                    job.envelope.evaluation_namespace == namespace
+                                })
                             && job.envelope.search_conditions
                                 == cpu_search_conditions_digest(&engine)
                             && job.target_depth <= engine.config().max_depth
@@ -1872,6 +1885,16 @@ impl CpuWorker {
             .map_err(|_| CpuWorkerError::Quarantined)?
             .pending())
     }
+    /// A historical receipt from another worker with an equal numeric owner
+    /// cannot authorize this owner's current value profile.
+    pub fn validates_installation_receipt(&self, receipt: &ValueInstallReceipt) -> bool {
+        !self.shutdown.load(Ordering::Acquire)
+            && receipt.installed_profile() == Some(self.profile())
+            && self
+                .installation
+                .lock()
+                .is_ok_and(|endpoint| endpoint.validates_receipt(receipt))
+    }
     /// Reserve one installation/readback seat without granting a native node
     /// or claiming that an actual owner is idle. Only its command decides that.
     pub fn try_install_prepared_value(
@@ -2173,6 +2196,10 @@ impl CpuWorker {
                 Ok(receipt) => (receipt, None),
                 Err(error) => (None, Some(error)),
             };
+        if value_installation_error.is_some() {
+            self.recovered_engine = None;
+            self.joined_known = false;
+        }
         CpuWorkerShutdown {
             owner: self.owner,
             events,

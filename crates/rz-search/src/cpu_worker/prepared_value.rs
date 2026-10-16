@@ -14,12 +14,9 @@ use crate::pals::store::PalsStores;
 use rz_contracts::Digest;
 use rz_runtime::CompletionSignal;
 use rz_runtime::adaptive::MailboxOccupancy;
-use sha2::{Digest as _, Sha256};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-
-const BINDING_DOMAIN: &[u8] = b"rz-cpu-prepared-value-binding/1";
 
 /// Only actual accepted ReviewView custody can construct an installation.
 /// No weights/model are cloned; the immutable evaluator and view are pinned.
@@ -46,7 +43,10 @@ impl PreparedValueInstallation {
     ) -> Result<Self, NnuecError> {
         let evaluator =
             V2CpuValue::from_bound(model, Arc::clone(&bound), stores, original_view_seal)?;
-        let binding = binding_digest(evaluator.identity(), bound.provenance())?;
+        let binding = evaluator
+            .job_binding_digest()
+            .map_err(|_| NnuecError::StateMismatch)?
+            .ok_or(NnuecError::StateMismatch)?;
         if !bound.authority_is_live() {
             return Err(NnuecError::StateMismatch);
         }
@@ -65,25 +65,6 @@ impl PreparedValueInstallation {
     pub fn value_identity(&self) -> &CpuValueIdentity {
         self.evaluator.identity()
     }
-}
-
-fn binding_digest(
-    identity: &CpuValueIdentity,
-    provenance: &Provenance,
-) -> Result<Digest, NnuecError> {
-    let bytes = serde_json::to_vec(identity).map_err(|e| NnuecError::Json(e.to_string()))?;
-    let root = u64::try_from(provenance.root.0)
-        .map_err(|_| NnuecError::Capacity("prepared value root identity"))?;
-    let mut hash = Sha256::new();
-    hash.update(BINDING_DOMAIN);
-    hash.update((bytes.len() as u64).to_be_bytes());
-    hash.update(bytes);
-    hash.update(provenance.full_view_digest);
-    hash.update(provenance.view_seal);
-    hash.update(provenance.record_scope_digest);
-    hash.update(root.to_be_bytes());
-    hash.update(provenance.generation.to_be_bytes());
-    Ok(Digest(hash.finalize().into()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,6 +167,11 @@ struct Pending {
     previous_profile: CpuWorkerProfile,
     binding: Digest,
 }
+struct Acknowledged {
+    id: InstallId,
+    binding: Digest,
+    profile: CpuWorkerProfile,
+}
 
 pub(super) struct Endpoint {
     authority: Arc<()>,
@@ -193,6 +179,7 @@ pub(super) struct Endpoint {
     receiver: Receiver<ValueInstallReceipt>,
     sequence: u64,
     pending: Option<Pending>,
+    acknowledged: Option<Acknowledged>,
     quarantined: bool,
 }
 pub(super) struct Owner {
@@ -215,6 +202,7 @@ pub(super) fn channel() -> (Endpoint, Owner) {
             receiver,
             sequence: 0,
             pending: None,
+            acknowledged: None,
             quarantined: false,
         },
         Owner {
@@ -315,10 +303,26 @@ impl Endpoint {
             return Err(CpuWorkerError::Quarantined);
         }
         self.pending = None;
+        if let Some(profile) = receipt.installed_profile() {
+            self.acknowledged = Some(Acknowledged {
+                id: receipt.id,
+                binding: receipt.binding,
+                profile,
+            });
+        }
         if matches!(&receipt.result, Err(CpuWorkerError::Quarantined)) {
             self.quarantined = true;
         }
         Ok(Some(receipt))
+    }
+    pub(super) fn validates_receipt(&self, receipt: &ValueInstallReceipt) -> bool {
+        !self.pending()
+            && Arc::ptr_eq(&receipt.authority, &self.authority)
+            && self.acknowledged.as_ref().is_some_and(|acknowledged| {
+                receipt.id == acknowledged.id
+                    && receipt.binding == acknowledged.binding
+                    && receipt.installed_profile() == Some(acknowledged.profile)
+            })
     }
 }
 
@@ -326,7 +330,14 @@ pub(super) fn registered_namespace(
     engine: &CpuEngine,
     binding: Option<Digest>,
 ) -> Result<Digest, CpuWorkerError> {
-    binding.map_or_else(|| cpu_evaluation_namespace_digest(engine), Ok)
+    match (engine.job_binding_digest()?, binding) {
+        (Some(actual), Some(registered)) if actual != registered => {
+            Err(CpuWorkerError::Quarantined)
+        }
+        (Some(actual), _) => Ok(actual),
+        (None, Some(_)) => Err(CpuWorkerError::Quarantined),
+        (None, None) => cpu_evaluation_namespace_digest(engine),
+    }
 }
 
 impl Owner {
@@ -431,7 +442,11 @@ impl Owner {
         let previous = request.previous_profile;
         if previous.max_depth != engine.config().max_depth
             || previous.search_conditions != cpu_search_conditions_digest(engine)
-            || previous.evaluation_namespace != registered_namespace(engine, *current_binding)?
+            // Old bound authority may have expired while this actual owner is
+            // known idle. Compare its already registered immutable namespace;
+            // only the new payload needs live authority for replacement.
+            || previous.evaluation_namespace
+                != current_binding.map_or_else(|| cpu_evaluation_namespace_digest(engine), Ok)?
         {
             return Err(CpuWorkerError::Invalid(
                 "prepared value previous profile mismatch",
@@ -458,6 +473,7 @@ impl Owner {
         };
         replacement.set_paused_stack_max_bytes(engine.paused_stack_max_bytes())?;
         if replacement.value_identity() != request.payload.evaluator.identity()
+            || replacement.job_binding_digest()? != Some(request.payload.binding)
             || replacement.config().max_depth != previous.max_depth
             || cpu_search_conditions_digest(&replacement) != previous.search_conditions
             || replacement.ordering_policy() != engine.ordering_policy()
@@ -486,3 +502,7 @@ impl Owner {
         Ok(readback)
     }
 }
+
+#[cfg(test)]
+#[path = "prepared_value_tests.rs"]
+mod tests;

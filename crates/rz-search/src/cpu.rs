@@ -1337,6 +1337,12 @@ impl CpuEngine {
     pub fn value_identity(&self) -> &CpuValueIdentity {
         &self.value_identity
     }
+    /// Preserve an actual evaluator's immutable contextual registration across
+    /// known owner recovery. This does not recreate a revoked view authority.
+    pub fn job_binding_digest(&self) -> Result<Option<rz_contracts::Digest>, CpuError> {
+        self.validate_frozen_value_namespace()?;
+        self.evaluator.job_binding_digest().map_err(CpuError::Value)
+    }
 
     pub fn search_conditions(&self) -> String {
         let legacy = format!(

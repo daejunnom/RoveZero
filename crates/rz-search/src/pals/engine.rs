@@ -42,6 +42,7 @@ mod archive_lifecycle;
 mod cpu_lifecycle;
 mod followup_execution;
 mod frozen_recheck;
+pub mod pc_port;
 mod review_lifecycle;
 mod semantic_state;
 pub use followup_execution::{
@@ -52,7 +53,8 @@ pub use followup_execution::{
     PalsRepairRecheckExecution, RoleExecutionContext, RoleValueExecutionEvidence,
 };
 pub use semantic_state::{
-    NoResearcher, PalsSemanticConfig, PalsSemanticState, PcSemanticOwner, RegisteredResearcher,
+    NoResearcher, PalsSemanticConfig, PalsSemanticState, PcSemanticOwner, PcSemanticProfile,
+    RegisteredResearcher,
 };
 
 pub const PALS_SEARCH_VERSION: &str = "pals-restricted-refinement/0.1";
@@ -131,6 +133,15 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 "pals/engine/semantic_state.rs",
                 include_str!("engine/semantic_state.rs"),
             ),
+            ("pals/engine/pc_port.rs", include_str!("engine/pc_port.rs")),
+            (
+                "pals/engine/pc_port/frontier_port.rs",
+                include_str!("engine/pc_port/frontier_port.rs"),
+            ),
+            (
+                "pals/engine/pc_port/goal_local.rs",
+                include_str!("engine/pc_port/goal_local.rs"),
+            ),
             (
                 "pals/engine/frozen_recheck.rs",
                 include_str!("engine/frozen_recheck.rs"),
@@ -166,6 +177,10 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
             (
                 "pals/rovent_frontier.rs",
                 include_str!("rovent_frontier.rs"),
+            ),
+            (
+                "pals/rovent_frontier/question.rs",
+                include_str!("rovent_frontier/question.rs"),
             ),
             ("pals/rovent_goals.rs", include_str!("rovent_goals.rs")),
             ("pals/rovent_solved.rs", include_str!("rovent_solved.rs")),

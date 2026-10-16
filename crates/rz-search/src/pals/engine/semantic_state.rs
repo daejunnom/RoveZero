@@ -70,6 +70,33 @@ impl PalsSemanticConfig {
     }
 }
 
+/// Separate Rovent admission: bounded generation chunks keep the legacy V5
+/// maximum, while an exact original-root query prefix may span 256 plies.
+/// This profile never changes legacy PalsSemanticConfig validation or bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PcSemanticProfile {
+    pub semantic: PalsSemanticConfig,
+    pub maximum_root_prefix_plies: u16,
+}
+impl PcSemanticProfile {
+    pub fn validate(&self) -> Result<(), PalsError> {
+        self.semantic.validate()?;
+        if self.maximum_root_prefix_plies == 0
+            || self.maximum_root_prefix_plies > 256
+            || usize::from(self.maximum_root_prefix_plies) < self.semantic.line_plies
+        {
+            return Err(PalsError::InvalidConfig);
+        }
+        Ok(())
+    }
+    fn sequence_config(self) -> PalsSemanticConfig {
+        PalsSemanticConfig {
+            line_plies: usize::from(self.maximum_root_prefix_plies),
+            ..self.semantic
+        }
+    }
+}
+
 /// Exact graph/public-memory ownership shared by future typed assemblies.
 /// A state is not itself a search driver, researcher registration or receipt.
 pub struct PalsSemanticState<M: RoleModel> {
@@ -113,6 +140,23 @@ impl<M: RoleModel> PalsSemanticState<M> {
         model_registered_value: Option<ModelValueIdentity>,
     ) -> Result<Self, PalsError> {
         config.validate()?;
+        Self::allocate_admitted(config, model, model_registered_value)
+    }
+
+    fn new_pc_admitted(
+        profile: PcSemanticProfile,
+        model: M,
+        model_registered_value: Option<ModelValueIdentity>,
+    ) -> Result<Self, PalsError> {
+        profile.validate()?;
+        Self::allocate_admitted(&profile.sequence_config(), model, model_registered_value)
+    }
+
+    fn allocate_admitted(
+        config: &PalsSemanticConfig,
+        model: M,
+        model_registered_value: Option<ModelValueIdentity>,
+    ) -> Result<Self, PalsError> {
         let mut nodes = Vec::new();
         nodes
             .try_reserve(config.max_nodes)
@@ -447,6 +491,7 @@ impl<M: RoleModel> PalsSemanticState<M> {
 /// same exact Rules/public-memory implementation as the registered-R assembly.
 pub struct PcSemanticOwner<M: RoleModel> {
     pub(super) config: PalsSemanticConfig,
+    pub(super) profile: PcSemanticProfile,
     pub(super) semantic: PalsSemanticState<M>,
     researcher: NoResearcher,
 }
@@ -458,7 +503,27 @@ impl<M: RoleModel> PcSemanticOwner<M> {
         policy: ReviewSelectionPolicy,
         limits: ReviewIndexLimits,
     ) -> Result<Self, PalsError> {
-        config.validate()?;
+        let maximum_root_prefix_plies =
+            u16::try_from(config.line_plies).map_err(|_| PalsError::InvalidConfig)?;
+        Self::new_selected_rovent(
+            PcSemanticProfile {
+                semantic: config,
+                maximum_root_prefix_plies,
+            },
+            model,
+            policy,
+            limits,
+        )
+    }
+
+    pub fn new_selected_rovent(
+        profile: PcSemanticProfile,
+        model: M,
+        policy: ReviewSelectionPolicy,
+        limits: ReviewIndexLimits,
+    ) -> Result<Self, PalsError> {
+        profile.validate()?;
+        let config = profile.semantic;
         let identity = model
             .value_identity()
             .ok_or(RoleError::Unavailable)?
@@ -478,10 +543,11 @@ impl<M: RoleModel> PcSemanticOwner<M> {
         if let Some(namespace) = model.registered_representation_namespace() {
             namespace.verify_identity(model.identity(), Some(&identity))?;
         }
-        let mut semantic = PalsSemanticState::new_admitted(&config, model, Some(identity))?;
+        let mut semantic = PalsSemanticState::new_pc_admitted(profile, model, Some(identity))?;
         semantic.select_review_context(policy, limits)?;
         Ok(Self {
             config,
+            profile,
             semantic,
             researcher: NoResearcher,
         })
@@ -489,6 +555,9 @@ impl<M: RoleModel> PcSemanticOwner<M> {
 
     pub fn config(&self) -> PalsSemanticConfig {
         self.config
+    }
+    pub fn profile(&self) -> PcSemanticProfile {
+        self.profile
     }
     pub fn researcher(&self) -> &NoResearcher {
         &self.researcher
@@ -523,7 +592,8 @@ impl<M: RoleModel> PcSemanticOwner<M> {
         node: usize,
         question: RoleQuestion<'_>,
     ) -> Result<RoleLogicalContext, PalsError> {
-        self.semantic.role_context(&self.config, node, question)
+        self.semantic
+            .role_context(&self.profile.sequence_config(), node, question)
     }
     pub(super) fn prepare_review_view(
         &mut self,
@@ -532,7 +602,7 @@ impl<M: RoleModel> PcSemanticOwner<M> {
         legal: &[BoardMove],
     ) -> Result<Option<Arc<ReviewView>>, PalsError> {
         self.semantic
-            .prepare_review_view(&self.config, node, question, legal)
+            .prepare_review_view(&self.profile.sequence_config(), node, question, legal)
     }
     pub(super) fn prepare_frozen_review_views(
         &mut self,
@@ -544,7 +614,7 @@ impl<M: RoleModel> PcSemanticOwner<M> {
         second_legal: &[BoardMove],
     ) -> Result<Option<review_lifecycle::FrozenReviewViews>, PalsError> {
         self.semantic.prepare_frozen_review_views(
-            &self.config,
+            &self.profile.sequence_config(),
             first_node,
             first_question,
             first_legal,
@@ -566,7 +636,8 @@ impl<M: RoleModel> PcSemanticOwner<M> {
         self.semantic.refresh_projection(state);
     }
     pub(super) fn root_model_value(&self, child: usize) -> (PalsResolvedValue, PalsValueScope) {
-        self.semantic.root_model_value(&self.config, child)
+        self.semantic
+            .root_model_value(&self.profile.sequence_config(), child)
     }
     pub(super) fn intern_hot(&mut self, position: Position) -> Result<usize, PalsError> {
         self.semantic.intern_hot(&self.config, position)

@@ -281,6 +281,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     ) -> Result<(), FrontierError> {
         self.check_live().map_err(|_| FrontierError::ForeignRoot)?;
         if self.engine.semantic.rovent_frontier.is_some()
+            || self.root_rules_scanned
             || self.next_question != 1
             || !self.accepted.is_empty()
             || !self.cpu_admissions.is_empty()
@@ -330,6 +331,87 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
 
     pub fn rovent_frontier(&self) -> Option<&RoventFrontier> {
         self.engine.semantic.rovent_frontier.as_deref()
+    }
+
+    /// Inspect only the originally admitted root moves. The original clock
+    /// and controller charge every actual checked Rules transition; this is
+    /// neither a model opinion nor an extra search outside the root quota.
+    pub fn prepare_rovent_root_rules(
+        &mut self,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
+        self.check_live().map_err(|_| FrontierError::ForeignRoot)?;
+        self.deadline.accepts(clock, now)?;
+        let frontier = self
+            .rovent_frontier()
+            .ok_or(FrontierError::Invalid("Rovent frontier absent"))?;
+        if frontier.registration().authority != self.authority
+            || frontier.registration().root_state != self.engine.semantic.nodes[self.root].state
+            || !Arc::ptr_eq(&frontier.registration().root_rules, &self.rules)
+        {
+            return Err(FrontierError::ForeignRoot);
+        }
+        frontier.validate_attachment(
+            FrontierAttachment {
+                authority: self.authority,
+                mode: frontier.registration().mode,
+                original_deadline: self.deadline,
+                root_budget: frontier.registration().root_budget,
+                root_rules: &self.rules,
+                root_moves: frontier.root_moves(),
+                root_state: self.engine.semantic.nodes[self.root].state,
+                model_namespace: self
+                    .model_namespace()
+                    .map_err(|_| FrontierError::ForeignRoot)?,
+                native_ledger: frontier.registration().native_ledger.as_ref(),
+            },
+            &self.engine.semantic.stores,
+        )?;
+        if self.root_rules_scanned {
+            return Ok(());
+        }
+        let moves = frontier.root_moves().allowed().to_vec();
+        for movement in moves {
+            self.check_live().map_err(|_| FrontierError::ForeignRoot)?;
+            let child = {
+                let frontier = self.engine.semantic.rovent_frontier.as_mut().unwrap();
+                let path = frontier.observe_root_child(movement, clock, now)?;
+                let child =
+                    Position::from_snapshot(frontier.path_snapshot(path)?, Default::default())?;
+                matches!(
+                    child.classify_position()?.play_status,
+                    PlayStatus::Terminal { .. }
+                )
+                .then_some(child)
+            };
+            if let Some(position) = child {
+                // The controller already checked and charged this exact edge.
+                // Adopt its immutable result instead of replaying make_move.
+                if let Some(edge) = self.engine.semantic.nodes[self.root]
+                    .edges
+                    .iter()
+                    .find(|edge| edge.movement == movement)
+                {
+                    if !self.engine.semantic.nodes[edge.child]
+                        .position
+                        .snapshot()
+                        .same_state(&position.snapshot())
+                    {
+                        return Err(FrontierError::ForeignRoot);
+                    }
+                } else {
+                    let child = Self::intern_hot(&mut self.engine, position)
+                        .map_err(|_| FrontierError::StoreUnavailable)?;
+                    self.engine.semantic.nodes[self.root]
+                        .edges
+                        .push(Edge { movement, child });
+                    self.counters.examined_edges += 1;
+                }
+            }
+        }
+        self.root_rules_scanned = true;
+        Ok(())
     }
 
     /// Disjoint borrowing of the real controller and its Store. Controller
@@ -406,6 +488,33 @@ mod tests {
 
     type Port = AdaptiveEnginePort<LegalOrderRoleMock>;
     type Work = CoordinatorWork<ReviewView, AdaptivePortQuestion>;
+
+    fn copied_registration(source: &FrontierRegistration) -> FrontierRegistration {
+        FrontierRegistration {
+            authority: source.authority,
+            mode: source.mode,
+            original_deadline: source.original_deadline,
+            root_budget: source.root_budget,
+            goal: source.goal,
+            nodes: source.nodes,
+            selective_policy: source.selective_policy,
+            root_rules: Arc::clone(&source.root_rules),
+            root_moves: Arc::clone(&source.root_moves),
+            root_state: source.root_state,
+            model_namespace: Arc::clone(&source.model_namespace),
+            native_ledger: source.native_ledger.clone(),
+        }
+    }
+
+    fn limits() -> FrontierLimits {
+        FrontierLimits {
+            maximum_goal_plies: NonZeroU16::new(16).unwrap(),
+            maximum_frames: 16,
+            maximum_paths: 64,
+            maximum_mate_nodes: 64,
+            maximum_native_receipts: 16,
+        }
+    }
 
     fn controller(port: &Port) -> RoventFrontier {
         let domain = Arc::new(RootMoveDomain::new(&port.rules, None).unwrap());
@@ -602,15 +711,18 @@ mod tests {
         );
         let mut frontier = controller(&port);
         let mut obligations = Vec::new();
-        for kind in [
-            FrontierFrameKind::Candidate,
-            FrontierFrameKind::Counter,
-            FrontierFrameKind::Repair,
+        let counter =
+            super::super::port_tests::work(&mut port, "e2e4", RefinementStage::CriticReply, 1);
+        let repair = super::super::port_tests::work(&mut port, "e2e4", RefinementStage::Repair, 1);
+        for (kind, source) in [
+            (FrontierFrameKind::Candidate, &work),
+            (FrontierFrameKind::Counter, &counter),
+            (FrontierFrameKind::Repair, &repair),
         ] {
             obligations.push(
                 frontier
                     .register_local_frame(
-                        &work,
+                        source,
                         &port.engine.semantic.stores,
                         kind,
                         port.deadline.clock,
@@ -792,5 +904,36 @@ mod tests {
         assert_eq!(retained.registration().root_budget, budget);
         assert_eq!(retained.snapshot().work.root_entries, 1);
         assert!(engine.semantic.ensure_frontier_retired().is_err());
+    }
+
+    #[test]
+    fn legacy_root_rules_scan_cannot_be_relabelled_as_frontier_startup() {
+        let mut port = super::super::port_tests::setup(Position::startpos(), 4);
+        let frontier = controller(&port);
+        let registration = copied_registration(frontier.registration());
+        let domain = Arc::clone(&registration.root_moves);
+        let ledger = registration.native_ledger.clone();
+        drop(frontier);
+        port.prepare_root_rules().unwrap();
+        assert!(port.root_rules_scanned);
+        let result = port.attach_rovent_frontier(
+            registration,
+            limits(),
+            AdaptiveFrontierStartup {
+                mode: ExecutionMode::CpuPcr,
+                root_budget: ContractDigest([10; 32]),
+                root_moves: &domain,
+                native_ledger: ledger.as_ref(),
+            },
+            port.deadline.clock,
+            MonotonicTick(0),
+        );
+        assert_eq!(
+            result,
+            Err(FrontierError::Invalid(
+                "frontier attachment after root work"
+            ))
+        );
+        assert!(port.rovent_frontier().is_none());
     }
 }

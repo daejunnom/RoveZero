@@ -4,10 +4,13 @@
 
 use super::{Context, Edge, EdgeKind, LineKind, Model};
 use crate::cpu_value::{CpuValueIdentity, nnuec::NnuecError};
+use crate::cpu_worker::deferred_value::MaterializationOwner;
+use crate::cpu_worker::{CpuWorkerError, MaterializationCompletion, MaterializationRequest};
 use crate::pals::engine::RecordKind;
 use crate::pals::review_context::{ReviewView, checked_rebase_offset};
 use crate::pals::store::{PalsStores, StateId};
 use rz_position::{MAX_UCI_REPLAY_PLIES, Position, PositionIdentity, PositionSnapshot};
+use rz_runtime::CompletionSignal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -397,6 +400,7 @@ pub struct Completion {
 }
 enum Command {
     Prepare(Request, u64),
+    Materialize(MaterializationRequest),
     Wake,
 }
 /// One explicitly accounted preparation worker; no default background thread.
@@ -405,6 +409,7 @@ enum Command {
 pub struct PreparationActor {
     sender: Option<SyncSender<Command>>,
     receiver: Receiver<Completion>,
+    materialized: Receiver<MaterializationCompletion>,
     outstanding: Arc<AtomicUsize>,
     stopping: Arc<AtomicBool>,
     invalidations: Arc<AtomicU64>,
@@ -413,9 +418,19 @@ pub struct PreparationActor {
 }
 impl PreparationActor {
     pub fn spawn(model: Arc<Model>) -> Result<Self, PreparationError> {
+        Self::spawn_notified(model, CompletionSignal::default())
+    }
+    /// Same explicitly counted actor for C preparation and initial TT
+    /// materialization. No relay thread or second preparation owner is added.
+    pub fn spawn_notified(
+        model: Arc<Model>,
+        signal: CompletionSignal,
+    ) -> Result<Self, PreparationError> {
         let (sender, commands) = mpsc::sync_channel::<Command>(1);
         let (results, receiver) = mpsc::channel();
+        let (materializations, materialized) = mpsc::channel();
         let outstanding = Arc::new(AtomicUsize::new(0));
+        let worker_outstanding = Arc::clone(&outstanding);
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopping);
         let invalidations = Arc::new(AtomicU64::new(0));
@@ -433,27 +448,73 @@ impl PreparationActor {
                     invalidation_ack: worker_ack,
                     active_epoch: 0,
                 };
+                // Holds at most one unclaimed engine. Destruction/TT release
+                // stays on this actor even when a manager drops its terminal.
+                let mut materialization_owner = None;
                 while let Ok(command) = commands.recv() {
                     factory.sync_cache_epoch();
-                    let Command::Prepare(request, epoch) = command else {
-                        continue;
-                    };
-                    let provenance = request.provenance.clone();
-                    let result = if stop.load(Ordering::Acquire) {
-                        Err(PreparationError::Cancelled)
-                    } else {
-                        factory.prepare_at(request, epoch)
-                    };
-                    factory.sync_cache_epoch();
-                    if results.send(Completion { provenance, result }).is_err() {
-                        break;
+                    match command {
+                        Command::Wake => {}
+                        Command::Prepare(request, epoch) => {
+                            let provenance = request.provenance.clone();
+                            let result = if stop.load(Ordering::Acquire) {
+                                Err(PreparationError::Cancelled)
+                            } else {
+                                factory.prepare_at(request, epoch)
+                            };
+                            factory.sync_cache_epoch();
+                            if results.send(Completion { provenance, result }).is_err() {
+                                break;
+                            }
+                        }
+                        Command::Materialize(request) => {
+                            let provenance = request.provenance().clone();
+                            // Equal model bytes alone do not grant another
+                            // actor's cancellation/epoch authority. Preserve
+                            // the original Bound, never the latest cache view.
+                            let same_actor = request.model_matches(&factory.model)
+                                && Arc::ptr_eq(&request.bound().stopping, &factory.stopping)
+                                && Arc::ptr_eq(
+                                    &request.bound().invalidations,
+                                    &factory.invalidations,
+                                );
+                            let result = if !same_actor || !request.bound().authority_is_live() {
+                                Err((
+                                    request,
+                                    CpuWorkerError::Invalid(
+                                        "foreign or revoked NNUEC preparation actor",
+                                    ),
+                                ))
+                            } else {
+                                request.materialize()
+                            };
+                            let result = result.map(|engine| {
+                                let (owner, handoff) = MaterializationOwner::handoff(
+                                    engine,
+                                    Arc::clone(&worker_outstanding),
+                                );
+                                materialization_owner = Some(owner);
+                                handoff
+                            });
+                            factory.sync_cache_epoch();
+                            if materializations
+                                .send(MaterializationCompletion { provenance, result })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                     }
+                    signal.notify();
                 }
+                // Explicit owner drop precedes thread-exit/join receipt.
+                drop(materialization_owner);
             })
             .map_err(|_| PreparationError::WorkerStopped)?;
         Ok(Self {
             sender: Some(sender),
             receiver,
+            materialized,
             outstanding,
             stopping,
             invalidations,
@@ -506,14 +567,94 @@ impl PreparationActor {
             Err(TryRecvError::Disconnected) => Err(PreparationError::WorkerStopped),
         }
     }
+    /// Shares the single outstanding seat with neural preparation. Failure
+    /// retains the exact source/Bound request. A success terminal retains its
+    /// seat until the unique engine handoff is claimed, not merely polled.
+    #[allow(clippy::result_large_err)]
+    pub fn try_materialize(
+        &self,
+        request: MaterializationRequest,
+    ) -> Result<(), (PreparationError, MaterializationRequest)> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err((PreparationError::WorkerStopped, request));
+        }
+        if self
+            .outstanding
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err((PreparationError::Busy, request));
+        }
+        match self
+            .sender
+            .as_ref()
+            .expect("live actor sender")
+            .try_send(Command::Materialize(request))
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.outstanding.store(0, Ordering::Release);
+                match error {
+                    TrySendError::Full(Command::Materialize(request)) => {
+                        Err((PreparationError::Busy, request))
+                    }
+                    TrySendError::Disconnected(Command::Materialize(request)) => {
+                        Err((PreparationError::WorkerStopped, request))
+                    }
+                    _ => unreachable!("only a materialize command was submitted"),
+                }
+            }
+        }
+    }
+    pub fn try_materialized(&self) -> Result<Option<MaterializationCompletion>, PreparationError> {
+        match self.materialized.try_recv() {
+            Ok(completion) => {
+                if completion.result.is_err() {
+                    self.outstanding.store(0, Ordering::Release);
+                }
+                Ok(Some(completion))
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(PreparationError::WorkerStopped),
+        }
+    }
     pub fn shutdown(mut self) -> Result<(), PreparationError> {
         self.stop_and_join()
+    }
+    /// Nonblocking closure for the manager. Existing Bound authority is
+    /// revoked immediately; the actor still owns in-progress preparation and
+    /// any unclaimed engine until its actual thread exit is joined.
+    pub fn request_shutdown(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        self.sender.take();
+    }
+    /// Join only an already finished preparation owner. This is separate from
+    /// cache-release acknowledgement and from every installed CPU owner join.
+    pub fn try_join(&mut self) -> Result<Option<()>, PreparationError> {
+        let worker = self
+            .worker
+            .as_ref()
+            .ok_or(PreparationError::WorkerStopped)?;
+        if !worker.is_finished() {
+            return Ok(None);
+        }
+        let worker = self
+            .worker
+            .take()
+            .expect("finished preparation owner retained");
+        worker
+            .join()
+            .map_err(|_| PreparationError::WorkerPanicked)?;
+        Ok(Some(()))
     }
     /// Independent atomic control cannot be blocked by the ordinary request
     /// slot. It revokes old Bound acceptance immediately; the worker publishes
     /// a cache-release acknowledgement after observing it. Pending terminals
     /// remain available for collection and retain their original provenance.
     pub fn invalidate_cache(&self) -> Result<u64, PreparationError> {
+        if self.stopping.load(Ordering::Acquire) || self.sender.is_none() {
+            return Err(PreparationError::WorkerStopped);
+        }
         let previous = self
             .invalidations
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
@@ -534,8 +675,7 @@ impl PreparationActor {
         self.invalidation_ack.load(Ordering::Acquire)
     }
     fn stop_and_join(&mut self) -> Result<(), PreparationError> {
-        self.stopping.store(true, Ordering::Release);
-        self.sender.take();
+        self.request_shutdown();
         if self
             .worker
             .take()

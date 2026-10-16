@@ -10,14 +10,16 @@ use super::super::{
     NnuecError, NnuecNativeAccumulator, NnuecNativeUndo, copy_board, cpu_error,
     padded_board_values, reserve_local_append,
 };
-use super::review::BoundNnuecReviewContext;
+use super::review::{BoundNnuecReviewContext, Provenance};
 use super::{Model, Output, SEMANTICS};
 use crate::cpu_value::{
     CpuAccumulator, CpuAccumulatorUndo, CpuValueCacheContext, CpuValueError, CpuValueEvaluator,
     CpuValueIdentity,
 };
 use crate::pals::store::PalsStores;
+use rz_contracts::Digest;
 use rz_position::{Position, PositionLimits, RuleMoveDelta};
+use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 
 /// Installed only after the original ReviewView submission is accepted.
@@ -27,6 +29,7 @@ use std::sync::Arc;
 pub struct V2CpuValue {
     model: Arc<Model>,
     bound: Arc<BoundNnuecReviewContext>,
+    binding: Digest,
 }
 
 impl V2CpuValue {
@@ -49,7 +52,15 @@ impl V2CpuValue {
             return Err(NnuecError::StateMismatch);
         }
         model.check_context(bound.context())?;
-        Ok(Self { model, bound })
+        let binding = binding_digest(model.identity(), provenance)?;
+        if !bound.authority_is_live() {
+            return Err(NnuecError::StateMismatch);
+        }
+        Ok(Self {
+            model,
+            bound,
+            binding,
+        })
     }
 
     fn check_live(&self) -> Result<(), CpuValueError> {
@@ -82,6 +93,27 @@ impl V2CpuValue {
     }
 }
 
+/// Immutable job namespace belongs to the actual evaluator, so recovering its
+/// engine cannot silently replace view custody with a weights-only identity.
+fn binding_digest(
+    identity: &CpuValueIdentity,
+    provenance: &Provenance,
+) -> Result<Digest, NnuecError> {
+    let bytes = serde_json::to_vec(identity).map_err(|e| NnuecError::Json(e.to_string()))?;
+    let root = u64::try_from(provenance.root.0)
+        .map_err(|_| NnuecError::Capacity("prepared value root identity"))?;
+    let mut hash = Sha256::new();
+    hash.update(b"rz-cpu-prepared-value-binding/1");
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+    hash.update(provenance.full_view_digest);
+    hash.update(provenance.view_seal);
+    hash.update(provenance.record_scope_digest);
+    hash.update(root.to_be_bytes());
+    hash.update(provenance.generation.to_be_bytes());
+    Ok(Digest(hash.finalize().into()))
+}
+
 impl CpuValueEvaluator for V2CpuValue {
     fn identity(&self) -> &CpuValueIdentity {
         self.model.identity()
@@ -89,6 +121,11 @@ impl CpuValueEvaluator for V2CpuValue {
 
     fn provenance(&self) -> &'static str {
         SEMANTICS
+    }
+
+    fn job_binding_digest(&self) -> Result<Option<Digest>, CpuValueError> {
+        self.check_live()?;
+        Ok(Some(self.binding))
     }
 
     fn initialize(&self, position: &Position) -> Result<CpuAccumulator, CpuValueError> {

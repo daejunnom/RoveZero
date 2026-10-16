@@ -317,6 +317,7 @@ impl<M: RoleModel> PalsEngine<M> {
         position: &Position,
         authority: SearchAuthority,
     ) -> Result<AdaptiveRootRegistration, PalsError> {
+        self.ensure_archive_admission_open()?;
         self.ensure_adaptive_logical_quiescence()?;
         self.semantic.register_adaptive_root(position, authority)
     }

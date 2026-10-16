@@ -10,6 +10,7 @@ use super::engine::RoleQueryPurpose;
 use super::engine::adaptive_port::{
     AdaptiveModelNamespace, AdaptivePortQuestion, AdaptivePortRoleEvidence,
 };
+use super::engine::pc_port::PcResponsibilitySource;
 use super::review_context::ReviewView;
 use super::rovent_engine::{AdmittedRoleQuestion, ROVENT_NODE_UNIT, RootMoveDomain};
 use super::rovent_goals::{
@@ -34,6 +35,9 @@ use std::collections::HashMap;
 use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+mod question;
+pub(crate) use question::VerifiedFrontierQuestion;
 
 static NEXT_FRONTIER_OWNER: AtomicU64 = AtomicU64::new(1);
 
@@ -142,7 +146,7 @@ pub struct FrontierObligation {
     slot: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum FrontierFrameKind {
     Candidate,
     Counter,
@@ -253,6 +257,8 @@ struct FrameEntry {
     kind: FrontierFrameKind,
     original_first: BoardMove,
     question: Digest,
+    source_path: FrontierPath,
+    pc_source: bool,
     horizon: Option<HorizonObligationId>,
     finished: bool,
 }
@@ -275,12 +281,29 @@ pub struct MissingMateQuestion {
     original_deadline: Deadline,
     kind: MateQuestionKind,
 }
+/// Exact owner/action tuple for the existing manager's bounded pending set.
+/// A copied key grants no dispatch, credit, state transition or completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct MissingMateQuestionKey {
+    owner: u64,
+    lane: usize,
+    node: MateNodeId,
+    movement: BoardMove,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MateQuestionKind {
     AttackCandidate,
     RequiredDefense,
 }
 impl MissingMateQuestion {
+    pub fn key(&self) -> MissingMateQuestionKey {
+        MissingMateQuestionKey {
+            owner: self.owner,
+            lane: self.lane,
+            node: self.node,
+            movement: self.movement,
+        }
+    }
     pub fn kind(&self) -> MateQuestionKind {
         self.kind
     }
@@ -496,6 +519,23 @@ impl RoventFrontier {
             .chunk_limit(&self.path(path)?.anchor, configured)?)
     }
 
+    /// Actual startup Rules inspection under the original UCI controls. This
+    /// checks one admitted child only; it neither scans the root nor dispatches
+    /// a model/R task. The caller retains the live original Store/root owner.
+    pub(crate) fn observe_root_child(
+        &mut self,
+        movement: BoardMove,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<FrontierPath, FrontierError> {
+        let prefix = [movement];
+        let child = self.observe_prefix(&prefix, clock, now)?;
+        for lane in 0..2 {
+            self.observe_mate_path(lane, &prefix, clock, now)?;
+        }
+        Ok(child)
+    }
+
     /// This is actual Store evidence, never a generated string or raw value.
     /// New prefixes are Rules checked, while cached edge lookup adds no visit.
     pub fn observe_stored_line(
@@ -534,12 +574,25 @@ impl RoventFrontier {
         clock: ClockDomain,
         now: MonotonicTick,
     ) -> Result<FrontierPath, FrontierError> {
+        let question = VerifiedFrontierQuestion::from_adaptive(work, stores)?;
+        self.observe_verified_question(&question, stores, clock, now)
+    }
+
+    /// This source capability can only come from an actual port's typed smart
+    /// admission. It is not a frame-liveness or physical completion receipt.
+    pub(crate) fn observe_verified_question(
+        &mut self,
+        question: &VerifiedFrontierQuestion<'_>,
+        stores: &PalsStores,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<FrontierPath, FrontierError> {
         self.check_control(clock, now)?;
-        self.check_local_work(work, stores)?;
-        self.hold_local_source(stores, work)?;
-        let prefix = &work.input.question.context.prefix;
+        self.check_verified_work(question, stores)?;
+        self.hold_verified_source(stores, question)?;
+        let prefix = &question.context.prefix;
         let exact = self.observe_prefix(prefix, clock, now)?;
-        self.check_local_endpoint(exact, work)?;
+        self.check_verified_endpoint(exact, question)?;
         for lane in 0..2 {
             self.observe_mate_path(lane, prefix, clock, now)?;
         }
@@ -560,17 +613,8 @@ impl RoventFrontier {
         self.check_control(clock, now)?;
         self.check_peer_store(admitted, stores)?;
         self.check_work(work, admitted)?;
-        let exact = self.observe_local_question(work, stores, clock, now)?;
-        self.check_endpoint(exact, admitted)?;
-        self.register_checked_frame(
-            work.frame,
-            work.original_first_move,
-            work.input.question_digest,
-            &admitted.context().prefix,
-            kind,
-            clock,
-            now,
-        )
+        let question = VerifiedFrontierQuestion::from_adaptive(work, stores)?;
+        self.register_verified_frame(&question, stores, kind, clock, now)
     }
 
     /// A normal local continuation is not a reciprocal peer envelope. Its
@@ -584,13 +628,85 @@ impl RoventFrontier {
         clock: ClockDomain,
         now: MonotonicTick,
     ) -> Result<FrontierObligation, FrontierError> {
-        self.observe_local_question(work, stores, clock, now)?;
+        let question = VerifiedFrontierQuestion::from_adaptive(work, stores)?;
+        self.register_verified_frame(&question, stores, kind, clock, now)
+    }
+
+    pub(crate) fn register_verified_frame(
+        &mut self,
+        question: &VerifiedFrontierQuestion<'_>,
+        stores: &PalsStores,
+        kind: FrontierFrameKind,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<FrontierObligation, FrontierError> {
+        if question.pc_question.is_some() {
+            return Err(FrontierError::Invalid(
+                "R-free goal requires its original accepted responsibility",
+            ));
+        }
+        if !admission_stage_matches(kind, question.stage) {
+            return Err(FrontierError::Invalid(
+                "responsibility differs from actual question stage",
+            ));
+        }
+        self.observe_verified_question(question, stores, clock, now)?;
         self.register_checked_frame(
-            work.frame,
-            work.original_first_move,
-            work.input.question_digest,
-            &work.input.question.context.prefix,
+            question.frame,
+            question.original_first_move,
+            question.question_digest,
+            &question.context.prefix,
             kind,
+            false,
+            clock,
+            now,
+        )
+    }
+
+    /// The R-free producer seals this source only after actual native role
+    /// acceptance, exact legal selection and Rules-child validation. The
+    /// current C/Repair/Fresh stage does not invent the original responsibility.
+    pub(crate) fn register_pc_responsibility(
+        &mut self,
+        question: &VerifiedFrontierQuestion<'_>,
+        source: &PcResponsibilitySource,
+        stores: &PalsStores,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<FrontierObligation, FrontierError> {
+        self.check_control(clock, now)?;
+        self.check_verified_work(question, stores)?;
+        let port_question = question
+            .pc_question
+            .ok_or(FrontierError::MissingAcceptance)?;
+        if !port_question
+            .frontier_responsibilities()
+            .iter()
+            .any(|held| std::ptr::eq(held, source))
+        {
+            return Err(FrontierError::MissingAcceptance);
+        }
+        self.observe_verified_question(question, stores, clock, now)?;
+        let exact = self.observe_prefix(source.prefix(), clock, now)?;
+        if !self.path_snapshot(exact)?.same_state(source.snapshot()) {
+            return Err(FrontierError::Invalid(
+                "responsibility differs from original checked Rules child",
+            ));
+        }
+        let first = BoardMove::try_from(question.original_first_move.decode()?)?;
+        if source.prefix().first() != Some(&first) {
+            return Err(FrontierError::ForeignRoot);
+        }
+        for lane in 0..2 {
+            self.observe_mate_path(lane, source.prefix(), clock, now)?;
+        }
+        self.register_checked_frame(
+            question.frame,
+            question.original_first_move,
+            source.question_digest(),
+            source.prefix(),
+            source.kind(),
+            true,
             clock,
             now,
         )
@@ -604,6 +720,7 @@ impl RoventFrontier {
         question: Digest,
         prefix: &[BoardMove],
         kind: FrontierFrameKind,
+        pc_source: bool,
         clock: ClockDomain,
         now: MonotonicTick,
     ) -> Result<FrontierObligation, FrontierError> {
@@ -613,13 +730,6 @@ impl RoventFrontier {
         if self.frames.len() >= self.limits.maximum_frames {
             return Err(FrontierError::Capacity("frame obligations"));
         }
-        if self
-            .frames
-            .iter()
-            .any(|held| held.frame == frame && held.kind == kind && held.question == question)
-        {
-            return Err(FrontierError::Duplicate);
-        }
         let original_first = BoardMove::try_from(first.decode()?)?;
         let mut anchor = self.observe_prefix(prefix, clock, now)?;
         // A root candidate's actual first move scopes its responsibility. The
@@ -627,6 +737,23 @@ impl RoventFrontier {
         // not an invented child tensor/view or a mandatory time-only pass.
         if self.registration.goal.depth_plies.is_some() && self.path_ply(anchor)? == ChessPly(0) {
             anchor = self.advance_path(anchor, original_first, clock, now)?;
+        }
+        for held in self
+            .frames
+            .iter()
+            .filter(|held| held.frame == frame && held.kind == kind)
+        {
+            if held.question == question
+                && held.source_path == anchor
+                && held.pc_source == pc_source
+            {
+                return Err(FrontierError::Duplicate);
+            }
+            if !pc_source || !held.pc_source {
+                return Err(FrontierError::Invalid(
+                    "responsibility already has an original question",
+                ));
+            }
         }
         self.frames
             .try_reserve(1)
@@ -646,6 +773,8 @@ impl RoventFrontier {
             kind,
             original_first,
             question,
+            source_path: anchor,
+            pc_source,
             horizon: obligation,
             finished: false,
         });
@@ -682,16 +811,8 @@ impl RoventFrontier {
         self.check_control(clock, now)?;
         self.check_peer_store(admitted, stores)?;
         self.check_work(work, admitted)?;
-        self.check_local_work(work, stores)?;
-        let at = self.check_obligation(obligation, work.frame)?;
-        if !rules_stage_matches(self.frames[at].kind, work.input.stage) {
-            return Err(FrontierError::MissingAcceptance);
-        }
-        self.check_endpoint(endpoint, admitted)?;
-        self.check_local_endpoint(endpoint, work)?;
-        let position = Position::from_snapshot(self.path_snapshot(endpoint)?, Default::default())?;
-        let boundary = HorizonBoundary::rules_terminal(&position)?;
-        self.finish_obligation(at, endpoint, boundary)
+        let question = VerifiedFrontierQuestion::from_adaptive(work, stores)?;
+        self.accept_verified_rules_endpoint(obligation, &question, stores, endpoint, clock, now)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -704,13 +825,27 @@ impl RoventFrontier {
         clock: ClockDomain,
         now: MonotonicTick,
     ) -> Result<(), FrontierError> {
+        let question = VerifiedFrontierQuestion::from_adaptive(work, stores)?;
+        self.accept_verified_rules_endpoint(obligation, &question, stores, endpoint, clock, now)
+    }
+
+    pub(crate) fn accept_verified_rules_endpoint(
+        &mut self,
+        obligation: FrontierObligation,
+        question: &VerifiedFrontierQuestion<'_>,
+        stores: &PalsStores,
+        endpoint: FrontierPath,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
         self.check_control(clock, now)?;
-        self.check_local_work(work, stores)?;
-        let at = self.check_obligation(obligation, work.frame)?;
-        if !rules_stage_matches(self.frames[at].kind, work.input.stage) {
+        self.check_verified_work(question, stores)?;
+        let at = self.check_obligation(obligation, question.frame)?;
+        let pc_source = self.check_completion_source(at, question)?;
+        if !pc_source && !rules_stage_matches(self.frames[at].kind, question.stage) {
             return Err(FrontierError::MissingAcceptance);
         }
-        self.check_local_endpoint(endpoint, work)?;
+        self.check_verified_endpoint(endpoint, question)?;
         let position = Position::from_snapshot(self.path_snapshot(endpoint)?, Default::default())?;
         let boundary = HorizonBoundary::rules_terminal(&position)?;
         self.finish_obligation(at, endpoint, boundary)
@@ -733,21 +868,9 @@ impl RoventFrontier {
         self.check_control(clock, now)?;
         self.check_peer_store(admitted, stores)?;
         self.check_work(work, admitted)?;
-        self.check_local_work(work, stores)?;
-        let at = self.check_obligation(obligation, work.frame)?;
-        if !fresh_stage_matches(self.frames[at].kind, work.input.stage) {
-            return Err(FrontierError::MissingAcceptance);
-        }
-        self.check_endpoint(endpoint, admitted)?;
-        self.check_local_endpoint(endpoint, work)?;
-        self.accept_checked_fresh(
-            at,
-            work,
-            admitted.context().purpose,
-            endpoint,
-            accepted,
-            output,
-            physical,
+        let question = VerifiedFrontierQuestion::from_adaptive(work, stores)?;
+        self.accept_verified_fresh_endpoint(
+            obligation, &question, stores, endpoint, accepted, output, physical, clock, now,
         )
     }
 
@@ -764,44 +887,59 @@ impl RoventFrontier {
         clock: ClockDomain,
         now: MonotonicTick,
     ) -> Result<(), FrontierError> {
+        let question = VerifiedFrontierQuestion::from_adaptive(work, stores)?;
+        self.accept_verified_fresh_endpoint(
+            obligation, &question, stores, endpoint, accepted, output, physical, clock, now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn accept_verified_fresh_endpoint(
+        &mut self,
+        obligation: FrontierObligation,
+        question: &VerifiedFrontierQuestion<'_>,
+        stores: &PalsStores,
+        endpoint: FrontierPath,
+        accepted: &AcceptedRoleStep,
+        output: &RoleOutput,
+        physical: AdaptivePortRoleEvidence,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
         self.check_control(clock, now)?;
-        self.check_local_work(work, stores)?;
-        let at = self.check_obligation(obligation, work.frame)?;
-        if !fresh_stage_matches(self.frames[at].kind, work.input.stage) {
+        self.check_verified_work(question, stores)?;
+        let at = self.check_obligation(obligation, question.frame)?;
+        let pc_source = self.check_completion_source(at, question)?;
+        if !(if pc_source {
+            any_fresh_stage(question.stage)
+        } else {
+            fresh_stage_matches(self.frames[at].kind, question.stage)
+        }) {
             return Err(FrontierError::MissingAcceptance);
         }
-        self.check_local_endpoint(endpoint, work)?;
-        self.accept_checked_fresh(
-            at,
-            work,
-            work.input.question.context.purpose,
-            endpoint,
-            accepted,
-            output,
-            physical,
-        )
+        self.check_verified_endpoint(endpoint, question)?;
+        self.accept_checked_fresh(at, question, endpoint, accepted, output, physical)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn accept_checked_fresh(
         &mut self,
         at: usize,
-        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
-        purpose: RoleQueryPurpose,
+        question: &VerifiedFrontierQuestion<'_>,
         endpoint: FrontierPath,
         accepted: &AcceptedRoleStep,
         output: &RoleOutput,
         physical: AdaptivePortRoleEvidence,
     ) -> Result<(), FrontierError> {
         let ticket = accepted.ticket();
-        if ticket.authority != work.frame.authority
-            || ticket.question != work.input.question_digest
-            || ticket.view != work.input.view_seal
+        if ticket.authority != question.frame.authority
+            || ticket.question != question.question_digest
+            || ticket.view != question.view_seal
             || ticket.original_deadline != self.registration.original_deadline
             || ticket.role != Role::Proposer
-            || ticket.representation.record_revision != work.input.question.context.public_revision
+            || ticket.representation.record_revision != question.context.public_revision
             || !accepted.validates_output(output)
-            || purpose != RoleQueryPurpose::ValueFresh
+            || question.context.purpose != RoleQueryPurpose::ValueFresh
             || physical.physical_fresh != Some(true)
             || !physical.measurement_complete
             || physical.completed_nn_inputs.is_none_or(|count| count == 0)
@@ -1087,6 +1225,48 @@ impl RoventFrontier {
         Ok(())
     }
 
+    /// Build only the one requested branch descriptor. Its final transition
+    /// must still be checked by the actual port; this function executes none.
+    pub fn missing_question_prefix(
+        &self,
+        question: &MissingMateQuestion,
+    ) -> Result<Vec<BoardMove>, FrontierError> {
+        self.validate_missing_question(question)?;
+        let mut prefix = self.path_prefix(question.anchor)?;
+        prefix
+            .try_reserve(1)
+            .map_err(|_| FrontierError::Capacity("missing question prefix"))?;
+        prefix.push(question.movement);
+        Ok(prefix)
+    }
+
+    pub fn missing_question_first_move(
+        &self,
+        question: &MissingMateQuestion,
+    ) -> Result<BoardMove, FrontierError> {
+        self.validate_missing_question(question)?;
+        Ok(self
+            .path_prefix(question.anchor)?
+            .first()
+            .copied()
+            .unwrap_or(question.movement))
+    }
+
+    /// Remaining generation chunk after the imposed missing move. Zero
+    /// requests only a boundary/Rules observation, never an invented extra ply.
+    pub fn missing_question_chunk_limit(
+        &self,
+        question: &MissingMateQuestion,
+        configured: u16,
+    ) -> Result<u16, FrontierError> {
+        self.validate_missing_question(question)?;
+        let proof = question.remaining.0.saturating_sub(1);
+        let depth = self
+            .remaining_depth(question.anchor)?
+            .map(|plies| plies.0.saturating_sub(1));
+        Ok(configured.min(proof).min(depth.unwrap_or(u16::MAX)))
+    }
+
     pub fn revoke_obligation(
         &mut self,
         obligation: FrontierObligation,
@@ -1268,12 +1448,12 @@ impl RoventFrontier {
         self.pins = pins;
         Ok(())
     }
-    fn hold_local_source(
+    fn hold_verified_source(
         &mut self,
         stores: &PalsStores,
-        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        question: &VerifiedFrontierQuestion<'_>,
     ) -> Result<(), FrontierError> {
-        let source = &work.input.question.context;
+        let source = question.context;
         if self.pins.states.contains(&source.state)
             && self.pins.lines.contains(&source.focus)
             && self.pins.situations.contains(&source.situation)
@@ -1471,27 +1651,25 @@ impl RoventFrontier {
         Ok(())
     }
 
-    fn check_local_work(
+    fn check_verified_work(
         &mut self,
-        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        question: &VerifiedFrontierQuestion<'_>,
         stores: &PalsStores,
     ) -> Result<(), FrontierError> {
         self.check_store(stores)?;
-        AdaptivePortQuestion::validate_frontier_source(work, stores)
-            .map_err(|_| FrontierError::Invalid("actual local port question/view"))?;
-        let first = BoardMove::try_from(work.original_first_move.decode()?)?;
-        let view = &work.input.view;
-        if work.frame.authority != self.registration.authority
-            || work.frame.sequence == 0
-            || work.original_deadline != self.registration.original_deadline
-            || work.input.view_seal.authority != self.registration.authority
-            || work.input.view_seal.root_state != self.registration.root_rules.snapshot().identity()
+        let first = BoardMove::try_from(question.original_first_move.decode()?)?;
+        let view = question.view;
+        if question.frame.authority != self.registration.authority
+            || question.frame.sequence == 0
+            || question.original_deadline != self.registration.original_deadline
+            || question.view_seal.authority != self.registration.authority
+            || question.view_seal.root_state != self.registration.root_rules.snapshot().identity()
+            || question.public_context.0 != view.record_scope_digest()
             || view.root_state() != self.registration.root_state
             || view.generation() != self.registration.authority.root.0
+            || !view.validates(stores)
             || !self.registration.root_moves.allowed().contains(&first)
-            || work
-                .input
-                .question
+            || question
                 .context
                 .prefix
                 .first()
@@ -1533,31 +1711,43 @@ impl RoventFrontier {
         }
         Ok(obligation.slot)
     }
-    fn check_endpoint(
+    fn check_completion_source(
         &self,
-        endpoint: FrontierPath,
-        admitted: &AdmittedRoleQuestion,
-    ) -> Result<(), FrontierError> {
-        if !self
-            .path_snapshot(endpoint)?
-            .same_state(admitted.rules().rules().snapshot())
-            || self.path_prefix(endpoint)? != admitted.context().prefix
-        {
-            return Err(FrontierError::Invalid(
-                "endpoint differs from original exact question",
-            ));
+        at: usize,
+        question: &VerifiedFrontierQuestion<'_>,
+    ) -> Result<bool, FrontierError> {
+        let held = &self.frames[at];
+        if !held.pc_source {
+            return if question.pc_question.is_none() {
+                Ok(false)
+            } else {
+                Err(FrontierError::MissingAcceptance)
+            };
         }
-        Ok(())
+        let current = question
+            .pc_question
+            .ok_or(FrontierError::MissingAcceptance)?;
+        let prefix = self.path_prefix(held.source_path)?;
+        let snapshot = self.path_snapshot(held.source_path)?;
+        if !current.frontier_responsibilities().iter().any(|source| {
+            source.kind() == held.kind
+                && source.question_digest() == held.question
+                && source.prefix() == prefix.as_slice()
+                && source.snapshot().same_state(snapshot)
+        }) {
+            return Err(FrontierError::MissingAcceptance);
+        }
+        Ok(true)
     }
-    fn check_local_endpoint(
+    fn check_verified_endpoint(
         &self,
         endpoint: FrontierPath,
-        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        question: &VerifiedFrontierQuestion<'_>,
     ) -> Result<(), FrontierError> {
         if !self
             .path_snapshot(endpoint)?
-            .same_state(&work.input.question.position.snapshot())
-            || self.path_prefix(endpoint)? != work.input.question.context.prefix
+            .same_state(&question.position.snapshot())
+            || self.path_prefix(endpoint)? != question.context.prefix
         {
             return Err(FrontierError::Invalid(
                 "local endpoint differs from exact root replay",
@@ -1634,6 +1824,24 @@ fn fresh_stage_matches(kind: FrontierFrameKind, stage: RefinementStage) -> bool 
                 | RefinementStage::RecheckRepairedValueFresh
         ),
     }
+}
+
+fn any_fresh_stage(stage: RefinementStage) -> bool {
+    [
+        FrontierFrameKind::Candidate,
+        FrontierFrameKind::Counter,
+        FrontierFrameKind::Repair,
+    ]
+    .into_iter()
+    .any(|kind| fresh_stage_matches(kind, stage))
+}
+
+fn admission_stage_matches(kind: FrontierFrameKind, stage: RefinementStage) -> bool {
+    rules_stage_matches(kind, stage)
+        || matches!(
+            (kind, stage),
+            (FrontierFrameKind::Counter, RefinementStage::CpuDiscovery)
+        )
 }
 
 fn rules_stage_matches(kind: FrontierFrameKind, stage: RefinementStage) -> bool {

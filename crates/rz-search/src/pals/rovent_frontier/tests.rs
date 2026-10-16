@@ -131,7 +131,11 @@ fn zero_one_nodes_and_cached_edges_preserve_the_registered_unit() {
             false,
         );
         assert!(matches!(
-            fixture.observe(&[mv("e2e4")]),
+            fixture.frontier.observe_root_child(
+                mv("e2e4"),
+                fixture.clock.domain(),
+                fixture.clock.now().unwrap()
+            ),
             Err(FrontierError::NodeBudget)
         ));
         let snapshot = fixture.frontier.snapshot();
@@ -143,6 +147,15 @@ fn zero_one_nodes_and_cached_edges_preserve_the_registered_unit() {
         );
     }
     let mut fixture = Fixture::new(Position::startpos(), SearchGoal::default(), Some(10), false);
+    let root_child = fixture
+        .frontier
+        .observe_root_child(
+            mv("e2e4"),
+            fixture.clock.domain(),
+            fixture.clock.now().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(fixture.frontier.path_ply(root_child).unwrap(), ChessPly(1));
     let first = fixture.observe(&[mv("e2e4"), mv("e7e5")]).unwrap();
     let second = fixture.observe(&[mv("e2e4"), mv("e7e5")]).unwrap();
     assert_eq!(first, second);
@@ -205,6 +218,60 @@ fn unexamined_mate_defenses_are_returned_as_questions_and_depth_does_not_shrink_
     assert_eq!(
         fixture.frontier.snapshot().mate[0].unwrap().conclusion,
         MateConclusion::Unknown
+    );
+}
+
+#[test]
+fn missing_question_key_and_branch_descriptor_keep_original_owner_first_and_horizons() {
+    let goal = SearchGoal {
+        depth_plies: NonZeroU16::new(3),
+        mate_moves: NonZeroU16::new(2),
+    };
+    let mut fixture = Fixture::new(Position::startpos(), goal, None, false);
+    let mut questions = fixture
+        .frontier
+        .missing_mate_questions(1, fixture.clock.domain(), fixture.clock.now().unwrap())
+        .unwrap();
+    let question = questions.pop().unwrap();
+    assert_eq!(question.kind(), MateQuestionKind::AttackCandidate);
+    assert_eq!(question.remaining(), ChessPly(3));
+    let repeated = fixture
+        .frontier
+        .missing_mate_questions(1, fixture.clock.domain(), fixture.clock.now().unwrap())
+        .unwrap();
+    assert_eq!(question.key(), repeated[0].key());
+    assert_eq!(
+        fixture.frontier.missing_question_prefix(&question).unwrap(),
+        vec![question.movement()]
+    );
+    assert_eq!(
+        fixture
+            .frontier
+            .missing_question_first_move(&question)
+            .unwrap(),
+        question.movement()
+    );
+    assert_eq!(
+        fixture
+            .frontier
+            .missing_question_chunk_limit(&question, 16)
+            .unwrap(),
+        2
+    );
+    // A descriptor is not a visit or a completed defense.
+    assert_eq!(
+        fixture.frontier.snapshot().work.total_node_visits(),
+        Some(1)
+    );
+    let other = Fixture::new(Position::startpos(), goal, None, false);
+    assert_eq!(
+        other.frontier.validate_missing_question(&question),
+        Err(FrontierError::ForeignHandle)
+    );
+    fixture.observe(&[question.movement()]).unwrap();
+    assert_eq!(
+        fixture.frontier.validate_missing_question(&question),
+        Err(FrontierError::ForeignHandle)
     );
 }
 

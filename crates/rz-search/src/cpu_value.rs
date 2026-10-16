@@ -320,6 +320,12 @@ impl std::error::Error for CpuValueError {}
 pub trait CpuValueEvaluator: Send + Sync {
     fn identity(&self) -> &CpuValueIdentity;
     fn provenance(&self) -> &'static str;
+    /// Immutable task registration for a context-bound evaluator. Legacy
+    /// values retain their original namespace bytes. A revoked binding is an
+    /// error, never None or permission to fall back to a model-only namespace.
+    fn job_binding_digest(&self) -> Result<Option<rz_contracts::Digest>, CpuValueError> {
+        Ok(None)
+    }
     fn initialize(&self, position: &Position) -> Result<CpuAccumulator, CpuValueError>;
     /// Exact context of a position-dependent value. NNUEC additionally seals
     /// the frozen C owner and L anchor; a model/weights identity alone is not a

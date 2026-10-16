@@ -24,6 +24,7 @@ mod fixed_trace_tests;
 mod frontier_port;
 mod legacy_full_context;
 mod model_namespace;
+mod nnuec_port;
 #[cfg(test)]
 mod port_tests;
 mod reciprocal_port;
@@ -49,6 +50,9 @@ pub use frontier_port::{
 };
 pub use legacy_full_context::LegacyFullRoleRecords;
 pub use model_namespace::AdaptiveModelNamespace;
+pub use nnuec_port::{
+    AdaptiveNnuecPreparationError, AdaptiveNnuecReviewRequest, AdaptiveNnuecReviewSeal,
+};
 pub mod archive_worker;
 /// The process registry remains owned by UCI. Search cannot invent an owner
 /// from a root generation or reuse one for a separately owned Rules instance.
@@ -726,6 +730,33 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     pub fn root_rules(&self) -> Arc<ContractState> {
         Arc::clone(&self.rules)
     }
+    pub fn root_state_id(&self) -> StateId {
+        self.engine.semantic.nodes[self.root].state
+    }
+    pub fn model_namespace(&self) -> Result<&AdaptiveModelNamespace, PalsError> {
+        let namespace = self
+            .engine
+            .semantic
+            .model
+            .registered_representation_namespace()
+            .ok_or(RoleError::Unsupported(
+                "native representation namespace is not registered",
+            ))?;
+        namespace.verify_identity(
+            self.engine.semantic.model.identity(),
+            self.engine.semantic.model.value_identity(),
+        )?;
+        if self
+            .engine
+            .semantic
+            .model_registered_value
+            .as_ref()
+            .is_some_and(|value| value != namespace.value_identity())
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        Ok(namespace)
+    }
     pub fn root_is_terminal(&self) -> bool {
         self.engine.semantic.nodes[self.root].terminal.is_some()
     }
@@ -736,6 +767,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         self.check_live()?;
         if self.root_rules_scanned {
             return Ok(());
+        }
+        if self.engine.semantic.rovent_frontier.is_some() {
+            return Err(StoreError::InvalidConditions(
+                "Rovent root Rules inspection requires its original clock",
+            )
+            .into());
         }
         let position = self.engine.semantic.nodes[self.root].position.clone();
         for movement in position.legal_moves() {
@@ -1919,7 +1956,7 @@ fn purpose_for_stage(stage: RefinementStage) -> RoleQueryPurpose {
         _ => RoleQueryPurpose::ProposePolicy,
     }
 }
-fn validate_payload(
+pub(super) fn validate_payload(
     purpose: RoleQueryPurpose,
     view: &ReviewView,
     output: &RoleOutput,
