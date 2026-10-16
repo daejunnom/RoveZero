@@ -43,12 +43,16 @@ mod cpu_lifecycle;
 mod followup_execution;
 mod frozen_recheck;
 mod review_lifecycle;
+mod semantic_state;
 pub use followup_execution::{
     PALS_FOLLOWUP_EXECUTION_TRACE_MAX, PALS_FOLLOWUP_EXECUTION_VERSION,
     PalsExecutionEndpointSnapshot, PalsExecutionEndpointValue, PalsFollowupExecutionScope,
     PalsFollowupExecutionSnapshot, PalsFollowupObservationIssue, PalsFollowupOwnerSnapshot,
     PalsFrozenComparisonExecution, PalsFrozenValueExecution, PalsRepairExecutionTrace,
     PalsRepairRecheckExecution, RoleExecutionContext, RoleValueExecutionEvidence,
+};
+pub use semantic_state::{
+    NoResearcher, PalsSemanticConfig, PalsSemanticState, RegisteredResearcher,
 };
 
 pub const PALS_SEARCH_VERSION: &str = "pals-restricted-refinement/0.1";
@@ -123,6 +127,10 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
         b"rz-pals-search-implementation-sources/1",
         &[
             ("pals/engine.rs", include_str!("engine.rs")),
+            (
+                "pals/engine/semantic_state.rs",
+                include_str!("engine/semantic_state.rs"),
+            ),
             (
                 "pals/engine/frozen_recheck.rs",
                 include_str!("engine/frozen_recheck.rs"),
@@ -338,19 +346,8 @@ impl Default for PalsConfig {
 }
 impl PalsConfig {
     pub fn validate(&self) -> Result<(), PalsError> {
-        if self.beam_width == 0
-            || self.beam_width > 16
-            || self.line_plies == 0
-            || self.line_plies > 16
-            || self.max_nodes < 257
-            || self.max_nodes > 65_536
-            || self.max_records < 4
-            || self.max_records > 128
-            || self.max_role_calls == 0
-            || self.max_role_calls > 1_000_000
-            || self.cpu_nodes_per_task == 0
-            || self.cpu_nodes_per_task > 10_000_000
-        {
+        PalsSemanticConfig::from(self).validate()?;
+        if self.cpu_nodes_per_task == 0 || self.cpu_nodes_per_task > 10_000_000 {
             return Err(PalsError::InvalidConfig);
         }
         Ok(())
@@ -1567,15 +1564,50 @@ impl<M: RoleModel> PalsEngine<M> {
         };
         let checker_registered_identity = cpu.identity().clone();
         let cpu_registered_condition = Self::cpu_condition_for(cpu.as_ref());
-        let mut nodes = Vec::new();
-        nodes
-            .try_reserve(config.max_nodes)
-            .map_err(|_| PalsError::Capacity)?;
-        let mut records = Vec::new();
-        records
-            .try_reserve(config.max_records)
-            .map_err(|_| PalsError::Capacity)?;
-        let stores = PalsStores::new(Self::store_limits(&config));
+        // Stage one retains the historical flat storage and all legacy
+        // consumers. Move admitted owners explicitly; never clone M/Store or
+        // use Deref to hide later field/borrow changes.
+        let PalsSemanticState {
+            model,
+            model_registered_value,
+            nodes,
+            records,
+            review_index,
+            review_policy,
+            legacy_full_native_context,
+            last_review_issue,
+            revision,
+            game_generation,
+            adaptive_root_registry,
+            stores,
+            clock_origin,
+            consumer_id,
+            last_search_counters,
+            last_recheck_observer_error,
+            repair_queue,
+            repair_questions,
+            repair_counts,
+            archive_state,
+            new_game_transition_error,
+        } = PalsSemanticState::new_admitted(
+            &PalsSemanticConfig::from(&config),
+            model,
+            model_registered_value,
+        )?;
+        let RegisteredResearcher {
+            cpu,
+            checker_registered_identity,
+            cpu_registered_value,
+            cpu_registered_condition,
+            checker_new_game_pending,
+            last_external_attempt,
+            external_attempts,
+        } = RegisteredResearcher::from_admitted(
+            cpu,
+            checker_registered_identity,
+            cpu_registered_value,
+            cpu_registered_condition,
+        );
         Ok(Self {
             config,
             resolver,
@@ -1589,30 +1621,30 @@ impl<M: RoleModel> PalsEngine<M> {
             cpu_registered_value,
             model_registered_value,
             cpu_registered_condition,
-            checker_new_game_pending: false,
-            last_external_attempt: None,
-            external_attempts: Vec::new(),
+            checker_new_game_pending,
+            last_external_attempt,
+            external_attempts,
             nodes,
             records,
-            review_index: None,
-            review_policy: None,
-            legacy_full_native_context: false,
-            last_review_issue: None,
-            revision: 0,
-            game_generation: Some(0),
-            adaptive_root_registry: adaptive_root::AdaptiveRootRegistry::default(),
+            review_index,
+            review_policy,
+            legacy_full_native_context,
+            last_review_issue,
+            revision,
+            game_generation,
+            adaptive_root_registry,
             stores,
-            clock_origin: Instant::now(),
-            consumer_id: 0,
-            last_search_counters: None,
-            last_recheck_observer_error: None,
+            clock_origin,
+            consumer_id,
+            last_search_counters,
+            last_recheck_observer_error,
             last_cpu_checkpoint_cleanup_error: None,
-            repair_queue: std::collections::VecDeque::new(),
-            repair_questions: HashSet::new(),
-            repair_counts: std::collections::HashMap::new(),
-            archive_state: archive_lifecycle::EngineArchiveLifecycle::default(),
+            repair_queue,
+            repair_questions,
+            repair_counts,
+            archive_state,
             followup_execution: followup_execution::FollowupExecutionRecorder::default(),
-            new_game_transition_error: None,
+            new_game_transition_error,
         })
     }
 
@@ -1869,17 +1901,7 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 
     fn store_limits(config: &PalsConfig) -> StoreLimits {
-        StoreLimits {
-            states: config.max_nodes,
-            situations: config.max_nodes,
-            line_chunks: config.max_nodes * 16,
-            line_plies: config.line_plies,
-            observations: config.max_nodes * 16,
-            dependency_edges: config.max_nodes * 16,
-            executions: config.max_nodes * 8,
-            consumers: config.max_nodes * 16,
-            ..StoreLimits::default()
-        }
+        PalsSemanticConfig::from(config).store_limits()
     }
 
     pub fn search(
