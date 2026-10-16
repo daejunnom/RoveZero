@@ -4,6 +4,9 @@ use rz_contracts::pals_adaptive::{
     CpuJobEnvelope, CpuJobId, CpuWorkerId, ExternalCpuJobEnvelope, ExternalSliceGrant,
     ReviewViewSeal, RoleTicketEnvelope, SliceGrant,
 };
+use rz_contracts::rovent::{
+    ExecutionMode, QuestionEnvelope, ReciprocalQuestionId, SearchRecipient,
+};
 use rz_contracts::{ClockDomain, Deadline, Digest, MonotonicTick, RequestId};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -13,6 +16,8 @@ pub const MAX_REPAIR_PER_FIRST_MOVE: u8 = 3;
 const MAX_REPAIR_QUESTION_HISTORY: usize = 256 * MAX_REPAIR_PER_FIRST_MOVE as usize;
 pub const MAX_FRAME_GENEALOGY: usize = 1024;
 pub const MAX_STEP_BINDING_HISTORY: usize = 65_536;
+pub const MAX_RECIPROCAL_QUESTION_HISTORY: usize = MAX_FRAME_GENEALOGY;
+pub const MAX_RECIPROCAL_QUESTION_DEPTH: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CoordinatorHistoryUsage {
@@ -445,6 +450,39 @@ pub struct ClosedFrame {
     pub completion_scope: Option<FrameCompletionScope>,
 }
 
+/// A dependent question reuses the real frame/ticket/CPU owner path. Joining
+/// existing work does not submit another role call or allocate more credit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependentFrameAdmission {
+    Admitted(FrameId),
+    Joined(FrameId),
+}
+
+/// Completion of one dependent question, not a terminal chess proof or a
+/// completed legacy PALS refinement workflow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependentFrameResponse {
+    pub frame: FrameId,
+    pub question: Digest,
+    pub view: ReviewViewSeal,
+    pub evidence: Digest,
+    pub execution: StepExecution,
+}
+
+#[derive(Clone, Copy)]
+struct FrameDependency {
+    waiter: FrameId,
+    dependency: FrameId,
+}
+
+struct ReciprocalRoot {
+    mode: ExecutionMode,
+    root_budget: Digest,
+    // Tombstones remain until root retirement: closing a question is not
+    // permission to resubmit the same unchanged work under a fresh sequence.
+    questions: Vec<(QuestionEnvelope, FrameId)>,
+}
+
 /// Finite continuation state with no worker calls and no hidden blocking.
 /// Frames can progress independently; only this owner mutates their authority.
 pub struct RefinementMachine<V, Q> {
@@ -466,6 +504,13 @@ pub struct RefinementMachine<V, Q> {
     validator_actions: HashSet<(RequestId, u8)>,
     validator_history_peak: ValidatorActionHistoryUsage,
     history_peak: CoordinatorHistoryUsage,
+    // Each live frame may await at most one other frame. This is a logical
+    // wait; a suspended R frame retains its original private CPU owner.
+    dependencies: Vec<FrameDependency>,
+    // Only the allocating parent receives unused role credit. Joined waiters
+    // paid no second reservation and therefore receive no refund.
+    dependent_credit_owners: Vec<(FrameId, FrameId)>,
+    reciprocal: Option<ReciprocalRoot>,
 }
 impl<V, Q> RefinementMachine<V, Q> {
     pub fn new(
@@ -497,6 +542,9 @@ impl<V, Q> RefinementMachine<V, Q> {
             validator_actions: HashSet::new(),
             validator_history_peak: ValidatorActionHistoryUsage::default(),
             history_peak: CoordinatorHistoryUsage::default(),
+            dependencies: Vec::with_capacity(MAX_COORDINATOR_FRAMES),
+            dependent_credit_owners: Vec::with_capacity(MAX_COORDINATOR_FRAMES),
+            reciprocal: None,
         })
     }
     pub fn frames(&self) -> impl Iterator<Item = &CoordinatorFrame<V, Q>> {
@@ -644,6 +692,7 @@ impl<V, Q> RefinementMachine<V, Q> {
         now: MonotonicTick,
     ) -> Result<CoordinatorWork<V, Q>, CoordinatorError> {
         self.check_control(clock, now)?;
+        self.check_not_waiting(id)?;
         let frame = self.frame(id).ok_or(CoordinatorError::UnknownRequest)?;
         if frame.phase != FramePhase::Ready {
             return Err(CoordinatorError::InvalidTransition("frame is not ready"));
@@ -689,6 +738,7 @@ impl<V, Q> RefinementMachine<V, Q> {
         now: MonotonicTick,
     ) -> Result<(), CoordinatorError> {
         self.check_control(clock, now)?;
+        self.check_not_waiting(id)?;
         ticket.validate(clock, now, self.token_budget)?;
         if self.used_role_requests.contains(&ticket.id) {
             return Err(CoordinatorError::Duplicate);
@@ -759,6 +809,7 @@ impl<V, Q> RefinementMachine<V, Q> {
         now: MonotonicTick,
     ) -> Result<(), CoordinatorError> {
         self.check_control(clock, now)?;
+        self.check_not_waiting(id)?;
         grant.validate(job, clock, now)?;
         if self.used_cpu_executions.contains(&grant.execution) {
             return Err(CoordinatorError::Duplicate);
@@ -807,6 +858,7 @@ impl<V, Q> RefinementMachine<V, Q> {
         now: MonotonicTick,
     ) -> Result<(), CoordinatorError> {
         self.check_control(clock, now)?;
+        self.check_not_waiting(id)?;
         grant.validate(job, clock, now)?;
         if self.used_cpu_executions.contains(&grant.execution) {
             return Err(CoordinatorError::Duplicate);
@@ -912,6 +964,30 @@ impl<V, Q> RefinementMachine<V, Q> {
         transition: FrameTransition<V, Q>,
         rules_pair: Option<RulesTerminalPairSeal>,
     ) -> Result<Option<ClosedFrame>, CoordinatorError> {
+        self.check_not_waiting(frame_id)?;
+        let is_dependent = self
+            .dependent_credit_owners
+            .iter()
+            .any(|(child, _)| *child == frame_id);
+        if is_dependent && !matches!(&transition, FrameTransition::Unknown { .. }) {
+            return Err(CoordinatorError::InvalidTransition(
+                "dependent question requires its exact reciprocal response",
+            ));
+        }
+        if is_dependent
+            && matches!(&transition, FrameTransition::Unknown { .. })
+            && self.frame(frame_id).is_some_and(|frame| {
+                matches!(
+                    frame.last_execution,
+                    Some(StepExecution::Cpu { .. } | StepExecution::ExternalCpu { .. })
+                )
+            })
+        {
+            return Err(CoordinatorError::MissingEvidence);
+        }
+        if !matches!(&transition, FrameTransition::Continue(_)) {
+            self.check_dependent_retirement(frame_id)?;
+        }
         let token_budget = self.token_budget;
         let authority = self.authority;
         let current = self
@@ -1142,7 +1218,9 @@ impl<V, Q> RefinementMachine<V, Q> {
                     unknown,
                     completion_scope,
                 };
+                let remaining_roles = frame.budget.role_submissions_remaining;
                 self.frames.retain(|held| held.id != closed.id);
+                self.retire_dependencies(closed.id, remaining_roles);
                 if let Some(seal) = queued_recheck {
                     self.queued_rechecks
                         .entry(queue_key)
@@ -1312,6 +1390,7 @@ impl<V, Q> RefinementMachine<V, Q> {
         if !self.admission_open {
             return Err(CoordinatorError::AdmissionClosed);
         }
+        self.check_not_waiting(id)?;
         let frame = self.match_frame_mut(id)?;
         if frame.phase != FramePhase::Suspended || frame.zero_work_yields >= 3 {
             return Err(CoordinatorError::InvalidTransition(
@@ -1333,6 +1412,10 @@ impl<V, Q> RefinementMachine<V, Q> {
         evidence: Digest,
         reason: &'static str,
     ) -> Result<ClosedFrame, CoordinatorError> {
+        // A real terminal owner receipt may retire a cancelled parent even
+        // while its child is still running. Joined waiters retain that child;
+        // an orphan remains visible for manager cancellation/physical drain.
+        self.check_dependent_credit_return(id)?;
         let frame = self.match_frame_mut(id)?;
         let expected = StepExecution::Cpu {
             job: termination.job,
@@ -1367,7 +1450,9 @@ impl<V, Q> RefinementMachine<V, Q> {
             unknown: Some(reason),
             completion_scope: None,
         };
+        let remaining_roles = frame.budget.role_submissions_remaining;
         self.frames.retain(|frame| frame.id != id);
+        self.retire_dependencies(id, remaining_roles);
         Ok(closed)
     }
     pub fn revoke(&mut self) -> Vec<StepExecution> {
@@ -1397,6 +1482,11 @@ impl<V, Q> RefinementMachine<V, Q> {
         self.ranking_request_sources.clear();
         self.validator_request_sources.clear();
         self.validator_actions.clear();
+        self.dependencies.clear();
+        self.dependent_credit_owners.clear();
+        if let Some(root) = self.reciprocal.as_mut() {
+            root.questions.clear();
+        }
     }
     fn check_control(
         &self,
@@ -1762,6 +1852,7 @@ impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
             output_digest: plan.source_output(),
             consumption_digest: plan.source_consumption(),
         };
+        self.check_not_waiting(plan.parent())?;
         let parent = self
             .frame(plan.parent())
             .ok_or(CoordinatorError::UnknownRequest)?;
@@ -1982,6 +2073,7 @@ impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
         now: MonotonicTick,
     ) -> Result<(), CoordinatorError> {
         self.check_control(clock, now)?;
+        self.check_not_waiting(id)?;
         grant.validate(job, clock, now)?;
         if self.used_cpu_executions.contains(&grant.execution) {
             return Err(CoordinatorError::Duplicate);
@@ -2548,3 +2640,6 @@ impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
 #[cfg(test)]
 #[path = "machine_tests.rs"]
 mod tests;
+
+#[path = "reciprocal.rs"]
+mod reciprocal;

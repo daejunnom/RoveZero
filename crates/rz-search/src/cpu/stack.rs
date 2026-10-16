@@ -395,12 +395,7 @@ pub(super) fn validate_reciprocal_resume(
             ));
         }
         match (&reciprocal.pending, reply) {
-            (Some(request), Some(reply))
-                if Arc::ptr_eq(&request.seal, &reply.request.seal)
-                    && request.scope == reply.request.scope
-                    && request.relative_prefix == reply.request.relative_prefix
-                    && request.position.position_identity()
-                        == reply.request.position.position_identity() => {}
+            (Some(request), Some(reply)) if request.same_request(&reply.request) => {}
             (None, None) => {}
             _ => {
                 return Err(CpuError::ResumeMismatch(
@@ -1989,8 +1984,10 @@ mod tests {
     #[test]
     fn reciprocal_prefix_excludes_job_history_and_resumes_without_recharging_that_path() {
         let mut position = Position::startpos();
+        // Retain four actual history moves without introducing a tactical
+        // checked qsearch frontier into this path-ownership regression.
         position
-            .apply_uci_moves(&["e2e4", "e7e5", "g1f3", "b8c6"])
+            .apply_uci_moves(&["g1f3", "g8f6", "f3g1", "f6g8"])
             .unwrap();
         let original = position.snapshot();
         let (mut scope, mailbox, bounded) = reciprocal_fixture(&position);
@@ -2000,6 +1997,11 @@ mod tests {
         let expected = baseline
             .analyze(&position, bounded, &AtomicBool::new(false))
             .unwrap();
+        assert_eq!(
+            expected.completion,
+            CpuCompletion::DepthLimit,
+            "the unchanged qsearch profile must complete this quiet baseline fixture"
+        );
         let mut engine = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
         let mut token = None;
         let mut reply = None;
@@ -2042,7 +2044,7 @@ mod tests {
                 token = next.controlled.report.resume;
                 reply = Some(reciprocal_reply(&request, Vec::new()));
             } else {
-                assert_eq!(next.controlled.report.completion, CpuCompletion::DepthLimit);
+                assert_eq!(next.controlled.report.completion, expected.completion);
                 assert_eq!(spent, expected.nodes);
                 assert_eq!(
                     (

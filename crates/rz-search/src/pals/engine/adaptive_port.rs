@@ -25,7 +25,9 @@ mod legacy_full_context;
 mod model_namespace;
 #[cfg(test)]
 mod port_tests;
+mod reciprocal_port;
 mod role_commit;
+pub use reciprocal_port::{AdaptiveAcceptedReciprocalAnswer, AdaptiveCpuReciprocalQuestion};
 pub mod validator_port;
 pub use branch_queue::{AdaptiveDeferredRepair, AdaptiveQueuedRecheck};
 pub use consumption_observation::{
@@ -456,6 +458,7 @@ pub struct AdaptiveEnginePort<M: RoleModel> {
     /// A weak cache shares an identical raw snapshot without extending a
     /// completed ticket's Store lease. Only the opt-in legacy route uses it.
     last_legacy_full_snapshot: Option<std::sync::Weak<LegacyFullRoleRecords>>,
+    reciprocal: reciprocal_port::ReciprocalPortState,
 }
 #[derive(Clone)]
 struct CpuPortAdmission {
@@ -682,6 +685,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             queued_questions: HashSet::new(),
             validator_state: validator_port::ValidatorPortState::default(),
             last_legacy_full_snapshot: None,
+            reciprocal: reciprocal_port::ReciprocalPortState::default(),
         })
     }
     /// Explicit root-local diagnostic opt-in before the first observed call.

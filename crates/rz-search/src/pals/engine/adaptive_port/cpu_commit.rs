@@ -1488,7 +1488,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             })
     }
 
-    fn account_cpu_failure(&mut self, work: CpuWork) -> Result<(), PalsError> {
+    pub(super) fn account_cpu_failure(&mut self, work: CpuWork) -> Result<(), PalsError> {
         let nodes = self
             .counters
             .cpu_nodes
@@ -1626,7 +1626,7 @@ fn is_cpu_stage(stage: RefinementStage) -> bool {
 /// Internal complete-receipt equality for retries, not a physical or
 /// performance attestation. Debug is streamed into SHA-256 without cloning
 /// the PV or allocating a serialized report; seals never leave this process.
-fn cpu_receipt_digest(receipt: &CpuSliceReport) -> ContractDigest {
+pub(super) fn cpu_receipt_digest(receipt: &CpuSliceReport) -> ContractDigest {
     struct DigestWriter(Sha256);
     impl std::fmt::Write for DigestWriter {
         fn write_str(&mut self, value: &str) -> std::fmt::Result {

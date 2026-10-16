@@ -1462,7 +1462,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         })
     }
 }
-fn rank_moves(legal: &[BoardMove], output: &RoleOutput) -> Result<Vec<BoardMove>, PalsError> {
+pub(super) fn rank_moves(
+    legal: &[BoardMove],
+    output: &RoleOutput,
+) -> Result<Vec<BoardMove>, PalsError> {
     let logits = match &output.payload {
         RolePayload::Proposal {
             candidate_logits, ..

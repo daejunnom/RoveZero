@@ -359,6 +359,18 @@ impl CpuReciprocalRequest {
     pub fn candidates(&self) -> &[BoardMove] {
         &self.candidates
     }
+    /// Exact issued-request equality, including its private owner authority.
+    /// Matching public descriptions alone cannot authorize another R parent.
+    pub fn same_request(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.seal, &other.seal)
+            && self.scope == other.scope
+            && self.position.position_identity() == other.position.position_identity()
+            && self.relative_prefix == other.relative_prefix
+            && self.ply == other.ply
+            && self.remaining_depth == other.remaining_depth
+            && self.ordinal == other.ordinal
+            && self.candidates == other.candidates
+    }
 }
 
 /// Accepted neural feedback changes move ordering only. It is neither a
