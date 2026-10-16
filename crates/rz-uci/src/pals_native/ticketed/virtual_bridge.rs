@@ -108,6 +108,25 @@ pub trait VirtualReviewCollectionObserver: Send + 'static {
         Ok(())
     }
 }
+
+#[derive(Default)]
+struct AcceptedWarmProfileWindow {
+    combinations: u8,
+    sealed: bool,
+}
+impl AcceptedWarmProfileWindow {
+    fn observe(&mut self, role: Role, physical_fresh: bool) -> bool {
+        self.combinations |= match (role, physical_fresh) {
+            (Role::Proposer, true) => 1,
+            (Role::Proposer, false) => 2,
+            (Role::Critic, true) => 4,
+            (Role::Critic, false) => 8,
+            (Role::Validator, _) => 0,
+        };
+        self.combinations == 15 && !self.sealed
+    }
+}
+
 pub struct NativeVirtualReviewTicketBackend {
     worker: NativeWorker,
     applied_session_settings: Option<Arc<[PalsAppliedSessionSettings]>>,
@@ -127,6 +146,7 @@ pub struct NativeVirtualReviewTicketBackend {
     game_reset_failed: bool,
     completed_nn_seen: bool,
     runtime_audited: bool,
+    accepted_warm_profile_window: Option<AcceptedWarmProfileWindow>,
     evidence: Option<(RequestId, TicketExecutionEvidence)>,
     completed_tickets: BTreeMap<RequestId, RoleTicketEnvelope>,
     observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
@@ -183,6 +203,7 @@ impl NativeVirtualReviewTicketBackend {
             game_reset_failed: false,
             completed_nn_seen: false,
             runtime_audited: false,
+            accepted_warm_profile_window: None,
             evidence: None,
             completed_tickets: BTreeMap::new(),
             observer: None,
@@ -213,6 +234,63 @@ impl NativeVirtualReviewTicketBackend {
     }
     pub fn backend_digest(&self) -> [u8; 32] {
         self.backend_digest
+    }
+
+    /// 진단 capture만 선택한다. 실제 P/C Fresh/Warm의 원 accepted ack가
+    /// 모두 모이면 idle worker에서 profile을 닫되 최종 runtime 감사는 남긴다.
+    pub fn enable_accepted_warm_profile_window(&mut self) -> Result<(), RoleFailure> {
+        if !self.virtual_cuda_placement_required
+            || !self.approximate_warm_capable
+            || self.validator_present
+            || self.execution_sequence != 0
+            || self.completed_nn_seen
+            || self.outstanding.is_some()
+            || self.physical_unknown
+            || self.game_reset_failed
+            || self.runtime_audited
+            || self.accepted_warm_profile_window.is_some()
+        {
+            return Err(RoleFailure::Unsupported(
+                "accepted Warm profile window requires an unused V-free CUDA Warm owner",
+            ));
+        }
+        self.accepted_warm_profile_window = Some(AcceptedWarmProfileWindow::default());
+        Ok(())
+    }
+
+    fn seal_warm_profile_after_accept(
+        &mut self,
+        role: Role,
+        physical_fresh: bool,
+        until: Instant,
+    ) -> Result<(), RoleFailure> {
+        let Some(window) = &mut self.accepted_warm_profile_window else {
+            return Ok(());
+        };
+        if !window.observe(role, physical_fresh) {
+            return Ok(());
+        }
+        if self.physical_unknown || self.outstanding.is_some() {
+            return Err(RoleFailure::PhysicalUnknown);
+        }
+        if Instant::now() >= until {
+            return Err(RoleFailure::Expired);
+        }
+        match self.execute_command(
+            VirtualReviewNativeCommand::VerifyVirtualCudaPlacement,
+            until,
+        )? {
+            VirtualReviewNativeResult::VirtualCudaPlacementVerified(_) => {
+                self.accepted_warm_profile_window
+                    .as_mut()
+                    .expect("opt-in profile window retained")
+                    .sealed = true;
+                // runtime_audited stays false. finish must still verify final
+                // dependency/mapping state, cached placement and physical join.
+                Ok(())
+            }
+            _ => Err(RoleFailure::InvalidOutput),
+        }
     }
 
     /// The physical deadline is solely a drain bound. The original ticket
@@ -555,6 +633,11 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                 if let Some(observer) = &mut self.observer {
                     observer.retired(ticket, true)?;
                 }
+                self.seal_warm_profile_after_accept(
+                    ticket.role,
+                    !output.completion.warm_started,
+                    until,
+                )?;
                 Ok(())
             }
             _ => Err(RoleFailure::InvalidOutput),
@@ -967,6 +1050,7 @@ mod tests {
             game_reset_failed: false,
             completed_nn_seen: true,
             runtime_audited: false,
+            accepted_warm_profile_window: None,
             evidence: None,
             completed_tickets: BTreeMap::new(),
             observer: None,
@@ -978,6 +1062,194 @@ mod tests {
             rz_eval::error::FailureStage::Backend,
             "mock known audit rejection",
         )
+    }
+
+    // 합성 worker 응답으로 제어 순서만 검사한다. 실제 CUDA kernel 증거가 아니다.
+    fn mock_profile_window_witness() -> VirtualReviewCudaPlacementWitness {
+        VirtualReviewCudaPlacementWitness {
+            schema: "authored-control-only-mock".into(),
+            inventory_sha256: [1; 32],
+            manifest_sha256: [2; 32],
+            runtime_sha256: [3; 32],
+            runtime_bundle_sha256: [4; 32],
+            layout: "authored-control-only-mock".into(),
+            artifact_kind: "approx_warm".into(),
+            optimization: rz_eval::pals_onnx::PalsGraphOptimization::Disable,
+            initialization: vec![],
+            kernels: BTreeMap::new(),
+            validator_private_kernels: 0,
+            validator_task_head_kernels: 0,
+            warm_seed_identity_kernels: 0,
+            category_provenance: "mock-only-no-model-or-kernel-loaded".into(),
+        }
+    }
+
+    #[test]
+    fn accepted_warm_profile_window_requires_all_four_combinations() {
+        let mut window = AcceptedWarmProfileWindow::default();
+        for _ in 0..6 {
+            assert!(!window.observe(Role::Proposer, true));
+            assert!(!window.observe(Role::Proposer, false));
+        }
+        assert!(!window.observe(Role::Validator, false));
+        assert!(!window.observe(Role::Critic, true));
+        assert!(window.observe(Role::Critic, false));
+        window.sealed = true;
+        assert!(!window.observe(Role::Critic, false));
+        assert!(!window.observe(Role::Proposer, true));
+    }
+
+    #[test]
+    fn accepted_warm_profile_window_seals_once_and_keeps_final_runtime_audit() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let receipt = MockShutdownReceipt(Arc::clone(&dropped));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&order);
+        let worker = SingleWorker::spawn(move |command: &VirtualReviewNativeCommand| {
+            let _ = &receipt;
+            match command {
+                VirtualReviewNativeCommand::VerifyVirtualCudaPlacement => {
+                    observed.lock().unwrap().push("placement");
+                    Ok(VirtualReviewNativeResult::VirtualCudaPlacementVerified(
+                        mock_profile_window_witness(),
+                    ))
+                }
+                VirtualReviewNativeCommand::VerifyRuntime => {
+                    observed.lock().unwrap().push("runtime");
+                    Ok(VirtualReviewNativeResult::RuntimeVerified)
+                }
+                _ => panic!("profile window must not dispatch an inference"),
+            }
+        })
+        .unwrap();
+        let mut backend = mock_finish_backend(worker, true);
+        backend.approximate_warm_capable = true;
+        backend.completed_nn_seen = false;
+        backend.enable_accepted_warm_profile_window().unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        for role in [Role::Proposer, Role::Critic] {
+            for physical_fresh in [true, false] {
+                backend
+                    .seal_warm_profile_after_accept(role, physical_fresh, until)
+                    .unwrap();
+            }
+        }
+        assert!(
+            backend
+                .accepted_warm_profile_window
+                .as_ref()
+                .unwrap()
+                .sealed
+        );
+        assert!(!backend.runtime_audited);
+        assert_eq!(*order.lock().unwrap(), ["placement"]);
+        backend
+            .seal_warm_profile_after_accept(Role::Critic, false, until)
+            .unwrap();
+        assert_eq!(*order.lock().unwrap(), ["placement"]);
+        backend.completed_nn_seen = true;
+        assert!(backend.finish(until));
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["placement", "runtime", "placement"]
+        );
+        assert!(backend.runtime_audited);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn accepted_warm_profile_window_failure_preserves_failed_audit_and_joins() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let receipt = MockShutdownReceipt(Arc::clone(&dropped));
+        let worker = SingleWorker::spawn(move |command: &VirtualReviewNativeCommand| {
+            let _ = &receipt;
+            match command {
+                VirtualReviewNativeCommand::VerifyVirtualCudaPlacement => Err(mock_audit_failure()),
+                VirtualReviewNativeCommand::VerifyRuntime => {
+                    Ok(VirtualReviewNativeResult::RuntimeVerified)
+                }
+                _ => panic!("failed profile window must not dispatch an inference"),
+            }
+        })
+        .unwrap();
+        let mut backend = mock_finish_backend(worker, true);
+        backend.approximate_warm_capable = true;
+        backend.completed_nn_seen = false;
+        backend.enable_accepted_warm_profile_window().unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        for (role, physical_fresh) in [
+            (Role::Proposer, true),
+            (Role::Proposer, false),
+            (Role::Critic, true),
+        ] {
+            backend
+                .seal_warm_profile_after_accept(role, physical_fresh, until)
+                .unwrap();
+        }
+        let failure = backend
+            .seal_warm_profile_after_accept(Role::Critic, false, until)
+            .unwrap_err();
+        assert_eq!(
+            failure,
+            RoleFailure::Backend(mock_audit_failure().to_string())
+        );
+        assert!(
+            !backend
+                .accepted_warm_profile_window
+                .as_ref()
+                .unwrap()
+                .sealed
+        );
+        assert!(!backend.runtime_audited);
+        assert!(!backend.physical_unknown);
+        backend.completed_nn_seen = true;
+        assert!(!backend.finish(until));
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn accepted_warm_profile_window_rejects_late_opt_in_and_expired_seal() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let worker = SingleWorker::spawn(move |_: &VirtualReviewNativeCommand| {
+            observed.fetch_add(1, Ordering::AcqRel);
+            panic!("expired profile window must not dispatch a command")
+        })
+        .unwrap();
+        let mut backend = mock_finish_backend(worker, true);
+        backend.approximate_warm_capable = true;
+        assert!(matches!(
+            backend.enable_accepted_warm_profile_window(),
+            Err(RoleFailure::Unsupported(
+                "accepted Warm profile window requires an unused V-free CUDA Warm owner"
+            ))
+        ));
+        backend.completed_nn_seen = false;
+        backend.enable_accepted_warm_profile_window().unwrap();
+        let until = Instant::now();
+        for (role, physical_fresh) in [
+            (Role::Proposer, true),
+            (Role::Proposer, false),
+            (Role::Critic, true),
+        ] {
+            backend
+                .seal_warm_profile_after_accept(role, physical_fresh, until)
+                .unwrap();
+        }
+        assert_eq!(
+            backend.seal_warm_profile_after_accept(Role::Critic, false, until),
+            Err(RoleFailure::Expired)
+        );
+        assert!(
+            !backend
+                .accepted_warm_profile_window
+                .as_ref()
+                .unwrap()
+                .sealed
+        );
+        assert!(!backend.runtime_audited);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert!(backend.finish(Instant::now() + Duration::from_secs(2)));
     }
 
     #[test]

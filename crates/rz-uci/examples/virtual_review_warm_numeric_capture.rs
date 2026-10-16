@@ -1064,6 +1064,9 @@ fn execute(config: Config) -> Result<()> {
                     clock,
                     Duration::from_secs(factory_config.cleanup_seconds),
                 ))?;
+                if factory_config.provider != "cpu" {
+                    checked(result.enable_accepted_warm_profile_window())?;
+                }
                 checked(
                     result.set_collection_observer(Box::new(PlacementObserver(Arc::clone(
                         &observe_placement,
