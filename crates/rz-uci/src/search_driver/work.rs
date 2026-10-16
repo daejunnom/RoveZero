@@ -584,6 +584,7 @@ mod tests {
             authority,
             root_moves: None,
             goal: rz_contracts::rovent::SearchGoal::default(),
+            requested_nodes: None,
             control: SearchControl::new(until, 10),
             cancellation: CancelToken::new(),
             shutdown_deadline: until,

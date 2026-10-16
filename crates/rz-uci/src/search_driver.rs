@@ -34,6 +34,7 @@ pub use work::{
 pub enum SearchKind {
     Cpu,
     Pals,
+    Rovent,
 }
 
 #[derive(Clone, Debug)]
@@ -42,6 +43,8 @@ pub struct SearchSessionContext {
     /// Canonical root-only subset. Child legal/policy order remains Rules-owned.
     pub root_moves: Option<Arc<[BoardMove]>>,
     pub goal: rz_contracts::rovent::SearchGoal,
+    /// Exact explicit UCI nodes limit, before legacy simulation defaults.
+    pub requested_nodes: Option<u64>,
     pub control: SearchControl,
     pub cancellation: CancelToken,
     pub shutdown_deadline: Instant,
@@ -79,6 +82,37 @@ pub enum DriverWork {
         completed_tasks: u64,
         consumed_role_outputs: u64,
         retained_situations: usize,
+    },
+    Rovent {
+        root_entries: u64,
+        total_node_visits: u64,
+        role_calls: u64,
+        accepted_policy: u64,
+        accepted_fresh_values: u64,
+        checked_transitions: u64,
+        native_r_calls: u64,
+        native_nodes: u64,
+        native_qsearch_nodes: u64,
+        native_pvs_entries: Option<u64>,
+        native_see_nodes: Option<u64>,
+        external_teacher_calls: u64,
+        completed_depth: Option<u16>,
+        maximum_examined_ply: u16,
+    },
+    /// Actual ticket-manager observations; head-specific acceptance is not
+    /// inferred from total role counts. Unknown physical work stays unknown.
+    RoventNative {
+        root_entries: u64,
+        total_node_visits: Option<u64>,
+        checked_transitions: u64,
+        native_nodes: Option<u64>,
+        native_qsearch_nodes: Option<u64>,
+        submitted_role_tickets: u64,
+        consumed_role_outputs: u64,
+        completed_nn_inputs: Option<u64>,
+        consumed_nn_inputs: Option<u64>,
+        completed_depth: Option<u16>,
+        maximum_examined_ply: u16,
     },
 }
 
@@ -1827,6 +1861,15 @@ pub trait SearchSessionDriver: Send + Sync + 'static {
     fn search_goal_capability(&self) -> Option<std::num::NonZeroU16> {
         None
     }
+    /// Close the complete search-session owner after its workers have joined.
+    /// This is distinct from ending only an optional CPU checker. None is an
+    /// unavailable/legacy interface and never an invented successful fence.
+    fn finish_session(
+        &self,
+        _deadline: Instant,
+    ) -> Result<Option<DriverPhysicalCompletion>, SearchSessionFailure> {
+        Ok(None)
+    }
     #[cfg(feature = "search-work-receipts")]
     fn followup_lifecycle(
         &self,
@@ -2242,6 +2285,7 @@ mod tests {
                 authority,
                 root_moves: None,
                 goal: rz_contracts::rovent::SearchGoal::default(),
+                requested_nodes: None,
                 control,
                 cancellation: CancelToken::new(),
                 shutdown_deadline: budget.output_deadline,
@@ -2496,6 +2540,7 @@ mod tests {
             authority,
             root_moves: None,
             goal: rz_contracts::rovent::SearchGoal::default(),
+            requested_nodes: None,
             control,
             cancellation: CancelToken::new(),
             shutdown_deadline: now + Duration::from_secs(6),

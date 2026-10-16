@@ -235,6 +235,18 @@ fn fixture_with_role_budget(
     ProcessClock,
     u64,
 ) {
+    fixture_with_rovent_mode(startup_gate, role_limit, None)
+}
+fn fixture_with_rovent_mode(
+    startup_gate: Option<std::sync::mpsc::Receiver<()>>,
+    role_limit: Option<u64>,
+    rovent_mode: Option<rz_contracts::rovent::ExecutionMode>,
+) -> (
+    AdaptiveSessionDriver<TerminalOwner>,
+    Arc<OwnerFacts>,
+    ProcessClock,
+    u64,
+) {
     let clock = ProcessClock::new(ProcessEpoch(31));
     let facts = Arc::new(OwnerFacts::default());
     facts.finish_ok.store(true, Ordering::Release);
@@ -243,21 +255,27 @@ fn fixture_with_role_budget(
         .store(role_limit.is_some(), Ordering::Release);
     let factory_facts = Arc::clone(&facts);
     let native_clock = clock.runtime_clock();
-    let native = TicketedNativeService::spawn(
-        move || {
-            factory_facts.factories.fetch_add(1, Ordering::AcqRel);
-            if let Some(gate) = startup_gate {
-                gate.recv_timeout(Duration::from_secs(3)).map_err(|_| {
-                    RoleFailure::Backend("terminal fixture startup gate expired".into())
-                })?;
-            }
-            Ok(TerminalOwner {
-                clock: native_clock,
-                facts: factory_facts,
-            })
-        },
-        TicketServiceLimits::default(),
-    )
+    let native_factory = move || {
+        factory_facts.factories.fetch_add(1, Ordering::AcqRel);
+        if let Some(gate) = startup_gate {
+            gate.recv_timeout(Duration::from_secs(3)).map_err(|_| {
+                RoleFailure::Backend("terminal fixture startup gate expired".into())
+            })?;
+        }
+        Ok(TerminalOwner {
+            clock: native_clock,
+            facts: factory_facts,
+        })
+    };
+    let native = match rovent_mode {
+        Some(_) => TicketedNativeService::spawn_with_capacity(
+            native_factory,
+            TicketServiceLimits::default(),
+            AdaptiveExecutionLimits::default().role_tickets_max,
+            AdaptiveExecutionLimits::default().worker_commands_max,
+        ),
+        None => TicketedNativeService::spawn(native_factory, TicketServiceLimits::default()),
+    }
     .unwrap();
     let cpu = CpuEngine::with_evaluator_ordering_and_resume_policy(
         CpuConfig {
@@ -294,6 +312,7 @@ fn fixture_with_role_budget(
         1,
     )
     .unwrap();
+    let rovent_namespace = Arc::new(namespace.clone());
     let model =
         AdaptivePortModel::new_with_namespace(value.model.clone(), Some(value.clone()), namespace)
             .unwrap();
@@ -347,24 +366,63 @@ fn fixture_with_role_budget(
         cpu_device_digest: Digest([8; 32]),
         external_policy: ExternalSlicePolicy::default(),
     };
-    let driver = AdaptiveSessionDriver::new(
-        options,
-        AdaptiveSessionSources {
-            native,
-            engine,
-            cpu: vec![PersistentCpuOwner {
-                profile,
-                engine: cpu,
-            }],
-            external: None,
-            checker_metadata: metadata,
-        },
-        clock.clone(),
-        issuer,
-        registration,
-        None,
-        None,
-    )
+    let sources = AdaptiveSessionSources {
+        native,
+        engine,
+        cpu: vec![PersistentCpuOwner {
+            profile,
+            engine: cpu,
+        }],
+        external: None,
+        checker_metadata: metadata,
+    };
+    let driver = match rovent_mode {
+        Some(mode) => AdaptiveSessionDriver::new_rovent_pcr_with_resource_limits(
+            options,
+            AdaptiveExecutionLimits::default(),
+            sources,
+            clock.clone(),
+            issuer,
+            registration,
+            RoventPcrSessionProfile {
+                mode,
+                maximum_goal_plies: std::num::NonZeroU16::new(8).unwrap(),
+                input_lock: Digest([9; 32]),
+                root_budget: Digest([10; 32]),
+                selective_policy: Digest([11; 32]),
+                model_namespace: rovent_namespace,
+                frontier_limits: rz_search::pals::rovent_frontier::FrontierLimits {
+                    maximum_goal_plies: std::num::NonZeroU16::new(8).unwrap(),
+                    maximum_frames: 16,
+                    maximum_paths: 64,
+                    maximum_mate_nodes: 128,
+                    maximum_native_receipts: 16,
+                },
+                reciprocal: crate::pals_adaptive::RoventReciprocalPolicy {
+                    mode,
+                    root_budget: Digest([10; 32]),
+                    recipient: rz_contracts::rovent::SearchRecipient::Proposer,
+                    max_questions_per_job: 1,
+                    node_interval: 1,
+                    first_question_sequence: 1,
+                },
+                peers: crate::pals_adaptive::RoventPeerFollowupPolicy {
+                    pc_peer: true,
+                    researcher: true,
+                    max_sources_per_root: 1,
+                },
+            },
+        ),
+        None => AdaptiveSessionDriver::new(
+            options,
+            sources,
+            clock.clone(),
+            issuer,
+            registration,
+            None,
+            None,
+        ),
+    }
     .unwrap_or_else(|rejected| panic!("{:?}", rejected.failure));
     (driver, facts, clock, actual_owner)
 }
@@ -380,12 +438,100 @@ fn context(clock: &ProcessClock, root: u64, game: u64) -> SearchSessionContext {
         authority,
         root_moves: None,
         goal: rz_contracts::rovent::SearchGoal::default(),
+        requested_nodes: None,
         control: SearchControl::new(now + Duration::from_secs(5), 64),
         cancellation: CancelToken::new(),
         shutdown_deadline: now + Duration::from_secs(6),
         current: Arc::new(Mutex::new(SessionScope::Search(authority))),
     }
 }
+
+#[test]
+fn rovent_initial_nodes_boundary_quiesces_without_a_role_ticket_or_physical_failure() {
+    use rz_contracts::rovent::ExecutionMode;
+    use rz_search::pals::rovent_frontier::{FrontierGoalStatus, FrontierStop};
+
+    let position = Position::startpos();
+    let allowed: BoardMove = "e2e4".parse().unwrap();
+    // Zero admits no root. One pays for the root only. Two exactly pays for
+    // this restricted root's one checked child. None may submit P ranking.
+    for nodes in [0, 1, 2] {
+        let (driver, facts, clock, _) =
+            fixture_with_rovent_mode(None, None, Some(ExecutionMode::CpuPcr));
+        let mut original = context(&clock, 1, 0);
+        original.requested_nodes = Some(nodes);
+        original.root_moves = Some(Arc::from([allowed]));
+        let mut published = Vec::new();
+        let report = driver
+            .run(&position, &original, &mut |movement| {
+                published.push(movement)
+            })
+            .unwrap();
+        assert_eq!(report.best_move, Some(allowed));
+        assert!(published.iter().all(|movement| *movement == allowed));
+        assert_eq!(facts.role_runs.load(Ordering::Acquire), 0);
+        let actual = driver.latest_rovent_root().unwrap().unwrap();
+        assert_eq!(actual.authority, original.authority);
+        let frontier = actual.frontier.as_ref().unwrap();
+        assert_eq!(frontier.requested_nodes, Some(nodes));
+        assert_eq!(
+            frontier.goal,
+            FrontierGoalStatus::Stopped(FrontierStop::WorkBudget)
+        );
+        assert_eq!(frontier.work.total_node_visits(), Some(nodes));
+        assert_eq!(frontier.horizon.completed_depth, None);
+        assert_eq!(actual.counters.submitted_role_tickets, 0);
+        assert!(actual.physical.as_ref().unwrap().permits_root_reuse());
+        assert!(matches!(
+            report.work,
+            DriverWork::RoventNative {
+                total_node_visits: Some(actual_nodes),
+                submitted_role_tickets: 0,
+                completed_depth: None,
+                ..
+            } if actual_nodes == nodes
+        ));
+        assert!(driver.work_receipt().unwrap().is_none());
+        assert!(driver.pals_checker_registration().is_none());
+        assert_eq!(
+            driver.finish_session(original.shutdown_deadline).unwrap(),
+            Some(crate::search_driver::DriverPhysicalCompletion::Confirmed)
+        );
+        assert_eq!(facts.finishes.load(Ordering::Acquire), 1);
+    }
+}
+
+#[test]
+fn rovent_initial_rules_mate_closes_before_root_ranking() {
+    use rz_contracts::rovent::ExecutionMode;
+    use rz_search::pals::rovent_frontier::FrontierGoalStatus;
+
+    let (driver, facts, clock, _) =
+        fixture_with_rovent_mode(None, None, Some(ExecutionMode::CpuPcr));
+    let position = Position::from_fen("7k/8/5KQ1/8/8/8/8/8 w - - 0 1").unwrap();
+    let allowed: BoardMove = "g6g7".parse().unwrap();
+    assert!(position.legal_moves().contains(&allowed));
+    let mut original = context(&clock, 1, 0);
+    original.goal.mate_moves = std::num::NonZeroU16::new(1);
+    original.root_moves = Some(Arc::from([allowed]));
+    let report = driver.run(&position, &original, &mut |_| {}).unwrap();
+    assert_eq!(report.best_move, Some(allowed));
+    assert_eq!(facts.role_runs.load(Ordering::Acquire), 0);
+    let actual = driver.latest_rovent_root().unwrap().unwrap();
+    let frontier = actual.frontier.as_ref().unwrap();
+    assert_eq!(frontier.goal, FrontierGoalStatus::MateSatisfied);
+    assert_eq!(frontier.work.root_entries, 1);
+    // The normal checked child and the two OR/AND mate lanes each perform
+    // their own Rules replay. Those real visits remain separately charged.
+    assert_eq!(frontier.work.checked_transitions, 3);
+    assert_eq!(actual.counters.submitted_role_tickets, 0);
+    assert!(actual.physical.as_ref().unwrap().permits_root_reuse());
+    assert_eq!(
+        driver.finish_session(original.shutdown_deadline).unwrap(),
+        Some(crate::search_driver::DriverPhysicalCompletion::Confirmed)
+    );
+}
+
 #[test]
 fn actual_session_projects_final_role_limit_without_a_caller_supplied_reason() {
     let (driver, facts, clock, _) = fixture_with_role_budget(None, Some(1));

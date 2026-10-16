@@ -221,7 +221,7 @@ pub fn validate_pals_virtual_rules_descriptor_bytes(
         encoder_source_sha256,
     })
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "search-work-receipts"))]
 mod tests {
     use super::*;
     #[cfg(feature = "search-work-receipts")]

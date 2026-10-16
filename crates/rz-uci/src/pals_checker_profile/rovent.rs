@@ -6,7 +6,6 @@ use super::{
     BoundedJson, MAX_CHECKER_PROFILE_BYTES, UniqueJsonKeys, invalid, linux_path, sha, sorted_value,
 };
 use rz_search::cpu_checker::{CheckerError, ExternalCheckerIdentity};
-#[cfg(target_os = "linux")]
 use rz_search::external_cpu::ExternalCpuConfig;
 use rz_search::external_cpu::{
     ExternalEngineProfile, ExternalEnginePurpose, ExternalGoConstraint, ExternalUciCpuChecker,
@@ -17,6 +16,7 @@ use sha2::{Digest, Sha256};
 pub const ROVENT_EXTERNAL_PROFILE_SCHEMA: &str = "rz-rovent-external-engine-profile/1";
 pub const ROVENT_EXTERNAL_REGISTRATION_SCHEMA: &str = "rz-rovent-external-engine-registration/1";
 const CANONICAL_DOMAIN: &str = "rz-rovent-external-engine-profile-canonical/1";
+pub const ROVENT_EXTERNAL_CAPABILITY_DOMAIN: &str = "rz-rovent-external-capabilities/1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -61,6 +61,31 @@ pub struct RoventExternalProfileRegistration<'a> {
 }
 
 impl RoventExternalProfile {
+    /// Canonical source capability, independent of actual startup/ISA/options
+    /// application. Profile canonical bytes separately bind requested options.
+    pub fn capability_sha256(&self) -> Result<String, CheckerError> {
+        self.validate()?;
+        let caps = self.engine.capabilities();
+        let bytes = serde_json::to_vec(&(
+            ROVENT_EXTERNAL_CAPABILITY_DOMAIN,
+            self.engine,
+            self.purpose,
+            self.engine.source_commit(),
+            &self.expected_uci_name,
+            rz_search::external_cpu::EXTERNAL_UCI_SCORE_SEMANTICS,
+            (
+                caps.searchmoves,
+                caps.combined_depth_nodes_movetime,
+                caps.ponder,
+                caps.embedded_nnue,
+                caps.separate_assets,
+                caps.exact_stack_resume,
+            ),
+        ))
+        .map_err(|_| invalid("cannot encode Rovent external capabilities"))?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
     /// Caller owns descriptor retention and bounded reads. Exact pinned bytes,
     /// duplicate keys, schema and all semantic bounds are checked before any
     /// executable/path access; legacy schemas are not automatically converted.
@@ -184,6 +209,37 @@ impl LoadedRoventExternalProfile {
         }
     }
 
+    /// Configuration only. No executable is read or process started here.
+    pub fn configuration(&self) -> Result<ExternalCpuConfig, CheckerError> {
+        self.profile.validate()?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::{path::PathBuf, time::Duration};
+            let p = &self.profile;
+            let config = ExternalCpuConfig {
+                program: PathBuf::from(&p.program),
+                arguments: Vec::new(),
+                working_directory: PathBuf::from(&p.working_directory),
+                identity: p.identity.clone(),
+                expected_uci_name: Some(p.expected_uci_name.clone()),
+                max_depth: p.max_depth,
+                max_prefix_plies: p.max_prefix_plies,
+                handshake_timeout: Duration::from_millis(p.handshake_timeout_ms),
+                max_task_wall_time: Duration::from_millis(p.max_task_wall_time_ms),
+                stop_grace: Duration::from_millis(p.stop_grace_ms),
+                shutdown_grace: Duration::from_millis(p.shutdown_grace_ms),
+                max_output_bytes: p.max_output_bytes,
+                max_line_bytes: p.max_line_bytes,
+            };
+            config.validate()?;
+            Ok(config)
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err(CheckerError::Unsupported(
+            "Rovent external checker requires Linux",
+        ))
+    }
+
     /// Creates an unstarted checker using the existing native process owner.
     /// Arena execution belongs to its independent arena launch path.
     pub fn checker(&self) -> Result<ExternalUciCpuChecker, CheckerError> {
@@ -193,34 +249,11 @@ impl LoadedRoventExternalProfile {
                 "arena opponent must use the arena process owner",
             ));
         }
-        #[cfg(target_os = "linux")]
-        {
-            use std::{path::PathBuf, time::Duration};
-            let p = &self.profile;
-            ExternalUciCpuChecker::create_profiled(
-                ExternalCpuConfig {
-                    program: PathBuf::from(&p.program),
-                    arguments: Vec::new(),
-                    working_directory: PathBuf::from(&p.working_directory),
-                    identity: p.identity.clone(),
-                    expected_uci_name: Some(p.expected_uci_name.clone()),
-                    max_depth: p.max_depth,
-                    max_prefix_plies: p.max_prefix_plies,
-                    handshake_timeout: Duration::from_millis(p.handshake_timeout_ms),
-                    max_task_wall_time: Duration::from_millis(p.max_task_wall_time_ms),
-                    stop_grace: Duration::from_millis(p.stop_grace_ms),
-                    shutdown_grace: Duration::from_millis(p.shutdown_grace_ms),
-                    max_output_bytes: p.max_output_bytes,
-                    max_line_bytes: p.max_line_bytes,
-                },
-                p.engine,
-                p.purpose,
-            )
-        }
-        #[cfg(not(target_os = "linux"))]
-        Err(CheckerError::Unsupported(
-            "Rovent external checker requires Linux",
-        ))
+        ExternalUciCpuChecker::create_profiled(
+            self.configuration()?,
+            self.profile.engine,
+            self.profile.purpose,
+        )
     }
 }
 

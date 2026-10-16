@@ -1,0 +1,1216 @@
+//! Actual P/C-only ticket manager. There is no CPU worker, native-node ledger,
+//! adaptive CPU controller, R frame machine, evaluator or stack in this owner.
+//! Encoding and inference stay on the existing single native service worker.
+use super::collection::AdaptiveCollectionObserver;
+use super::*;
+use rz_search::pals::coordinator::AcceptedRoleStep;
+use rz_search::pals::engine::NoResearcher;
+
+pub trait RoleOnlySearchDriver<Q> {
+    fn researcher(&self) -> &NoResearcher;
+    fn validate_registration(
+        &self,
+        authority: SearchAuthority,
+        mode: ExecutionMode,
+        hard_deadline: Instant,
+        root_budget: Digest,
+    ) -> Result<(), AdaptiveManagerError>;
+    fn next_role(&mut self) -> Result<Option<FrameInput<ReviewView, Q>>, AdaptiveManagerError>;
+    fn role_submitted(
+        &mut self,
+        input: &FrameInput<ReviewView, Q>,
+        ticket: &RoleTicketEnvelope,
+    ) -> Result<(), AdaptiveManagerError>;
+    fn validate_role(
+        &self,
+        input: &FrameInput<ReviewView, Q>,
+        ticket: &RoleTicketEnvelope,
+        output: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError>;
+    fn consume_accepted(
+        &mut self,
+        input: &FrameInput<ReviewView, Q>,
+        accepted: &AcceptedRoleStep,
+        output: &RoleOutput,
+        physical: Option<TicketExecutionEvidence>,
+    ) -> Result<(), AdaptiveManagerError>;
+    fn role_discarded(
+        &mut self,
+        input: &FrameInput<ReviewView, Q>,
+        ticket: Option<&RoleTicketEnvelope>,
+    ) -> Result<(), AdaptiveManagerError>;
+    fn is_complete(&self) -> bool;
+    fn revoke(&mut self) -> Result<(), AdaptiveManagerError>;
+    fn review_lease_admission(&self) -> Result<AdaptiveReviewLeaseAdmission, AdaptiveManagerError>;
+}
+
+/// Pure role configuration. R counts, R credit and R control are absent by type.
+#[derive(Clone, Copy, Debug)]
+pub struct RoleOnlyManagerRegistration {
+    pub authority: SearchAuthority,
+    pub mode: ExecutionMode,
+    pub root_budget: Digest,
+    pub hard_deadline: Instant,
+    pub token_budget: u16,
+    pub first_request_sequence: u64,
+    pub role_tickets_max: usize,
+    pub role_call_limit: u64,
+    pub event_order: CoordinatorPolicy,
+}
+
+struct RoleOnlyBinding<Q, O> {
+    preparation: PreparationId,
+    input: FrameInput<ReviewView, Q>,
+    ticket: Option<RoleTicketEnvelope>,
+    dispatch_pending: bool,
+    dispatched: bool,
+    owner_run_started: bool,
+    service_completed: bool,
+    physical: Option<TicketExecutionEvidence>,
+    delivered: Option<Arc<O>>,
+    ack_accepted: Option<bool>,
+    retired: bool,
+    accepted: Option<AcceptedRoleStep>,
+    collection_dispatched: bool,
+    collection_abandoned: bool,
+}
+
+pub struct RoleOnlyManagerSources<Q, B, D>
+where
+    B: TicketNativeBackend<ReviewView, Q>,
+{
+    pub native: TicketedNativeService<ReviewView, Q, B>,
+    pub driver: D,
+}
+pub struct RoleOnlyManagerRejection<Q, B, D>
+where
+    B: TicketNativeBackend<ReviewView, Q>,
+{
+    pub error: AdaptiveManagerError,
+    pub sources: RoleOnlyManagerSources<Q, B, D>,
+}
+
+/// Separate receipt domain; zero R work is a structural absence, not a copy of
+/// an internal PALS ledger or a four-session legacy acceptance condition.
+#[derive(Clone, Debug)]
+pub struct RoleOnlyShutdownReceipt {
+    pub authority: SearchAuthority,
+    pub mode: ExecutionMode,
+    pub root_budget: Digest,
+    pub native_process_joined: bool,
+    pub native_physical_shutdown_confirmed: bool,
+    pub pending_tickets: usize,
+    pub retained_outputs: usize,
+    pub quarantined: bool,
+    pub request_sequence_high_water: u64,
+    pub counters: AdaptiveManagerCounters,
+    pub review_leases: RoventReviewLeaseObservation,
+    native_root_fence: Option<NativeRootFence>,
+}
+impl RoleOnlyShutdownReceipt {
+    pub fn permits_semantic_closure(&self) -> bool {
+        !self.mode.has_native_r()
+            && !self.quarantined
+            && self.pending_tickets == 0
+            && self.retained_outputs == 0
+            && ((self.native_process_joined && self.native_physical_shutdown_confirmed)
+                || self.native_root_fence.is_some_and(|fence| {
+                    fence.authority() == self.authority && fence.permits_reuse()
+                }))
+    }
+    pub fn root_fence(&self) -> Option<NativeRootFence> {
+        self.native_root_fence
+    }
+}
+
+pub struct RoleOnlyExecutionManager<Q, B, D>
+where
+    B: TicketNativeBackend<ReviewView, Q>,
+{
+    registration: RoleOnlyManagerRegistration,
+    clock: ContractSystemClock,
+    deadline: Deadline,
+    native: TicketedNativeService<ReviewView, Q, B>,
+    registry: RoleTicketRegistry<ReviewView, Arc<B::Output>>,
+    driver: D,
+    bindings: Vec<RoleOnlyBinding<Q, B::Output>>,
+    acks: VecDeque<NativeAck>,
+    pending_input: Option<FrameInput<ReviewView, Q>>,
+    pending_preparation: Option<TicketPreparation<ReviewView, Q>>,
+    phase: ManagerPhase,
+    native_ready: bool,
+    verifier_registered: bool,
+    native_finished: Option<bool>,
+    native_joined: bool,
+    native_root_fence: Option<NativeRootFence>,
+    close_mode: AdaptiveCloseMode,
+    shutdown_until: Option<Instant>,
+    cleanup_boundary: Option<CleanupBoundary>,
+    counters: AdaptiveManagerCounters,
+    accounting: AdaptiveNativeAccountingSnapshot,
+    review_leases: RoventReviewLeaseObservation,
+    failures: VecDeque<AdaptiveManagerError>,
+    retained_completions: Vec<RetainedNativeCompletion<B::Output>>,
+    retained_receipts: Vec<NativeAcceptanceReceipt>,
+    retained_permits: Vec<NativeAcceptancePermit>,
+    collection: Option<Box<dyn AdaptiveCollectionObserver<Q, B::Output>>>,
+    collection_settled: bool,
+}
+
+impl<Q, B, D> RoleOnlyExecutionManager<Q, B, D>
+where
+    Q: Clone + Send + Sync + 'static,
+    B: TicketNativeBackend<ReviewView, Q>,
+    B::Output: ProposerRankingOutput,
+    D: RoleOnlySearchDriver<Q>,
+{
+    #[allow(clippy::result_large_err)]
+    pub fn new_retaining(
+        registration: RoleOnlyManagerRegistration,
+        clock: ContractSystemClock,
+        sources: RoleOnlyManagerSources<Q, B, D>,
+    ) -> Result<Self, RoleOnlyManagerRejection<Q, B, D>> {
+        let admission = (|| {
+            if registration.mode.has_native_r()
+                || registration.authority.epoch != clock.domain().0
+                || registration.role_call_limit == 0
+                || registration.first_request_sequence == 0
+                || !(1..=MAX_ROLE_PENDING).contains(&registration.role_tickets_max)
+                || registration.hard_deadline <= Instant::now()
+            {
+                return Err(AdaptiveManagerError::Invalid(
+                    "P/C-only manager registration",
+                ));
+            }
+            let _ = sources.driver.researcher();
+            sources.driver.validate_registration(
+                registration.authority,
+                registration.mode,
+                registration.hard_deadline,
+                registration.root_budget,
+            )?;
+            let deadline = InstantClock::new(clock.domain(), clock.origin())
+                .deadline_at(registration.hard_deadline)
+                .map_err(|_| AdaptiveManagerError::Deadline)?;
+            sources.native.replace_root(registration.authority)?;
+            let native_ready = match sources.native.ready_clock() {
+                Some(actual)
+                    if actual.domain() == clock.domain() && actual.origin() == clock.origin() =>
+                {
+                    true
+                }
+                Some(_) => return Err(AdaptiveManagerError::Invalid("P/C native clock origin")),
+                None => false,
+            };
+            let mut registry = RoleTicketRegistry::new_with_capacity(
+                registration.authority,
+                registration.token_budget,
+                registration.event_order,
+                registration.first_request_sequence,
+                registration.role_tickets_max,
+            )?;
+            let verifier_registered =
+                if let Some(verifier) = sources.native.native_acceptance_verifier() {
+                    registry.register_native_acceptance_verifier(verifier)?;
+                    true
+                } else {
+                    false
+                };
+            Ok((deadline, native_ready, registry, verifier_registered))
+        })();
+        let (deadline, native_ready, registry, verifier_registered) = match admission {
+            Ok(admission) => admission,
+            Err(error) => return Err(RoleOnlyManagerRejection { error, sources }),
+        };
+        Ok(Self {
+            registration,
+            clock,
+            deadline,
+            native: sources.native,
+            registry,
+            driver: sources.driver,
+            bindings: Vec::with_capacity(registration.role_tickets_max),
+            acks: VecDeque::with_capacity(registration.role_tickets_max),
+            pending_input: None,
+            pending_preparation: None,
+            phase: ManagerPhase::Running,
+            native_ready,
+            verifier_registered,
+            native_finished: None,
+            native_joined: false,
+            native_root_fence: None,
+            close_mode: AdaptiveCloseMode::RootQuiesce,
+            shutdown_until: None,
+            cleanup_boundary: None,
+            counters: AdaptiveManagerCounters::default(),
+            accounting: AdaptiveNativeAccountingSnapshot::default(),
+            review_leases: RoventReviewLeaseObservation::new(registration.role_tickets_max),
+            failures: VecDeque::with_capacity(64),
+            retained_completions: Vec::with_capacity(16),
+            retained_receipts: Vec::with_capacity(16),
+            retained_permits: Vec::with_capacity(16),
+            collection: None,
+            collection_settled: false,
+        })
+    }
+    pub fn driver(&self) -> &D {
+        &self.driver
+    }
+    pub fn driver_mut(&mut self) -> &mut D {
+        &mut self.driver
+    }
+    pub fn register_cleanup_deadline(
+        &mut self,
+        original_cleanup_deadline: Instant,
+    ) -> Result<(), AdaptiveManagerError> {
+        if self.cleanup_boundary.is_some()
+            || self.phase != ManagerPhase::Running
+            || self.shutdown_until.is_some()
+            || self.counters.native_preparations != 0
+            || !self.bindings.is_empty()
+            || self.pending_input.is_some()
+            || self.pending_preparation.is_some()
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C original cleanup deadline admission",
+            ));
+        }
+        self.cleanup_boundary = Some(CleanupBoundary::admit(
+            self.registration.hard_deadline,
+            original_cleanup_deadline,
+        )?);
+        Ok(())
+    }
+    pub fn registered_cleanup_deadline(&self) -> Option<Instant> {
+        self.cleanup_boundary.map(CleanupBoundary::original)
+    }
+    /// Observe its version before polling this manager and the caller's
+    /// controls, then wait on that same version to avoid a lost wakeup.
+    pub fn activity_signal(&self) -> rz_runtime::CompletionSignal {
+        self.native.signal()
+    }
+    pub fn phase(&self) -> ManagerPhase {
+        self.phase
+    }
+    pub fn failures(&self) -> impl Iterator<Item = &AdaptiveManagerError> {
+        self.failures.iter()
+    }
+    pub fn pending_tickets(&self) -> usize {
+        self.registry.occupancy()
+    }
+    pub fn counters(&self) -> AdaptiveManagerCounters {
+        self.counters
+    }
+    pub fn native_accounting(&self) -> AdaptiveNativeAccountingSnapshot {
+        self.accounting
+    }
+    pub fn install_collection_observer(
+        &mut self,
+        observer: Box<dyn AdaptiveCollectionObserver<Q, B::Output>>,
+    ) -> Result<(), AdaptiveManagerError> {
+        if self.collection.is_some()
+            || self.phase != ManagerPhase::Running
+            || self.registry.cumulative_observation().admitted != 0
+            || !self.bindings.is_empty()
+            || self.pending_input.is_some()
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C collection root observer admission",
+            ));
+        }
+        self.collection = Some(observer);
+        Ok(())
+    }
+
+    fn now(&self) -> Result<MonotonicTick, AdaptiveManagerError> {
+        let now = self
+            .clock
+            .try_now()
+            .map_err(|_| AdaptiveManagerError::Deadline)?;
+        self.deadline
+            .accepts(self.clock.domain(), now)
+            .map_err(|_| AdaptiveManagerError::Deadline)?;
+        Ok(now)
+    }
+    fn record_failure(&mut self, error: AdaptiveManagerError) {
+        if let AdaptiveManagerError::ReviewLeaseBackpressure {
+            current,
+            capacity,
+            required_new,
+            replacement_reserve,
+        } = &error
+        {
+            self.review_leases.record_blocked(
+                *current,
+                *capacity,
+                *required_new,
+                *replacement_reserve,
+            );
+            if self
+                .bindings
+                .iter()
+                .any(|binding| !binding.service_completed)
+                || !self.acks.is_empty()
+            {
+                return;
+            }
+            self.review_leases.terminal_capacity = true;
+        }
+        if matches!(error, AdaptiveManagerError::PhysicalUnknown) {
+            self.phase = ManagerPhase::Quarantined;
+        }
+        if self.failures.len() == 64 {
+            self.failures.pop_front();
+        }
+        self.failures.push_back(error);
+    }
+    fn pending_limit(&self) -> Result<usize, AdaptiveManagerError> {
+        let observed = self.driver.review_lease_admission()?;
+        let declared = if self.registration.event_order == CoordinatorPolicy::Synchronous {
+            1
+        } else {
+            self.registration.role_tickets_max
+        };
+        Ok(if observed.frontier_owner_present {
+            declared.min(
+                observed
+                    .capacity
+                    .saturating_sub(1)
+                    .saturating_sub(observed.frontier_replacement_reserve),
+            )
+        } else {
+            declared
+        })
+    }
+    fn index(&self, ticket: RoleTicketEnvelope) -> Result<usize, AdaptiveManagerError> {
+        self.bindings
+            .iter()
+            .position(|binding| binding.ticket == Some(ticket))
+            .ok_or(AdaptiveManagerError::Invalid("P/C original ticket binding"))
+    }
+    fn schedule(&mut self) -> Result<bool, AdaptiveManagerError> {
+        let mut changed = false;
+        while self.phase == ManagerPhase::Running && self.bindings.len() < self.pending_limit()? {
+            let reserved = self
+                .bindings
+                .iter()
+                .filter(|binding| binding.ticket.is_none())
+                .count() as u64;
+            if self
+                .registry
+                .cumulative_observation()
+                .admitted
+                .saturating_add(reserved)
+                >= self.registration.role_call_limit
+            {
+                break;
+            }
+            if self.pending_input.is_none() {
+                self.pending_input = self.driver.next_role()?;
+            }
+            let Some(input) = self.pending_input.as_ref() else {
+                break;
+            };
+            let role = input.stage.role().ok_or(AdaptiveManagerError::Invalid(
+                "CPU stage in P/C-only manager",
+            ))?;
+            if !matches!(role, Role::Proposer | Role::Critic) {
+                return Err(AdaptiveManagerError::Invalid(
+                    "non P/C role in P/C-only manager",
+                ));
+            }
+            validate_view(
+                &input.view,
+                &input.view_seal,
+                self.registration.authority,
+                self.registration.token_budget,
+            )?;
+            input
+                .view_seal
+                .validate(self.registration.authority, self.registration.token_budget)?;
+            let now = self.now()?;
+            self.deadline
+                .accepts(self.clock.domain(), now)
+                .map_err(|_| AdaptiveManagerError::Deadline)?;
+            if self.pending_preparation.is_none() {
+                self.pending_preparation = Some(TicketPreparation {
+                    question: input.question_digest,
+                    seal: input.view_seal,
+                    role,
+                    deadline: self.deadline,
+                    view: Arc::clone(&input.view),
+                    query: (*input.question).clone(),
+                });
+            }
+            let source = self
+                .pending_preparation
+                .take()
+                .expect("original unqueued preparation");
+            let preparation = match self.native.prepare(source) {
+                Ok(preparation) => preparation,
+                Err((TicketServiceError::Capacity, original)) => {
+                    self.pending_preparation = Some(original);
+                    break;
+                }
+                Err((error, original)) => {
+                    self.pending_preparation = Some(original);
+                    return Err(error.into());
+                }
+            };
+            self.bindings.push(RoleOnlyBinding {
+                preparation,
+                input: self.pending_input.take().expect("same pending input"),
+                ticket: None,
+                dispatch_pending: false,
+                dispatched: false,
+                owner_run_started: false,
+                service_completed: false,
+                physical: None,
+                delivered: None,
+                ack_accepted: None,
+                retired: false,
+                accepted: None,
+                collection_dispatched: false,
+                collection_abandoned: false,
+            });
+            self.counters.native_preparations += 1;
+            changed = true;
+        }
+        Ok(changed)
+    }
+    fn dispatch(&mut self) -> Result<bool, AdaptiveManagerError> {
+        if !self.native_ready
+            || self.phase != ManagerPhase::Running
+            || !self.failures.is_empty()
+            || self.now().is_err()
+        {
+            return Ok(false);
+        }
+        while let Some(dispatch) = self.registry.take_dispatch() {
+            let index = self.index(dispatch.ticket)?;
+            self.bindings[index].dispatch_pending = true;
+        }
+        let mut changed = false;
+        for index in 0..self.bindings.len() {
+            if !self.bindings[index].dispatch_pending {
+                continue;
+            }
+            let binding = &self.bindings[index];
+            let ticket = binding.ticket.expect("prepared actual ticket");
+            if !binding.collection_dispatched {
+                if let Some(observer) = &mut self.collection {
+                    observer
+                        .dispatch(&ticket, &binding.input)
+                        .map_err(AdaptiveManagerError::Collection)?;
+                }
+                self.bindings[index].collection_dispatched = true;
+            }
+            let binding = &self.bindings[index];
+            match self
+                .native
+                .execute_with_admission_clock(binding.preparation, ticket)
+            {
+                Ok(_) => {
+                    self.bindings[index].dispatch_pending = false;
+                    self.bindings[index].dispatched = true;
+                    changed = true;
+                }
+                Err(TicketServiceError::Capacity) => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(changed)
+    }
+    fn deliver(&mut self) -> Result<bool, AdaptiveManagerError> {
+        let mut changed = false;
+        for _ in 0..self.registration.role_tickets_max {
+            let now = self
+                .clock
+                .try_now()
+                .map_err(|_| AdaptiveManagerError::Deadline)?;
+            let Some(ready) = self.registry.take_ready(self.clock.domain(), now) else {
+                break;
+            };
+            let ticket = ready.ticket;
+            let index = self.index(ticket)?;
+            let accepted = ready.logically_eligible
+                && self.phase == ManagerPhase::Running
+                && ready.result.is_ok();
+            if let Ok(output) = ready.result {
+                self.bindings[index].delivered = Some(output);
+            }
+            let permit = if accepted {
+                let binding = &self.bindings[index];
+                let output = binding
+                    .delivered
+                    .as_ref()
+                    .expect("eligible output")
+                    .proposer_ranking_output();
+                validate_role_output(output, &ticket, &ready.view)?;
+                self.driver.validate_role(&binding.input, &ticket, output)?;
+                Some(self.registry.issue_reciprocal_native_acceptance(
+                    &ticket,
+                    self.clock.domain(),
+                    now,
+                )?)
+            } else {
+                None
+            };
+            self.bindings[index].ack_accepted = Some(accepted);
+            self.acks.push_back(NativeAck {
+                preparation: self.bindings[index].preparation,
+                ticket,
+                accepted,
+                permit,
+            });
+            changed = true;
+        }
+        self.flush_acks()?;
+        Ok(changed)
+    }
+    fn flush_acks(&mut self) -> Result<(), AdaptiveManagerError> {
+        while let Some(mut ack) = self.acks.pop_front() {
+            let result = if let Some(permit) = ack.permit.take() {
+                match self
+                    .native
+                    .accept_with_permit(ack.preparation, ack.ticket, permit)
+                {
+                    Ok(()) => Ok(()),
+                    Err((error, permit)) => {
+                        ack.permit = Some(permit);
+                        Err(error)
+                    }
+                }
+            } else {
+                self.native.discard(ack.preparation, ack.ticket)
+            };
+            if let Err(error) = result {
+                self.acks.push_front(ack);
+                return if error == TicketServiceError::Capacity {
+                    Ok(())
+                } else {
+                    Err(error.into())
+                };
+            }
+        }
+        Ok(())
+    }
+    fn consume_retired(&mut self) -> Result<bool, AdaptiveManagerError> {
+        let mut changed = false;
+        let mut index = 0;
+        while index < self.bindings.len() {
+            if !self.bindings[index].retired {
+                index += 1;
+                continue;
+            }
+            let will_consume = self.phase == ManagerPhase::Running
+                && self.now().is_ok()
+                && self.bindings[index].accepted.is_some();
+            if !will_consume && !self.bindings[index].collection_abandoned {
+                if let (Some(observer), Some(ticket)) =
+                    (&mut self.collection, self.bindings[index].ticket.as_ref())
+                {
+                    observer
+                        .abandoned(ticket)
+                        .map_err(AdaptiveManagerError::Collection)?;
+                }
+                self.bindings[index].collection_abandoned = true;
+            }
+            let binding = &self.bindings[index];
+            if self.phase == ManagerPhase::Running && self.now().is_ok() {
+                if let Some(accepted) = &binding.accepted {
+                    let output = binding
+                        .delivered
+                        .as_ref()
+                        .ok_or(AdaptiveManagerError::Invalid("accepted P/C output custody"))?;
+                    let mut counters = self.counters;
+                    let mut accounting = self.accounting;
+                    counters.consumed_role_outputs =
+                        counters.consumed_role_outputs.checked_add(1).ok_or(
+                            AdaptiveManagerError::Capacity("P/C consumed output counter"),
+                        )?;
+                    accounting
+                        .observe_search_consumption(accepted.ticket().role, binding.physical)?;
+                    match binding
+                        .physical
+                        .filter(|e| e.measurement_complete)
+                        .and_then(|e| e.completed_nn_inputs)
+                    {
+                        Some(count) => {
+                            counters.consumed_nn_inputs =
+                                counters.consumed_nn_inputs.checked_add(count).ok_or(
+                                    AdaptiveManagerError::Capacity("P/C consumed input counter"),
+                                )?;
+                            counters.zero_nn_outputs_consumed = counters
+                                .zero_nn_outputs_consumed
+                                .checked_add(u64::from(count == 0))
+                                .ok_or(AdaptiveManagerError::Capacity("P/C zero input counter"))?;
+                        }
+                        None => {
+                            counters.consumed_nn_input_count_unknown = counters
+                                .consumed_nn_input_count_unknown
+                                .checked_add(1)
+                                .ok_or(AdaptiveManagerError::Capacity(
+                                    "P/C unknown input counter",
+                                ))?
+                        }
+                    }
+                    self.driver.consume_accepted(
+                        &binding.input,
+                        accepted,
+                        output.proposer_ranking_output(),
+                        binding.physical,
+                    )?;
+                    self.counters = counters;
+                    self.accounting = accounting;
+                } else {
+                    self.driver
+                        .role_discarded(&binding.input, binding.ticket.as_ref())?;
+                    self.counters.unused_role_results += 1;
+                }
+            } else {
+                self.driver
+                    .role_discarded(&binding.input, binding.ticket.as_ref())?;
+                self.counters.unused_role_results += 1;
+            }
+            self.bindings.remove(index);
+            changed = true;
+        }
+        Ok(changed)
+    }
+    fn event(&mut self, event: TicketNativeEvent<B::Output>) -> Result<(), AdaptiveManagerError> {
+        match event {
+            TicketNativeEvent::Ready { clock } => {
+                if clock.domain() != self.clock.domain() || clock.origin() != self.clock.origin() {
+                    return Err(AdaptiveManagerError::Invalid("P/C native Ready origin"));
+                }
+                self.native_ready = true;
+                if self.phase == ManagerPhase::Running && !self.verifier_registered {
+                    let verifier = self
+                        .native
+                        .native_acceptance_verifier()
+                        .ok_or(AdaptiveManagerError::Invalid("P/C native verifier absent"))?;
+                    self.registry
+                        .register_native_acceptance_verifier(verifier)?;
+                    self.verifier_registered = true;
+                }
+            }
+            TicketNativeEvent::StartupFailed(error) => {
+                return Err(AdaptiveManagerError::Semantic(format!(
+                    "P/C native startup: {error:?}"
+                )));
+            }
+            TicketNativeEvent::Prepared(prepared) => {
+                let index = self
+                    .bindings
+                    .iter()
+                    .position(|binding| binding.preparation == prepared.preparation)
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "P/C native preparation owner",
+                    ))?;
+                let input = &self.bindings[index].input;
+                if self.bindings[index].ticket.is_some()
+                    || input.question_digest != prepared.question
+                    || input.view_seal != prepared.view
+                    || input.stage.role() != Some(prepared.role)
+                    || prepared.original_deadline != self.deadline
+                {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "P/C native prepared immutable echo",
+                    ));
+                }
+                if self.phase != ManagerPhase::Running || self.now().is_err() {
+                    self.native.cancel(prepared.preparation)?;
+                    self.counters.canceled_preparations += 1;
+                    return Ok(());
+                }
+                let now = self.now()?;
+                let ticket = self.registry.admit(
+                    RoleSubmission {
+                        question: prepared.question,
+                        view: prepared.view,
+                        representation: prepared.representation,
+                        role: prepared.role,
+                        original_deadline: prepared.original_deadline,
+                    },
+                    Arc::clone(&input.view),
+                    self.clock.domain(),
+                    now,
+                )?;
+                self.bindings[index].ticket = Some(ticket);
+                self.driver
+                    .role_submitted(&self.bindings[index].input, &ticket)?;
+                self.counters.submitted_role_tickets += 1;
+            }
+            TicketNativeEvent::Started(ticket) => {
+                let _ = self.index(ticket)?;
+                self.registry.physical_started(&ticket)?;
+            }
+            TicketNativeEvent::OwnerRunStarted { ticket, started_at } => {
+                let index = self.index(ticket)?;
+                if !self.bindings[index].dispatched
+                    || self.bindings[index].owner_run_started
+                    || started_at < self.clock.origin()
+                    || started_at > Instant::now()
+                {
+                    return Err(AdaptiveManagerError::Invalid("P/C owner run identity/time"));
+                }
+                self.bindings[index].owner_run_started = true;
+            }
+            TicketNativeEvent::Completed {
+                completion,
+                evidence,
+                owner_run,
+                owner_service_elapsed,
+            } => {
+                let retained = RetainedNativeCompletion {
+                    completion: RoleCompletion {
+                        ticket: completion.ticket,
+                        physical: completion.physical,
+                        result: completion.result.clone(),
+                    },
+                    evidence,
+                    owner_run,
+                    owner_service_elapsed,
+                };
+                let outcome = (|| {
+                    let ticket = completion.ticket;
+                    let index = self.index(ticket)?;
+                    if self.bindings[index].service_completed
+                        || retained.owner_run.ticket() != &ticket
+                    {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "P/C duplicate/foreign native owner completion",
+                        ));
+                    }
+                    self.bindings[index].service_completed = true;
+                    self.bindings[index].physical = evidence;
+                    self.accounting.observe_completion(
+                        &ticket,
+                        &retained.owner_run,
+                        completion.physical,
+                        completion.result.is_ok(),
+                        evidence,
+                    )?;
+                    match evidence
+                        .filter(|e| e.measurement_complete)
+                        .and_then(|e| e.completed_nn_inputs)
+                    {
+                        Some(count) => self.counters.completed_nn_inputs += count,
+                        None => self.counters.nn_input_count_unknown += 1,
+                    }
+                    self.counters.physical_role_completions +=
+                        u64::from(completion.physical == PhysicalRoleCompletion::Confirmed);
+                    let physical = completion.physical;
+                    let failure = completion.result.as_ref().err().cloned();
+                    match self.registry.complete_reciprocal_role(completion) {
+                        Ok(()) => {}
+                        Err(rejected) => return Err(rejected.error.into()),
+                    }
+                    if physical == PhysicalRoleCompletion::Unknown {
+                        return Err(AdaptiveManagerError::PhysicalUnknown);
+                    }
+                    if self.phase == ManagerPhase::Running {
+                        if let Some(failure) = failure {
+                            return Err(AdaptiveManagerError::Semantic(format!(
+                                "P/C native execution: {failure:?}"
+                            )));
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = outcome {
+                    self.retained_completions.push(retained);
+                    return Err(error);
+                }
+            }
+            TicketNativeEvent::PreparationFailed {
+                preparation,
+                failure,
+            } => {
+                if self.phase == ManagerPhase::Running {
+                    return Err(AdaptiveManagerError::Semantic(format!(
+                        "P/C native preparation: {failure:?}"
+                    )));
+                }
+                if let Some(index) = self
+                    .bindings
+                    .iter()
+                    .position(|b| b.preparation == preparation && b.ticket.is_none())
+                {
+                    self.driver
+                        .role_discarded(&self.bindings[index].input, None)?;
+                    self.bindings.remove(index);
+                }
+            }
+            TicketNativeEvent::Rejected { preparation, error } => {
+                if self.phase == ManagerPhase::Running {
+                    return Err(error.into());
+                }
+                if let Some(index) = self
+                    .bindings
+                    .iter()
+                    .position(|b| b.preparation == preparation && b.ticket.is_none())
+                {
+                    self.driver
+                        .role_discarded(&self.bindings[index].input, None)?;
+                    self.bindings.remove(index);
+                }
+            }
+            TicketNativeEvent::Retired {
+                ticket,
+                accepted,
+                result,
+                native_receipt,
+                rejected_permit,
+            } => {
+                if let Some(permit) = rejected_permit {
+                    self.retained_permits.push(permit);
+                }
+                let index = match self.index(ticket) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        if let Some(receipt) = native_receipt {
+                            self.retained_receipts.push(receipt);
+                        }
+                        return Err(error);
+                    }
+                };
+                if result.is_err()
+                    || self.bindings[index].ack_accepted != Some(accepted)
+                    || self.bindings[index].retired
+                {
+                    if let Some(receipt) = native_receipt {
+                        self.retained_receipts.push(receipt);
+                    }
+                    return Err(if result == Err(RoleFailure::PhysicalUnknown) {
+                        AdaptiveManagerError::PhysicalUnknown
+                    } else {
+                        AdaptiveManagerError::Invalid("P/C native retirement/ack differs")
+                    });
+                }
+                if accepted {
+                    let receipt = native_receipt.ok_or(AdaptiveManagerError::Invalid(
+                        "P/C actual acceptance receipt absent",
+                    ))?;
+                    self.accounting
+                        .observe_owner_acceptance(ticket.role, self.bindings[index].physical)?;
+                    match self.bindings[index]
+                        .physical
+                        .filter(|e| e.measurement_complete)
+                        .and_then(|e| e.completed_nn_inputs)
+                    {
+                        Some(count) => self.counters.accepted_nn_inputs += count,
+                        None => self.counters.accepted_nn_input_count_unknown += 1,
+                    }
+                    if self.phase == ManagerPhase::Running && self.now().is_ok() {
+                        match self.registry.accept_reciprocal_native(
+                            receipt,
+                            self.clock.domain(),
+                            self.now()?,
+                        ) {
+                            Ok(accepted) => {
+                                self.bindings[index].accepted = Some(accepted);
+                                if let Some(observer) = &mut self.collection {
+                                    let binding = &self.bindings[index];
+                                    observer
+                                        .accepted(
+                                            binding
+                                                .accepted
+                                                .as_ref()
+                                                .expect("actual accepted proof"),
+                                            &binding.input,
+                                            binding
+                                                .delivered
+                                                .as_ref()
+                                                .ok_or(AdaptiveManagerError::Invalid(
+                                                    "accepted capture output custody",
+                                                ))?
+                                                .as_ref(),
+                                        )
+                                        .map_err(AdaptiveManagerError::Collection)?;
+                                }
+                            }
+                            Err(rejected) => {
+                                self.retained_receipts.push(rejected.receipt);
+                                return Err(rejected.error.into());
+                            }
+                        }
+                    } else {
+                        self.retained_receipts.push(receipt);
+                    }
+                } else {
+                    if let Some(receipt) = native_receipt {
+                        self.retained_receipts.push(receipt);
+                        return Err(AdaptiveManagerError::Invalid(
+                            "discard returned acceptance receipt",
+                        ));
+                    }
+                    self.registry.discard_delivered(&ticket)?;
+                }
+                self.bindings[index].retired = true;
+            }
+            TicketNativeEvent::AcceptanceRejected { permit, error, .. } => {
+                self.retained_permits.push(permit);
+                return Err(error.into());
+            }
+            TicketNativeEvent::Finished {
+                physical_shutdown_confirmed,
+            } => {
+                if self.native_finished.is_some() {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "duplicate P/C process shutdown",
+                    ));
+                }
+                self.native_finished = Some(physical_shutdown_confirmed);
+                if !physical_shutdown_confirmed {
+                    return Err(AdaptiveManagerError::PhysicalUnknown);
+                }
+            }
+            TicketNativeEvent::RootQuiesced(fence) => {
+                if self.close_mode != AdaptiveCloseMode::RootQuiesce
+                    || fence.authority() != self.registration.authority
+                    || !fence.permits_reuse()
+                    || self.native_root_fence.is_some()
+                {
+                    return Err(AdaptiveManagerError::PhysicalUnknown);
+                }
+                self.native_root_fence = Some(fence);
+            }
+        }
+        Ok(())
+    }
+    pub fn begin_root_quiesce(&mut self, until: Instant) -> Result<(), AdaptiveManagerError> {
+        self.begin_close(until, AdaptiveCloseMode::RootQuiesce)
+    }
+    pub fn begin_shutdown(&mut self, until: Instant) -> Result<(), AdaptiveManagerError> {
+        self.begin_close(until, AdaptiveCloseMode::ProcessShutdown)
+    }
+    fn begin_close(
+        &mut self,
+        until: Instant,
+        mode: AdaptiveCloseMode,
+    ) -> Result<(), AdaptiveManagerError> {
+        let until = self
+            .cleanup_boundary
+            .map_or(until, |boundary| boundary.cap(until));
+        if self.phase == ManagerPhase::Finished {
+            return Ok(());
+        }
+        let escalation = self.shutdown_until.is_some()
+            && self.close_mode == AdaptiveCloseMode::RootQuiesce
+            && mode == AdaptiveCloseMode::ProcessShutdown;
+        if self.shutdown_until.is_some() && self.close_mode != mode && !escalation {
+            return Err(AdaptiveManagerError::Invalid("P/C closure mode change"));
+        }
+        let until = if escalation {
+            until
+        } else {
+            self.shutdown_until.map_or(until, |old| old.min(until))
+        };
+        self.close_mode = mode;
+        self.shutdown_until = Some(until);
+        if self.phase != ManagerPhase::Quarantined {
+            self.phase = ManagerPhase::Draining;
+        }
+        self.registry.revoke_all();
+        if !self.driver.is_complete() {
+            self.driver.revoke()?;
+        }
+        if let Some(input) = self.pending_input.as_ref() {
+            self.driver.role_discarded(input, None)?;
+        }
+        self.pending_input = None;
+        // prepare's returned question proves this owner never admitted its
+        // physical lease. Keep it through semantic discard, then release it.
+        self.pending_preparation = None;
+        for binding in &self.bindings {
+            self.native.cancel(binding.preparation).ok();
+        }
+        match mode {
+            AdaptiveCloseMode::RootQuiesce => self.native.begin_root_quiesce(until)?,
+            AdaptiveCloseMode::ProcessShutdown => self.native.begin_shutdown(until),
+        }
+        Ok(())
+    }
+    fn cleanup_until(&self) -> Result<Instant, AdaptiveManagerError> {
+        automatic_cleanup_deadline(self.cleanup_boundary)
+    }
+    pub fn tick(&mut self) -> Result<bool, AdaptiveManagerError> {
+        if self.phase == ManagerPhase::Finished {
+            return Ok(false);
+        }
+        let mut changed = false;
+        for _ in 0..MAX_EVENT_DRAIN {
+            let Some(event) = self.native.poll() else {
+                break;
+            };
+            changed = true;
+            let collection_failure = self
+                .collection
+                .as_mut()
+                .and_then(|observer| observer.native_event(&event).err());
+            if let Err(error) = self.event(event) {
+                self.record_failure(error);
+            }
+            if let Some(error) = collection_failure {
+                self.record_failure(AdaptiveManagerError::Collection(error));
+            }
+        }
+        for action in [
+            Self::flush_acks_changed,
+            Self::deliver,
+            Self::consume_retired,
+        ] {
+            match action(self) {
+                Ok(progress) => changed |= progress,
+                Err(error) => self.record_failure(error),
+            }
+        }
+        if (self.phase == ManagerPhase::Running
+            && (!self.failures.is_empty() || self.now().is_err()))
+            || (self.phase == ManagerPhase::Quarantined && self.shutdown_until.is_none())
+        {
+            self.begin_close(self.cleanup_until()?, self.close_mode)?;
+        }
+        if self.phase == ManagerPhase::Running {
+            match self.schedule() {
+                Ok(progress) => changed |= progress,
+                Err(error) => self.record_failure(error),
+            }
+            match self.dispatch() {
+                Ok(progress) => changed |= progress,
+                Err(error) => self.record_failure(error),
+            }
+            let spent = self.registry.cumulative_observation().admitted;
+            if !self.failures.is_empty()
+                || (self.bindings.is_empty()
+                    && self.pending_input.is_none()
+                    && (self.driver.is_complete() || spent >= self.registration.role_call_limit))
+            {
+                self.begin_close(self.cleanup_until()?, self.close_mode)?;
+            }
+        }
+        if self.phase != ManagerPhase::Running {
+            if self.native_finished.is_some() && !self.native_joined {
+                self.native_joined = self.native.try_join()?;
+                changed |= self.native_joined;
+            }
+            let fenced = self
+                .native_root_fence
+                .is_some_and(|fence| fence.permits_reuse())
+                || (self.native_joined && self.native_finished == Some(true));
+            if fenced && self.phase != ManagerPhase::Quarantined {
+                if !self.collection_settled {
+                    if let Some(observer) = &mut self.collection {
+                        let remaining: Vec<_> = self
+                            .bindings
+                            .iter()
+                            .filter_map(|binding| binding.ticket)
+                            .collect();
+                        observer
+                            .settled(&remaining)
+                            .map_err(AdaptiveManagerError::Collection)?;
+                    }
+                    self.collection_settled = true;
+                }
+                self.registry.retire_revoked_after_worker_join()?;
+                // Only the actual owner fence permits releasing unconsumed
+                // revoked inputs or linear permits, never logical cancel.
+                for binding in &self.bindings {
+                    self.driver
+                        .role_discarded(&binding.input, binding.ticket.as_ref())?;
+                }
+                self.counters.unused_role_results += self.bindings.len() as u64;
+                self.bindings.clear();
+                self.acks.clear();
+                self.retained_receipts.clear();
+                self.retained_permits.clear();
+                if !self.retained_completions.is_empty() || self.native.is_quarantined() {
+                    self.phase = ManagerPhase::Quarantined;
+                } else {
+                    self.phase = ManagerPhase::Finished;
+                }
+            }
+        }
+        Ok(changed)
+    }
+    fn flush_acks_changed(&mut self) -> Result<bool, AdaptiveManagerError> {
+        let before = self.acks.len();
+        self.flush_acks()?;
+        Ok(self.acks.len() != before)
+    }
+    pub fn shutdown_receipt(&self) -> Result<RoleOnlyShutdownReceipt, AdaptiveManagerError> {
+        let mut leases = self.review_leases;
+        let actual = self.driver.review_lease_admission()?;
+        leases.last = Some(actual);
+        leases.effective_role_ticket_ceiling = self.pending_limit()?;
+        Ok(RoleOnlyShutdownReceipt {
+            authority: self.registration.authority,
+            mode: self.registration.mode,
+            root_budget: self.registration.root_budget,
+            native_process_joined: self.native_joined,
+            native_physical_shutdown_confirmed: self.native_finished == Some(true),
+            pending_tickets: self.registry.occupancy(),
+            retained_outputs: self.bindings.len()
+                + self.retained_completions.len()
+                + usize::from(self.pending_input.is_some())
+                + usize::from(self.pending_preparation.is_some()),
+            quarantined: self.phase == ManagerPhase::Quarantined || self.native.is_quarantined(),
+            request_sequence_high_water: self.registry.next_request_sequence().saturating_sub(1),
+            counters: self.counters,
+            review_leases: leases,
+            native_root_fence: self.native_root_fence,
+        })
+    }
+    pub fn run_root_until(
+        &mut self,
+        until: Instant,
+        canceled: &AtomicBool,
+    ) -> Result<RoleOnlyShutdownReceipt, AdaptiveManagerError> {
+        let until = self
+            .cleanup_boundary
+            .map_or(until, |boundary| boundary.cap(until));
+        loop {
+            let signal = self.native.signal();
+            let observed = signal.version();
+            if canceled.load(Ordering::Acquire) && self.phase == ManagerPhase::Running {
+                self.begin_root_quiesce(self.cleanup_until()?)?;
+            }
+            let changed = self.tick()?;
+            if self.phase == ManagerPhase::Finished {
+                return self.shutdown_receipt();
+            }
+            if Instant::now() >= until {
+                self.begin_close(until, self.close_mode)?;
+                self.tick()?;
+                return self.shutdown_receipt();
+            }
+            if !changed {
+                self.counters.notification_waits += 1;
+                signal.wait_changed(
+                    observed,
+                    until
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10)),
+                );
+            }
+        }
+    }
+    #[allow(clippy::result_large_err)]
+    pub fn into_sources(
+        self,
+    ) -> Result<RoleOnlyManagerSources<Q, B, D>, (Self, AdaptiveManagerError)> {
+        let receipt = match self.shutdown_receipt() {
+            Ok(receipt) => receipt,
+            Err(error) => return Err((self, error)),
+        };
+        if self.phase != ManagerPhase::Finished || !receipt.permits_semantic_closure() {
+            return Err((self, AdaptiveManagerError::PhysicalUnknown));
+        }
+        Ok(RoleOnlyManagerSources {
+            native: self.native,
+            driver: self.driver,
+        })
+    }
+}

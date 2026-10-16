@@ -3,6 +3,10 @@
 //! semantic scope ends as explicit Unknown after checked worker evidence.
 #[path = "fixed_trace_tests.rs"]
 mod fixed_trace;
+#[path = "reciprocal_tests.rs"]
+mod reciprocal;
+#[path = "role_only_tests.rs"]
+mod role_only;
 
 use super::*;
 use crate::pals_adaptive::{
@@ -215,6 +219,8 @@ impl<Q: Clone + Send + Sync + 'static> TicketNativeBackend<ReviewView, Q> for Na
 enum FixtureScope {
     TwoIndependentRoles,
     OwnCpuResume,
+    OwnCpuReciprocal,
+    PeerAllDirections,
 }
 struct DriverFixture {
     authority: SearchAuthority,
@@ -234,6 +240,13 @@ struct DriverFixture {
     #[cfg(feature = "pals-adaptive-diagnostics")]
     fail_publish_closed_once: bool,
     raw_cpu_receipts: Vec<ExecutionId>,
+    reciprocal_questions: BTreeMap<u64, rz_contracts::rovent::QuestionEnvelope>,
+    reciprocal_waits: Vec<ExecutionId>,
+    reciprocal_replies: usize,
+    peer_sources: Vec<(Role, rz_contracts::rovent::SearchRecipient)>,
+    peer_opinions: usize,
+    peer_cpu_answers: usize,
+    peer_repeat_question: bool,
 }
 impl DriverFixture {
     fn input(
@@ -246,23 +259,57 @@ impl DriverFixture {
             rz_position::PositionLimits::default(),
         )
         .unwrap();
-        let prefix = first.into_iter().collect::<Vec<_>>();
+        let divergence = matches!(self.scope, FixtureScope::PeerAllDirections)
+            && stage == RefinementStage::CriticDivergence;
+        let prefix = if divergence {
+            Vec::new()
+        } else {
+            first.into_iter().collect::<Vec<_>>()
+        };
+        let proposal = if divergence {
+            let first = first.expect("actual first move for divergence fixture");
+            let mut branch = endpoint.clone();
+            branch.make_move(first).unwrap();
+            let mut proposal = vec![first];
+            let additional = if self.peer_repeat_question { 1 } else { 3 };
+            for _ in 0..additional {
+                let movement = branch.legal_moves()[0];
+                branch.make_move(movement).unwrap();
+                proposal.push(movement);
+            }
+            proposal
+        } else {
+            Vec::new()
+        };
+        let divergences: Vec<usize> = if divergence {
+            vec![if self.peer_repeat_question { 1 } else { 3 }]
+        } else {
+            Vec::new()
+        };
         for movement in &prefix {
             endpoint.make_move(*movement).unwrap();
         }
-        let legal = endpoint.legal_moves();
+        let legal = if divergence {
+            Vec::new()
+        } else {
+            endpoint.legal_moves()
+        };
         let view = Arc::new(
             self.index
                 .select(
                     &self.stores,
                     self.state,
                     ReviewQuerySequences {
-                        purpose: RoleQueryPurpose::ProposePolicy,
+                        purpose: if divergence {
+                            RoleQueryPurpose::DivergencePolicy
+                        } else {
+                            RoleQueryPurpose::ProposePolicy
+                        },
                         prefix: &prefix,
-                        proposal: &[],
+                        proposal: &proposal,
                         counterexample: None,
                         legal: &legal,
-                        divergences: &[],
+                        divergences: &divergences,
                     },
                     ReviewSelectionPolicy::default(),
                 )
@@ -293,6 +340,113 @@ impl DriverFixture {
     }
 }
 impl AdaptiveSearchDriver<u64> for DriverFixture {
+    fn accept_accepted_role_source(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, u64>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError> {
+        assert!(accepted.validates_output(output));
+        self.validate_role(work, accepted.ticket(), output)
+    }
+    fn discard_accepted_role_reciprocal(
+        &mut self,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.reciprocal_questions.remove(&id.sequence);
+        Ok(())
+    }
+    fn prepare_accepted_role_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, u64>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+        mode: rz_contracts::rovent::ExecutionMode,
+        budget: Digest,
+        recipient: rz_contracts::rovent::SearchRecipient,
+    ) -> Result<Option<AdaptivePeerQuestion<u64>>, AdaptiveManagerError> {
+        self.fixture_prepare_peer(work, accepted, output, id, mode, budget, recipient)
+            .map(Some)
+    }
+    fn consume_accepted_role_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, u64>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        _: Option<TicketExecutionEvidence>,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        self.validate_role(work, accepted.ticket(), output)?;
+        assert!(accepted.validates_output(output));
+        self.peer_opinions += 1;
+        Ok(accepted.output_digest())
+    }
+    fn consume_reciprocal_cpu(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, u64>,
+        report: &CpuSliceReport,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        assert!(report.terminal && !report.continuation_retained);
+        assert_eq!(
+            report.result.as_ref().unwrap().report.completion,
+            CpuCompletion::DepthLimit
+        );
+        self.peer_cpu_answers += 1;
+        Ok(Digest([87; 32]))
+    }
+    fn discard_cpu_reciprocal(
+        &mut self,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.reciprocal_questions.remove(&id.sequence);
+        Ok(())
+    }
+    fn reciprocal_parent(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, u64>,
+        job: &rz_contracts::pals_adaptive::CpuJobEnvelope,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+        mode: rz_contracts::rovent::ExecutionMode,
+        root_budget: Digest,
+    ) -> Result<rz_contracts::rovent::QuestionEnvelope, AdaptiveManagerError> {
+        self.fixture_reciprocal_parent(work, job, id, mode, root_budget)
+    }
+    fn prepare_cpu_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, u64>,
+        request: &rz_search::cpu::CpuReciprocalRequest,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+        mode: rz_contracts::rovent::ExecutionMode,
+        root_budget: Digest,
+    ) -> Result<AdaptiveReciprocalQuestion<u64>, AdaptiveManagerError> {
+        self.fixture_prepare_reciprocal(work, request, id, mode, root_budget)
+    }
+    fn cpu_reciprocal_wait(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, u64>,
+        report: &CpuSliceReport,
+    ) -> Result<(), AdaptiveManagerError> {
+        assert_eq!(
+            report.result.as_ref().unwrap().report.completion,
+            CpuCompletion::AwaitReciprocal
+        );
+        assert!(!self.reciprocal_waits.contains(&report.grant.execution));
+        self.reciprocal_waits.push(report.grant.execution);
+        Ok(())
+    }
+    fn consume_cpu_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, u64>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        _: Option<TicketExecutionEvidence>,
+        requests: &[(
+            rz_search::cpu::CpuReciprocalRequest,
+            rz_contracts::rovent::ReciprocalQuestionId,
+        )],
+    ) -> Result<Vec<rz_search::cpu::CpuReciprocalReply>, AdaptiveManagerError> {
+        self.fixture_consume_reciprocal(work, accepted, output, requests)
+    }
     fn root_rules(&self) -> Arc<ContractState> {
         Arc::clone(&self.rules)
     }
@@ -313,7 +467,9 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
         );
         let width = match self.scope {
             FixtureScope::TwoIndependentRoles => 2,
-            FixtureScope::OwnCpuResume => 1,
+            FixtureScope::OwnCpuResume
+            | FixtureScope::OwnCpuReciprocal
+            | FixtureScope::PeerAllDirections => 1,
         };
         ranking
             .ranked_candidates()
@@ -325,7 +481,14 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
                     first_move: *movement,
                     input: self.input(RefinementStage::ProposalContinuation, Some(first)),
                     budget: FrameBudget {
-                        role_submissions_remaining: 4,
+                        role_submissions_remaining: if matches!(
+                            self.scope,
+                            FixtureScope::PeerAllDirections
+                        ) {
+                            12
+                        } else {
+                            4
+                        },
                         original_cpu_credit: TOTAL_NODES,
                         original_store_byte_limit: 1 << 20,
                     },
@@ -352,11 +515,14 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
                 "fixture original question/view",
             ));
         }
-        let RolePayload::Proposal {
-            candidate_logits, ..
-        } = &output.payload
-        else {
-            return Err(AdaptiveManagerError::Invalid("fixture proposer head"));
+        let candidate_logits = match &output.payload {
+            RolePayload::Proposal {
+                candidate_logits, ..
+            } if ticket.role == Role::Proposer => candidate_logits,
+            RolePayload::Counterexample {
+                candidate_logits, ..
+            } if ticket.role == Role::Critic => candidate_logits,
+            _ => return Err(AdaptiveManagerError::Invalid("fixture role head")),
         };
         if candidate_logits.len() != work.input.view.query().legal.len()
             || candidate_logits.iter().any(|v| !v.is_finite())
@@ -390,10 +556,21 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
             FixtureScope::TwoIndependentRoles => FrameTransition::Unknown {
                 reason: "authored integration fixture ends after actual role acceptance",
             },
-            FixtureScope::OwnCpuResume => {
+            FixtureScope::OwnCpuResume | FixtureScope::OwnCpuReciprocal => {
                 let mut input = work.input.clone();
                 input.stage = RefinementStage::CpuValidation;
                 FrameTransition::Continue(input)
+            }
+            FixtureScope::PeerAllDirections => {
+                if ticket.role == Role::Proposer {
+                    let mut input = work.input.clone();
+                    input.stage = RefinementStage::CpuValidation;
+                    FrameTransition::Continue(input)
+                } else {
+                    FrameTransition::Unknown {
+                        reason: "authored peer fixture ends after original C source commits",
+                    }
+                }
             }
         };
         Ok(CheckedStep {
@@ -446,18 +623,34 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
     ) -> Result<CheckedStep<u64>, AdaptiveManagerError> {
         assert!(report.terminal && !report.continuation_retained);
         let actual = &report.result.as_ref().unwrap().report;
-        let expected = &self.expected_cpu[&work.original_first_move.bits()];
         assert_eq!(actual.completion, CpuCompletion::DepthLimit);
-        assert_eq!(actual.completed_depth, expected.completed_depth);
-        assert_eq!(actual.score, expected.score);
-        assert_eq!(actual.pv, expected.pv);
-        assert_eq!(report.cumulative_nodes, expected.nodes);
+        if matches!(
+            self.scope,
+            FixtureScope::OwnCpuReciprocal | FixtureScope::PeerAllDirections
+        ) {
+            assert_eq!(actual.completed_depth, 2);
+            assert!(report.cumulative_nodes > 0);
+            assert!(!self.reciprocal_waits.is_empty());
+            assert!(self.reciprocal_replies > 0);
+        } else {
+            let expected = &self.expected_cpu[&work.original_first_move.bits()];
+            assert_eq!(actual.completed_depth, expected.completed_depth);
+            assert_eq!(actual.score, expected.score);
+            assert_eq!(actual.pv, expected.pv);
+            assert_eq!(report.cumulative_nodes, expected.nodes);
+        }
         self.actual_cpu.push(report.clone());
+        let transition = if matches!(self.scope, FixtureScope::PeerAllDirections) {
+            let first = BoardMove::try_from(work.original_first_move.decode().unwrap()).unwrap();
+            FrameTransition::Continue(self.input(RefinementStage::CriticDivergence, Some(first)))
+        } else {
+            FrameTransition::Unknown {
+                reason: "authored integration fixture ends after actual private CPU completion",
+            }
+        };
         Ok(CheckedStep {
             evidence: Digest([42; 32]),
-            transition: FrameTransition::Unknown {
-                reason: "authored integration fixture ends after actual private CPU completion",
-            },
+            transition,
             fresh_pair: None,
             rules_pair: None,
             queued_recheck: None,
@@ -504,8 +697,11 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
         ticket: &RoleTicketEnvelope,
         view: &Arc<ReviewView>,
     ) -> Result<(), AdaptiveManagerError> {
-        assert!(self.consumed.iter().all(|old| old.id != ticket.id));
         assert_eq!(ticket.view.view_digest.0, view.seal_digest());
+        if let Some(original) = self.consumed.iter().find(|old| old.id == ticket.id) {
+            assert_eq!(original, ticket);
+            return Ok(());
+        }
         self.index.consume(view, &self.stores).unwrap();
         self.consumed.push(*ticket);
         Ok(())
@@ -634,6 +830,13 @@ fn fixture_with_registered_role_limit(
         #[cfg(feature = "pals-adaptive-diagnostics")]
         fail_publish_closed_once: false,
         raw_cpu_receipts: Vec::new(),
+        reciprocal_questions: BTreeMap::new(),
+        reciprocal_waits: Vec::new(),
+        reciprocal_replies: 0,
+        peer_sources: Vec::new(),
+        peer_opinions: 0,
+        peer_cpu_answers: 0,
+        peer_repeat_question: false,
     };
     let root_input = driver.input(RefinementStage::ProposerRanking, None);
     let facts = Arc::new(NativeFacts::default());
@@ -1948,6 +2151,13 @@ mod adaptive_partial_feedback {
                 #[cfg(feature = "pals-adaptive-diagnostics")]
                 fail_publish_closed_once: false,
                 raw_cpu_receipts: Vec::new(),
+                reciprocal_questions: BTreeMap::new(),
+                reciprocal_waits: Vec::new(),
+                reciprocal_replies: 0,
+                peer_sources: Vec::new(),
+                peer_opinions: 0,
+                peer_cpu_answers: 0,
+                peer_repeat_question: false,
             },
             admissions: Vec::new(),
             partial_commits: Vec::new(),

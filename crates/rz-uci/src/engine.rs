@@ -647,6 +647,7 @@ impl WorkerCompletion {
 #[derive(Debug)]
 pub enum EngineError {
     Contract(contract::ContractError),
+    SearchDriverClose(crate::search_driver::SearchSessionFailure),
     Session(SessionError),
     Transport(Box<ServeError<EngineError>>),
     WorkerPanic,
@@ -1494,6 +1495,7 @@ impl Owner {
                             depth_plies: limits.depth_plies,
                             mate_moves: limits.mate_moves,
                         },
+                        requested_nodes: limits.nodes,
                         control: control.clone(),
                         cancellation: token,
                         shutdown_deadline,
@@ -2298,7 +2300,8 @@ pub fn serve<O: Write, D: Write>(
     if timer.join().is_err() {
         cleanup.push(EngineError::WorkerPanic);
     }
-    if let Some(until) = Instant::now().checked_add(settings.shutdown_limit) {
+    let cleanup_deadline = Instant::now().checked_add(settings.shutdown_limit);
+    if let Some(until) = cleanup_deadline {
         loop {
             let mut owner = match owner.lock() {
                 Ok(owner) => owner,
@@ -2332,8 +2335,12 @@ pub fn serve<O: Write, D: Write>(
             .into(),
         );
     }
+    let mut joined_driver = None;
     match owner.lock() {
         Ok(mut owner) => {
+            if owner.workers.is_empty() {
+                joined_driver = owner.driver.clone();
+            }
             if let Some(error) = owner.fence_failure.take() {
                 cleanup.push(error);
             }
@@ -2356,6 +2363,23 @@ pub fn serve<O: Write, D: Write>(
         }
         Err(_) => {
             cleanup.push(failure(contract::ErrorCode::BackendFailure, "UCI owner poisoned").into())
+        }
+    }
+    // The search thread is joined before its persistent model/search owners
+    // close. Keep the same cleanup deadline; expiry grants no fresh window.
+    // No hook means no additional lifecycle observation for legacy drivers.
+    if let (Some(driver), Some(until)) = (joined_driver, cleanup_deadline) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            driver.finish_session(until)
+        })) {
+            Ok(Ok(Some(crate::search_driver::DriverPhysicalCompletion::Unknown))) => {
+                cleanup.push(EngineError::SearchDriverClose(
+                    crate::search_driver::SearchSessionFailure::physical_completion_unknown(),
+                ));
+            }
+            Ok(Err(error)) => cleanup.push(EngineError::SearchDriverClose(error)),
+            Err(_) => cleanup.push(EngineError::WorkerPanic),
+            Ok(Ok(_)) => {}
         }
     }
     finish_errors(primary, cleanup)
@@ -2385,6 +2409,86 @@ pub fn event_channel() -> (SyncSender<Event>, Receiver<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CloseObservedDriver {
+        state: crate::search_driver::DriverPhysicalCompletion,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::search_driver::SearchSessionDriver for CloseObservedDriver {
+        fn kind(&self) -> crate::search_driver::SearchKind {
+            crate::search_driver::SearchKind::Cpu
+        }
+        fn implementation(&self) -> contract::Digest {
+            contract::Digest([77; 32])
+        }
+        fn identity(&self) -> EngineIdentity {
+            EngineIdentity {
+                name: "persistent owner close fixture".into(),
+                author: "test".into(),
+            }
+        }
+        fn finish_session(
+            &self,
+            _: Instant,
+        ) -> Result<
+            Option<crate::search_driver::DriverPhysicalCompletion>,
+            crate::search_driver::SearchSessionFailure,
+        > {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Ok(Some(self.state))
+        }
+        fn run(
+            &self,
+            _: &Position,
+            _: &crate::search_driver::SearchSessionContext,
+            _: &mut dyn FnMut(BoardMove),
+        ) -> Result<
+            crate::search_driver::SearchSessionReport,
+            crate::search_driver::SearchSessionFailure,
+        > {
+            unreachable!("quit without go must not invoke a search")
+        }
+    }
+
+    #[test]
+    fn persistent_driver_close_runs_once_and_unknown_prevents_success() {
+        use crate::search_driver::DriverPhysicalCompletion::{Confirmed, Unknown};
+        for state in [Confirmed, Unknown] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let process = EngineProcess::with_search_driver(
+                Arc::new(CloseObservedDriver {
+                    state,
+                    calls: Arc::clone(&calls),
+                }),
+                Arc::new(OwnerRegistry::default()),
+                ProcessClock::new(contract::ProcessEpoch(78)),
+            );
+            let (sender, events) = event_channel();
+            sender.send(Event::Line("quit".into())).unwrap();
+            let mut protocol = Vec::new();
+            let mut diagnostics = Vec::new();
+            let result = serve(
+                events,
+                sender,
+                &mut protocol,
+                &mut diagnostics,
+                process,
+                EngineSettings::default(),
+            );
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+            if state == Confirmed {
+                result.unwrap();
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("PhysicalCompletionUnknown")
+                );
+            }
+            assert!(!String::from_utf8(protocol).unwrap().contains("bestmove "));
+        }
+    }
 
     struct UnknownPhysicalDriver;
     impl crate::search_driver::SearchSessionDriver for UnknownPhysicalDriver {
@@ -4443,7 +4547,23 @@ mod tests {
             }
         );
         let stopped = owner.handle(&mut session, Event::Line("stop".into()));
-        assert_eq!(stopped.protocol, ["bestmove e2e4"]);
+        let [line] = stopped.protocol.as_slice() else {
+            panic!("expected one constrained bestmove: {:?}", stopped.protocol);
+        };
+        let fields: Vec<_> = line.split_ascii_whitespace().collect();
+        let ["bestmove", "e2e4", "ponder", prediction] = fields.as_slice() else {
+            panic!("enabled Ponder must retain the restricted root move: {line}");
+        };
+        // searchmoves restricts this root's move, not the opponent's reply.
+        let mut child = Position::startpos();
+        child
+            .make_move(BoardMove::from_uci("e2e4").unwrap())
+            .unwrap();
+        assert!(
+            child
+                .legal_moves()
+                .contains(&BoardMove::from_uci(prediction).unwrap())
+        );
     }
 
     type DriverOutputAcks = Arc<Mutex<Vec<(contract::pals::SearchAuthority, String, bool)>>>;

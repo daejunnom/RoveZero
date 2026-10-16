@@ -39,6 +39,10 @@ pub fn adaptive_execution_manager_source_digest() -> [u8; 32] {
             include_bytes!("pals_adaptive/manager.rs").as_slice(),
         ),
         (
+            "pals_adaptive/manager/reciprocal.rs",
+            include_bytes!("pals_adaptive/manager/reciprocal.rs").as_slice(),
+        ),
+        (
             "pals_adaptive/continuation_diagnostic.rs",
             include_bytes!("pals_adaptive/continuation_diagnostic.rs").as_slice(),
         ),

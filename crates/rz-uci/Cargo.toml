@@ -38,6 +38,10 @@ required-features = ["pals-adaptive-diagnostics"]
 name = "virtual_review_warm_numeric_capture"
 required-features = ["pals-adaptive", "onnx-cpu", "experimental-io-binding"]
 
+[[example]]
+name = "rovent_external_probe"
+required-features = ["pals-adaptive"]
+
 [features]
 experimental-batch = ["rz-search/experimental-batch", "rz-eval/experimental-batch"]
 experimental-io-buffers = ["rz-eval/experimental-io-buffers"]

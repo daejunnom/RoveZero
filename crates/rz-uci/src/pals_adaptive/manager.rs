@@ -21,6 +21,9 @@ use rz_contracts::pals_adaptive::{
     CpuJobEnvelope, CpuJobId, CpuWorkerId, ExternalCpuJobEnvelope, ExternalSliceGrant,
     ReviewViewSeal, RoleTicketEnvelope, SliceGrant,
 };
+use rz_contracts::rovent::{
+    ExecutionMode, QuestionEnvelope, ReciprocalQuestionId, SearchRecipient,
+};
 use rz_contracts::{
     ClockDomain, ContractError, Deadline, Digest, ExecutionId, MonotonicTick, RequestId,
 };
@@ -34,11 +37,15 @@ use rz_runtime::adaptive::{
 };
 use rz_runtime::contracts::{ContractClock as _, ContractSystemClock};
 use rz_search::contract_time::InstantClock;
-use rz_search::cpu::{CpuCompletion, CpuControlMailbox, CpuEngine};
+use rz_search::cpu::{
+    CpuCompletion, CpuControlMailbox, CpuEngine, CpuReciprocalReply, CpuReciprocalRequest,
+    CpuReciprocalScope,
+};
 use rz_search::cpu_worker::{
-    CPU_JOB_CAPACITY, CpuAdmissionRejection, CpuCreditLedger, CpuJobTermination, CpuSliceReport,
-    CpuWorker, CpuWorkerError, CpuWorkerEvent, CpuWorkerEventObservation, CpuWorkerProfile,
-    CpuWorkerProgress, CpuWorkerProgressObservation, CpuWorkerSliceTiming,
+    CPU_JOB_CAPACITY, CpuAdmissionRejection, CpuCreditLedger, CpuJobTermination, CpuLedgerIdentity,
+    CpuSliceReport, CpuWorker, CpuWorkerError, CpuWorkerEvent, CpuWorkerEventObservation,
+    CpuWorkerProfile, CpuWorkerProgress, CpuWorkerProgressObservation, CpuWorkerSliceTiming,
+    ReleasedCpuReservation, SettledCpuSlice,
 };
 use rz_search::external_cpu::worker::{
     ExternalCpuWorker, ExternalJob, ExternalRootFence, ExternalTeacherDispatch,
@@ -61,10 +68,11 @@ use rz_search::pals::engine::adaptive_port::validator_port::{
     AdaptiveValidatorAction, AdaptiveValidatorActionPlan, ValidatorActionId, ValidatorActionOutcome,
 };
 use rz_search::pals::engine::adaptive_port::{
-    AdaptiveDeferredRepair, AdaptiveQueuedRecheck, AdaptiveRulesPairProof, CheckedRootCandidate,
-    DeferredRootCandidate,
+    AdaptiveDeferredRepair, AdaptiveQueuedRecheck, AdaptiveReviewLeaseAdmission,
+    AdaptiveRulesPairProof, CheckedRootCandidate, DeferredRootCandidate,
 };
 use rz_search::pals::review_context::ReviewView;
+use rz_search::pals::rovent_frontier::{FrontierError, NativeCloseReason, NativeReservation};
 use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,6 +81,32 @@ use std::time::{Duration, Instant};
 
 const MAX_EVENT_DRAIN: usize = 256;
 const MAX_ROLE_PENDING: usize = 16;
+
+mod cleanup;
+mod collection;
+mod frontier;
+mod reciprocal;
+mod role_only;
+use cleanup::{CleanupBoundary, automatic_cleanup_deadline};
+pub use collection::*;
+pub use frontier::{RoventNativeAccountingObservation, RoventReviewLeaseObservation};
+pub use reciprocal::{
+    PeerFollowupDisposition, PeerFollowupObservation, RoventPeerFollowupPolicy,
+    RoventReciprocalPolicy,
+};
+pub use role_only::*;
+
+/// Search-issued immutable child input. The engine port keeps the opaque CPU
+/// request seal and Store pins; the manager owns submission and physical custody.
+pub struct AdaptiveReciprocalQuestion<Q> {
+    pub question: QuestionEnvelope,
+    pub input: FrameInput<ReviewView, Q>,
+}
+pub struct AdaptivePeerQuestion<Q> {
+    pub origin: rz_search::pals::coordinator::AcceptedRoleOrigin,
+    pub question: QuestionEnvelope,
+    pub input: FrameInput<ReviewView, Q>,
+}
 
 /// Concrete queue/owner ceilings. These values are applied during physical
 /// owner admission, rather than copied into receipts without enforcement.
@@ -112,10 +146,18 @@ impl AdaptiveExecutionLimits {
 
 #[derive(Clone, Debug)]
 pub enum AdaptiveManagerError {
+    Collection(AdaptiveCollectionError),
     Coordinator(CoordinatorError),
     Contract(ContractError),
     Native(TicketServiceError),
     Cpu(CpuWorkerError),
+    Frontier(FrontierError),
+    ReviewLeaseBackpressure {
+        current: usize,
+        capacity: usize,
+        required_new: usize,
+        replacement_reserve: usize,
+    },
     Invalid(&'static str),
     Semantic(String),
     Capacity(&'static str),
@@ -142,6 +184,11 @@ impl From<TicketServiceError> for AdaptiveManagerError {
 impl From<CpuWorkerError> for AdaptiveManagerError {
     fn from(error: CpuWorkerError) -> Self {
         Self::Cpu(error)
+    }
+}
+impl From<FrontierError> for AdaptiveManagerError {
+    fn from(error: FrontierError) -> Self {
+        Self::Frontier(error)
     }
 }
 impl std::fmt::Display for AdaptiveManagerError {
@@ -203,6 +250,165 @@ pub struct CandidateFrame<Q> {
 /// remain with the independent archive owner and finish after worker fences.
 pub trait AdaptiveSearchDriver<Q> {
     fn root_rules(&self) -> Arc<ContractState>;
+    fn review_lease_admission(
+        &self,
+    ) -> Result<Option<AdaptiveReviewLeaseAdmission>, AdaptiveManagerError> {
+        Ok(None)
+    }
+    /// Optional common-node controller. Legacy PALS has no such owner.
+    fn frontier_native_capacity(
+        &mut self,
+        _: u64,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<Option<u64>, AdaptiveManagerError> {
+        Ok(None)
+    }
+    fn frontier_native_reserve(
+        &mut self,
+        _: &CpuJobEnvelope,
+        _: SliceGrant,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<Option<NativeReservation>, AdaptiveManagerError> {
+        Ok(None)
+    }
+    fn frontier_native_settled(
+        &mut self,
+        _: &NativeReservation,
+        _: &CpuSliceReport,
+        _: &SettledCpuSlice,
+    ) -> Result<NativeCloseReason, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid("native frontier absent"))
+    }
+    fn frontier_native_released(
+        &mut self,
+        _: &NativeReservation,
+        _: &ReleasedCpuReservation,
+    ) -> Result<NativeCloseReason, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid("native frontier absent"))
+    }
+    fn frontier_native_unknown(
+        &mut self,
+        _: &NativeReservation,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid("native frontier absent"))
+    }
+    fn reciprocal_parent(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuJobEnvelope,
+        _: ReciprocalQuestionId,
+        _: ExecutionMode,
+        _: Digest,
+    ) -> Result<QuestionEnvelope, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no reciprocal CPU parent consumer",
+        ))
+    }
+    fn register_cpu_reciprocal_scope(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuJobEnvelope,
+        _: &QuestionEnvelope,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no existing reciprocal R scope consumer",
+        ))
+    }
+    fn prepare_cpu_reciprocal(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuReciprocalRequest,
+        _: ReciprocalQuestionId,
+        _: ExecutionMode,
+        _: Digest,
+    ) -> Result<AdaptiveReciprocalQuestion<Q>, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no reciprocal native input consumer",
+        ))
+    }
+    fn cpu_reciprocal_wait(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuSliceReport,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no reciprocal wait receipt consumer",
+        ))
+    }
+    fn discard_cpu_reciprocal(
+        &mut self,
+        _: ReciprocalQuestionId,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no reciprocal pin retirement consumer",
+        ))
+    }
+    fn prepare_accepted_role_reciprocal(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+        _: ReciprocalQuestionId,
+        _: ExecutionMode,
+        _: Digest,
+        _: SearchRecipient,
+    ) -> Result<Option<AdaptivePeerQuestion<Q>>, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no accepted-role peer question producer",
+        ))
+    }
+    fn accept_accepted_role_source(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no staged accepted role source consumer",
+        ))
+    }
+    fn consume_accepted_role_reciprocal(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+        _: Option<TicketExecutionEvidence>,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no accepted peer opinion consumer",
+        ))
+    }
+    fn consume_reciprocal_cpu(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuSliceReport,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual reciprocal CPU answer consumer",
+        ))
+    }
+    fn consume_cpu_reciprocal(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+        _: Option<TicketExecutionEvidence>,
+        _: &[(CpuReciprocalRequest, ReciprocalQuestionId)],
+    ) -> Result<Vec<CpuReciprocalReply>, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no accepted reciprocal reply consumer",
+        ))
+    }
+    fn discard_accepted_role_reciprocal(
+        &mut self,
+        _: ReciprocalQuestionId,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no accepted peer pin retirement consumer",
+        ))
+    }
     /// Immutable root registration, separate from per-frame ceilings, CPU
     /// credit, semantic consumption and physical NN/cache accounting.
     fn root_role_call_limit(&self) -> Result<Option<u64>, AdaptiveManagerError> {
@@ -899,6 +1105,7 @@ struct RoleBinding<Q, O> {
     admission_charged: bool,
     dispatch_pending: bool,
     collection_registered: bool,
+    rovent_collection_registered: bool,
     physical: Option<TicketExecutionEvidence>,
     prepared_at: Instant,
     preparation_elapsed: Option<Duration>,
@@ -912,12 +1119,15 @@ struct RoleBinding<Q, O> {
     native_acceptance_recorded: bool,
     consumption_recorded: bool,
     purpose: RolePurpose,
+    reciprocal_acceptance: Option<rz_search::pals::coordinator::AcceptedRoleStep>,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RolePurpose {
     RootRanking,
     Refinement,
     Validator,
+    Reciprocal,
+    RoventRefinement,
 }
 struct NativeAck {
     preparation: PreparationId,
@@ -943,6 +1153,11 @@ struct OwnBinding<Q> {
     requested_yield: Option<(u64, Instant)>,
     pending_slice: Option<CpuSliceReport>,
     validator_reviewed_execution: Option<ExecutionId>,
+    reciprocal: Option<reciprocal::OwnReciprocalCustody>,
+    // Linear custody of the same grant in the root's common-node controller.
+    // Its accepted native-ledger receipt is kept until the semantic owner
+    // returns; a cold Store never turns a reservation into zero work.
+    native_frontier: Option<NativeReservation>,
 }
 struct OwnSlot<Q> {
     worker: Option<CpuWorker>,
@@ -1029,6 +1244,16 @@ enum DeferredCommit<Q> {
     TokenDiscard {
         work: CoordinatorWork<ReviewView, Q>,
         termination: CpuJobTermination,
+    },
+    ReciprocalWait {
+        work: CoordinatorWork<ReviewView, Q>,
+        report: CpuSliceReport,
+    },
+    ReciprocalDiscard {
+        question: ReciprocalQuestionId,
+    },
+    PeerDiscard {
+        question: ReciprocalQuestionId,
     },
 }
 pub struct ExternalManagerWorker {
@@ -1141,6 +1366,8 @@ where
     machine: RefinementMachine<ReviewView, Q>,
     driver: D,
     role_call_limit: Option<u64>,
+    collection_observer: Option<AdaptiveCollectionObserverBox<Q, B::Output>>,
+    collection_admission: Option<RoventCollectionRootAdmission>,
     roles: Vec<RoleBinding<Q, B::Output>>,
     acknowledgements: VecDeque<NativeAck>,
     own: Vec<OwnSlot<Q>>,
@@ -1173,6 +1400,7 @@ where
     counters: AdaptiveManagerCounters,
     native_accounting: AdaptiveNativeAccountingSnapshot,
     shutdown_until: Option<Instant>,
+    cleanup_boundary: Option<CleanupBoundary>,
     native_ready: bool,
     native_verifier_registered: bool,
     retained_native_permits: Vec<NativeAcceptancePermit>,
@@ -1184,6 +1412,8 @@ where
     quarantined_foreign_receipts: Vec<ExternalWorkerReport>,
     ready_ids: Vec<FrameId>,
     deferred: VecDeque<DeferredCommit<Q>>,
+    native_frontier_events: VecDeque<frontier::NativeFrontierEvent>,
+    review_leases: RoventReviewLeaseObservation,
     validator_waiting: Vec<FrameId>,
     root_started: bool,
     cpu_node_limit_reached: bool,
@@ -1192,6 +1422,12 @@ where
     registered_action: Option<AdaptiveValidatorAction>,
     exclusive_scope: Option<ExclusiveActionScope>,
     finished_at: Option<Instant>,
+    reciprocal_policy: Option<RoventReciprocalPolicy>,
+    next_reciprocal_question: u64,
+    peer_policy: Option<RoventPeerFollowupPolicy>,
+    accepted_roles: Vec<reciprocal::AcceptedRoleCustody<Q, B::Output>>,
+    peer_sources_admitted: u16,
+    peer_observations: Vec<PeerFollowupObservation>,
 }
 
 impl<Q, B, D> AdaptiveExecutionManager<Q, B, D>
@@ -1443,6 +1679,8 @@ where
             machine,
             driver,
             role_call_limit,
+            collection_observer: None,
+            collection_admission: None,
             roles: Vec::with_capacity(limits.role_tickets_max),
             acknowledgements: VecDeque::with_capacity(limits.role_tickets_max),
             own: own_workers
@@ -1483,6 +1721,7 @@ where
             counters: AdaptiveManagerCounters::default(),
             native_accounting: AdaptiveNativeAccountingSnapshot::default(),
             shutdown_until: None,
+            cleanup_boundary: None,
             native_ready,
             native_verifier_registered,
             retained_native_permits: Vec::with_capacity(limits.role_tickets_max),
@@ -1494,6 +1733,8 @@ where
             quarantined_foreign_receipts: Vec::with_capacity(1),
             ready_ids: Vec::with_capacity(limits.waiting_jobs_max),
             deferred: VecDeque::with_capacity(128),
+            native_frontier_events: VecDeque::with_capacity(32),
+            review_leases: RoventReviewLeaseObservation::new(limits.role_tickets_max),
             validator_waiting: Vec::with_capacity(limits.waiting_jobs_max),
             root_started: false,
             cpu_node_limit_reached: false,
@@ -1502,6 +1743,12 @@ where
             registered_action: None,
             exclusive_scope: None,
             finished_at: None,
+            reciprocal_policy: None,
+            next_reciprocal_question: 1,
+            peer_policy: None,
+            accepted_roles: Vec::with_capacity(MAX_ROLE_PENDING),
+            peer_sources_admitted: 0,
+            peer_observations: Vec::with_capacity(128),
         })
     }
     pub fn new_continued(
@@ -1712,6 +1959,60 @@ where
     pub fn counters(&self) -> AdaptiveManagerCounters {
         self.counters
     }
+    /// 실제 수집을 요청한 caller만 root 시작 전에 설치한다. 기존 dispatch
+    /// observer와 native owner 입력 observer는 별도 원 소유 경계로 유지한다.
+    pub fn set_collection_observer(
+        &mut self,
+        mut observer: AdaptiveCollectionObserverBox<Q, B::Output>,
+    ) -> Result<(), AdaptiveManagerError> {
+        if self.root_started
+            || !self.roles.is_empty()
+            || self.phase != ManagerPhase::Running
+            || self.collection_observer.is_some()
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "collection observer installation order",
+            ));
+        }
+        let admission = self
+            .collection_admission
+            .as_ref()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "collection requires original Rovent root admission",
+            ))?;
+        observer.admitted(admission)?;
+        self.collection_observer = Some(observer);
+        Ok(())
+    }
+    pub(crate) fn admit_collection_root(
+        &mut self,
+        admission: RoventCollectionRootAdmission,
+    ) -> Result<(), AdaptiveManagerError> {
+        if self.root_started
+            || !self.roles.is_empty()
+            || self.collection_admission.is_some()
+            || self.phase != ManagerPhase::Running
+            || admission.authority() != self.registration.authority
+            || !Arc::ptr_eq(admission.rules(), &self.driver.root_rules())
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "original Rovent collection root scope",
+            ));
+        }
+        self.collection_admission = Some(admission);
+        Ok(())
+    }
+    /// 다음 root에서 재사용할 observer 반환은 실제 owner fence 뒤만 허용한다.
+    pub fn take_collection_observer(
+        &mut self,
+    ) -> Result<Option<AdaptiveCollectionObserverBox<Q, B::Output>>, AdaptiveManagerError> {
+        if self.phase != ManagerPhase::Finished {
+            return Err(AdaptiveManagerError::Invalid(
+                "collection observer requires settled root",
+            ));
+        }
+        Ok(self.collection_observer.take())
+    }
     /// Explicit diagnostic opt-in before root/CPU admission. This can be used
     /// from the read-only diagnostic root hook: it installs observation only,
     /// never a callback, worker control, credit or semantic acceptance permit.
@@ -1811,6 +2112,37 @@ where
     pub fn driver_mut(&mut self) -> &mut D {
         &mut self.driver
     }
+    /// Register the caller's original finite cleanup deadline before this
+    /// root admits work. This policy can shorten closure, never extend it.
+    pub fn register_cleanup_deadline(
+        &mut self,
+        original_cleanup_deadline: Instant,
+    ) -> Result<(), AdaptiveManagerError> {
+        if self.cleanup_boundary.is_some()
+            || self.phase != ManagerPhase::Running
+            || self.root_started
+            || self.shutdown_until.is_some()
+            || self.counters.native_preparations != 0
+            || !self.roles.is_empty()
+            || self.own.iter().any(|slot| slot.binding.is_some())
+            || self.foreign.is_some()
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "original cleanup deadline admission",
+            ));
+        }
+        self.cleanup_boundary = Some(CleanupBoundary::admit(
+            self.registration.hard_deadline,
+            original_cleanup_deadline,
+        )?);
+        Ok(())
+    }
+    pub fn registered_cleanup_deadline(&self) -> Option<Instant> {
+        self.cleanup_boundary.map(CleanupBoundary::original)
+    }
+    fn cleanup_until(&self) -> Result<Instant, AdaptiveManagerError> {
+        automatic_cleanup_deadline(self.cleanup_boundary)
+    }
     pub fn enable_exclusive_action_capture(&mut self) -> Result<(), AdaptiveManagerError> {
         if self.root_started
             || self.phase != ManagerPhase::Running
@@ -1903,6 +2235,11 @@ where
     pub fn native_cpu_usage(&self) -> Result<(u64, u64), AdaptiveManagerError> {
         Ok(self.ledger.global_usage()?)
     }
+    /// Actual single-writer identity for opt-in root-controller attachment.
+    /// A digest or a freshly constructed ledger cannot replace this owner.
+    pub fn cpu_ledger_identity(&self) -> CpuLedgerIdentity {
+        self.ledger.identity()
+    }
     pub fn cpu_node_limit_reached(&self) -> bool {
         self.cpu_node_limit_reached
     }
@@ -1932,10 +2269,12 @@ where
     }
     pub fn has_pending_work(&self) -> bool {
         !self.roles.is_empty()
+            || !self.accepted_roles.is_empty()
             || self.machine.frames().next().is_some()
             || self.own.iter().any(|slot| slot.binding.is_some())
             || self.foreign.is_some()
             || !self.deferred.is_empty()
+            || !self.native_frontier_events.is_empty()
             || !self.driver.semantic_owner_available()
     }
     /// The root P call is issued exactly once. Candidate frames are admitted
@@ -2094,11 +2433,24 @@ where
         Ok(now)
     }
     fn role_pending_limit(&self) -> usize {
-        if self.registration.policy == CoordinatorPolicy::Synchronous {
+        let declared = if self.registration.policy == CoordinatorPolicy::Synchronous {
             1
         } else {
             self.limits.role_tickets_max
-        }
+        };
+        self.driver
+            .review_lease_admission()
+            .ok()
+            .flatten()
+            .filter(|state| state.frontier_owner_present)
+            .map_or(declared, |state| {
+                declared.min(
+                    state
+                        .capacity
+                        .saturating_sub(1)
+                        .saturating_sub(state.frontier_replacement_reserve),
+                )
+            })
     }
     /// Jobs waiting before their first physical CPU slice share this ceiling.
     /// A started paused owner waiting for V feedback is not a new queued Job;
@@ -2137,7 +2489,9 @@ where
             let allowed = match purpose {
                 RolePurpose::RootRanking => false,
                 RolePurpose::Validator => scope.action.is_none(),
-                RolePurpose::Refinement => {
+                RolePurpose::Refinement
+                | RolePurpose::Reciprocal
+                | RolePurpose::RoventRefinement => {
                     work.as_ref().is_some_and(|work| scope.allows(work.frame))
                 }
             };
@@ -2192,6 +2546,7 @@ where
             admission_charged: false,
             dispatch_pending: false,
             collection_registered: false,
+            rovent_collection_registered: false,
             physical: None,
             prepared_at: Instant::now(),
             preparation_elapsed: None,
@@ -2205,6 +2560,7 @@ where
             native_acceptance_recorded: false,
             consumption_recorded: false,
             purpose,
+            reciprocal_acceptance: None,
         });
         self.counters.native_preparations += 1;
         Ok(preparation)
@@ -2301,19 +2657,11 @@ where
             self.record_failure(error);
         }
         if !self.failures.is_empty() && self.shutdown_until.is_none() {
-            self.begin_selected_shutdown(
-                Instant::now()
-                    .checked_add(Duration::from_secs(30))
-                    .ok_or(AdaptiveManagerError::Deadline)?,
-            )?;
+            self.begin_selected_shutdown(self.cleanup_until()?)?;
         }
         if self.phase == ManagerPhase::Running {
             if self.check_running().is_err() {
-                self.begin_selected_shutdown(
-                    Instant::now()
-                        .checked_add(Duration::from_secs(30))
-                        .ok_or(AdaptiveManagerError::Deadline)?,
-                )?;
+                self.begin_selected_shutdown(self.cleanup_until()?)?;
             } else {
                 for action in [
                     Self::flush_deferred,
@@ -2329,6 +2677,13 @@ where
                             break;
                         }
                     }
+                    if self
+                        .failures
+                        .iter()
+                        .any(|error| matches!(error, AdaptiveManagerError::Collection(_)))
+                    {
+                        break;
+                    }
                 }
                 let exclusive_completed = self
                     .exclusive_scope
@@ -2340,11 +2695,9 @@ where
                         // completion/ack/semantic commit obligations. Budget
                         // exhaustion only closes new work; it cannot discard
                         // an already reserved output to manufacture success.
-                        || (self.role_call_limit_reached() && self.roles.is_empty()))
+                        || (self.role_call_limit_reached() && self.roles.is_empty() && self.accepted_roles.is_empty()))
                 {
-                    let until = Instant::now()
-                        .checked_add(Duration::from_secs(30))
-                        .ok_or(AdaptiveManagerError::Deadline)?;
+                    let until = self.cleanup_until()?;
                     if exclusive_completed {
                         self.begin_root_quiesce(until)?;
                     } else {
@@ -2352,11 +2705,7 @@ where
                     }
                 }
                 if !self.failures.is_empty() {
-                    self.begin_selected_shutdown(
-                        Instant::now()
-                            .checked_add(Duration::from_secs(30))
-                            .ok_or(AdaptiveManagerError::Deadline)?,
-                    )?;
+                    self.begin_selected_shutdown(self.cleanup_until()?)?;
                 }
             }
         } else {
@@ -2450,10 +2799,35 @@ where
         if matches!(error, AdaptiveManagerError::AuxiliaryPending) {
             return;
         }
+        if let AdaptiveManagerError::ReviewLeaseBackpressure {
+            current,
+            capacity,
+            required_new,
+            replacement_reserve,
+        } = &error
+        {
+            self.review_leases.record_blocked(
+                *current,
+                *capacity,
+                *required_new,
+                *replacement_reserve,
+            );
+            if self.review_lease_return_can_progress() {
+                // The existing source packet remains in its original binding
+                // or deferred queue. Wait for a real owner event; never drop
+                // its view to make room or count this as semantic success.
+                return;
+            }
+            self.review_leases.terminal_capacity = true;
+        }
         if self.failures.len() == 64 {
             self.failures.pop_front();
         }
         let unsafe_completion = matches!(error, AdaptiveManagerError::PhysicalUnknown)
+            || matches!(
+                error,
+                AdaptiveManagerError::Frontier(FrontierError::NativeUnknown)
+            )
             || matches!(
                 error,
                 AdaptiveManagerError::Cpu(
@@ -2469,511 +2843,585 @@ where
         &mut self,
         event: TicketNativeEvent<B::Output>,
     ) -> Result<(), AdaptiveManagerError> {
-        match event {
-            TicketNativeEvent::Ready { clock } => {
-                if clock.domain() != self.clock.domain() || clock.origin() != self.clock.origin() {
-                    return Err(AdaptiveManagerError::Invalid(
-                        "native owner clock origin mismatch",
-                    ));
-                }
-                self.native_ready = true;
-                if self.phase == ManagerPhase::Running && !self.native_verifier_registered {
-                    // Startup may finish after a terminal root or cancellation
-                    // has already revoked admission. Its real Ready remains a
-                    // clock/owner observation; it cannot install new acceptance
-                    // authority into the closed registry. The next root uses
-                    // the same native owner's persistent verifier readback.
-                    let verifier = self.native.native_acceptance_verifier().ok_or(
-                        AdaptiveManagerError::Invalid(
-                            "native Ready has no owner acceptance verifier",
-                        ),
-                    )?;
-                    self.registry
-                        .register_native_acceptance_verifier(verifier)?;
-                    self.native_verifier_registered = true;
-                }
+        let mut collection_failures = Vec::new();
+        if let Some(observer) = &mut self.collection_observer {
+            if let Err(error) = observer.native_event(&event) {
+                collection_failures.push(error);
             }
-            TicketNativeEvent::StartupFailed(failure) => {
-                return Err(AdaptiveManagerError::Semantic(format!(
-                    "native startup: {failure:?}"
-                )));
-            }
-            TicketNativeEvent::Prepared(prepared) => {
-                let index = self
-                    .roles
-                    .iter()
-                    .position(|binding| binding.preparation == prepared.preparation)
-                    .ok_or(AdaptiveManagerError::Invalid("unknown native preparation"))?;
-                let binding = &self.roles[index];
-                if binding.ticket.is_some()
-                    || binding.admission_charged
-                    || prepared.question != binding.input.question_digest
-                    || prepared.view != binding.input.view_seal
-                    || Some(prepared.role) != binding.input.stage.role()
-                    || prepared.original_deadline != self.deadline
-                {
-                    return Err(AdaptiveManagerError::Invalid(
-                        "prepared immutable question echo mismatch",
-                    ));
-                }
-                if self.phase != ManagerPhase::Running || self.check_running().is_err() {
-                    self.native.cancel(prepared.preparation)?;
-                    self.counters.canceled_preparations += 1;
-                    return Ok(());
-                }
-                let now = self.check_running()?;
-                let ticket = self.registry.admit(
-                    RoleSubmission {
-                        question: prepared.question,
-                        view: prepared.view,
-                        representation: prepared.representation,
-                        role: prepared.role,
-                        original_deadline: prepared.original_deadline,
-                    },
-                    Arc::clone(&binding.input.view),
-                    self.clock.domain(),
-                    now,
-                )?;
-                let work = binding.work.clone();
-                let preparation_elapsed = binding.prepared_at.elapsed();
-                self.roles[index].admission_charged = true;
-                if let Some(work) = &work {
-                    if matches!(
-                        work.input.stage,
-                        RefinementStage::FreshRepairedEndpoint
-                            | RefinementStage::FreshCounterEndpoint
-                    ) {
-                        // Endpoint input differs, while the public scope is
-                        // frozen. The actual Root Rules perspective is fixed.
-                        self.machine.seal_fresh_pair(
-                            work.frame,
-                            FreshPairSeal::from_ticket(
-                                &ticket,
-                                work.input.public_context,
-                                self.driver.root_rules().snapshot().side_to_move(),
+        }
+        // 수집 오류가 non-Clone permit/receipt나 물리 완료 packet을 버리게
+        // 해서는 안 된다. 원 runtime 처리를 먼저 마치고 오류를 따로 남긴다.
+        let runtime_result = (|| -> Result<(), AdaptiveManagerError> {
+            match event {
+                TicketNativeEvent::Ready { clock } => {
+                    if clock.domain() != self.clock.domain()
+                        || clock.origin() != self.clock.origin()
+                    {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "native owner clock origin mismatch",
+                        ));
+                    }
+                    self.native_ready = true;
+                    if self.phase == ManagerPhase::Running && !self.native_verifier_registered {
+                        // Startup may finish after a terminal root or cancellation
+                        // has already revoked admission. Its real Ready remains a
+                        // clock/owner observation; it cannot install new acceptance
+                        // authority into the closed registry. The next root uses
+                        // the same native owner's persistent verifier readback.
+                        let verifier = self.native.native_acceptance_verifier().ok_or(
+                            AdaptiveManagerError::Invalid(
+                                "native Ready has no owner acceptance verifier",
                             ),
                         )?;
+                        self.registry
+                            .register_native_acceptance_verifier(verifier)?;
+                        self.native_verifier_registered = true;
                     }
-                    self.machine
-                        .bind_role(work.frame, &ticket, self.clock.domain(), now)?;
                 }
-                let class = role_cost_class(&ticket, self.registration.device_digest);
-                // Cache/Fresh ownership is known only at the actual completion.
-                // Retain this duration rather than training an assumed Miss.
-                self.roles[index].ticket = Some(ticket);
-                self.roles[index].class = Some(class);
-                self.roles[index].preparation_elapsed = Some(preparation_elapsed);
-                self.roles[index].dispatch_pending = true;
-                if let Some(frame) = self.roles[index].work.as_ref().map(|work| work.frame) {
-                    self.roles[index].work = Some(
+                TicketNativeEvent::StartupFailed(failure) => {
+                    return Err(AdaptiveManagerError::Semantic(format!(
+                        "native startup: {failure:?}"
+                    )));
+                }
+                TicketNativeEvent::Prepared(prepared) => {
+                    let index = self
+                        .roles
+                        .iter()
+                        .position(|binding| binding.preparation == prepared.preparation)
+                        .ok_or(AdaptiveManagerError::Invalid("unknown native preparation"))?;
+                    let binding = &self.roles[index];
+                    if binding.ticket.is_some()
+                        || binding.admission_charged
+                        || prepared.question != binding.input.question_digest
+                        || prepared.view != binding.input.view_seal
+                        || Some(prepared.role) != binding.input.stage.role()
+                        || prepared.original_deadline != self.deadline
+                    {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "prepared immutable question echo mismatch",
+                        ));
+                    }
+                    if self.phase != ManagerPhase::Running || self.check_running().is_err() {
+                        self.native.cancel(prepared.preparation)?;
+                        self.counters.canceled_preparations += 1;
+                        return Ok(());
+                    }
+                    let now = self.check_running()?;
+                    let ticket = self.registry.admit(
+                        RoleSubmission {
+                            question: prepared.question,
+                            view: prepared.view,
+                            representation: prepared.representation,
+                            role: prepared.role,
+                            original_deadline: prepared.original_deadline,
+                        },
+                        Arc::clone(&binding.input.view),
+                        self.clock.domain(),
+                        now,
+                    )?;
+                    let work = binding.work.clone();
+                    let preparation_elapsed = binding.prepared_at.elapsed();
+                    self.roles[index].admission_charged = true;
+                    if let Some(work) = &work {
+                        if matches!(
+                            work.input.stage,
+                            RefinementStage::FreshRepairedEndpoint
+                                | RefinementStage::FreshCounterEndpoint
+                        ) {
+                            // Endpoint input differs, while the public scope is
+                            // frozen. The actual Root Rules perspective is fixed.
+                            self.machine.seal_fresh_pair(
+                                work.frame,
+                                FreshPairSeal::from_ticket(
+                                    &ticket,
+                                    work.input.public_context,
+                                    self.driver.root_rules().snapshot().side_to_move(),
+                                ),
+                            )?;
+                        }
                         self.machine
-                            .bound_work(frame, StepExecution::Role(ticket.id))?,
-                    );
+                            .bind_role(work.frame, &ticket, self.clock.domain(), now)?;
+                    }
+                    let class = role_cost_class(&ticket, self.registration.device_digest);
+                    // Cache/Fresh ownership is known only at the actual completion.
+                    // Retain this duration rather than training an assumed Miss.
+                    self.roles[index].ticket = Some(ticket);
+                    self.roles[index].class = Some(class);
+                    self.roles[index].preparation_elapsed = Some(preparation_elapsed);
+                    self.roles[index].dispatch_pending = true;
+                    if let Some(frame) = self.roles[index].work.as_ref().map(|work| work.frame) {
+                        self.roles[index].work = Some(
+                            self.machine
+                                .bound_work(frame, StepExecution::Role(ticket.id))?,
+                        );
+                    }
+                    self.counters.submitted_role_tickets += 1;
+                    self.counters.validator_ticket_admissions +=
+                        u64::from(self.roles[index].purpose == RolePurpose::Validator);
                 }
-                self.counters.submitted_role_tickets += 1;
-                self.counters.validator_ticket_admissions +=
-                    u64::from(self.roles[index].purpose == RolePurpose::Validator);
-            }
-            TicketNativeEvent::Started(ticket) => {
-                self.registry.physical_started(&ticket)?;
-                let binding = self.role_mut(ticket.id)?;
-                if binding.ticket != Some(ticket) {
-                    return Err(AdaptiveManagerError::Invalid("started ticket echo"));
+                TicketNativeEvent::Started(ticket) => {
+                    self.registry.physical_started(&ticket)?;
+                    let binding = self.role_mut(ticket.id)?;
+                    if binding.ticket != Some(ticket) {
+                        return Err(AdaptiveManagerError::Invalid("started ticket echo"));
+                    }
                 }
-            }
-            TicketNativeEvent::OwnerRunStarted { ticket, started_at } => {
-                if started_at < self.clock.origin() || started_at > Instant::now() {
-                    return Err(AdaptiveManagerError::Invalid(
-                        "owner service clock timestamp",
-                    ));
+                TicketNativeEvent::OwnerRunStarted { ticket, started_at } => {
+                    if started_at < self.clock.origin() || started_at > Instant::now() {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "owner service clock timestamp",
+                        ));
+                    }
+                    let binding = self.role_mut(ticket.id)?;
+                    if binding.ticket != Some(ticket) || binding.dispatched_at.is_some() {
+                        return Err(AdaptiveManagerError::Invalid("owner service start ticket"));
+                    }
+                    let admitted_at =
+                        binding
+                            .queue_admitted_at
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "owner start lacks queue admission clock",
+                            ))?;
+                    binding.queue_wait =
+                        Some(started_at.checked_duration_since(admitted_at).ok_or(
+                            AdaptiveManagerError::Invalid("owner start predates queue admission"),
+                        )?);
+                    binding.dispatched_at = Some(started_at);
                 }
-                let binding = self.role_mut(ticket.id)?;
-                if binding.ticket != Some(ticket) || binding.dispatched_at.is_some() {
-                    return Err(AdaptiveManagerError::Invalid("owner service start ticket"));
-                }
-                let admitted_at =
-                    binding
-                        .queue_admitted_at
-                        .ok_or(AdaptiveManagerError::Invalid(
-                            "owner start lacks queue admission clock",
-                        ))?;
-                binding.queue_wait = Some(started_at.checked_duration_since(admitted_at).ok_or(
-                    AdaptiveManagerError::Invalid("owner start predates queue admission"),
-                )?);
-                binding.dispatched_at = Some(started_at);
-            }
-            TicketNativeEvent::Completed {
-                completion,
-                evidence,
-                owner_run,
-                owner_service_elapsed,
-            } => {
-                let retained = RetainedNativeCompletion {
-                    completion: RoleCompletion {
-                        ticket: completion.ticket,
-                        physical: completion.physical,
-                        result: completion.result.clone(),
-                    },
+                TicketNativeEvent::Completed {
+                    completion,
                     evidence,
                     owner_run,
                     owner_service_elapsed,
-                };
-                #[cfg(feature = "pals-adaptive-diagnostics")]
-                let diagnostic_completion_ticket = completion.ticket.id;
-                let outcome = (|| -> Result<(), AdaptiveManagerError> {
-                    let ticket = completion.ticket;
-                    let physical = completion.physical;
-                    let success = completion.result.is_ok();
-                    let failure = completion.result.as_ref().err().cloned();
-                    let binding = self
-                        .roles
-                        .iter_mut()
-                        .find(|binding| binding.ticket == Some(ticket))
-                        .ok_or(AdaptiveManagerError::Invalid(
-                            "completion has no original native binding",
-                        ))?;
-                    if binding.service_completed {
-                        // Reject the repeated source event before replacing
-                        // the original evidence or charging raw NN inputs.
-                        return Err(AdaptiveManagerError::Invalid(
-                            "duplicate original native completion",
-                        ));
-                    }
-                    if owner_run.ticket() != &ticket {
-                        return Err(AdaptiveManagerError::Invalid(
-                            "completion owner-run witness differs from original ticket",
-                        ));
-                    }
-                    binding.physical = evidence;
-                    binding.service_completed = true;
-                    let mut class = binding.class;
-                    if let (Some(class), Some(evidence)) = (&mut class, evidence) {
-                        if let Some(fresh) = evidence.physical_fresh {
-                            class.invocation = if fresh {
-                                InvocationClass::Fresh
-                            } else {
-                                InvocationClass::Warm
-                            };
+                } => {
+                    let retained = RetainedNativeCompletion {
+                        completion: RoleCompletion {
+                            ticket: completion.ticket,
+                            physical: completion.physical,
+                            result: completion.result.clone(),
+                        },
+                        evidence,
+                        owner_run,
+                        owner_service_elapsed,
+                    };
+                    #[cfg(feature = "pals-adaptive-diagnostics")]
+                    let diagnostic_completion_ticket = completion.ticket.id;
+                    let outcome = (|| -> Result<(), AdaptiveManagerError> {
+                        let ticket = completion.ticket;
+                        let physical = completion.physical;
+                        let success = completion.result.is_ok();
+                        let failure = completion.result.as_ref().err().cloned();
+                        let binding = self
+                            .roles
+                            .iter_mut()
+                            .find(|binding| binding.ticket == Some(ticket))
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "completion has no original native binding",
+                            ))?;
+                        if binding.service_completed {
+                            // Reject the repeated source event before replacing
+                            // the original evidence or charging raw NN inputs.
+                            return Err(AdaptiveManagerError::Invalid(
+                                "duplicate original native completion",
+                            ));
                         }
-                        class.cache = observed_public_cache_class(physical, evidence);
-                    }
-                    binding.class = class;
-                    let preparation_elapsed = binding.preparation_elapsed.take();
-                    let queue_wait = binding.queue_wait.take();
-                    // Receive-time differences can collapse to zero when Started
-                    // and Completed share one manager turn. Use owner measurement.
-                    // A public cache hit may still run a private role head.
-                    // Zero/unknown NN inputs alone never decide cache class.
-                    let elapsed = if evidence.is_some_and(|actual| {
-                        actual.measurement_complete
-                            && actual.completed_nn_inputs.is_some()
-                            && actual.physical_fresh.is_some()
-                    }) {
-                        owner_service_elapsed
-                    } else {
-                        None
-                    };
-                    let purpose = binding.purpose;
-                    self.native_accounting
-                        .observe_completion(&ticket, &owner_run, physical, success, evidence)?;
-                    let disposition = if physical == PhysicalRoleCompletion::Unknown {
-                        CostDisposition::Censored(CensorReason::PhysicalUnknown)
-                    } else if success {
-                        CostDisposition::Completed
-                    } else {
-                        CostDisposition::Censored(CensorReason::Failed)
-                    };
-                    if let Some(class) = class {
-                        if disposition == CostDisposition::Completed && elapsed.is_some() {
-                            let mut query = class;
-                            query.invocation = InvocationClass::Fresh;
-                            query.cache = CacheClass::Unknown;
-                            if !self.observed_role_classes.contains(&(ticket.role, query))
-                                && self.observed_role_classes.len() < 64
-                            {
-                                self.observed_role_classes.push((ticket.role, query));
+                        if owner_run.ticket() != &ticket {
+                            return Err(AdaptiveManagerError::Invalid(
+                                "completion owner-run witness differs from original ticket",
+                            ));
+                        }
+                        binding.physical = evidence;
+                        binding.service_completed = true;
+                        let mut class = binding.class;
+                        if let (Some(class), Some(evidence)) = (&mut class, evidence) {
+                            if let Some(fresh) = evidence.physical_fresh {
+                                class.invocation = if fresh {
+                                    InvocationClass::Fresh
+                                } else {
+                                    InvocationClass::Warm
+                                };
                             }
+                            class.cache = observed_public_cache_class(physical, evidence);
                         }
-                        for (stage, elapsed) in [
-                            (CostStage::Preparation, preparation_elapsed),
-                            (CostStage::QueueWait, queue_wait),
-                        ] {
+                        binding.class = class;
+                        let preparation_elapsed = binding.preparation_elapsed.take();
+                        let queue_wait = binding.queue_wait.take();
+                        // Receive-time differences can collapse to zero when Started
+                        // and Completed share one manager turn. Use owner measurement.
+                        // A public cache hit may still run a private role head.
+                        // Zero/unknown NN inputs alone never decide cache class.
+                        let elapsed = if evidence.is_some_and(|actual| {
+                            actual.measurement_complete
+                                && actual.completed_nn_inputs.is_some()
+                                && actual.physical_fresh.is_some()
+                        }) {
+                            owner_service_elapsed
+                        } else {
+                            None
+                        };
+                        let purpose = binding.purpose;
+                        self.native_accounting
+                            .observe_completion(&ticket, &owner_run, physical, success, evidence)?;
+                        let disposition = if physical == PhysicalRoleCompletion::Unknown {
+                            CostDisposition::Censored(CensorReason::PhysicalUnknown)
+                        } else if success {
+                            CostDisposition::Completed
+                        } else {
+                            CostDisposition::Censored(CensorReason::Failed)
+                        };
+                        if let Some(class) = class {
+                            if disposition == CostDisposition::Completed && elapsed.is_some() {
+                                let mut query = class;
+                                query.invocation = InvocationClass::Fresh;
+                                query.cache = CacheClass::Unknown;
+                                if !self.observed_role_classes.contains(&(ticket.role, query))
+                                    && self.observed_role_classes.len() < 64
+                                {
+                                    self.observed_role_classes.push((ticket.role, query));
+                                }
+                            }
+                            for (stage, elapsed) in [
+                                (CostStage::Preparation, preparation_elapsed),
+                                (CostStage::QueueWait, queue_wait),
+                            ] {
+                                self.observe_observation(
+                                    class,
+                                    stage,
+                                    CostObservation {
+                                        elapsed: elapsed
+                                            .map_or(ObservedCost::Unknown, ObservedCost::Known),
+                                        disposition: if elapsed.is_some() {
+                                            CostDisposition::Completed
+                                        } else {
+                                            disposition
+                                        },
+                                    },
+                                )?;
+                            }
                             self.observe_observation(
                                 class,
-                                stage,
+                                CostStage::GpuService,
                                 CostObservation {
                                     elapsed: elapsed
                                         .map_or(ObservedCost::Unknown, ObservedCost::Known),
-                                    disposition: if elapsed.is_some() {
-                                        CostDisposition::Completed
-                                    } else {
-                                        disposition
-                                    },
+                                    disposition,
+                                },
+                            )?;
+                            // No backend phase witness separates the physical fence
+                            // wait from service. Do not relabel service as this cost.
+                            self.observe_observation(
+                                class,
+                                CostStage::PhysicalCompletionWait,
+                                CostObservation {
+                                    elapsed: ObservedCost::Unknown,
+                                    disposition,
                                 },
                             )?;
                         }
-                        self.observe_observation(
-                            class,
-                            CostStage::GpuService,
-                            CostObservation {
-                                elapsed: elapsed.map_or(ObservedCost::Unknown, ObservedCost::Known),
-                                disposition,
-                            },
-                        )?;
-                        // No backend phase witness separates the physical fence
-                        // wait from service. Do not relabel service as this cost.
-                        self.observe_observation(
-                            class,
-                            CostStage::PhysicalCompletionWait,
-                            CostObservation {
-                                elapsed: ObservedCost::Unknown,
-                                disposition,
-                            },
-                        )?;
-                    }
-                    if let Some(evidence) = evidence {
-                        if evidence.measurement_complete {
-                            if let Some(count) = evidence.completed_nn_inputs {
-                                self.counters.completed_nn_inputs =
-                                    self.counters.completed_nn_inputs.checked_add(count).ok_or(
-                                        AdaptiveManagerError::Capacity("completed NN input count"),
-                                    )?;
+                        if let Some(evidence) = evidence {
+                            if evidence.measurement_complete {
+                                if let Some(count) = evidence.completed_nn_inputs {
+                                    self.counters.completed_nn_inputs = self
+                                        .counters
+                                        .completed_nn_inputs
+                                        .checked_add(count)
+                                        .ok_or(AdaptiveManagerError::Capacity(
+                                            "completed NN input count",
+                                        ))?;
+                                } else {
+                                    self.counters.nn_input_count_unknown += 1;
+                                }
                             } else {
                                 self.counters.nn_input_count_unknown += 1;
                             }
-                        } else {
+                        } else if owner_run.backend_run_invoked()
+                            || physical != PhysicalRoleCompletion::Confirmed
+                            || success
+                        {
                             self.counters.nn_input_count_unknown += 1;
                         }
-                    } else if owner_run.backend_run_invoked()
-                        || physical != PhysicalRoleCompletion::Confirmed
-                        || success
-                    {
-                        self.counters.nn_input_count_unknown += 1;
-                    }
-                    self.counters.physical_role_completions +=
-                        u64::from(physical == PhysicalRoleCompletion::Confirmed);
-                    let completed = match purpose {
-                        RolePurpose::RootRanking => {
-                            self.registry.complete_proposer_ranking(completion)
+                        self.counters.physical_role_completions +=
+                            u64::from(physical == PhysicalRoleCompletion::Confirmed);
+                        let completed = match purpose {
+                            RolePurpose::RootRanking => {
+                                self.registry.complete_proposer_ranking(completion)
+                            }
+                            RolePurpose::Validator => {
+                                self.registry.complete_validator_task(completion)
+                            }
+                            RolePurpose::Refinement => self.registry.complete(completion),
+                            RolePurpose::Reciprocal => {
+                                self.registry.complete_reciprocal_role(completion)
+                            }
+                            RolePurpose::RoventRefinement => {
+                                self.registry.complete_reciprocal_role(completion)
+                            }
+                        };
+                        if let Err(rejected) = completed {
+                            self.counters.rejected_events += 1;
+                            if rejected.completion.physical == PhysicalRoleCompletion::Unknown {
+                                // Worker protocol bounds this storage. On corruption,
+                                // retaining is mandatory; do not invent a fence.
+                                self.quarantine_rejections.push(rejected.completion);
+                                return Err(AdaptiveManagerError::PhysicalUnknown);
+                            }
+                            return Err(AdaptiveManagerError::Coordinator(rejected.error));
                         }
-                        RolePurpose::Validator => self.registry.complete_validator_task(completion),
-                        RolePurpose::Refinement => self.registry.complete(completion),
-                    };
-                    if let Err(rejected) = completed {
-                        self.counters.rejected_events += 1;
-                        if rejected.completion.physical == PhysicalRoleCompletion::Unknown {
-                            // Worker protocol bounds this storage. On corruption,
-                            // retaining is mandatory; do not invent a fence.
-                            self.quarantine_rejections.push(rejected.completion);
+                        if physical == PhysicalRoleCompletion::Unknown {
                             return Err(AdaptiveManagerError::PhysicalUnknown);
                         }
-                        return Err(AdaptiveManagerError::Coordinator(rejected.error));
+                        if self.phase == ManagerPhase::Running {
+                            if let Some(failure) = failure {
+                                return Err(AdaptiveManagerError::Semantic(format!(
+                                    "native role execution: {failure:?}"
+                                )));
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = outcome {
+                        // Preserve unknown binding, observation overflow and
+                        // registry rejection just as carefully as backend errors.
+                        self.retained_native_completions.push(retained);
+                        return Err(error);
                     }
-                    if physical == PhysicalRoleCompletion::Unknown {
-                        return Err(AdaptiveManagerError::PhysicalUnknown);
-                    }
-                    if self.phase == ManagerPhase::Running {
-                        if let Some(failure) = failure {
-                            return Err(AdaptiveManagerError::Semantic(format!(
-                                "native role execution: {failure:?}"
-                            )));
+                    #[cfg(feature = "pals-adaptive-diagnostics")]
+                    self.observe_pending_diagnostic(
+                        ContinuationPendingSource::CompletionProcessed,
+                        diagnostic_completion_ticket,
+                        None,
+                    );
+                }
+                TicketNativeEvent::PreparationFailed {
+                    preparation,
+                    failure,
+                } => {
+                    if let Some(index) = self
+                        .roles
+                        .iter()
+                        .position(|binding| binding.preparation == preparation)
+                    {
+                        if self.roles[index].ticket.is_none() {
+                            self.roles.remove(index);
+                        } else {
+                            return Err(AdaptiveManagerError::Invalid(
+                                "prepared ticket failed after issue",
+                            ));
                         }
                     }
-                    Ok(())
-                })();
-                if let Err(error) = outcome {
-                    // Preserve unknown binding, observation overflow and
-                    // registry rejection just as carefully as backend errors.
-                    self.retained_native_completions.push(retained);
-                    return Err(error);
+                    if self.phase == ManagerPhase::Running {
+                        return Err(AdaptiveManagerError::Semantic(format!(
+                            "native preparation: {failure:?}"
+                        )));
+                    }
                 }
-                #[cfg(feature = "pals-adaptive-diagnostics")]
-                self.observe_pending_diagnostic(
-                    ContinuationPendingSource::CompletionProcessed,
-                    diagnostic_completion_ticket,
-                    None,
-                );
-            }
-            TicketNativeEvent::PreparationFailed {
-                preparation,
-                failure,
-            } => {
-                if let Some(index) = self
-                    .roles
-                    .iter()
-                    .position(|binding| binding.preparation == preparation)
-                {
-                    if self.roles[index].ticket.is_none() {
-                        self.roles.remove(index);
+                TicketNativeEvent::Rejected { preparation, error } => {
+                    if self.phase != ManagerPhase::Running {
+                        if let Some(index) = self.roles.iter().position(|binding| {
+                            binding.preparation == preparation && binding.ticket.is_none()
+                        }) {
+                            self.roles.remove(index);
+                        }
                     } else {
-                        return Err(AdaptiveManagerError::Invalid(
-                            "prepared ticket failed after issue",
-                        ));
+                        return Err(AdaptiveManagerError::Native(error));
                     }
                 }
-                if self.phase == ManagerPhase::Running {
-                    return Err(AdaptiveManagerError::Semantic(format!(
-                        "native preparation: {failure:?}"
-                    )));
-                }
-            }
-            TicketNativeEvent::Rejected { preparation, error } => {
-                if self.phase != ManagerPhase::Running {
-                    if let Some(index) = self.roles.iter().position(|binding| {
-                        binding.preparation == preparation && binding.ticket.is_none()
-                    }) {
-                        self.roles.remove(index);
-                    }
-                } else {
-                    return Err(AdaptiveManagerError::Native(error));
-                }
-            }
-            TicketNativeEvent::Retired {
-                ticket,
-                accepted,
-                result,
-                native_receipt,
-                rejected_permit,
-            } => {
-                let index = self
-                    .roles
-                    .iter()
-                    .position(|binding| binding.ticket == Some(ticket));
-                let Some(index) = index else {
-                    // A malformed/late echo cannot discard linear owner
-                    // evidence. Keep it quarantined until a real fence.
+                TicketNativeEvent::Retired {
+                    ticket,
+                    accepted,
+                    result,
+                    native_receipt,
+                    rejected_permit,
+                } => {
+                    let index = self
+                        .roles
+                        .iter()
+                        .position(|binding| binding.ticket == Some(ticket));
+                    let Some(index) = index else {
+                        // A malformed/late echo cannot discard linear owner
+                        // evidence. Keep it quarantined until a real fence.
+                        if let Some(permit) = rejected_permit {
+                            self.retained_native_permits.push(permit);
+                        }
+                        if let Some(receipt) = native_receipt {
+                            self.retained_native_receipts.push(receipt);
+                        }
+                        return Err(AdaptiveManagerError::Invalid("unknown native retirement"));
+                    };
                     if let Some(permit) = rejected_permit {
                         self.retained_native_permits.push(permit);
                     }
-                    if let Some(receipt) = native_receipt {
-                        self.retained_native_receipts.push(receipt);
+                    if let Err(failure) = result {
+                        if let Some(receipt) = native_receipt {
+                            self.retained_native_receipts.push(receipt);
+                        }
+                        // A failed accept reports accepted=false. Preserve the
+                        // original output until the owner's discard/fence rather
+                        // than treating the echo as an accepted seed.
+                        return Err(if failure == RoleFailure::PhysicalUnknown {
+                            AdaptiveManagerError::PhysicalUnknown
+                        } else {
+                            AdaptiveManagerError::Semantic(format!(
+                                "native retirement: {failure:?}"
+                            ))
+                        });
                     }
-                    return Err(AdaptiveManagerError::Invalid("unknown native retirement"));
-                };
-                if let Some(permit) = rejected_permit {
-                    self.retained_native_permits.push(permit);
-                }
-                if let Err(failure) = result {
-                    if let Some(receipt) = native_receipt {
-                        self.retained_native_receipts.push(receipt);
+                    if self.roles[index].ack_accepted != Some(accepted) {
+                        if let Some(receipt) = native_receipt {
+                            self.retained_native_receipts.push(receipt);
+                        }
+                        return Err(AdaptiveManagerError::Invalid(
+                            "native acceptance ack mismatch",
+                        ));
                     }
-                    // A failed accept reports accepted=false. Preserve the
-                    // original output until the owner's discard/fence rather
-                    // than treating the echo as an accepted seed.
-                    return Err(if failure == RoleFailure::PhysicalUnknown {
-                        AdaptiveManagerError::PhysicalUnknown
-                    } else {
-                        AdaptiveManagerError::Semantic(format!("native retirement: {failure:?}"))
-                    });
-                }
-                if self.roles[index].ack_accepted != Some(accepted) {
-                    if let Some(receipt) = native_receipt {
-                        self.retained_native_receipts.push(receipt);
+                    if accepted && !self.roles[index].native_acceptance_recorded {
+                        let mut native_accounting = self.native_accounting;
+                        native_accounting
+                            .observe_owner_acceptance(ticket.role, self.roles[index].physical)?;
+                        match self.roles[index]
+                            .physical
+                            .filter(|physical| physical.measurement_complete)
+                            .and_then(|physical| physical.completed_nn_inputs)
+                        {
+                            Some(count) => {
+                                self.counters.accepted_nn_inputs =
+                                    self.counters.accepted_nn_inputs.checked_add(count).ok_or(
+                                        AdaptiveManagerError::Capacity("native accepted NN count"),
+                                    )?;
+                            }
+                            None => self.counters.accepted_nn_input_count_unknown += 1,
+                        }
+                        self.roles[index].native_acceptance_recorded = true;
+                        self.native_accounting = native_accounting;
                     }
-                    return Err(AdaptiveManagerError::Invalid(
-                        "native acceptance ack mismatch",
-                    ));
-                }
-                if accepted && !self.roles[index].native_acceptance_recorded {
-                    let mut native_accounting = self.native_accounting;
-                    native_accounting
-                        .observe_owner_acceptance(ticket.role, self.roles[index].physical)?;
-                    match self.roles[index]
-                        .physical
-                        .filter(|physical| physical.measurement_complete)
-                        .and_then(|physical| physical.completed_nn_inputs)
+                    let published_head = matches!(
+                        self.roles[index].purpose,
+                        RolePurpose::RootRanking | RolePurpose::Validator
+                    );
+                    if accepted
+                        && matches!(
+                            self.roles[index].purpose,
+                            RolePurpose::Reciprocal | RolePurpose::RoventRefinement
+                        )
                     {
-                        Some(count) => {
-                            self.counters.accepted_nn_inputs =
-                                self.counters.accepted_nn_inputs.checked_add(count).ok_or(
-                                    AdaptiveManagerError::Capacity("native accepted NN count"),
-                                )?;
+                        let receipt = native_receipt.ok_or(AdaptiveManagerError::Invalid(
+                            "reciprocal acceptance has no actual native-owner receipt",
+                        ))?;
+                        if self.phase == ManagerPhase::Running && self.check_running().is_ok() {
+                            let now = self.check_running()?;
+                            match self.registry.accept_reciprocal_native(
+                                receipt,
+                                self.clock.domain(),
+                                now,
+                            ) {
+                                Ok(accepted_step) => {
+                                    self.roles[index].reciprocal_acceptance = Some(accepted_step);
+                                    if let Some(observer) = &mut self.collection_observer {
+                                        let binding = &self.roles[index];
+                                        if let (Some(proof), Some(output)) =
+                                            (&binding.reciprocal_acceptance, &binding.delivered)
+                                        {
+                                            if let Err(error) = observer.accepted(
+                                                proof,
+                                                &binding.input,
+                                                output.as_ref(),
+                                            ) {
+                                                collection_failures.push(error);
+                                            }
+                                        } else {
+                                            collection_failures.push(AdaptiveCollectionError::new(AdaptiveCollectionStage::Accepted,"MissingOriginalOutput","accepted native proof has no original retained output"));
+                                        }
+                                    }
+                                }
+                                Err(rejected) => {
+                                    self.retained_native_receipts.push(rejected.receipt);
+                                    return Err(rejected.error.into());
+                                }
+                            }
+                        } else {
+                            self.retained_native_receipts.push(receipt);
                         }
-                        None => self.counters.accepted_nn_input_count_unknown += 1,
-                    }
-                    self.roles[index].native_acceptance_recorded = true;
-                    self.native_accounting = native_accounting;
-                }
-                let published_head = matches!(
-                    self.roles[index].purpose,
-                    RolePurpose::RootRanking | RolePurpose::Validator
-                );
-                if accepted && published_head {
-                    let receipt = native_receipt.ok_or(AdaptiveManagerError::Invalid(
-                        "P/V acceptance has no actual native-owner receipt",
-                    ))?;
-                    if self.phase == ManagerPhase::Running && self.check_running().is_ok() {
-                        let now = self.check_running()?;
-                        if let Err(rejected) = self.registry.confirm_native_acceptance(
-                            receipt,
-                            self.clock.domain(),
-                            now,
-                        ) {
-                            self.retained_native_receipts.push(rejected.receipt);
-                            return Err(rejected.error.into());
+                    } else if accepted && published_head {
+                        let receipt = native_receipt.ok_or(AdaptiveManagerError::Invalid(
+                            "P/V acceptance has no actual native-owner receipt",
+                        ))?;
+                        if self.phase == ManagerPhase::Running && self.check_running().is_ok() {
+                            let now = self.check_running()?;
+                            if let Err(rejected) = self.registry.confirm_native_acceptance(
+                                receipt,
+                                self.clock.domain(),
+                                now,
+                            ) {
+                                self.retained_native_receipts.push(rejected.receipt);
+                                return Err(rejected.error.into());
+                            }
+                        } else {
+                            // Logical revocation never turns a late owner success
+                            // into new search-consumption permission.
+                            self.retained_native_receipts.push(receipt);
                         }
-                    } else {
-                        // Logical revocation never turns a late owner success
-                        // into new search-consumption permission.
+                    } else if let Some(receipt) = native_receipt {
                         self.retained_native_receipts.push(receipt);
+                        return Err(AdaptiveManagerError::Invalid(
+                            "unexpected native publication receipt",
+                        ));
                     }
-                } else if let Some(receipt) = native_receipt {
-                    self.retained_native_receipts.push(receipt);
-                    return Err(AdaptiveManagerError::Invalid(
-                        "unexpected native publication receipt",
-                    ));
+                    // Retirement may need an archive owner turn before its hot
+                    // commit. Keep the original ticket/binding until that barrier
+                    // succeeds, including when receipt delivery raced shutdown.
+                    self.defer(DeferredCommit::Role { ticket, accepted })?;
                 }
-                // Retirement may need an archive owner turn before its hot
-                // commit. Keep the original ticket/binding until that barrier
-                // succeeds, including when receipt delivery raced shutdown.
-                self.defer(DeferredCommit::Role { ticket, accepted })?;
-            }
-            TicketNativeEvent::AcceptanceRejected {
-                preparation,
-                ticket,
-                error,
-                permit,
-            } => {
-                // This linear authority must survive failure until the actual
-                // root/process fence; reissuing a permit would be a duplicate.
-                let original = self.roles.iter().any(|binding| {
-                    binding.preparation == preparation && binding.ticket == Some(ticket)
-                });
-                self.retained_native_permits.push(permit);
-                if !original {
-                    return Err(AdaptiveManagerError::Invalid(
-                        "unknown native acceptance rejection",
-                    ));
+                TicketNativeEvent::AcceptanceRejected {
+                    preparation,
+                    ticket,
+                    error,
+                    permit,
+                } => {
+                    // This linear authority must survive failure until the actual
+                    // root/process fence; reissuing a permit would be a duplicate.
+                    let original = self.roles.iter().any(|binding| {
+                        binding.preparation == preparation && binding.ticket == Some(ticket)
+                    });
+                    self.retained_native_permits.push(permit);
+                    if !original {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "unknown native acceptance rejection",
+                        ));
+                    }
+                    return Err(error.into());
                 }
-                return Err(error.into());
-            }
-            TicketNativeEvent::Finished {
-                physical_shutdown_confirmed,
-            } => {
-                if self.native_finished.is_some() {
-                    return Err(AdaptiveManagerError::Invalid("duplicate native shutdown"));
+                TicketNativeEvent::Finished {
+                    physical_shutdown_confirmed,
+                } => {
+                    if self.native_finished.is_some() {
+                        return Err(AdaptiveManagerError::Invalid("duplicate native shutdown"));
+                    }
+                    self.native_finished = Some(physical_shutdown_confirmed);
+                    if !physical_shutdown_confirmed {
+                        return Err(AdaptiveManagerError::PhysicalUnknown);
+                    }
                 }
-                self.native_finished = Some(physical_shutdown_confirmed);
-                if !physical_shutdown_confirmed {
-                    return Err(AdaptiveManagerError::PhysicalUnknown);
-                }
-            }
-            TicketNativeEvent::RootQuiesced(fence) => {
-                if self.close_mode != AdaptiveCloseMode::RootQuiesce
-                    || fence.authority() != self.registration.authority
-                    || self.native_root_fence.is_some()
-                {
-                    return Err(AdaptiveManagerError::Invalid(
-                        "unexpected native root fence",
-                    ));
-                }
-                self.native_root_fence = Some(fence);
-                if !fence.permits_reuse() {
-                    return Err(AdaptiveManagerError::PhysicalUnknown);
+                TicketNativeEvent::RootQuiesced(fence) => {
+                    if self.close_mode != AdaptiveCloseMode::RootQuiesce
+                        || fence.authority() != self.registration.authority
+                        || self.native_root_fence.is_some()
+                    {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "unexpected native root fence",
+                        ));
+                    }
+                    self.native_root_fence = Some(fence);
+                    if !fence.permits_reuse() {
+                        return Err(AdaptiveManagerError::PhysicalUnknown);
+                    }
                 }
             }
+            Ok(())
+        })();
+        for error in collection_failures {
+            self.record_failure(error.into());
         }
-        Ok(())
+        runtime_result
     }
     fn role_mut(
         &mut self,
@@ -2995,6 +3443,13 @@ where
             .iter()
             .position(|binding| binding.ticket == Some(ticket))
             .ok_or(AdaptiveManagerError::Invalid("unknown semantic retirement"))?;
+        if accepted
+            && self.roles[index].purpose == RolePurpose::RoventRefinement
+            && self.phase == ManagerPhase::Running
+            && self.check_running().is_ok()
+        {
+            return self.retain_accepted_role_for_peer(index);
+        }
         if accepted && self.phase == ManagerPhase::Running && self.check_running().is_ok() {
             // Fallible hot commits must not erase the original immutable
             // question or owner evidence. A deferred retry/drain still owns
@@ -3014,7 +3469,18 @@ where
                         "accepted native ack has no output",
                     ))?;
             let attempted = (|| -> Result<(), AdaptiveManagerError> {
-                if let Some(work) = work {
+                if purpose == RolePurpose::Reciprocal {
+                    let work = work.ok_or(AdaptiveManagerError::Invalid(
+                        "reciprocal role lost its exact child frame",
+                    ))?;
+                    self.consume_reciprocal_role(
+                        index,
+                        &work,
+                        &ticket,
+                        output.proposer_ranking_output(),
+                        physical,
+                    )?;
+                } else if let Some(work) = work {
                     let committed = self.driver.commit_role(
                         &work,
                         &ticket,
@@ -3033,13 +3499,35 @@ where
                         self.clock.domain(),
                         self.check_running()?,
                     )?;
+                    self.root_ranking_proof = Some(ranking.clone());
                     let candidates = self.driver.ranking_published(&ranking)?;
                     if candidates.len() > 64 {
                         return Err(AdaptiveManagerError::Capacity("root candidate fanout"));
                     }
                     self.driver.role_consumed(&ticket, &input.view)?;
                     self.mark_role_consumed(index)?;
-                    self.root_ranking_proof = Some(ranking.clone());
+                    if self.reciprocal_policy.is_some() || self.peer_policy.is_some() {
+                        if let Some(observer) = &mut self.collection_observer {
+                            let proof = match self.collection_admission.as_ref() {
+                                Some(admission) => {
+                                    RoventRootRankingAcceptance::from_current_ranking(
+                                        &ranking, admission,
+                                    )
+                                }
+                                None => Err(AdaptiveCollectionError::new(
+                                    AdaptiveCollectionStage::Accepted,
+                                    "MissingRoventRootAdmission",
+                                    "root ranking has no original Rovent collection admission",
+                                )),
+                            };
+                            let result = proof.and_then(|proof| {
+                                observer.root_ranking(&proof, &input, output.as_ref())
+                            });
+                            if let Err(error) = result {
+                                self.record_failure(error.into());
+                            }
+                        }
+                    }
                     for candidate in candidates {
                         let input = candidate.input.clone();
                         let now = self.check_running()?;
@@ -3188,18 +3676,26 @@ where
         if binding.consumption_recorded {
             return Ok(());
         }
-        let mut counters = self.counters;
-        let mut native_accounting = self.native_accounting;
         let ticket = binding.ticket.ok_or(AdaptiveManagerError::Invalid(
             "original consumed role ticket missing",
         ))?;
-        native_accounting.observe_search_consumption(ticket.role, binding.physical)?;
+        self.record_role_consumption(ticket, binding.physical)?;
+        self.roles[index].consumption_recorded = true;
+        Ok(())
+    }
+    fn record_role_consumption(
+        &mut self,
+        ticket: RoleTicketEnvelope,
+        physical: Option<TicketExecutionEvidence>,
+    ) -> Result<(), AdaptiveManagerError> {
+        let mut counters = self.counters;
+        let mut native_accounting = self.native_accounting;
+        native_accounting.observe_search_consumption(ticket.role, physical)?;
         counters.consumed_role_outputs = counters
             .consumed_role_outputs
             .checked_add(1)
             .ok_or(AdaptiveManagerError::Capacity("role consumption count"))?;
-        match binding
-            .physical
+        match physical
             .filter(|physical| physical.measurement_complete)
             .and_then(|physical| physical.completed_nn_inputs)
         {
@@ -3214,7 +3710,6 @@ where
         }
         self.counters = counters;
         self.native_accounting = native_accounting;
-        self.roles[index].consumption_recorded = true;
         Ok(())
     }
     fn defer(&mut self, event: DeferredCommit<Q>) -> Result<(), AdaptiveManagerError> {
@@ -3229,7 +3724,9 @@ where
         Ok(())
     }
     fn flush_deferred(&mut self) -> Result<bool, AdaptiveManagerError> {
-        let mut changed = false;
+        // The root common ledger receives only the real native ledger's
+        // opaque success receipt, before any later semantic CPU publication.
+        let mut changed = self.flush_frontier_native()?;
         for index in 0..self.own.len() {
             if !self.driver.semantic_owner_available() {
                 break;
@@ -3284,6 +3781,15 @@ where
                 DeferredCommit::TokenDiscard { work, termination } => {
                     self.driver.cpu_token_discarded(work, termination)
                 }
+                DeferredCommit::ReciprocalWait { work, report } => {
+                    self.driver.cpu_reciprocal_wait(work, report)
+                }
+                DeferredCommit::ReciprocalDiscard { question } => {
+                    self.driver.discard_cpu_reciprocal(*question)
+                }
+                DeferredCommit::PeerDiscard { question } => {
+                    self.driver.discard_accepted_role_reciprocal(*question)
+                }
             };
             if let Err(error) = result {
                 // A failed hot commit cannot erase the original worker receipt.
@@ -3316,6 +3822,28 @@ where
                     .collection_before_dispatch(&ticket, &self.roles[index].input)?;
                 self.roles[index].collection_registered = true;
             }
+            if !self.roles[index].rovent_collection_registered {
+                let result = match &mut self.collection_observer {
+                    Some(observer) => observer.dispatch(&ticket, &self.roles[index].input),
+                    None => Ok(()),
+                };
+                if let Err(error) = result {
+                    let cancel = self.native.cancel(self.roles[index].preparation);
+                    let abandoned = self
+                        .collection_observer
+                        .as_mut()
+                        .map(|observer| observer.abandoned(&ticket));
+                    if let Some(Err(other)) = abandoned {
+                        self.record_failure(other.into());
+                    }
+                    if let Err(native) = cancel {
+                        self.record_failure(error.into());
+                        return Err(native.into());
+                    }
+                    return Err(error.into());
+                }
+                self.roles[index].rovent_collection_registered = true;
+            }
             if self.roles[index].queue_admitted_at.is_some() {
                 return Err(AdaptiveManagerError::Invalid("duplicate queue admission"));
             }
@@ -3335,7 +3863,16 @@ where
                     changed = true;
                 }
                 Err(TicketServiceError::Capacity) => break,
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    let abandoned = self
+                        .collection_observer
+                        .as_mut()
+                        .map(|observer| observer.abandoned(&ticket));
+                    if let Some(Err(other)) = abandoned {
+                        self.record_failure(other.into());
+                    }
+                    return Err(error.into());
+                }
             }
         }
         Ok(changed)
@@ -3396,8 +3933,19 @@ where
             let permit = if accepted
                 && matches!(
                     self.roles[index].purpose,
-                    RolePurpose::RootRanking | RolePurpose::Validator
+                    RolePurpose::Reciprocal | RolePurpose::RoventRefinement
                 ) {
+                Some(self.registry.issue_reciprocal_native_acceptance(
+                    &ticket,
+                    self.clock.domain(),
+                    now,
+                )?)
+            } else if accepted
+                && matches!(
+                    self.roles[index].purpose,
+                    RolePurpose::RootRanking | RolePurpose::Validator
+                )
+            {
                 Some(
                     self.registry
                         .issue_native_acceptance(&ticket, self.clock.domain(), now)?,
@@ -3612,17 +4160,21 @@ where
         match event {
             CpuWorkerEvent::Slice(report) => {
                 self.counters.cpu_slice_receipts += 1;
-                if let Err(error) = self.ledger.settle(&report) {
-                    if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
-                        diagnostic.mark_unavailable(
-                            AdaptiveCpuSliceDiagnosticUnavailable::OriginalReceiptRejected,
-                        );
+                let settled = match self.ledger.settle_attested(&report) {
+                    Ok(settled) => settled,
+                    Err(error) => {
+                        self.quarantine_frontier_slot(slot);
+                        if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
+                            diagnostic.mark_unavailable(
+                                AdaptiveCpuSliceDiagnosticUnavailable::OriginalReceiptRejected,
+                            );
+                        }
+                        self.quarantined_cpu_receipts
+                            .push(CpuWorkerEvent::Slice(report));
+                        self.phase = ManagerPhase::Quarantined;
+                        return Err(error.into());
                     }
-                    self.quarantined_cpu_receipts
-                        .push(CpuWorkerEvent::Slice(report));
-                    self.phase = ManagerPhase::Quarantined;
-                    return Err(error.into());
-                }
+                };
                 self.own[slot].settled_execution = Some(report.grant.execution);
                 let Some(mut binding) = self.own[slot].binding.take() else {
                     if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
@@ -3638,6 +4190,9 @@ where
                     ));
                 };
                 if report.grant != binding.grant {
+                    if let Some(reservation) = binding.native_frontier.take() {
+                        self.retain_frontier_unknown(reservation);
+                    }
                     if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
                         diagnostic.mark_unavailable(
                             AdaptiveCpuSliceDiagnosticUnavailable::OriginalReceiptRejected,
@@ -3650,6 +4205,17 @@ where
                     return Err(AdaptiveManagerError::Invalid(
                         "CPU slice grant echo mismatch",
                     ));
+                }
+                if let Some(reservation) = binding.native_frontier.take() {
+                    self.retain_frontier_settlement(reservation, report.clone(), settled);
+                    if let Err(error) = self.flush_frontier_native() {
+                        // Keep original execution/receipt custody even when
+                        // common accounting rejects it. No zero-work fallback.
+                        binding.pending_slice = Some(report);
+                        self.own[slot].binding = Some(binding);
+                        self.phase = ManagerPhase::Quarantined;
+                        return Err(error);
+                    }
                 }
                 // Copy only after the original ledger and binding/grant
                 // checks. This is prior to timing/semantic/yield processing;
@@ -3799,6 +4365,13 @@ where
                     return Err(AdaptiveManagerError::Invalid(
                         "private CPU admission was rejected",
                     ));
+                }
+                if report
+                    .result
+                    .as_ref()
+                    .is_ok_and(|actual| actual.report.completion == CpuCompletion::AwaitReciprocal)
+                {
+                    return self.retain_reciprocal_wait(slot, binding, report);
                 }
                 if report.continuation_retained && !report.terminal {
                     if binding.feedback_forwarded {
@@ -3969,6 +4542,7 @@ where
             }
             CpuWorkerEvent::JobTerminated(termination) => {
                 if let Err(error) = self.ledger.accept_job_termination(&termination) {
+                    self.quarantine_frontier_slot(slot);
                     self.quarantined_cpu_receipts
                         .push(CpuWorkerEvent::JobTerminated(termination));
                     self.phase = ManagerPhase::Quarantined;
@@ -3998,6 +4572,19 @@ where
                         work: binding.work.clone(),
                         report,
                     })?;
+                }
+                if let Some(custody) = binding.reciprocal {
+                    if !custody.observed {
+                        self.defer(DeferredCommit::ReciprocalWait {
+                            work: binding.work.clone(),
+                            report: custody.report,
+                        })?;
+                    }
+                    if let Some(question) = custody.question {
+                        self.defer(DeferredCommit::ReciprocalDiscard {
+                            question: question.id,
+                        })?;
+                    }
                 }
                 self.defer(DeferredCommit::TokenDiscard {
                     work: binding.work.clone(),
@@ -4238,6 +4825,31 @@ where
         binding: &OwnBinding<Q>,
         report: &CpuSliceReport,
     ) -> Result<(), AdaptiveManagerError> {
+        if self
+            .accepted_roles
+            .iter()
+            .any(|held| held.child == Some(binding.work.frame))
+        {
+            let digest = self.driver.consume_reciprocal_cpu(&binding.work, report)?;
+            self.machine.resolve_reciprocal_cpu_response(
+                StepEvidence {
+                    frame: binding.work.frame,
+                    stage: binding.work.input.stage,
+                    execution: StepExecution::Cpu {
+                        job: binding.envelope.id,
+                        execution: report.grant.execution,
+                    },
+                    submitted_question: binding.work.input.question_digest,
+                    submitted_view: binding.work.input.view_seal,
+                    completed_evidence: digest,
+                },
+                report,
+                self.clock.domain(),
+                self.check_running()?,
+            )?;
+            self.release_accepted_role_waiters(binding.work.frame)?;
+            return Ok(());
+        }
         let checked = self.driver.commit_cpu(&binding.work, report)?;
         self.resolve(
             binding.work.clone(),
@@ -4375,12 +4987,14 @@ where
         Ok(())
     }
     fn schedule(&mut self) -> Result<bool, AdaptiveManagerError> {
-        if !self.role_call_admission_available() {
+        if !self.role_call_admission_available() && self.peer_policy.is_none() {
             return Ok(false);
         }
         if !self.driver.prepare_semantic_commit()? {
             return Ok(false);
         }
+        let peers_changed = self.drive_accepted_role_parents()?;
+        let reciprocal_changed = self.admit_waiting_reciprocal_questions()?;
         let now = self.check_running()?;
         let now_duration = Duration::from_nanos(now.0);
         // Small ID list only; no record payload, tensor or statistics snapshot
@@ -4390,6 +5004,7 @@ where
             .frames()
             .filter(|frame| {
                 frame.phase == FramePhase::Ready
+                    && self.machine.waiting_on(frame.id).is_none()
                     && self
                         .exclusive_scope
                         .as_ref()
@@ -4446,7 +5061,7 @@ where
             self.ready_ids.push(id);
         }
         let advice = self.advice(now)?;
-        let mut changed = false;
+        let mut changed = peers_changed || reciprocal_changed;
         if advice.yield_selected_worker {
             if let Some(selection) = self.advised_yield.take() {
                 // Advice and delivery refer to the same original execution;
@@ -4459,6 +5074,7 @@ where
                             binding.grant.execution == execution
                                 && !binding.feedback_forwarded
                                 && !binding.resume_pending
+                                && binding.reciprocal.is_none()
                                 && binding.requested_yield.is_none()
                         }) {
                             let sequence = self.issue_control()?;
@@ -4493,7 +5109,17 @@ where
         }
         for index in 0..self.own.len() {
             if !self.role_call_admission_available() {
-                break;
+                let retained_peer_r = self.own[index].binding.as_ref().is_some_and(|binding| {
+                    self.accepted_roles
+                        .iter()
+                        .any(|held| held.child == Some(binding.work.frame))
+                });
+                if self.peer_policy.is_none() {
+                    break;
+                }
+                if !retained_peer_r {
+                    continue;
+                }
             }
             if self.own[index].binding.as_ref().is_some_and(|binding| {
                 binding.feedback_forwarded
@@ -4518,8 +5144,8 @@ where
                     binding.resume_pending = false;
                     changed = true;
                 } else if let Some(slice) = advice.slice {
-                    self.resume_cpu(index, slice.node_credit, slice.soft_lease)?;
-                    changed = true;
+                    let result = self.resume_cpu(index, slice.node_credit, slice.soft_lease);
+                    changed |= self.native_admission_result(result)?;
                 }
                 continue;
             }
@@ -4527,13 +5153,21 @@ where
                 !binding.feedback_forwarded
                     && binding.resume_pending
                     && binding.pending_slice.is_none()
+                    && binding
+                        .reciprocal
+                        .as_ref()
+                        .is_none_or(|held| held.reply.is_some())
                     && !self.validator_waiting.contains(&binding.work.frame)
                     && self
                         .exclusive_scope
                         .as_ref()
                         .is_none_or(|scope| scope.allows(binding.work.frame))
             }) {
-                if self.registration.endpoints.load_v
+                if self.own[index]
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.reciprocal.is_none())
+                    && self.registration.endpoints.load_v
                     && self.registration.endpoints.execution_use == CpuExecutionUse::Collection
                 {
                     let binding = self.own[index]
@@ -4587,13 +5221,20 @@ where
                 let Some(slice) = advice.slice else {
                     continue;
                 };
-                self.resume_cpu(index, slice.node_credit, slice.soft_lease)?;
-                changed = true;
+                let result = self.resume_cpu(index, slice.node_credit, slice.soft_lease);
+                changed |= self.native_admission_result(result)?;
             }
+        }
+        if self.phase != ManagerPhase::Running {
+            return Ok(changed);
         }
         if self.registration.policy == CoordinatorPolicy::Synchronous
             && (!self.roles.is_empty()
-                || self.own.iter().any(|slot| slot.binding.is_some())
+                || self.own.iter().any(|slot| {
+                    slot.binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.reciprocal.is_none())
+                })
                 || self.foreign.is_some()
                 || !self.deferred.is_empty())
         {
@@ -4603,7 +5244,9 @@ where
             if self.roles.len() >= self.role_pending_limit()
                 || !self.role_call_admission_available()
             {
-                break;
+                if self.peer_policy.is_none() {
+                    break;
+                }
             }
             let own_available = self
                 .own
@@ -4619,13 +5262,15 @@ where
                     self.machine.frame(*id).map(|frame| {
                         (
                             *id,
-                            (frame.input.stage.role().is_some()
-                                || own_available
-                                || (self.external.is_some() && self.foreign.is_none()))
-                                && self
-                                    .exclusive_scope
-                                    .as_ref()
-                                    .is_none_or(|scope| scope.allows(frame.id)),
+                            (if frame.input.stage.role().is_some() {
+                                self.role_call_admission_available()
+                                    && self.roles.len() < self.role_pending_limit()
+                            } else {
+                                own_available || (self.external.is_some() && self.foreign.is_none())
+                            }) && self
+                                .exclusive_scope
+                                .as_ref()
+                                .is_none_or(|scope| scope.allows(frame.id)),
                         )
                     })
                 })
@@ -4648,7 +5293,12 @@ where
                 self.clock.domain(),
                 self.check_running()?,
             )?;
-            if let Some(mut terminal) = self.driver.short_circuit(&work)? {
+            let reciprocal_child = self.is_reciprocal_child(work.frame);
+            if let Some(mut terminal) = if reciprocal_child {
+                None
+            } else {
+                self.driver.short_circuit(&work)?
+            } {
                 if terminal.checked.fresh_pair.is_some() {
                     return Err(AdaptiveManagerError::Invalid(
                         "Rules proof cannot claim neural Fresh pair",
@@ -4703,7 +5353,7 @@ where
                 changed = true;
                 continue;
             }
-            if self.registration.endpoints.load_v {
+            if self.registration.endpoints.load_v && !reciprocal_child {
                 if self.exclusive_requested && self.exclusive_scope.is_none() {
                     if !self.roles.is_empty()
                         || self.own.iter().any(|slot| slot.binding.is_some())
@@ -4772,7 +5422,23 @@ where
             }
             if work.input.stage.role().is_some() {
                 let input = work.input.clone();
-                match self.prepare_role(Some(work), input, RolePurpose::Refinement) {
+                let purpose = if reciprocal_child {
+                    RolePurpose::Reciprocal
+                } else if self.peer_policy.is_some()
+                    && matches!(
+                        work.input.stage,
+                        RefinementStage::ProposalContinuation
+                            | RefinementStage::Repair
+                            | RefinementStage::CriticDivergence
+                            | RefinementStage::CriticReply
+                            | RefinementStage::CounterContinuation
+                    )
+                {
+                    RolePurpose::RoventRefinement
+                } else {
+                    RolePurpose::Refinement
+                };
+                match self.prepare_role(Some(work), input, purpose) {
                     Ok(_) => {
                         changed = true;
                     }
@@ -4847,11 +5513,7 @@ where
                             ));
                         }
                         self.cpu_node_limit_reached = true;
-                        self.begin_root_quiesce(
-                            Instant::now()
-                                .checked_add(Duration::from_secs(30))
-                                .ok_or(AdaptiveManagerError::Deadline)?,
-                        )?;
+                        self.begin_root_quiesce(self.cleanup_until()?)?;
                         return Ok(true);
                     }
                     CpuQuestion::Own(question) => {
@@ -4866,8 +5528,17 @@ where
                         let Some(slice) = advice.slice else {
                             break;
                         };
-                        self.begin_cpu(slot, work, question, slice.node_credit, slice.soft_lease)?;
-                        changed = true;
+                        let result = self.begin_cpu(
+                            slot,
+                            work,
+                            question,
+                            slice.node_credit,
+                            slice.soft_lease,
+                        );
+                        changed |= self.native_admission_result(result)?;
+                        if self.phase != ManagerPhase::Running {
+                            return Ok(changed);
+                        }
                     }
                     CpuQuestion::External(question) => {
                         if self.foreign.is_some() {
@@ -5143,7 +5814,7 @@ where
             total_native_node_credit: question.total_native_node_credit,
             hard_deadline: self.deadline,
         };
-        let prepared = self.own[index]
+        let mut prepared = self.own[index]
             .worker
             .as_ref()
             .expect("checked owner")
@@ -5154,8 +5825,49 @@ where
                 question.target_depth,
                 &self.cpu_clock,
             )?;
+        if let Some(policy) = self
+            .reciprocal_policy
+            .filter(|_| !self.is_reciprocal_child(work.frame))
+        {
+            let parent = if let Some(original) = self.machine.reciprocal_question(work.frame) {
+                self.driver
+                    .register_cpu_reciprocal_scope(&work, &envelope, &original)?;
+                original
+            } else {
+                let id = self.issue_reciprocal_question()?;
+                let parent = self.driver.reciprocal_parent(
+                    &work,
+                    &envelope,
+                    id,
+                    policy.mode,
+                    policy.root_budget,
+                )?;
+                self.machine.register_reciprocal_parent(
+                    work.frame,
+                    parent,
+                    self.clock.domain(),
+                    self.check_running()?,
+                )?;
+                parent
+            };
+            prepared.enable_reciprocal_questions(CpuReciprocalScope {
+                job: envelope,
+                owner: profile.owner,
+                parent,
+                recipient: policy.recipient,
+                max_questions: policy.max_questions_per_job,
+                node_interval: policy.node_interval,
+            })?;
+        }
         self.ledger.register(envelope)?;
-        let grant = self.next_grant(envelope, profile.owner, requested_credit, requested_lease)?;
+        let grant =
+            match self.next_grant(envelope, profile.owner, requested_credit, requested_lease) {
+                Ok(grant) => grant,
+                Err(error) => {
+                    self.ledger.retire_unstarted(envelope.id)?;
+                    return Err(error);
+                }
+            };
         let controls = Arc::clone(&prepared.mailbox);
         let class = cpu_cost_class(
             profile.evaluation_namespace,
@@ -5173,13 +5885,40 @@ where
             self.ledger.retire_unstarted(envelope.id)?;
             return Err(error.into());
         }
+        let native_frontier = match self.driver.frontier_native_reserve(
+            &envelope,
+            grant,
+            self.clock.domain(),
+            admitted_at,
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let rejected = self.own[index]
+                    .worker
+                    .as_ref()
+                    .expect("checked owner")
+                    .reject_prepared(prepared, grant)?;
+                self.release_frontier_before_enqueue(None, rejected.proof())?;
+                self.ledger.retire_unstarted(envelope.id)?;
+                return Err(error);
+            }
+        };
         if let Err(error) = self.driver.cpu_admitted(&work, &envelope, &grant) {
-            let rejected = self.own[index]
+            let rejected = match self.own[index]
                 .worker
                 .as_ref()
                 .expect("checked owner")
-                .reject_prepared(prepared, grant)?;
-            self.ledger.release_unadmitted(rejected.proof())?;
+                .reject_prepared(prepared, grant)
+            {
+                Ok(rejected) => rejected,
+                Err(rejection_error) => {
+                    if let Some(reservation) = native_frontier {
+                        self.retain_frontier_unknown(reservation);
+                    }
+                    return Err(rejection_error.into());
+                }
+            };
+            self.release_frontier_before_enqueue(native_frontier, rejected.proof())?;
             self.ledger.retire_unstarted(envelope.id)?;
             return Err(error);
         }
@@ -5191,7 +5930,7 @@ where
         {
             Ok(()) => {}
             Err(rejected) => {
-                self.ledger.release_unadmitted(rejected.proof())?;
+                self.release_frontier_before_enqueue(native_frontier, rejected.proof())?;
                 self.ledger.retire_unstarted(envelope.id)?;
                 self.driver
                     .cpu_rejected(&work, &envelope, rejected.proof())?;
@@ -5219,6 +5958,8 @@ where
             requested_yield: None,
             pending_slice: None,
             validator_reviewed_execution: None,
+            reciprocal: None,
+            native_frontier,
         });
         self.machine
             .bind_cpu(frame, &envelope, &grant, self.clock.domain(), admitted_at)?;
@@ -5248,6 +5989,22 @@ where
             .binding
             .take()
             .ok_or(AdaptiveManagerError::Invalid("missing paused CPU owner"))?;
+        if binding.native_frontier.is_some() || self.pending_frontier_for(binding.envelope.id) {
+            self.own[index].binding = Some(binding);
+            return Err(AdaptiveManagerError::Frontier(FrontierError::NodesReserved));
+        }
+        let reply = match binding.reciprocal.as_ref() {
+            Some(held) => match held.reply.clone() {
+                Some(reply) => Some(reply),
+                None => {
+                    self.own[index].binding = Some(binding);
+                    return Err(AdaptiveManagerError::Invalid(
+                        "reciprocal checkpoint lacks accepted reply",
+                    ));
+                }
+            },
+            None => None,
+        };
         let grant = match self.next_grant(binding.envelope, binding.grant.owner, credit, lease) {
             Ok(grant) => grant,
             Err(error) => {
@@ -5266,6 +6023,24 @@ where
             self.own[index].binding = Some(binding);
             return Err(error.into());
         }
+        let native_frontier = match self.driver.frontier_native_reserve(
+            &binding.envelope,
+            grant,
+            self.clock.domain(),
+            admitted_at,
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let rejected = self.own[index]
+                    .worker
+                    .as_ref()
+                    .expect("checked paused owner")
+                    .reject_unsubmitted_resume(grant);
+                self.own[index].binding = Some(binding);
+                self.release_frontier_before_enqueue(None, rejected?.proof())?;
+                return Err(error);
+            }
+        };
         if let Err(error) = self
             .driver
             .cpu_admitted(&binding.work, &binding.envelope, &grant)
@@ -5276,18 +6051,35 @@ where
                 .expect("checked paused owner")
                 .reject_unsubmitted_resume(grant);
             self.own[index].binding = Some(binding);
-            self.ledger.release_unadmitted(rejected?.proof())?;
+            let rejected = match rejected {
+                Ok(rejected) => rejected,
+                Err(rejection_error) => {
+                    if let Some(reservation) = native_frontier {
+                        self.retain_frontier_unknown(reservation);
+                    }
+                    return Err(rejection_error.into());
+                }
+            };
+            self.release_frontier_before_enqueue(native_frontier, rejected.proof())?;
             return Err(error);
         }
-        match self.own[index]
-            .worker
-            .as_ref()
-            .expect("checked paused CPU worker")
-            .resume_attested(grant)
-        {
+        let submitted = match reply {
+            Some(reply) => self.own[index]
+                .worker
+                .as_ref()
+                .expect("checked paused CPU worker")
+                .resume_with_reply_attested(grant, reply),
+            None => self.own[index]
+                .worker
+                .as_ref()
+                .expect("checked paused CPU worker")
+                .resume_attested(grant),
+        };
+        match submitted {
             Ok(()) => {}
             Err(rejected) => {
-                let released = self.ledger.release_unadmitted(rejected.proof());
+                let released =
+                    self.release_frontier_before_enqueue(native_frontier, rejected.proof());
                 let cleanup =
                     self.driver
                         .cpu_rejected(&binding.work, &binding.envelope, rejected.proof());
@@ -5299,7 +6091,14 @@ where
         }
         let frame = binding.work.frame;
         let envelope = binding.envelope;
+        let reciprocal_question = binding
+            .reciprocal
+            .as_ref()
+            .and_then(|held| held.question)
+            .map(|question| question.id);
         binding.grant = grant;
+        binding.native_frontier = native_frontier;
+        binding.reciprocal = None;
         binding.resume_pending = false;
         binding.started_at = Instant::now();
         binding.progress_published_at = None;
@@ -5340,6 +6139,9 @@ where
                 execution: grant.execution,
             },
         )?;
+        if let Some(question) = reciprocal_question {
+            self.defer(DeferredCommit::ReciprocalDiscard { question })?;
+        }
         Ok(())
     }
     fn next_grant(
@@ -5354,7 +6156,7 @@ where
         if quarantined || reserved != 0 {
             return Err(AdaptiveManagerError::PhysicalUnknown);
         }
-        let credit = credit
+        let mut credit = credit
             .min(envelope.total_native_node_credit.saturating_sub(spent))
             .min(
                 self.registration
@@ -5363,6 +6165,15 @@ where
                     .saturating_sub(global_reserved),
             );
         let now = self.check_running()?;
+        if let Some(capacity) =
+            self.driver
+                .frontier_native_capacity(credit, self.clock.domain(), now)?
+        {
+            credit = credit.min(capacity);
+            if credit == 0 {
+                return Err(AdaptiveManagerError::Frontier(FrontierError::NodesReserved));
+            }
+        }
         let lease = lease.min(Duration::from_nanos(
             self.deadline.at.0.saturating_sub(now.0),
         ));
@@ -5577,6 +6388,9 @@ where
         until: Instant,
         mode: AdaptiveCloseMode,
     ) -> Result<(), AdaptiveManagerError> {
+        let until = self
+            .cleanup_boundary
+            .map_or(until, |boundary| boundary.cap(until));
         if self.phase == ManagerPhase::Finished {
             return Ok(());
         }
@@ -5644,9 +6458,7 @@ where
     fn poll_shutdown(&mut self) -> Result<bool, AdaptiveManagerError> {
         let mut changed = false;
         if self.shutdown_until.is_none() {
-            let until = Instant::now()
-                .checked_add(Duration::from_secs(30))
-                .ok_or(AdaptiveManagerError::Deadline)?;
+            let until = self.cleanup_until()?;
             self.begin_selected_shutdown(until)?;
             changed = true;
         }
@@ -5674,6 +6486,7 @@ where
             self.own[index].panicked = receipt.thread_panicked;
             self.own[index].ready_readback = receipt.ready_readback;
             if receipt.thread_panicked {
+                self.quarantine_frontier_slot(index);
                 if let Some(binding) = &self.own[index].binding {
                     self.ledger.quarantine(binding.envelope.id)?;
                 }
@@ -5733,6 +6546,7 @@ where
             && self.own.iter().all(|slot| slot.joined)
             && self.external_owner_closed()
             && self.deferred.is_empty()
+            && self.native_frontier_events.is_empty()
             && self.own.iter().all(|slot| {
                 slot.binding
                     .as_ref()
@@ -5746,6 +6560,7 @@ where
             && self.external_owner_closed()
             && self.driver.auxiliary_shutdown_confirmed()
             && self.deferred.is_empty()
+            && self.native_frontier_events.is_empty()
             && self.own.iter().all(|slot| {
                 slot.binding
                     .as_ref()
@@ -5755,6 +6570,16 @@ where
         {
             // Finished is an owner fence, not a late output acceptance.
             // Canceled questions are retired with zero search consumption.
+            if let Some(observer) = &mut self.collection_observer {
+                let tickets = self
+                    .roles
+                    .iter()
+                    .filter_map(|r| r.ticket)
+                    .collect::<Vec<_>>();
+                if let Err(error) = observer.settled(&tickets) {
+                    self.record_failure(error.into());
+                }
+            }
             let retired = self.registry.retire_revoked_after_worker_join()?;
             self.counters.unused_role_results = self
                 .counters
@@ -5762,6 +6587,17 @@ where
                 .checked_add(retired.len() as u64)
                 .ok_or(AdaptiveManagerError::Capacity("unused result sum"))?;
             self.roles.clear();
+            let unused_accepted = self
+                .accepted_roles
+                .iter()
+                .filter(|held| !held.binding.consumption_recorded)
+                .count() as u64;
+            self.counters.unused_role_results = self
+                .counters
+                .unused_role_results
+                .checked_add(unused_accepted)
+                .ok_or(AdaptiveManagerError::Capacity("unused accepted role sum"))?;
+            self.accepted_roles.clear();
             self.acknowledgements.clear();
             self.retained_native_permits.clear();
             self.retained_native_receipts.clear();
@@ -5807,7 +6643,10 @@ where
                 || self.native.is_quarantined()
                 || !self.quarantine_rejections.is_empty()
                 || !self.quarantined_cpu_receipts.is_empty()
-                || !self.quarantined_foreign_receipts.is_empty(),
+                || !self.quarantined_foreign_receipts.is_empty()
+                || !self.native_frontier_events.is_empty(),
+            // Common accounting remains separate from the original
+            // native ledger totals but can veto a clean owner closure.
             request_sequence_high_water: self.registry.next_request_sequence().saturating_sub(1),
             counters: self.counters,
             native_cpu_thread_observation: self.native.ready_cpu_thread_observation(),
@@ -5877,15 +6716,14 @@ where
         canceled: &AtomicBool,
         observer: &mut dyn FnMut(&mut Self) -> Result<(), AdaptiveManagerError>,
     ) -> Result<AdaptiveShutdownReceipt, AdaptiveManagerError> {
+        let until = self
+            .cleanup_boundary
+            .map_or(until, |boundary| boundary.cap(until));
         loop {
             let signal = self.native.signal();
             let observed = signal.version();
             if canceled.load(Ordering::Acquire) && self.phase == ManagerPhase::Running {
-                self.begin_selected_shutdown(
-                    Instant::now()
-                        .checked_add(Duration::from_secs(30))
-                        .ok_or(AdaptiveManagerError::Deadline)?,
-                )?;
+                self.begin_selected_shutdown(self.cleanup_until()?)?;
             }
             // Apply the caller's soft/admission boundary before a tick may
             // dispatch another immutable question. This control observation
@@ -5898,11 +6736,7 @@ where
             observer(self)?;
             if self.phase == ManagerPhase::Running && self.root_started && !self.has_pending_work()
             {
-                self.begin_selected_shutdown(
-                    Instant::now()
-                        .checked_add(Duration::from_secs(30))
-                        .ok_or(AdaptiveManagerError::Deadline)?,
-                )?;
+                self.begin_selected_shutdown(self.cleanup_until()?)?;
             }
             if self.phase == ManagerPhase::Finished {
                 return self.shutdown_receipt();

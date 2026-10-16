@@ -12,6 +12,7 @@ use rz_position::contracts::ContractState;
 use rz_runtime::CompletionSignal;
 use rz_search::cpu_worker::{
     CpuAdmissionRejection, CpuJobTermination, CpuSliceReport, CpuWorkerProfile, CpuWorkerProgress,
+    ReleasedCpuReservation, SettledCpuSlice,
 };
 use rz_search::external_cpu::worker::{
     ExternalJob, ExternalTeacherDispatch, ExternalWorkerCompletion, ExternalWorkerReport,
@@ -32,18 +33,25 @@ use rz_search::pals::engine::adaptive_port::validator_port::{
     ValidatorActionId, ValidatorActionOutcome,
 };
 use rz_search::pals::engine::adaptive_port::{
-    AdaptiveDeferredRepair, AdaptiveEnginePort, AdaptivePortMaterializedStep, AdaptivePortQuestion,
-    AdaptivePortRoleEvidence, AdaptiveRootFanoutPolicy, AdaptiveRulesPairProof,
+    AdaptiveDeferredRepair, AdaptiveEnginePort, AdaptiveFrontierReceipt, AdaptiveFrontierStartup,
+    AdaptivePortMaterializedStep, AdaptivePortQuestion, AdaptivePortRoleEvidence,
+    AdaptiveReviewLeaseAdmission, AdaptiveRootFanoutPolicy, AdaptiveRulesPairProof,
 };
 use rz_search::pals::engine::{PalsCompletion, PalsError, PalsResult, RoleModel};
 use rz_search::pals::review_context::ReviewView;
-use rz_search::pals::store::{ForeignAppendPermit, ObservationId, StorePins};
+use rz_search::pals::rovent_frontier::{
+    FrontierLimits, FrontierRegistration, NativeCloseReason, NativeReservation,
+};
+use rz_search::pals::store::{ForeignAppendPermit, ObservationId, StoreError, StorePins};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_RETAINED_QUESTIONS: usize = 64;
 const MAX_ARCHIVE_RECEIPTS: usize = 64;
+
+mod role_only;
+pub use role_only::PcPortDriver;
 
 /// A coherent iteration publication is scoped to its original question and
 /// physical owner. It is not CPU credit settlement or a new semantic witness.
@@ -275,6 +283,33 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
     pub fn port(&self) -> Option<&AdaptiveEnginePort<M>> {
         self.port.as_deref()
     }
+    pub fn attach_rovent_frontier(
+        &mut self,
+        registration: FrontierRegistration,
+        limits: FrontierLimits,
+        actual: AdaptiveFrontierStartup<'_>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .attach_rovent_frontier(registration, limits, actual, clock, now)?;
+        Ok(())
+    }
+    /// Evidence recovery does not retire the controller or release its pins.
+    pub fn rovent_frontier_receipt(
+        &self,
+    ) -> Result<Option<AdaptiveFrontierReceipt>, AdaptiveManagerError> {
+        Ok(self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .rovent_frontier_receipt())
+    }
+    pub fn retire_rovent_frontier(
+        &mut self,
+    ) -> Result<Option<AdaptiveFrontierReceipt>, AdaptiveManagerError> {
+        Ok(self.hot()?.retire_rovent_frontier()?)
+    }
     pub fn set_collection_dispatch_observer(
         &mut self,
         observer: AdaptiveCollectionDispatchObserver,
@@ -306,6 +341,31 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
     }
     pub fn prepare_root_rules(&mut self) -> Result<(), AdaptiveManagerError> {
         self.hot()?.prepare_root_rules().map_err(semantic)
+    }
+    pub fn prepare_rovent_root_rules(
+        &mut self,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?.prepare_rovent_root_rules(clock, now)?;
+        Ok(())
+    }
+    pub fn root_state_id(&self) -> Result<rz_search::pals::store::StateId, AdaptiveManagerError> {
+        Ok(self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .root_state_id())
+    }
+    pub fn model_namespace(
+        &self,
+    ) -> Result<&rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace, AdaptiveManagerError>
+    {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .model_namespace()
+            .map_err(semantic)
     }
     pub fn root_is_terminal(&self) -> Result<bool, AdaptiveManagerError> {
         Ok(self
@@ -504,7 +564,20 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
     }
 }
 fn semantic(error: PalsError) -> AdaptiveManagerError {
-    AdaptiveManagerError::Semantic(error.to_string())
+    match error {
+        PalsError::Store(StoreError::ReviewLeaseBackpressure {
+            current,
+            capacity,
+            required_new,
+            replacement_reserve,
+        }) => AdaptiveManagerError::ReviewLeaseBackpressure {
+            current,
+            capacity,
+            required_new,
+            replacement_reserve,
+        },
+        other => AdaptiveManagerError::Semantic(other.to_string()),
+    }
 }
 fn checked(step: AdaptivePortMaterializedStep) -> CheckedStep<AdaptivePortQuestion> {
     CheckedStep {
@@ -516,6 +589,221 @@ fn checked(step: AdaptivePortMaterializedStep) -> CheckedStep<AdaptivePortQuesti
     }
 }
 impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for AdaptivePortDriver<M> {
+    fn review_lease_admission(
+        &self,
+    ) -> Result<Option<AdaptiveReviewLeaseAdmission>, AdaptiveManagerError> {
+        let observed = self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .review_lease_admission()
+            .map_err(semantic)?;
+        Ok(observed.frontier_owner_present.then_some(observed))
+    }
+    fn frontier_native_capacity(
+        &mut self,
+        requested: u64,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<Option<u64>, AdaptiveManagerError> {
+        self.hot()?
+            .with_rovent_frontier(|frontier, _| frontier.native_capacity(requested, clock, now))
+            .map_err(Into::into)
+    }
+    fn frontier_native_reserve(
+        &mut self,
+        job: &CpuJobEnvelope,
+        grant: SliceGrant,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<Option<NativeReservation>, AdaptiveManagerError> {
+        self.hot()?
+            .with_rovent_frontier(|frontier, _| frontier.reserve_native(job, grant, clock, now))
+            .map_err(Into::into)
+    }
+    fn frontier_native_settled(
+        &mut self,
+        reservation: &NativeReservation,
+        report: &CpuSliceReport,
+        accepted: &SettledCpuSlice,
+    ) -> Result<NativeCloseReason, AdaptiveManagerError> {
+        self.hot()?
+            .with_rovent_frontier(|frontier, _| {
+                frontier.settle_native(reservation, report, accepted)
+            })?
+            .ok_or(AdaptiveManagerError::Invalid(
+                "native frontier owner absent",
+            ))
+    }
+    fn frontier_native_released(
+        &mut self,
+        reservation: &NativeReservation,
+        accepted: &ReleasedCpuReservation,
+    ) -> Result<NativeCloseReason, AdaptiveManagerError> {
+        self.hot()?
+            .with_rovent_frontier(|frontier, _| frontier.release_unqueued(reservation, accepted))?
+            .ok_or(AdaptiveManagerError::Invalid(
+                "native frontier owner absent",
+            ))
+    }
+    fn frontier_native_unknown(
+        &mut self,
+        reservation: &NativeReservation,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .with_rovent_frontier(|frontier, _| frontier.native_usage_unknown(reservation))?
+            .ok_or(AdaptiveManagerError::Invalid(
+                "native frontier owner absent",
+            ))
+    }
+    fn register_cpu_reciprocal_scope(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        job: &CpuJobEnvelope,
+        question: &rz_contracts::rovent::QuestionEnvelope,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .register_cpu_reciprocal_scope(work, job, question)
+            .map_err(semantic)
+    }
+    fn prepare_accepted_role_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+        mode: rz_contracts::rovent::ExecutionMode,
+        budget: Digest,
+        recipient: rz_contracts::rovent::SearchRecipient,
+    ) -> Result<Option<AdaptivePeerQuestion<AdaptivePortQuestion>>, AdaptiveManagerError> {
+        Ok(self
+            .hot()?
+            .prepare_accepted_role_reciprocal(work, accepted, output, id, mode, budget, recipient)
+            .map_err(semantic)?
+            .map(|prepared| AdaptivePeerQuestion {
+                origin: prepared.origin,
+                question: prepared.question,
+                input: prepared.input,
+            }))
+    }
+    fn accept_accepted_role_source(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .accept_accepted_role_source(work, accepted, output)
+            .map_err(semantic)
+    }
+    fn consume_accepted_role_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        physical: Option<TicketExecutionEvidence>,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        let physical = physical.map(|evidence| AdaptivePortRoleEvidence {
+            execution: evidence.execution,
+            completed_nn_inputs: evidence.completed_nn_inputs,
+            measurement_complete: evidence.measurement_complete,
+            physical_fresh: evidence.physical_fresh,
+        });
+        self.hot()?
+            .consume_accepted_role_reciprocal(work, accepted, output, physical)
+            .map_err(semantic)
+    }
+    fn consume_reciprocal_cpu(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        report: &CpuSliceReport,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        self.hot()?
+            .consume_reciprocal_cpu(work, report)
+            .map_err(semantic)
+    }
+    fn discard_accepted_role_reciprocal(
+        &mut self,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?.discard_accepted_role_reciprocal(id);
+        Ok(())
+    }
+    fn reciprocal_parent(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        job: &CpuJobEnvelope,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+        mode: rz_contracts::rovent::ExecutionMode,
+        root_budget: Digest,
+    ) -> Result<rz_contracts::rovent::QuestionEnvelope, AdaptiveManagerError> {
+        self.hot()?
+            .cpu_reciprocal_parent(work, job, id, mode, root_budget)
+            .map_err(semantic)
+    }
+    fn prepare_cpu_reciprocal(
+        &mut self,
+        parent: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        request: &rz_search::cpu::CpuReciprocalRequest,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+        mode: rz_contracts::rovent::ExecutionMode,
+        root_budget: Digest,
+    ) -> Result<AdaptiveReciprocalQuestion<AdaptivePortQuestion>, AdaptiveManagerError> {
+        let prepared = self
+            .hot()?
+            .prepare_cpu_reciprocal(parent, request, id, mode, root_budget)
+            .map_err(semantic)?;
+        Ok(AdaptiveReciprocalQuestion {
+            question: prepared.question,
+            input: prepared.input,
+        })
+    }
+    fn cpu_reciprocal_wait(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        report: &CpuSliceReport,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .cpu_reciprocal_wait(work, report)
+            .map_err(semantic)
+    }
+    fn discard_cpu_reciprocal(
+        &mut self,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?.discard_cpu_reciprocal(id);
+        Ok(())
+    }
+    fn consume_cpu_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        physical: Option<TicketExecutionEvidence>,
+        requests: &[(
+            rz_search::cpu::CpuReciprocalRequest,
+            rz_contracts::rovent::ReciprocalQuestionId,
+        )],
+    ) -> Result<Vec<rz_search::cpu::CpuReciprocalReply>, AdaptiveManagerError> {
+        let physical = physical.map(|evidence| AdaptivePortRoleEvidence {
+            execution: evidence.execution,
+            completed_nn_inputs: evidence.completed_nn_inputs,
+            measurement_complete: evidence.measurement_complete,
+            physical_fresh: evidence.physical_fresh,
+        });
+        let answer = self
+            .hot()?
+            .consume_cpu_reciprocal(work, accepted, output, physical)
+            .map_err(semantic)?;
+        requests
+            .iter()
+            .map(|(request, id)| {
+                self.hot()?
+                    .cpu_reciprocal_reply(&answer, request, *id)
+                    .map_err(semantic)
+            })
+            .collect()
+    }
     fn root_rules(&self) -> Arc<ContractState> {
         Arc::clone(&self.rules)
     }
@@ -655,6 +943,13 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
             && self.port.is_some()
             && self.quarantine.is_none()
             && self.unexpected_archive_owner.is_none()
+            && self.port.as_ref().is_none_or(|port| {
+                port.rovent_frontier_receipt().is_none_or(|receipt| {
+                    receipt.snapshot.work.native_usage_known
+                        && receipt.snapshot.work.reserved_native_nodes == 0
+                        && receipt.snapshot.work.outstanding_native_executions == 0
+                })
+            })
     }
     fn short_circuit(
         &mut self,

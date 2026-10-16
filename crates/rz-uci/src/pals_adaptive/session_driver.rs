@@ -6,11 +6,13 @@
 mod checker_metadata;
 pub use checker_metadata::*;
 mod completion_observation;
+mod rovent;
 use completion_observation::CompletionJournal;
 pub use completion_observation::{
     AdaptiveCompletionDiagnostic, AdaptiveCompletionFailure, AdaptiveCompletionObservation,
     AdaptiveCompletionReasonCounts, AdaptiveCompletionReturn,
 };
+pub use rovent::{ROVENT_NATIVE_ROOT_DOMAIN, RoventNativeRootReceipt, RoventPcrSessionProfile};
 
 use super::{
     AdaptiveCollectionDispatchObserver, AdaptiveExecutionLimits, AdaptiveExecutionManager,
@@ -318,6 +320,9 @@ where
     #[cfg(feature = "pals-adaptive-diagnostics")]
     continuation_diagnostic: std::sync::OnceLock<super::ContinuationDiagnostic>,
     latest_root: Mutex<Option<AdaptiveShutdownReceipt>>,
+    rovent: Option<RoventPcrSessionProfile>,
+    rovent_collection_origin: Option<super::RoventNativeCollectionOrigin>,
+    latest_rovent_root: Mutex<Option<Arc<RoventNativeRootReceipt>>>,
     archive_receipts: Mutex<VecDeque<ArchiveWorkReceipt>>,
     pending_output: Mutex<Option<PendingOutput>>,
     accepted_outputs: Mutex<VecDeque<AdaptiveUciOutputObservation>>,
@@ -622,6 +627,9 @@ where
             #[cfg(feature = "pals-adaptive-diagnostics")]
             continuation_diagnostic: std::sync::OnceLock::new(),
             latest_root: Mutex::new(None),
+            rovent: None,
+            rovent_collection_origin: None,
+            latest_rovent_root: Mutex::new(None),
             archive_receipts: Mutex::new(VecDeque::with_capacity(64)),
             pending_output: Mutex::new(None),
             accepted_outputs: Mutex::new(VecDeque::with_capacity(64)),
@@ -1042,8 +1050,9 @@ where
         observation: &mut AttemptObservation,
         semantic_completion: &mut Option<PalsCompletion>,
     ) -> Result<SearchSessionReport, SearchSessionFailure> {
-        if context.control.max_simulations == 0
-            || context.control.max_simulations > self.options.max_cpu_nodes
+        if self.rovent.is_none()
+            && (context.control.max_simulations == 0
+                || context.control.max_simulations > self.options.max_cpu_nodes)
         {
             return Err(failure(
                 "AdaptiveCpuCredit",
@@ -1063,6 +1072,7 @@ where
                 "closed or mismatched UCI process authority",
             ));
         }
+        let rovent_root_legal = self.rovent_root_legal(position, context)?;
         let mut state = loop {
             match self.state.try_lock() {
                 Ok(state) => break state,
@@ -1101,7 +1111,7 @@ where
                 "root revoked before actual admission",
             ));
         }
-        let root_legal = position.legal_moves();
+        let root_legal = rovent_root_legal.unwrap_or_else(|| position.legal_moves());
         match self.pending_output.lock() {
             Ok(mut output) => {
                 *output = Some(PendingOutput {
@@ -1196,7 +1206,11 @@ where
         let limits = PalsLimits {
             deadline: context.control.deadline,
             max_rounds: self.options.max_rounds,
-            max_cpu_nodes: context.control.max_simulations,
+            max_cpu_nodes: if self.rovent.is_some() {
+                self.options.max_cpu_nodes
+            } else {
+                context.control.max_simulations
+            },
             cpu_depth: self.options.cpu_depth,
         };
         let port = match AdaptiveEnginePort::new_registered_retaining(
@@ -1288,7 +1302,11 @@ where
             token_budget: self.options.token_budget,
             policy: self.options.policy,
             first_request_sequence,
-            native_cpu_node_limit: context.control.max_simulations,
+            native_cpu_node_limit: if self.rovent.is_some() {
+                self.options.max_cpu_nodes
+            } else {
+                context.control.max_simulations
+            },
             endpoints: self.options.endpoints,
             controller: self.options.controller,
             device_digest: self.options.device_digest,
@@ -1335,6 +1353,20 @@ where
         };
         *observation = AttemptObservation::PalsStarted;
         let admitted = catch_unwind(AssertUnwindSafe(|| {
+            if let Some(profile) = &self.rovent {
+                manager.register_cleanup_deadline(context.shutdown_deadline)?;
+                if manager.registered_cleanup_deadline() != Some(context.shutdown_deadline) {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "Rovent original cleanup boundary differs",
+                    ));
+                }
+                profile.attach(
+                    &mut manager,
+                    context,
+                    &self.clock,
+                    self.rovent_collection_origin.as_ref(),
+                )?;
+            }
             #[cfg(feature = "pals-adaptive-diagnostics")]
             if let Some(diagnostic) = self.continuation_diagnostic.get() {
                 manager.install_continuation_diagnostic(diagnostic.clone());
@@ -1345,8 +1377,24 @@ where
             if let Some(observer) = &self.collection_hooks.root_admission {
                 observer(&mut manager)?;
             }
-            manager.driver_mut().prepare_root_rules()?;
-            if manager.driver().root_is_terminal()? {
+            if self.rovent.is_some() {
+                if !context.accepts()? {
+                    manager.begin_root_quiesce(context.shutdown_deadline)?;
+                    drain_root(&mut manager, context.shutdown_deadline)?;
+                    return manager.shutdown_receipt();
+                }
+                if let Err(error) = manager
+                    .driver_mut()
+                    .prepare_rovent_root_rules(self.clock.domain(), self.clock.now()?)
+                {
+                    if !self.rovent_controlled_scan_stop(&manager, &error)? {
+                        return Err(error);
+                    }
+                }
+            } else {
+                manager.driver_mut().prepare_root_rules()?;
+            }
+            if manager.driver().root_is_terminal()? || self.rovent_should_quiesce(&manager)? {
                 manager.begin_root_quiesce(context.shutdown_deadline)?;
                 drain_root(&mut manager, context.shutdown_deadline)?;
                 manager.shutdown_receipt()
@@ -1369,7 +1417,9 @@ where
                     &context.control.cancellation,
                     &mut |manager| {
                         if manager.phase() == ManagerPhase::Running
-                            && (Instant::now() >= close_at || !context.accepts().unwrap_or(false))
+                            && (Instant::now() >= close_at
+                                || !context.accepts().unwrap_or(false)
+                                || self.rovent_should_quiesce(manager)?)
                         {
                             manager.begin_root_quiesce(context.shutdown_deadline)?;
                         }
@@ -1413,6 +1463,7 @@ where
                 let _ = manager.begin_root_quiesce(context.shutdown_deadline);
                 let _ = drain_root(&mut manager, context.shutdown_deadline);
             }));
+            let _ = self.observe_rovent_root(&manager, context);
             // Even cleanup panic retains the whole actual manager before any
             // caller-visible failure; a local owner must not unwind and drop.
             #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -1437,6 +1488,7 @@ where
             // Preserve the first original failure before retaining the complete
             // manager. Its cause does not confirm a fence or relax quarantine.
             let failure = failed_root_closure(manager.failures().next());
+            let _ = self.observe_rovent_root(&manager, context);
             *state = SessionState::Manager(manager);
             return Err(failure);
         }
@@ -1497,6 +1549,33 @@ where
                 }
             };
         let retained_failure = manager.failures().next().cloned();
+        let rovent_receipt = match self.observe_rovent_root(&manager, context) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                *state = SessionState::Manager(manager);
+                return Err(error.unknown_if_unclosed());
+            }
+        };
+        if self.rovent.is_some() {
+            match manager.driver_mut().retire_rovent_frontier() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    *state = SessionState::Manager(manager);
+                    return Err(failure(
+                        "RoventFrontierRetirement",
+                        "actual Rovent frontier is missing",
+                    )
+                    .unknown_if_unclosed());
+                }
+                Err(error) => {
+                    *state = SessionState::Manager(manager);
+                    return Err(
+                        SearchSessionFailure::debug("RoventFrontierRetirement", &error)
+                            .unknown_if_unclosed(),
+                    );
+                }
+            }
+        }
         let parts = match manager.into_persistent_parts() {
             Ok(parts) => parts,
             Err(rejected) => {
@@ -1532,6 +1611,15 @@ where
             return Err(SearchSessionFailure::debug("AdaptiveRootFailure", &error));
         }
         let result = semantic.map_err(|e| SearchSessionFailure::debug("AdaptiveRootResult", &e))?;
+        if result
+            .best_move
+            .is_some_and(|movement| !root_legal.contains(&movement))
+        {
+            return Err(failure(
+                "RoventRootRestriction",
+                "actual result escaped its original legal root domain",
+            ));
+        }
         if result.resolver_version != self.registration.resolver_version {
             return Err(failure(
                 "AdaptiveResolverChanged",
@@ -1555,7 +1643,10 @@ where
         initial_game.armed = false;
         Ok(SearchSessionReport {
             best_move: result.best_move,
-            work: pals_work(result.counters),
+            work: match rovent_receipt {
+                Some(receipt) => receipt.work()?,
+                None => pals_work(result.counters),
+            },
         })
     }
 
@@ -1892,7 +1983,22 @@ where
     B::Output: ProposerRankingOutput,
 {
     fn kind(&self) -> SearchKind {
-        SearchKind::Pals
+        if self.rovent.is_some() {
+            SearchKind::Rovent
+        } else {
+            SearchKind::Pals
+        }
+    }
+    fn search_goal_capability(&self) -> Option<std::num::NonZeroU16> {
+        self.rovent
+            .as_ref()
+            .map(|profile| profile.maximum_goal_plies)
+    }
+    fn finish_session(
+        &self,
+        until: Instant,
+    ) -> Result<Option<crate::search_driver::DriverPhysicalCompletion>, SearchSessionFailure> {
+        self.finish_rovent_session(until)
     }
     fn implementation(&self) -> Digest {
         self.options.implementation
@@ -1901,10 +2007,14 @@ where
         self.options.identity.clone()
     }
     fn work_receipt(&self) -> Result<Option<ProcessSearchWorkReceipt>, ContractError> {
-        self.work.snapshot().map(Some)
+        if self.rovent.is_some() {
+            Ok(None)
+        } else {
+            self.work.snapshot().map(Some)
+        }
     }
     fn pals_checker_registration(&self) -> Option<PalsCheckerRegistration> {
-        Some(self.registration.clone())
+        self.rovent.is_none().then(|| self.registration.clone())
     }
     fn checker_started(&self) -> Option<bool> {
         match self.state.try_lock() {
@@ -2032,12 +2142,15 @@ where
         context: &SearchSessionContext,
         progress: &mut dyn FnMut(BoardMove),
     ) -> Result<SearchSessionReport, SearchSessionFailure> {
-        if let Err(error) = self.work.begin() {
-            let failure = SearchSessionFailure::debug("AdaptiveWorkJournal", &error);
-            if let Ok(mut journal) = self.completion.lock() {
-                journal.record(context.authority, None, Err(&failure));
+        let legacy_journal = self.rovent.is_none();
+        if legacy_journal {
+            if let Err(error) = self.work.begin() {
+                let failure = SearchSessionFailure::debug("AdaptiveWorkJournal", &error);
+                if let Ok(mut journal) = self.completion.lock() {
+                    journal.record(context.authority, None, Err(&failure));
+                }
+                return Err(failure);
             }
-            return Err(failure);
         }
         let mut observation = AttemptObservation::NoWork;
         let mut semantic_completion = None;
@@ -2048,7 +2161,11 @@ where
             &mut observation,
             &mut semantic_completion,
         );
-        let recorded = self.work.finish(context, &result, observation);
+        let recorded = if legacy_journal {
+            self.work.finish(context, &result, observation)
+        } else {
+            Ok(())
+        };
         let returned = match (result, recorded) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(SearchSessionFailure::debug("AdaptiveWorkJournal", &error)),
