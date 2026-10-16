@@ -23,10 +23,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub mod adaptive;
+pub mod profiled_worker;
 pub mod profiles;
 pub mod worker;
 
 pub use adaptive::*;
+pub use profiled_worker::*;
 pub use profiles::*;
 
 pub const EXTERNAL_UCI_CHECKER_VERSION: &str = "rz-external-uci-checker/0.1";
