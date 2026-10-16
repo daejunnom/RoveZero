@@ -1111,7 +1111,7 @@ mod tests {
                 VirtualReviewNativeCommand::VerifyVirtualCudaPlacement => {
                     observed.lock().unwrap().push("placement");
                     Ok(VirtualReviewNativeResult::VirtualCudaPlacementVerified(
-                        mock_profile_window_witness(),
+                        Box::new(mock_profile_window_witness()),
                     ))
                 }
                 VirtualReviewNativeCommand::VerifyRuntime => {
