@@ -1,6 +1,6 @@
 //! Opt-in copied scalar facts at the original Search semantic boundaries.
 //! No output/model/view payload, callback or coordinator-transition authority.
-use super::{PalsError, RoleError, StoreError};
+use super::{BoardMove, LineId, ObservationId, PalsError, RoleError, StateId, StoreError};
 use crate::pals::coordinator::FrameId;
 use rz_contracts::pals::{Role, SearchAuthority};
 use rz_contracts::{Digest, RequestId};
@@ -63,6 +63,23 @@ impl AdaptiveRoleConsumptionRejection {
     }
 }
 
+/// Copied by the original Search record producer only after publish_record
+/// succeeded. Store-local IDs require the event's original authority; they are
+/// not Rules StateIdentity/OwnerId or a neural execution identity.
+/// Publication may precede a later semantic commit failure, so this fact alone
+/// never asserts SemanticResult, view consumption or machine acceptance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdaptivePublishedRepairLine {
+    pub line: LineId,
+    pub observation: ObservationId,
+    pub record_revision: u64,
+    pub parent_revision: Option<u64>,
+    pub supersedes_revision: Option<u64>,
+    pub origin_state: StateId,
+    pub committed_plies: usize,
+    pub first_move: Option<BoardMove>,
+}
+
 /// RequestId is the original role ticket's id. Every field is a copied scalar
 /// identity/digest; neither the ReviewView nor RoleOutput is retained here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +103,10 @@ pub struct AdaptiveRoleConsumptionEvent {
     /// Exact attempted_role_commits membership before this call. A true value
     /// does not assert that the earlier attempt succeeded or consumed a view.
     pub prior_semantic_attempt: Option<bool>,
+    /// Exact original Repair record publication, if this invocation reached it.
+    /// None for an unfinished Repair prefix, a pre-publication error, all other
+    /// roles and consume-only events. Never copied from a previous invocation.
+    pub published_repair_line: Option<AdaptivePublishedRepairLine>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

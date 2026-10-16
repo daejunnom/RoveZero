@@ -15,7 +15,13 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .role_consumption_observation
             .as_ref()
             .map(|_| self.attempted_role_commits.contains(&ticket.id));
-        let returned = self.commit_role_unobserved(work, ticket, output, physical);
+        let mut published_repair_line = None;
+        let repair_publication_sink = self
+            .role_consumption_observation
+            .is_some()
+            .then_some(&mut published_repair_line);
+        let returned =
+            self.commit_role_unobserved(work, ticket, output, physical, repair_publication_sink);
         if let Some(journal) = &mut self.role_consumption_observation {
             let (outcome, completed_evidence) = match &returned {
                 Ok(step) => (
@@ -42,6 +48,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 outcome,
                 completed_evidence,
                 prior_semantic_attempt,
+                published_repair_line,
             });
         }
         returned
@@ -53,6 +60,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         ticket: &RoleTicketEnvelope,
         output: &RoleOutput,
         physical: Option<AdaptivePortRoleEvidence>,
+        repair_publication_sink: Option<&mut Option<AdaptivePublishedRepairLine>>,
     ) -> Result<AdaptivePortStep, PalsError> {
         self.validate_role(work, ticket, output)?;
         let observations_before = self.engine.stores.observations.next_observation_sequence();
@@ -149,7 +157,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                         ),
                         _ => (RecordKind::Repair, RefinementStage::RepairValidation),
                     };
-                    self.record_hot(
+                    self.record_hot_with_cpu_value(
                         kind,
                         &prefix,
                         if kind == RecordKind::Counterexample {
@@ -157,6 +165,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                         } else {
                             None
                         },
+                        None,
+                        repair_publication_sink,
                     )?;
                     match kind {
                         RecordKind::Proposal => self.counters.proposals += 1,
@@ -874,7 +884,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         line: &[BoardMove],
         cpu: Option<ObservationId>,
     ) -> Result<Option<(LineId, ObservationId)>, PalsError> {
-        self.record_hot_with_cpu_value(kind, line, cpu, None)
+        self.record_hot_with_cpu_value(kind, line, cpu, None, None)
     }
 
     /// Publish the same model-facing verification projection as the legacy
@@ -892,6 +902,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             line,
             None,
             Some((score, depth, scope, perspective)),
+            None,
         )?;
         Ok(())
     }
@@ -902,6 +913,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         line: &[BoardMove],
         cpu: Option<ObservationId>,
         value: Option<(i32, u16, CpuScoreScope, Color)>,
+        repair_publication_sink: Option<&mut Option<AdaptivePublishedRepairLine>>,
     ) -> Result<Option<(LineId, ObservationId)>, PalsError> {
         if value.is_some() && kind != RecordKind::CpuVerification {
             return Err(StoreError::InvalidEvidence("CPU verification projection kind").into());
@@ -1009,8 +1021,26 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             execution: None,
         })?;
         self.engine.pin_archive_active_record(line, observation)?;
+        // Copy only scalar fields of the record that this owner is about to
+        // publish. No additional line clone, lookup/replay or digest is made.
+        let copied_repair_line = (repair_publication_sink.is_some() && kind == RecordKind::Repair)
+            .then(|| AdaptivePublishedRepairLine {
+                line,
+                observation,
+                record_revision: record.revision,
+                parent_revision: record.parent_revision,
+                supersedes_revision: record.supersedes_revision,
+                origin_state: record.origin_state,
+                committed_plies: record.line.len(),
+                first_move: record.line.first().copied(),
+            });
         self.engine
             .publish_record(record, None, Some(observation))?;
+        // Only the successful original publication releases this observation.
+        // A later commit error still returns unchanged, alongside Rejected.
+        if let Some(destination) = repair_publication_sink {
+            *destination = copied_repair_line;
+        }
         Ok(Some((line, observation)))
     }
 

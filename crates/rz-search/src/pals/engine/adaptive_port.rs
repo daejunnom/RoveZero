@@ -29,7 +29,7 @@ mod role_commit;
 pub mod validator_port;
 pub use branch_queue::{AdaptiveDeferredRepair, AdaptiveQueuedRecheck};
 pub use consumption_observation::{
-    AdaptiveRoleConsumptionEvent, AdaptiveRoleConsumptionObservation,
+    AdaptivePublishedRepairLine, AdaptiveRoleConsumptionEvent, AdaptiveRoleConsumptionObservation,
     AdaptiveRoleConsumptionOutcome, AdaptiveRoleConsumptionRejection, AdaptiveRoleConsumptionStage,
     AdaptiveRoleConsumptionUnavailable, MAX_ROLE_CONSUMPTION_EVENTS,
 };
@@ -1443,6 +1443,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 outcome,
                 completed_evidence: None,
                 prior_semantic_attempt: None,
+                published_repair_line: None,
             });
         }
     }

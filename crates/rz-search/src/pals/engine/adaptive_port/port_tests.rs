@@ -1114,3 +1114,151 @@ fn role_consumption_observation_overflow_cannot_change_idempotent_search_behavio
             .unwrap()
     );
 }
+
+// Authored source fixtures: original semantic/Store path, no native forward.
+fn repair_publication_work(line_plies: usize, observe: bool) -> (Port, Work) {
+    let mut port = setup(Position::startpos(), line_plies);
+    if observe {
+        assert!(port.enable_role_consumption_observation());
+    }
+    let first = BoardMove::from_uci("e2e4").unwrap();
+    let proposal = ["e2e4", "c7c5", "g1f3"]
+        .map(|m| BoardMove::from_uci(m).unwrap())
+        .to_vec();
+    let counter = ["e2e4", "e7e5"]
+        .map(|m| BoardMove::from_uci(m).unwrap())
+        .to_vec();
+    port.record_hot(RecordKind::Proposal, &proposal, None)
+        .unwrap();
+    port.record_hot(RecordKind::Counterexample, &counter, None)
+        .unwrap();
+    let node = port.replay_node(&counter).unwrap();
+    let input = port
+        .input(
+            node,
+            RefinementStage::Repair,
+            Some(first),
+            counter.clone(),
+            proposal,
+            Some(counter),
+            None,
+            Some(1),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+    let work = Work {
+        frame: FrameId {
+            authority: port.authority,
+            sequence: 1,
+        },
+        original_first_move: rz_contracts::pals::Move16::encode(
+            rz_contracts::Move::try_from(first).unwrap(),
+        ),
+        original_deadline: port.deadline,
+        budget: FrameBudget {
+            original_cpu_credit: port.limits.max_cpu_nodes,
+            role_submissions_remaining: port.engine.config.max_role_calls,
+            original_store_byte_limit: 8 * 1024 * 1024,
+        },
+        input,
+    };
+    (port, work)
+}
+#[test]
+fn repair_publication_metadata_is_original_and_does_not_change_semantic_result() {
+    let mut results = Vec::new();
+    for observe in [false, true] {
+        let (mut port, work) = repair_publication_work(3, observe);
+        let prior_revision = port.engine.revision;
+        let (ticket, out) = output(&work, 1);
+        let step = port.commit_role(&work, &ticket, &out, None).unwrap();
+        let record = port.engine.records.last().unwrap();
+        assert_eq!(record.kind, RecordKind::Repair);
+        assert_eq!(record.parent_revision, Some(prior_revision));
+        assert_eq!(record.line.len(), 3);
+        results.push((
+            step.evidence,
+            record.revision,
+            record.line.len(),
+            record.line.first().copied(),
+            port.counters.role_calls,
+            port.counters.accepted_repair_outputs,
+        ));
+        if observe {
+            let event = port.role_consumption_observation().unwrap().events()[0];
+            assert_eq!(
+                event.outcome,
+                AdaptiveRoleConsumptionOutcome::SemanticResult
+            );
+            assert_eq!(event.completed_evidence, Some(step.evidence));
+            assert_eq!(event.frame, Some(work.frame));
+            assert_eq!(event.submitted_question, Some(work.input.question_digest));
+            let published = event.published_repair_line.unwrap();
+            assert_eq!(published.record_revision, record.revision);
+            assert_eq!(published.parent_revision, record.parent_revision);
+            assert_eq!(published.supersedes_revision, record.supersedes_revision);
+            assert_eq!(published.origin_state, record.origin_state);
+            assert_eq!(published.committed_plies, record.line.len());
+            assert_eq!(published.first_move, record.line.first().copied());
+            let original_observation = port
+                .engine
+                .stores
+                .observations
+                .get(published.observation)
+                .unwrap();
+            assert_eq!(original_observation.line, Some(published.line));
+            assert_eq!(original_observation.kind, ObservationKind::Repair);
+            assert_eq!(
+                port.engine.stores.lines.moves(published.line).unwrap(),
+                record.line
+            );
+            port.role_consumed(&ticket, &work.input.view).unwrap();
+            let consumed = port.role_consumption_observation().unwrap().events()[1];
+            assert_eq!(
+                consumed.outcome,
+                AdaptiveRoleConsumptionOutcome::ConsumedView
+            );
+            assert!(consumed.published_repair_line.is_none());
+            assert!(port.commit_role(&work, &ticket, &out, None).is_err());
+            let rejected = *port
+                .role_consumption_observation()
+                .unwrap()
+                .events()
+                .last()
+                .unwrap();
+            assert!(matches!(
+                rejected.outcome,
+                AdaptiveRoleConsumptionOutcome::Rejected(_)
+            ));
+            assert!(rejected.published_repair_line.is_none());
+        } else {
+            assert!(port.role_consumption_observation().is_none());
+        }
+    }
+    assert_eq!(results[0], results[1]);
+}
+#[test]
+fn unfinished_repair_semantic_result_is_not_a_published_repair_line() {
+    let (mut port, work) = repair_publication_work(4, true);
+    let (ticket, out) = output(&work, 1);
+    let step = port.commit_role(&work, &ticket, &out, None).unwrap();
+    assert!(matches!(
+        step.transition,
+        AdaptivePortTransition::Continue(_)
+    ));
+    let event = port.role_consumption_observation().unwrap().events()[0];
+    assert_eq!(
+        event.outcome,
+        AdaptiveRoleConsumptionOutcome::SemanticResult
+    );
+    assert!(event.published_repair_line.is_none());
+    assert!(
+        !port
+            .engine
+            .records
+            .iter()
+            .any(|r| r.kind == RecordKind::Repair)
+    );
+}

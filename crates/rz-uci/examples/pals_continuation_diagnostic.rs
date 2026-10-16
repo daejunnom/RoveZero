@@ -449,7 +449,7 @@ mod actual {
                 .as_ref()
                 .is_ok_and(|p| p.permits_archive_close() && p.store_archive_closed());
         emit(&json!({
-            "domain":"rovezero.actual-continuation-diagnostic-raw/3",
+            "domain":"rovezero.actual-continuation-diagnostic-raw/4",
             "case":opaque(&case), "case_acceptance":"NOT_ISSUED_BY_DIAGNOSTIC_RUNNER",
             "source_commit":env!("RZ_PALS_COMPILED_SOURCE_COMMIT"),
             "startup_config_sha256":config_pin,"registered_image":registered_image,
@@ -495,7 +495,7 @@ mod actual {
         };
         use serde_json::{Value, json};
         use std::time::Instant;
-        const DOMAIN: &str = "rovezero.continuation-diagnostic-scalar/1";
+        const DOMAIN: &str = "rovezero.continuation-diagnostic-scalar/2";
         fn hex(value: Digest) -> String {
             const HEX: &[u8; 16] = b"0123456789abcdef";
             let mut text = String::with_capacity(64);
@@ -666,7 +666,18 @@ mod actual {
                 "ticket_question_digest":hex(event.question),"submitted_source_question_digest":event.submitted_question.map(hex),
                 "ticket_view_digest":hex(event.ticket_view),"submitted_view_digest":hex(event.submitted_view),
                 "frame":event.frame.map(frame),"source_stage":opaque(&event.stage),"outcome":outcome,
-                "completed_evidence_digest":event.completed_evidence.map(hex),"prior_semantic_attempt":event.prior_semantic_attempt})
+                "completed_evidence_digest":event.completed_evidence.map(hex),"prior_semantic_attempt":event.prior_semantic_attempt,
+                "published_repair_line":event.published_repair_line.map(|line|json!({
+                    "domain":"search-published-repair-line/1","authority":authority(&event.authority),
+                    "line":{"domain":"search_store_line","store_local_index":line.line.0.to_string()},
+                    "observation":{"domain":"search_store_observation","store_local_index":line.observation.0.to_string()},
+                    "record_revision":line.record_revision.to_string(),
+                    "parent_record_revision":line.parent_revision.map(|v|v.to_string()),
+                    "supersedes_record_revision":line.supersedes_revision.map(|v|v.to_string()),
+                    "origin_state":{"domain":"search_store_state","store_local_index":line.origin_state.0.to_string()},
+                    "committed_plies":line.committed_plies,"first_move_uci":line.first_move.map(|m|m.to_uci()),
+                    "source_boundary":"ORIGINAL_REPAIR_PUBLISH_RECORD_RETURNED_OK",
+                    "semantic_and_machine_acceptance":"REQUIRE_SEPARATE_ORIGINAL_EVENTS"}))})
         }
         fn resolved(event: &ContinuationResolutionObservation) -> Value {
             let transition = match event.transition {
@@ -1033,6 +1044,57 @@ mod actual {
             }
 
             #[test]
+            fn repair_line_wire_preserves_publication_even_when_later_semantic_commit_failed() {
+                use rz_search::pals::engine::adaptive_port::{
+                    AdaptivePublishedRepairLine, AdaptiveRoleConsumptionRejection,
+                };
+                use rz_search::pals::store::{LineId, ObservationId, StateId};
+                let event = AdaptiveRoleConsumptionEvent {
+                    authority: scope(),
+                    request: RequestId::new(scope().epoch, u64::MAX),
+                    role: Role::Proposer,
+                    question: Digest([3; 32]),
+                    submitted_question: Some(Digest([3; 32])),
+                    ticket_view: Digest([4; 32]),
+                    submitted_view: Digest([4; 32]),
+                    frame: Some(FrameId {
+                        authority: scope(),
+                        sequence: 77,
+                    }),
+                    stage: AdaptiveRoleConsumptionStage::SemanticCommit,
+                    outcome: AdaptiveRoleConsumptionOutcome::Rejected(
+                        AdaptiveRoleConsumptionRejection::Capacity,
+                    ),
+                    completed_evidence: None,
+                    prior_semantic_attempt: Some(false),
+                    published_repair_line: Some(AdaptivePublishedRepairLine {
+                        line: LineId(11),
+                        observation: ObservationId(12),
+                        record_revision: u64::MAX,
+                        parent_revision: Some(17),
+                        supersedes_revision: None,
+                        origin_state: StateId(2),
+                        committed_plies: 3,
+                        first_move: Some(rz_position::BoardMove::from_uci("e2e4").unwrap()),
+                    }),
+                };
+                let value = consumed(&event);
+                assert_eq!(value["outcome"]["kind"], "Rejected");
+                assert!(value["completed_evidence_digest"].is_null());
+                let line = &value["published_repair_line"];
+                assert_eq!(line["record_revision"], u64::MAX.to_string());
+                assert_eq!(line["line"]["domain"], "search_store_line");
+                assert_eq!(line["origin_state"]["domain"], "search_store_state");
+                assert_eq!(line["committed_plies"], 3);
+                assert_eq!(line["first_move_uci"], "e2e4");
+                let none = AdaptiveRoleConsumptionEvent {
+                    published_repair_line: None,
+                    ..event
+                };
+                assert!(consumed(&none)["published_repair_line"].is_null());
+            }
+
+            #[test]
             fn scalar_wire_keeps_large_ids_and_typed_domains_distinct() {
                 let a = scope();
                 let r = request(RequestId::new(a.epoch, u64::MAX));
@@ -1112,6 +1174,7 @@ mod actual {
                     outcome: AdaptiveRoleConsumptionOutcome::SemanticResult,
                     completed_evidence: Some(Digest([5; 32])),
                     prior_semantic_attempt: Some(false),
+                    published_repair_line: None,
                 };
                 let mut first_consume = semantic;
                 first_consume.stage = AdaptiveRoleConsumptionStage::ViewConsumption;
@@ -1187,6 +1250,9 @@ mod actual {
                 "hot":{"event_presence":match hot_value {Ok(events)=>presence(true,events.is_empty()),Err(_)=>"UNAVAILABLE"},
                     "source_error":hot_value.as_ref().err(),"records":hot_value.as_ref().ok().map(|events|events.iter().map(hot).collect::<Vec<_>>())},
                 "cpu_slices":cpu_channel(cpu),"continuation":continuation_channel(continuation,options,clock),
+                "repair_to_critic_line_identity":{"status":"UNAVAILABLE_NO_ORIGINAL_REPAIR_LINE_ID",
+                    "repair_line":null,"consumer_line":null,
+                    "reason":"Original submitted C question carries line values but no producer-preserved Repair LineId/revision; length/digest/frame matches do not issue a causal link"},
                 "case_acceptance":"NOT_ISSUED_BY_DIAGNOSTIC_RUNNER"})
         }
     }
@@ -1198,7 +1264,7 @@ mod actual {
             Err(error) => {
                 let detail: String = error.to_string().chars().take(512).collect();
                 let _ = emit(
-                    &json!({"domain":"rovezero.actual-continuation-diagnostic-raw/3",
+                    &json!({"domain":"rovezero.actual-continuation-diagnostic-raw/4",
                     "status":"PREPARATION_OR_PUBLICATION_FAILED","detail":detail,
                     "case_acceptance":"NOT_ISSUED_BY_DIAGNOSTIC_RUNNER",
                     "actual_nn_scope":"UNKNOWN_UNLESS_ORIGINAL_RAW_PROVES_IT","scalar_observations":null,"runtime_closure":null}),
