@@ -45,7 +45,9 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::fs::{self, File};
+#[cfg(target_os = "linux")]
+use std::fs;
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -224,6 +226,7 @@ struct Output {
     dir: cap_std::fs::Dir,
     bytes: usize,
 }
+#[cfg(target_os = "linux")]
 fn outside_git(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         return Err("absolute paths required".into());
@@ -242,7 +245,7 @@ impl Output {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = path;
-            return Err("retained output-directory identity currently requires Linux".into());
+            Err("retained output-directory identity currently requires Linux".into())
         }
         #[cfg(target_os = "linux")]
         {
