@@ -1041,7 +1041,7 @@ impl ExternalUciCpuChecker {
             },
             elapsed: Duration::ZERO,
         };
-        self.capture(&report, start);
+        self.capture(&mut report, start);
         let result = self.run_active(
             position,
             roots,
@@ -1053,8 +1053,7 @@ impl ExternalUciCpuChecker {
             &mut report,
             cooperative,
         );
-        report.elapsed = start.elapsed();
-        self.capture(&report, start);
+        self.capture(&mut report, start);
         if let Err(failure) = result {
             if !self.active
                 && matches!(
@@ -1089,7 +1088,7 @@ impl ExternalUciCpuChecker {
                 Some(cleanup_fence),
             )?;
             let _ = self.shutdown(cleanup);
-            self.capture(&report, start);
+            self.capture(&mut report, start);
             return Err(failure);
         }
         Ok(CheckerReport::ExternalUci(report))
@@ -1384,14 +1383,18 @@ impl ExternalUciCpuChecker {
         }
     }
 
-    fn capture(&mut self, report: &ExternalCheckerReport, start: Instant) {
+    fn capture(&mut self, report: &mut ExternalCheckerReport, start: Instant) {
+        // One clock observation belongs to both copies of this physical fact.
+        // Reading it again for the attempt makes an otherwise identical final
+        // report fail the immutable receipt comparison in the search owner.
+        report.elapsed = start.elapsed();
         let process = self
             .owner
             .as_ref()
             .map_or_else(empty_shutdown, |owner| owner.evidence());
         self.last_attempt = Some(CheckerAttempt {
             work: report.work,
-            elapsed: start.elapsed(),
+            elapsed: report.elapsed,
             external: Some(ExternalAttemptEvidence {
                 request_id: report.request_id,
                 partial_report: Some(report.clone()),
@@ -2611,6 +2614,13 @@ mod tests {
             assert_eq!(result.report.work.nodes, Some(10));
             assert!(result.readiness_barrier_completed);
             assert!(result.stop_control.is_none()); // quantum, not a fabricated control ack
+            let attempt = checker.last_attempt().unwrap();
+            assert_eq!(attempt.elapsed, result.report.elapsed);
+            assert_eq!(
+                attempt.external.as_ref().unwrap().partial_report.as_ref(),
+                Some(&result.report)
+            );
+            assert!(attempt.elapsed > Duration::ZERO);
             assert!(Instant::now() < hard);
         }
         assert_eq!(checker.request_id, 2);
@@ -2694,6 +2704,12 @@ mod tests {
             })
         );
         assert!(result.readiness_barrier_completed);
+        let attempt = checker.last_attempt().unwrap();
+        assert_eq!(attempt.elapsed, result.report.elapsed);
+        assert_eq!(
+            attempt.external.as_ref().unwrap().partial_report.as_ref(),
+            Some(&result.report)
+        );
         assert!(!checker.capabilities().resume);
         checker
             .shutdown(Instant::now() + Duration::from_secs(2))
