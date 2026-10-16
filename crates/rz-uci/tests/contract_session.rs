@@ -11,6 +11,7 @@ use rz_uci::{
     CancelReason, Effect, EngineIdentity, Event, ParserLimits, PositionBase, PositionPort,
     PositionSpec, PreparedPosition, SearchCompletion, SearchTicket, Session,
 };
+use std::num::NonZeroU16;
 use std::time::{Duration, Instant};
 
 const EPOCH: ProcessEpoch = ProcessEpoch(7000);
@@ -165,6 +166,87 @@ fn assert_typed_error(out: &ContractSessionOutcome<Snapshot>, code: ErrorCode) {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "ContractFailure")
+    );
+}
+
+#[test]
+fn rejected_restrictions_and_unregistered_goals_preserve_common_authority_and_budget() {
+    let mut owner = owner(fixture_scope());
+    let mut session = session();
+    let ticket = begin(&mut owner, &mut session, "go nodes 8 searchmoves e2e4");
+    let scope = owner.scope();
+    let deadline = owner.control().unwrap().deadline;
+    for (command, code) in [
+        ("go nodes 1 searchmoves e2e4 e2e5", "InvalidSearchMoves"),
+        ("go depth 1", "UnsupportedSearchGoal"),
+        ("go mate 1", "UnsupportedSearchGoal"),
+    ] {
+        let out = line(&mut owner, &mut session, command);
+        assert!(!out.session.accepted);
+        assert!(
+            out.session
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == code)
+        );
+        assert!(out.session.effects.is_empty() && out.session.protocol.is_empty());
+        assert!(out.errors.is_empty());
+        assert_scope(owner.scope(), scope);
+        assert_eq!(owner.active_ticket(), Some(&ticket));
+        assert_eq!(owner.control().unwrap().deadline, deadline);
+        assert!(
+            !owner
+                .control()
+                .unwrap()
+                .cancellation
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+    assert_eq!(
+        line(&mut owner, &mut session, "stop").session.protocol,
+        ["bestmove e2e4"]
+    );
+}
+
+#[test]
+fn registered_goal_binding_and_canonical_root_restriction_reach_the_start_effect() {
+    let mut owner = owner(fixture_scope());
+    let mut session = session();
+    session
+        .set_search_goal_capability(NonZeroU16::new(8))
+        .unwrap();
+    let out = line(
+        &mut owner,
+        &mut session,
+        "go mate 3 depth 6 searchmoves d2d4 e2e4 d2d4",
+    );
+    assert!(out.session.accepted && out.errors.is_empty(), "{out:?}");
+    let [Effect::Start { limits, .. }] = out.session.effects.as_slice() else {
+        panic!(
+            "expected goal-aware Start effect: {:?}",
+            out.session.effects
+        );
+    };
+    assert_eq!(limits.searchmoves, Some(vec!["e2e4".into(), "d2d4".into()]));
+    let binding = owner.active_binding().unwrap();
+    assert_eq!(
+        binding.goal(),
+        rz_contracts::rovent::SearchGoal {
+            depth_plies: NonZeroU16::new(6),
+            mate_moves: NonZeroU16::new(3),
+        }
+    );
+    assert_eq!(
+        binding.budget_kind(),
+        rz_uci::bridge::BudgetKind::ResourceWall
+    );
+    assert_eq!(
+        binding.control().max_simulations,
+        settings().max_simulations
+    );
+    assert_eq!(
+        line(&mut owner, &mut session, "stop").session.protocol,
+        ["bestmove e2e4"]
     );
 }
 

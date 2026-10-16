@@ -752,11 +752,21 @@ impl Owner {
                 }
                 // The opponent's elapsed time is never debited from the supplied own clock.
                 // A finite resource wall and simulation ceiling still bound speculative work.
+                let mut normalized = limits.clone();
+                normalized.ponder = false;
+                normalized.infinite = true;
+                normalized.movetime_ms = None;
+                normalized.white_time_ms = None;
+                normalized.black_time_ms = None;
+                normalized.white_increment_ms = None;
+                normalized.black_increment_ms = None;
+                normalized.moves_to_go = None;
                 append_contract_result(
                     &mut out,
-                    self.session_owner.handle_line(session, "go infinite", |s| {
-                        Ok(s.state.snapshot().side_to_move())
-                    }),
+                    self.session_owner
+                        .handle_normalized_go(session, normalized, |s| {
+                            Ok(s.state.snapshot().side_to_move())
+                        }),
                 );
                 if out.accepted {
                     self.held_ponder_bestmove = None;
@@ -1394,7 +1404,10 @@ impl Owner {
             }
             Effect::Shutdown => self.cancel(),
             Effect::Start {
-                ticket, snapshot, ..
+                ticket,
+                snapshot,
+                limits,
+                ..
             } => {
                 self.reap()?;
                 if self.workers.len() >= self.settings.max_workers {
@@ -1459,6 +1472,28 @@ impl Owner {
                         })?;
                     let context = crate::search_driver::SearchSessionContext {
                         authority: search_authority,
+                        root_moves: limits
+                            .searchmoves
+                            .as_ref()
+                            .map(|moves| {
+                                moves
+                                    .iter()
+                                    .map(|movement| {
+                                        movement.parse::<BoardMove>().map_err(|_| {
+                                            failure(
+                                                contract::ErrorCode::IdentityMismatch,
+                                                "sealed root move could not be decoded",
+                                            )
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()
+                                    .map(Arc::from)
+                            })
+                            .transpose()?,
+                        goal: contract::rovent::SearchGoal {
+                            depth_plies: limits.depth_plies,
+                            mate_moves: limits.mate_moves,
+                        },
                         control: control.clone(),
                         cancellation: token,
                         shutdown_deadline,
@@ -4327,6 +4362,50 @@ mod tests {
         assert!(started.protocol.is_empty());
         assert_eq!(owner.ponder.unwrap().1, Some(1));
         assert!(owner.session_owner.control().unwrap().deadline > Instant::now());
+    }
+
+    #[test]
+    fn ponder_normalization_preserves_root_restriction_and_registered_goals() {
+        let (mut owner, mut session) = fixture();
+        session
+            .set_search_goal_capability(std::num::NonZeroU16::new(8))
+            .unwrap();
+        owner.handle(
+            &mut session,
+            Event::Line("setoption name Ponder value true".into()),
+        );
+        let started = owner.handle(
+            &mut session,
+            Event::Line(
+                "go ponder wtime 1000 btime 2000 winc 1 binc 2 movestogo 8 nodes 1 depth 6 mate 3 searchmoves e2e4".into(),
+            ),
+        );
+        assert!(started.accepted, "{:?}", started.diagnostics);
+        let [Effect::Start { limits, .. }] = started.effects.as_slice() else {
+            panic!(
+                "expected one constrained ponder start: {:?}",
+                started.effects
+            );
+        };
+        assert_eq!(limits.searchmoves, Some(vec!["e2e4".into()]));
+        assert_eq!(limits.depth_plies, std::num::NonZeroU16::new(6));
+        assert_eq!(limits.mate_moves, std::num::NonZeroU16::new(3));
+        assert_eq!(limits.nodes, Some(1));
+        assert!(limits.infinite && !limits.ponder);
+        assert_eq!(limits.white_time_ms, None);
+        assert_eq!(limits.black_time_ms, None);
+        assert_eq!(limits.white_increment_ms, None);
+        assert_eq!(limits.black_increment_ms, None);
+        assert_eq!(limits.moves_to_go, None);
+        assert_eq!(
+            owner.session_owner.active_binding().unwrap().goal(),
+            contract::rovent::SearchGoal {
+                depth_plies: std::num::NonZeroU16::new(6),
+                mate_moves: std::num::NonZeroU16::new(3),
+            }
+        );
+        let stopped = owner.handle(&mut session, Event::Line("stop".into()));
+        assert_eq!(stopped.protocol, ["bestmove e2e4"]);
     }
 
     type DriverOutputAcks = Arc<Mutex<Vec<(contract::pals::SearchAuthority, String, bool)>>>;

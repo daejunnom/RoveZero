@@ -13,9 +13,11 @@
 //! 이것은 UCI movetime/clock 의미가 아니며, 한도 도달은 진단되는 자원 실패이다.
 
 use std::fmt;
+use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use rz_contracts::rovent::SearchGoal;
 use rz_search::driver::{SearchControl, StopReason};
 use rz_search::time::{TimeBudget, TimeBudgetConfig, TimeBudgetError, TimeControl};
 
@@ -50,6 +52,7 @@ pub struct SearchBinding {
     control: SearchControl,
     budget: TimeBudget,
     kind: BudgetKind,
+    goal: SearchGoal,
     infinite: bool,
     work_completed: AtomicBool,
 }
@@ -62,7 +65,47 @@ impl SearchBinding {
         start: Instant,
         settings: BuildSearchSettings,
     ) -> Result<Self, BuildSearchError> {
+        Self::build(ticket, limits, side, start, settings, None)
+    }
+
+    /// Explicit admission for a driver that implements the registered goals.
+    /// Legacy callers of `new` cannot silently ignore depth/mate objectives.
+    pub fn new_with_goal_capability(
+        ticket: SearchTicket,
+        limits: &GoLimits,
+        side: SideToMove,
+        start: Instant,
+        settings: BuildSearchSettings,
+        registered_max_plies: NonZeroU16,
+    ) -> Result<Self, BuildSearchError> {
+        Self::build(
+            ticket,
+            limits,
+            side,
+            start,
+            settings,
+            Some(registered_max_plies),
+        )
+    }
+
+    fn build(
+        ticket: SearchTicket,
+        limits: &GoLimits,
+        side: SideToMove,
+        start: Instant,
+        settings: BuildSearchSettings,
+        goal_capability: Option<NonZeroU16>,
+    ) -> Result<Self, BuildSearchError> {
         validate_limits(limits)?;
+        let goal = SearchGoal {
+            depth_plies: limits.depth_plies,
+            mate_moves: limits.mate_moves,
+        };
+        if goal.has_goal() {
+            let max_plies = goal_capability.ok_or(BuildSearchError::UnsupportedSearchGoal)?;
+            goal.validate(max_plies)
+                .map_err(|error| BuildSearchError::InvalidGo(error.detail))?;
+        }
         if settings.max_simulations == 0 {
             return Err(BuildSearchError::ZeroSimulationLimit);
         }
@@ -115,6 +158,7 @@ impl SearchBinding {
             control,
             budget,
             kind,
+            goal,
             infinite: limits.infinite,
             work_completed: AtomicBool::new(false),
         })
@@ -134,6 +178,10 @@ impl SearchBinding {
 
     pub fn budget_kind(&self) -> BudgetKind {
         self.kind
+    }
+
+    pub fn goal(&self) -> SearchGoal {
+        self.goal
     }
 
     /// Close tree/evaluator result admission before emitting stop/expiry output.
@@ -335,6 +383,7 @@ impl SearchBinding {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuildSearchError {
     InvalidGo(&'static str),
+    UnsupportedSearchGoal,
     ZeroSimulationLimit,
     ZeroUntimedLimit,
     UntimedDeadlineOverflow,
@@ -346,6 +395,9 @@ impl fmt::Display for BuildSearchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidGo(reason) => write!(f, "invalid go limits: {reason}"),
+            Self::UnsupportedSearchGoal => {
+                f.write_str("selected search binding has no registered depth/mate capability")
+            }
             Self::ZeroSimulationLimit => {
                 f.write_str("configured simulation limit must be positive")
             }
@@ -375,6 +427,16 @@ impl std::error::Error for BuildSearchError {
 }
 
 fn validate_limits(limits: &GoLimits) -> Result<(), BuildSearchError> {
+    if limits.searchmoves.as_ref().is_some_and(|moves| {
+        moves.is_empty()
+            || moves
+                .iter()
+                .any(|movement| !crate::parser::is_move_text(movement))
+    }) {
+        return Err(BuildSearchError::InvalidGo(
+            "searchmoves requires a nonempty list of move text",
+        ));
+    }
     if limits.nodes == Some(0) {
         return Err(BuildSearchError::InvalidGo("nodes must be positive"));
     }
@@ -401,12 +463,18 @@ fn validate_limits(limits: &GoLimits) -> Result<(), BuildSearchError> {
             "movetime and clocks are distinct modes",
         ));
     }
-    if limits.infinite && (limits.movetime_ms.is_some() || has_clock || limits.nodes.is_some()) {
+    if limits.infinite && (limits.ponder || limits.movetime_ms.is_some() || has_clock) {
         return Err(BuildSearchError::InvalidGo(
-            "infinite cannot combine with finite limits",
+            "infinite cannot combine with ponder or time limits",
         ));
     }
-    if !limits.infinite && limits.movetime_ms.is_none() && !has_clock && limits.nodes.is_none() {
+    if !limits.infinite
+        && limits.movetime_ms.is_none()
+        && !has_clock
+        && limits.nodes.is_none()
+        && limits.depth_plies.is_none()
+        && limits.mate_moves.is_none()
+    {
         return Err(BuildSearchError::InvalidGo(
             "go needs a finite limit or infinite",
         ));
@@ -522,6 +590,116 @@ mod tests {
         assert_eq!(binding.budget().allocation, Duration::from_secs(1));
         assert_eq!(binding.control().max_simulations, 7);
         assert_eq!(binding.control().deadline, now + Duration::from_millis(990));
+    }
+
+    #[test]
+    fn legacy_binding_rejects_goals_and_registered_binding_preserves_their_units() {
+        let now = Instant::now();
+        let mut session = session();
+        session
+            .set_search_goal_capability(NonZeroU16::new(8))
+            .unwrap();
+        let (ticket, limits) = start(&mut session, "go depth 6 mate 3 nodes 7 searchmoves b2b3");
+        assert!(matches!(
+            SearchBinding::new(ticket.clone(), &limits, SideToMove::White, now, settings()),
+            Err(BuildSearchError::UnsupportedSearchGoal)
+        ));
+        let binding = SearchBinding::new_with_goal_capability(
+            ticket,
+            &limits,
+            SideToMove::White,
+            now,
+            settings(),
+            NonZeroU16::new(8).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            binding.goal(),
+            SearchGoal {
+                depth_plies: NonZeroU16::new(6),
+                mate_moves: NonZeroU16::new(3),
+            }
+        );
+        assert_eq!(binding.control().max_simulations, 7);
+        assert_eq!(binding.budget_kind(), BudgetKind::ResourceWall);
+        let outside = binding.progress(&mut session, "a2a3", now);
+        assert!(!outside.accepted);
+        assert!(
+            outside
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "IllegalBestMove")
+        );
+        assert_eq!(session.handle_line("stop").protocol, ["bestmove b2b3"]);
+    }
+
+    #[test]
+    fn registered_depth_and_mate_only_goals_use_a_resource_wall_without_becoming_nodes() {
+        let now = Instant::now();
+        for line in [
+            "go depth 4",
+            "go mate 2",
+            "go infinite depth 4 mate 2 nodes 3",
+        ] {
+            let mut session = session();
+            session
+                .set_search_goal_capability(NonZeroU16::new(8))
+                .unwrap();
+            let (ticket, limits) = start(&mut session, line);
+            let binding = SearchBinding::new_with_goal_capability(
+                ticket,
+                &limits,
+                SideToMove::White,
+                now,
+                settings(),
+                NonZeroU16::new(8).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(binding.goal().depth_plies, limits.depth_plies);
+            assert_eq!(binding.goal().mate_moves, limits.mate_moves);
+            assert_eq!(binding.budget_kind(), BudgetKind::ResourceWall);
+            assert_eq!(
+                binding.control().max_simulations,
+                limits.nodes.unwrap_or(100)
+            );
+        }
+    }
+
+    #[test]
+    fn direct_goals_above_the_registered_horizon_are_not_clamped() {
+        let now = Instant::now();
+        let (ticket, _) = start(&mut session(), "go nodes 1");
+        for (limits, reason) in [
+            (
+                GoLimits {
+                    depth_plies: NonZeroU16::new(9),
+                    ..GoLimits::default()
+                },
+                "depth exceeds the registered chess-ply capability",
+            ),
+            (
+                GoLimits {
+                    mate_moves: NonZeroU16::new(5),
+                    ..GoLimits::default()
+                },
+                "mate horizon exceeds the registered chess-ply capability",
+            ),
+            (
+                GoLimits {
+                    mate_moves: NonZeroU16::new(u16::MAX),
+                    ..GoLimits::default()
+                },
+                "mate move-to-ply conversion overflow",
+            ),
+        ] {
+            assert!(matches!(
+                SearchBinding::new_with_goal_capability(
+                    ticket.clone(), &limits, SideToMove::White, now, settings(),
+                    NonZeroU16::new(8).unwrap(),
+                ),
+                Err(BuildSearchError::InvalidGo(actual)) if actual == reason
+            ));
+        }
     }
 
     #[test]

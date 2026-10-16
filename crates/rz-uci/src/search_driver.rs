@@ -39,6 +39,9 @@ pub enum SearchKind {
 #[derive(Clone, Debug)]
 pub struct SearchSessionContext {
     pub authority: rz_contracts::pals::SearchAuthority,
+    /// Canonical root-only subset. Child legal/policy order remains Rules-owned.
+    pub root_moves: Option<Arc<[BoardMove]>>,
+    pub goal: rz_contracts::rovent::SearchGoal,
     pub control: SearchControl,
     pub cancellation: CancelToken,
     pub shutdown_deadline: Instant,
@@ -2201,6 +2204,8 @@ mod tests {
             };
             let context = SearchSessionContext {
                 authority,
+                root_moves: None,
+                goal: rz_contracts::rovent::SearchGoal::default(),
                 control,
                 cancellation: CancelToken::new(),
                 shutdown_deadline: budget.output_deadline,
@@ -2453,6 +2458,8 @@ mod tests {
         control.soft_deadline = now + Duration::from_secs(4);
         SearchSessionContext {
             authority,
+            root_moves: None,
+            goal: rz_contracts::rovent::SearchGoal::default(),
             control,
             cancellation: CancelToken::new(),
             shutdown_deadline: now + Duration::from_secs(6),

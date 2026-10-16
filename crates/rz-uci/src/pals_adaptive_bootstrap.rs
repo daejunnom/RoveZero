@@ -539,6 +539,8 @@ impl PreparedAdaptiveProcessV5 {
         };
         let context = SearchSessionContext {
             authority,
+            root_moves: None,
+            goal: rz_contracts::rovent::SearchGoal::default(),
             control: rz_search::driver::SearchControl::new(hard_deadline, self.cpu_nodes_limit),
             cancellation: CancelToken::new(),
             shutdown_deadline,

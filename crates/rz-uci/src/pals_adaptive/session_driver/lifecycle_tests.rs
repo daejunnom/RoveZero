@@ -378,6 +378,8 @@ fn context(clock: &ProcessClock, root: u64, game: u64) -> SearchSessionContext {
     };
     SearchSessionContext {
         authority,
+        root_moves: None,
+        goal: rz_contracts::rovent::SearchGoal::default(),
         control: SearchControl::new(now + Duration::from_secs(5), 64),
         cancellation: CancelToken::new(),
         shutdown_deadline: now + Duration::from_secs(6),

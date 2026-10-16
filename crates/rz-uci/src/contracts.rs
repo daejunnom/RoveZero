@@ -16,8 +16,8 @@ use rz_search::time::TimeBudgetError;
 
 use crate::bridge::{BudgetKind, BuildSearchError, BuildSearchSettings, SearchBinding, SideToMove};
 use crate::{
-    CancelReason, Command, Diagnostic, Effect, Event, PositionPort, SearchCompletion, SearchTicket,
-    Session, SessionResult, handle_event, parse,
+    CancelReason, Command, Diagnostic, Effect, Event, GoLimits, PositionPort, SearchCompletion,
+    SearchTicket, Session, SessionResult, handle_event, parse,
 };
 
 /// UCI publication authority is independent of the selected search algorithm.
@@ -281,11 +281,45 @@ impl ContractSessionOwner {
             Ok(command) => command,
             Err(_) => return session.handle_line(line).into(),
         };
+        self.handle_command_at(session, command, side, start)
+    }
+
+    /// Concrete UCI owner only: `limits` came from the bounded parser. Ponder
+    /// normalizes clock/output ownership while retaining the exact root goals.
+    pub(crate) fn handle_normalized_go<P, F>(
+        &mut self,
+        session: &mut Session<P>,
+        limits: GoLimits,
+        side: F,
+    ) -> ContractSessionOutcome<P::Snapshot>
+    where
+        P: PositionPort,
+        F: Fn(&P::Snapshot) -> Result<Color, ContractError>,
+    {
+        let start = Instant::now();
+        if let Err(err) = self.ensure_session(session) {
+            return rejected(err);
+        }
+        self.handle_command_at(session, Command::Go(limits), side, start)
+    }
+
+    fn handle_command_at<P, F>(
+        &mut self,
+        session: &mut Session<P>,
+        command: Command,
+        side: F,
+        start: Instant,
+    ) -> ContractSessionOutcome<P::Snapshot>
+    where
+        P: PositionPort,
+        F: Fn(&P::Snapshot) -> Result<Color, ContractError>,
+    {
         let root_change = matches!(
             command,
             Command::Go(_) | Command::Position(_) | Command::NewGame
         );
         let new_game = matches!(command, Command::NewGame);
+        let stops_search = matches!(command, Command::Stop | Command::Quit);
         let next = if root_change {
             match self.next_generations(new_game) {
                 Ok(next) => Some(next),
@@ -295,7 +329,7 @@ impl ContractSessionOwner {
             None
         };
         let previous_ticket = self.current.as_ref().map(|c| c.binding.ticket().clone());
-        let mut out = ContractSessionOutcome::from(session.handle_line(line));
+        let mut out = ContractSessionOutcome::from(session.handle_command(command));
         if !out.session.accepted {
             return out;
         }
@@ -303,7 +337,7 @@ impl ContractSessionOwner {
             self.close_current();
             self.scope.set_generations(game, root);
         }
-        if matches!(command, Command::Stop | Command::Quit) {
+        if stops_search {
             self.close_current();
         }
         let effects = std::mem::take(&mut out.session.effects);
@@ -321,12 +355,23 @@ impl ContractSessionOwner {
                         Color::White => SideToMove::White,
                         Color::Black => SideToMove::Black,
                     };
-                    let binding =
-                        SearchBinding::new(ticket.clone(), &limits, color, start, self.settings)
-                            .map_err(|err| {
-                                build_detail = Some(err.to_string());
-                                map_build_error(err)
-                            })?;
+                    let binding = match session.search_goal_capability() {
+                        Some(max_plies) => SearchBinding::new_with_goal_capability(
+                            ticket.clone(),
+                            &limits,
+                            color,
+                            start,
+                            self.settings,
+                            max_plies,
+                        ),
+                        None => {
+                            SearchBinding::new(ticket.clone(), &limits, color, start, self.settings)
+                        }
+                    }
+                    .map_err(|err| {
+                        build_detail = Some(err.to_string());
+                        map_build_error(err)
+                    })?;
                     let deadlines = ContractDeadlines::from_budget(&self.clock, binding.budget())?;
                     let cancellation = ContractCancellation::from_control(binding.control());
                     Ok(CurrentSearch {
@@ -685,6 +730,10 @@ fn error(code: ErrorCode, detail: &'static str) -> ContractError {
 }
 fn map_build_error(err: BuildSearchError) -> ContractError {
     match err {
+        BuildSearchError::UnsupportedSearchGoal => error(
+            ErrorCode::UnsupportedContract,
+            "selected driver has no registered depth/mate capability",
+        ),
         BuildSearchError::SimulationLimitExceeded { .. } => error(
             ErrorCode::ResourceExhausted,
             "go nodes exceeds configured search work bound",

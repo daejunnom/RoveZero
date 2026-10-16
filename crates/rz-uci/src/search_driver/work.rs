@@ -582,6 +582,8 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(5);
         SearchSessionContext {
             authority,
+            root_moves: None,
+            goal: rz_contracts::rovent::SearchGoal::default(),
             control: SearchControl::new(until, 10),
             cancellation: CancelToken::new(),
             shutdown_deadline: until,
