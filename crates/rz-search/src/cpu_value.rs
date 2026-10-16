@@ -321,6 +321,22 @@ pub trait CpuValueEvaluator: Send + Sync {
     fn identity(&self) -> &CpuValueIdentity;
     fn provenance(&self) -> &'static str;
     fn initialize(&self, position: &Position) -> Result<CpuAccumulator, CpuValueError>;
+    /// Exact context of a position-dependent value. NNUEC additionally seals
+    /// the frozen C owner and L anchor; a model/weights identity alone is not a
+    /// sufficient TT key for a path-conditioned evaluator.
+    fn cache_context(
+        &self,
+        accumulator: &CpuAccumulator,
+        position: &Position,
+    ) -> Result<CpuValueCacheContext, CpuValueError> {
+        if accumulator.identity != position.position_identity()
+            || accumulator.namespace.as_ref() != self.identity()
+            || accumulator.nnuec.is_some()
+        {
+            return Err(CpuValueError::StateMismatch);
+        }
+        Ok(CpuValueCacheContext::default())
+    }
     fn score(
         &self,
         accumulator: &CpuAccumulator,
@@ -347,11 +363,49 @@ pub trait CpuValueEvaluator: Send + Sync {
         {
             return Err(CpuValueError::StateMismatch);
         }
-        if undo.changes.is_some() {
+        if undo.changes.is_some() || undo.nnuec.is_some() || accumulator.nnuec.is_some() {
             return Err(CpuValueError::StateMismatch);
         }
         accumulator.identity = undo.before;
         Ok(())
+    }
+}
+
+/// Opaque, cheap exact cache context. The authority pins only a small seal,
+/// never an old C view or all of its archived lines. Rules identity supplies
+/// exact current history; the local anchor then determines the full suffix.
+#[derive(Clone, Debug, Default)]
+pub struct CpuValueCacheContext {
+    contextual: Option<ContextualCacheContext>,
+}
+
+#[derive(Clone, Debug)]
+struct ContextualCacheContext {
+    authority: Arc<()>,
+    local_anchor: PositionIdentity,
+}
+
+impl PartialEq for CpuValueCacheContext {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.contextual, &other.contextual) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                Arc::ptr_eq(&a.authority, &b.authority) && a.local_anchor == b.local_anchor
+            }
+            _ => false,
+        }
+    }
+}
+impl Eq for CpuValueCacheContext {}
+
+impl CpuValueCacheContext {
+    fn contextual(authority: &Arc<()>, local_anchor: &PositionIdentity) -> Self {
+        Self {
+            contextual: Some(ContextualCacheContext {
+                authority: Arc::clone(authority),
+                local_anchor: local_anchor.clone(),
+            }),
+        }
     }
 }
 
@@ -361,11 +415,23 @@ pub struct CpuAccumulator {
     identity: PositionIdentity,
     namespace: Arc<CpuValueIdentity>,
     exact: Option<Box<ExactValues>>,
+    nnuec: Option<Box<nnuec::NnuecNativeAccumulator>>,
 }
 
 impl CpuAccumulator {
     pub fn values(&self) -> &[[f32; CPU_ACCUMULATOR_WIDTH]; 2] {
         &self.values
+    }
+    /// Conservative inline + owned backing charge. Frozen model/C and shared
+    /// Rules history are retained by their existing owner, not copied here.
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.exact
+                    .as_ref()
+                    .map_or(0, |_| std::mem::size_of::<ExactValues>()),
+            )
+            .saturating_add(self.nnuec.as_ref().map_or(0, |v| v.retained_bytes()))
     }
 }
 
@@ -374,6 +440,14 @@ pub struct CpuAccumulatorUndo {
     before: PositionIdentity,
     after: PositionIdentity,
     namespace: Arc<CpuValueIdentity>,
+    nnuec: Option<Box<nnuec::NnuecNativeUndo>>,
+}
+
+impl CpuAccumulatorUndo {
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.nnuec.as_ref().map_or(0, |v| v.retained_bytes()))
+    }
 }
 
 pub struct BootstrapCpuValue {
@@ -407,6 +481,7 @@ impl CpuValueEvaluator for BootstrapCpuValue {
             identity: position.position_identity(),
             namespace: Arc::clone(&self.identity),
             exact: None,
+            nnuec: None,
         })
     }
 
@@ -438,6 +513,7 @@ impl CpuValueEvaluator for BootstrapCpuValue {
             before: accumulator.identity.clone(),
             after: delta.after.position_identity(),
             namespace: Arc::clone(&self.identity),
+            nnuec: None,
         };
         accumulator.identity = undo.after.clone();
         Ok(undo)
@@ -707,6 +783,7 @@ impl CpuValueEvaluator for CpuFloatValue {
             identity: position.position_identity(),
             namespace: Arc::clone(&self.identity),
             exact: Some(exact),
+            nnuec: None,
         })
     }
 
@@ -779,6 +856,7 @@ impl CpuValueEvaluator for CpuFloatValue {
             before: accumulator.identity.clone(),
             after: delta.after.position_identity(),
             namespace: Arc::clone(&self.identity),
+            nnuec: None,
         };
         accumulator.values = rounded_values(exact);
         accumulator.identity = undo.after.clone();

@@ -1057,6 +1057,20 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         receipt: &CpuSliceReport,
         consume_current: bool,
     ) -> Result<(ObservationId, bool), PalsError> {
+        // V5 never issued a reciprocal scope. Keep an owned question/token
+        // outside the legacy Yield/terminal codec instead of retiring it as
+        // ordinary completed work. Rovent's ticket consumer owns this receipt.
+        if receipt.reciprocal_request.is_some()
+            || receipt
+                .result
+                .as_ref()
+                .is_ok_and(|actual| actual.report.completion == CpuCompletion::AwaitReciprocal)
+        {
+            return Err(StoreError::InvalidConditions(
+                "reciprocal CPU wait requires the Rovent question consumer",
+            )
+            .into());
+        }
         let digest = work.input.question_digest;
         let admission = self
             .cpu_admissions
@@ -1852,6 +1866,7 @@ mod tests {
         let yielded = completion == CpuCompletion::Yielded;
         CpuSliceReport {
             grant,
+            reciprocal_request: None,
             actual_work: Some(CpuWork {
                 nodes: delta,
                 quiescence_nodes: 1,

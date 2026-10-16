@@ -7,8 +7,8 @@
 use crate::contract_time::{ContractClock, InstantClock};
 use crate::cpu::{
     CpuCompletion, CpuControlMailbox, CpuControlledReport, CpuEngine, CpuError,
-    CpuIterationProgress, CpuLimits, CpuMailboxScope, CpuResumePolicy, CpuResumeToken,
-    CpuSliceControl, CpuWork,
+    CpuIterationProgress, CpuLimits, CpuMailboxScope, CpuReciprocalReply, CpuReciprocalRequest,
+    CpuReciprocalScope, CpuResumePolicy, CpuResumeToken, CpuSliceControl, CpuWork,
 };
 use rz_contracts::pals::SearchAuthority;
 use rz_contracts::pals_adaptive::{CpuJobEnvelope, CpuJobId, CpuWorkerId, SliceGrant};
@@ -103,7 +103,7 @@ impl CpuSubmissionRejected {
     fn from_command(reason: CpuWorkerError, command: CpuCommand, verified_unqueued: bool) -> Self {
         let (grant, job) = match command {
             CpuCommand::Begin(job, grant) => (grant, Some(job)),
-            CpuCommand::Resume(grant) => (grant, None),
+            CpuCommand::Resume(grant) | CpuCommand::ResumeWithReply(grant, _) => (grant, None),
         };
         Self {
             reason,
@@ -170,6 +170,7 @@ pub struct CpuJob {
     hard_deadline: Instant,
     clock: InstantClock,
     pub mailbox: Arc<CpuControlMailbox>,
+    reciprocal_scope: Option<CpuReciprocalScope>,
 }
 
 impl CpuJob {
@@ -276,16 +277,52 @@ impl CpuJob {
             hard_deadline,
             clock: *clock,
             mailbox,
+            reciprocal_scope: None,
         })
     }
     pub fn envelope(&self) -> CpuJobEnvelope {
         self.envelope
+    }
+
+    /// Configure before Begin. The original Job, owner and hard deadline stay
+    /// immutable; a question never creates a second engine or paused stack.
+    pub fn enable_reciprocal_questions(
+        &mut self,
+        scope: CpuReciprocalScope,
+    ) -> Result<(), CpuWorkerError> {
+        use rz_contracts::rovent::SearchRecipient;
+        if self.reciprocal_scope.is_some() {
+            return Err(CpuWorkerError::Duplicate);
+        }
+        if scope.job != self.envelope
+            || scope.owner != self.mailbox.scope().owner
+            || scope.parent.id.authority != self.envelope.id.authority
+            || scope.parent.anchor != self.envelope.state_identity
+            || scope.parent.question_digest != self.envelope.question
+            || scope.parent.original_deadline != self.envelope.hard_deadline
+            || scope.parent.recipient != SearchRecipient::Researcher
+            || !matches!(
+                scope.recipient,
+                SearchRecipient::Proposer | SearchRecipient::Critic
+            )
+            || !(1..=64).contains(&scope.max_questions)
+            || scope.node_interval == 0
+        {
+            return Err(CpuWorkerError::Invalid(
+                "CPU reciprocal scope differs from its original Job",
+            ));
+        }
+        self.reciprocal_scope = Some(scope);
+        Ok(())
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct CpuSliceReport {
     pub grant: SliceGrant,
+    /// A real owner-sealed waiting question, distinct from occupancy Yield.
+    /// The private continuation token remains exclusively on that CPU worker.
+    pub reciprocal_request: Option<CpuReciprocalRequest>,
     /// None is unknown and must quarantine the outstanding reservation.
     pub actual_work: Option<CpuWork>,
     pub result: Result<CpuControlledReport, CpuError>,
@@ -462,9 +499,11 @@ impl CpuCreditLedger {
                 "CPU primary job cannot move between owners",
             ));
         }
-        if let Some((blocking_job, _)) = self.jobs.iter().find(|(id, held)| {
-            **id != job && !held.terminal && held.owner == Some(owner)
-        }) {
+        if let Some((blocking_job, _)) = self
+            .jobs
+            .iter()
+            .find(|(id, held)| **id != job && !held.terminal && held.owner == Some(owner))
+        {
             return Ok(CpuOwnerAdmission::BlockedBy(*blocking_job));
         }
         Ok(if account.owner.is_some() {
@@ -562,16 +601,23 @@ impl CpuCreditLedger {
         };
         let invalid_result = match &report.result {
             Ok(value) => {
+                let paused = matches!(
+                    value.report.completion,
+                    CpuCompletion::Yielded | CpuCompletion::AwaitReciprocal
+                );
                 value.report.nodes != work.nodes
                     || value.report.quiescence_nodes != work.quiescence_nodes
                     || value.report.tt_hits != work.tt_hits
                     || value.report.resume.is_some()
-                    || (value.report.completion == CpuCompletion::Yielded
-                        && (report.terminal || !report.continuation_retained))
-                    || (value.report.completion != CpuCompletion::Yielded
-                        && (!report.terminal || report.continuation_retained))
+                    || (paused && (report.terminal || !report.continuation_retained))
+                    || (!paused && (!report.terminal || report.continuation_retained))
+                    || ((value.report.completion == CpuCompletion::AwaitReciprocal)
+                        != report.reciprocal_request.is_some())
             }
-            Err(_) => !report.admission_rejected && !report.terminal,
+            Err(_) => {
+                (!report.admission_rejected && !report.terminal)
+                    || report.reciprocal_request.is_some()
+            }
         };
         let spent = account.spent.checked_add(work.nodes);
         let global_spent = self.global_spent.checked_add(work.nodes);
@@ -580,6 +626,10 @@ impl CpuCreditLedger {
             || (!report.admission_rejected && spent != Some(report.cumulative_nodes))
             || global_spent.is_none_or(|sum| sum > self.global_limit)
             || invalid_result
+            || report.reciprocal_request.as_ref().is_some_and(|request| {
+                request.scope().job != account.envelope
+                    || request.scope().owner != report.grant.owner
+            })
             || (report.terminal && report.continuation_retained)
             || (report.admission_rejected
                 && (work != CpuWork::default() || report.result.is_ok() || report.terminal))
@@ -727,6 +777,7 @@ impl CpuCreditLedger {
 enum CpuCommand {
     Begin(Box<CpuJob>, SliceGrant),
     Resume(SliceGrant),
+    ResumeWithReply(SliceGrant, Box<CpuReciprocalReply>),
 }
 struct TimedCpuCommand {
     original: CpuCommand,
@@ -735,7 +786,7 @@ struct TimedCpuCommand {
 impl CpuCommand {
     fn grant(&self) -> SliceGrant {
         match self {
-            Self::Begin(_, grant) | Self::Resume(grant) => *grant,
+            Self::Begin(_, grant) | Self::Resume(grant) | Self::ResumeWithReply(grant, _) => *grant,
         }
     }
 }
@@ -1238,7 +1289,7 @@ impl CpuWorker {
                 };
                 let admitted_at = command.command.admitted_at;
                 let mut rejected_controls = None;
-                let (grant, accepted_command) = match command.command.original {
+                let (grant, accepted_command, reciprocal_reply) = match command.command.original {
                     CpuCommand::Begin(job, grant) => {
                         let fresh_eligible = !worker_shutdown.load(Ordering::Acquire)
                             && grant.job == job.envelope.id
@@ -1269,7 +1320,7 @@ impl CpuWorker {
                                 last_control_sequence: 0,
                                 terminal_permit: None,
                             });
-                            (grant, true)
+                            (grant, true, None)
                         } else {
                             // This owned Begin never ran. Closing its
                             // question admission is distinct from an
@@ -1282,13 +1333,15 @@ impl CpuWorker {
                             if !aliases_primary {
                                 rejected_controls = Some(job.mailbox.seal_terminal());
                             }
-                            (grant, false)
+                            (grant, false, None)
                         }
                     }
-                    CpuCommand::Resume(grant) => (grant, true),
+                    CpuCommand::Resume(grant) => (grant, true, None),
+                    CpuCommand::ResumeWithReply(grant, reply) => (grant, true, Some(reply)),
                 };
                 let mut report = CpuSliceReport {
                     grant,
+                    reciprocal_request: None,
                     actual_work: Some(CpuWork::default()),
                     result: Err(CpuError::InvalidLimits(
                         "slice does not name the live private job",
@@ -1300,8 +1353,32 @@ impl CpuWorker {
                     admission_rejected: true,
                     controls: rejected_controls,
                 };
+                // Reject malformed/late replies before taking the old terminal
+                // seat or invoking the engine. A rejected Resume must preserve
+                // the original paused stack and charge no new native work.
+                let reciprocal_admission_error =
+                    active
+                        .as_ref()
+                        .and_then(|task| match &task.job.reciprocal_scope {
+                            Some(scope) => engine
+                                .validate_reciprocal_resume(
+                                    task.token.as_ref(),
+                                    scope,
+                                    reciprocal_reply.as_deref(),
+                                )
+                                .err(),
+                            None if reciprocal_reply.is_some()
+                                || engine.pending_reciprocal_request().is_some() =>
+                            {
+                                Some(CpuError::ResumeMismatch(
+                                    "plain CPU Resume cannot bypass a reciprocal question",
+                                ))
+                            }
+                            None => None,
+                        });
                 let eligible = !worker_shutdown.load(Ordering::Acquire)
                     && accepted_command
+                    && reciprocal_admission_error.is_none()
                     && active.as_ref().is_some_and(|task| {
                         grant.job == task.job.envelope.id
                             && grant.owner == owner
@@ -1322,6 +1399,9 @@ impl CpuWorker {
                                     sum <= task.job.envelope.total_native_node_credit
                                 })
                     });
+                if let Some(error) = reciprocal_admission_error {
+                    report.result = Err(error);
+                }
                 let mut owner_timing = None;
                 if eligible {
                     let task = active.as_mut().expect("checked private job");
@@ -1340,57 +1420,77 @@ impl CpuWorker {
                         CpuSliceControl::new(grant.node_credit, lease, task.job.mailbox.clone())
                             .and_then(|control| {
                                 invoked = true;
-                                engine.analyze_controlled(
-                                    &task.job.position,
-                                    task.job.root_moves.as_deref(),
-                                    CpuLimits {
-                                        max_depth: task.job.target_depth,
-                                        max_nodes: task.job.envelope.total_native_node_credit
-                                            - task.spent,
-                                        deadline: Some(task.job.hard_deadline),
-                                    },
-                                    &worker_shutdown,
-                                    &control,
-                                    task.token.as_ref(),
-                                    |iteration| {
-                                        if iteration.completed_depth == 0 {
-                                            return;
-                                        }
-                                        let published_at = Instant::now();
-                                        if first_publication
-                                            && resumed_depth == Some(iteration.completed_depth)
-                                            && iteration.nodes == 0
-                                        {
-                                            // The existing stack owner publishes its
-                                            // reused iteration after exact restoration.
-                                            // This is not a newly completed depth.
-                                            resume_admission_and_restore =
-                                                published_at.checked_duration_since(admitted_at);
-                                        }
-                                        first_publication = false;
-                                        let advanced_depth = iteration.completed_depth > last_depth;
-                                        last_depth = last_depth.max(iteration.completed_depth);
-                                        progress_sequence = progress_sequence.saturating_add(1);
-                                        let _ = worker_mailbox.publish_progress(
-                                            progress_sequence,
-                                            CpuWorkerProgressObservation {
-                                                original: CpuWorkerProgress {
-                                                    job: grant.job,
-                                                    execution: grant.execution,
-                                                    owner,
-                                                    sequence: progress_sequence,
-                                                    iteration,
-                                                },
-                                                run_started_at,
-                                                published_at,
-                                                interval_started_at,
-                                                advanced_depth,
-                                                resume_admission_and_restore,
+                                let limits = CpuLimits {
+                                    max_depth: task.job.target_depth,
+                                    max_nodes: task.job.envelope.total_native_node_credit
+                                        - task.spent,
+                                    deadline: Some(task.job.hard_deadline),
+                                };
+                                let mut observer = |iteration: CpuIterationProgress| {
+                                    if iteration.completed_depth == 0 {
+                                        return;
+                                    }
+                                    let published_at = Instant::now();
+                                    if first_publication
+                                        && resumed_depth == Some(iteration.completed_depth)
+                                        && iteration.nodes == 0
+                                    {
+                                        // The existing stack owner publishes its
+                                        // reused iteration after exact restoration.
+                                        // This is not a newly completed depth.
+                                        resume_admission_and_restore =
+                                            published_at.checked_duration_since(admitted_at);
+                                    }
+                                    first_publication = false;
+                                    let advanced_depth = iteration.completed_depth > last_depth;
+                                    last_depth = last_depth.max(iteration.completed_depth);
+                                    progress_sequence = progress_sequence.saturating_add(1);
+                                    let _ = worker_mailbox.publish_progress(
+                                        progress_sequence,
+                                        CpuWorkerProgressObservation {
+                                            original: CpuWorkerProgress {
+                                                job: grant.job,
+                                                execution: grant.execution,
+                                                owner,
+                                                sequence: progress_sequence,
+                                                iteration,
                                             },
-                                        );
-                                        interval_started_at = published_at;
-                                    },
-                                )
+                                            run_started_at,
+                                            published_at,
+                                            interval_started_at,
+                                            advanced_depth,
+                                            resume_admission_and_restore,
+                                        },
+                                    );
+                                    interval_started_at = published_at;
+                                };
+                                match &task.job.reciprocal_scope {
+                                    Some(scope) => engine
+                                        .analyze_controlled_reciprocal(
+                                            &task.job.position,
+                                            task.job.root_moves.as_deref(),
+                                            limits,
+                                            &worker_shutdown,
+                                            &control,
+                                            task.token.as_ref(),
+                                            scope,
+                                            reciprocal_reply.as_deref(),
+                                            &mut observer,
+                                        )
+                                        .map(|value| {
+                                            report.reciprocal_request = value.request;
+                                            value.controlled
+                                        }),
+                                    None => engine.analyze_controlled(
+                                        &task.job.position,
+                                        task.job.root_moves.as_deref(),
+                                        limits,
+                                        &worker_shutdown,
+                                        &control,
+                                        task.token.as_ref(),
+                                        &mut observer,
+                                    ),
+                                }
                             })
                     }));
                     let analyze_returned_at = Instant::now();
@@ -1410,6 +1510,9 @@ impl CpuWorker {
                         if let Err(error) = engine.validate_frozen_value_namespace() {
                             result = Err(error);
                         }
+                    }
+                    if result.is_err() {
+                        report.reciprocal_request = None;
                     }
                     report.actual_work = if panicked {
                         None
@@ -1434,7 +1537,12 @@ impl CpuWorker {
                     task.token = result
                         .as_ref()
                         .ok()
-                        .filter(|value| value.report.completion == CpuCompletion::Yielded)
+                        .filter(|value| {
+                            matches!(
+                                value.report.completion,
+                                CpuCompletion::Yielded | CpuCompletion::AwaitReciprocal
+                            )
+                        })
                         .and_then(|value| value.report.resume.clone());
                     task.retained_completed_depth = result
                         .as_ref()
@@ -1449,7 +1557,10 @@ impl CpuWorker {
                         .as_ref()
                         .is_some_and(|token| engine.token_is_current(token));
                     report.terminal = match &result {
-                        Ok(value) => value.report.completion != CpuCompletion::Yielded,
+                        Ok(value) => !matches!(
+                            value.report.completion,
+                            CpuCompletion::Yielded | CpuCompletion::AwaitReciprocal
+                        ),
                         Err(_) => true,
                     };
                     report.admission_rejected = false;
@@ -1759,6 +1870,16 @@ impl CpuWorker {
     }
     pub fn resume_attested(&self, grant: SliceGrant) -> Result<(), CpuSubmissionRejected> {
         self.submit(CpuCommand::Resume(grant))
+    }
+
+    /// Validate and consume the reply on the original private owner as one
+    /// command. Rejection before invocation leaves its pending token intact.
+    pub fn resume_with_reply_attested(
+        &self,
+        grant: SliceGrant,
+        reply: CpuReciprocalReply,
+    ) -> Result<(), CpuSubmissionRejected> {
+        self.submit(CpuCommand::ResumeWithReply(grant, Box::new(reply)))
     }
     pub fn try_event(&self) -> Result<Option<CpuWorkerEvent>, CpuWorkerError> {
         self.try_event_observed()

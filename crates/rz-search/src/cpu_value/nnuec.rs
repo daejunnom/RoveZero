@@ -11,11 +11,13 @@
 //! Undo restores the original bits; no clipping precedes accumulator sums.
 
 use super::{
-    CPU_FEATURE_COUNT, CpuTrainingState, CpuValueIdentity, Signed192, metadata_features,
-    piece_feature, validate_training_declaration,
+    CPU_ACCUMULATOR_WIDTH, CPU_FEATURE_COUNT, CpuAccumulator, CpuAccumulatorUndo, CpuTrainingState,
+    CpuValueCacheContext, CpuValueError, CpuValueEvaluator, CpuValueIdentity, Signed192,
+    metadata_features, piece_feature, validate_training_declaration,
 };
 use rz_position::{
-    BoardMove, Color, PieceKind, Position, PositionIdentity, RuleMoveDelta, Square, UndoToken,
+    BoardMove, Color, PieceKind, Position, PositionIdentity, PositionLimits, RuleMoveDelta, Square,
+    UndoToken,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -464,6 +466,33 @@ impl NnuecModel {
         local: &mut NnuecLocal,
         mv: BoardMove,
     ) -> Result<NnuecLocalUndo, NnuecError> {
+        let prepared = self.prepare_local_append(local, mv)?;
+        reserve_local_append(local)?;
+        let rules = local
+            .work
+            .make_move(mv)
+            .map_err(|e| NnuecError::Rules(e.to_string()))?;
+        let stamp = Arc::new(());
+        let undo = NnuecLocalUndo {
+            rules,
+            previous_embedding: std::mem::replace(&mut local.embedding, prepared.embedding),
+            previous_projected: std::mem::replace(&mut local.projected, prepared.projected),
+            model: Arc::clone(&self.identity),
+            before_stamp: Arc::clone(&local.stamp),
+            after_stamp: Arc::clone(&stamp),
+            expected_length: local.moves.len() + 1,
+        };
+        local.tokens.push(prepared.token);
+        local.moves.push(mv);
+        local.stamp = stamp;
+        Ok(undo)
+    }
+
+    fn prepare_local_append(
+        &self,
+        local: &NnuecLocal,
+        mv: BoardMove,
+    ) -> Result<PreparedLocalAppend, NnuecError> {
         if local.model != self.identity {
             return Err(NnuecError::StateMismatch);
         }
@@ -503,32 +532,11 @@ impl NnuecModel {
             &self.checkpoint.parameters.local_projection,
             &self.checkpoint.parameters.local_bias,
         )?;
-        local
-            .tokens
-            .try_reserve(1)
-            .map_err(|_| NnuecError::Capacity("local token allocation"))?;
-        local
-            .moves
-            .try_reserve(1)
-            .map_err(|_| NnuecError::Capacity("local move allocation"))?;
-        let rules = local
-            .work
-            .make_move(mv)
-            .map_err(|e| NnuecError::Rules(e.to_string()))?;
-        let stamp = Arc::new(());
-        let undo = NnuecLocalUndo {
-            rules,
-            previous_embedding: std::mem::replace(&mut local.embedding, embedding),
-            previous_projected: std::mem::replace(&mut local.projected, projected),
-            model: Arc::clone(&self.identity),
-            before_stamp: Arc::clone(&local.stamp),
-            after_stamp: Arc::clone(&stamp),
-            expected_length: local.moves.len() + 1,
-        };
-        local.tokens.push(token);
-        local.moves.push(mv);
-        local.stamp = stamp;
-        Ok(undo)
+        Ok(PreparedLocalAppend {
+            token,
+            embedding,
+            projected,
+        })
     }
 
     pub fn undo_local(
@@ -631,6 +639,7 @@ impl NnuecModel {
             lines: BTreeMap::new(),
             values,
             exact,
+            authority: Arc::new(()),
         })
     }
 
@@ -663,6 +672,7 @@ impl NnuecModel {
             lines,
             values,
             exact,
+            authority: Arc::new(()),
         }))
     }
 
@@ -685,6 +695,7 @@ impl NnuecModel {
             lines,
             values,
             exact,
+            authority: Arc::new(()),
         }))
     }
 
@@ -702,6 +713,7 @@ impl NnuecModel {
             lines: context.lines.clone(),
             values,
             exact,
+            authority: Arc::new(()),
         }))
     }
 
@@ -859,6 +871,7 @@ pub struct NnuecContext {
     lines: BTreeMap<u64, Arc<NnuecLine>>,
     values: Vec<f32>,
     exact: Vec<Exact256>,
+    authority: Arc<()>,
 }
 impl NnuecContext {
     pub fn values(&self) -> &[f32] {
@@ -903,6 +916,343 @@ pub struct NnuecLocalUndo {
     before_stamp: Arc<()>,
     after_stamp: Arc<()>,
     expected_length: usize,
+}
+
+struct PreparedLocalAppend {
+    token: Vec<f32>,
+    embedding: Vec<f32>,
+    projected: Vec<f32>,
+}
+
+fn reserve_local_append(local: &mut NnuecLocal) -> Result<(), NnuecError> {
+    local
+        .tokens
+        .try_reserve(1)
+        .map_err(|_| NnuecError::Capacity("local token allocation"))?;
+    local
+        .moves
+        .try_reserve(1)
+        .map_err(|_| NnuecError::Capacity("local move allocation"))?;
+    Ok(())
+}
+
+/// Explicit experimental CPU value profile. Existing engine constructors keep
+/// their original evaluator. The declared training state remains in identity;
+/// constructing this profile does not claim training, strength or Rules proof.
+pub struct NnuecCpuValue {
+    model: Arc<NnuecModel>,
+    context: Arc<NnuecContext>,
+}
+
+impl NnuecCpuValue {
+    pub fn new(model: Arc<NnuecModel>, context: Arc<NnuecContext>) -> Result<Self, NnuecError> {
+        if context.model != model.identity {
+            return Err(NnuecError::StateMismatch);
+        }
+        Ok(Self { model, context })
+    }
+
+    /// Read-only conditional value/utility observation. Utility rows have no
+    /// authority to retain/drop/route work, regardless of checkpoint labels.
+    pub fn observe(
+        &self,
+        accumulator: &CpuAccumulator,
+        position: &Position,
+    ) -> Result<NnuecOutput, CpuValueError> {
+        self.cache_context(accumulator, position)?;
+        let state = accumulator
+            .nnuec
+            .as_ref()
+            .ok_or(CpuValueError::StateMismatch)?;
+        self.model
+            .forward(&state.board, &self.context, &state.local, position)
+            .map_err(cpu_error)
+    }
+}
+
+pub(crate) struct NnuecNativeAccumulator {
+    board: NnuecBoard,
+    local: NnuecLocal,
+    context_authority: Arc<()>,
+}
+pub(crate) struct NnuecNativeUndo {
+    board: NnuecBoard,
+    previous_work: Position,
+    previous_embedding: Vec<f32>,
+    previous_projected: Vec<f32>,
+    before_stamp: Arc<()>,
+    after_stamp: Arc<()>,
+    board_after_stamp: Arc<()>,
+    expected_length: usize,
+}
+
+impl std::fmt::Debug for NnuecNativeAccumulator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NnuecNativeAccumulator")
+            .field("model", &self.board.model)
+            .field("local_plies", &self.local.moves.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for NnuecNativeAccumulator {
+    fn clone(&self) -> Self {
+        let mut board = copy_board(&self.board);
+        board.stamp = Arc::new(());
+        let local = &self.local;
+        Self {
+            board,
+            context_authority: Arc::clone(&self.context_authority),
+            local: NnuecLocal {
+                work: local.work.clone(),
+                anchor: local.anchor.clone(),
+                perspective: local.perspective,
+                anchor_features: local.anchor_features.clone(),
+                anchor_values: local.anchor_values.clone(),
+                tokens: local.tokens.clone(),
+                moves: local.moves.clone(),
+                embedding: local.embedding.clone(),
+                projected: local.projected.clone(),
+                model: Arc::clone(&local.model),
+                stamp: Arc::new(()),
+            },
+        }
+    }
+}
+
+impl NnuecNativeAccumulator {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(board_backing_bytes(&self.board))
+            .saturating_add(vector_backing_bytes(&self.local.anchor_features))
+            .saturating_add(vector_backing_bytes(&self.local.anchor_values))
+            .saturating_add(vector_backing_bytes(&self.local.tokens))
+            .saturating_add(self.local.tokens.iter().fold(0usize, |sum, row| {
+                sum.saturating_add(vector_backing_bytes(row))
+            }))
+            .saturating_add(vector_backing_bytes(&self.local.moves))
+            .saturating_add(vector_backing_bytes(&self.local.embedding))
+            .saturating_add(vector_backing_bytes(&self.local.projected))
+            .saturating_add(96)
+    }
+}
+impl NnuecNativeUndo {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        // The saved Position shares the already charged Rules history chain.
+        std::mem::size_of::<Self>()
+            .saturating_add(board_backing_bytes(&self.board))
+            .saturating_add(vector_backing_bytes(&self.previous_embedding))
+            .saturating_add(vector_backing_bytes(&self.previous_projected))
+            .saturating_add(96)
+    }
+}
+
+impl CpuValueEvaluator for NnuecCpuValue {
+    fn identity(&self) -> &CpuValueIdentity {
+        self.model.identity()
+    }
+    fn provenance(&self) -> &'static str {
+        NNUEC_SEMANTICS
+    }
+    fn initialize(&self, position: &Position) -> Result<CpuAccumulator, CpuValueError> {
+        let board = self.model.board(position).map_err(cpu_error)?;
+        let local = self.model.local(position).map_err(cpu_error)?;
+        let values = padded_board_values(&board);
+        Ok(CpuAccumulator {
+            values,
+            identity: position.position_identity(),
+            namespace: Arc::clone(&self.model.identity),
+            exact: None,
+            nnuec: Some(Box::new(NnuecNativeAccumulator {
+                board,
+                local,
+                context_authority: Arc::clone(&self.context.authority),
+            })),
+        })
+    }
+    fn cache_context(
+        &self,
+        accumulator: &CpuAccumulator,
+        position: &Position,
+    ) -> Result<CpuValueCacheContext, CpuValueError> {
+        let state = accumulator
+            .nnuec
+            .as_ref()
+            .ok_or(CpuValueError::StateMismatch)?;
+        if accumulator.namespace != self.model.identity
+            || accumulator.identity != position.position_identity()
+            || state.board.position != accumulator.identity
+            || state.local.work.position_identity() != accumulator.identity
+            || state.board.model != self.model.identity
+            || state.local.model != self.model.identity
+            || !Arc::ptr_eq(&state.context_authority, &self.context.authority)
+        {
+            return Err(CpuValueError::StateMismatch);
+        }
+        Ok(CpuValueCacheContext::contextual(
+            &self.context.authority,
+            &state.local.anchor,
+        ))
+    }
+    fn score(
+        &self,
+        accumulator: &CpuAccumulator,
+        position: &Position,
+    ) -> Result<i32, CpuValueError> {
+        let output = self.observe(accumulator, position)?;
+        Ok(output.frontier_score())
+    }
+    fn apply_delta(
+        &self,
+        accumulator: &mut CpuAccumulator,
+        delta: &RuleMoveDelta,
+    ) -> Result<CpuAccumulatorUndo, CpuValueError> {
+        if accumulator.namespace != self.model.identity
+            || accumulator.identity != delta.before.position_identity()
+        {
+            return Err(CpuValueError::StateMismatch);
+        }
+        let state = accumulator
+            .nnuec
+            .as_mut()
+            .ok_or(CpuValueError::StateMismatch)?;
+        if state.local.work.position_identity() != accumulator.identity
+            || !Arc::ptr_eq(&state.context_authority, &self.context.authority)
+        {
+            return Err(CpuValueError::StateMismatch);
+        }
+        let prepared = self
+            .model
+            .prepare_local_append(&state.local, delta.mv)
+            .map_err(cpu_error)?;
+        // Consume the already checked Rules delta. Restore an immutable view;
+        // do not replay legality, make_move or an entire prefix in the evaluator.
+        let next_work = Position::from_snapshot(
+            &delta.after,
+            PositionLimits {
+                max_history_positions: delta.after.known_history_len().max(1),
+                ..PositionLimits::default()
+            },
+        )
+        .map_err(|_| CpuValueError::StateMismatch)?;
+        let mut next_board = copy_board(&state.board);
+        self.model
+            .apply_board_delta(&mut next_board, delta)
+            .map_err(cpu_error)?;
+        reserve_local_append(&mut state.local).map_err(cpu_error)?;
+        let stamp = Arc::new(());
+        let native = NnuecNativeUndo {
+            board_after_stamp: Arc::clone(&next_board.stamp),
+            board: std::mem::replace(&mut state.board, next_board),
+            previous_work: std::mem::replace(&mut state.local.work, next_work),
+            previous_embedding: std::mem::replace(&mut state.local.embedding, prepared.embedding),
+            previous_projected: std::mem::replace(&mut state.local.projected, prepared.projected),
+            before_stamp: Arc::clone(&state.local.stamp),
+            after_stamp: Arc::clone(&stamp),
+            expected_length: state.local.moves.len() + 1,
+        };
+        state.local.moves.push(delta.mv);
+        state.local.tokens.push(prepared.token);
+        state.local.stamp = stamp;
+        let undo = CpuAccumulatorUndo {
+            changes: None,
+            before: accumulator.identity.clone(),
+            after: delta.after.position_identity(),
+            namespace: Arc::clone(&self.model.identity),
+            nnuec: Some(Box::new(native)),
+        };
+        accumulator.identity = undo.after.clone();
+        accumulator.values = padded_board_values(&state.board);
+        Ok(undo)
+    }
+    fn restore(
+        &self,
+        accumulator: &mut CpuAccumulator,
+        undo: CpuAccumulatorUndo,
+        position: &Position,
+    ) -> Result<(), CpuValueError> {
+        if accumulator.namespace != self.model.identity
+            || undo.namespace != self.model.identity
+            || accumulator.identity != undo.after
+            || position.position_identity() != undo.before
+            || undo.changes.is_some()
+        {
+            return Err(CpuValueError::StateMismatch);
+        }
+        let native = undo.nnuec.ok_or(CpuValueError::StateMismatch)?;
+        let state = accumulator
+            .nnuec
+            .as_mut()
+            .ok_or(CpuValueError::StateMismatch)?;
+        if !Arc::ptr_eq(&state.local.stamp, &native.after_stamp)
+            || !Arc::ptr_eq(&state.board.stamp, &native.board_after_stamp)
+            || state.local.moves.len() != native.expected_length
+            || native.previous_work.position_identity() != undo.before
+            || !Arc::ptr_eq(&state.context_authority, &self.context.authority)
+        {
+            return Err(CpuValueError::StateMismatch);
+        }
+        state.board = native.board;
+        state.local.work = native.previous_work;
+        state.local.embedding = native.previous_embedding;
+        state.local.projected = native.previous_projected;
+        state.local.stamp = native.before_stamp;
+        state.local.moves.pop();
+        state.local.tokens.pop();
+        accumulator.values = padded_board_values(&state.board);
+        accumulator.identity = undo.before;
+        Ok(())
+    }
+}
+
+fn cpu_error(error: NnuecError) -> CpuValueError {
+    match error {
+        NnuecError::StateMismatch | NnuecError::Rules(_) => CpuValueError::StateMismatch,
+        NnuecError::NonFinite => CpuValueError::NonFiniteForward,
+        NnuecError::AccumulatorOverflow => CpuValueError::AccumulatorOverflow,
+        NnuecError::Capacity(_) => {
+            CpuValueError::InvalidCheckpoint("NNUEC configured capacity exceeded")
+        }
+        NnuecError::InvalidConfig(_) | NnuecError::InvalidCheckpoint(_) => {
+            CpuValueError::InvalidCheckpoint("NNUEC invalid model")
+        }
+        NnuecError::Io(s) => CpuValueError::Io(s),
+        NnuecError::Json(s) => CpuValueError::Json(s),
+    }
+}
+fn copy_board(board: &NnuecBoard) -> NnuecBoard {
+    NnuecBoard {
+        values: board.values.clone(),
+        exact: board.exact.clone(),
+        position: board.position.clone(),
+        model: Arc::clone(&board.model),
+        stamp: Arc::clone(&board.stamp),
+    }
+}
+fn padded_board_values(board: &NnuecBoard) -> [[f32; CPU_ACCUMULATOR_WIDTH]; 2] {
+    let mut values = [[0.0; CPU_ACCUMULATOR_WIDTH]; 2];
+    for (out, source) in values.iter_mut().zip(&board.values) {
+        out[..source.len()].copy_from_slice(source);
+    }
+    values
+}
+fn vector_backing_bytes<T>(values: &Vec<T>) -> usize {
+    values
+        .capacity()
+        .saturating_mul(std::mem::size_of::<T>())
+        .saturating_add(32)
+}
+fn board_backing_bytes(board: &NnuecBoard) -> usize {
+    board
+        .values
+        .iter()
+        .fold(0usize, |sum, v| sum.saturating_add(vector_backing_bytes(v)))
+        .saturating_add(
+            board
+                .exact
+                .iter()
+                .fold(0usize, |sum, v| sum.saturating_add(vector_backing_bytes(v))),
+        )
 }
 
 /// The value is a nonterminal learned/frontier number, never a Rules mate proof.
@@ -1298,6 +1648,121 @@ mod tests {
         ] {
             values.fill(0.0);
         }
+    }
+
+    #[test]
+    fn native_value_profile_seals_frozen_context_and_observes_conditional_value() {
+        let mut checkpoint = checkpoint();
+        zero_parameters(&mut checkpoint);
+        checkpoint.output_scale = 1.0;
+        checkpoint.parameters.token_bias[0] = 1.0;
+        checkpoint.parameters.causal_weights[0] = 1.0;
+        checkpoint.parameters.context_projection[0] = 1.0;
+        checkpoint.parameters.hidden_weights[2 * checkpoint.config.board_width] = 1.0;
+        checkpoint.parameters.output_weights[0] = 100.0;
+        checkpoint.parameters.output_bias[5] = -3.0;
+        checkpoint.parameters.output_bias[6] = 9.0;
+        let model = Arc::new(NnuecModel::new(checkpoint).unwrap());
+        let root = position("position startpos");
+        let empty = model.empty_context();
+        let filled = model
+            .with_line(&empty, 1, model.encode_line(&root, &moves("e2e4")).unwrap())
+            .unwrap();
+        let no_context = NnuecCpuValue::new(Arc::clone(&model), empty).unwrap();
+        let contextual = NnuecCpuValue::new(Arc::clone(&model), filled).unwrap();
+        let a = no_context.initialize(&root).unwrap();
+        let b = contextual.initialize(&root).unwrap();
+        assert_eq!(no_context.score(&a, &root).unwrap(), 0);
+        assert_eq!(contextual.score(&b, &root).unwrap(), 100);
+        assert_eq!(contextual.identity().training, CpuTrainingState::Untrained);
+        assert_ne!(
+            no_context.cache_context(&a, &root).unwrap(),
+            contextual.cache_context(&b, &root).unwrap()
+        );
+        assert_eq!(
+            contextual.cache_context(&a, &root),
+            Err(CpuValueError::StateMismatch)
+        );
+        assert_eq!(
+            contextual.observe(&b, &root).unwrap().context_utility(),
+            [-3.0, 9.0, 0.0]
+        );
+        assert!(b.retained_bytes() > std::mem::size_of::<CpuAccumulator>());
+    }
+
+    #[test]
+    fn native_checked_delta_and_undo_preserve_local_anchor_and_exact_board() {
+        let model = Arc::new(NnuecModel::new(checkpoint()).unwrap());
+        let evaluator = NnuecCpuValue::new(Arc::clone(&model), model.empty_context()).unwrap();
+        let mut root = position("position startpos");
+        let mut accumulator = evaluator.initialize(&root).unwrap();
+        let original_values = accumulator.values;
+        let rules = root.make_move("e2e4".parse().unwrap()).unwrap();
+        let undo = evaluator
+            .apply_delta(&mut accumulator, rules.delta())
+            .unwrap();
+        assert!(undo.retained_bytes() > std::mem::size_of::<CpuAccumulatorUndo>());
+        let fresh_at_child = evaluator.initialize(&root).unwrap();
+        assert_eq!(accumulator.values, fresh_at_child.values);
+        assert_ne!(
+            evaluator.cache_context(&accumulator, &root).unwrap(),
+            evaluator.cache_context(&fresh_at_child, &root).unwrap()
+        );
+        let native = accumulator.nnuec.as_ref().unwrap();
+        assert_eq!(native.local.moves(), &moves("e2e4"));
+        assert_eq!(
+            native.local.position().position_identity(),
+            root.position_identity()
+        );
+        root.unmake(rules).unwrap();
+        evaluator.restore(&mut accumulator, undo, &root).unwrap();
+        assert_eq!(accumulator.values, original_values);
+        assert!(accumulator.nnuec.as_ref().unwrap().local.moves().is_empty());
+        let fresh_root = evaluator.initialize(&root).unwrap();
+        assert_eq!(
+            evaluator.cache_context(&accumulator, &root).unwrap(),
+            evaluator.cache_context(&fresh_root, &root).unwrap()
+        );
+    }
+
+    #[test]
+    fn native_capacity_failure_and_foreign_clone_undo_leave_owned_state_unchanged() {
+        let mut checkpoint = checkpoint();
+        checkpoint.config.max_plies = 1;
+        checkpoint
+            .parameters
+            .ply_weights
+            .truncate(checkpoint.config.line_width);
+        checkpoint.parameters.ply_weights.shrink_to_fit();
+        let model = Arc::new(NnuecModel::new(checkpoint).unwrap());
+        let evaluator = NnuecCpuValue::new(Arc::clone(&model), model.empty_context()).unwrap();
+        let mut root = position("position startpos");
+        let mut accumulator = evaluator.initialize(&root).unwrap();
+        let first = root.make_move("e2e4".parse().unwrap()).unwrap();
+        let undo = evaluator
+            .apply_delta(&mut accumulator, first.delta())
+            .unwrap();
+        let values = accumulator.values;
+        let identity = accumulator.identity.clone();
+        let second = root.make_move("e7e5".parse().unwrap()).unwrap();
+        assert_eq!(
+            evaluator
+                .apply_delta(&mut accumulator, second.delta())
+                .err(),
+            Some(CpuValueError::InvalidCheckpoint(
+                "NNUEC configured capacity exceeded"
+            ))
+        );
+        assert_eq!(accumulator.values, values);
+        assert_eq!(accumulator.identity, identity);
+        root.unmake(second).unwrap();
+        let mut cloned = accumulator.clone();
+        root.unmake(first).unwrap();
+        assert_eq!(
+            evaluator.restore(&mut cloned, undo, &root),
+            Err(CpuValueError::StateMismatch)
+        );
+        assert_eq!(cloned.values, values);
     }
 
     #[test]
