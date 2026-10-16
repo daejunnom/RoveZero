@@ -1122,9 +1122,36 @@ fn main() -> Result<()> {
         println!("{}", serde_json::to_string(&source_pins()?)?);
         return Ok(());
     }
+    if args == ["--model-registry"] {
+        // Static registry methods only: no asset, runtime or model is opened.
+        // The consumer must separately join the actual build and source bytes.
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "rz-pals-report-model-registry-query/1",
+                "model_profile": model::PROFILE,
+                "model_schema": model::MODEL_SCHEMA,
+                "model_semantics": model::MODEL_SEMANTICS,
+                "model_semantic_sha256": hex(PalsModelProfile::VirtualReviewV1.registered_semantics_sha256()),
+                "encoding_schema": model::ENCODING,
+                "encoding_sha256": hex(model::registered_encoding_sha256()),
+                "registry_methods": [
+                    "PalsModelProfile::VirtualReviewV1.registered_semantics_sha256",
+                    "pals_model::virtual_review::registered_encoding_sha256"
+                ],
+                "source_provenance": "caller_must_join_actual_path_dependency_bytes_to_registered_source",
+                "model_initialized": false,
+                "ort_loaded": false,
+                "neural_executed": false,
+                "training_executed": false,
+                "numerical_authority_issued": false
+            })
+        );
+        return Ok(());
+    }
     if args.len() != 1 {
         return Err(
-            "usage: virtual_review_numeric_capture --source-pins | ABSOLUTE_CAPTURE_CONFIG.json"
+            "usage: virtual_review_numeric_capture --source-pins | --model-registry | ABSOLUTE_CAPTURE_CONFIG.json"
                 .into(),
         );
     }
