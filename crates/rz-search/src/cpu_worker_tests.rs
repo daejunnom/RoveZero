@@ -426,11 +426,38 @@ fn global_credit_covers_all_jobs_and_one_owner_cannot_hold_two_primaries() {
     let mut ledger = ledger(first, clock);
     ledger.register(first).unwrap();
     ledger.register(second).unwrap();
+    assert_eq!(
+        ledger.owner_admission(second.id, CpuWorkerId(0)),
+        Ok(CpuOwnerAdmission::Unstarted)
+    );
     let first_grant = grant(first, CpuWorkerId(0), 1, 6);
     ledger.reserve(first_grant).unwrap();
+    assert_eq!(
+        ledger.owner_admission(first.id, CpuWorkerId(0)),
+        Err(CpuWorkerError::AlreadyReserved)
+    );
     ledger
         .settle(&observed_report(first_grant, 4, 4, false))
         .unwrap();
+    assert_eq!(ledger.global_usage().unwrap(), (4, 0));
+    // A settled Yield frees this invocation's reservation, not its private
+    // primary stack. P/C feedback may run while that exact R owner waits.
+    assert_eq!(
+        ledger.owner_admission(first.id, CpuWorkerId(0)),
+        Ok(CpuOwnerAdmission::SameOwnerResume)
+    );
+    assert_eq!(
+        ledger.owner_admission(second.id, CpuWorkerId(0)),
+        Ok(CpuOwnerAdmission::BlockedBy(first.id))
+    );
+    assert_eq!(
+        ledger.owner_admission(second.id, CpuWorkerId(1)),
+        Ok(CpuOwnerAdmission::Unstarted)
+    );
+    assert!(matches!(
+        ledger.owner_admission(first.id, CpuWorkerId(1)),
+        Err(CpuWorkerError::Invalid("CPU primary job cannot move between owners"))
+    ));
     assert_eq!(ledger.global_usage().unwrap(), (4, 0));
     assert!(matches!(
         ledger.reserve(grant(second, CpuWorkerId(0), 2, 1)),

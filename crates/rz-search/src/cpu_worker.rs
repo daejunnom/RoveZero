@@ -367,6 +367,15 @@ pub struct CpuCreditLedger {
     highest_job_sequence: u64,
     highest_execution_sequence: u64,
 }
+
+/// Read-only dispatch eligibility. A logically waiting parent still owns its
+/// private paused stack; it is not an idle physical worker for a child Job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CpuOwnerAdmission {
+    Unstarted,
+    SameOwnerResume,
+    BlockedBy(CpuJobId),
+}
 impl CpuCreditLedger {
     pub fn new(
         authority: SearchAuthority,
@@ -430,15 +439,51 @@ impl CpuCreditLedger {
         );
         Ok(())
     }
+    /// Inspect before assigning independent, not-yet-started work. This neither
+    /// reserves credit nor moves a token. `reserve` rechecks the same authority
+    /// after the manager chooses the owner.
+    pub fn owner_admission(
+        &self,
+        job: CpuJobId,
+        owner: CpuWorkerId,
+    ) -> Result<CpuOwnerAdmission, CpuWorkerError> {
+        let account = self.jobs.get(&job).ok_or(CpuWorkerError::UnknownJob)?;
+        if account.quarantine {
+            return Err(CpuWorkerError::Quarantined);
+        }
+        if account.terminal {
+            return Err(CpuWorkerError::Invalid("CPU job has terminated"));
+        }
+        if account.reservation.is_some() {
+            return Err(CpuWorkerError::AlreadyReserved);
+        }
+        if account.owner.is_some_and(|previous| previous != owner) {
+            return Err(CpuWorkerError::Invalid(
+                "CPU primary job cannot move between owners",
+            ));
+        }
+        if let Some((blocking_job, _)) = self.jobs.iter().find(|(id, held)| {
+            **id != job && !held.terminal && held.owner == Some(owner)
+        }) {
+            return Ok(CpuOwnerAdmission::BlockedBy(*blocking_job));
+        }
+        Ok(if account.owner.is_some() {
+            CpuOwnerAdmission::SameOwnerResume
+        } else {
+            CpuOwnerAdmission::Unstarted
+        })
+    }
+
     pub fn reserve(&mut self, grant: SliceGrant) -> Result<(), CpuWorkerError> {
         if grant.job.authority != self.authority
             || grant.execution.sequence <= self.highest_execution_sequence
         {
             return Err(CpuWorkerError::Duplicate);
         }
-        if self.jobs.iter().any(|(id, account)| {
-            *id != grant.job && !account.terminal && account.owner == Some(grant.owner)
-        }) {
+        if matches!(
+            self.owner_admission(grant.job, grant.owner),
+            Ok(CpuOwnerAdmission::BlockedBy(_))
+        ) {
             return Err(CpuWorkerError::Invalid(
                 "CPU owner already holds another primary job",
             ));
