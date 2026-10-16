@@ -679,7 +679,7 @@ mod actual {
                 "parent_record_revision":line.parent_revision.map(|v|v.to_string()),
                 "supersedes_record_revision":line.supersedes_revision.map(|v|v.to_string()),
                 "origin_state":{"domain":"search_store_state","store_local_index":line.origin_state.0.to_string()},
-                "committed_plies":line.committed_plies,"first_move_uci":line.first_move.map(|m|m.to_uci()),
+                "committed_plies":line.committed_plies,"first_move_uci":line.first_move.map(|m|m.to_string()),
                 "source_boundary":"ORIGINAL_REPAIR_PUBLISH_RECORD_RETURNED_OK",
                 "semantic_and_machine_acceptance":"REQUIRE_SEPARATE_ORIGINAL_EVENTS"})
         }
