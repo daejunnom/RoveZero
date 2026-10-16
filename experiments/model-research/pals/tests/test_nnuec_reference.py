@@ -57,27 +57,68 @@ class NnuecReferenceTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 reference.NnuecConfig.from_mapping({**config, name: value})
         checkpoint = checkpoint_mapping()
+        checkpoint["semantics"] = "board800-causal-line-bcl-fp32-v1"
+        with self.assertRaisesRegex(ValueError, "unregistered"):
+            reference.NnuecCheckpoint.from_mapping(checkpoint)
+        checkpoint["semantics"] = reference.SEMANTICS
         checkpoint["training"] = {"kind": "bootstrap"}
         with self.assertRaisesRegex(ValueError, "bootstrap"):
             reference.NnuecCheckpoint.from_mapping(checkpoint)
 
-    def test_fp32_rounds_each_feature_addition_and_preserves_feature_order(self):
+    def test_board_exact_feature_sum_rounds_once_and_survives_cancellation(self):
         checkpoint = checkpoint_mapping()
         parameters = checkpoint["parameters"]
         parameters["board_bias"][0] = 1.0
         parameters["board_weights"][0] = 2.0 ** -24
         parameters["board_weights"][65] = 2.0 ** -24
         result = evaluate(checkpoint, input_mapping(boards=((0, 65), ())))
-        self.assertEqual(result["board_accumulators"], [[1.0], [1.0]])
-        # A single rounding after summation would differ by one ULP.
-        self.assertNotEqual(result["board_accumulators"][0][0], 1.0 + 2.0 ** -23)
+        self.assertEqual(result["board_accumulators"], [[1.0 + 2.0 ** -23], [1.0]])
+        # Sequential FP32 feature addition would lose both half-ULP terms.
+        self.assertNotEqual(result["board_accumulators"][0][0], 1.0)
         parameters["board_bias"][0] = 0.0
         for index, value in ((0, 1000.0), (65, 0.00001), (130, -1000.0), (129, -1000.0), (66, 0.00001)):
             parameters["board_weights"][index] = value
         left = evaluate(checkpoint, input_mapping(boards=((0, 65, 130), ())))
         right = evaluate(checkpoint, input_mapping(boards=((0, 129, 66), ())))
-        self.assertEqual(left["board_accumulators"][0][0], 0.0)
-        self.assertGreater(right["board_accumulators"][0][0], 0.0)
+        self.assertEqual(left["board_accumulators"][0][0], reference.f32(0.00001))
+        self.assertEqual(right["board_accumulators"][0], left["board_accumulators"][0])
+        # Eight allowed +1000 terms produce an 8000 partial sum. Adding a
+        # 2^-12 tie there, then eight -1000 terms, must retain the small term.
+        parameters["board_weights"][:] = [0.0] * len(parameters["board_weights"])
+        parameters["board_weights"][:17] = [1000.0] * 8 + [2.0 ** -12] + [-1000.0] * 8
+        adversarial = evaluate(checkpoint, input_mapping(boards=(tuple(range(17)), ())))
+        self.assertEqual(adversarial["board_accumulators"][0], [2.0 ** -12])
+
+    def test_exact_sum_rounding_handles_subnormals_ties_sticky_and_capacity(self):
+        smallest = struct.unpack("<f", struct.pack("<I", 1))[0]
+        cases = (([1.0, 2.0 ** -24], 1.0),
+                 ([1.0, 2.0 ** -24, smallest], 1.0 + 2.0 ** -23),
+                 ([-1.0, -(2.0 ** -24), -smallest], -(1.0 + 2.0 ** -23)),
+                 ([smallest, smallest], 2.0 * smallest),
+                 ([1.0, -1.0, -0.0], 0.0))
+        for operands, expected in cases:
+            with self.subTest(operands=operands):
+                actual = reference._exact_sum_fp32(operands, 192)
+                self.assertEqual(struct.pack("<f", actual), struct.pack("<f", expected))
+        maximum = struct.unpack("<f", struct.pack("<I", 0x7f7fffff))[0]
+        with self.assertRaisesRegex(ValueError, "signed192 accumulation overflow"):
+            reference._exact_sum_fp32([maximum], 192)
+
+    def test_context_exact_sum_preserves_bias_after_large_contribution_cancellation(self):
+        checkpoint = checkpoint_mapping(line_width=2)
+        parameters = checkpoint["parameters"]
+        parameters["from_weights"][:4] = [1000.0, 0.0, 0.0, 1000.0]
+        parameters["causal_weights"][:2] = [1000.0, 1000.0]
+        parameters["context_projection"][:] = [1000.0, -1000.0]
+        parameters["context_bias"][0] = 1.0
+        positive = line(((0, 8, 0),))
+        negative = line(((1, 9, 0),))
+        result = evaluate(checkpoint, input_mapping(context=(positive, negative)))
+        self.assertEqual(result["context_contributions"], [[1e9], [-1e9]])
+        self.assertEqual(result["context_accumulator"], [1.0])
+        swapped = evaluate(checkpoint, input_mapping(context=(negative, positive)))
+        self.assertEqual(swapped["context_accumulator"], result["context_accumulator"])
+        self.assertEqual(evaluate(checkpoint, input_mapping())["context_accumulator"], [1.0])
 
     def test_causal_sequence_order_and_context_local_separation(self):
         checkpoint = checkpoint_mapping()
@@ -178,7 +219,7 @@ class NnuecReferenceTests(unittest.TestCase):
         checkpoint = checkpoint_mapping()
         model = reference.NnuecCheckpoint.from_mapping(checkpoint)
         # Independent protocol construction, intentionally not a JSON hash.
-        wire = bytearray(b"rz-nnuec-fp32-v1\0board800-causal-line-bcl-fp32-v1\0")
+        wire = bytearray(b"rz-nnuec-fp32-v1\0board800-exactb192-causal-line-exactc256-fp32-v1\0")
         for dimension in (1, 1, 1, 1, 1, 3, 4, 8):
             wire.extend(dimension.to_bytes(4, "little"))
         for name in ("board_weights", "board_bias", "anchor_weights", "anchor_bias", "from_weights",

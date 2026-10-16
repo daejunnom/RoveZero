@@ -6,7 +6,10 @@ checked move coordinates supplied by the Rust Rules consumer. Context lines C
 and the local continuation L are distinct inputs. Nothing is trained, exported
 to ONNX, registered as an arena asset or evaluated merely by importing it.
 
-Every multiply and addition rounds separately to IEEE binary32, without FMA.
+Encoder, projection and head multiply/add operations round separately to IEEE
+binary32, without FMA. B sums admitted FP32 feature terms exactly in signed192;
+C sums already-rounded line contributions exactly in signed256. Each exact sum
+rounds once to FP32. This is accumulation of FP32 operands, not quantized weights.
 Weights are output-row-major. Widths are required bounded configuration values,
 not a newly selected default architecture. The byte digest below is shared with
 the Rust reader; JSON formatting and declared training metadata are not weights.
@@ -23,7 +26,7 @@ import sys
 
 
 SCHEMA = "rz-nnuec-fp32-v1"
-SEMANTICS = "board800-causal-line-bcl-fp32-v1"
+SEMANTICS = "board800-exactb192-causal-line-exactc256-fp32-v1"
 INPUT_SCHEMA = "rz-nnuec-fp32-input/1"
 OUTPUT_SCHEMA = "rz-nnuec-fp32-output/1"
 REFERENCE_SCOPE = "independent_scalar_numeric_only_not_rules_or_training_proof"
@@ -31,6 +34,8 @@ BOARD_FEATURES = 800
 OUTPUT_ROWS = 11
 MAX_JSON_BYTES = 32 << 20
 MAX_PARAMETER_MAGNITUDE = 1000.0
+MAX_CONTEXT_CONTRIBUTION = float(1 << 60)
+MAX_CONTEXT_MAGNITUDE = float(1 << 68)
 CONFIG_FIELDS = (
     "board_width", "line_width", "context_width", "local_width", "hidden_width",
     "causal_window", "max_lines", "max_plies",
@@ -77,6 +82,47 @@ def _mul(left, right):
     return f32(left * right)
 
 
+def _exact_sum_fp32(values, bits):
+    """Independent bigint sum in units 2^-149, with checked signed capacity.
+
+    Only B's bounded parameters and C's bounded projected contributions use
+    this path. In particular, signed256 is not a claim that an arbitrary sum
+    of all finite binary32 operands is supported.
+    """
+    total = 0
+    limit = 1 << (bits - 1)
+    for value in values:
+        raw = struct.unpack("<I", struct.pack("<f", f32(value)))[0]
+        exponent = (raw >> 23) & 255
+        fraction = raw & 0x7fffff
+        magnitude = fraction if exponent == 0 else (fraction | 0x800000) << (exponent - 1)
+        total += -magnitude if raw >> 31 else magnitude
+        if not -limit <= total < limit:
+            raise ValueError(f"exact signed{bits} accumulation overflow")
+    if total == 0:
+        return 0.0
+    sign = 0x80000000 if total < 0 else 0
+    magnitude = abs(total)
+    highest = magnitude.bit_length() - 1
+    if highest <= 22:
+        return struct.unpack("<f", struct.pack("<I", sign | magnitude))[0]
+    shift = highest - 23
+    mantissa = magnitude >> shift
+    if shift:
+        remainder = magnitude - (mantissa << shift)
+        half = 1 << (shift - 1)
+        if remainder > half or (remainder == half and mantissa & 1):
+            mantissa += 1
+            if mantissa == 0x1000000:
+                mantissa >>= 1
+                highest += 1
+    exponent = highest - 22
+    if exponent >= 255:
+        raise ValueError("exact accumulation cannot round to finite FP32")
+    raw = sign | (exponent << 23) | (mantissa & 0x7fffff)
+    return struct.unpack("<f", struct.pack("<I", raw))[0]
+
+
 def _relu(value):
     return value if value > 0.0 else 0.0
 
@@ -91,7 +137,7 @@ def _dense(weights, values, width, bias=None):
     output = []
     for index in range(width):
         # Dense heads and L add each product directly to the bias. C uses a
-        # zero-start dot, followed by one immutable-context accumulator add.
+        # zero-start FP32 dot, then exact summation of immutable contributions.
         total = 0.0 if bias is None else bias[index]
         start = index * stride
         for column, value in enumerate(values):
@@ -320,7 +366,12 @@ class ReferenceInput:
                 "local_line": self.local_line.to_mapping()}
 
 
-def _sparse(parameters, features, width, weights, bias):
+def _sparse(parameters, features, width, weights, bias, *, exact_board=False):
+    if exact_board:
+        return tuple(_exact_sum_fp32(
+            (parameters[bias][column], *(parameters[weights][feature * width + column] for feature in features)),
+            192,
+        ) for column in range(width))
     output = list(parameters[bias])
     for feature in features:
         for column in range(width):
@@ -370,16 +421,20 @@ def evaluate(checkpoint, inputs):
     inputs = ReferenceInput.from_mapping(inputs.to_mapping(), checkpoint.config)
     config = checkpoint.config
     parameters = dict(zip(PARAMETER_FIELDS, checkpoint.parameters, strict=True))
-    board = tuple(_sparse(parameters, features, config.board_width, "board_weights", "board_bias")
+    board = tuple(_sparse(parameters, features, config.board_width, "board_weights", "board_bias", exact_board=True)
                   for features in inputs.board_features)
-    context = list(parameters["context_bias"])
     context_contributions = []
     for line in inputs.context_lines:
         representation = _encode_line(checkpoint, line)
         contribution = _dense(parameters["context_projection"], representation, config.context_width)
+        if any(abs(value) > MAX_CONTEXT_CONTRIBUTION for value in contribution):
+            raise ValueError("context contribution exceeds admitted FP32 operand bound")
         context_contributions.append(contribution)
-        for column, value in enumerate(contribution):
-            context[column] = _add(context[column], value)
+    context = [_exact_sum_fp32(
+        (parameters["context_bias"][column], *(row[column] for row in context_contributions)), 256,
+    ) for column in range(config.context_width)]
+    if any(abs(value) > MAX_CONTEXT_MAGNITUDE for value in context):
+        raise ValueError("context accumulator exceeds admitted FP32 result bound")
     local_representation = _encode_line(checkpoint, inputs.local_line)
     local = _dense(parameters["local_projection"], local_representation, config.local_width,
                    parameters["local_bias"])

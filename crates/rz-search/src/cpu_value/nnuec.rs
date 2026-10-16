@@ -4,13 +4,15 @@
 //! line set, and L is an owned, Rules-checked local suffix. No search, runtime,
 //! Python, GPU, or global mutable context is required to use this module.
 //! The dimensions are required experimental configuration, not adopted defaults.
-//! Arithmetic uses separate scalar FP32 multiplication and addition. B/C delta
-//! results are compared to full rebuild with abs 1e-4 + rel 1e-3; undo restores
-//! the original FP32 bits. There is no clipping before an accumulator's sum.
+//! Encoders, projections and heads use separate FP32 multiply/add operations.
+//! B sums FP32 feature operands in signed192; C sums the already-FP32 line
+//! projections in checked signed256. Both round once, ties to even. This avoids
+//! irreversible FP32 subtraction, and is not integer quantization of weights.
+//! Undo restores the original bits; no clipping precedes accumulator sums.
 
 use super::{
-    CPU_FEATURE_COUNT, CpuTrainingState, CpuValueIdentity, metadata_features, piece_feature,
-    validate_training_declaration,
+    CPU_FEATURE_COUNT, CpuTrainingState, CpuValueIdentity, Signed192, metadata_features,
+    piece_feature, validate_training_declaration,
 };
 use rz_position::{
     BoardMove, Color, PieceKind, Position, PositionIdentity, RuleMoveDelta, Square, UndoToken,
@@ -22,7 +24,7 @@ use std::io::Read;
 use std::sync::Arc;
 
 pub const NNUEC_SCHEMA: &str = "rz-nnuec-fp32-v1";
-pub const NNUEC_SEMANTICS: &str = "board800-causal-line-bcl-fp32-v1";
+pub const NNUEC_SEMANTICS: &str = "board800-exactb192-causal-line-exactc256-fp32-v1";
 pub const NNUEC_INPUT_SCHEMA: &str = "rz-nnuec-fp32-input/1";
 pub const NNUEC_OUTPUT_SCHEMA: &str = "rz-nnuec-fp32-output/1";
 pub const NNUEC_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -30,6 +32,15 @@ pub const NNUEC_OUTPUTS: usize = 11;
 pub const NNUEC_ABSOLUTE_TOLERANCE: f32 = 1e-4;
 pub const NNUEC_RELATIVE_TOLERANCE: f32 = 1e-3;
 const PARAMETER_MAGNITUDE: f32 = 1000.0;
+// Even the conservative bound of 800 anchor terms gives |anchor| < 2^20,
+// |token| < 806001, |causal token| < 4.031e9, |line sum| < 1.032e12 and a
+// 256-column FP32 projection < 2.65e17 (rounding slack included). We separately
+// enforce the looser exact operand limit 2^60, rather than admitting arbitrary
+// finite FP32 values. Bias + 128 contributions and one replacement transient
+// have |sum| < 2^68; scaled by 2^149 they need fewer than 217 magnitude bits.
+// B's bias + 800 features + at most 22 transition terms have |sum| < 2^20,
+// or fewer than 169 scaled magnitude bits, within the existing signed192.
+const MAX_CONTEXT_OPERAND: f32 = 1_152_921_504_606_846_976.0; // 2^60
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NnuecError {
@@ -38,6 +49,7 @@ pub enum NnuecError {
     Capacity(&'static str),
     StateMismatch,
     NonFinite,
+    AccumulatorOverflow,
     Rules(String),
     Io(String),
     Json(String),
@@ -51,6 +63,7 @@ impl std::fmt::Display for NnuecError {
             Self::Capacity(s) => write!(f, "NNUEC capacity: {s}"),
             Self::StateMismatch => f.write_str("NNUEC owner/model/Rules state mismatch"),
             Self::NonFinite => f.write_str("NNUEC FP32 operation produced a non-finite result"),
+            Self::AccumulatorOverflow => f.write_str("NNUEC exact accumulator range exceeded"),
             Self::Rules(s) => write!(f, "NNUEC Rules transition: {s}"),
             Self::Io(s) => write!(f, "NNUEC checkpoint read: {s}"),
             Self::Json(s) => write!(f, "NNUEC JSON: {s}"),
@@ -309,14 +322,21 @@ impl NnuecModel {
 
     pub fn board(&self, position: &Position) -> Result<NnuecBoard, NnuecError> {
         let p = &self.checkpoint.parameters;
-        let mut values = [p.board_bias.clone(), p.board_bias.clone()];
+        let bias = p
+            .board_bias
+            .iter()
+            .map(|v| exact_board_operand(*v))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut exact = [bias.clone(), bias];
         for side in [Color::White, Color::Black] {
             for feature in board_features(position, side) {
-                add_row(&mut values[side as usize], &p.board_weights, feature, 1.0)?;
+                add_exact_board_row(&mut exact[side as usize], &p.board_weights, feature, false)?;
             }
         }
+        let values = round_board(&exact);
         Ok(NnuecBoard {
             values,
+            exact,
             position: position.position_identity(),
             model: Arc::clone(&self.identity),
             stamp: Arc::new(()),
@@ -334,42 +354,44 @@ impl NnuecModel {
         if delta.removals.len() > 4 || delta.additions.len() > 4 {
             return Err(NnuecError::Capacity("Rules piece delta"));
         }
-        let mut next = board.values.clone();
+        let mut next = board.exact.clone();
         for side in [Color::White, Color::Black] {
             let out = &mut next[side as usize];
             for r in &delta.removals {
-                add_row(
+                add_exact_board_row(
                     out,
                     &self.checkpoint.parameters.board_weights,
                     piece_feature(r.piece, r.square, side),
-                    -1.0,
+                    true,
                 )?;
             }
             for a in &delta.additions {
-                add_row(
+                add_exact_board_row(
                     out,
                     &self.checkpoint.parameters.board_weights,
                     piece_feature(a.piece, a.square, side),
-                    1.0,
+                    false,
                 )?;
             }
             let before = metadata_features(&delta.before, side);
             let after = metadata_features(&delta.after, side);
             for f in before.as_slice() {
                 if !after.as_slice().contains(f) {
-                    add_row(out, &self.checkpoint.parameters.board_weights, *f, -1.0)?;
+                    add_exact_board_row(out, &self.checkpoint.parameters.board_weights, *f, true)?;
                 }
             }
             for f in after.as_slice() {
                 if !before.as_slice().contains(f) {
-                    add_row(out, &self.checkpoint.parameters.board_weights, *f, 1.0)?;
+                    add_exact_board_row(out, &self.checkpoint.parameters.board_weights, *f, false)?;
                 }
             }
         }
         let after = delta.after.position_identity();
         let stamp = Arc::new(());
+        let rounded = round_board(&next);
         let undo = NnuecBoardUndo {
-            values: std::mem::replace(&mut board.values, next),
+            values: std::mem::replace(&mut board.values, rounded),
+            exact: std::mem::replace(&mut board.exact, next),
             before: board.position.clone(),
             after: after.clone(),
             model: Arc::clone(&self.identity),
@@ -396,6 +418,7 @@ impl NnuecModel {
             return Err(NnuecError::StateMismatch);
         }
         board.values = undo.values;
+        board.exact = undo.exact;
         board.position = undo.before;
         board.stamp = undo.before_stamp;
         Ok(())
@@ -413,6 +436,12 @@ impl NnuecModel {
                 1.0,
             )?;
         }
+        let embedding = vec![0.0; self.checkpoint.config.line_width];
+        let projected = project(
+            &embedding,
+            &self.checkpoint.parameters.local_projection,
+            &self.checkpoint.parameters.local_bias,
+        )?;
         Ok(NnuecLocal {
             work: anchor.clone(),
             anchor: anchor.position_identity(),
@@ -421,8 +450,8 @@ impl NnuecModel {
             anchor_values,
             tokens: Vec::new(),
             moves: Vec::new(),
-            embedding: vec![0.0; self.checkpoint.config.line_width],
-            projected: self.checkpoint.parameters.local_bias.clone(),
+            embedding,
+            projected,
             model: Arc::clone(&self.identity),
             stamp: Arc::new(()),
         })
@@ -539,6 +568,14 @@ impl NnuecModel {
         for mv in moves {
             self.append_local(&mut local, *mv)?;
         }
+        let contribution = project(
+            &local.embedding,
+            &self.checkpoint.parameters.context_projection,
+            &vec![0.0; self.checkpoint.config.context_width],
+        )?;
+        for value in &contribution {
+            Exact256::from_f32(*value)?;
+        }
         Ok(Arc::new(NnuecLine {
             model: Arc::clone(&self.identity),
             anchor: local.anchor,
@@ -553,6 +590,7 @@ impl NnuecModel {
                     .collect(),
             },
             embedding: local.embedding,
+            contribution,
         }))
     }
 
@@ -580,10 +618,19 @@ impl NnuecModel {
     }
 
     pub fn empty_context(&self) -> Arc<NnuecContext> {
+        let exact: Vec<Exact256> = self
+            .checkpoint
+            .parameters
+            .context_bias
+            .iter()
+            .map(|v| Exact256::from_f32(*v).expect("admitted bias within exact context range"))
+            .collect();
+        let values = exact.iter().map(|value| value.to_f32()).collect();
         Arc::new(NnuecContext {
             model: Arc::clone(&self.identity),
             lines: BTreeMap::new(),
-            values: self.checkpoint.parameters.context_bias.clone(),
+            values,
+            exact,
         })
     }
 
@@ -603,17 +650,19 @@ impl NnuecModel {
         {
             return Err(NnuecError::Capacity("context lines"));
         }
-        let mut values = context.values.clone();
+        let mut exact = context.exact.clone();
         if let Some(old) = context.lines.get(&id) {
-            self.add_line(&mut values, old, -1.0)?;
+            Self::add_line(&mut exact, old, true)?;
         }
-        self.add_line(&mut values, &line, 1.0)?;
+        Self::add_line(&mut exact, &line, false)?;
+        let values = exact.iter().map(|v| v.to_f32()).collect();
         let mut lines = context.lines.clone();
         lines.insert(id, line);
         Ok(Arc::new(NnuecContext {
             model: Arc::clone(&self.identity),
             lines,
             values,
+            exact,
         }))
     }
 
@@ -626,14 +675,16 @@ impl NnuecModel {
             return Err(NnuecError::StateMismatch);
         }
         let old = context.lines.get(&id).ok_or(NnuecError::StateMismatch)?;
-        let mut values = context.values.clone();
-        self.add_line(&mut values, old, -1.0)?;
+        let mut exact = context.exact.clone();
+        Self::add_line(&mut exact, old, true)?;
+        let values = exact.iter().map(|v| v.to_f32()).collect();
         let mut lines = context.lines.clone();
         lines.remove(&id);
         Ok(Arc::new(NnuecContext {
             model: Arc::clone(&self.identity),
             lines,
             values,
+            exact,
         }))
     }
 
@@ -641,25 +692,23 @@ impl NnuecModel {
         if context.model != self.identity {
             return Err(NnuecError::StateMismatch);
         }
-        let mut values = self.checkpoint.parameters.context_bias.clone();
+        let mut exact = self.empty_context().exact.clone();
         for line in context.lines.values() {
-            self.add_line(&mut values, line, 1.0)?;
+            Self::add_line(&mut exact, line, false)?;
         }
+        let values = exact.iter().map(|v| v.to_f32()).collect();
         Ok(Arc::new(NnuecContext {
             model: Arc::clone(&self.identity),
             lines: context.lines.clone(),
             values,
+            exact,
         }))
     }
 
-    fn add_line(&self, values: &mut [f32], line: &NnuecLine, sign: f32) -> Result<(), NnuecError> {
-        let contribution = project(
-            &line.embedding,
-            &self.checkpoint.parameters.context_projection,
-            &vec![0.0; values.len()],
-        )?;
-        for (value, contribution) in values.iter_mut().zip(contribution) {
-            *value = add(*value, mul(sign, contribution)?)?;
+    fn add_line(values: &mut [Exact256], line: &NnuecLine, remove: bool) -> Result<(), NnuecError> {
+        for (value, contribution) in values.iter_mut().zip(&line.contribution) {
+            let operand = Exact256::from_f32(*contribution)?;
+            *value = value.checked_add(if remove { operand.negated() } else { operand })?;
         }
         Ok(())
     }
@@ -770,6 +819,7 @@ impl NnuecModel {
 /// Owned B. It is deliberately not Clone: undo authority belongs to this owner.
 pub struct NnuecBoard {
     values: [Vec<f32>; 2],
+    exact: [Vec<Signed192>; 2],
     position: PositionIdentity,
     model: Arc<CpuValueIdentity>,
     stamp: Arc<()>,
@@ -781,6 +831,7 @@ impl NnuecBoard {
 }
 pub struct NnuecBoardUndo {
     values: [Vec<f32>; 2],
+    exact: [Vec<Signed192>; 2],
     before: PositionIdentity,
     after: PositionIdentity,
     model: Arc<CpuValueIdentity>,
@@ -793,6 +844,7 @@ pub struct NnuecLine {
     anchor: PositionIdentity,
     input: ReferenceLine,
     embedding: Vec<f32>,
+    contribution: Vec<f32>,
 }
 impl NnuecLine {
     pub fn embedding(&self) -> &[f32] {
@@ -806,6 +858,7 @@ pub struct NnuecContext {
     model: Arc<CpuValueIdentity>,
     lines: BTreeMap<u64, Arc<NnuecLine>>,
     values: Vec<f32>,
+    exact: Vec<Exact256>,
 }
 impl NnuecContext {
     pub fn values(&self) -> &[f32] {
@@ -998,6 +1051,146 @@ fn project(input: &[f32], weights: &[f32], bias: &[f32]) -> Result<Vec<f32>, Nnu
     Ok(out)
 }
 
+fn exact_board_operand(value: f32) -> Result<Signed192, NnuecError> {
+    Signed192::from_f32(value).map_err(|_| NnuecError::AccumulatorOverflow)
+}
+
+fn add_exact_board_row(
+    out: &mut [Signed192],
+    weights: &[f32],
+    row: usize,
+    remove: bool,
+) -> Result<(), NnuecError> {
+    let width = out.len();
+    let weights = weights
+        .get(row * width..(row + 1) * width)
+        .ok_or(NnuecError::StateMismatch)?;
+    for (out, weight) in out.iter_mut().zip(weights) {
+        let operand = exact_board_operand(*weight)?;
+        *out = out
+            .checked_add(if remove { operand.negated() } else { operand })
+            .map_err(|_| NnuecError::AccumulatorOverflow)?;
+    }
+    Ok(())
+}
+
+fn round_board(exact: &[Vec<Signed192>; 2]) -> [Vec<f32>; 2] {
+    std::array::from_fn(|side| exact[side].iter().map(|value| value.to_f32()).collect())
+}
+
+/// Exact sum of bounded FP32 context operands expressed in 2^-149 units.
+/// This is deliberately local to C, not a quantized network or an accumulator
+/// for arbitrary finite FP32 inputs. Its operand and signed-overflow checks are
+/// retained even though admitted model bounds leave more than 38 spare bits.
+#[derive(Clone, Copy, Default)]
+struct Exact256([u64; 4]);
+
+impl Exact256 {
+    fn from_f32(value: f32) -> Result<Self, NnuecError> {
+        if !value.is_finite() || value.abs() > MAX_CONTEXT_OPERAND {
+            return Err(NnuecError::AccumulatorOverflow);
+        }
+        let bits = value.to_bits();
+        let exponent = ((bits >> 23) & 255) as usize;
+        let fraction = bits & 0x7f_ffff;
+        let mantissa = if exponent == 0 {
+            fraction
+        } else {
+            fraction | 0x80_0000
+        };
+        let shift = exponent.saturating_sub(1);
+        let word = shift / 64;
+        let offset = shift % 64;
+        if word >= 4 || shift + 24 >= 256 {
+            return Err(NnuecError::AccumulatorOverflow);
+        }
+        let mut words = [0u64; 4];
+        words[word] = u64::from(mantissa) << offset;
+        if offset > 40 {
+            words[word + 1] = u64::from(mantissa) >> (64 - offset);
+        }
+        let positive = Self(words);
+        Ok(if bits >> 31 != 0 {
+            positive.negated()
+        } else {
+            positive
+        })
+    }
+
+    fn negative(self) -> bool {
+        self.0[3] >> 63 != 0
+    }
+
+    fn negated(self) -> Self {
+        let mut out = self.0.map(|word| !word);
+        let mut carry = true;
+        for word in &mut out {
+            let (value, overflow) = word.overflowing_add(u64::from(carry));
+            *word = value;
+            carry = overflow;
+        }
+        Self(out)
+    }
+
+    fn checked_add(self, other: Self) -> Result<Self, NnuecError> {
+        let mut words = [0u64; 4];
+        let mut carry = false;
+        for (index, word) in words.iter_mut().enumerate() {
+            let (value, first) = self.0[index].overflowing_add(other.0[index]);
+            let (value, second) = value.overflowing_add(u64::from(carry));
+            *word = value;
+            carry = first || second;
+        }
+        let out = Self(words);
+        if self.negative() == other.negative() && self.negative() != out.negative() {
+            return Err(NnuecError::AccumulatorOverflow);
+        }
+        Ok(out)
+    }
+
+    fn to_f32(self) -> f32 {
+        let negative = self.negative();
+        let words = if negative { self.negated().0 } else { self.0 };
+        let Some(mut highest) = words
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, word)| **word != 0)
+            .map(|(index, word)| index * 64 + 63 - word.leading_zeros() as usize)
+        else {
+            return 0.0;
+        };
+        let sign = if negative { 1u32 << 31 } else { 0 };
+        if highest <= 22 {
+            return f32::from_bits(sign | words[0] as u32);
+        }
+        let shift = highest - 23;
+        let index = shift / 64;
+        let offset = shift % 64;
+        let mut top = words[index] >> offset;
+        if offset != 0 && index + 1 < 4 {
+            top |= words[index + 1] << (64 - offset);
+        }
+        let mut mantissa = (top & 0xff_ffff) as u32;
+        if shift != 0 {
+            let guard = shift - 1;
+            let guard_bit = words[guard / 64] & (1u64 << (guard % 64)) != 0;
+            let word = guard / 64;
+            let offset = guard % 64;
+            let sticky = words[..word].iter().any(|w| *w != 0)
+                || (offset != 0 && words[word] & ((1u64 << offset) - 1) != 0);
+            if guard_bit && (sticky || mantissa & 1 != 0) {
+                mantissa += 1;
+                if mantissa == 0x100_0000 {
+                    mantissa >>= 1;
+                    highest += 1;
+                }
+            }
+        }
+        f32::from_bits(sign | (((highest - 22) as u32) << 23) | (mantissa & 0x7f_ffff))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1080,6 +1273,120 @@ mod tests {
         a.iter().map(|v| v.to_bits()).collect()
     }
 
+    fn zero_parameters(checkpoint: &mut NnuecCheckpoint) {
+        let p = &mut checkpoint.parameters;
+        for values in [
+            &mut p.board_weights,
+            &mut p.board_bias,
+            &mut p.anchor_weights,
+            &mut p.anchor_bias,
+            &mut p.from_weights,
+            &mut p.to_weights,
+            &mut p.promotion_weights,
+            &mut p.ply_weights,
+            &mut p.token_bias,
+            &mut p.causal_weights,
+            &mut p.causal_bias,
+            &mut p.context_projection,
+            &mut p.context_bias,
+            &mut p.local_projection,
+            &mut p.local_bias,
+            &mut p.hidden_weights,
+            &mut p.hidden_bias,
+            &mut p.output_weights,
+            &mut p.output_bias,
+        ] {
+            values.fill(0.0);
+        }
+    }
+
+    #[test]
+    fn cancellation_does_not_turn_context_deletion_into_a_different_empty_view() {
+        let mut checkpoint = checkpoint();
+        zero_parameters(&mut checkpoint);
+        checkpoint.parameters.context_bias[0] = 1.0;
+        checkpoint.parameters.token_bias[0] = 1000.0;
+        checkpoint.parameters.causal_weights[0] = 1000.0;
+        checkpoint.parameters.context_projection[0] = 1000.0;
+        let model = NnuecModel::new(checkpoint).unwrap();
+        let root = position("position startpos");
+        let empty = model.empty_context();
+        let line = model.encode_line(&root, &moves("e2e4")).unwrap();
+        let occupied = model.with_line(&empty, 1, line).unwrap();
+        let removed = model.without_line(&occupied, 1).unwrap();
+        assert_eq!(bits(removed.values()), bits(empty.values()));
+        close(
+            removed.values(),
+            model.rebuild_context(&removed).unwrap().values(),
+        );
+    }
+
+    #[test]
+    fn board_delta_rebuild_handles_half_ulp_hidden_by_large_canceling_features() {
+        let mut checkpoint = checkpoint();
+        zero_parameters(&mut checkpoint);
+        let mut root = position("position startpos");
+        let snapshot = root.snapshot();
+        for square in (0..8).chain(56..64) {
+            let square = Square::new(square).unwrap();
+            let piece = snapshot.piece_at(square).unwrap();
+            let feature = piece_feature(piece, square, Color::White);
+            checkpoint.parameters.board_weights[feature * checkpoint.config.board_width] =
+                if square.rank() == 0 { 1000.0 } else { -1000.0 };
+        }
+        let feature = piece_feature(
+            snapshot.piece_at("e2".parse().unwrap()).unwrap(),
+            "e2".parse().unwrap(),
+            Color::White,
+        );
+        checkpoint.parameters.board_weights[feature * checkpoint.config.board_width] =
+            2.0f32.powi(-12);
+        let model = NnuecModel::new(checkpoint).unwrap();
+        let mut board = model.board(&root).unwrap();
+        let rules = root.make_move("e2e4".parse().unwrap()).unwrap();
+        model.apply_board_delta(&mut board, rules.delta()).unwrap();
+        let rebuilt = model.board(&root).unwrap();
+        close(&board.values[0], &rebuilt.values[0]);
+        assert_eq!(bits(&board.values[0]), bits(&rebuilt.values[0]));
+    }
+
+    #[test]
+    fn exact_context_sum_rounds_ties_sticky_subnormals_and_rejects_oversized_operands() {
+        let one = Exact256::from_f32(1.0).unwrap();
+        let half = Exact256::from_f32(2.0f32.powi(-24)).unwrap();
+        let tiny = Exact256::from_f32(f32::from_bits(1)).unwrap();
+        let tie = one.checked_add(half).unwrap();
+        assert_eq!(tie.to_f32().to_bits(), 1.0f32.to_bits());
+        assert_eq!(
+            tie.checked_add(tiny).unwrap().to_f32().to_bits(),
+            1.0f32.to_bits() + 1
+        );
+        assert_eq!(tiny.to_f32().to_bits(), 1);
+        assert_eq!(tiny.negated().to_f32().to_bits(), (1 << 31) | 1);
+        let maximum = Exact256::from_f32(MAX_CONTEXT_OPERAND).unwrap();
+        assert_eq!(
+            maximum
+                .checked_add(maximum.negated())
+                .unwrap()
+                .to_f32()
+                .to_bits(),
+            0
+        );
+        assert_eq!(
+            Exact256::from_f32(f32::MAX).err(),
+            Some(NnuecError::AccumulatorOverflow)
+        );
+        assert_eq!(
+            Exact256::from_f32(MAX_CONTEXT_OPERAND * 2.0).err(),
+            Some(NnuecError::AccumulatorOverflow)
+        );
+        let signed_max = Exact256([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 1]);
+        assert_eq!(
+            signed_max.checked_add(tiny).err(),
+            Some(NnuecError::AccumulatorOverflow)
+        );
+    }
+
     #[test]
     fn required_config_parameters_and_weight_domain_are_validated() {
         let good = checkpoint();
@@ -1155,6 +1462,8 @@ mod tests {
             let rebuilt = model.board(&position).unwrap();
             close(&board.values[0], &rebuilt.values[0]);
             close(&board.values[1], &rebuilt.values[1]);
+            assert_eq!(bits(&board.values[0]), bits(&rebuilt.values[0]));
+            assert_eq!(bits(&board.values[1]), bits(&rebuilt.values[1]));
             let child = board.values.clone();
             assert_eq!(
                 model.apply_board_delta(&mut board, rules.delta()).err(),
@@ -1223,10 +1532,22 @@ mod tests {
             c2.lines.get(&17).unwrap()
         ));
         close(c2.values(), model.rebuild_context(&c2).unwrap().values());
+        assert_eq!(
+            bits(c2.values()),
+            bits(model.rebuild_context(&c2).unwrap().values())
+        );
         let c3 = model.with_line(&c2, 17, Arc::clone(&b)).unwrap();
         close(c3.values(), model.rebuild_context(&c3).unwrap().values());
+        assert_eq!(
+            bits(c3.values()),
+            bits(model.rebuild_context(&c3).unwrap().values())
+        );
         let c4 = model.without_line(&c3, 99).unwrap();
         close(c4.values(), model.rebuild_context(&c4).unwrap().values());
+        assert_eq!(
+            bits(c4.values()),
+            bits(model.rebuild_context(&c4).unwrap().values())
+        );
         let before = bits(c2.values());
         assert!(matches!(
             model.with_line(&c2, 100, a),
