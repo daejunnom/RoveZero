@@ -22,12 +22,14 @@ from .rovent_generation import (GlobalLineageIndex, LegacyIntakeStatus, SeriesRe
     audit_legacy_chunks, common_teacher_forks, fork_plan, resume_plan, validate_checkpoint_metadata)
 
 REQUEST_DOMAIN = "rz-rovent-generation-preparation-request/1"
+TRAINING_REQUEST_DOMAIN = "rz-rovent-generation-preparation-request/2"
 RESULT_DOMAIN = "rz-rovent-generation-preparation-result/1"
 MAX_JSON_BYTES = 16 * 1024**2
 MAX_INPUT_BYTES = 64 * 1024**2
 MAX_WALL_NS = 120 * 10**9
 ACTIONS = ("validate_recipe", "validate_checkpoint_metadata", "prepare_resume", "prepare_fork",
            "prepare_common_forks", "audit_legacy_intake", "audit_global_lineage")
+TRAINING_ACTIONS = ("prepare_training_stage", "validate_training_inventory", "prepare_model_export")
 
 
 def _path(value, *, directory=False):
@@ -123,13 +125,40 @@ def read_pinned_json(pin, budget):
 
 
 def validate_request(value):
-    fields(value, ("schema", "action", "recipe", "checkpoint", "ancestors", "origins", "legacy_intake", "stage_id",
-                   "output_root", "output_name", "max_records", "max_output_bytes", "max_wall_ns"), "Rovent preparation request")
-    if value["schema"] != REQUEST_DOMAIN or value["action"] not in ACTIONS:
+    names = ("schema", "action", "recipe", "checkpoint", "ancestors", "origins", "legacy_intake", "stage_id",
+             "output_root", "output_name", "max_records", "max_output_bytes", "max_wall_ns")
+    if type(value) is not dict:
+        raise ValueError("Rovent preparation request object required")
+    training_version = value.get("schema") == TRAINING_REQUEST_DOMAIN
+    fields(value, names + (("training_preparation",) if training_version else ()), "Rovent preparation request")
+    if value["schema"] not in (REQUEST_DOMAIN, TRAINING_REQUEST_DOMAIN) or value["action"] not in ACTIONS + TRAINING_ACTIONS:
         raise ValueError("new preparation domain and supported action required")
+    training = None
+    if value["action"] in TRAINING_ACTIONS:
+        if not training_version:
+            raise ValueError("new training preparation actions require request V2")
+        training = fields(value["training_preparation"], ("membership", "inventory", "mode", "export_kind"), "trainer/checkpoint/export preparation")
+        _pin(training["membership"])
+        if value["action"] == "prepare_training_stage":
+            if training["mode"] not in ("initialize", "resume", "fork") or training["export_kind"] is not None:
+                raise ValueError("explicit stage operation with no foreign export override required")
+            if training["mode"] == "initialize":
+                if training["inventory"] is not None:
+                    raise ValueError("initialization cannot load a foreign state inventory")
+            else:
+                _pin(training["inventory"])
+        else:
+            _pin(training["inventory"])
+            if training["mode"] is not None or (value["action"] == "validate_training_inventory" and training["export_kind"] is not None):
+                raise ValueError("unexpected checkpoint inventory mode/export override")
+            if value["action"] == "prepare_model_export" and training["export_kind"] not in ("collection", "deployment"):
+                raise ValueError("explicit model export kind required")
+    elif training_version and value["training_preparation"] is not None:
+        raise ValueError("unexpected training preparation inputs")
     _pin(value["recipe"])
     checkpoint_needed = value["action"] in ("validate_checkpoint_metadata", "prepare_resume", "prepare_fork",
-                                            "prepare_common_forks", "audit_global_lineage")
+                                            "prepare_common_forks", "audit_global_lineage") or (
+        value["action"] == "prepare_training_stage" and training["mode"] != "initialize")
     if checkpoint_needed:
         _pin(value["checkpoint"])
     elif value["checkpoint"] is not None:
@@ -142,7 +171,7 @@ def validate_request(value):
         _pin(value["origins"])
     elif value["origins"] is not None or value["ancestors"]:
         raise ValueError("unexpected lineage input")
-    if value["action"] in ("prepare_resume", "prepare_fork"):
+    if value["action"] in ("prepare_resume", "prepare_fork", "prepare_training_stage"):
         from .rovent_generation import _plain_id
         _plain_id(value["stage_id"])
     elif value["stage_id"] is not None:
@@ -202,6 +231,18 @@ def prepare_request(value, *, budget):
         index = GlobalLineageIndex(recipe, records)
         result = index.admit_checkpoint_lineage(recipe, checkpoint,
             ancestors=[read_pinned_json(pin, budget) for pin in value["ancestors"]])
+    elif action in TRAINING_ACTIONS:
+        from .rovent_training import prepare_export, prepare_training_stage, validate_checkpoint_inventory
+        training = value["training_preparation"]
+        membership = read_pinned_json(training["membership"], budget)
+        if action == "prepare_training_stage":
+            inventory = None if training["inventory"] is None else read_pinned_json(training["inventory"], budget)
+            result = prepare_training_stage(recipe, membership, stage_id=value["stage_id"], mode=training["mode"],
+                checkpoint=checkpoint, inventory=inventory)
+        else:
+            inventory = read_pinned_json(training["inventory"], budget)
+            result = (validate_checkpoint_inventory(recipe, membership, inventory) if action == "validate_training_inventory" else
+                      prepare_export(recipe, membership, inventory, kind=training["export_kind"]))
     else:
         from .generation_data import digest
         intake = value["legacy_intake"]
@@ -229,10 +270,13 @@ def prepare_request(value, *, budget):
             result = {"status": LegacyIntakeStatus.UNSUPPORTED_FORMAT.value,
                       "code": "OriginalFormatNotSupported", "original_format": intake["format"]}
     budget.check()
-    return {"schema": RESULT_DOMAIN, "action": action, "recipe_sha256": recipe.sha256,
+    result = {"schema": RESULT_DOMAIN, "action": action, "recipe_sha256": recipe.sha256,
             "input_pins": {key: value[key] for key in ("recipe", "checkpoint", "ancestors", "origins", "legacy_intake")},
             "result": result, "actual_training_executed": False, "optimizer_updates": 0,
             "execution_authorized": False, "arena_eligible": False}
+    if value["schema"] == TRAINING_REQUEST_DOMAIN:
+        result["input_pins"]["training_preparation"] = value["training_preparation"]
+    return result
 
 
 def write_result_noreplace(root, name, result, *, maximum):
