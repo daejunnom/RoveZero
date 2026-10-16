@@ -1611,6 +1611,24 @@ impl Owner {
                     tree_limits: self.settings.tree,
                 };
                 let factory = Arc::clone(factory);
+                let restricted_root_moves = limits
+                    .searchmoves
+                    .as_ref()
+                    .map(|moves| {
+                        moves
+                            .iter()
+                            .map(|movement| {
+                                let movement = movement.parse::<BoardMove>().map_err(|_| {
+                                    failure(
+                                        contract::ErrorCode::IdentityMismatch,
+                                        "sealed PUCT root move could not be decoded",
+                                    )
+                                })?;
+                                contract::Move::try_from(movement)
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?;
                 let clock = self.clock.clone();
                 let shutdown_limit = self.settings.shutdown_limit;
                 let self_final_move_policy = self.settings.final_move_policy;
@@ -1648,6 +1666,20 @@ impl Owner {
                                 );
                             }
                         };
+                    if let Some(root_moves) = &restricted_root_moves {
+                        if let Err(error) = search.set_root_moves(root_moves) {
+                            return finish_worker(
+                                &events,
+                                ticket,
+                                WorkerCompletion::failed(WorkerFailureSource::SearchConstructor(
+                                    error,
+                                )),
+                                &worker_publication,
+                                Some(runtime.as_mut()),
+                                shutdown_limit,
+                            );
+                        }
+                    }
                     #[cfg(feature = "experimental-batch")]
                     if let Err(error) = search.set_parallelism(factory.parallelism()) {
                         return finish_worker(
@@ -2174,6 +2206,9 @@ pub fn serve<O: Write, D: Write>(
         settings.search,
         settings.max_workers,
     )?;
+    let goal_capability = driver
+        .as_ref()
+        .and_then(|driver| driver.search_goal_capability());
     let owner = Arc::new(Mutex::new(Owner {
         session_owner,
         active: None,
@@ -2204,6 +2239,9 @@ pub fn serve<O: Write, D: Write>(
         settings.parser,
     )
     .map_err(EngineError::Session)?;
+    session
+        .set_search_goal_capability(goal_capability)
+        .map_err(EngineError::Session)?;
     let timer_owner = Arc::clone(&owner);
     let timer_events = sender.clone();
     let timer_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
