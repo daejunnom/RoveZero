@@ -214,7 +214,10 @@ mod actual {
         output.flush()?;
         Ok(())
     }
-    fn arguments() -> Result<(Case, u64, ProcessEpoch, Vec<String>), Box<dyn std::error::Error>> {
+    type DiagnosticError = Box<dyn std::error::Error>;
+    type DiagnosticArguments = (Case, u64, ProcessEpoch, Vec<String>);
+
+    fn arguments() -> Result<DiagnosticArguments, DiagnosticError> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         if args.len() != 6 || args.iter().any(|s| s.len() > 8192) {
             return Err(fail("SixBoundedArgumentsRequired"));
@@ -474,7 +477,7 @@ mod actual {
     // Auxiliary raw projection only. Borrow original DTOs after original drain;
     // never reconstruct a view/payload, parse Debug, or issue acceptance.
     mod scalar_wire {
-        use super::{HotEvent, opaque};
+        use super::{DiagnosticError, HotEvent, opaque};
         use rz_contracts::pals::{RepresentationKey, Role, SearchAuthority};
         use rz_contracts::pals_adaptive::{
             CpuJobEnvelope, CpuJobId, ReviewViewSeal, RoleTicketEnvelope,
@@ -863,14 +866,14 @@ mod actual {
                 PalsCompletion::Terminal => "Terminal",
             }
         }
+        type OriginalDriverResult = Result<
+            rz_uci::search_driver::SearchSessionReport,
+            rz_uci::search_driver::SearchSessionFailure,
+        >;
+        type OriginalConsumerExecution = Result<OriginalDriverResult, DiagnosticError>;
+
         pub(super) fn runtime_closure(
-            execution: &Result<
-                Result<
-                    rz_uci::search_driver::SearchSessionReport,
-                    rz_uci::search_driver::SearchSessionFailure,
-                >,
-                Box<dyn std::error::Error>,
-            >,
+            execution: &OriginalConsumerExecution,
             process: &Result<
                 rz_uci::pals_adaptive::AdaptiveSessionProcessReceipt,
                 rz_uci::search_driver::SearchSessionFailure,
