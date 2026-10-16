@@ -25,6 +25,9 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::sync::Arc;
 
+#[path = "nnuec_v2.rs"]
+pub mod v2;
+
 pub const NNUEC_SCHEMA: &str = "rz-nnuec-fp32-v1";
 pub const NNUEC_SEMANTICS: &str = "board800-exactb192-causal-line-exactc256-fp32-v1";
 pub const NNUEC_INPUT_SCHEMA: &str = "rz-nnuec-fp32-input/1";
@@ -732,11 +735,27 @@ impl NnuecModel {
         local: &NnuecLocal,
         position: &Position,
     ) -> Result<NnuecOutput, NnuecError> {
+        if context.model != self.identity {
+            return Err(NnuecError::StateMismatch);
+        }
+        self.forward_with_context_values(board, &context.values, local, position)
+    }
+
+    // V2 reuses this exact B/L/head operation order with its separately
+    // admitted context and output identity. No checkpoint conversion occurs.
+    fn forward_with_context_values(
+        &self,
+        board: &NnuecBoard,
+        values: &[f32],
+        local: &NnuecLocal,
+        position: &Position,
+    ) -> Result<NnuecOutput, NnuecError> {
         if board.model != self.identity
-            || context.model != self.identity
             || local.model != self.identity
             || board.position != position.position_identity()
             || local.work.position_identity() != board.position
+            || values.len() != self.checkpoint.config.context_width
+            || values.iter().any(|value| !value.is_finite())
         {
             return Err(NnuecError::StateMismatch);
         }
@@ -746,7 +765,7 @@ impl NnuecModel {
             board.values[side]
                 .iter()
                 .chain(&board.values[1 - side])
-                .chain(&context.values)
+                .chain(values)
                 .chain(&local.projected)
                 .map(|v| v.clamp(0.0, 1.0)),
         );
@@ -784,7 +803,7 @@ impl NnuecModel {
                 .clone()
                 .expect("admitted weights"),
             board_accumulators: board.values.clone(),
-            context_accumulator: context.values.clone(),
+            context_accumulator: values.to_vec(),
             local_accumulator: local.projected.clone(),
             hidden,
             raw_outputs,
@@ -1437,7 +1456,11 @@ struct Exact256([u64; 4]);
 
 impl Exact256 {
     fn from_f32(value: f32) -> Result<Self, NnuecError> {
-        if !value.is_finite() || value.abs() > MAX_CONTEXT_OPERAND {
+        Self::from_f32_bounded(value, MAX_CONTEXT_OPERAND)
+    }
+
+    fn from_f32_bounded(value: f32, maximum: f32) -> Result<Self, NnuecError> {
+        if !maximum.is_finite() || maximum <= 0.0 || !value.is_finite() || value.abs() > maximum {
             return Err(NnuecError::AccumulatorOverflow);
         }
         let bits = value.to_bits();
