@@ -25,8 +25,10 @@ mod actual {
     use rz_search::pals::review_context::ReviewView;
     use rz_uci::pals_adaptive::{
         AdaptiveCpuSliceDiagnostic, AdaptiveCpuSliceDiagnosticError,
-        AdaptiveCpuSliceDiagnosticOptions, ContinuationDiagnostic, ContinuationDiagnosticOptions,
+        AdaptiveCpuSliceDiagnosticOptions, AdaptiveSessionManager, ContinuationDiagnostic,
+        ContinuationDiagnosticOptions,
     };
+    use rz_uci::pals_adaptive_bootstrap::ActualAdaptiveBackendV5;
     use rz_uci::pals_adaptive_bootstrap::diagnostic::{
         DeploymentDiagnosticObserversV5, prepare_deployment_diagnostic_actual_with_cancellation,
     };
@@ -51,12 +53,33 @@ mod actual {
     const HOT_RECORDS_MAX: usize = 64;
     const ROOT: Duration = Duration::from_secs(5);
     const Y1_FEN: &str = "3rk3/8/8/3p4/4P3/8/8/4K3 w - - 0 1";
+    const EXTERNAL_OBSERVATION_SCAN_MAX: usize = 512;
+    const EXTERNAL_REPORTS_MAX: usize = 64;
+    const EXTERNAL_ROOT_BYTES_MAX: usize = 1024 * 1024;
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Case {
         Y1Natural,
         T1Pending,
         R1Repair,
+        ExternalRRepair,
+    }
+    impl Case {
+        fn repair_observation(self) -> bool {
+            matches!(self, Self::R1Repair | Self::ExternalRRepair)
+        }
+        fn checker(self) -> PalsCpuSelectionV5 {
+            match self {
+                Self::ExternalRRepair => PalsCpuSelectionV5::Stockfish19Full,
+                _ => PalsCpuSelectionV5::Own,
+            }
+        }
+        fn position(self) -> Result<Position, rz_position::PositionError> {
+            match self {
+                Self::Y1Natural | Self::ExternalRRepair => Position::from_fen(Y1_FEN),
+                _ => Ok(Position::startpos()),
+            }
+        }
     }
     #[derive(Clone, Copy, Debug)]
     enum HotEvent {
@@ -214,6 +237,123 @@ mod actual {
         output.flush()?;
         Ok(())
     }
+
+    // A single read after the original root fence, not a callback on every
+    // search step. These are the Store's original foreign packets and public
+    // records. Publication alone does not attest their semantic consumption;
+    // the original continuation/role journals retain that separate boundary.
+    fn external_root_observation(
+        manager: &AdaptiveSessionManager<ActualAdaptiveBackendV5>,
+    ) -> Result<serde_json::Value, &'static str> {
+        use rz_search::pals::store::ObservationId;
+
+        let root = manager
+            .root_observation_snapshot()
+            .map_err(|_| "OriginalRootFenceUnavailable")?;
+        let port = manager
+            .driver()
+            .port()
+            .ok_or("OriginalStoreOwnerUnavailable")?;
+        let engine = port.engine();
+        let stores = engine.stores();
+        let issued = stores.observations.next_observation_sequence();
+        if issued > EXTERNAL_OBSERVATION_SCAN_MAX || engine.records().len() > 128 {
+            return Err("ExternalRootObservationCapacity");
+        }
+        let mut reports = Vec::new();
+        for sequence in 0..issued {
+            let observation = stores
+                .observations
+                .get(ObservationId(sequence))
+                .map_err(|_| "OriginalObservationUnavailableNoImplicitColdLoad")?;
+            let Some(report) = observation.external_report.as_ref() else {
+                continue;
+            };
+            if reports.len() == EXTERNAL_REPORTS_MAX {
+                return Err("ExternalReportObservationCapacity");
+            }
+            let state = stores
+                .states
+                .get(observation.state)
+                .map_err(|_| "OriginalRulesAnchorUnavailable")?;
+            let replay = state
+                .uci_replay(256)
+                .map_err(|_| "OriginalRulesHistoryUnavailable")?;
+            let rules_digest = rz_position::contracts::rules_snapshot_semantic_digest(state)
+                .0
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let checked_pv = observation
+                .cpu_pv
+                .map(|line| stores.lines.moves(line))
+                .transpose()
+                .map_err(|_| "OriginalRulesCheckedPvUnavailable")?;
+            reports.push(json!({
+                "observation_id":sequence,"state_id":observation.state.0,
+                "store_execution_id":observation.execution.map(|id|id.0),
+                "source":observation.source,"epoch":observation.epoch,
+                "kind":opaque(&observation.kind),"scope":opaque(&observation.scope),
+                "cpu_condition":observation.cpu_condition,
+                "cpu_pv_line_id":observation.cpu_pv.map(|id|id.0),
+                "rules_checked_pv":checked_pv.map(|line|line.iter().map(ToString::to_string).collect::<Vec<_>>()),
+                "rules_anchor":{"fen":state.to_fen(),"semantic_sha256":rules_digest,
+                    "history_origin":opaque(&replay.origin),"history_completeness":opaque(&replay.completeness),
+                    "start_fen":replay.start_fen,"moves":replay.moves.iter().map(ToString::to_string).collect::<Vec<_>>()},
+                "original_report":external_report_wire(report),
+                "semantic_consumption":"NOT_INFERRED_FROM_STORE_PUBLICATION"
+            }));
+        }
+        let records = engine.records().iter().map(|record| json!({
+            "revision":record.revision,"parent_revision":record.parent_revision,
+            "supersedes_revision":record.supersedes_revision,"origin_state_id":record.origin_state.0,
+            "kind":opaque(&record.kind),"line":record.line.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "cpu_observation_id":record.cpu_observation.map(|id|id.0),
+            "perspective":opaque(&record.perspective)
+        })).collect::<Vec<_>>();
+        let observed = !reports.is_empty();
+        let counts = root.manager_counters();
+        let value = json!({
+            "status":if observed{"OBSERVED"}else{"NOT_OBSERVED"},
+            "scope":"ORIGINAL_STORE_AFTER_ORIGINAL_ROOT_FENCE_NO_RECONSTRUCTED_WORK",
+            "authority":opaque(&root.authority()),"foreign_reports_counter":counts.foreign_reports,
+            "foreign_reported_nodes_counter":counts.foreign_reported_nodes,
+            "foreign_node_count_unknown_counter":counts.foreign_node_count_unknown,
+            "reports":reports,"public_records":records,
+            "case_acceptance":"NOT_ISSUED_BY_DIAGNOSTIC_RUNNER"
+        });
+        if serde_json::to_vec(&value)
+            .map_err(|_| "ExternalRootSerialization")?
+            .len()
+            > EXTERNAL_ROOT_BYTES_MAX
+        {
+            return Err("ExternalRootBytesCapacity");
+        }
+        Ok(value)
+    }
+
+    fn external_report_wire(
+        report: &rz_search::cpu_checker::ExternalCheckerReport,
+    ) -> serde_json::Value {
+        use rz_search::cpu_checker::ExternalRawScore;
+        let score = match report.score {
+            ExternalRawScore::Centipawns(cp) => json!({"kind":"Centipawns","value":cp}),
+            ExternalRawScore::MateMoves(moves) => json!({"kind":"MateMoves","value":moves}),
+            ExternalRawScore::Unknown => json!({"kind":"Unknown","value":null}),
+        };
+        json!({
+            "identity":report.identity,"observed_uci":{"name":report.observed_uci.name,"author":report.observed_uci.author},
+            "request_id":report.request_id,"best_move":report.best_move.map(|movement|movement.to_string()),
+            "pv":report.pv.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "score":score,"bound":opaque(&report.bound),"wdl_per_mille":report.wdl_per_mille,
+            "perspective":opaque(&report.perspective),"requested_depth":report.requested_depth,
+            "reported_depth":report.reported_depth,"seldepth":report.seldepth,"root_restricted":report.root_restricted,
+            "completion":opaque(&report.completion),
+            "work":{"nodes":report.work.nodes,"qnodes":report.work.qnodes,"tt_hits":report.work.tt_hits},
+            "elapsed_ns":report.elapsed.as_nanos().to_string(),
+            "scope":"ORIGINAL_FOREIGN_UNITS_NOT_OWN_RAW_WDL_OR_RULES_MATE_PROOF"
+        })
+    }
     type DiagnosticError = Box<dyn std::error::Error>;
     type DiagnosticArguments = (Case, u64, ProcessEpoch, Vec<String>);
 
@@ -235,6 +375,7 @@ mod actual {
                     "y1-natural" => Case::Y1Natural,
                     "t1-pending" => Case::T1Pending,
                     "r1-repair" => Case::R1Repair,
+                    "external-r-repair" => Case::ExternalRRepair,
                     _ => return Err(fail("UnknownCase")),
                 });
             } else if let Some(value) = arg.strip_prefix("--diagnostic-wall-ms=") {
@@ -277,7 +418,7 @@ mod actual {
             return Err(fail("OriginalWindowExceeded"));
         }
         let endpoint = &pinned.config.endpoint;
-        if endpoint.cpu.cpu_r != PalsCpuSelectionV5::Own
+        if endpoint.cpu.cpu_r != case.checker()
             || endpoint.cpu.cpu_t != PalsCpuSelectionV5::Disabled
             || pinned
                 .config
@@ -287,14 +428,19 @@ mod actual {
             || pinned.config.native_options.cuda_device_id.is_some()
             || pinned.config.native_options.cuda_arena_bytes.is_some()
             || pinned.config.native_options.device_public_memory
+            || (case == Case::ExternalRRepair && pinned.config.native_options.approximate_warm)
         {
-            return Err(fail("ActualCpuOwnNoTeacherProfileRequired"));
+            return Err(fail(if case == Case::ExternalRRepair {
+                "ActualCpuExternalRNoTeacherProfileRequired"
+            } else {
+                "ActualCpuOwnNoTeacherProfileRequired"
+            }));
         }
         let selected = parse_pals_search_settings_v5(&pinned.config, until)?;
         let (line, beam, role_max, cpu_max) = match case {
             Case::Y1Natural => (2, 1, 8, 32),
             Case::T1Pending => (2, 2, 8, 128),
-            Case::R1Repair => (4, 1, 16, 1024),
+            Case::R1Repair | Case::ExternalRRepair => (4, 1, 16, 1024),
         };
         let expected_policy = if matches!(case, Case::T1Pending) {
             PalsCoordinatorPolicyV5::CoordinatorAdaptive
@@ -310,7 +456,7 @@ mod actual {
             || (matches!(case, Case::Y1Natural)
                 && endpoint.coordinator.slices.slice_native_nodes_max != 1)
             || (matches!(case, Case::T1Pending) && endpoint.coordinator.slices.role_tickets_max < 2)
-            || (matches!(case, Case::R1Repair)
+            || (case.repair_observation()
                 && selected.post_repair_recheck == PostRepairRecheckPolicy::Disabled)
         {
             return Err(fail("PinnedCaseRecipeDiffersNoAutomaticRewrite"));
@@ -336,18 +482,17 @@ mod actual {
                     } else {
                         0
                     },
-                    resolution_records_max: if matches!(case, Case::R1Repair) {
-                        64
-                    } else {
-                        0
-                    },
-                    role_consumption: matches!(case, Case::R1Repair),
+                    resolution_records_max: if case.repair_observation() { 64 } else { 0 },
+                    role_consumption: case.repair_observation(),
                 },
             )?)
         };
         let dispatch_hot = Arc::clone(&hot);
         let admission_hot = Arc::clone(&hot);
         let admission_cpu = cpu.clone();
+        let external_root = (case == Case::ExternalRRepair)
+            .then(|| Arc::new(Mutex::new(None::<Result<serde_json::Value, &'static str>>)));
+        let closure_external = external_root.clone();
         let observers = DeploymentDiagnosticObserversV5 {
             native_observer: Box::new(NativeObserver(Arc::clone(&hot))),
             dispatch_observer: Arc::new(move |ticket, input, _| {
@@ -367,7 +512,18 @@ mod actual {
                 }
                 Ok(())
             }),
-            root_completion: Arc::new(|_, _| Ok(())),
+            root_completion: Arc::new(move |manager, _| {
+                if let Some(slot) = &closure_external {
+                    if let Ok(mut slot) = slot.try_lock() {
+                        *slot = Some(if slot.is_some() {
+                            Err("ExternalRootReadbackRepeated")
+                        } else {
+                            external_root_observation(manager)
+                        });
+                    }
+                }
+                Ok(())
+            }),
         };
         // One signal created before actual preparation and retained through all
         // original startup/cleanup stages. No callback resets cancellation.
@@ -398,11 +554,7 @@ mod actual {
             }
             let context = prepared.context(hard, shutdown)?;
             authority = Some(context.authority);
-            let position = if matches!(case, Case::Y1Natural) {
-                Position::from_fen(Y1_FEN)?
-            } else {
-                Position::startpos()
-            };
+            let position = case.position()?;
             let run_started = Instant::now();
             let returned = driver.run(&position, &context, &mut |_| {});
             run_elapsed = Some(u64::try_from(run_started.elapsed().as_nanos())?);
@@ -424,6 +576,14 @@ mod actual {
             continuation.as_ref().map(ContinuationDiagnostic::options),
         );
         let runtime_closure = scalar_wire::runtime_closure(&execution, &process, &completion);
+        let external_snapshot = external_root.as_ref().map(|slot| match slot.try_lock() {
+            Ok(slot) => match slot.as_ref() {
+                Some(Ok(value)) => value.clone(),
+                Some(Err(error)) => json!({"status":"UNAVAILABLE","reason":error}),
+                None => json!({"status":"UNAVAILABLE","reason":"OriginalRootReadbackNotObserved"}),
+            },
+            Err(_) => json!({"status":"UNAVAILABLE","reason":"ExternalRootReadbackBusyOrPoisoned"}),
+        });
         let available = hot.unavailable.load(Ordering::Acquire) == 0
             && hot_snapshot.is_ok()
             && authority.is_some()
@@ -441,17 +601,20 @@ mod actual {
                 s.as_ref().is_ok_and(|s| {
                     s.unavailable_bits == 0
                         && s.authority == authority
-                        && (!matches!(case, Case::R1Repair)
+                        && (!case.repair_observation()
                             || (s.role_install_observed == Some(true)
                                 && s.role_readback_root_fence == Some(true)
                                 && s.role_unavailable.is_none()))
                 })
-            });
+            })
+            && external_snapshot
+                .as_ref()
+                .is_none_or(|snapshot| snapshot["status"] != "UNAVAILABLE");
         let successful_return = execution.as_ref().is_ok_and(|run| run.is_ok())
             && process
                 .as_ref()
                 .is_ok_and(|p| p.permits_archive_close() && p.store_archive_closed());
-        emit(&json!({
+        let mut raw = json!({
             "domain":"rovezero.actual-continuation-diagnostic-raw/5",
             "case":opaque(&case), "case_acceptance":"NOT_ISSUED_BY_DIAGNOSTIC_RUNNER",
             "source_commit":env!("RZ_PALS_COMPILED_SOURCE_COMMIT"),
@@ -470,8 +633,125 @@ mod actual {
             "requested_yield_acceptance":"NOT_ISSUED",
             "external_signal_cancellation":"NOT_OBSERVED_BY_THIS_CONSUMER",
             "training_executed":false,"optimizer_steps":0
-        }))?;
+        });
+        if let Some(external) = external_snapshot {
+            // A distinct auxiliary domain preserves the original three raw/5
+            // field sets and does not admit an external case through the Own
+            // case auditor or the Collection teacher path.
+            raw["domain"] = "rovezero.actual-external-continuation-diagnostic-raw/1".into();
+            raw["position_command"] = format!("position fen {Y1_FEN}").into();
+            raw["external_root"] = external;
+        }
+        emit(&raw)?;
         Ok(successful_return && available)
+    }
+
+    #[cfg(test)]
+    mod external_tests {
+        use super::*;
+        use rz_position::Color;
+        use rz_search::cpu_checker::{
+            CheckerWork, ExternalBound, ExternalCheckerIdentity, ExternalCheckerReport,
+            ExternalCompletion, ExternalModelMetadata, ExternalRawScore, ExternalTrainingKnowledge,
+            ExternalUciIdentity,
+        };
+        use std::collections::BTreeMap;
+
+        fn report() -> ExternalCheckerReport {
+            ExternalCheckerReport {
+                identity: ExternalCheckerIdentity {
+                    adapter_semantics: "explicit-test-only-not-actual".into(),
+                    binary_sha256: "a".repeat(64),
+                    launch_arguments_sha256: "b".repeat(64),
+                    declared_name: "fixture".into(),
+                    declared_version: "fixture".into(),
+                    declared_source: "https://example.invalid/fixture".into(),
+                    declared_license: "fixture".into(),
+                    options: BTreeMap::from([("Threads".into(), "1".into())]),
+                    assets: Vec::new(),
+                    model_metadata: ExternalModelMetadata {
+                        weights_sha256: None,
+                        training: ExternalTrainingKnowledge::Unknown,
+                        declared_rights: None,
+                        precision: None,
+                    },
+                },
+                observed_uci: ExternalUciIdentity {
+                    name: "fixture-observed".into(),
+                    author: None,
+                },
+                request_id: u64::MAX,
+                best_move: Some("e2e4".parse().unwrap()),
+                pv: vec!["e2e4".parse().unwrap(), "e7e5".parse().unwrap()],
+                score: ExternalRawScore::MateMoves(-2),
+                bound: ExternalBound::Lower,
+                wdl_per_mille: None,
+                perspective: Color::Black,
+                requested_depth: 2,
+                reported_depth: Some(1),
+                seldepth: None,
+                root_restricted: true,
+                completion: ExternalCompletion::StoppedYield,
+                work: CheckerWork {
+                    nodes: Some(0),
+                    qnodes: None,
+                    tt_hits: None,
+                },
+                elapsed: Duration::from_nanos(123),
+            }
+        }
+
+        #[test]
+        fn external_case_never_changes_own_or_teacher_selection() {
+            for own in [Case::Y1Natural, Case::T1Pending, Case::R1Repair] {
+                assert_eq!(own.checker(), PalsCpuSelectionV5::Own);
+            }
+            assert_eq!(
+                Case::ExternalRRepair.checker(),
+                PalsCpuSelectionV5::Stockfish19Full
+            );
+            assert!(Case::ExternalRRepair.repair_observation());
+            assert!(!Case::Y1Natural.repair_observation());
+            assert!(!Case::T1Pending.repair_observation());
+            assert!(Case::R1Repair.repair_observation());
+            let position = Case::ExternalRRepair.position().unwrap();
+            assert_eq!(position.to_fen(), Y1_FEN);
+            assert!(!position.legal_moves().is_empty());
+            assert!(position.legal_moves().len() < Position::startpos().legal_moves().len());
+        }
+
+        #[test]
+        fn external_wire_keeps_original_request_pv_raw_units_and_unknowns() {
+            let report = report();
+            let wire = external_report_wire(&report);
+            assert_eq!(wire["request_id"], u64::MAX);
+            assert_eq!(wire["identity"]["binary_sha256"], "a".repeat(64));
+            assert_eq!(wire["observed_uci"]["name"], "fixture-observed");
+            assert!(wire["observed_uci"]["author"].is_null());
+            assert_eq!(wire["pv"], json!(["e2e4", "e7e5"]));
+            assert_eq!(wire["score"], json!({"kind":"MateMoves","value":-2}));
+            assert_eq!(wire["bound"], "Lower");
+            assert_eq!(wire["perspective"], "Black");
+            assert_eq!(wire["completion"], "StoppedYield");
+            assert_eq!(wire["work"]["nodes"], 0);
+            assert!(wire["work"]["qnodes"].is_null());
+            assert!(wire["wdl_per_mille"].is_null());
+            assert_eq!(wire["elapsed_ns"], "123");
+            assert!(wire.get("rules_mate_proof").is_none());
+            assert!(wire.get("own_raw").is_none());
+            let mut unknown = report.clone();
+            unknown.score = ExternalRawScore::Unknown;
+            assert_eq!(
+                external_report_wire(&unknown)["score"],
+                json!({"kind":"Unknown","value":null})
+            );
+            unknown.score = ExternalRawScore::Centipawns(-17);
+            assert_eq!(
+                external_report_wire(&unknown)["score"],
+                json!({"kind":"Centipawns","value":-17})
+            );
+            assert_eq!(report.score, ExternalRawScore::MateMoves(-2));
+        }
     }
 
     // Auxiliary raw projection only. Borrow original DTOs after original drain;
