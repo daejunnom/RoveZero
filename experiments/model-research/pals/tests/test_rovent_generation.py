@@ -238,6 +238,21 @@ class RoventSeriesTests(unittest.TestCase):
         self.assertIs(result["native_intake_verified"], False)
         self.assertIs(result["execution_authorized"], False)
 
+    def test_own_origin_keeps_null_teacher_without_creating_teacher_policy_authority(self):
+        recipe = series.SeriesRecipe(recipe_value())
+        own = origin("own-rules", teacher=None)
+        self.assertIsNone(series.validate_record_origin(recipe, own)["teacher_actor_id"])
+        index = series.GlobalLineageIndex(recipe, [own])
+        self.assertIsNone(index.rows("train", optimization=True)[0]["teacher_actor_id"])
+        # An origin index is not teacher-policy admission. The legacy intake
+        # still requires an actual frozen actor even for an otherwise valid row.
+        with self.assertRaisesRegex(ValueError, "actor is not assigned"):
+            series.audit_legacy_bundle(recipe, None, stage_id="common", teacher_actor_id=None,
+                expected_model_sha256="4" * 64, expected_runtime_sha256="5" * 64)
+        foreign = origin("foreign", stage_id="sf-ft", teacher="reckless")
+        with self.assertRaisesRegex(ValueError, "frozen round/teacher origin"):
+            series.validate_record_origin(recipe, foreign)
+
     def test_checkpoint_chain_cannot_erase_ancestor_or_consume_sibling_teacher_rows(self):
         recipe = series.SeriesRecipe(recipe_value())
         common, sf, reckless = origin("common"), origin("sf", stage_id="sf-ft"), origin("reckless", stage_id="reckless-ft", teacher="reckless")

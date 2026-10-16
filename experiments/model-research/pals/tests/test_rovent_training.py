@@ -49,6 +49,14 @@ def recipe_fixture(membership):
     return SeriesRecipe(value)
 
 
+def membership_v2_fixture(*, validator=True):
+    original = membership_fixture(validator=validator)
+    return {**original, "schema": training.MEMBERSHIP_V2_DOMAIN,
+        "nnuec_schema": training.NNUEC_V2_SCHEMA, "nnuec_semantics": training.NNUEC_V2_SEMANTICS,
+        "parameters": [item for item in original["parameters"] if not item["name"].startswith("nnuec.")]
+            + training.nnuec_v2_parameter_descriptors(original["nnuec_config"])}
+
+
 def checkpoint(recipe):
     value = series_checkpoint(recipe)
     value["parameter_membership_sha256"] = recipe.to_dict()["parameter_ownership"]["membership_sha256"]
@@ -92,6 +100,36 @@ class RoventTrainingPreparationTests(unittest.TestCase):
 
     def tearDown(self):
         sys.meta_path.remove(self.guard)
+
+    def test_v2_membership_is_explicit_base19_plus_relation5_without_v1_or_utility_conversion(self):
+        original = membership_fixture()
+        before = copy.deepcopy(original)
+        original_digest = training.membership_digest(original)
+        revised = membership_v2_fixture()
+        training.validate_membership(revised)
+        parameters = {item["name"]: item for item in revised["parameters"] if item["name"].startswith("nnuec.")}
+        self.assertEqual(len(parameters), 24)
+        self.assertEqual(parameters["nnuec.base.board_weights"]["shape"], [800, 2])
+        self.assertEqual(parameters["nnuec.kind_embeddings"]["shape"], [4, 3])
+        self.assertEqual(parameters["nnuec.pair_projection"]["shape"], [4, 3])
+        self.assertEqual(parameters["nnuec.pair_projection"]["layout"], "output_rows")
+        self.assertNotEqual(training.membership_digest(revised), original_digest)
+        self.assertEqual(original, before)
+        self.assertEqual(training.membership_digest(original), original_digest)
+        for name in ("nnuec_schema", "nnuec_semantics"):
+            bad = copy.deepcopy(revised)
+            del bad[name]
+            with self.subTest(missing=name), self.assertRaisesRegex(ValueError, "fields mismatch"):
+                training.validate_membership(bad)
+        for name in ("nnuec.pair_parent", "nnuec.base.board_weights"):
+            bad = copy.deepcopy(revised)
+            next(item for item in bad["parameters"] if item["name"] == name)["shape"] = [1, 1]
+            with self.subTest(shape=name), self.assertRaisesRegex(ValueError, "differs from Rust FP32 wire"):
+                training.validate_membership(bad)
+        bad = copy.deepcopy(revised)
+        bad["parameters"].append({**parameters["nnuec.pair_projection"], "name": "nnuec.utility_weights", "wire_name": "utility_weights"})
+        with self.assertRaisesRegex(ValueError, "differs from Rust FP32 wire"):
+            training.validate_membership(bad)
 
     def test_nnuec_embedding_and_dense_shapes_match_the_rust_wire_orientation(self):
         membership = membership_fixture()

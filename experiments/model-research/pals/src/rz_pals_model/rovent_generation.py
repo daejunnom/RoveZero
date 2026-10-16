@@ -339,7 +339,11 @@ def _validate_record_origin(value, stages, opening_splits):
     stage = stages.get(value["stage_id"])
     if stage is None:
         raise ValueError("row stage absent from frozen recipe")
-    if value["round_id"] != stage.round_id or value["teacher_actor_id"] not in (stage.teacher_actor_ids or (None,)):
+    # Own/Rules-WDL/V observations retain a null teacher even inside a stage
+    # with teacher actors. This origin index cannot issue policy supervision;
+    # the source-specific native head consumer must verify that separately.
+    if value["round_id"] != stage.round_id or (value["teacher_actor_id"] is not None
+            and value["teacher_actor_id"] not in stage.teacher_actor_ids):
         raise ValueError("row differs from its frozen round/teacher origin")
     for key in ("input_sha256", "record_sha256", "producer_sha256", "rules_state_sha256", "transposition_sha256"):
         sha(value[key])

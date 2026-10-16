@@ -17,6 +17,7 @@ mod pals_manifest_v4;
 mod pals_manifest_v5;
 mod pals_source_pins_v5;
 mod pals_startup_v5;
+pub mod rovent_corpus;
 mod rovent_manifest;
 mod validation;
 

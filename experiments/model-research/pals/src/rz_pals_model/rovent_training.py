@@ -17,11 +17,14 @@ from .rovent_generation import (SeriesRecipe, StageKind, fork_plan, resume_plan,
                                 validate_checkpoint_metadata)
 
 MEMBERSHIP_DOMAIN = "rz-rovent-trainable-parameter-membership/1"
+MEMBERSHIP_V2_DOMAIN = "rz-rovent-trainable-parameter-membership/2"
 STATE_DOMAIN = "rz-rovent-checkpoint-state-inventory/1"
 WINDOW_DOMAIN = "rz-rovent-training-stage-preparation/1"
 EXPORT_DOMAIN = "rz-rovent-export-preparation/1"
 NNUEC_SCHEMA = "rz-nnuec-fp32-v1"
 NNUEC_SEMANTICS = "board800-exactb192-causal-line-exactc256-fp32-v1"
+NNUEC_V2_SCHEMA = "rz-nnuec-fp32-v2"
+NNUEC_V2_SEMANTICS = "board800-exactb192-causal-line-kind4-directedpair-exactc256-fp32-v2"
 CONFIG_FIELDS = ("board_width", "line_width", "context_width", "local_width", "hidden_width",
                  "causal_window", "max_lines", "max_plies")
 COMPONENTS = ("pc_shared", "p_private", "c_private", "v_private", "nnuec")
@@ -62,6 +65,27 @@ def nnuec_parameter_descriptors(config):
             for name, shape in shapes.items()]
 
 
+def nnuec_v2_parameter_descriptors(config):
+    """Explicit base19+relation5 domain; V1 is never silently upgraded."""
+    parameters = [{**item, "name": "nnuec.base." + item["wire_name"],
+        "wire_name": "base." + item["wire_name"], "semantics": NNUEC_V2_SEMANTICS}
+        for item in nnuec_parameter_descriptors(config)]
+    e, c = config["line_width"], config["context_width"]
+    for name, shape in (("kind_embeddings", [4, e]), ("pair_parent", [2, e]), ("pair_child", [2, e]),
+                         ("pair_bias", [2, e]), ("pair_projection", [c, e])):
+        parameters.append({"name": "nnuec." + name, "wire_name": name, "shape": shape, "dtype": "float32",
+            "semantics": NNUEC_V2_SEMANTICS, "layout": "output_rows" if name == "pair_projection" else "feature_rows", "trainable": True})
+    return parameters
+
+
+def nnuec_membership(membership):
+    if membership["schema"] == MEMBERSHIP_DOMAIN:
+        return NNUEC_SCHEMA, NNUEC_SEMANTICS, nnuec_parameter_descriptors(membership["nnuec_config"])
+    if membership["schema"] == MEMBERSHIP_V2_DOMAIN:
+        return NNUEC_V2_SCHEMA, NNUEC_V2_SEMANTICS, nnuec_v2_parameter_descriptors(membership["nnuec_config"])
+    raise ValueError("unsupported NNUEC trainable membership domain")
+
+
 def _component(name):
     if name.startswith("nnuec."):
         return "nnuec"
@@ -70,11 +94,17 @@ def _component(name):
 
 
 def validate_membership(value):
-    fields(value, ("schema", "model_semantics_sha256", "nnuec_config", "validator_present", "parameters"), "Rovent trainable membership")
-    if value["schema"] != MEMBERSHIP_DOMAIN or type(value["validator_present"]) is not bool:
+    if type(value) is not dict:
+        raise ValueError("Rovent trainable membership fields mismatch")
+    domain = value.get("schema")
+    fields(value, ("schema", "model_semantics_sha256", "nnuec_config", "validator_present", "parameters")
+        + (("nnuec_schema", "nnuec_semantics") if domain == MEMBERSHIP_V2_DOMAIN else ()), "Rovent trainable membership")
+    if domain not in (MEMBERSHIP_DOMAIN, MEMBERSHIP_V2_DOMAIN) or type(value["validator_present"]) is not bool:
         raise ValueError("new explicit Rovent membership domain required")
+    if domain == MEMBERSHIP_V2_DOMAIN and (value["nnuec_schema"] != NNUEC_V2_SCHEMA or value["nnuec_semantics"] != NNUEC_V2_SEMANTICS):
+        raise ValueError("explicit V2 NNUEC schema/semantics required")
     sha(value["model_semantics_sha256"])
-    expected_nnuec = {item["name"]: item for item in nnuec_parameter_descriptors(value["nnuec_config"])}
+    expected_nnuec = {item["name"]: item for item in nnuec_membership(value)[2]}
     parameters = value["parameters"]
     if type(parameters) is not list or not 1 <= len(parameters) <= 4096:
         raise ValueError("bounded explicit parameter membership required")
@@ -106,7 +136,8 @@ def validate_membership(value):
 
 
 def membership_digest(value):
-    return digest(MEMBERSHIP_DOMAIN, validate_membership(value))
+    checked = validate_membership(value)
+    return digest(checked["schema"], checked)
 
 
 def optimizer_ownership(recipe, membership):
@@ -244,8 +275,8 @@ def prepare_export(recipe, membership, checkpoint_inventory, *, kind):
             "membership_sha256": membership_digest(membership), "validator_present": include_v,
             "roles": ["proposer", "critic"] + (["validator"] if include_v else []),
             "parameter_names": [item["name"] for item in selected],
-            "nnuec": {"schema": NNUEC_SCHEMA, "semantics": NNUEC_SEMANTICS,
-                      "parameters": nnuec_parameter_descriptors(membership["nnuec_config"]),
+            "nnuec": {"schema": nnuec_membership(membership)[0], "semantics": nnuec_membership(membership)[1],
+                      "parameters": nnuec_membership(membership)[2],
                       "output_scale": {"trainable": False, "source": "original_checkpoint_scalar"}},
             "legacy_export_domain_compatible": False, "actual_checkpoint_bytes_loaded": False,
             "actual_export_written": False, "training_provenance_verified": False,
