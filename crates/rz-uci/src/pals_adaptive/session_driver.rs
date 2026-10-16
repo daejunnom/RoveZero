@@ -1434,8 +1434,11 @@ where
             }
         };
         if !receipt.permits_root_reuse() || manager.phase() != ManagerPhase::Finished {
+            // Preserve the first original failure before retaining the complete
+            // manager. Its cause does not confirm a fence or relax quarantine.
+            let failure = failed_root_closure(manager.failures().next());
             *state = SessionState::Manager(manager);
-            return Err(SearchSessionFailure::physical_completion_unknown());
+            return Err(failure);
         }
         #[cfg(feature = "pals-adaptive-diagnostics")]
         if let Some(diagnostic) = self.continuation_diagnostic.get() {
@@ -2092,6 +2095,11 @@ impl SearchSessionFailure {
         self.physical_completion = crate::search_driver::DriverPhysicalCompletion::Unknown;
         self
     }
+}
+fn failed_root_closure(first: Option<&AdaptiveManagerError>) -> SearchSessionFailure {
+    first.map_or_else(SearchSessionFailure::physical_completion_unknown, |cause| {
+        SearchSessionFailure::debug("AdaptiveRootClosure", cause).unknown_if_unclosed()
+    })
 }
 fn drain_root<B>(
     manager: &mut SessionManager<B>,

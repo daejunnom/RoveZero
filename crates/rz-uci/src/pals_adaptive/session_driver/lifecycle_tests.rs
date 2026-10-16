@@ -24,6 +24,49 @@ use rz_search::pals::review_context::{ReviewIndexLimits, ReviewSelectionPolicy};
 use rz_search::pals::value::{MODEL_WDL_VALUE_SEMANTICS, ModelValueIdentity};
 use sha2::Sha256;
 
+#[test]
+fn failed_root_closure_keeps_first_cause_without_confirming_physical_completion() {
+    let original = [
+        AdaptiveManagerError::Semantic("original external response failure".into()),
+        AdaptiveManagerError::Capacity("later cleanup failure"),
+    ];
+    let failure = failed_root_closure(original.first());
+    assert_eq!(failure.code, "AdaptiveRootClosure");
+    assert!(
+        failure
+            .detail
+            .contains("original external response failure")
+    );
+    assert!(!failure.detail.contains("later cleanup failure"));
+    assert_eq!(
+        failure.physical_completion,
+        crate::search_driver::DriverPhysicalCompletion::Unknown
+    );
+}
+
+#[test]
+fn failed_root_closure_bounds_original_unicode_cause() {
+    let original = AdaptiveManagerError::Semantic("원인".repeat(1024));
+    let failure = failed_root_closure(Some(&original));
+    assert_eq!(failure.code, "AdaptiveRootClosure");
+    assert!(failure.detail.len() <= 512 + " [cause truncated]".len());
+    assert!(failure.detail.ends_with(" [cause truncated]"));
+    assert!(failure.detail.contains("원인"));
+    assert_eq!(
+        failure.physical_completion,
+        crate::search_driver::DriverPhysicalCompletion::Unknown
+    );
+}
+
+#[test]
+fn failed_root_closure_without_cause_keeps_original_unknown_failure() {
+    let failure = failed_root_closure(None);
+    let original = SearchSessionFailure::physical_completion_unknown();
+    assert_eq!(failure.code, original.code);
+    assert_eq!(failure.detail, original.detail);
+    assert_eq!(failure.physical_completion, original.physical_completion);
+}
+
 #[derive(Default)]
 struct OwnerFacts {
     factories: AtomicU64,
