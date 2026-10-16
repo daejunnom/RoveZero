@@ -49,6 +49,10 @@ pub struct VirtualReviewTicketOutput {
     completion: VirtualReviewCompletion,
 }
 impl VirtualReviewTicketOutput {
+    /// Raw, physically completed numbers; the opaque acceptance token stays private.
+    pub fn raw_output(&self) -> &PalsRawOutput {
+        self.completion.raw_output()
+    }
     pub fn physical_invocation(&self) -> VirtualReviewPhysicalInvocationEvidence {
         VirtualReviewPhysicalInvocationEvidence {
             invocation_key: Digest(self.completion.invocation_key),

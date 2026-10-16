@@ -22,6 +22,13 @@ pub struct VirtualReviewCompletion {
     ticket: RoleTicketEnvelope,
     raw_digest: [u8; 32],
 }
+impl VirtualReviewCompletion {
+    /// Immutable numeric observation after the original owner's physical fence.
+    /// This borrow grants neither a completion constructor nor seed acceptance.
+    pub fn raw_output(&self) -> &PalsRawOutput {
+        &self.raw
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SeedKey {
     authority: SearchAuthority,
