@@ -41,6 +41,7 @@ mod actual {
         VirtualReviewPreparedTicket,
     };
     use rz_uci::search_driver::SearchSessionDriver;
+    use rz_uci::{Command, ParserLimits, PositionPort};
     use serde_json::json;
     use std::fmt::Debug;
     use std::io::{self, Write};
@@ -355,16 +356,71 @@ mod actual {
         })
     }
     type DiagnosticError = Box<dyn std::error::Error>;
-    type DiagnosticArguments = (Case, u64, ProcessEpoch, Vec<String>);
+    struct DiagnosticPosition {
+        command: String,
+        position: Position,
+    }
+    type DiagnosticArguments = (
+        Case,
+        u64,
+        ProcessEpoch,
+        Vec<String>,
+        Option<DiagnosticPosition>,
+    );
+
+    fn diagnostic_position(command: &str) -> Result<DiagnosticPosition, DiagnosticError> {
+        let Command::Position(spec) = rz_uci::parse(
+            command,
+            ParserLimits {
+                max_line_bytes: 8192,
+                ..ParserLimits::default()
+            },
+        )?
+        else {
+            return Err(fail("DiagnosticPositionCommandRequired"));
+        };
+        let port = rz_uci::engine::RulesUciPort::new(
+            Arc::new(rz_uci::engine::OwnerRegistry::default()),
+            rz_position::PositionLimits::default(),
+        );
+        let prepared = port.prepare(&spec)?;
+        Ok(DiagnosticPosition {
+            command: command.into(),
+            position: prepared.snapshot.rules_position().clone(),
+        })
+    }
+
+    // Custom input has its own raw domain; the original four default recipes
+    // retain every existing raw field and source/limit/acceptance guard.
+    fn record_custom_position(
+        raw: &mut serde_json::Value,
+        custom: &Option<(Case, serde_json::Value)>,
+    ) {
+        if let Some((case, input)) = custom {
+            raw["domain"] = if *case == Case::ExternalRRepair {
+                "rovezero.actual-external-continuation-diagnostic-raw/2"
+            } else {
+                "rovezero.actual-continuation-diagnostic-raw/6"
+            }
+            .into();
+            raw["position_command"] = input["position_command"].clone();
+            raw["position_input"] = input.clone();
+        }
+    }
 
     fn arguments() -> Result<DiagnosticArguments, DiagnosticError> {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        if args.len() != 6 || args.iter().any(|s| s.len() > 8192) {
-            return Err(fail("SixBoundedArgumentsRequired"));
+        parse_arguments(args)
+    }
+
+    fn parse_arguments(args: Vec<String>) -> Result<DiagnosticArguments, DiagnosticError> {
+        if !matches!(args.len(), 6 | 7) || args.iter().any(|s| s.len() > 8192) {
+            return Err(fail("SixOrSevenBoundedArgumentsRequired"));
         }
         let mut case = None;
         let mut wall = None;
         let mut epoch = None;
+        let mut position = None;
         let mut startup = Vec::with_capacity(3);
         for arg in args {
             if let Some(value) = arg.strip_prefix("--diagnostic-case=") {
@@ -386,6 +442,11 @@ mod actual {
                 if epoch.replace(value.parse::<u64>()?).is_some() {
                     return Err(fail("DuplicateEpoch"));
                 }
+            } else if let Some(value) = arg.strip_prefix("--diagnostic-position=") {
+                if position.is_some() {
+                    return Err(fail("DuplicateDiagnosticPosition"));
+                }
+                position = Some(diagnostic_position(value)?);
             } else {
                 startup.push(arg);
             }
@@ -400,11 +461,25 @@ mod actual {
             wall,
             ProcessEpoch(epoch),
             startup,
+            position,
         ))
     }
-    fn run() -> Result<bool, Box<dyn std::error::Error>> {
+    fn run(
+        custom_input: &mut Option<(Case, serde_json::Value)>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let started = Instant::now();
-        let (case, wall_ms, epoch, startup_args) = arguments()?;
+        let (case, wall_ms, epoch, startup_args, position) = arguments()?;
+        if let Some(position) = &position {
+            *custom_input = Some((
+                case,
+                json!({"domain":"rovezero.diagnostic-exact-position-input/1",
+                    "position_command":position.command,"rules_current_fen":position.position.to_fen(),
+                    "history_origin":opaque(&position.position.history_origin()),
+                    "history_completeness":opaque(&position.position.history_completeness()),
+                    "known_history_len":position.position.known_history_len(),
+                    "source":"PUBLIC_UCI_PARSER_AND_RULES_POSITION_PORT_BEFORE_NATIVE_STARTUP"}),
+            ));
+        }
         let until = started
             .checked_add(Duration::from_millis(wall_ms))
             .ok_or_else(|| fail("WindowOverflow"))?;
@@ -554,7 +629,10 @@ mod actual {
             }
             let context = prepared.context(hard, shutdown)?;
             authority = Some(context.authority);
-            let position = case.position()?;
+            let position = match position {
+                Some(position) => position.position,
+                None => case.position()?,
+            };
             let run_started = Instant::now();
             let returned = driver.run(&position, &context, &mut |_| {});
             run_elapsed = Some(u64::try_from(run_started.elapsed().as_nanos())?);
@@ -642,6 +720,7 @@ mod actual {
             raw["position_command"] = format!("position fen {Y1_FEN}").into();
             raw["external_root"] = external;
         }
+        record_custom_position(&mut raw, custom_input);
         emit(&raw)?;
         Ok(successful_return && available)
     }
@@ -656,6 +735,108 @@ mod actual {
             ExternalUciIdentity,
         };
         use std::collections::BTreeMap;
+
+        fn default_arguments(case: &str) -> Vec<String> {
+            [
+                "--startup-config=/tmp/not-opened-config.json".into(),
+                "--startup-lock=/tmp/not-opened-lock.json".into(),
+                format!("--startup-config-sha256={}", "a".repeat(64)),
+                format!("--diagnostic-case={case}"),
+                "--diagnostic-wall-ms=60000".into(),
+                "--diagnostic-epoch=7".into(),
+            ]
+            .into()
+        }
+
+        #[test]
+        fn diagnostic_position_rejects_non_position_illegal_history_and_unbounded_input() {
+            for command in [
+                "go nodes 1",
+                "position startpos moves e2e5",
+                "position fen bad",
+            ] {
+                let mut args = default_arguments("r1-repair");
+                args.push(format!("--diagnostic-position={command}"));
+                assert!(parse_arguments(args).is_err());
+            }
+            assert!(diagnostic_position(&"x".repeat(8193)).is_err());
+            let mut duplicate = default_arguments("r1-repair");
+            duplicate.extend([
+                "--diagnostic-position=position startpos".into(),
+                "--diagnostic-position=position startpos".into(),
+            ]);
+            assert!(parse_arguments(duplicate).is_err());
+        }
+
+        #[test]
+        fn diagnostic_position_uses_public_rules_port_with_full_history() {
+            let command = "position startpos moves e2e4 e7e5 g1f3 b8c6";
+            let mut args = default_arguments("r1-repair");
+            args.push(format!("--diagnostic-position={command}"));
+            let (case, wall, epoch, startup, custom) = parse_arguments(args).unwrap();
+            assert_eq!(case, Case::R1Repair);
+            assert_eq!(wall, 60000);
+            assert_eq!(epoch, ProcessEpoch(7));
+            assert_eq!(startup.len(), 3);
+            let custom = custom.unwrap();
+            let mut expected = Position::startpos();
+            for text in ["e2e4", "e7e5", "g1f3", "b8c6"] {
+                expected.make_move(text.parse().unwrap()).unwrap();
+            }
+            assert_eq!(custom.command, command);
+            assert_eq!(custom.position.to_fen(), expected.to_fen());
+            assert_eq!(
+                custom.position.known_history_len(),
+                expected.known_history_len()
+            );
+            assert_eq!(custom.position.history_origin(), expected.history_origin());
+            assert_eq!(
+                custom.position.history_completeness(),
+                expected.history_completeness()
+            );
+            assert_eq!(
+                rz_uci::pals_native::pals_history_digest(&custom.position).unwrap(),
+                rz_uci::pals_native::pals_history_digest(&expected).unwrap()
+            );
+        }
+
+        #[test]
+        fn diagnostic_default_positions_and_raw_domains_are_unchanged() {
+            for (name, expected_fen) in [
+                ("y1-natural", Y1_FEN.to_owned()),
+                ("t1-pending", Position::startpos().to_fen()),
+                ("r1-repair", Position::startpos().to_fen()),
+                ("external-r-repair", Y1_FEN.to_owned()),
+            ] {
+                let (case, wall, _, _, custom) = parse_arguments(default_arguments(name)).unwrap();
+                assert!(custom.is_none());
+                assert_eq!(wall, 60000);
+                assert_eq!(case.position().unwrap().to_fen(), expected_fen);
+                let original = json!({"domain":if case == Case::ExternalRRepair {
+                    "rovezero.actual-external-continuation-diagnostic-raw/1"
+                } else {"rovezero.actual-continuation-diagnostic-raw/5"},
+                    "unchanged_field":"original"});
+                let mut raw = original.clone();
+                record_custom_position(&mut raw, &None);
+                assert_eq!(raw, original);
+                let custom = Some((
+                    case,
+                    json!({"domain":"rovezero.diagnostic-exact-position-input/1",
+                    "position_command":"position startpos"}),
+                ));
+                record_custom_position(&mut raw, &custom);
+                assert_eq!(raw["unchanged_field"], "original");
+                assert_eq!(raw["position_command"], "position startpos");
+                assert_eq!(
+                    raw["domain"],
+                    if case == Case::ExternalRRepair {
+                        "rovezero.actual-external-continuation-diagnostic-raw/2"
+                    } else {
+                        "rovezero.actual-continuation-diagnostic-raw/6"
+                    }
+                );
+            }
+        }
 
         fn report() -> ExternalCheckerReport {
             ExternalCheckerReport {
@@ -1657,17 +1838,18 @@ mod actual {
     }
 
     pub fn main() -> ExitCode {
-        match run() {
+        let mut custom_input = None;
+        match run(&mut custom_input) {
             Ok(true) => ExitCode::SUCCESS,
             Ok(false) => ExitCode::FAILURE,
             Err(error) => {
                 let detail: String = error.to_string().chars().take(512).collect();
-                let _ = emit(
-                    &json!({"domain":"rovezero.actual-continuation-diagnostic-raw/5",
+                let mut raw = json!({"domain":"rovezero.actual-continuation-diagnostic-raw/5",
                     "status":"PREPARATION_OR_PUBLICATION_FAILED","detail":detail,
                     "case_acceptance":"NOT_ISSUED_BY_DIAGNOSTIC_RUNNER",
-                    "actual_nn_scope":"UNKNOWN_UNLESS_ORIGINAL_RAW_PROVES_IT","scalar_observations":null,"runtime_closure":null}),
-                );
+                    "actual_nn_scope":"UNKNOWN_UNLESS_ORIGINAL_RAW_PROVES_IT","scalar_observations":null,"runtime_closure":null});
+                record_custom_position(&mut raw, &custom_input);
+                let _ = emit(&raw);
                 ExitCode::FAILURE
             }
         }
