@@ -12,7 +12,8 @@ import copy
 from dataclasses import dataclass
 from enum import Enum
 
-from .generation_data import digest, fields, identifier, seal_input, sha, uint, validate_input
+from .generation_data import (GenerationDataset, digest, fields, identifier, seal_input, sha, uint,
+                              validate_input, validate_record)
 
 RECIPE_DOMAIN = "rz-rovent-generation-series/1"
 CHECKPOINT_DOMAIN = "rz-rovent-series-checkpoint-metadata/1"
@@ -55,6 +56,7 @@ class FrozenTeacherActor:
     source_revision: str
     source_sha256: str
     binary_sha256: str
+    profile_sha256: str
     options_sha256: str
     assets_sha256: str
     rights_sha256: str
@@ -68,7 +70,7 @@ class FrozenTeacherActor:
         revision = value["source_revision"]
         if type(revision) is not str or len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
             raise ValueError("teacher source must pin a full commit revision")
-        for key in ("source_sha256", "binary_sha256", "options_sha256", "assets_sha256", "rights_sha256"):
+        for key in ("source_sha256", "binary_sha256", "profile_sha256", "options_sha256", "assets_sha256", "rights_sha256"):
             sha(value[key])
         return cls(**value)
 
@@ -152,10 +154,10 @@ class SeriesRecipe:
         if type(splits) is not dict or not 1 <= len(splits) <= 65536:
             raise ValueError("bounded predeclared global opening split required")
         for opening, split in splits.items():
-            _plain_id(opening)
+            identifier(opening)
             if split not in ("train", "validation", "holdout"):
                 raise ValueError("unregistered global split")
-        holdout = _unique_strings(value["global_holdout_openings"], _plain_id, 65536, "global holdout openings")
+        holdout = _unique_strings(value["global_holdout_openings"], identifier, 65536, "global holdout openings")
         if any(splits.get(opening) != "holdout" for opening in holdout):
             raise ValueError("global holdout must be excluded before all ancestor training")
         self._value = copy.deepcopy(value)
@@ -342,7 +344,7 @@ def _validate_record_origin(value, stages, opening_splits):
     for key in ("input_sha256", "record_sha256", "producer_sha256", "rules_state_sha256", "transposition_sha256"):
         sha(value[key])
     for key in ("opening_id", "game_id", "line_genealogy_id"):
-        _plain_id(value[key])
+        identifier(value[key])
     if value["opening_id"] not in opening_splits:
         raise ValueError("row opening absent from globally registered split")
     return value
@@ -458,3 +460,138 @@ class GlobalLineageIndex:
                 "cross_split_identities": self.cross_split_identities,
                 "excluded_input_seals": len(self._excluded), "native_intake_verified": False,
                 "execution_authorized": False}
+
+
+class LegacyIntakeStatus(str, Enum):
+    AUDITED = "legacy_provenance_audited_not_trainable"
+    UNSUPPORTED_TEACHER = "unsupported_legacy_teacher_family"
+    UNSUPPORTED_FORMAT = "unsupported_legacy_format"
+    REJECTED = "rejected_legacy_provenance"
+
+
+def _legacy_result(recipe, stage_id, actor_id, status, code, **observations):
+    return {"schema": "rz-rovent-legacy-intake-audit/1", "recipe_sha256": recipe.sha256,
+            "stage_id": stage_id, "teacher_actor_id": actor_id, "status": status.value, "code": code,
+            "actual_training_admissible": False, "execution_authorized": False,
+            "actual_training_executed": False, "optimizer_updates": 0, "arena_eligible": False,
+            **observations}
+
+
+def _legacy_actor(recipe, stage_id, teacher_actor_id):
+    stage = recipe.stage(stage_id)
+    if teacher_actor_id not in stage.teacher_actor_ids:
+        raise ValueError("legacy intake actor is not assigned to its stage")
+    return next(actor for actor in recipe.actors if actor.actor_id == teacher_actor_id)
+
+
+def _audit_legacy_dataset(recipe, dataset, *, stage_id, actor, expected_model_sha256,
+                          expected_runtime_sha256, max_records, check_budget):
+    producer = dataset.authority
+    for key, expected in (("teacher_binary_sha256", actor.binary_sha256),
+                          ("teacher_profile_sha256", actor.profile_sha256),
+                          ("model_sha256", sha(expected_model_sha256)),
+                          ("runtime_sha256", sha(expected_runtime_sha256))):
+        if producer[key] != expected:
+            raise ValueError("legacy producer differs from its frozen teacher/model/runtime pin: " + key)
+    splits = recipe.to_dict()["opening_splits"]
+    stages = {stage.stage_id: stage for stage in recipe.stages}
+    selected = recipe.stage(stage_id)
+    producer_sha256 = digest(producer["schema"], producer)
+    if any(splits.get(opening) != split for opening, split in dataset.opening_splits.items()):
+        raise ValueError("legacy producer split differs from preregistered global split")
+    origins, heads, counts = [], [], dict.fromkeys(ROLES, 0)
+    for split in ("train", "validation", "holdout"):
+        for record in dataset.rows(split):
+            check_budget()
+            if len(origins) >= max_records:
+                raise ValueError("legacy audit record capacity exceeded; no sampled admission")
+            targets = validate_record(record)
+            snapshot = record["input"]  # Already validated against its original seal above.
+            origin = {"input_sha256": record["input_sha256"],
+                "record_sha256": digest("rz-rovent-legacy-hydrated-record-snapshot/1", record),
+                "producer_sha256": producer_sha256, "stage_id": stage_id, "round_id": selected.round_id,
+                "teacher_actor_id": actor.actor_id, **{key: snapshot[key] for key in
+                    ("opening_id", "game_id", "line_genealogy_id", "transposition_sha256")},
+                "rules_state_sha256": snapshot["rules_anchor"]["rules_state_sha256"]}
+            _validate_record_origin(origin, stages, splits)
+            origins.append(origin)
+            labels = record["future_targets"]
+            heads.append({"input_sha256": record["input_sha256"], "record_sha256": origin["record_sha256"],
+                "split": split, "role": record["input"]["role"], "capture_sequence": record["input"]["capture_sequence"],
+                "action_support_mask": list(record["input"]["action_support_mask"]),
+                "heads": {head: {"masked": targets[head] is None,
+                    "source": None if label is None else label["source"],
+                    "evidence_sha256": None if label is None else label["raw_evidence_sha256"],
+                    "observed_sequence": None if label is None else label["observed_sequence"]}
+                    for head, label in labels.items()},
+                "task_target_known_mask": None if labels["task"] is None else list(labels["task"]["target_known_mask"])})
+            counts[record["input"]["role"]] += 1
+    check_budget()
+    # A valid legacy row is still not a new native Rovent producer, nor does a
+    # serialized receipt prove the live game/trainer authority of its origin.
+    return _legacy_result(recipe, stage_id, actor.actor_id, LegacyIntakeStatus.AUDITED,
+        "LegacyReadOnlyProvenanceAudit", dataset_sha256=dataset.sha256, producer=producer,
+        record_snapshot_domain="rz-rovent-legacy-hydrated-record-snapshot/1", origins=origins,
+        head_observations=heads, role_records=counts, exclusions=dict(dataset.exclusions),
+        limitations=["legacy_domain_preserved_no_automatic_conversion",
+                     "native_rovent_collector_authority_not_issued",
+                     "serialized_provenance_does_not_certify_live_original_authority",
+                     "actual_parameter_membership_and_checkpoint_bytes_not_loaded"])
+
+
+def audit_legacy_bundle(recipe, bundle, *, stage_id, teacher_actor_id, expected_model_sha256,
+                        expected_runtime_sha256, max_records=4096, check_budget=lambda: None):
+    """Reuse the original whole-JSON parser; never promote its eligibility.
+
+    Legacy first-generation code itself excludes this format from actual
+    optimizer dispatch because its producer does not seal the physical native
+    collection chain. Successful head evidence joins remain useful for audit.
+    """
+    actor = _legacy_actor(recipe, stage_id, teacher_actor_id)
+    if actor.family != "stockfish":
+        return _legacy_result(recipe, stage_id, actor.actor_id, LegacyIntakeStatus.UNSUPPORTED_TEACHER,
+            "LegacyPolicySourceIsStockfish19Only", required="new_teacher_aware_native_corpus_domain")
+    try:
+        check_budget()
+        if not 1 <= uint(max_records, 4096):
+            raise ValueError("bounded legacy audit record ceiling required")
+        fields(bundle, ("producer", "trajectories", "opening_splits", "allowed_evidence", "records"), "legacy generation input bundle")
+        if type(bundle["records"]) is not list or len(bundle["records"]) > max_records:
+            raise ValueError("legacy audit record capacity exceeded")
+        dataset = GenerationDataset(bundle["records"], producer=bundle["producer"], trajectories=bundle["trajectories"],
+            opening_splits=bundle["opening_splits"], allowed_evidence=bundle["allowed_evidence"])
+        result = _audit_legacy_dataset(recipe, dataset, stage_id=stage_id, actor=actor,
+            expected_model_sha256=expected_model_sha256, expected_runtime_sha256=expected_runtime_sha256,
+            max_records=max_records, check_budget=check_budget)
+        result["data_format"] = "legacy_whole_json_bundle"
+        result["limitations"].append("legacy_bundle_lacks_native_physical_receipt_chain")
+        return result
+    except ValueError as error:
+        return _legacy_result(recipe, stage_id, actor.actor_id, LegacyIntakeStatus.REJECTED,
+            "LegacyProvenanceRejected", error_type=type(error).__name__, reason=str(error))
+
+
+def audit_legacy_chunks(recipe, manifest, *, stage_id, teacher_actor_id, expected_model_sha256,
+                        expected_runtime_sha256, expected_manifest_sha256, corpus_root, index_root,
+                        max_records=4096, check_budget=lambda: None):
+    """Use original bounded chunk/native/head validators and their exclusions."""
+    actor = _legacy_actor(recipe, stage_id, teacher_actor_id)
+    if actor.family != "stockfish":
+        return _legacy_result(recipe, stage_id, actor.actor_id, LegacyIntakeStatus.UNSUPPORTED_TEACHER,
+            "LegacyPolicySourceIsStockfish19Only", required="new_teacher_aware_native_corpus_domain")
+    from .generation_chunks import ChunkGenerationDataset, validate_manifest
+    try:
+        check_budget()
+        if not 1 <= uint(max_records, 4096):
+            raise ValueError("bounded legacy audit record ceiling required")
+        validate_manifest(manifest)
+        if manifest["total_records"] > max_records or manifest["total_bytes"] > 64 * 1024**2:
+            raise ValueError("legacy preparation audit corpus exceeds bounded records/64MiB")
+        with ChunkGenerationDataset(corpus_root, manifest, expected_manifest_sha256=expected_manifest_sha256,
+                                    index_root=index_root, max_index_bytes=16 * 1024**2) as dataset:
+            return _audit_legacy_dataset(recipe, dataset, stage_id=stage_id, actor=actor,
+                expected_model_sha256=expected_model_sha256, expected_runtime_sha256=expected_runtime_sha256,
+                max_records=max_records, check_budget=check_budget) | {"data_format": manifest["schema"]}
+    except ValueError as error:
+        return _legacy_result(recipe, stage_id, actor.actor_id, LegacyIntakeStatus.REJECTED,
+            "LegacyProvenanceRejected", error_type=type(error).__name__, reason=str(error))
