@@ -322,7 +322,7 @@ impl Config {
             "cuda-control" => Some(NativeLoadingProfile::EagerCuda12Cudnn9V1),
             "cuda-control-shim" => Some(NativeLoadingProfile::CuDnnShimLazyV1),
             _ => {
-                return Err("explicit cpu/cuda-control/cuda-control-shim provider required".into())
+                return Err("explicit cpu/cuda-control/cuda-control-shim provider required".into());
             }
         };
         if profile.is_some() {
@@ -394,6 +394,25 @@ struct JoinedPolicyObservation {
     numerical_acceptance: bool,
     performance_improvement_claim: bool,
     process_exit_evidence: &'static str,
+    cuda_profiling_window: Option<CudaProfilingWindow>,
+}
+
+#[derive(Serialize)]
+struct CudaProfilingWindow {
+    scope: &'static str,
+    actual_cases: Vec<ProfiledCase>,
+    completed_nn_inputs: u64,
+    remaining_cases_profiled: bool,
+}
+
+#[derive(Serialize)]
+struct ProfiledCase {
+    group: String,
+    case: String,
+    role: PalsRole,
+    line_bucket: usize,
+    records: usize,
+    anchors: usize,
 }
 
 fn loaded_policy_observation(
@@ -412,7 +431,7 @@ fn loaded_policy_observation(
         }
         PalsCuDnnConvSearch::ExperimentalDefault => ("experimental_default", "DEFAULT"),
         PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm => {
-            return Err("device Warm is outside Fresh capture selection".into())
+            return Err("device Warm is outside Fresh capture selection".into());
         }
     };
     let applied_session_settings = backend
@@ -474,7 +493,7 @@ struct RawRun {
     physical_completion_known: bool,
     cases: Vec<RawCase>,
 }
-#[derive(Serialize)]
+#[derive(Debug, Default, Eq, PartialEq, Serialize)]
 struct StageWork {
     admitted_role_requests: u64,
     public_cache_hits: u64,
@@ -489,6 +508,74 @@ struct StageWork {
     validated_role_outputs: u64,
     completed_nn_inputs: u64,
 }
+
+impl StageWork {
+    fn checked_add(&mut self, other: Self) -> Result<()> {
+        let add = |a: u64, b: u64| {
+            a.checked_add(b)
+                .ok_or_else(|| Box::<dyn Error>::from("native stage delta sum overflow"))
+        };
+        let next = Self {
+            admitted_role_requests: add(self.admitted_role_requests, other.admitted_role_requests)?,
+            public_cache_hits: add(self.public_cache_hits, other.public_cache_hits)?,
+            public_cache_misses: add(self.public_cache_misses, other.public_cache_misses)?,
+            public_nn_runs_attempted: add(
+                self.public_nn_runs_attempted,
+                other.public_nn_runs_attempted,
+            )?,
+            public_nn_runs_completed: add(
+                self.public_nn_runs_completed,
+                other.public_nn_runs_completed,
+            )?,
+            public_nn_runs_failed_known: add(
+                self.public_nn_runs_failed_known,
+                other.public_nn_runs_failed_known,
+            )?,
+            role_nn_runs_attempted: add(self.role_nn_runs_attempted, other.role_nn_runs_attempted)?,
+            role_nn_runs_completed: add(self.role_nn_runs_completed, other.role_nn_runs_completed)?,
+            role_nn_runs_failed_known: add(
+                self.role_nn_runs_failed_known,
+                other.role_nn_runs_failed_known,
+            )?,
+            validated_public_outputs: add(
+                self.validated_public_outputs,
+                other.validated_public_outputs,
+            )?,
+            validated_role_outputs: add(self.validated_role_outputs, other.validated_role_outputs)?,
+            completed_nn_inputs: add(self.completed_nn_inputs, other.completed_nn_inputs)?,
+        };
+        *self = next;
+        Ok(())
+    }
+
+    fn validate_fresh_count(&self, count: usize) -> Result<()> {
+        let n = count as u64;
+        if [
+            self.admitted_role_requests,
+            self.public_cache_misses,
+            self.public_nn_runs_attempted,
+            self.public_nn_runs_completed,
+            self.role_nn_runs_attempted,
+            self.role_nn_runs_completed,
+            self.validated_public_outputs,
+            self.validated_role_outputs,
+        ]
+        .iter()
+        .any(|v| *v != n)
+            || self.public_cache_hits != 0
+            || self.public_nn_runs_failed_known != 0
+            || self.role_nn_runs_failed_known != 0
+            || self.completed_nn_inputs != 2 * n
+        {
+            return Err(
+                "Fresh cache-off public/private completed work does not match captured cases"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 fn stage_delta(
     before: &PalsBackendStats,
     after: &PalsBackendStats,
@@ -529,29 +616,149 @@ fn stage_delta(
         validated_role_outputs: delta(after.validated_role_outputs, before.validated_role_outputs)?,
         completed_nn_inputs: delta(after.completed_nn_inputs, before.completed_nn_inputs)?,
     };
-    let n = count as u64;
-    if [
-        s.admitted_role_requests,
-        s.public_cache_misses,
-        s.public_nn_runs_attempted,
-        s.public_nn_runs_completed,
-        s.role_nn_runs_attempted,
-        s.role_nn_runs_completed,
-        s.validated_public_outputs,
-        s.validated_role_outputs,
-    ]
-    .iter()
-    .any(|v| *v != n)
-        || s.public_cache_hits != 0
-        || s.public_nn_runs_failed_known != 0
-        || s.role_nn_runs_failed_known != 0
-        || s.completed_nn_inputs != 2 * n
-    {
-        return Err(
-            "Fresh cache-off public/private completed work does not match captured cases".into(),
-        );
-    }
+    s.validate_fresh_count(count)?;
     Ok(s)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CaptureSlot {
+    group: usize,
+    case: usize,
+}
+
+struct CaptureOrder {
+    slots: Vec<CaptureSlot>,
+    profile_cases: usize,
+}
+
+fn capture_order(groups: &[Group], cuda: bool, collection: bool) -> Result<CaptureOrder> {
+    let mut slots = Vec::new();
+    if cuda {
+        let roles = [PalsRole::Proposer, PalsRole::Critic, PalsRole::Validator];
+        for role in &roles[..if collection { 3 } else { 2 }] {
+            // Use original cases only. Prefer a nonempty record branch, short
+            // physical L, and all available anchors before ending profiles.
+            // Kernel/provider acceptance remains the original backend's job.
+            let slot = groups
+                .iter()
+                .enumerate()
+                .filter(|(_, group)| group.role == *role)
+                .flat_map(|(group_index, group)| {
+                    group
+                        .cases
+                        .iter()
+                        .enumerate()
+                        .map(move |(case_index, case)| {
+                            let Input::VirtualReview(input) = &case.input;
+                            (
+                                (
+                                    input.records.is_empty(),
+                                    group.line_bucket,
+                                    std::cmp::Reverse(input.anchors.len()),
+                                    group_index,
+                                    case_index,
+                                ),
+                                CaptureSlot {
+                                    group: group_index,
+                                    case: case_index,
+                                },
+                            )
+                        })
+                })
+                .min_by_key(|(key, _)| *key)
+                .map(|(_, slot)| slot)
+                .ok_or("capture plan lacks an original case for a registered role")?;
+            slots.push(slot);
+        }
+    }
+    let profile_cases = slots.len();
+    let selected = slots.iter().copied().collect::<BTreeSet<_>>();
+    for (group, item) in groups.iter().enumerate() {
+        for case in 0..item.cases.len() {
+            let slot = CaptureSlot { group, case };
+            if !selected.contains(&slot) {
+                slots.push(slot);
+            }
+        }
+    }
+    Ok(CaptureOrder {
+        slots,
+        profile_cases,
+    })
+}
+
+struct GroupCapture {
+    id: String,
+    remaining: Vec<Option<Case>>,
+    captured: Vec<Option<RawCase>>,
+    stage: StageWork,
+}
+
+impl From<Group> for GroupCapture {
+    fn from(group: Group) -> Self {
+        Self {
+            id: group.id,
+            captured: (0..group.cases.len()).map(|_| None).collect(),
+            remaining: group.cases.into_iter().map(Some).collect(),
+            stage: StageWork::default(),
+        }
+    }
+}
+
+fn capture_case(
+    worker: &mut Worker,
+    group: &mut GroupCapture,
+    case_index: usize,
+    epoch: [u8; 32],
+    backend_digest: [u8; 32],
+    completion: &mut u64,
+    until: Instant,
+) -> Result<u64> {
+    let case = group
+        .remaining
+        .get_mut(case_index)
+        .and_then(Option::take)
+        .ok_or("capture case was already executed or is outside the original plan")?;
+    if group.captured[case_index].is_some() {
+        return Err("capture case has an earlier physical completion".into());
+    }
+    let Input::VirtualReview(input) = &case.input;
+    let input_tensors = tensors::capture(input)?;
+    let input_tensor_sha256 = tensors::digest(&input_tensors, input.role)?;
+    let identity = identity(input, epoch, backend_digest)?;
+    // These are adjacent snapshots of this actual invocation, never synthetic
+    // group boundaries spanning another group's interleaved work.
+    let before = stats(worker, until)?;
+    let output = match command(
+        worker,
+        Command::Evaluate(VirtualReviewInvocation {
+            request_history: identity.rules_history,
+            identity,
+            input: input.clone(),
+        }),
+        until,
+    )? {
+        Outcome::Evaluation(raw) => raw,
+        _ => return Err("incorrect physical evaluation completion".into()),
+    };
+    let after = stats(worker, until)?;
+    let delta = stage_delta(&before, &after, 1)?;
+    let actual_nn_inputs = delta.completed_nn_inputs;
+    group.stage.checked_add(delta)?;
+    *completion = completion
+        .checked_add(1)
+        .ok_or("physical completion sequence overflow")?;
+    let candidate_order = input.candidates.clone();
+    group.captured[case_index] = Some(RawCase {
+        id: case.id,
+        input: case.input,
+        candidate_order,
+        input_tensors,
+        input_tensor_sha256,
+        raw_output: output,
+        physical_completion_id: Some(format!("native-{}-{}", group.id, *completion)),
+    });
+    Ok(actual_nn_inputs)
 }
 
 fn hex(bytes: [u8; 32]) -> String {
@@ -696,7 +903,7 @@ fn finish(worker: &mut Worker, until: Instant) -> Result<()> {
             Poll::Ready(result) => return Ok(result?),
             Poll::Pending if Instant::now() < until => std::thread::sleep(Duration::from_millis(1)),
             Poll::Pending => {
-                return Err("native worker did not join within cleanup deadline".into())
+                return Err("native worker did not join within cleanup deadline".into());
             }
         }
     }
@@ -843,6 +1050,29 @@ fn execute(config: Config) -> Result<()> {
     if roles != expected {
         return Err("capture plan omits or adds an actual registered role".into());
     }
+    let order = capture_order(
+        &plan.groups,
+        is_cuda,
+        mode == VirtualReviewExecutionMode::Collection,
+    )?;
+    let mut profiling_window = is_cuda.then(|| CudaProfilingWindow {
+        scope: "original planned cases only; profiles close at first registered role coverage, not full-run kernel coverage",
+        actual_cases: order.slots[..order.profile_cases].iter().map(|slot| {
+            let group = &plan.groups[slot.group];
+            let case = &group.cases[slot.case];
+            let Input::VirtualReview(input) = &case.input;
+            ProfiledCase {
+                group: group.id.clone(),
+                case: case.id.clone(),
+                role: input.role,
+                line_bucket: group.line_bucket,
+                records: input.records.len(),
+                anchors: input.anchors.len(),
+            }
+        }).collect(),
+        completed_nn_inputs: 0,
+        remaining_cases_profiled: false,
+    });
     let manifest_bytes = asset::read_bounded(&config.export_manifest, 256 * 1024)?;
     let summary = validate_virtual_review_export_manifest(&manifest_bytes, mode)?;
     let graph_pins = summary
@@ -979,44 +1209,58 @@ fn execute(config: Config) -> Result<()> {
         loaded_policy_observation(&backend, config.cudnn_conv_search.as_deref(), is_cuda)?;
     let mut worker = backend.into_worker()?;
     let work = (|| -> Result<Vec<(PathBuf, PathBuf)>> {
-        let mut outputs = Vec::new();
+        let mut outputs = (0..plan.groups.len()).map(|_| None).collect::<Vec<_>>();
         let mut bytes = 0u64;
         let mut completion = 0u64;
         let mut stages = BTreeMap::new();
-        for group in plan.groups {
-            let before = stats(&mut worker, until)?;
-            let mut captured = Vec::new();
-            for case in group.cases {
-                let Input::VirtualReview(input) = &case.input;
-                let input_tensors = tensors::capture(input)?;
-                let input_tensor_sha256 = tensors::digest(&input_tensors, input.role)?;
-                let identity = identity(input, epoch, backend_digest)?;
-                let output = match command(
-                    &mut worker,
-                    Command::Evaluate(VirtualReviewInvocation {
-                        request_history: identity.rules_history,
-                        identity,
-                        input: input.clone(),
-                    }),
-                    until,
-                )? {
-                    Outcome::Evaluation(raw) => raw,
-                    _ => return Err("incorrect physical evaluation completion".into()),
-                };
-                completion += 1;
-                let candidate_order = input.candidates.clone();
-                captured.push(RawCase {
-                    id: case.id,
-                    input: case.input,
-                    candidate_order,
-                    input_tensors,
-                    input_tensor_sha256,
-                    raw_output: output,
-                    physical_completion_id: Some(format!("native-{}-{completion}", group.id)),
-                });
+        let mut groups = plan
+            .groups
+            .into_iter()
+            .map(GroupCapture::from)
+            .collect::<Vec<_>>();
+        let mut first_placement = None;
+        for (index, slot) in order.slots.iter().enumerate() {
+            let actual_nn_inputs = capture_case(
+                &mut worker,
+                &mut groups[slot.group],
+                slot.case,
+                epoch,
+                backend_digest,
+                &mut completion,
+                until,
+            )?;
+            if index < order.profile_cases {
+                let window = profiling_window
+                    .as_mut()
+                    .ok_or("CUDA profile window absent")?;
+                window.completed_nn_inputs = window
+                    .completed_nn_inputs
+                    .checked_add(actual_nn_inputs)
+                    .ok_or("profile window NN input overflow")?;
             }
-            let after = stats(&mut worker, until)?;
-            let stage = stage_delta(&before, &after, captured.len())?;
+            if is_cuda && index + 1 == order.profile_cases {
+                first_placement = Some(
+                    match command(&mut worker, Command::VerifyVirtualCudaPlacement, until)? {
+                        Outcome::VirtualCudaPlacementVerified(witness) => witness,
+                        _ => return Err("actual initial V3 placement witness absent".into()),
+                    },
+                );
+            }
+            let group = &mut groups[slot.group];
+            if group.remaining.iter().any(Option::is_some) {
+                continue;
+            }
+            // Publish each completed group's pending bytes immediately. Only
+            // its early representative remains held while another group runs;
+            // do not accumulate all raw tensors until the complete plan ends.
+            let captured = group
+                .captured
+                .iter_mut()
+                .map(Option::take)
+                .collect::<Option<Vec<_>>>()
+                .ok_or("original capture case lacks a physical completion")?;
+            let stage = std::mem::take(&mut group.stage);
+            stage.validate_fresh_count(captured.len())?;
             let completed_nn_inputs = stage.completed_nn_inputs;
             let public_cache_hits = stage.public_cache_hits;
             stages.insert(group.id.clone(), stage);
@@ -1045,8 +1289,21 @@ fn execute(config: Config) -> Result<()> {
                 .checked_add(write_pending(&pending, &raw, RAW_TOTAL - bytes)?)
                 .filter(|n| *n <= RAW_TOTAL)
                 .ok_or("raw collection exceeds 64MiB")?;
-            outputs.push((pending, final_path));
+            if outputs[slot.group].replace((pending, final_path)).is_some() {
+                return Err("original capture group was published twice".into());
+            }
         }
+        if completion != order.slots.len() as u64
+            || groups
+                .iter()
+                .any(|group| group.remaining.iter().any(Option::is_some))
+        {
+            return Err("physical capture count differs from original plan".into());
+        }
+        let mut outputs = outputs
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or("original capture plan has an unpublished group")?;
         match command(&mut worker, Command::VerifyRuntime, until)? {
             Outcome::RuntimeVerified => {}
             _ => return Err("runtime audit incomplete".into()),
@@ -1054,6 +1311,11 @@ fn execute(config: Config) -> Result<()> {
         if is_cuda {
             match command(&mut worker, Command::VerifyVirtualCudaPlacement, until)? {
                 Outcome::VirtualCudaPlacementVerified(witness) => {
+                    if first_placement.as_ref() != Some(&witness) {
+                        return Err(
+                            "final V3 placement differs from original profiled witness".into()
+                        );
+                    }
                     write_exclusive(&root.join("actual-virtual-cuda-placement.json"), &witness)?;
                 }
                 _ => return Err("actual V3 placement witness absent".into()),
@@ -1074,16 +1336,16 @@ fn execute(config: Config) -> Result<()> {
             return Err(format!(
                 "capture failed: {work}; physical cleanup failed: {join}; pending files retained"
             )
-            .into())
+            .into());
         }
         (Err(work), Ok(())) => {
             return Err(format!(
                 "capture failed: {work}; native worker joined; pending files retained"
             )
-            .into())
+            .into());
         }
         (Ok(_), Err(join)) => {
-            return Err(format!("physical cleanup failed: {join}; pending files retained").into())
+            return Err(format!("physical cleanup failed: {join}; pending files retained").into());
         }
     };
     output_owner.verify()?;
@@ -1103,6 +1365,7 @@ fn execute(config: Config) -> Result<()> {
             numerical_acceptance: false,
             performance_improvement_claim: false,
             process_exit_evidence: "requires_external_process_owner_exit_observation",
+            cuda_profiling_window: profiling_window,
         },
         POLICY_LIMIT,
     )?;
@@ -1113,7 +1376,9 @@ fn execute(config: Config) -> Result<()> {
         publish_pending(&pending, &final_path)?;
     }
     output_owner.verify()?;
-    println!("RZ_NUMERIC_CAPTURE_STATUS={{\"status\":\"captured\",\"numerical_acceptance\":false,\"rules_legality_certified\":false,\"native_worker_joined\":true}}");
+    println!(
+        "RZ_NUMERIC_CAPTURE_STATUS={{\"status\":\"captured\",\"numerical_acceptance\":false,\"rules_legality_certified\":false,\"native_worker_joined\":true}}"
+    );
     Ok(())
 }
 fn main() -> Result<()> {
@@ -1167,6 +1432,225 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn schedule_group(role: PalsRole, bucket: usize) -> Group {
+        let role_name = format!("{role:?}");
+        let cases = (0..if bucket == 8 { 10 } else { 8 })
+            .map(|index| {
+                let token = PalsCandidateToken {
+                    from: 48,
+                    to: 56,
+                    promotion: 1,
+                };
+                let anchors = if index == 1 { 1 } else { 4 };
+                let input = PalsVirtualReviewInput {
+                    schema: model::INPUT_SCHEMA.into(),
+                    role,
+                    anchors: (0..anchors)
+                        .map(|_| model::ReviewAnchorInput {
+                            board: vec![0; 64],
+                            metadata: [0.0; 16],
+                        })
+                        .collect(),
+                    records: if index == 0 {
+                        Vec::new()
+                    } else {
+                        vec![model::ReviewRecordInput {
+                            kind: model::ReviewRecordKind::Counterexample,
+                            perspective: 1,
+                            completed_iteration: true,
+                            rules_terminal: false,
+                            line: vec![token],
+                            anchor: 0,
+                            parent: None,
+                            supersedes: None,
+                        }]
+                    },
+                    query: model::ReviewQueryInput {
+                        purpose: if role == PalsRole::Validator {
+                            model::ReviewQueryPurpose::TaskPolicy
+                        } else {
+                            model::ReviewQueryPurpose::ReplyPolicy
+                        },
+                        perspective: 1,
+                        prefix: Vec::new(),
+                        proposal: vec![token; bucket],
+                        counter: Vec::new(),
+                        counter_present: false,
+                        anchors: [0; 3],
+                    },
+                    candidates: vec![token],
+                    divergences: Vec::new(),
+                    token_budget: 512,
+                };
+                Case {
+                    id: format!("{role_name}_L{bucket}_{index}"),
+                    input: Input::VirtualReview(input),
+                }
+            })
+            .collect();
+        Group {
+            id: format!("{role_name}_L{bucket}"),
+            role,
+            line_bucket: bucket,
+            cases,
+        }
+    }
+
+    fn cumulative_stats(calls: u64) -> PalsBackendStats {
+        PalsBackendStats {
+            admitted_role_requests: calls,
+            public_cache_misses: calls,
+            public_nn_runs_attempted: calls,
+            public_nn_runs_completed: calls,
+            role_nn_runs_attempted: calls,
+            role_nn_runs_completed: calls,
+            validated_public_outputs: calls,
+            validated_role_outputs: calls,
+            completed_nn_inputs: 2 * calls,
+            ..PalsBackendStats::default()
+        }
+    }
+
+    #[test]
+    fn short_original_profile_prefix_covers_roles_without_repeating_or_reordering_raw_cases() {
+        for collection in [false, true] {
+            let roles = [PalsRole::Proposer, PalsRole::Critic, PalsRole::Validator];
+            let count = if collection { 3 } else { 2 };
+            let groups = roles[..count]
+                .iter()
+                .flat_map(|role| {
+                    model::LENGTH_BUCKETS
+                        .iter()
+                        .map(move |bucket| schedule_group(*role, *bucket))
+                })
+                .collect::<Vec<_>>();
+            let expected = groups
+                .iter()
+                .map(|group| {
+                    group
+                        .cases
+                        .iter()
+                        .map(|case| case.id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let schedule = capture_order(&groups, true, collection).unwrap();
+            assert_eq!(schedule.profile_cases, count);
+            assert_eq!(schedule.slots.len(), 50 * count);
+            assert_eq!(
+                schedule
+                    .slots
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                50 * count
+            );
+            for (slot, role) in schedule.slots[..count].iter().zip(&roles[..count]) {
+                let group = &groups[slot.group];
+                let Input::VirtualReview(input) = &group.cases[slot.case].input;
+                assert_eq!(&group.role, role);
+                assert_eq!(group.line_bucket, 8);
+                assert_eq!(slot.case, 2);
+                assert!(!input.records.is_empty());
+                assert_eq!(input.anchors.len(), 4);
+            }
+            let mut actual = groups
+                .into_iter()
+                .map(GroupCapture::from)
+                .collect::<Vec<_>>();
+            let mut restored = expected
+                .iter()
+                .map(|cases| vec![None; cases.len()])
+                .collect::<Vec<_>>();
+            let mut profile_nn_inputs = 0;
+            for (sequence, slot) in schedule.slots.iter().enumerate() {
+                let case = actual[slot.group].remaining[slot.case]
+                    .take()
+                    .expect("each original case once");
+                restored[slot.group][slot.case] = Some(case.id);
+                let delta = stage_delta(
+                    &cumulative_stats(sequence as u64),
+                    &cumulative_stats(sequence as u64 + 1),
+                    1,
+                )
+                .unwrap();
+                if sequence < schedule.profile_cases {
+                    profile_nn_inputs += delta.completed_nn_inputs;
+                }
+                actual[slot.group].stage.checked_add(delta).unwrap();
+            }
+            assert_eq!(profile_nn_inputs, 2 * count as u64);
+            for ((group, restored), expected) in actual.iter().zip(restored).zip(expected) {
+                assert!(group.remaining.iter().all(Option::is_none));
+                assert_eq!(
+                    restored.into_iter().collect::<Option<Vec<_>>>().unwrap(),
+                    expected
+                );
+                group
+                    .stage
+                    .validate_fresh_count(group.remaining.len())
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_capture_order_is_unchanged_and_missing_cuda_role_is_explicitly_refused() {
+        let groups = vec![
+            schedule_group(PalsRole::Critic, 16),
+            schedule_group(PalsRole::Proposer, 8),
+        ];
+        let schedule = capture_order(&groups, false, false).unwrap();
+        assert_eq!(schedule.profile_cases, 0);
+        assert_eq!(
+            schedule.slots,
+            (0..8)
+                .map(|case| CaptureSlot { group: 0, case })
+                .chain((0..10).map(|case| CaptureSlot { group: 1, case }))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            capture_order(&groups, true, true)
+                .err()
+                .unwrap()
+                .to_string(),
+            "capture plan lacks an original case for a registered role"
+        );
+    }
+
+    #[test]
+    fn interleaved_work_requires_adjacent_actual_deltas_and_checked_group_sums() {
+        assert_eq!(
+            stage_delta(&cumulative_stats(0), &cumulative_stats(2), 1)
+                .unwrap_err()
+                .to_string(),
+            "Fresh cache-off public/private completed work does not match captured cases"
+        );
+        assert_eq!(
+            stage_delta(&cumulative_stats(2), &cumulative_stats(1), 1)
+                .unwrap_err()
+                .to_string(),
+            "native stage counter regressed"
+        );
+        let mut sum = StageWork {
+            public_cache_hits: u64::MAX,
+            ..StageWork::default()
+        };
+        let before = serde_json::to_value(&sum).unwrap();
+        assert_eq!(
+            sum.checked_add(StageWork {
+                admitted_role_requests: 1,
+                public_cache_hits: 1,
+                ..StageWork::default()
+            })
+            .unwrap_err()
+            .to_string(),
+            "native stage delta sum overflow"
+        );
+        assert_eq!(serde_json::to_value(&sum).unwrap(), before);
+    }
 
     #[cfg(target_os = "linux")]
     struct OwnedOutputRootTestDirectory {
