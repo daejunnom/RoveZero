@@ -212,6 +212,18 @@ pub const TRUSTED_NATIVE_PROFILE: [TrustedNativeProfileEntry; 19] = [
     ),
 ];
 
+/// Exact additional CUDA runtime declaration from NVIDIA's unmodified
+/// nvidia_cuda_runtime_cu12-12.8.90 manylinux2014_x86_64 wheel.
+/// Wheel SHA-256: adade8dcbd0edf427b7204d480d6066d33902cab2a4707dcfc48a2d0fd44ab90.
+/// Member: nvidia/cuda_runtime/lib/libcudart.so.12. The remaining 18 entries,
+/// file-content/FD checks and complete-bundle requirement stay unchanged.
+/// Keep the historical declaration above readable for existing artifacts.
+pub const TRUSTED_CUDART_12_8_90_WHEEL: TrustedNativeProfileEntry = trusted(
+    "libcudart.so.12",
+    728800,
+    "c3a75b33af334a3486d197dbd1584a2985183ba4688d237a2be5f2f679329920",
+);
+
 const fn trusted(filename: &'static str, bytes: u64, sha256: &str) -> TrustedNativeProfileEntry {
     let encoded = sha256.as_bytes();
     assert!(
@@ -859,7 +871,10 @@ mod linux {
                     "library has no reviewed native admission",
                 )
             })?;
-        if admitted.bytes != bytes || admitted.digest != digest {
+        let matches = |entry: &TrustedNativeProfileEntry| {
+            entry.filename == profile[index] && entry.bytes == bytes && entry.digest == digest
+        };
+        if !matches(admitted) && !matches(&TRUSTED_CUDART_12_8_90_WHEEL) {
             return Err(LoadError::new(
                 LoadErrorKind::UntrustedProfile,
                 "library declaration differs from the reviewed native profile",
@@ -1684,6 +1699,52 @@ mod linux {
                     .unwrap_err()
                     .kind,
                 LoadErrorKind::UntrustedProfile
+            );
+        }
+
+        #[test]
+        fn reviewed_cudart_wheel_preserves_legacy_and_rejects_other_declarations() {
+            let wheel = TRUSTED_CUDART_12_8_90_WHEEL;
+            let path = Path::new("/private native/libcudart.so.12");
+            for entry in [TRUSTED_NATIVE_PROFILE[0], wheel] {
+                assert!(
+                    validate_declaration(path, entry.bytes, entry.digest, &NVIDIA_LOAD_ORDER)
+                        .is_ok()
+                );
+            }
+            let mut changed = wheel.digest;
+            changed[0] ^= 1;
+            for (name, bytes, digest) in [
+                (path, wheel.bytes + 1, wheel.digest),
+                (path, wheel.bytes, changed),
+                (
+                    Path::new("/private native/libnvJitLink.so.12"),
+                    wheel.bytes,
+                    wheel.digest,
+                ),
+            ] {
+                assert_eq!(
+                    validate_declaration(name, bytes, digest, &NVIDIA_LOAD_ORDER)
+                        .unwrap_err()
+                        .kind,
+                    LoadErrorKind::UntrustedProfile
+                );
+            }
+            let mut declared: Vec<_> = TRUSTED_NATIVE_PROFILE[..16]
+                .iter()
+                .map(|entry| OwnedLibrary {
+                    path: PathBuf::from(format!("/private native/{}", entry.filename)),
+                    file: File::open("/dev/null").unwrap(),
+                    digest: entry.digest,
+                    bytes: entry.bytes,
+                })
+                .collect();
+            declared[0].digest = wheel.digest;
+            assert!(sort_inputs(&mut declared).is_ok());
+            declared.pop();
+            assert_eq!(
+                sort_inputs(&mut declared).unwrap_err().kind,
+                LoadErrorKind::InvalidBundle
             );
         }
 
