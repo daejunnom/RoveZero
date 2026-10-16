@@ -1,0 +1,796 @@
+//! Root goal ownership beside the actual semantic Store. This bridge performs
+//! no model call, native search, archive I/O or physical completion check.
+use super::*;
+use crate::cpu_worker::CpuLedgerIdentity;
+use crate::pals::rovent_engine::RootMoveDomain;
+use crate::pals::rovent_frontier::{
+    FrontierAttachment, FrontierError, FrontierLimits, FrontierRegistration, FrontierSnapshot,
+    RoventFrontier,
+};
+use rz_contracts::rovent::ExecutionMode;
+use rz_contracts::{ClockDomain, MonotonicTick};
+
+/// Independent startup owners, supplied by the concrete manager assembly.
+/// A registration's own copies are not used to certify its root domain/ledger.
+pub struct AdaptiveFrontierStartup<'a> {
+    pub mode: ExecutionMode,
+    pub root_budget: ContractDigest,
+    pub root_moves: &'a Arc<RootMoveDomain>,
+    pub native_ledger: Option<&'a CpuLedgerIdentity>,
+}
+
+/// A copied semantic report. It attests neither GPU drain nor worker join.
+pub struct AdaptiveFrontierReceipt {
+    pub root_budget: ContractDigest,
+    pub snapshot: FrontierSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdaptiveReviewLeaseAdmission {
+    pub current: usize,
+    pub capacity: usize,
+    pub required_new_leases: usize,
+    /// The permanent frontier lease is already part of current. Only its
+    /// allocate-before-release replacement is reserved in addition here.
+    pub frontier_replacement_reserve: usize,
+    pub frontier_owner_present: bool,
+    pub may_prepare: bool,
+}
+
+/// Private original submission. PositionSnapshot shares immutable Rules
+/// history; no second tensor, policy input or Store pin is allocated here.
+#[derive(Clone)]
+pub(super) struct FrontierQuestionSource {
+    authority: SearchAuthority,
+    original_deadline: Deadline,
+    deadline: Instant,
+    position: PositionSnapshot,
+    context: ContractDigest,
+    view: ReviewViewSeal,
+    legacy: Option<std::sync::Weak<LegacyFullRoleRecords>>,
+}
+
+impl FrontierQuestionSource {
+    pub(super) fn new(
+        authority: SearchAuthority,
+        original_deadline: Deadline,
+        deadline: Instant,
+        position: PositionSnapshot,
+        context: &RoleLogicalContext,
+        view: ReviewViewSeal,
+        legacy: Option<&Arc<LegacyFullRoleRecords>>,
+    ) -> Result<Self, PalsError> {
+        Ok(Self {
+            authority,
+            original_deadline,
+            deadline,
+            position,
+            context: source_context_digest(context)?,
+            view,
+            legacy: legacy.map(Arc::downgrade),
+        })
+    }
+}
+
+impl AdaptivePortQuestion {
+    /// Check the actual private producer seal. Frame liveness/role acceptance
+    /// remains with the machine; root-to-prefix replay stays with Frontier.
+    pub fn validate_frontier_source(
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        stores: &PalsStores,
+    ) -> Result<(), PalsError> {
+        let input = &work.input;
+        let query = &input.question;
+        let source = &query.frontier_source;
+        let view = &input.view;
+        let first = query.first.ok_or(RoleError::InvalidOutput)?;
+        let first = rz_contracts::pals::Move16::encode(
+            rz_contracts::Move::try_from(first).map_err(|_| RoleError::InvalidOutput)?,
+        );
+        let actual_seal = ReviewViewSeal {
+            authority: source.authority,
+            view_sequence: view.sequence(),
+            context_policy: ContractDigest(view.policy_digest()),
+            view_digest: ContractDigest(view.seal_digest()),
+            root_state: source.view.root_state,
+            actual_tokens: view.token_count(),
+            selected_records: view.records().len() as u16,
+            anchors: view.anchors().len() as u8,
+            length_bucket: view.length_bucket(),
+        };
+        if work.frame.authority != source.authority
+            || work.original_deadline != source.original_deadline
+            || query.deadline != source.deadline
+            || input.stage != query.stage
+            || input.question_digest != query.question_digest
+            || work.original_first_move != first
+            || actual_seal != source.view
+            || input.view_seal != source.view
+            || input.public_context.0 != view.record_scope_digest()
+            || source.context != source_context_digest(&query.context)?
+            || !source.position.same_state(&query.position.snapshot())
+            || !view.validates(stores)
+            || query.context.game_generation != source.authority.game.0
+            || query.context.search_generation != source.authority.root.0
+            || stores.generation() != source.authority.root.0
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        let legacy_matches = match (&source.legacy, &query.legacy_full_records) {
+            (None, None) => true,
+            (Some(original), Some(records)) => original.upgrade().is_some_and(|original| {
+                Arc::ptr_eq(&original, records) && records.validates(stores)
+            }),
+            _ => false,
+        };
+        if !legacy_matches {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        let visible = view.query();
+        let proposal = if query.context.purpose == RoleQueryPurpose::ValueFresh {
+            query.context.prefix.as_slice()
+        } else {
+            query.proposal.as_slice()
+        };
+        let counter = if query.context.purpose == RoleQueryPurpose::ValueFresh
+            || matches!(
+                query.stage,
+                RefinementStage::CriticReply | RefinementStage::CounterContinuation
+            ) {
+            None
+        } else {
+            query.counter.as_deref()
+        };
+        let legal = if matches!(
+            query.context.purpose,
+            RoleQueryPurpose::DivergencePolicy | RoleQueryPurpose::TaskPolicy
+        ) {
+            Vec::new()
+        } else {
+            query.position.legal_moves()
+        };
+        if visible.purpose != query.context.purpose
+            || visible.prefix != query.context.prefix
+            || visible.proposal != proposal
+            || visible.counterexample.as_deref() != counter
+            || visible.legal != legal
+            || query.context.prefix_sha256 != role_line_sha256(b"prefix", &visible.prefix)?
+            || query.context.proposal_sha256 != role_line_sha256(b"proposal", &visible.proposal)?
+            || query.context.refutation_sha256
+                != visible
+                    .counterexample
+                    .as_deref()
+                    .map(|line| role_line_sha256(b"refutation", line))
+                    .transpose()?
+            || query.context.divergence_sha256 != role_divergence_sha256(&visible.divergences)?
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        let situation = stores.situations.get(query.context.situation)?;
+        if situation.state != query.context.state
+            || situation.focus != query.context.focus
+            || situation.revision < query.context.situation_revision
+            || !stores
+                .states
+                .get(query.context.state)?
+                .same_state(&query.position.snapshot())
+            || stores.lines.get(query.context.focus)?.start_state != query.context.state
+            || query.context.focus_sha256
+                != role_line_sha256(b"focus", &stores.lines.moves(query.context.focus)?)?
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        Ok(())
+    }
+}
+
+fn source_context_digest(context: &RoleLogicalContext) -> Result<ContractDigest, PalsError> {
+    let mut hash = Sha256::new();
+    hash.update(b"rz-rovent-private-role-source-context/1\0");
+    for value in [
+        context.game_generation,
+        context.search_generation,
+        context.situation.slot as u64,
+        context.situation.generation,
+        context.state.0 as u64,
+        context.focus.0 as u64,
+        context.public_revision,
+        context.situation_revision,
+    ] {
+        hash.update(value.to_le_bytes());
+    }
+    hash.update([context.purpose as u8]);
+    hash.update(role_line_sha256(b"prefix", &context.prefix)?);
+    hash.update(context.focus_sha256);
+    hash.update(context.prefix_sha256);
+    hash.update(context.proposal_sha256);
+    hash.update([u8::from(context.refutation_sha256.is_some())]);
+    if let Some(refutation) = context.refutation_sha256 {
+        hash.update(refutation);
+    }
+    hash.update(context.divergence_sha256);
+    Ok(ContractDigest(hash.finalize().into()))
+}
+
+impl<M: RoleModel> AdaptiveEnginePort<M> {
+    /// Preflight for one genuinely new selected view. Cached input/alias
+    /// return paths retain their original lease and need no new admission.
+    pub fn review_lease_admission(&self) -> Result<AdaptiveReviewLeaseAdmission, PalsError> {
+        self.review_lease_admission_for(true)
+    }
+
+    fn review_lease_admission_for(
+        &self,
+        new_selected_view: bool,
+    ) -> Result<AdaptiveReviewLeaseAdmission, PalsError> {
+        let stores = &self.engine.semantic.stores;
+        let current = stores.review_pin_count()?;
+        let capacity = stores.review_pin_capacity();
+        let frontier_owner_present = self.engine.semantic.rovent_frontier.is_some();
+        // The legacy full-input branch may also acquire an independently
+        // pinned raw snapshot. Conservatively reserve it before capture; a
+        // reused existing snapshot does not turn this declaration into work.
+        let required_new_leases = usize::from(new_selected_view)
+            + usize::from(self.engine.semantic.legacy_full_native_context);
+        let frontier_replacement_reserve = usize::from(frontier_owner_present);
+        let may_prepare = current
+            .checked_add(required_new_leases)
+            .and_then(|count| count.checked_add(frontier_replacement_reserve))
+            .is_some_and(|count| count <= capacity);
+        Ok(AdaptiveReviewLeaseAdmission {
+            current,
+            capacity,
+            required_new_leases,
+            frontier_replacement_reserve,
+            frontier_owner_present,
+            may_prepare,
+        })
+    }
+
+    pub(super) fn ensure_new_review_leases(
+        &self,
+        new_selected_view: bool,
+    ) -> Result<(), PalsError> {
+        // Existing V5 admission remains unchanged when no Rovent frontier is
+        // registered. pin_review still enforces its exact hard ceiling.
+        if self.engine.semantic.rovent_frontier.is_none() {
+            return Ok(());
+        }
+        let observed = self.review_lease_admission_for(new_selected_view)?;
+        if !observed.may_prepare {
+            return Err(StoreError::ReviewLeaseBackpressure {
+                current: observed.current,
+                capacity: observed.capacity,
+                required_new: observed.required_new_leases,
+                replacement_reserve: observed.frontier_replacement_reserve,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Startup-only attachment. No caller-supplied root Rules/Store/model
+    /// mirror can replace the owners already held by this port.
+    pub fn attach_rovent_frontier(
+        &mut self,
+        registration: FrontierRegistration,
+        limits: FrontierLimits,
+        actual: AdaptiveFrontierStartup<'_>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
+        self.check_live().map_err(|_| FrontierError::ForeignRoot)?;
+        if self.engine.semantic.rovent_frontier.is_some()
+            || self.next_question != 1
+            || !self.accepted.is_empty()
+            || !self.cpu_admissions.is_empty()
+        {
+            return Err(FrontierError::Invalid(
+                "frontier attachment after root work",
+            ));
+        }
+        let namespace = self
+            .engine
+            .semantic
+            .model
+            .registered_representation_namespace()
+            .ok_or(FrontierError::Invalid(
+                "actual native model namespace absent",
+            ))?;
+        namespace
+            .verify_identity(
+                self.engine.semantic.model.identity(),
+                self.engine.semantic.model.value_identity(),
+            )
+            .map_err(|_| FrontierError::ForeignRoot)?;
+        let frontier = RoventFrontier::new(
+            registration,
+            limits,
+            &self.engine.semantic.stores,
+            clock,
+            now,
+        )?;
+        frontier.validate_attachment(
+            FrontierAttachment {
+                authority: self.authority,
+                mode: actual.mode,
+                original_deadline: self.deadline,
+                root_budget: actual.root_budget,
+                root_rules: &self.rules,
+                root_moves: actual.root_moves,
+                root_state: self.engine.semantic.nodes[self.root].state,
+                model_namespace: namespace,
+                native_ledger: actual.native_ledger,
+            },
+            &self.engine.semantic.stores,
+        )?;
+        self.engine.semantic.rovent_frontier = Some(Box::new(frontier));
+        Ok(())
+    }
+
+    pub fn rovent_frontier(&self) -> Option<&RoventFrontier> {
+        self.engine.semantic.rovent_frontier.as_deref()
+    }
+
+    /// Disjoint borrowing of the real controller and its Store. Controller
+    /// APIs retain their own original deadline, receipt and pin validation.
+    /// Late known-work settlement remains possible after admission closes.
+    pub fn with_rovent_frontier<T>(
+        &mut self,
+        apply: impl FnOnce(&mut RoventFrontier, &PalsStores) -> Result<T, FrontierError>,
+    ) -> Result<Option<T>, FrontierError> {
+        let semantic = &mut self.engine.semantic;
+        semantic
+            .rovent_frontier
+            .as_deref_mut()
+            .map(|frontier| apply(frontier, &semantic.stores))
+            .transpose()
+    }
+
+    /// Always available for evidence recovery, including stopped/unknown work.
+    /// This copy neither releases pins nor refunds outstanding reservations.
+    pub fn rovent_frontier_receipt(&self) -> Option<AdaptiveFrontierReceipt> {
+        self.rovent_frontier()
+            .map(|frontier| AdaptiveFrontierReceipt {
+                root_budget: frontier.registration().root_budget,
+                snapshot: frontier.snapshot(),
+            })
+    }
+
+    /// The concrete owner must first drain role/CPU workers and recover this
+    /// receipt. Unknown/outstanding native usage keeps the opaque owner beside
+    /// its Store, including across legacy into_engine ownership transfers.
+    /// A successful retirement makes no goal-success or physical-fence claim.
+    pub fn retire_rovent_frontier(
+        &mut self,
+    ) -> Result<Option<AdaptiveFrontierReceipt>, FrontierError> {
+        let Some(receipt) = self.rovent_frontier_receipt() else {
+            return Ok(None);
+        };
+        if !receipt.snapshot.work.native_usage_known
+            || receipt.snapshot.work.outstanding_native_executions != 0
+            || receipt.snapshot.work.reserved_native_nodes != 0
+            || self
+                .cpu_admissions
+                .values()
+                .any(|admission| admission.grant.is_some() || admission.continuation_retained)
+        {
+            return Err(FrontierError::NativeUnknown);
+        }
+        self.engine.semantic.rovent_frontier.take();
+        Ok(Some(receipt))
+    }
+
+    pub(super) fn root_move_allowed(&self, movement: BoardMove) -> bool {
+        self.rovent_frontier()
+            .is_none_or(|frontier| frontier.root_moves().allowed().contains(&movement))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Authored CPU/mock native receipts exercise contract custody only. None
+    // of these fixtures runs a role model or establishes GPU/Fresh execution.
+    use super::*;
+    use crate::contract_time::InstantClock;
+    use crate::cpu_worker::CpuCreditLedger;
+    use crate::pals::coordinator::{
+        AcceptedRoleStep, NativeAcceptanceIssuer, PhysicalRoleCompletion, RoleCompletion,
+        RoleSubmission, RoleTicketRegistry,
+    };
+    use crate::pals::rovent_frontier::{FrontierFrameKind, FrontierGoalStatus};
+    use rz_contracts::ExecutionId;
+    use rz_contracts::rovent::SearchGoal;
+    use rz_runtime::adaptive::CoordinatorPolicy;
+    use std::num::NonZeroU16;
+
+    type Port = AdaptiveEnginePort<LegalOrderRoleMock>;
+    type Work = CoordinatorWork<ReviewView, AdaptivePortQuestion>;
+
+    fn controller(port: &Port) -> RoventFrontier {
+        let domain = Arc::new(RootMoveDomain::new(&port.rules, None).unwrap());
+        let value = port.engine.semantic.model.value_identity().unwrap().clone();
+        let namespace = Arc::new(
+            AdaptiveModelNamespace::new(
+                value,
+                ContractDigest([5; 32]),
+                ContractDigest([6; 32]),
+                rz_contracts::PrecisionProfile::Fp32,
+                1,
+            )
+            .unwrap(),
+        );
+        let ledger = CpuCreditLedger::new(
+            port.authority,
+            2000,
+            InstantClock::new(port.deadline.clock, Instant::now()),
+        )
+        .unwrap();
+        RoventFrontier::new(
+            FrontierRegistration {
+                authority: port.authority,
+                mode: ExecutionMode::CpuPcr,
+                original_deadline: port.deadline,
+                root_budget: ContractDigest([10; 32]),
+                goal: SearchGoal {
+                    depth_plies: NonZeroU16::new(2),
+                    mate_moves: None,
+                },
+                nodes: Some(2000),
+                selective_policy: ContractDigest([11; 32]),
+                root_rules: Arc::clone(&port.rules),
+                root_moves: domain,
+                root_state: port.engine.semantic.nodes[port.root].state,
+                model_namespace: namespace,
+                native_ledger: Some(ledger.identity()),
+            },
+            FrontierLimits {
+                maximum_goal_plies: NonZeroU16::new(16).unwrap(),
+                maximum_frames: 16,
+                maximum_paths: 64,
+                maximum_mate_nodes: 64,
+                maximum_native_receipts: 16,
+            },
+            &port.engine.semantic.stores,
+            port.deadline.clock,
+            MonotonicTick(0),
+        )
+        .unwrap()
+    }
+
+    fn accepted(work: &Work) -> (AcceptedRoleStep, RoleOutput) {
+        let (expected, output) = super::super::port_tests::output(work, 1);
+        let mut registry =
+            RoleTicketRegistry::new(work.frame.authority, 512, CoordinatorPolicy::Fixed, 1)
+                .unwrap();
+        let ticket = registry
+            .admit(
+                RoleSubmission {
+                    question: expected.question,
+                    view: expected.view,
+                    representation: expected.representation,
+                    role: expected.role,
+                    original_deadline: expected.original_deadline,
+                },
+                Arc::clone(&work.input.view),
+                work.original_deadline.clock,
+                MonotonicTick(0),
+            )
+            .unwrap();
+        assert_eq!(ticket, expected);
+        registry.take_dispatch().unwrap();
+        registry
+            .complete_reciprocal_role(RoleCompletion {
+                ticket,
+                physical: PhysicalRoleCompletion::Confirmed,
+                result: Ok(output.clone()),
+            })
+            .unwrap();
+        registry
+            .take_ready(work.original_deadline.clock, MonotonicTick(0))
+            .unwrap();
+        let (issuer, verifier) = NativeAcceptanceIssuer::new_pair();
+        registry
+            .register_native_acceptance_verifier(verifier)
+            .unwrap();
+        let permit = registry
+            .issue_reciprocal_native_acceptance(
+                &ticket,
+                work.original_deadline.clock,
+                MonotonicTick(0),
+            )
+            .unwrap();
+        let accepted = registry
+            .accept_reciprocal_native(
+                issuer.issue_success(permit),
+                work.original_deadline.clock,
+                MonotonicTick(0),
+            )
+            .unwrap();
+        (accepted, output)
+    }
+
+    fn fresh_descendant(port: &mut Port, source: &Work) -> Work {
+        let prefix = vec![
+            BoardMove::from_uci("e2e4").unwrap(),
+            BoardMove::from_uci("e7e5").unwrap(),
+        ];
+        let node = port.replay_node(&prefix).unwrap();
+        let input = port
+            .input(
+                node,
+                RefinementStage::ProposalValueFresh,
+                Some(prefix[0]),
+                prefix.clone(),
+                prefix,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        Work {
+            input,
+            ..source.clone()
+        }
+    }
+
+    #[test]
+    fn private_frontier_source_rejects_cloned_public_field_changes() {
+        let mut port = super::super::port_tests::setup(Position::startpos(), 4);
+        let work = super::super::port_tests::work(
+            &mut port,
+            "e2e4",
+            RefinementStage::ProposalContinuation,
+            1,
+        );
+        AdaptivePortQuestion::validate_frontier_source(&work, &port.engine.semantic.stores)
+            .unwrap();
+        let mut changed = work.clone();
+        Arc::make_mut(&mut changed.input.question)
+            .context
+            .public_revision += 1;
+        assert!(
+            AdaptivePortQuestion::validate_frontier_source(&changed, &port.engine.semantic.stores)
+                .is_err()
+        );
+        let mut changed = work.clone();
+        Arc::make_mut(&mut changed.input.question).deadline += Duration::from_millis(1);
+        assert!(
+            AdaptivePortQuestion::validate_frontier_source(&changed, &port.engine.semantic.stores)
+                .is_err()
+        );
+        let mut changed = work.clone();
+        let fen = changed.input.question.position.to_fen();
+        Arc::make_mut(&mut changed.input.question).position = Position::from_fen(&fen).unwrap();
+        assert!(
+            AdaptivePortQuestion::validate_frontier_source(&changed, &port.engine.semantic.stores)
+                .is_err()
+        );
+        let mut changed = work.clone();
+        changed.original_deadline.at.0 += 1;
+        assert!(
+            AdaptivePortQuestion::validate_frontier_source(&changed, &port.engine.semantic.stores)
+                .is_err()
+        );
+        let replacement = super::super::port_tests::work(
+            &mut port,
+            "d2d4",
+            RefinementStage::ProposalContinuation,
+            2,
+        );
+        let mut changed = work.clone();
+        changed.input.view = replacement.input.view;
+        changed.input.view_seal = replacement.input.view_seal;
+        changed.input.public_context = replacement.input.public_context;
+        assert!(
+            AdaptivePortQuestion::validate_frontier_source(&changed, &port.engine.semantic.stores)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn actual_local_fresh_descendant_closes_only_its_own_responsibility() {
+        let mut port = super::super::port_tests::setup(Position::startpos(), 4);
+        let work = super::super::port_tests::work(
+            &mut port,
+            "e2e4",
+            RefinementStage::ProposalContinuation,
+            1,
+        );
+        let mut frontier = controller(&port);
+        let mut obligations = Vec::new();
+        for kind in [
+            FrontierFrameKind::Candidate,
+            FrontierFrameKind::Counter,
+            FrontierFrameKind::Repair,
+        ] {
+            obligations.push(
+                frontier
+                    .register_local_frame(
+                        &work,
+                        &port.engine.semantic.stores,
+                        kind,
+                        port.deadline.clock,
+                        MonotonicTick(0),
+                    )
+                    .unwrap(),
+            );
+        }
+        let endpoint = fresh_descendant(&mut port, &work);
+        let path = frontier
+            .observe_local_question(
+                &endpoint,
+                &port.engine.semantic.stores,
+                port.deadline.clock,
+                MonotonicTick(0),
+            )
+            .unwrap();
+        let (accepted, output) = accepted(&endpoint);
+        let physical = AdaptivePortRoleEvidence {
+            execution: Some(ExecutionId::new(port.authority.epoch, 1)),
+            completed_nn_inputs: Some(1),
+            measurement_complete: true,
+            physical_fresh: Some(true),
+        };
+        let mut incomplete = physical;
+        incomplete.physical_fresh = Some(false);
+        assert_eq!(
+            frontier.accept_local_fresh_endpoint(
+                obligations[0],
+                &endpoint,
+                &port.engine.semantic.stores,
+                path,
+                &accepted,
+                &output,
+                incomplete,
+                port.deadline.clock,
+                MonotonicTick(0),
+            ),
+            Err(FrontierError::MissingAcceptance)
+        );
+        let mut changed = output.clone();
+        let RolePayload::Proposal {
+            candidate_logits, ..
+        } = &mut changed.payload
+        else {
+            unreachable!("Fresh fixture returns the P head");
+        };
+        candidate_logits[0] += 1.0;
+        assert_eq!(
+            frontier.accept_local_fresh_endpoint(
+                obligations[0],
+                &endpoint,
+                &port.engine.semantic.stores,
+                path,
+                &accepted,
+                &changed,
+                physical,
+                port.deadline.clock,
+                MonotonicTick(0),
+            ),
+            Err(FrontierError::MissingAcceptance)
+        );
+        frontier
+            .accept_local_fresh_endpoint(
+                obligations[0],
+                &endpoint,
+                &port.engine.semantic.stores,
+                path,
+                &accepted,
+                &output,
+                physical,
+                port.deadline.clock,
+                MonotonicTick(0),
+            )
+            .unwrap();
+        frontier
+            .seal_selected_policy(port.deadline.clock, MonotonicTick(0))
+            .unwrap();
+        let snapshot = frontier.snapshot();
+        assert_eq!(snapshot.completed_frames, 1);
+        assert_eq!(snapshot.horizon.declared_obligations, 3);
+        assert_eq!(snapshot.horizon.completed_obligations, 1);
+        assert_eq!(snapshot.goal, FrontierGoalStatus::Pending);
+    }
+
+    #[test]
+    fn actual_local_rules_terminal_closes_early_without_inventing_depth() {
+        let mut port = super::super::port_tests::setup(
+            Position::from_fen("7k/8/5KQ1/8/8/8/8/8 w - - 0 1").unwrap(),
+            4,
+        );
+        let work =
+            super::super::port_tests::work(&mut port, "g6g7", RefinementStage::CpuValidation, 1);
+        let mut frontier = controller(&port);
+        let obligation = frontier
+            .register_local_frame(
+                &work,
+                &port.engine.semantic.stores,
+                FrontierFrameKind::Candidate,
+                port.deadline.clock,
+                MonotonicTick(0),
+            )
+            .unwrap();
+        let endpoint = frontier
+            .observe_local_question(
+                &work,
+                &port.engine.semantic.stores,
+                port.deadline.clock,
+                MonotonicTick(0),
+            )
+            .unwrap();
+        frontier
+            .accept_local_rules_endpoint(
+                obligation,
+                &work,
+                &port.engine.semantic.stores,
+                endpoint,
+                port.deadline.clock,
+                MonotonicTick(0),
+            )
+            .unwrap();
+        frontier
+            .seal_selected_policy(port.deadline.clock, MonotonicTick(0))
+            .unwrap();
+        let snapshot = frontier.snapshot();
+        assert!(snapshot.horizon.target_satisfied);
+        assert_eq!(snapshot.horizon.completed_depth.unwrap().0, 1);
+        assert_eq!(snapshot.horizon.maximum_examined_ply.0, 1);
+        assert_eq!(snapshot.goal, FrontierGoalStatus::DepthSatisfied);
+    }
+
+    #[test]
+    fn frontier_lease_gate_preserves_replacement_without_changing_the_hard_ceiling() {
+        let mut port = super::super::port_tests::setup(Position::startpos(), 4);
+        let frontier = controller(&port);
+        port.engine.semantic.rovent_frontier = Some(Box::new(frontier));
+        let stores = &port.engine.semantic.stores;
+        let capacity = stores.review_pin_capacity();
+        assert_eq!(capacity, 16);
+        let mut held = Vec::new();
+        while stores.review_pin_count().unwrap() < capacity - 1 {
+            held.push(stores.pin_review(Default::default()).unwrap());
+        }
+        let observed = port.review_lease_admission().unwrap();
+        assert_eq!(observed.current, capacity - 1);
+        assert_eq!(observed.frontier_replacement_reserve, 1);
+        assert!(!observed.may_prepare);
+        assert!(matches!(
+            port.ensure_new_review_leases(true),
+            Err(PalsError::Store(StoreError::ReviewLeaseBackpressure { .. }))
+        ));
+        // A frozen existing view needs no new selected lease. It does not
+        // spend the replacement slot or fabricate another ticket/NN input.
+        port.ensure_new_review_leases(false).unwrap();
+        let last = port
+            .engine
+            .semantic
+            .stores
+            .pin_review(Default::default())
+            .unwrap();
+        assert_eq!(
+            port.engine.semantic.stores.review_pin_count().unwrap(),
+            capacity
+        );
+        drop(last);
+        held.pop();
+        assert!(port.review_lease_admission().unwrap().may_prepare);
+        port.ensure_new_review_leases(true).unwrap();
+    }
+
+    #[test]
+    fn legacy_engine_transfer_retains_the_frontier_and_original_budget() {
+        let mut port = super::super::port_tests::setup(Position::startpos(), 4);
+        let frontier = controller(&port);
+        let budget = frontier.registration().root_budget;
+        port.engine.semantic.rovent_frontier = Some(Box::new(frontier));
+        let engine = port.into_engine();
+        let retained = engine.semantic.rovent_frontier.as_ref().unwrap();
+        assert_eq!(retained.registration().root_budget, budget);
+        assert_eq!(retained.snapshot().work.root_entries, 1);
+        assert!(engine.semantic.ensure_frontier_retired().is_err());
+    }
+}

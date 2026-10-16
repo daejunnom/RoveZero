@@ -98,6 +98,128 @@ impl AcceptedRoleStep {
             && output.key == self.ticket.representation
             && native_acceptance_output_digest(output).ok() == Some(self.output_digest)
     }
+
+    /// A local accepted checkpoint is not a fictitious P->P or R->P message.
+    /// Only an actual peer envelope may populate QuestionEnvelope.parent.
+    pub fn origin(
+        &self,
+        frame: super::FrameId,
+        peer: Option<rz_contracts::rovent::QuestionEnvelope>,
+    ) -> Result<AcceptedRoleOrigin, CoordinatorError> {
+        if frame.authority != self.ticket.authority || frame.sequence == 0 {
+            return Err(CoordinatorError::IdentityMismatch("accepted source frame"));
+        }
+        if let Some(peer) = peer {
+            let recipient = match self.ticket.role {
+                Role::Proposer => rz_contracts::rovent::SearchRecipient::Proposer,
+                Role::Critic => rz_contracts::rovent::SearchRecipient::Critic,
+                Role::Validator => {
+                    return Err(CoordinatorError::InvalidTransition(
+                        "V is not a reciprocal source",
+                    ));
+                }
+            };
+            if peer.id.authority != self.ticket.authority
+                || peer.question_digest != self.ticket.question
+                || peer.view != self.ticket.view
+                || peer.recipient != recipient
+                || peer.original_deadline != self.ticket.original_deadline
+            {
+                return Err(CoordinatorError::IdentityMismatch(
+                    "actual peer source ticket/view",
+                ));
+            }
+        }
+        Ok(AcceptedRoleOrigin {
+            frame,
+            ticket: self.ticket,
+            output_digest: self.output_digest,
+            kind: peer.map_or(
+                AcceptedRoleOriginKind::LocalAccepted,
+                AcceptedRoleOriginKind::PeerQuestion,
+            ),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcceptedRoleOriginKind {
+    LocalAccepted,
+    PeerQuestion(rz_contracts::rovent::QuestionEnvelope),
+}
+
+/// Opaque origin relation, not a peer question and not new execution credit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcceptedRoleOrigin {
+    frame: super::FrameId,
+    ticket: RoleTicketEnvelope,
+    output_digest: Digest,
+    kind: AcceptedRoleOriginKind,
+}
+impl AcceptedRoleOrigin {
+    pub fn frame(&self) -> super::FrameId {
+        self.frame
+    }
+    pub fn ticket(&self) -> &RoleTicketEnvelope {
+        &self.ticket
+    }
+    pub fn output_digest(&self) -> Digest {
+        self.output_digest
+    }
+    pub fn kind(&self) -> AcceptedRoleOriginKind {
+        self.kind
+    }
+    pub fn matches(&self, accepted: &AcceptedRoleStep) -> bool {
+        self.ticket == accepted.ticket && self.output_digest == accepted.output_digest
+    }
+    /// Invocation seal includes actual source ownership/issuance. It is kept
+    /// outside the model input and semantic deduplication digest.
+    pub fn seal_digest(&self) -> Digest {
+        let mut hash = Sha256::new();
+        hash.update(b"rz-rovent-accepted-local-origin-seal/1\0");
+        hash.update(self.frame.sequence.to_le_bytes());
+        hash.update(self.ticket.id.sequence.to_le_bytes());
+        hash.update(self.ticket.authority.epoch.0.to_le_bytes());
+        hash.update(self.ticket.authority.game.0.to_le_bytes());
+        hash.update(self.ticket.authority.root.0.to_le_bytes());
+        hash.update(self.ticket.authority.implementation.0);
+        hash.update(self.ticket.question.0);
+        hash.update(self.ticket.view.view_digest.0);
+        hash.update(self.ticket.view.view_sequence.to_le_bytes());
+        hash.update(self.output_digest.0);
+        for digest in [
+            self.ticket.representation.input,
+            self.ticket.representation.history,
+            self.ticket.representation.candidates,
+            self.ticket.representation.mask_positions,
+            self.ticket.representation.model,
+            self.ticket.representation.encoding,
+        ] {
+            hash.update(digest.0);
+        }
+        hash.update(self.ticket.representation.frozen_epoch.to_le_bytes());
+        hash.update(self.ticket.representation.record_revision.to_le_bytes());
+        hash.update([self.ticket.role as u8]);
+        match self.ticket.representation.precision {
+            rz_contracts::PrecisionProfile::Fp32 => hash.update([0]),
+            rz_contracts::PrecisionProfile::Fp16 => hash.update([1]),
+            rz_contracts::PrecisionProfile::Bf16 => hash.update([2]),
+            rz_contracts::PrecisionProfile::Quantized(profile) => {
+                hash.update([3]);
+                hash.update(profile.0);
+            }
+        }
+        hash.update(self.ticket.original_deadline.at.0.to_le_bytes());
+        match self.kind {
+            AcceptedRoleOriginKind::LocalAccepted => hash.update([0]),
+            AcceptedRoleOriginKind::PeerQuestion(peer) => {
+                hash.update([1]);
+                hash.update(peer.id.sequence.to_le_bytes());
+                hash.update(peer.question_digest.0);
+            }
+        }
+        Digest(hash.finalize().into())
+    }
 }
 
 impl<V, O> RoleTicketRegistry<V, O> {

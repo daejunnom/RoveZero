@@ -4,7 +4,10 @@
 //! bounded mailbox와 보존된 증거만 다루며, Rules 재생·pipe·stop/drain은 이
 //! worker에서 수행한다. 외부 reported depth/nodes/CP/mate는 Rules 증명이 아니다.
 
-use super::worker::{ExternalWorkerClock, ExternalWorkerStartup, external_evaluation_namespace};
+use super::worker::{
+    ExternalWorkerClock, ExternalWorkerStartup, external_evaluation_namespace,
+    external_root_restriction_digest,
+};
 use super::*;
 use rz_contracts::pals::SearchAuthority;
 use rz_contracts::pals_adaptive::CpuWorkerId;
@@ -62,6 +65,7 @@ pub struct ProfiledExternalDispatch {
     purpose: ExternalEnginePurpose,
     evaluation_namespace: Digest,
     process: ExternalProcessIdentity,
+    root_restriction: Digest,
 }
 
 impl ProfiledExternalDispatch {
@@ -76,6 +80,9 @@ impl ProfiledExternalDispatch {
     }
     pub fn process_identity(&self) -> ExternalProcessIdentity {
         self.process
+    }
+    pub fn root_restriction(&self) -> Digest {
+        self.root_restriction
     }
 }
 
@@ -116,6 +123,7 @@ pub struct ProfiledExternalCompletion {
     controls: ControlSnapshot,
     timing: ProfiledExternalTiming,
     go_issue: ExternalGoIssue,
+    root_restriction: Digest,
 }
 
 impl ProfiledExternalCompletion {
@@ -143,6 +151,9 @@ impl ProfiledExternalCompletion {
     pub fn process_identity(&self) -> Option<ExternalProcessIdentity> {
         self.process
     }
+    pub fn root_restriction(&self) -> Digest {
+        self.root_restriction
+    }
     pub fn matches_submission(&self, dispatch: &ProfiledExternalDispatch) -> bool {
         self.question == dispatch.question
             && self.scope == dispatch.scope
@@ -151,6 +162,7 @@ impl ProfiledExternalCompletion {
             && self.purpose == dispatch.purpose
             && self.evaluation_namespace == dispatch.evaluation_namespace
             && self.process == Some(dispatch.process)
+            && self.root_restriction == dispatch.root_restriction
     }
 }
 
@@ -225,6 +237,22 @@ struct TimedJob {
     original: ProfiledExternalJob,
     admitted_at: Instant,
 }
+
+/// Original bounded process output, retained only after the owner finished its
+/// shutdown attempt. Absence is unknown, not evidence of an empty transcript.
+#[derive(Clone, Debug)]
+pub struct ProfiledExternalDiagnostics {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+impl ProfiledExternalDiagnostics {
+    pub fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+    pub fn stderr(&self) -> &[u8] {
+        &self.stderr
+    }
+}
 type Mailbox = WorkerMailbox<TimedJob, ProfiledExternalCompletion, ProfiledExternalProgress>;
 
 pub struct ProfiledExternalWorker {
@@ -240,6 +268,7 @@ pub struct ProfiledExternalWorker {
     roots: Arc<Mutex<RootState>>,
     thread: Option<JoinHandle<Result<CheckerShutdown, CheckerError>>>,
     joined: Option<Result<CheckerShutdown, CheckerError>>,
+    diagnostics: Arc<Mutex<Option<ProfiledExternalDiagnostics>>>,
 }
 
 impl ProfiledExternalWorker {
@@ -295,6 +324,8 @@ impl ProfiledExternalWorker {
             execution_high_water: 0,
             last_question: None,
         }));
+        let diagnostics = Arc::new(Mutex::new(None));
+        let worker_diagnostics = diagnostics.clone();
         let (
             worker_config,
             worker_mailbox,
@@ -326,6 +357,7 @@ impl ProfiledExternalWorker {
                     worker_startup,
                     worker_roots,
                     launch_pin,
+                    worker_diagnostics,
                 )
             })
             .map_err(|_| error("profiled_worker", "thread_spawn"))?;
@@ -342,6 +374,7 @@ impl ProfiledExternalWorker {
             roots,
             thread: Some(thread),
             joined: None,
+            diagnostics,
         })
     }
 
@@ -416,6 +449,7 @@ impl ProfiledExternalWorker {
             purpose: self.purpose,
             evaluation_namespace: external_evaluation_namespace(&self.config.identity)?,
             process,
+            root_restriction: external_root_restriction_digest(job.root_moves.as_deref()),
         };
         self.mailbox
             .admit(
@@ -533,6 +567,13 @@ impl ProfiledExternalWorker {
     }
     pub fn shutdown_snapshot(&self) -> Option<Result<CheckerShutdown, CheckerError>> {
         self.joined.clone()
+    }
+    pub fn take_diagnostics_after_join(&mut self) -> Option<ProfiledExternalDiagnostics> {
+        self.joined.as_ref()?;
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
     }
 }
 
@@ -811,6 +852,7 @@ fn run_worker(
     startup_report: Arc<Mutex<Option<ExternalWorkerStartup>>>,
     roots: Arc<Mutex<RootState>>,
     launch_pin: Option<ExternalLaunchPin>,
+    diagnostics: Arc<Mutex<Option<ProfiledExternalDiagnostics>>>,
 ) -> Result<CheckerShutdown, CheckerError> {
     let mut checker = ExternalUciCpuChecker::create_profiled(config.clone(), profile, purpose)?;
     checker.launch_pin = launch_pin;
@@ -997,6 +1039,7 @@ fn run_worker(
                 controls,
                 timing: retained_timing,
                 go_issue: checker.go_issue,
+                root_restriction: external_root_restriction_digest(job.root_moves.as_deref()),
             };
             let published = if panicked {
                 supervisor.publish(completion)
@@ -1102,7 +1145,13 @@ fn run_worker(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .unwrap_or_else(|| Instant::now() + config.shutdown_grace);
-    checker.shutdown(until)
+    let result = checker.shutdown(until);
+    let (stdout, stderr) = checker.diagnostic_output();
+    *diagnostics.lock().unwrap_or_else(|p| p.into_inner()) = Some(ProfiledExternalDiagnostics {
+        stdout: stdout.to_vec(),
+        stderr: stderr.to_vec(),
+    });
+    result
 }
 
 #[cfg(test)]

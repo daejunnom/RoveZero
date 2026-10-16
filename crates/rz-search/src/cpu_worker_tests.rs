@@ -366,6 +366,83 @@ fn native_private_worker_slices_settle_once_and_match_uninterrupted_work() {
 }
 
 #[test]
+fn settled_slice_receipts_bind_one_ledger_and_never_reissue_work() {
+    let cpu = engine(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+    let clock = clock();
+    let envelope = job(&cpu, Position::startpos(), None, &clock, CpuWorkerId(0), 8).envelope();
+    let mut first_ledger = ledger(envelope, clock);
+    let second_ledger = ledger(envelope, clock);
+    let identity = first_ledger.identity();
+    assert_eq!(identity, first_ledger.identity());
+    assert_ne!(identity, second_ledger.identity());
+    first_ledger.register(envelope).unwrap();
+    let reserved = grant(envelope, CpuWorkerId(0), 1, 4);
+    first_ledger.reserve(reserved).unwrap();
+    let report = observed_report(reserved, 2, 2, false);
+    let receipt = first_ledger.settle_attested(&report).unwrap();
+    assert_eq!(receipt.ledger_identity(), &identity);
+    assert_eq!(receipt.grant(), reserved);
+    assert_eq!(receipt.actual_work().nodes, 2);
+    assert!(!receipt.admission_rejected());
+    assert!(!receipt.terminal());
+    assert_eq!(first_ledger.global_usage().unwrap(), (2, 0));
+    assert!(matches!(
+        first_ledger.settle_attested(&report),
+        Err(CpuWorkerError::Duplicate)
+    ));
+    assert_eq!(first_ledger.global_usage().unwrap(), (2, 0));
+
+    let next = grant(envelope, CpuWorkerId(0), 2, 3);
+    first_ledger.reserve(next).unwrap();
+    let mut unknown = observed_report(next, 1, 3, true);
+    unknown.actual_work = None;
+    assert!(matches!(
+        first_ledger.settle_attested(&unknown),
+        Err(CpuWorkerError::UnknownUsage)
+    ));
+    assert_eq!(first_ledger.usage(envelope.id).unwrap(), (2, 3, true));
+}
+
+#[test]
+fn unqueued_release_and_worker_rejection_have_distinct_accounting_receipts() {
+    let cpu = engine(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+    let clock = clock();
+    let envelope = job(&cpu, Position::startpos(), None, &clock, CpuWorkerId(0), 8).envelope();
+    let mut credits = ledger(envelope, clock);
+    credits.register(envelope).unwrap();
+    let first = grant(envelope, CpuWorkerId(0), 1, 4);
+    credits.reserve(first).unwrap();
+    assert!(matches!(
+        credits.release_unadmitted_attested(&CpuAdmissionRejection {
+            grant: first,
+            verified_unqueued: false,
+        }),
+        Err(CpuWorkerError::UnknownUsage)
+    ));
+    assert_eq!(credits.usage(envelope.id).unwrap(), (0, 4, false));
+    let released = credits
+        .release_unadmitted_attested(&CpuAdmissionRejection {
+            grant: first,
+            verified_unqueued: true,
+        })
+        .unwrap();
+    assert_eq!(released.ledger_identity(), &credits.identity());
+    assert_eq!(released.grant(), first);
+    assert_eq!(credits.global_usage().unwrap(), (0, 0));
+    let second = grant(envelope, CpuWorkerId(0), 2, 4);
+    credits.reserve(second).unwrap();
+    let mut rejected = observed_report(second, 0, 0, false);
+    rejected.admission_rejected = true;
+    rejected.continuation_retained = false;
+    rejected.result = Err(CpuError::Unsupported("authored worker rejection"));
+    let settled = credits.settle_attested(&rejected).unwrap();
+    assert!(settled.admission_rejected());
+    assert_eq!(settled.actual_work(), CpuWork::default());
+    assert_eq!(settled.grant(), second);
+    assert_eq!(credits.global_usage().unwrap(), (0, 0));
+}
+
+#[test]
 fn ledger_rejects_overreservation_duplicate_and_owner_migration_without_refund() {
     let cpu = engine(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
     let clock = clock();

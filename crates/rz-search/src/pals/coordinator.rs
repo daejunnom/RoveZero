@@ -32,6 +32,9 @@ pub enum CoordinatorError {
     Capacity(&'static str),
     IdentityMismatch(&'static str),
     InvalidTransition(&'static str),
+    /// This exact input/evidence was already retired. Optional follow-ups may
+    /// skip it, without minting a frame, dependency or additional work credit.
+    ReciprocalNoProgress,
     Duplicate,
     UnknownRequest,
     Deadline,

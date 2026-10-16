@@ -355,9 +355,7 @@ fn a_new_view_issuance_does_not_reopen_completed_identical_semantics() {
             deadline().clock,
             MonotonicTick(0)
         ),
-        Err(CoordinatorError::InvalidTransition(
-            "unchanged reciprocal question made no new progress"
-        ))
+        Err(CoordinatorError::ReciprocalNoProgress)
     );
     assert_eq!(machine.waiting_on(parent), None);
 }
@@ -462,9 +460,7 @@ fn joined_question_runs_once_and_refunds_only_the_allocating_parent() {
             deadline().clock,
             MonotonicTick(0)
         ),
-        Err(CoordinatorError::InvalidTransition(
-            "unchanged reciprocal question made no new progress"
-        ))
+        Err(CoordinatorError::ReciprocalNoProgress)
     ));
     assert_eq!(
         machine

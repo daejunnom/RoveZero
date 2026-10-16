@@ -21,13 +21,17 @@ mod cpu_commit;
 mod external_commit;
 #[cfg(test)]
 mod fixed_trace_tests;
+mod frontier_port;
 mod legacy_full_context;
 mod model_namespace;
 #[cfg(test)]
 mod port_tests;
 mod reciprocal_port;
 mod role_commit;
-pub use reciprocal_port::{AdaptiveAcceptedReciprocalAnswer, AdaptiveCpuReciprocalQuestion};
+pub use reciprocal_port::{
+    AdaptiveAcceptedReciprocalAnswer, AdaptiveCpuReciprocalQuestion, AdaptivePeerQuestion,
+    AdaptiveSourceOpinion,
+};
 pub mod validator_port;
 pub use branch_queue::{AdaptiveDeferredRepair, AdaptiveQueuedRecheck};
 pub use consumption_observation::{
@@ -40,6 +44,9 @@ pub use continuation_blueprint::{
     AdaptiveContinuationBlueprint, AdaptivePortMaterializedStep, AdaptivePortTransition,
 };
 pub use external_commit::{AdaptiveForeignPublication, AdaptivePortExternalQuestion};
+pub use frontier_port::{
+    AdaptiveFrontierReceipt, AdaptiveFrontierStartup, AdaptiveReviewLeaseAdmission,
+};
 pub use legacy_full_context::LegacyFullRoleRecords;
 pub use model_namespace::AdaptiveModelNamespace;
 pub mod archive_worker;
@@ -139,6 +146,7 @@ pub struct AdaptivePortQuestion {
     paired_repaired: Option<ObservationId>,
     paired_fresh_seal: Option<FreshPairSeal>,
     question_digest: ContractDigest,
+    frontier_source: frontier_port::FrontierQuestionSource,
     // Observer-only inline Copy metadata. Never hashed, encoded, selected or
     // consulted by Rules, a cache, acceptance, scheduling or the model.
     diagnostic_repair_line: Option<AdaptiveRepairLineProvenance>,
@@ -587,19 +595,26 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         registration: Option<super::adaptive_root::AdaptiveRootRegistration>,
     ) -> Result<Self, (PalsEngine<M>, PalsError)> {
         let prepared = (|| -> Result<(usize, Arc<ContractState>), PalsError> {
-            if engine.review_index.is_none()
-                || engine.review_policy.is_none()
+            if engine.semantic.review_index.is_none()
+                || engine.semantic.review_policy.is_none()
                 || limits.max_rounds == 0
                 || limits.max_cpu_nodes == 0
                 || limits.cpu_depth == 0
                 || deadline.clock.0 != authority.epoch
-                || engine.game_generation != Some(authority.game.0)
+                || engine.semantic.game_generation != Some(authority.game.0)
                 || Instant::now() >= limits.deadline
             {
                 return Err(PalsError::InvalidLimits);
             }
-            if engine.model.requires_registered_representation_namespace()
-                && engine.model.registered_representation_namespace().is_none()
+            if engine
+                .semantic
+                .model
+                .requires_registered_representation_namespace()
+                && engine
+                    .semantic
+                    .model
+                    .registered_representation_namespace()
+                    .is_none()
             {
                 return Err(RoleError::Unsupported(
                     "native representation namespace is not registered",
@@ -617,19 +632,22 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     )?;
                 }
                 None => {
-                    engine.stores.hot_focus_actual_moves(position.snapshot())?;
+                    engine
+                        .semantic
+                        .stores
+                        .hot_focus_actual_moves(position.snapshot())?;
                 }
             }
-            if engine.stores.generation() != authority.root.0 {
+            if engine.semantic.stores.generation() != authority.root.0 {
                 return Err(StoreError::StaleConsumer.into());
             }
             let root = Self::intern_hot(&mut engine, position.clone())?;
-            for node in &mut engine.nodes {
+            for node in &mut engine.semantic.nodes {
                 node.model_value = None;
                 node.model_observation = None;
                 node.model_value_revision = None;
             }
-            engine.refresh_projection(engine.nodes[root].state);
+            engine.refresh_projection(engine.semantic.nodes[root].state);
             let rules = Arc::new(
                 ContractPosition::new(
                     rules_owner_issuer().map_err(|_| RoleError::InvalidOutput)?,
@@ -709,7 +727,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         Arc::clone(&self.rules)
     }
     pub fn root_is_terminal(&self) -> bool {
-        self.engine.nodes[self.root].terminal.is_some()
+        self.engine.semantic.nodes[self.root].terminal.is_some()
     }
 
     /// Rules covers every immediate legal child before any model beam is used.
@@ -719,7 +737,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if self.root_rules_scanned {
             return Ok(());
         }
-        let position = self.engine.nodes[self.root].position.clone();
+        let position = self.engine.semantic.nodes[self.root].position.clone();
         for movement in position.legal_moves() {
             self.check_live()?;
             let mut child = position.clone();
@@ -935,7 +953,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     ) -> Result<Option<AdaptivePortRulesStep>, PalsError> {
         self.check_work(work)?;
         let query = &work.input.question;
-        if self.engine.nodes[query.node].terminal.is_none()
+        if self.engine.semantic.nodes[query.node].terminal.is_none()
             || !matches!(
                 query.stage,
                 RefinementStage::CpuValidation
@@ -990,12 +1008,17 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         ranking: &ProposerRankingPublished,
     ) -> Result<Vec<AdaptivePortCandidate>, PalsError> {
         self.check_live()?;
-        let observations_before = self.engine.stores.observations.next_observation_sequence();
+        let observations_before = self
+            .engine
+            .semantic
+            .stores
+            .observations
+            .next_observation_sequence();
         if ranking.source().ticket.authority != self.authority
             || !self.root_ranking_pending
             || self.root_ranking_question != Some(ranking.source().ticket.question)
             || !self.round_candidates.is_empty()
-            || !ranking.view().validates(&self.engine.stores)
+            || !ranking.view().validates(&self.engine.semantic.stores)
             || ranking.source().view_input_digest.0 != ranking.view().digest()
             || !ranking
                 .rules()
@@ -1011,10 +1034,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         }
         let mut ranked = Vec::new();
         for movement in ranking.ranked_candidates() {
-            ranked.push(
+            let movement =
                 BoardMove::try_from(movement.decode().map_err(|_| RoleError::InvalidOutput)?)
-                    .map_err(|_| RoleError::InvalidOutput)?,
-            );
+                    .map_err(|_| RoleError::InvalidOutput)?;
+            if self.root_move_allowed(movement) {
+                ranked.push(movement);
+            }
         }
         // Preserve root candidate selection and deterministic ties. Independent
         // frames carry the same already-consumed ranking source, never new NN work.
@@ -1060,7 +1085,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             let mut candidate =
                 self.make_root_candidate(remaining.pop_front().ok_or(PalsError::InvalidConfig)?)?;
             if self.engine.config.line_plies == 1
-                && self.engine.nodes[candidate.input.question.node]
+                && self.engine.semantic.nodes[candidate.input.question.node]
                     .terminal
                     .is_none()
             {
@@ -1100,7 +1125,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             ranking.source().ticket.question,
             ranking.source().ticket.id,
             observations_before,
-            self.engine.stores.observations.next_observation_sequence(),
+            self.engine
+                .semantic
+                .stores
+                .observations
+                .next_observation_sequence(),
         ));
         Ok(out)
     }
@@ -1109,14 +1138,18 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         &mut self,
         movement: BoardMove,
     ) -> Result<AdaptivePortCandidate, PalsError> {
+        if !self.root_move_allowed(movement) {
+            return Err(RoleError::InvalidOutput.into());
+        }
         let child = self.connect_hot(self.root, movement)?;
         let prefix = vec![movement];
-        let stage =
-            if self.engine.config.line_plies <= 1 || self.engine.nodes[child].terminal.is_some() {
-                RefinementStage::CpuValidation
-            } else {
-                RefinementStage::ProposalContinuation
-            };
+        let stage = if self.engine.config.line_plies <= 1
+            || self.engine.semantic.nodes[child].terminal.is_some()
+        {
+            RefinementStage::CpuValidation
+        } else {
+            RefinementStage::ProposalContinuation
+        };
         if stage == RefinementStage::CpuValidation {
             self.record_hot(RecordKind::Proposal, &prefix, None)?;
             self.counters.proposals += 1;
@@ -1176,7 +1209,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             };
             if self.engine.uses_model_resolver() {
                 let value = |movement| {
-                    self.engine.nodes[self.root]
+                    self.engine.semantic.nodes[self.root]
                         .edges
                         .iter()
                         .find(|edge| edge.movement == movement)
@@ -1190,7 +1223,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     .then_with(rank)
             } else {
                 let value = |movement| {
-                    self.engine.nodes[self.root]
+                    self.engine.semantic.nodes[self.root]
                         .edges
                         .iter()
                         .find(|edge| edge.movement == movement)
@@ -1204,7 +1237,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             }
         });
         let new_root = ranked.iter().take(width).copied().find(|movement| {
-            !self.engine.nodes[self.root]
+            !self.engine.semantic.nodes[self.root]
                 .edges
                 .iter()
                 .any(|edge| edge.movement == *movement)
@@ -1233,7 +1266,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         self.verify_registered_model_namespace(ticket, output)?;
         let query = &work.input.question;
         let view = &work.input.view;
-        if self.accepted.contains(&ticket.id)
+        if (self.accepted.contains(&ticket.id)
+            && !self.reciprocal_source_consumed(work, ticket, output))
             || ticket.authority != self.authority
             || ticket.question != work.input.question_digest
             || ticket.original_deadline != work.original_deadline
@@ -1244,7 +1278,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             || ticket.role != role_for_purpose(query.context.purpose)
             || view.query().purpose != query.context.purpose
             || view.query().prefix != query.context.prefix
-            || query.context.public_revision > self.engine.revision
+            || query.context.public_revision > self.engine.semantic.revision
             || query.context.game_generation != self.authority.game.0
             || query.context.search_generation != self.authority.root.0
             || query.context.proposal_sha256
@@ -1260,14 +1294,20 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        let node = &self.engine.nodes[query.node];
-        let situation = self.engine.stores.situations.get(query.context.situation)?;
+        let node = &self.engine.semantic.nodes[query.node];
+        let situation = self
+            .engine
+            .semantic
+            .stores
+            .situations
+            .get(query.context.situation)?;
         if node.state != query.context.state
             || node.situation != query.context.situation
             || situation.state != query.context.state
             || situation.focus != query.context.focus
             || self
                 .engine
+                .semantic
                 .stores
                 .lines
                 .get(query.context.focus)?
@@ -1276,7 +1316,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             || query.context.focus_sha256
                 != role_line_sha256(
                     b"focus",
-                    &self.engine.stores.lines.moves(query.context.focus)?,
+                    &self
+                        .engine
+                        .semantic
+                        .stores
+                        .lines
+                        .moves(query.context.focus)?,
                 )?
             || query.context.prefix_sha256 != role_line_sha256(b"prefix", &query.context.prefix)?
             || !node
@@ -1292,7 +1337,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             let current = FreshPairSeal::from_ticket(
                 ticket,
                 work.input.public_context,
-                self.engine.nodes[self.root].position.side_to_move().into(),
+                self.engine.semantic.nodes[self.root]
+                    .position
+                    .side_to_move()
+                    .into(),
             );
             original
                 .validate_pair(&current)
@@ -1309,15 +1357,21 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         ticket: &RoleTicketEnvelope,
         output: &RoleOutput,
     ) -> Result<(), PalsError> {
-        match self.engine.model.registered_representation_namespace() {
+        match self
+            .engine
+            .semantic
+            .model
+            .registered_representation_namespace()
+        {
             Some(namespace) => {
                 namespace.verify_identity(
-                    self.engine.model.identity(),
-                    self.engine.model.value_identity(),
+                    self.engine.semantic.model.identity(),
+                    self.engine.semantic.model.value_identity(),
                 )?;
-                namespace.verify(ticket, output, self.engine.model.value_identity())?;
+                namespace.verify(ticket, output, self.engine.semantic.model.value_identity())?;
                 if self
                     .engine
+                    .semantic
                     .model_registered_value
                     .as_ref()
                     .is_some_and(|value| value != namespace.value_identity())
@@ -1328,6 +1382,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             }
             None if self
                 .engine
+                .semantic
                 .model
                 .requires_registered_representation_namespace() =>
             {
@@ -1344,15 +1399,21 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         &self,
         ticket: &RoleTicketEnvelope,
     ) -> Result<(), PalsError> {
-        match self.engine.model.registered_representation_namespace() {
+        match self
+            .engine
+            .semantic
+            .model
+            .registered_representation_namespace()
+        {
             Some(namespace) => {
                 namespace.verify_identity(
-                    self.engine.model.identity(),
-                    self.engine.model.value_identity(),
+                    self.engine.semantic.model.identity(),
+                    self.engine.semantic.model.value_identity(),
                 )?;
-                namespace.verify_ticket(ticket, self.engine.model.value_identity())?;
+                namespace.verify_ticket(ticket, self.engine.semantic.model.value_identity())?;
                 if self
                     .engine
+                    .semantic
                     .model_registered_value
                     .as_ref()
                     .is_some_and(|value| value != namespace.value_identity())
@@ -1363,6 +1424,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             }
             None if self
                 .engine
+                .semantic
                 .model
                 .requires_registered_representation_namespace() =>
             {
@@ -1402,7 +1464,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if ticket.authority != self.authority
             || ticket.view.view_digest.0 != view.seal_digest()
             || ticket.view != self.seal(view)
-            || !view.validates(&self.engine.stores)
+            || !view.validates(&self.engine.semantic.stores)
             || !self.accepted.contains(&ticket.id)
         {
             return Err(RoleError::InvalidOutput.into());
@@ -1419,10 +1481,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             return Err(RoleError::InvalidOutput.into());
         }
         self.engine
+            .semantic
             .review_index
             .as_mut()
             .ok_or(PalsError::InvalidConfig)?
-            .consume(view, &self.engine.stores)?;
+            .consume(view, &self.engine.semantic.stores)?;
         self.consumed_role_views
             .insert(ticket.id, ticket.view.view_digest);
         // This is the original first successful consume+insert, not a native
@@ -1491,10 +1554,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if Instant::now() >= self.limits.deadline {
             return Err(RoleError::Deadline.into());
         }
-        if self.engine.game_generation != Some(self.authority.game.0)
-            || self.engine.stores.generation() != self.authority.root.0
-            || self.engine.stores.root() != Some(self.engine.nodes[self.root].situation)
-            || !self.engine.nodes[self.root]
+        if self.engine.semantic.game_generation != Some(self.authority.game.0)
+            || self.engine.semantic.stores.generation() != self.authority.root.0
+            || self.engine.semantic.stores.root()
+                != Some(self.engine.semantic.nodes[self.root].situation)
+            || !self.engine.semantic.nodes[self.root]
                 .position
                 .snapshot()
                 .same_state(self.rules.rules().snapshot())
@@ -1507,7 +1571,15 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         &self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
     ) -> Result<(), PalsError> {
-        self.check_work_input(work.frame, work.original_deadline, &work.input)
+        self.check_work_input(work.frame, work.original_deadline, &work.input)?;
+        if let Some(first) = work.input.question.first
+            && rz_contracts::pals::Move16::encode(
+                rz_contracts::Move::try_from(first).map_err(|_| RoleError::InvalidOutput)?,
+            ) != work.original_first_move
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        Ok(())
     }
 
     fn check_work_input(
@@ -1525,8 +1597,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             || input.question_digest != query.question_digest
             || input.view_seal != self.seal(&input.view)
             || input.public_context.0 != input.view.record_scope_digest()
-            || !input.view.validates(&self.engine.stores)
-            || query.node >= self.engine.nodes.len()
+            || !input.view.validates(&self.engine.semantic.stores)
+            || query.node >= self.engine.semantic.nodes.len()
             || query.first.is_some_and(|first| {
                 Some(first) != query.context.prefix.first().copied()
                     && !query.context.prefix.is_empty()
@@ -1534,7 +1606,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        let root = &self.engine.nodes[self.root].position;
+        let root = &self.engine.semantic.nodes[self.root].position;
         let mut replay = root.clone();
         for movement in &query.context.prefix {
             replay.make_move(*movement)?;
@@ -1641,8 +1713,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         ) {
             Vec::new()
         } else {
-            self.engine.nodes[node].position.legal_moves()
+            self.engine.semantic.nodes[node].position.legal_moves()
         };
+        self.ensure_new_review_leases(frozen.is_none())?;
         let view = match frozen {
             Some(view) => {
                 if view.query().purpose != purpose
@@ -1650,7 +1723,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     || view.query().proposal != model_proposal
                     || view.query().counterexample.as_deref() != model_counter
                     || view.query().legal != legal
-                    || !view.validates(&self.engine.stores)
+                    || !view.validates(&self.engine.semantic.stores)
                 {
                     return Err(RoleError::InvalidOutput.into());
                 }
@@ -1676,8 +1749,17 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             hash.update(records.digest());
         }
         let question_digest = ContractDigest(hash.finalize().into());
+        let frontier_source = frontier_port::FrontierQuestionSource::new(
+            self.authority,
+            self.deadline,
+            self.limits.deadline,
+            self.engine.semantic.nodes[node].position.snapshot(),
+            &context,
+            self.seal(&view),
+            legacy_full_records.as_ref(),
+        )?;
         let query = AdaptivePortQuestion {
-            position: self.engine.nodes[node].position.clone(),
+            position: self.engine.semantic.nodes[node].position.clone(),
             context,
             deadline: self.limits.deadline,
             legacy_full_records,
@@ -1696,6 +1778,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             paired_repaired,
             paired_fresh_seal: None,
             question_digest,
+            frontier_source,
             diagnostic_repair_line: None,
         };
         Ok(FrameInput {
@@ -1709,7 +1792,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     }
 
     fn divergence_indices(&self, line: &[BoardMove]) -> Result<Vec<usize>, PalsError> {
-        let mut replay = self.engine.nodes[self.root].position.clone();
+        let mut replay = self.engine.semantic.nodes[self.root].position.clone();
         let color = replay.side_to_move();
         let mut indices = Vec::new();
         for (ply, movement) in line.iter().enumerate() {
@@ -1724,28 +1807,38 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     }
     fn intern_hot(engine: &mut PalsEngine<M>, position: Position) -> Result<usize, PalsError> {
         let snapshot = position.snapshot();
-        if let Some(state) = engine.stores.states.find(&snapshot)
-            && let Some(index) = engine.nodes.iter().position(|node| node.state == state)
+        if let Some(state) = engine.semantic.stores.states.find(&snapshot)
+            && let Some(index) = engine
+                .semantic
+                .nodes
+                .iter()
+                .position(|node| node.state == state)
         {
             return Ok(index);
         }
-        if engine.nodes.len() >= engine.config.max_nodes {
+        if engine.semantic.nodes.len() >= engine.config.max_nodes {
             return Err(PalsError::Capacity);
         }
-        let situation = if let Some(root) = engine.stores.root().filter(|root| {
-            engine.stores.situations.get(*root).is_ok_and(|situation| {
-                engine
-                    .stores
-                    .states
-                    .get(situation.state)
-                    .is_ok_and(|state| state.same_state(&snapshot))
-            })
+        let situation = if let Some(root) = engine.semantic.stores.root().filter(|root| {
+            engine
+                .semantic
+                .stores
+                .situations
+                .get(*root)
+                .is_ok_and(|situation| {
+                    engine
+                        .semantic
+                        .stores
+                        .states
+                        .get(situation.state)
+                        .is_ok_and(|state| state.same_state(&snapshot))
+                })
         }) {
             root
         } else {
-            engine.stores.hot_insert_situation(snapshot)?
+            engine.semantic.stores.hot_insert_situation(snapshot)?
         };
-        let state = engine.stores.situations.get(situation)?.state;
+        let state = engine.semantic.stores.situations.get(situation)?.state;
         let terminal = match position.classify_position()?.play_status {
             PlayStatus::Ongoing => None,
             PlayStatus::Terminal { reason, winner } => Some((
@@ -1758,9 +1851,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             )),
         };
         if terminal.is_some() {
-            engine.stores.hot_append_rules_terminal(&position, 0, 0)?;
+            engine
+                .semantic
+                .stores
+                .hot_append_rules_terminal(&position, 0, 0)?;
         }
-        engine.nodes.push(Node {
+        engine.semantic.nodes.push(Node {
             position,
             state,
             situation,
@@ -1772,20 +1868,20 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             model_value_revision: None,
             resume: None,
         });
-        Ok(engine.nodes.len() - 1)
+        Ok(engine.semantic.nodes.len() - 1)
     }
     fn connect_hot(&mut self, parent: usize, movement: BoardMove) -> Result<usize, PalsError> {
-        if let Some(edge) = self.engine.nodes[parent]
+        if let Some(edge) = self.engine.semantic.nodes[parent]
             .edges
             .iter()
             .find(|edge| edge.movement == movement)
         {
             return Ok(edge.child);
         }
-        let mut position = self.engine.nodes[parent].position.clone();
+        let mut position = self.engine.semantic.nodes[parent].position.clone();
         position.make_move(movement)?;
         let child = Self::intern_hot(&mut self.engine, position)?;
-        self.engine.nodes[parent]
+        self.engine.semantic.nodes[parent]
             .edges
             .push(Edge { movement, child });
         self.counters.examined_edges += 1;

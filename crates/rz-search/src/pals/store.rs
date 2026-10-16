@@ -29,6 +29,8 @@ pub use archive::{
 };
 use hot::HotRecords;
 
+const REVIEW_PIN_CAPACITY: usize = 16;
+
 macro_rules! index_id {
     ($name:ident) => {
         #[derive(
@@ -88,6 +90,14 @@ pub enum StoreError {
     /// The caller must report unknown and request a new bounded worker scan.
     ForeignPermitStale,
     PinSaturated(&'static str),
+    /// Admission is waiting for existing selected-view owners to retire. This
+    /// is neither archive evidence deletion nor permission to refund work.
+    ReviewLeaseBackpressure {
+        current: usize,
+        capacity: usize,
+        required_new: usize,
+        replacement_reserve: usize,
+    },
     ColdRecord(&'static str),
 }
 
@@ -2133,7 +2143,7 @@ impl PalsStores {
             .review_pins
             .lock()
             .map_err(|_| StoreError::InvalidConditions("review pin owner poisoned"))?;
-        if registry.leases.len() >= 16 {
+        if registry.leases.len() >= REVIEW_PIN_CAPACITY {
             return Err(StoreError::PinSaturated("review view leases"));
         }
         let serial = registry.next;
@@ -2151,6 +2161,11 @@ impl PalsStores {
             .lock()
             .map(|pins| pins.leases.len())
             .map_err(|_| StoreError::InvalidConditions("review pin owner poisoned"))
+    }
+    /// The exact same hard ceiling enforced by pin_review. Reading it grants
+    /// no lease and does not change the Store's capacity policy.
+    pub const fn review_pin_capacity(&self) -> usize {
+        REVIEW_PIN_CAPACITY
     }
     pub(super) fn review_pin_union(&self) -> Result<StorePins, StoreError> {
         let registry = self

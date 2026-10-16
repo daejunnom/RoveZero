@@ -115,7 +115,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     pub fn archive_maintenance_proposal(
         &self,
     ) -> Result<Option<ArchiveMaintenanceProposal>, PalsError> {
-        if !self.engine.archive_enabled() || !self.engine.stores.archive_pressure() {
+        if !self.engine.archive_enabled() || !self.engine.semantic.stores.archive_pressure() {
             return Ok(None);
         }
         self.engine.ensure_archive_admission_open()?;
@@ -126,9 +126,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if max_io_bytes == 0 {
             return Err(StoreError::ArchiveByteBudget.into());
         }
-        let stores = &self.engine.stores;
+        let stores = &self.engine.semantic.stores;
         let root = self
             .engine
+            .semantic
             .nodes
             .get(self.root)
             .ok_or(StoreError::InvalidHandle("adaptive archive root"))?;
@@ -153,7 +154,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             deadline: self.limits.deadline,
             stamp: ArchiveMaintenanceStamp {
                 store_generation: stores.generation(),
-                public_revision: self.engine.revision,
+                public_revision: self.engine.semantic.revision,
                 hot: stores.hot_stats(),
             },
         }))
@@ -355,18 +356,25 @@ impl<M: RoleModel> ArchiveCompletion<M> {
                     .registry_owner
                     .ptr_eq(&engine.adaptive_registry_identity())
                 || engine.adaptive_new_game_scope() != Some(next)
-                || engine.game_generation != Some(next.game.0)
-                || engine.stores.generation() != 0
-                || engine.stores.root().is_some()
-                || self.seal.store_owner.matches(&engine.stores)
-                || engine.stores.tasks.active_states().next().is_some()
+                || engine.semantic.game_generation != Some(next.game.0)
+                || engine.semantic.stores.generation() != 0
+                || engine.semantic.stores.root().is_some()
+                || self.seal.store_owner.matches(&engine.semantic.stores)
                 || engine
+                    .semantic
+                    .stores
+                    .tasks
+                    .active_states()
+                    .next()
+                    .is_some()
+                || engine
+                    .semantic
                     .stores
                     .review_pin_count()
                     .map_err(|error| ArchiveQuarantineReason::Operation(error.into()))?
                     != 0
-                || !engine.nodes.is_empty()
-                || !engine.records.is_empty()
+                || !engine.semantic.nodes.is_empty()
+                || !engine.semantic.records.is_empty()
             {
                 return Err(invalid("official newgame owner transition"));
             }
@@ -376,6 +384,7 @@ impl<M: RoleModel> ArchiveCompletion<M> {
             match (self.seal.archive_owner, actual) {
                 (Some(old), Some(new)) => {
                     let previous = engine
+                        .semantic
                         .archive_state
                         .previous_closed_owner
                         .ok_or_else(|| invalid("previous archive close missing"))?;
@@ -394,20 +403,20 @@ impl<M: RoleModel> ArchiveCompletion<M> {
             }
             return Ok(());
         }
-        if !self.seal.store_owner.matches(&engine.stores)
-            || engine.game_generation != self.seal.game_generation
-            || engine.revision != self.seal.revision
+        if !self.seal.store_owner.matches(&engine.semantic.stores)
+            || engine.semantic.game_generation != self.seal.game_generation
+            || engine.semantic.revision != self.seal.revision
             || matches!(self.owner, ArchiveOwner::Port(_)) != self.seal.is_port
         {
             return Err(invalid("store owner, game or semantic revision"));
         }
-        let generation = engine.stores.generation();
+        let generation = engine.semantic.stores.generation();
         if generation != self.seal.store_generation {
             // Root preparation alone may retire the previous exact root after
             // its attested metadata commit; it does not admit the next root.
             let retired = self.receipt.operation == ArchiveOperationKind::PrepareRoot
                 && self.seal.root.is_some()
-                && engine.stores.root().is_none()
+                && engine.semantic.stores.root().is_none()
                 && self.seal.store_generation.checked_add(1) == Some(generation)
                 && engine.last_engine_archive().is_some_and(|receipt| {
                     receipt
@@ -420,7 +429,7 @@ impl<M: RoleModel> ArchiveCompletion<M> {
             if !retired {
                 return Err(invalid("store generation"));
             }
-        } else if engine.stores.root() != self.seal.root {
+        } else if engine.semantic.stores.root() != self.seal.root {
             return Err(invalid("store root"));
         }
         let actual = engine
@@ -438,24 +447,26 @@ impl<M: RoleModel> ArchiveCompletion<M> {
         {
             return Err(invalid("archive persistence owner"));
         }
-        validate_pins(&engine.stores, &self.seal.review_pins)
+        validate_pins(&engine.semantic.stores, &self.seal.review_pins)
             .map_err(|_| invalid("submitted review pins"))?;
-        validate_pins(&engine.stores, &self.seal.active_cpu_pins)
+        validate_pins(&engine.semantic.stores, &self.seal.active_cpu_pins)
             .map_err(|_| invalid("worker CPU task pins"))?;
         if matches!(
             self.receipt.operation,
             ArchiveOperationKind::ReclaimHot | ArchiveOperationKind::PrepareForeign
-        ) && (engine.nodes.len() != self.seal.node_handles.len()
+        ) && (engine.semantic.nodes.len() != self.seal.node_handles.len()
             || engine
+                .semantic
                 .nodes
                 .iter()
                 .map(|node| (node.state, node.situation))
                 .ne(self.seal.node_handles.iter().copied())
-            || engine.records.iter().map(|record| record.revision).ne(self
-                .seal
-                .record_revisions
+            || engine
+                .semantic
+                .records
                 .iter()
-                .copied()))
+                .map(|record| record.revision)
+                .ne(self.seal.record_revisions.iter().copied()))
         {
             return Err(invalid("active engine topology"));
         }
@@ -706,8 +717,8 @@ fn seal_owner<M: RoleModel>(
     work: &ArchiveWork,
 ) -> Result<ArchiveSeal, PalsError> {
     let engine = owner.engine();
-    if engine.game_generation != Some(authority.game.0)
-        || engine.stores.generation() != authority.root.0
+    if engine.semantic.game_generation != Some(authority.game.0)
+        || engine.semantic.stores.generation() != authority.root.0
     {
         return Err(StoreError::StaleConsumer.into());
     }
@@ -751,7 +762,13 @@ fn seal_owner<M: RoleModel>(
         ArchiveOperation::PrepareRoot { .. }
             | ArchiveOperation::LoadRoot { .. }
             | ArchiveOperation::NewGame { .. }
-    ) && engine.stores.tasks.active_states().next().is_some()
+    ) && engine
+        .semantic
+        .stores
+        .tasks
+        .active_states()
+        .next()
+        .is_some()
     {
         return Err(
             StoreError::InvalidConditions("root maintenance requires drained CPU tasks").into(),
@@ -776,7 +793,7 @@ fn seal_owner<M: RoleModel>(
         None
     };
     if let ArchiveOperation::ReclaimHot { incoming_pins } = &work.operation {
-        validate_pins(&engine.stores, incoming_pins)?;
+        validate_pins(&engine.semantic.stores, incoming_pins)?;
     }
     let mut active_cpu_pins = StorePins::default();
     if let ArchiveOwner::Port(port) = owner {
@@ -785,29 +802,31 @@ fn seal_owner<M: RoleModel>(
             if let Some(execution) = admission.execution {
                 active_cpu_pins
                     .states
-                    .insert(engine.stores.tasks.get(execution)?.key.state);
+                    .insert(engine.semantic.stores.tasks.get(execution)?.key.state);
             }
         }
-        validate_pins(&engine.stores, &active_cpu_pins)?;
+        validate_pins(&engine.semantic.stores, &active_cpu_pins)?;
     }
     Ok(ArchiveSeal {
         authority,
-        store_owner: engine.stores.read_owner(),
-        store_generation: engine.stores.generation(),
-        game_generation: engine.game_generation,
-        root: engine.stores.root(),
-        revision: engine.revision,
+        store_owner: engine.semantic.stores.read_owner(),
+        store_generation: engine.semantic.stores.generation(),
+        game_generation: engine.semantic.game_generation,
+        root: engine.semantic.stores.root(),
+        revision: engine.semantic.revision,
         node_handles: engine
+            .semantic
             .nodes
             .iter()
             .map(|node| (node.state, node.situation))
             .collect(),
         record_revisions: engine
+            .semantic
             .records
             .iter()
             .map(|record| record.revision)
             .collect(),
-        review_pins: engine.stores.review_pin_union()?,
+        review_pins: engine.semantic.stores.review_pin_union()?,
         active_cpu_pins,
         archive_owner,
         registry_owner: engine.adaptive_registry_identity(),
@@ -853,7 +872,7 @@ fn catch_archive_work(
 
 fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
     let began = Instant::now();
-    let before = command.owner.engine().stores.hot_stats();
+    let before = command.owner.engine().stores().hot_stats();
     let mut budget = ArchiveIoBudget {
         deadline: command.work.deadline,
         max_bytes: command.work.max_io_bytes,
@@ -889,9 +908,12 @@ fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
                 // adding the submission union also covers release during I/O.
                 merge_pins(&mut pins, &command.seal.review_pins);
                 merge_pins(&mut pins, &command.seal.active_cpu_pins);
-                engine.stores.set_archive_pins(pins)?;
+                engine.semantic.stores.set_archive_pins(pins)?;
                 let initial = budget.max_bytes;
-                let result = engine.stores.archive_inactive_with_budget(&mut budget);
+                let result = engine
+                    .semantic
+                    .stores
+                    .archive_inactive_with_budget(&mut budget);
                 if command.seal.is_port {
                     engine.charge_engine_archive_io(initial.saturating_sub(budget.max_bytes))?;
                 }
@@ -903,10 +925,11 @@ fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
                 issued,
             } => {
                 let initial = budget.max_bytes;
-                let prepared =
-                    engine
-                        .stores
-                        .prepare_foreign_append_permit(observation, issued, &mut budget);
+                let prepared = engine.semantic.stores.prepare_foreign_append_permit(
+                    observation,
+                    issued,
+                    &mut budget,
+                );
                 if command.seal.is_port {
                     engine.charge_engine_archive_io(initial.saturating_sub(budget.max_bytes))?;
                 }
@@ -932,9 +955,9 @@ fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
         authority: command.seal.authority,
         operation: kind,
         generation_before: command.seal.store_generation,
-        generation_after: engine.stores.generation(),
+        generation_after: engine.semantic.stores.generation(),
         hot_before: before,
-        hot_after: engine.stores.hot_stats(),
+        hot_after: engine.semantic.stores.hot_stats(),
         io_bytes: if matches!(result, Err(ArchiveQuarantineReason::Panic))
             || (kind == ArchiveOperationKind::PrepareRoot && result.is_err())
             || kind == ArchiveOperationKind::NewGame
@@ -1014,7 +1037,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        engine.stores = PalsStores::new(StoreLimits {
+        engine.semantic.stores = PalsStores::new(StoreLimits {
             states: 8,
             situations: 8,
             line_chunks: 16,
@@ -1033,6 +1056,7 @@ mod tests {
                 .unwrap();
         }
         engine
+            .semantic
             .stores
             .focus_actual_moves(Position::startpos().snapshot())
             .unwrap();
@@ -1041,8 +1065,8 @@ mod tests {
     fn authority(engine: &PalsEngine<LegalOrderRoleMock>) -> SearchAuthority {
         SearchAuthority {
             epoch: ProcessEpoch(1),
-            game: GameGeneration(engine.game_generation.unwrap()),
-            root: RootGeneration(engine.stores.generation()),
+            game: GameGeneration(engine.semantic.game_generation.unwrap()),
+            root: RootGeneration(engine.semantic.stores.generation()),
             implementation: Digest([7; 32]),
         }
     }
@@ -1053,8 +1077,18 @@ mod tests {
                     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 {fullmove}"
                 ))
                 .unwrap();
-                let situation = engine.stores.insert_situation(position.snapshot()).unwrap();
-                engine.stores.situations.get(situation).unwrap().state
+                let situation = engine
+                    .semantic
+                    .stores
+                    .insert_situation(position.snapshot())
+                    .unwrap();
+                engine
+                    .semantic
+                    .stores
+                    .situations
+                    .get(situation)
+                    .unwrap()
+                    .state
             })
             .collect()
     }
@@ -1085,10 +1119,10 @@ mod tests {
     fn actual_archive_reclaim_returns_same_owner_and_preserves_submitted_pins() {
         let (mut engine, scratch) = fixture(true);
         let inactive = populate(&mut engine);
-        let original_owner = engine.stores.read_owner();
+        let original_owner = engine.semantic.stores.read_owner();
         let mut review = StorePins::default();
         review.states.insert(inactive[1]);
-        let lease = engine.stores.pin_review(review).unwrap();
+        let lease = engine.semantic.stores.pin_review(review).unwrap();
         let mut incoming = StorePins::default();
         incoming.states.insert(inactive[0]);
         let authority = authority(&engine);
@@ -1112,19 +1146,19 @@ mod tests {
         let ArchiveOwner::Engine(engine) = owner else {
             panic!("owner kind changed")
         };
-        assert!(original_owner.matches(&engine.stores));
-        assert!(lease.validates(&engine.stores));
+        assert!(original_owner.matches(&engine.semantic.stores));
+        assert!(lease.validates(&engine.semantic.stores));
         assert_eq!(receipt.generation_before, receipt.generation_after);
         assert!(receipt.io_bytes.is_some_and(|bytes| bytes > 0));
         assert!(receipt.hot_after.states < receipt.hot_before.states);
-        assert!(engine.stores.states.get(inactive[0]).is_ok());
-        assert!(engine.stores.states.get(inactive[1]).is_ok());
+        assert!(engine.semantic.stores.states.get(inactive[0]).is_ok());
+        assert!(engine.semantic.stores.states.get(inactive[1]).is_ok());
         assert!(matches!(
-            engine.stores.states.get(inactive[2]),
+            engine.semantic.stores.states.get(inactive[2]),
             Err(StoreError::ColdRecord(_))
         ));
-        assert_eq!(engine.revision, 0);
-        assert!(engine.nodes.is_empty() && engine.records.is_empty());
+        assert_eq!(engine.semantic.revision, 0);
+        assert!(engine.semantic.nodes.is_empty() && engine.semantic.records.is_empty());
         drop(lease);
         worker.finish().unwrap();
         drop(engine);
@@ -1134,7 +1168,7 @@ mod tests {
     #[test]
     fn archive_disabled_rejection_returns_original_store_without_fallback() {
         let (engine, scratch) = fixture(false);
-        let source = engine.stores.read_owner();
+        let source = engine.semantic.stores.read_owner();
         let authority = authority(&engine);
         let mut worker = ArchiveWorker::start().unwrap();
         let rejected =
@@ -1146,7 +1180,7 @@ mod tests {
             rejected.error,
             PalsError::Store(StoreError::ArchiveDisabled)
         ));
-        assert!(source.matches(&rejected.owner.engine().stores));
+        assert!(source.matches(rejected.owner.engine().stores()));
         assert!(!worker.is_busy());
         worker.finish().unwrap();
         drop(rejected);
@@ -1158,8 +1192,8 @@ mod tests {
         let (mut engine, scratch) = fixture(true);
         populate(&mut engine);
         let authority = authority(&engine);
-        let source = engine.stores.read_owner();
-        let before = engine.stores.hot_stats();
+        let source = engine.semantic.stores.read_owner();
+        let before = engine.semantic.stores.hot_stats();
         let mut worker = ArchiveWorker::start().unwrap();
         let transfer = worker
             .submit(ArchiveOwner::Engine(engine), authority, work(1))
@@ -1174,8 +1208,8 @@ mod tests {
             ArchiveQuarantineReason::Operation(_)
         ));
         let owner = quarantine.into_owner_for_shutdown();
-        assert!(source.matches(&owner.engine().stores));
-        assert_eq!(owner.engine().stores.hot_stats(), before);
+        assert!(source.matches(owner.engine().stores()));
+        assert_eq!(owner.engine().stores().hot_stats(), before);
         worker.finish().unwrap();
         drop(owner);
         drop(scratch);
@@ -1186,7 +1220,7 @@ mod tests {
         let (mut engine, scratch) = fixture(true);
         populate(&mut engine);
         let authority = authority(&engine);
-        let source = engine.stores.read_owner();
+        let source = engine.semantic.stores.read_owner();
         let mut worker = ArchiveWorker::start().unwrap();
         let transfer = worker
             .submit(ArchiveOwner::Engine(engine), authority, work(MAX_IO_BYTES))
@@ -1201,7 +1235,7 @@ mod tests {
             ArchiveQuarantineReason::InvalidReturn("transfer authority")
         ));
         let owner = quarantine.into_owner_for_shutdown();
-        assert!(source.matches(&owner.engine().stores));
+        assert!(source.matches(owner.engine().stores()));
         worker.finish().unwrap();
         drop(owner);
         drop(scratch);
@@ -1236,7 +1270,7 @@ mod tests {
     fn expired_submission_does_not_consume_owner_or_start_work() {
         let (engine, scratch) = fixture(true);
         let authority = authority(&engine);
-        let source = engine.stores.read_owner();
+        let source = engine.semantic.stores.read_owner();
         let mut worker = ArchiveWorker::start().unwrap();
         let rejected = match worker.submit(
             ArchiveOwner::Engine(engine),
@@ -1253,7 +1287,7 @@ mod tests {
             rejected.error,
             PalsError::Store(StoreError::ArchiveDeadline)
         ));
-        assert!(source.matches(&rejected.owner.engine().stores));
+        assert!(source.matches(rejected.owner.engine().stores()));
         assert!(!worker.is_busy());
         worker.finish().unwrap();
         drop(rejected);
@@ -1294,7 +1328,7 @@ mod tests {
         let (mut engine, scratch) = fixture(true);
         populate(&mut engine);
         let authority = authority(&engine);
-        let source = engine.stores.read_owner();
+        let source = engine.semantic.stores.read_owner();
         let mut worker = ArchiveWorker::start().unwrap();
         let retained = Arc::clone(&worker.orphan);
         let join = worker.join.take().unwrap();
@@ -1314,7 +1348,7 @@ mod tests {
             .unwrap()
             .take()
             .expect("actual owner retained");
-        assert!(source.matches(&completed.owner.engine().stores));
+        assert!(source.matches(completed.owner.engine().stores()));
         let quarantine = match completed.install(authority, transfer.nonce()) {
             Err(value) => value,
             Ok(_) => panic!("abandoned transfer accepted"),
@@ -1331,15 +1365,15 @@ mod tests {
     fn panic_guard_keeps_borrowed_owner_and_hot_facts() {
         let (engine, scratch) = fixture(true);
         let mut owner = ArchiveOwner::Engine(engine);
-        let source = owner.engine().stores.read_owner();
-        let before = owner.engine().stores.hot_stats();
+        let source = owner.engine().stores().read_owner();
+        let before = owner.engine().stores().hot_stats();
         let result = catch_archive_work(|| {
             let _exact_borrow = owner.engine_mut();
             panic!("bounded archive failure fixture");
         });
         assert!(matches!(result, Err(ArchiveQuarantineReason::Panic)));
-        assert!(source.matches(&owner.engine().stores));
-        assert_eq!(owner.engine().stores.hot_stats(), before);
+        assert!(source.matches(owner.engine().stores()));
+        assert_eq!(owner.engine().stores().hot_stats(), before);
         drop(owner);
         drop(scratch);
     }
@@ -1371,8 +1405,8 @@ mod tests {
     fn root_maintenance_does_not_retire_worker_owned_paused_task() {
         use crate::pals::store::{TaskAdmission, TaskConsumer, TaskKey, TaskQuestion, TaskStatus};
         let (mut engine, scratch) = fixture(true);
-        let root = engine.stores.root().unwrap();
-        let situation = engine.stores.situations.get(root).unwrap();
+        let root = engine.semantic.stores.root().unwrap();
+        let situation = engine.semantic.stores.situations.get(root).unwrap();
         let key = TaskKey {
             state: situation.state,
             line: None,
@@ -1380,9 +1414,9 @@ mod tests {
             root_moves: Vec::new(),
             model: 1,
             epoch: 0,
-            value_identity: engine.cpu_registered_value.clone(),
-            checker_identity: Some(engine.checker_registered_identity.clone()),
-            cpu_condition: Some(engine.cpu_registered_condition.clone()),
+            value_identity: engine.researcher.cpu_registered_value.clone(),
+            checker_identity: Some(engine.researcher.checker_registered_identity.clone()),
+            cpu_condition: Some(engine.researcher.cpu_registered_condition.clone()),
             profile: 1,
             condition: 1,
             input_revision: 0,
@@ -1393,14 +1427,22 @@ mod tests {
             id: 1,
             situation: root,
             revision: situation.revision,
-            generation: engine.stores.generation(),
+            generation: engine.semantic.stores.generation(),
             deadline_tick: 100_000,
         };
-        let TaskAdmission::Start(execution) = engine.stores.request_task(key, consumer, 0).unwrap()
+        let TaskAdmission::Start(execution) = engine
+            .semantic
+            .stores
+            .request_task(key, consumer, 0)
+            .unwrap()
         else {
             panic!("fixture admission")
         };
-        engine.stores.pause_task(execution, 17, None).unwrap();
+        engine
+            .semantic
+            .stores
+            .pause_task(execution, 17, None)
+            .unwrap();
         let authority = authority(&engine);
         let mut worker = ArchiveWorker::start().unwrap();
         let rejected = match worker.submit(
@@ -1426,7 +1468,7 @@ mod tests {
             rejected
                 .owner
                 .engine()
-                .stores
+                .stores()
                 .tasks
                 .get(execution)
                 .unwrap()
@@ -1465,7 +1507,7 @@ mod tests {
         let (mut engine, scratch) = fixture(true);
         populate(&mut engine);
         let authority = authority(&engine);
-        let source = engine.stores.read_owner();
+        let source = engine.semantic.stores.read_owner();
         let mut worker = ArchiveWorker::start().unwrap();
         let transfer = worker
             .submit(ArchiveOwner::Engine(engine), authority, work(MAX_IO_BYTES))
@@ -1478,7 +1520,7 @@ mod tests {
             Ok(_) => panic!("shutdown canceled transfer admitted"),
         };
         let owner = quarantine.into_owner_for_shutdown();
-        assert!(source.matches(&owner.engine().stores));
+        assert!(source.matches(owner.engine().stores()));
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if worker.try_join().unwrap().is_some() {

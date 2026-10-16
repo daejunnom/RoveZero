@@ -473,6 +473,7 @@ pub struct DependentFrameResponse {
 struct FrameDependency {
     waiter: FrameId,
     dependency: FrameId,
+    origin_seal: Option<Digest>,
 }
 
 struct ReciprocalRoot {
@@ -481,6 +482,7 @@ struct ReciprocalRoot {
     // Tombstones remain until root retirement: closing a question is not
     // permission to resubmit the same unchanged work under a fresh sequence.
     questions: Vec<(QuestionEnvelope, FrameId)>,
+    accepted_origins: HashMap<(FrameId, Digest), super::AcceptedRoleOrigin>,
 }
 
 /// Finite continuation state with no worker calls and no hidden blocking.
@@ -1486,6 +1488,7 @@ impl<V, Q> RefinementMachine<V, Q> {
         self.dependent_credit_owners.clear();
         if let Some(root) = self.reciprocal.as_mut() {
             root.questions.clear();
+            root.accepted_origins.clear();
         }
     }
     fn check_control(

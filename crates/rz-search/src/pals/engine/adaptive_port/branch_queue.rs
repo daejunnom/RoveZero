@@ -239,8 +239,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        if !self.engine.records.iter().any(|record| {
-            record.origin_state == self.engine.nodes[self.root].state
+        if !self.engine.semantic.records.iter().any(|record| {
+            record.origin_state == self.engine.semantic.nodes[self.root].state
                 && record.kind == RecordKind::Repair
                 && record.line == repaired
         }) {
@@ -456,7 +456,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        let mut checked = self.engine.nodes[self.root].position.clone();
+        let mut checked = self.engine.semantic.nodes[self.root].position.clone();
         for movement in &pending.counter {
             checked.make_move(*movement)?;
         }
@@ -465,7 +465,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         hash.update(self.authority.epoch.0.to_le_bytes());
         hash.update(self.authority.game.0.to_le_bytes());
         hash.update(self.authority.root.0.to_le_bytes());
-        hash.update(self.engine.revision.to_le_bytes());
+        hash.update(self.engine.semantic.revision.to_le_bytes());
         hash.update(role_line_sha256(b"proposal", &pending.proposal)?);
         hash.update(role_line_sha256(b"counter", &pending.counter)?);
         hash.update([u8::from(pending.repair_direct)]);
@@ -525,7 +525,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             );
         }
         let done = pending.counter.len() >= self.engine.config.line_plies
-            || self.engine.nodes[node].terminal.is_some();
+            || self.engine.semantic.nodes[node].terminal.is_some();
         let stage = if done {
             self.record_hot(RecordKind::Counterexample, &pending.counter, pending.source)?;
             self.counters.refutations += 1;
@@ -662,11 +662,15 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .zip(&counter)
             .position(|(a, b)| a != b)
             .ok_or(RoleError::InvalidOutput)?;
-        let mut position = self.engine.nodes[self.root].position.clone();
+        let mut position = self.engine.semantic.nodes[self.root].position.clone();
         for movement in &proposal[..attack] {
             position.make_move(*movement)?;
         }
-        if position.side_to_move() == self.engine.nodes[self.root].position.side_to_move() {
+        if position.side_to_move()
+            == self.engine.semantic.nodes[self.root]
+                .position
+                .side_to_move()
+        {
             return Err(RoleError::InvalidOutput.into());
         }
         self.enqueue_counter(PendingCounter {

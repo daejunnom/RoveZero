@@ -148,6 +148,7 @@ impl<V, Q> RefinementMachine<V, Q> {
             mode,
             root_budget,
             questions: Vec::with_capacity(MAX_RECIPROCAL_QUESTION_HISTORY),
+            accepted_origins: HashMap::new(),
         });
         Ok(())
     }
@@ -180,6 +181,13 @@ impl<V, Q> RefinementMachine<V, Q> {
         self.dependencies
             .iter()
             .find_map(|edge| (edge.waiter == frame).then_some(edge.dependency))
+    }
+
+    pub fn waiting_origin_seal(&self, frame: FrameId) -> Option<Digest> {
+        self.dependencies
+            .iter()
+            .find(|edge| edge.waiter == frame)
+            .and_then(|edge| edge.origin_seal)
     }
 
     /// Cancellation of one parent does not discard a joined child's physical
@@ -252,6 +260,9 @@ impl<V, Q> RefinementMachine<V, Q> {
                 "accepted original P/C checkpoint",
             ));
         }
+        let peer = self.reciprocal_question(evidence.frame);
+        let origin = accepted.origin(evidence.frame, peer)?;
+        self.register_accepted_role_origin(evidence.frame, origin, accepted, clock, now)?;
         self.admit_reciprocal_inner(
             evidence.frame,
             question,
@@ -261,6 +272,56 @@ impl<V, Q> RefinementMachine<V, Q> {
             clock,
             now,
         )
+    }
+
+    pub fn register_accepted_role_origin(
+        &mut self,
+        frame: FrameId,
+        origin: super::super::AcceptedRoleOrigin,
+        accepted: &super::super::AcceptedRoleStep,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), CoordinatorError> {
+        use super::super::AcceptedRoleOriginKind;
+        self.check_control(clock, now)?;
+        let held = self.frame(frame).ok_or(CoordinatorError::UnknownRequest)?;
+        let ticket = origin.ticket();
+        let peer = match origin.kind() {
+            AcceptedRoleOriginKind::LocalAccepted => None,
+            AcceptedRoleOriginKind::PeerQuestion(peer) => Some(peer),
+        };
+        if origin.frame() != frame
+            || !origin.matches(accepted)
+            || held.phase != FramePhase::Waiting(StepExecution::Role(ticket.id))
+            || held.input.question_digest != ticket.question
+            || held.input.view_seal != ticket.view
+            || held.input.stage.role() != Some(ticket.role)
+            || held.original_deadline != ticket.original_deadline
+            || peer != self.reciprocal_question(frame)
+        {
+            return Err(CoordinatorError::IdentityMismatch(
+                "accepted local/peer origin and original source",
+            ));
+        }
+        let root = self
+            .reciprocal
+            .as_mut()
+            .ok_or(CoordinatorError::MissingEvidence)?;
+        let key = (frame, ticket.question);
+        if let Some(previous) = root.accepted_origins.get(&key) {
+            return if *previous == origin {
+                Ok(())
+            } else {
+                Err(CoordinatorError::IdentityMismatch(
+                    "accepted source origin changed",
+                ))
+            };
+        }
+        if root.accepted_origins.len() >= MAX_RECIPROCAL_QUESTION_HISTORY {
+            return Err(CoordinatorError::Capacity("accepted source origins"));
+        }
+        root.accepted_origins.insert(key, origin);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -339,9 +400,7 @@ impl<V, Q> RefinementMachine<V, Q> {
                 && held.view.context_policy == question.view.context_policy
                 && held.view.root_state == question.view.root_state
         }) {
-            return Err(CoordinatorError::InvalidTransition(
-                "unchanged reciprocal question made no new progress",
-            ));
+            return Err(CoordinatorError::ReciprocalNoProgress);
         }
         if root.questions.len() >= MAX_RECIPROCAL_QUESTION_HISTORY {
             return Err(CoordinatorError::Capacity(
@@ -376,9 +435,7 @@ impl<V, Q> RefinementMachine<V, Q> {
             .find_map(|(held, frame)| same_work(held, &question).then_some(*frame));
         if let Some(existing) = existing {
             let Some(existing_frame) = self.frame(existing) else {
-                return Err(CoordinatorError::InvalidTransition(
-                    "unchanged reciprocal question made no new progress",
-                ));
+                return Err(CoordinatorError::ReciprocalNoProgress);
             };
             if existing_frame.input.stage != input.stage
                 || existing_frame.input.public_context != input.public_context
@@ -395,6 +452,9 @@ impl<V, Q> RefinementMachine<V, Q> {
             self.dependencies.push(FrameDependency {
                 waiter: parent,
                 dependency: existing,
+                origin_seal: accepted.map(|evidence| {
+                    root.accepted_origins[&(parent, evidence.submitted_question)].seal_digest()
+                }),
             });
             self.reciprocal
                 .as_mut()
@@ -434,6 +494,13 @@ impl<V, Q> RefinementMachine<V, Q> {
         self.dependencies.push(FrameDependency {
             waiter: parent,
             dependency: child,
+            origin_seal: accepted.map(|evidence| {
+                self.reciprocal
+                    .as_ref()
+                    .expect("registered root")
+                    .accepted_origins[&(parent, evidence.submitted_question)]
+                    .seal_digest()
+            }),
         });
         self.dependent_credit_owners.push((child, parent));
         self.reciprocal

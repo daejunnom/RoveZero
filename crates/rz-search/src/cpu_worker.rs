@@ -31,6 +31,13 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[path = "cpu_worker/prepared_value.rs"]
+mod prepared_value;
+pub use prepared_value::{
+    InstallId, InstallRejected, PreparedValueInstallation, ValueInstallReadback,
+    ValueInstallReceipt,
+};
+
 pub const CPU_WORKER_COMMAND_CAPACITY: usize = 8;
 pub const CPU_JOB_CAPACITY: usize = 64;
 pub const CPU_FIXED_SLICE_NODES: u64 = 4096;
@@ -155,6 +162,7 @@ pub fn compiled_cooperative_cpu_owner_sha256() -> [u8; 32] {
         include_bytes!("cpu.rs").as_slice(),
         include_bytes!("cpu/stack.rs").as_slice(),
         include_bytes!("cpu_worker.rs").as_slice(),
+        include_bytes!("cpu_worker/prepared_value.rs").as_slice(),
     ] {
         hash.update((bytes.len() as u64).to_be_bytes());
         hash.update(bytes);
@@ -379,6 +387,10 @@ pub struct CpuWorkerShutdown {
     /// The actual engine may be taken only after this known joined exit. This
     /// does not replace settlement of the returned reliable event receipts.
     pub engine_recoverable: bool,
+    /// The independently bounded installation terminal is never discarded by
+    /// shutdown. A failed/absent channel acknowledgement remains an error.
+    pub value_installation_receipt: Option<ValueInstallReceipt>,
+    pub value_installation_error: Option<CpuWorkerError>,
 }
 
 struct CreditAccount {
@@ -396,6 +408,7 @@ struct CreditAccount {
 /// Root-scoped single manager writer. Unknown failure retains reservation;
 /// snapshots do not settle credit. Completed receipts are externally retained.
 pub struct CpuCreditLedger {
+    identity: CpuLedgerIdentity,
     jobs: HashMap<CpuJobId, CreditAccount>,
     authority: SearchAuthority,
     clock: InstantClock,
@@ -403,6 +416,62 @@ pub struct CpuCreditLedger {
     global_spent: u64,
     highest_job_sequence: u64,
     highest_execution_sequence: u64,
+}
+
+/// In-process identity of the single writer, never a serializable authority.
+/// Retaining the Arc prevents a later ledger from reusing this identity even
+/// when it has the same root and credit settings.
+#[derive(Clone, Debug)]
+pub struct CpuLedgerIdentity(Arc<()>);
+impl PartialEq for CpuLedgerIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for CpuLedgerIdentity {}
+
+/// Issued only after this ledger has accepted and settled the supplied report.
+/// This attests accounting, not independent worker/physical completion. The
+/// actual worker report and its owner channel remain separate evidence.
+#[derive(Clone, Debug)]
+pub struct SettledCpuSlice {
+    ledger: CpuLedgerIdentity,
+    grant: SliceGrant,
+    actual_work: CpuWork,
+    admission_rejected: bool,
+    terminal: bool,
+}
+impl SettledCpuSlice {
+    pub fn ledger_identity(&self) -> &CpuLedgerIdentity {
+        &self.ledger
+    }
+    pub fn grant(&self) -> SliceGrant {
+        self.grant
+    }
+    pub fn actual_work(&self) -> CpuWork {
+        self.actual_work
+    }
+    pub fn admission_rejected(&self) -> bool {
+        self.admission_rejected
+    }
+    pub fn terminal(&self) -> bool {
+        self.terminal
+    }
+}
+
+/// Definite pre-enqueue release is not a zero-work worker completion.
+#[derive(Clone, Debug)]
+pub struct ReleasedCpuReservation {
+    ledger: CpuLedgerIdentity,
+    grant: SliceGrant,
+}
+impl ReleasedCpuReservation {
+    pub fn ledger_identity(&self) -> &CpuLedgerIdentity {
+        &self.ledger
+    }
+    pub fn grant(&self) -> SliceGrant {
+        self.grant
+    }
 }
 
 /// Read-only dispatch eligibility. A logically waiting parent still owns its
@@ -425,6 +494,7 @@ impl CpuCreditLedger {
             ));
         }
         Ok(Self {
+            identity: CpuLedgerIdentity(Arc::new(())),
             jobs: HashMap::new(),
             authority,
             clock,
@@ -433,6 +503,9 @@ impl CpuCreditLedger {
             highest_job_sequence: 0,
             highest_execution_sequence: 0,
         })
+    }
+    pub fn identity(&self) -> CpuLedgerIdentity {
+        self.identity.clone()
     }
     pub fn register(&mut self, envelope: CpuJobEnvelope) -> Result<(), CpuWorkerError> {
         if envelope.id.authority != self.authority
@@ -655,6 +728,24 @@ impl CpuCreditLedger {
         account.terminal |= report.terminal;
         Ok(())
     }
+    /// A consumer can bind this successful accounting transition to its own
+    /// outstanding token. Cloned receipts still describe one settlement and
+    /// must be consumed once by the downstream owner.
+    pub fn settle_attested(
+        &mut self,
+        report: &CpuSliceReport,
+    ) -> Result<SettledCpuSlice, CpuWorkerError> {
+        self.settle(report)?;
+        Ok(SettledCpuSlice {
+            ledger: self.identity(),
+            grant: report.grant,
+            actual_work: report
+                .actual_work
+                .expect("successful settlement has known work"),
+            admission_rejected: report.admission_rejected,
+            terminal: report.terminal,
+        })
+    }
     /// Roll back only a command proved not to have entered its worker queue.
     /// Execution high water remains advanced, so the rejected ID cannot replay.
     pub fn release_unadmitted(
@@ -681,6 +772,16 @@ impl CpuCreditLedger {
             account.owner = None;
         }
         Ok(())
+    }
+    pub fn release_unadmitted_attested(
+        &mut self,
+        rejection: &CpuAdmissionRejection,
+    ) -> Result<ReleasedCpuReservation, CpuWorkerError> {
+        self.release_unadmitted(rejection)?;
+        Ok(ReleasedCpuReservation {
+            ledger: self.identity(),
+            grant: rejection.grant,
+        })
     }
     /// Abandon a queued-but-never-started question. An admitted reservation or
     /// an owned continuation requires its worker's actual terminal receipt.
@@ -967,6 +1068,9 @@ pub struct CpuWorker {
     affinity_finished: Option<Result<CpuThreadAffinityObservation, CpuThreadAffinityFinishError>>,
     pub signal: CompletionSignal,
     submission: Mutex<CpuSubmissionFence>,
+    /// One independently bounded install seat. A pending owner readback blocks
+    /// new job/profile admission; it never transfers an active or paused job.
+    installation: Mutex<prepared_value::Endpoint>,
     join: Option<JoinHandle<CpuWorkerExit>>,
     recovered_engine: Option<CpuEngine>,
     joined_known: bool,
@@ -1142,6 +1246,7 @@ impl CpuWorker {
             };
         let worker_shutdown = shutdown.clone();
         let worker_mailbox = mailbox.clone();
+        let (installation, mut worker_installation) = prepared_value::channel();
         let ready_readback = Arc::new(OnceLock::new());
         let worker_readback = ready_readback.clone();
         let affinity_ready = cpus.as_ref().map(|_| Arc::new(OnceLock::new()));
@@ -1215,6 +1320,7 @@ impl CpuWorker {
             let mut active: Option<ActiveJob> = None;
             let mut progress_sequence = 0u64;
             let mut engine_reusable = true;
+            let mut value_binding = None;
             loop {
                 let observed = worker_mailbox.signal().version();
                 // A paused owner keeps a reliable terminal seat. Atomic
@@ -1260,6 +1366,25 @@ impl CpuWorker {
                         active = None;
                     }
                 }
+                // This actual owner decides whether its engine, token and
+                // reliable seats are idle. A producer's claim of idleness
+                // cannot authorize replacement of a private paused traversal.
+                if worker_installation
+                    .service(
+                        &mut engine,
+                        &mut value_binding,
+                        active.is_none(),
+                        engine_reusable,
+                        worker_mailbox.occupancy(),
+                        worker_shutdown.load(Ordering::Acquire),
+                        &worker_mailbox.signal(),
+                    )
+                    .is_err()
+                {
+                    engine_reusable = false;
+                    worker_shutdown.store(true, Ordering::Release);
+                    worker_mailbox.close();
+                }
                 // A source fixture can hold this exact boundary after paused
                 // termination was checked and before the next shutdown read.
                 // The hook does not exist in non-test worker builds.
@@ -1300,7 +1425,7 @@ impl CpuWorker {
                                     owner,
                                 }
                             && job.envelope.evaluation_namespace
-                                == cpu_evaluation_namespace_digest(&engine)
+                                == prepared_value::registered_namespace(&engine, value_binding)
                                     .unwrap_or(Digest([0; 32]))
                             && job.envelope.search_conditions
                                 == cpu_search_conditions_digest(&engine)
@@ -1676,6 +1801,7 @@ impl CpuWorker {
             mailbox,
             signal,
             submission: Mutex::new(CpuSubmissionFence::default()),
+            installation: Mutex::new(installation),
             join: Some(join),
             recovered_engine: None,
             joined_known: false,
@@ -1694,6 +1820,14 @@ impl CpuWorker {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(CpuWorkerError::Disconnected);
         }
+        if self
+            .installation
+            .lock()
+            .map_err(|_| CpuWorkerError::Quarantined)?
+            .pending()
+        {
+            return Err(CpuWorkerError::AlreadyReserved);
+        }
         CpuJob::from_profile(
             envelope,
             position,
@@ -1707,6 +1841,8 @@ impl CpuWorker {
             self.signal.clone(),
         )
     }
+    /// Last actual owner profile whose installation readback was collected.
+    /// Use acknowledged_profile() to exclude an in-progress replacement.
     pub fn profile(&self) -> CpuWorkerProfile {
         CpuWorkerProfile {
             owner: self.owner,
@@ -1714,6 +1850,81 @@ impl CpuWorker {
             evaluation_namespace: self.evaluation_namespace,
             search_conditions: self.search_conditions,
         }
+    }
+    pub fn acknowledged_profile(&self) -> Result<CpuWorkerProfile, CpuWorkerError> {
+        if self
+            .installation
+            .lock()
+            .map_err(|_| CpuWorkerError::Quarantined)?
+            .pending()
+        {
+            return Err(CpuWorkerError::AlreadyReserved);
+        }
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(CpuWorkerError::Disconnected);
+        }
+        Ok(self.profile())
+    }
+    pub fn value_install_pending(&self) -> Result<bool, CpuWorkerError> {
+        Ok(self
+            .installation
+            .lock()
+            .map_err(|_| CpuWorkerError::Quarantined)?
+            .pending())
+    }
+    /// Reserve one installation/readback seat without granting a native node
+    /// or claiming that an actual owner is idle. Only its command decides that.
+    pub fn try_install_prepared_value(
+        &self,
+        payload: PreparedValueInstallation,
+    ) -> Result<InstallId, InstallRejected> {
+        let _fence = match self.submission.lock() {
+            Ok(fence) => fence,
+            Err(_) => return Err(InstallRejected::new(payload, CpuWorkerError::Quarantined)),
+        };
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(InstallRejected::new(payload, CpuWorkerError::Disconnected));
+        }
+        if self.thread_affinity_requested() && !matches!(self.thread_affinity_ready(), Some(Ok(_)))
+        {
+            return Err(InstallRejected::new(
+                payload,
+                CpuWorkerError::Invalid("CPU worker affinity apply/readback not ready"),
+            ));
+        }
+        let mut installation = match self.installation.lock() {
+            Ok(installation) => installation,
+            Err(_) => return Err(InstallRejected::new(payload, CpuWorkerError::Quarantined)),
+        };
+        let id = installation.try_submit(payload, self.profile())?;
+        self.signal.notify();
+        Ok(id)
+    }
+    /// The endpoint verifies this worker's private channel/sequence/binding
+    /// before returning a receipt. No caller-supplied profile can update it.
+    pub fn try_install_readback(&mut self) -> Result<Option<ValueInstallReceipt>, CpuWorkerError> {
+        let _fence = self
+            .submission
+            .lock()
+            .map_err(|_| CpuWorkerError::Quarantined)?;
+        let mut installation = self
+            .installation
+            .lock()
+            .map_err(|_| CpuWorkerError::Quarantined)?;
+        let receipt = installation.try_ack()?;
+        if let Some(profile) = receipt
+            .as_ref()
+            .and_then(|receipt| receipt.result().ok())
+            .map(ValueInstallReadback::profile)
+        {
+            if profile.owner != self.owner {
+                return Err(CpuWorkerError::Quarantined);
+            }
+            self.max_depth = profile.max_depth;
+            self.evaluation_namespace = profile.evaluation_namespace;
+            self.search_conditions = profile.search_conditions;
+        }
+        Ok(receipt)
     }
     /// The actual mailbox and engine ceilings captured before worker start.
     pub fn command_capacity(&self) -> usize {
@@ -1751,6 +1962,23 @@ impl CpuWorker {
         };
         if let Err(error) = fence.claim(self.owner, command.grant()) {
             return Err(CpuSubmissionRejected::from_command(error, command, false));
+        }
+        match self.installation.lock() {
+            Ok(installation) if installation.pending() => {
+                return Err(CpuSubmissionRejected::from_command(
+                    CpuWorkerError::AlreadyReserved,
+                    command,
+                    true,
+                ));
+            }
+            Err(_) => {
+                return Err(CpuSubmissionRejected::from_command(
+                    CpuWorkerError::Quarantined,
+                    command,
+                    true,
+                ));
+            }
+            _ => {}
         }
         if self.shutdown.load(Ordering::Acquire) {
             return Err(CpuSubmissionRejected::from_command(
@@ -1940,6 +2168,11 @@ impl CpuWorker {
             events.push(event.original);
         }
         let last_progress = self.latest_progress();
+        let (value_installation_receipt, value_installation_error) =
+            match self.try_install_readback() {
+                Ok(receipt) => (receipt, None),
+                Err(error) => (None, Some(error)),
+            };
         CpuWorkerShutdown {
             owner: self.owner,
             events,
@@ -1957,6 +2190,8 @@ impl CpuWorker {
                 CpuWorkerThreadAffinityShutdown::NotRequested
             },
             engine_recoverable: self.joined_known,
+            value_installation_receipt,
+            value_installation_error,
         }
     }
     /// Move the same engine/TT out only after a known joined owner exit. The

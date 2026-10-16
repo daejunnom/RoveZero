@@ -38,6 +38,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                             admission.consumer == Some(original.id)
                                 && self
                                     .engine
+                                    .semantic
                                     .stores
                                     .hot_validate_pending_cpu_feedback(
                                         execution,
@@ -82,6 +83,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     admission.consumer == Some(original.id)
                         && self
                             .engine
+                            .semantic
                             .stores
                             .hot_validate_pending_cpu_feedback(
                                 execution,
@@ -96,7 +98,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             && !admission.terminal
             && !admission.quarantined
             && query.stage == RefinementStage::CpuValidation
-            && self.engine.nodes[query.node].terminal.is_none()
+            && self.engine.semantic.nodes[query.node].terminal.is_none()
             && self
                 .divergence_indices(proposal)
                 .is_ok_and(|indices| !indices.is_empty())
@@ -194,8 +196,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .position
                 .snapshot()
                 .same_state(&admission.position.snapshot())
-            || self.engine.stores.tasks.get(execution)?.key != admission.task_key
-            || self.engine.stores.tasks.get(execution)?.status != TaskStatus::InFlight
+            || self.engine.semantic.stores.tasks.get(execution)?.key != admission.task_key
+            || self.engine.semantic.stores.tasks.get(execution)?.status != TaskStatus::InFlight
         {
             return Err(StoreError::InvalidConditions(
                 "unadmitted CPU proof differs from original grant",
@@ -204,6 +206,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         }
         if admission.continuation_retained {
             self.engine
+                .semantic
                 .stores
                 .pause_task(execution, job.id.sequence, None)?;
             self.cpu_admissions
@@ -211,9 +214,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .expect("checked rejection")
                 .grant = None;
         } else {
-            self.engine.stores.tasks.fail(execution)?;
+            self.engine.semantic.stores.tasks.fail(execution)?;
             if let Some(consumer) = admission.consumer {
                 self.engine
+                    .semantic
                     .stores
                     .tasks
                     .cancel_consumer(execution, consumer)?;
@@ -250,6 +254,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         actual == execution
             && self
                 .engine
+                .semantic
                 .stores
                 .observations
                 .get(observation)
@@ -261,6 +266,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                         && raw.cpu_condition == admission.task_key.cpu_condition
                         && self
                             .engine
+                            .semantic
                             .stores
                             .tasks
                             .get(stored_execution)
@@ -352,6 +358,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                         })
                     && admission.original_consumer.is_some_and(|original| {
                         self.engine
+                            .semantic
                             .stores
                             .hot_validate_consumed_cpu_feedback(
                                 execution,
@@ -365,6 +372,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     })
                     && self
                         .engine
+                        .semantic
                         .stores
                         .observations
                         .get(observation)
@@ -424,7 +432,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .position
                 .snapshot()
                 .same_state(&admission.position.snapshot())
-            || self.engine.game_generation != Some(job.id.authority.game.0)
+            || self.engine.semantic.game_generation != Some(job.id.authority.game.0)
             || admission.cumulative_nodes > admission.credit
             || termination.retained_bytes != 0
             || !controls.terminal
@@ -449,10 +457,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         }
         // Current root/revision/deadline acceptance does not authorize disposal
         // of another job. Verify the original immutable Store facts instead.
-        let root = self.engine.stores.situations.get(admission.root)?;
-        let task = self.engine.stores.tasks.get(execution)?;
+        let root = self.engine.semantic.stores.situations.get(admission.root)?;
+        let task = self.engine.semantic.stores.tasks.get(execution)?;
         if !self
             .engine
+            .semantic
             .stores
             .states
             .get(root.state)?
@@ -460,6 +469,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             || task.key != admission.task_key
             || !self
                 .engine
+                .semantic
                 .stores
                 .states
                 .get(task.key.state)?
@@ -471,7 +481,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             )
             .into());
         }
-        self.engine.stores.hot_retire_paused(execution)?;
+        self.engine.semantic.stores.hot_retire_paused(execution)?;
         let stored = self
             .cpu_admissions
             .get_mut(&digest)
@@ -538,7 +548,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if !is_cpu_stage(question.stage) || self.closed.contains(&work.frame) {
             return Err(StoreError::InvalidConditions("not an open CPU frame").into());
         }
-        let node = &self.engine.nodes[question.node];
+        let node = &self.engine.semantic.nodes[question.node];
         if node.terminal.is_some()
             || node.state != question.context.state
             || node.situation != question.context.situation
@@ -711,10 +721,21 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             "{};q={}",
             descriptor.search_identity, descriptor.config.quiescence_ply
         ));
-        let root = self.engine.stores.root().ok_or(StoreError::StaleConsumer)?;
-        let root_record = self.engine.stores.situations.get(root)?;
+        let root = self
+            .engine
+            .semantic
+            .stores
+            .root()
+            .ok_or(StoreError::StaleConsumer)?;
+        let root_record = self.engine.semantic.stores.situations.get(root)?;
         let situation = node.situation;
-        let situation_revision = self.engine.stores.situations.get(situation)?.revision;
+        let situation_revision = self
+            .engine
+            .semantic
+            .stores
+            .situations
+            .get(situation)?
+            .revision;
         let position = question.position.clone();
         let rules_position = self.issue_rules_position(position.clone())?;
         let rules_identity = rules_position
@@ -744,10 +765,16 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 target_depth,
                 credit,
                 restriction,
-                generation: self.engine.stores.generation(),
+                generation: self.engine.semantic.stores.generation(),
                 root,
                 root_revision: root_record.revision,
-                root_snapshot: self.engine.stores.states.get(root_record.state)?.clone(),
+                root_snapshot: self
+                    .engine
+                    .semantic
+                    .stores
+                    .states
+                    .get(root_record.state)?
+                    .clone(),
                 position,
                 rules_identity,
                 situation,
@@ -855,12 +882,13 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             )
             .into());
         }
-        self.engine.consumer_id = self
+        self.engine.semantic.consumer_id = self
             .engine
+            .semantic
             .consumer_id
             .checked_add(1)
             .ok_or(PalsError::Capacity)?;
-        let consumer = self.engine.consumer_id;
+        let consumer = self.engine.semantic.consumer_id;
         let deadline_tick = self.engine.tick_at(self.limits.deadline);
         let now_tick = self.engine.tick_at(Instant::now());
         let next_consumer = TaskConsumer {
@@ -898,7 +926,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 )
                 .into());
             }
-            self.engine.stores.hot_resume_cpu_instance(
+            self.engine.semantic.stores.hot_resume_cpu_instance(
                 dispatch,
                 admission.task_key.clone(),
                 consumer,
@@ -906,7 +934,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 now_tick,
             )?
         } else {
-            self.engine.stores.hot_request_cpu_instance(
+            self.engine.semantic.stores.hot_request_cpu_instance(
                 admission.task_key.clone(),
                 next_consumer,
                 now_tick,
@@ -923,11 +951,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 && checkpoint == job.id.sequence
                 && admission.owner == Some(grant.owner) =>
             {
-                self.engine.stores.hot_retire_paused(previous)?;
+                self.engine.semantic.stores.hot_retire_paused(previous)?;
                 execution
             }
             TaskAdmission::Join(execution) | TaskAdmission::Reuse { execution, .. } => {
                 self.engine
+                    .semantic
                     .stores
                     .tasks
                     .cancel_consumer(execution, consumer)?;
@@ -937,7 +966,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .into());
             }
             TaskAdmission::Start(execution) | TaskAdmission::Resume { execution, .. } => {
-                self.engine.stores.tasks.fail(execution)?;
+                self.engine.semantic.stores.tasks.fail(execution)?;
                 return Err(StoreError::InvalidConditions(
                     "CPU resume checkpoint differs from its actual owner",
                 )
@@ -1036,6 +1065,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .same_state(&admission.position.snapshot())
             && self
                 .engine
+                .semantic
                 .stores
                 .tasks
                 .get(stored_execution)
@@ -1107,7 +1137,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .position
                 .snapshot()
                 .same_state(&admission.position.snapshot())
-            || self.engine.stores.tasks.get(execution)?.key != admission.task_key
+            || self.engine.semantic.stores.tasks.get(execution)?.key != admission.task_key
         {
             return Err(
                 StoreError::InvalidConditions("duplicate or mismatched CPU slice receipt").into(),
@@ -1195,10 +1225,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 self.account_cpu_failure(actual)?;
                 if receipt.admission_rejected && admission.continuation_retained {
                     self.engine
+                        .semantic
                         .stores
                         .pause_task(execution, job.id.sequence, None)?;
                 } else {
-                    self.engine.stores.tasks.fail(execution)?;
+                    self.engine.semantic.stores.tasks.fail(execution)?;
                     if receipt.admission_rejected {
                         let stored = self
                             .cpu_admissions
@@ -1249,7 +1280,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .cpu_tasks
                 .checked_add(1)
                 .ok_or(PalsError::Capacity)?;
-            self.engine.stores.tasks.fail(execution)?;
+            self.engine.semantic.stores.tasks.fail(execution)?;
             self.cpu_admissions
                 .get_mut(&digest)
                 .expect("checked admission")
@@ -1268,7 +1299,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .cpu_tasks
                 .checked_add(1)
                 .ok_or(PalsError::Capacity)?;
-            self.engine.stores.tasks.fail(execution)?;
+            self.engine.semantic.stores.tasks.fail(execution)?;
             self.cpu_admissions
                 .get_mut(&digest)
                 .expect("checked admission")
@@ -1298,7 +1329,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let observation = match observation {
             Ok(observation) => observation,
             Err(error) => {
-                self.engine.stores.tasks.fail(execution)?;
+                self.engine.semantic.stores.tasks.fail(execution)?;
                 self.cpu_admissions
                     .get_mut(&digest)
                     .expect("checked admission")
@@ -1317,13 +1348,18 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             CpuCompletion::Canceled | CpuCompletion::Deadline
         );
         if receipt.continuation_retained {
-            self.engine
-                .stores
-                .pause_task(execution, job.id.sequence, Some(observation))?;
+            self.engine.semantic.stores.pause_task(
+                execution,
+                job.id.sequence,
+                Some(observation),
+            )?;
         } else if complete && !aborted {
-            self.engine.stores.complete_task(execution, observation)?;
+            self.engine
+                .semantic
+                .stores
+                .complete_task(execution, observation)?;
         } else {
-            self.engine.stores.tasks.fail(execution)?;
+            self.engine.semantic.stores.tasks.fail(execution)?;
         }
         if consume_current && !aborted && self.cpu_context_current(work, &admission) {
             let now_tick = self.engine.tick_at(Instant::now());
@@ -1334,16 +1370,19 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                         "CPU original consumer missing",
                     ))?;
             let accepted = if receipt.continuation_retained {
-                self.engine.stores.hot_validate_sealed_paused_cpu_feedback(
-                    execution,
-                    original_consumer,
-                    &admission.task_key,
-                    &admission.position.snapshot(),
-                    observation,
-                    now_tick,
-                )
+                self.engine
+                    .semantic
+                    .stores
+                    .hot_validate_sealed_paused_cpu_feedback(
+                        execution,
+                        original_consumer,
+                        &admission.task_key,
+                        &admission.position.snapshot(),
+                        observation,
+                        now_tick,
+                    )
             } else if complete {
-                self.engine.stores.hot_consume_sealed_cpu_task(
+                self.engine.semantic.stores.hot_consume_sealed_cpu_task(
                     execution,
                     original_consumer,
                     &admission.task_key,
@@ -1351,7 +1390,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     now_tick,
                 )
             } else {
-                self.engine.stores.hot_consume_sealed_cpu_feedback(
+                self.engine.semantic.stores.hot_consume_sealed_cpu_feedback(
                     execution,
                     original_consumer,
                     &admission.task_key,
@@ -1383,7 +1422,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             // Discovery estimates describe the divergence question, including
             // unrestricted discovery. They never enter generic node evidence.
             if work.input.stage != RefinementStage::CpuDiscovery {
-                self.engine.nodes[admission.node].evidence = Some(CpuEvidence {
+                self.engine.semantic.nodes[admission.node].evidence = Some(CpuEvidence {
                     score: report.score,
                     depth: report.completed_depth,
                     scope: report.score_scope,
@@ -1452,11 +1491,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         self.check_live().is_ok()
             && admission.frame.authority == self.authority
             && admission.view_seal.authority == self.authority
-            && self.engine.game_generation == Some(self.authority.game.0)
-            && self.engine.stores.generation() == admission.generation
-            && self.engine.stores.root() == Some(admission.root)
+            && self.engine.semantic.game_generation == Some(self.authority.game.0)
+            && self.engine.semantic.stores.generation() == admission.generation
+            && self.engine.semantic.stores.root() == Some(admission.root)
             && self
                 .engine
+                .semantic
                 .stores
                 .situations
                 .get(admission.root)
@@ -1464,6 +1504,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     root.revision >= admission.root_revision
                         && self
                             .engine
+                            .semantic
                             .stores
                             .states
                             .get(root.state)
@@ -1471,6 +1512,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 })
             && self
                 .engine
+                .semantic
                 .stores
                 .situations
                 .get(admission.situation)
@@ -1478,14 +1520,19 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     situation.revision >= admission.situation_revision
                         && situation.state == admission.task_key.state
                 })
-            && self.engine.nodes.get(admission.node).is_some_and(|node| {
-                node.state == admission.task_key.state
-                    && node.situation == admission.situation
-                    && node
-                        .position
-                        .snapshot()
-                        .same_state(&admission.position.snapshot())
-            })
+            && self
+                .engine
+                .semantic
+                .nodes
+                .get(admission.node)
+                .is_some_and(|node| {
+                    node.state == admission.task_key.state
+                        && node.situation == admission.situation
+                        && node
+                            .position
+                            .snapshot()
+                            .same_state(&admission.position.snapshot())
+                })
     }
 
     pub(super) fn account_cpu_failure(&mut self, work: CpuWork) -> Result<(), PalsError> {
@@ -1519,6 +1566,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     ) -> Result<ObservationId, PalsError> {
         if !self
             .engine
+            .semantic
             .stores
             .states
             .get(admission.task_key.state)?
@@ -1531,49 +1579,56 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         } else {
             Some(
                 self.engine
+                    .semantic
                     .stores
                     .hot_append_cpu_pv(&admission.position, projected)?,
             )
         };
-        let observation = self.engine.stores.hot_append_observation(Observation {
-            state: admission.task_key.state,
-            line: None,
-            source: stable_id(report.score_provenance),
-            epoch: 0,
-            value_identity: Some(report.value_identity.clone()),
-            checker_identity: None,
-            checker_work: None,
-            external_report: None,
-            model_value_identity: None,
-            model_value_input: None,
-            cpu_condition: admission.task_key.cpu_condition.clone(),
-            cpu_pv,
-            scope: EvidenceScope::DepthLimited {
-                depth: report.completed_depth,
-                profile: admission.task_key.profile,
-                condition: admission.task_key.condition,
-            },
-            score: if report.score_scope == CpuScoreScope::FrontierOnly {
-                RawScore::Estimate {
-                    value: report.score as f32,
-                    perspective: admission.position.side_to_move(),
-                }
-            } else {
-                RawScore::Cpu {
-                    value: report.score,
-                    perspective: admission.position.side_to_move(),
-                    bound: BoundKind::ExactWithinSearch,
-                }
-            },
-            budget: report.nodes,
-            kind: ObservationKind::CpuAnalysis,
-            supersedes: None,
-            execution: Some(execution),
-        })?;
+        let observation = self
+            .engine
+            .semantic
+            .stores
+            .hot_append_observation(Observation {
+                state: admission.task_key.state,
+                line: None,
+                source: stable_id(report.score_provenance),
+                epoch: 0,
+                value_identity: Some(report.value_identity.clone()),
+                checker_identity: None,
+                checker_work: None,
+                external_report: None,
+                model_value_identity: None,
+                model_value_input: None,
+                cpu_condition: admission.task_key.cpu_condition.clone(),
+                cpu_pv,
+                scope: EvidenceScope::DepthLimited {
+                    depth: report.completed_depth,
+                    profile: admission.task_key.profile,
+                    condition: admission.task_key.condition,
+                },
+                score: if report.score_scope == CpuScoreScope::FrontierOnly {
+                    RawScore::Estimate {
+                        value: report.score as f32,
+                        perspective: admission.position.side_to_move(),
+                    }
+                } else {
+                    RawScore::Cpu {
+                        value: report.score,
+                        perspective: admission.position.side_to_move(),
+                        bound: BoundKind::ExactWithinSearch,
+                    }
+                },
+                budget: report.nodes,
+                kind: ObservationKind::CpuAnalysis,
+                supersedes: None,
+                execution: Some(execution),
+            })?;
         self.engine
+            .semantic
             .stores
             .hot_add_dependency(observation, admission.situation)?;
         self.engine
+            .semantic
             .stores
             .hot_add_dependency(observation, admission.root)?;
         Ok(observation)
@@ -1795,10 +1850,17 @@ mod tests {
         let execution = original.execution.unwrap();
         let consumer = original.original_consumer.unwrap();
         assert_eq!(
-            port.engine.stores.tasks.get(execution).unwrap().status,
+            port.engine
+                .semantic
+                .stores
+                .tasks
+                .get(execution)
+                .unwrap()
+                .status,
             TaskStatus::InFlight
         );
         port.engine
+            .semantic
             .stores
             .tasks
             .cancel_consumer(execution, consumer.id)
@@ -1930,6 +1992,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             port.engine
+                .semantic
                 .stores
                 .observations
                 .get(observation)
@@ -1939,6 +2002,7 @@ mod tests {
         );
         assert_eq!(
             port.engine
+                .semantic
                 .stores
                 .tasks
                 .get(admission.execution.unwrap())
@@ -1947,15 +2011,15 @@ mod tests {
             TaskStatus::Completed(observation)
         );
         assert!(
-            port.engine.nodes[work.input.question.node]
+            port.engine.semantic.nodes[work.input.question.node]
                 .evidence
                 .is_some()
         );
         assert_eq!(port.counters.cpu_nodes, 12);
         assert_eq!(port.counters.consumed_cpu_tasks, 1);
-        let observed = port.engine.stores.observations.len();
+        let observed = port.engine.semantic.stores.observations.len();
         assert!(port.commit_cpu_report(&work, &report).is_err());
-        assert_eq!(port.engine.stores.observations.len(), observed);
+        assert_eq!(port.engine.semantic.stores.observations.len(), observed);
         assert_eq!(port.counters.cpu_nodes, 12);
         assert_eq!(port.counters.consumed_cpu_tasks, 1);
     }
@@ -1966,13 +2030,21 @@ mod tests {
         let (_, grant) = first_grant(&mut port, &work, profile);
         let admission = port.cpu_admissions[&work.input.question_digest].clone();
         for node in [port.root, admission.node] {
-            let situation = port.engine.nodes[node].situation;
-            let focus = port.engine.stores.situations.get(situation).unwrap().focus;
+            let situation = port.engine.semantic.nodes[node].situation;
+            let focus = port
+                .engine
+                .semantic
+                .stores
+                .situations
+                .get(situation)
+                .unwrap()
+                .focus;
             let evidence = port
                 .engine
                 .conclusion_observation(node, focus, ObservationKind::Refutation, -1, None)
                 .unwrap();
             port.engine
+                .semantic
                 .stores
                 .hot_refute_continuation(situation, focus, evidence)
                 .unwrap();
@@ -1982,7 +2054,11 @@ mod tests {
         let (_, complete) = port.commit_cpu_report(&work, &report).unwrap();
         assert!(complete);
         assert_eq!(port.counters.consumed_cpu_tasks, 1);
-        assert!(port.engine.nodes[admission.node].evidence.is_some());
+        assert!(
+            port.engine.semantic.nodes[admission.node]
+                .evidence
+                .is_some()
+        );
         // No latest-revision consumer was substituted for the original one.
         assert_eq!(
             port.cpu_admissions[&work.input.question_digest]
@@ -1999,13 +2075,13 @@ mod tests {
         let (_, grant) = first_grant(&mut port, &work, profile);
         let report = receipt(&port, &work, grant, 1, 12, 12, CpuCompletion::DepthLimit);
         port.observe_cpu_report(&work, &report).unwrap();
-        let observed = port.engine.stores.observations.len();
+        let observed = port.engine.semantic.stores.observations.len();
         port.observe_cpu_report(&work, &report).unwrap();
-        assert_eq!(port.engine.stores.observations.len(), observed);
+        assert_eq!(port.engine.semantic.stores.observations.len(), observed);
         assert_eq!(port.counters.cpu_nodes, 12);
         assert_eq!(port.counters.consumed_cpu_tasks, 0);
         assert!(
-            port.engine.nodes[work.input.question.node]
+            port.engine.semantic.nodes[work.input.question.node]
                 .evidence
                 .is_none()
         );
@@ -2044,7 +2120,13 @@ mod tests {
         let previous = before.execution.unwrap();
         let key = before.task_key.clone();
         assert_eq!(
-            port.engine.stores.tasks.get(previous).unwrap().status,
+            port.engine
+                .semantic
+                .stores
+                .tasks
+                .get(previous)
+                .unwrap()
+                .status,
             TaskStatus::Paused {
                 checkpoint: job.id.sequence,
                 evidence: Some(partial)
@@ -2068,7 +2150,13 @@ mod tests {
             .unwrap();
         assert_eq!(resumed.task_key, key);
         assert_eq!(
-            port.engine.stores.tasks.get(previous).unwrap().status,
+            port.engine
+                .semantic
+                .stores
+                .tasks
+                .get(previous)
+                .unwrap()
+                .status,
             TaskStatus::RetiredPaused {
                 checkpoint: job.id.sequence,
                 evidence: Some(partial)
@@ -2076,6 +2164,7 @@ mod tests {
         );
         assert_eq!(
             port.engine
+                .semantic
                 .stores
                 .tasks
                 .get(resumed.execution.unwrap())
@@ -2089,6 +2178,7 @@ mod tests {
         assert!(port.cpu_observation_consumed(&work, observation));
         assert_eq!(
             port.engine
+                .semantic
                 .stores
                 .observations
                 .get(observation)
@@ -2113,6 +2203,7 @@ mod tests {
         let admission = port.cpu_admissions[&work.input.question_digest].clone();
         assert_eq!(
             port.engine
+                .semantic
                 .stores
                 .tasks
                 .get(admission.execution.unwrap())
@@ -2124,7 +2215,7 @@ mod tests {
         assert_eq!(port.counters.consumed_cpu_tasks, 0);
         assert_eq!(port.counters.consumed_partial_cpu_values, 1);
         assert_eq!(
-            port.engine.stores.hot_consume_sealed_cpu_feedback(
+            port.engine.semantic.stores.hot_consume_sealed_cpu_feedback(
                 admission.execution.unwrap(),
                 admission.original_consumer.unwrap(),
                 &admission.task_key,
@@ -2145,6 +2236,7 @@ mod tests {
         let (_, grant) = first_grant(&mut port, &work, profile);
         let admission = port.cpu_admissions[&work.input.question_digest].clone();
         port.engine
+            .semantic
             .stores
             .tasks
             .cancel_consumer(admission.execution.unwrap(), admission.consumer.unwrap())
@@ -2153,10 +2245,21 @@ mod tests {
         let (observation, complete) = port.commit_cpu_report(&work, &report).unwrap();
         assert!(!complete);
         assert!(!port.cpu_observation_consumed(&work, observation));
-        assert!(port.engine.nodes[admission.node].evidence.is_none());
+        assert!(
+            port.engine.semantic.nodes[admission.node]
+                .evidence
+                .is_none()
+        );
         assert_eq!(port.counters.cpu_nodes, 100);
         assert_eq!(port.counters.consumed_partial_cpu_values, 0);
-        assert!(port.engine.stores.observations.get(observation).is_ok());
+        assert!(
+            port.engine
+                .semantic
+                .stores
+                .observations
+                .get(observation)
+                .is_ok()
+        );
         port.observe_cpu_report(&work, &report).unwrap();
         assert!(!port.cpu_observation_consumed(&work, observation));
     }
@@ -2181,57 +2284,87 @@ mod tests {
             let admission = port.cpu_admissions[&work.input.question_digest].clone();
             let execution = admission.execution.unwrap();
             let original = admission.original_consumer.unwrap();
-            let status = port.engine.stores.tasks.get(execution).unwrap().status;
+            let status = port
+                .engine
+                .semantic
+                .stores
+                .tasks
+                .get(execution)
+                .unwrap()
+                .status;
             let counters = port.counters;
-            let observations = port.engine.stores.observations.len();
+            let observations = port.engine.semantic.stores.observations.len();
             // Retained paused feedback used the real receipt but did not
             // consume the checkpoint's original resume permission. Terminal
             // feedback did consume it. Both still obey an explicit revoke.
             assert_eq!(
-                port.engine.stores.hot_validate_consumed_cpu_feedback(
-                    execution,
-                    original,
-                    &admission.task_key,
-                    &admission.position.snapshot(),
-                    observation,
-                    0,
-                ),
+                port.engine
+                    .semantic
+                    .stores
+                    .hot_validate_consumed_cpu_feedback(
+                        execution,
+                        original,
+                        &admission.task_key,
+                        &admission.position.snapshot(),
+                        observation,
+                        0,
+                    ),
                 Ok(observation)
             );
             assert_eq!(
-                port.engine.stores.hot_validate_consumed_cpu_feedback(
-                    execution,
-                    original,
-                    &admission.task_key,
-                    &admission.position.snapshot(),
-                    observation,
-                    original.deadline_tick,
-                ),
+                port.engine
+                    .semantic
+                    .stores
+                    .hot_validate_consumed_cpu_feedback(
+                        execution,
+                        original,
+                        &admission.task_key,
+                        &admission.position.snapshot(),
+                        observation,
+                        original.deadline_tick,
+                    ),
                 Err(StoreError::ExpiredConsumer)
             );
             port.engine
+                .semantic
                 .stores
                 .tasks
                 .cancel_consumer(execution, original.id)
                 .unwrap();
             assert_eq!(
-                port.engine.stores.hot_validate_consumed_cpu_feedback(
-                    execution,
-                    original,
-                    &admission.task_key,
-                    &admission.position.snapshot(),
-                    observation,
-                    0,
-                ),
+                port.engine
+                    .semantic
+                    .stores
+                    .hot_validate_consumed_cpu_feedback(
+                        execution,
+                        original,
+                        &admission.task_key,
+                        &admission.position.snapshot(),
+                        observation,
+                        0,
+                    ),
                 Err(StoreError::CancelledConsumer)
             );
             assert!(!port.cpu_observation_consumed(&work, observation));
             assert_eq!(
-                port.engine.stores.tasks.get(execution).unwrap().status,
+                port.engine
+                    .semantic
+                    .stores
+                    .tasks
+                    .get(execution)
+                    .unwrap()
+                    .status,
                 status
             );
-            assert!(port.engine.stores.observations.get(observation).is_ok());
-            assert_eq!(port.engine.stores.observations.len(), observations);
+            assert!(
+                port.engine
+                    .semantic
+                    .stores
+                    .observations
+                    .get(observation)
+                    .is_ok()
+            );
+            assert_eq!(port.engine.semantic.stores.observations.len(), observations);
             assert_eq!(port.counters, counters);
             port.observe_cpu_report(&work, &report).unwrap();
             assert_eq!(port.counters, counters);
@@ -2286,9 +2419,10 @@ mod tests {
             let execution = admission.execution.unwrap();
             let original = admission.original_consumer.unwrap();
             let counters = port.counters;
-            let observations = port.engine.stores.observations.len();
-            let public_revision = port.engine.revision;
+            let observations = port.engine.semantic.stores.observations.len();
+            let public_revision = port.engine.semantic.revision;
             port.engine
+                .semantic
                 .stores
                 .tasks
                 .cancel_consumer(execution, original.id)
@@ -2298,11 +2432,17 @@ mod tests {
                 port.materialize_step(step),
                 Err(PalsError::Store(StoreError::StaleConsumer))
             ));
-            assert_eq!(port.engine.stores.observations.len(), observations);
-            assert_eq!(port.engine.revision, public_revision);
+            assert_eq!(port.engine.semantic.stores.observations.len(), observations);
+            assert_eq!(port.engine.semantic.revision, public_revision);
             assert_eq!(port.counters, counters);
             assert_eq!(
-                port.engine.stores.tasks.get(execution).unwrap().status,
+                port.engine
+                    .semantic
+                    .stores
+                    .tasks
+                    .get(execution)
+                    .unwrap()
+                    .status,
                 TaskStatus::Completed(observation)
             );
         }
@@ -2368,11 +2508,12 @@ mod tests {
             assert!(!port.cpu_deferred_feedback_still_authorized(other, question, observation));
 
             let counters = port.counters;
-            let observations = port.engine.stores.observations.len();
-            let public_revision = port.engine.revision;
+            let observations = port.engine.semantic.stores.observations.len();
+            let public_revision = port.engine.semantic.revision;
             match revoke {
                 Some("cancel") => port
                     .engine
+                    .semantic
                     .stores
                     .tasks
                     .cancel_consumer(execution, original.id)
@@ -2389,10 +2530,16 @@ mod tests {
             );
             assert!(!port.cpu_feedback_still_authorized(question, observation));
             assert_eq!(port.counters, counters);
-            assert_eq!(port.engine.stores.observations.len(), observations);
-            assert_eq!(port.engine.revision, public_revision);
+            assert_eq!(port.engine.semantic.stores.observations.len(), observations);
+            assert_eq!(port.engine.semantic.revision, public_revision);
             assert_eq!(
-                port.engine.stores.tasks.get(execution).unwrap().status,
+                port.engine
+                    .semantic
+                    .stores
+                    .tasks
+                    .get(execution)
+                    .unwrap()
+                    .status,
                 TaskStatus::Completed(observation)
             );
         }
@@ -2416,13 +2563,21 @@ mod tests {
             let original = admission.original_consumer.unwrap();
             let counters = port.counters;
             for node in [port.root, admission.node] {
-                let situation = port.engine.nodes[node].situation;
-                let focus = port.engine.stores.situations.get(situation).unwrap().focus;
+                let situation = port.engine.semantic.nodes[node].situation;
+                let focus = port
+                    .engine
+                    .semantic
+                    .stores
+                    .situations
+                    .get(situation)
+                    .unwrap()
+                    .focus;
                 let conclusion = port
                     .engine
                     .conclusion_observation(node, focus, ObservationKind::Refutation, -1, None)
                     .unwrap();
                 port.engine
+                    .semantic
                     .stores
                     .hot_refute_continuation(situation, focus, conclusion)
                     .unwrap();
@@ -2438,23 +2593,26 @@ mod tests {
             assert_eq!(port.counters, counters);
             if completion == CpuCompletion::Yielded {
                 assert_eq!(
-                    port.engine.stores.hot_validate_sealed_paused_cpu_feedback(
-                        execution,
-                        original,
-                        &admission.task_key,
-                        &admission.position.snapshot(),
-                        observation,
-                        0,
-                    ),
+                    port.engine
+                        .semantic
+                        .stores
+                        .hot_validate_sealed_paused_cpu_feedback(
+                            execution,
+                            original,
+                            &admission.task_key,
+                            &admission.position.snapshot(),
+                            observation,
+                            0,
+                        ),
                     Ok(observation)
                 );
                 assert!(
-                    matches!(port.engine.stores.tasks.get(execution).unwrap().status,
+                    matches!(port.engine.semantic.stores.tasks.get(execution).unwrap().status,
                     TaskStatus::Paused { evidence: Some(id), .. } if id == observation)
                 );
             } else {
                 assert_eq!(
-                    port.engine.stores.hot_consume_sealed_cpu_task(
+                    port.engine.semantic.stores.hot_consume_sealed_cpu_task(
                         execution,
                         original,
                         &admission.task_key,
@@ -2478,6 +2636,7 @@ mod tests {
             let admission = port.cpu_admissions[&work.input.question_digest].clone();
             assert_eq!(
                 port.engine
+                    .semantic
                     .stores
                     .tasks
                     .get(admission.execution.unwrap())
@@ -2485,11 +2644,15 @@ mod tests {
                     .status,
                 TaskStatus::Failed
             );
-            assert!(port.engine.nodes[admission.node].evidence.is_none());
+            assert!(
+                port.engine.semantic.nodes[admission.node]
+                    .evidence
+                    .is_none()
+            );
             assert_eq!(port.counters.cpu_nodes, 12);
             assert_eq!(port.counters.consumed_cpu_tasks, 0);
             assert_eq!(port.counters.consumed_partial_cpu_values, 0);
-            assert!(port.engine.records.is_empty());
+            assert!(port.engine.semantic.records.is_empty());
             port.observe_cpu_report(&work, &report).unwrap();
             assert_eq!(port.counters.cpu_nodes, 12);
         }
@@ -2507,13 +2670,21 @@ mod tests {
         // An independent frame may publish conclusions at either shared
         // situation while this exact worker-owned job is temporarily paused.
         for node in [port.root, original.node] {
-            let situation = port.engine.nodes[node].situation;
-            let focus = port.engine.stores.situations.get(situation).unwrap().focus;
+            let situation = port.engine.semantic.nodes[node].situation;
+            let focus = port
+                .engine
+                .semantic
+                .stores
+                .situations
+                .get(situation)
+                .unwrap()
+                .focus;
             let evidence = port
                 .engine
                 .conclusion_observation(node, focus, ObservationKind::Refutation, -1, None)
                 .unwrap();
             port.engine
+                .semantic
                 .stores
                 .hot_refute_continuation(situation, focus, evidence)
                 .unwrap();
@@ -2542,6 +2713,7 @@ mod tests {
         assert_ne!(authority.id, original.original_consumer.unwrap().id);
         assert_eq!(
             port.engine
+                .semantic
                 .stores
                 .tasks
                 .get(resumed.execution.unwrap())
@@ -2555,7 +2727,7 @@ mod tests {
         assert_eq!(port.counters.cpu_nodes, 17);
         assert_eq!(port.counters.consumed_cpu_tasks, 1);
         assert_eq!(
-            port.engine.stores.hot_consume_sealed_cpu_task(
+            port.engine.semantic.stores.hot_consume_sealed_cpu_task(
                 resumed.execution.unwrap(),
                 resumed.original_consumer.unwrap(),
                 &resumed.task_key,
@@ -2642,13 +2814,21 @@ mod tests {
         port.commit_cpu_report(&first_work, &yielded).unwrap();
         let first = port.cpu_admissions[&first_work.input.question_digest].clone();
         for node in [port.root, first.node] {
-            let situation = port.engine.nodes[node].situation;
-            let focus = port.engine.stores.situations.get(situation).unwrap().focus;
+            let situation = port.engine.semantic.nodes[node].situation;
+            let focus = port
+                .engine
+                .semantic
+                .stores
+                .situations
+                .get(situation)
+                .unwrap()
+                .focus;
             let evidence = port
                 .engine
                 .conclusion_observation(node, focus, ObservationKind::Refutation, -1, None)
                 .unwrap();
             port.engine
+                .semantic
                 .stores
                 .hot_refute_continuation(situation, focus, evidence)
                 .unwrap();
@@ -2713,6 +2893,7 @@ mod tests {
         assert!(complete);
         assert!(
             port.engine
+                .semantic
                 .stores
                 .observations
                 .get(observation)
@@ -2721,7 +2902,7 @@ mod tests {
                 .is_some()
         );
         assert!(
-            port.engine.nodes[work.input.question.node]
+            port.engine.semantic.nodes[work.input.question.node]
                 .evidence
                 .is_none()
         );
@@ -2782,7 +2963,7 @@ mod tests {
         assert!(port.commit_cpu_report(&work, &report).is_err());
         assert_eq!(port.counters.cpu_nodes, 11);
         assert!(
-            port.engine.nodes[work.input.question.node]
+            port.engine.semantic.nodes[work.input.question.node]
                 .evidence
                 .is_none()
         );
@@ -2804,6 +2985,7 @@ mod tests {
         assert!(complete);
         assert_eq!(
             port.engine
+                .semantic
                 .stores
                 .observations
                 .get(observation)
@@ -2814,7 +2996,7 @@ mod tests {
         assert_eq!(port.counters.cpu_nodes, 13);
         assert_eq!(port.counters.consumed_cpu_tasks, 0);
         assert!(
-            port.engine.nodes[work.input.question.node]
+            port.engine.semantic.nodes[work.input.question.node]
                 .evidence
                 .is_none()
         );
@@ -2835,6 +3017,7 @@ mod tests {
         assert!(admission.grant.is_some());
         assert_eq!(
             port.engine
+                .semantic
                 .stores
                 .tasks
                 .get(admission.execution.unwrap())
@@ -2846,7 +3029,7 @@ mod tests {
         assert_eq!(port.counters.cpu_nodes, 0);
         assert_eq!(port.counters.cpu_tasks, 1);
         assert!(
-            port.engine.nodes[work.input.question.node]
+            port.engine.semantic.nodes[work.input.question.node]
                 .evidence
                 .is_none()
         );
@@ -2874,12 +3057,18 @@ mod tests {
             retained_bytes: 0,
             shutdown: false,
         };
-        let observed = port.engine.stores.observations.len();
+        let observed = port.engine.semantic.stores.observations.len();
         port.retire_cpu_token(&work, &termination).unwrap();
         assert_eq!(port.counters.cpu_nodes, 10);
-        assert_eq!(port.engine.stores.observations.len(), observed);
+        assert_eq!(port.engine.semantic.stores.observations.len(), observed);
         assert_eq!(
-            port.engine.stores.tasks.get(execution).unwrap().status,
+            port.engine
+                .semantic
+                .stores
+                .tasks
+                .get(execution)
+                .unwrap()
+                .status,
             TaskStatus::RetiredPaused {
                 checkpoint: job.id.sequence,
                 evidence: Some(evidence)
@@ -2923,7 +3112,13 @@ mod tests {
             .quarantined = true;
         assert!(port.retire_cpu_token(&work, &termination).is_err());
         assert!(matches!(
-            port.engine.stores.tasks.get(execution).unwrap().status,
+            port.engine
+                .semantic
+                .stores
+                .tasks
+                .get(execution)
+                .unwrap()
+                .status,
             TaskStatus::Paused { .. }
         ));
         assert_eq!(port.counters.cpu_nodes, 10);
@@ -2934,10 +3129,10 @@ mod tests {
         let (mut port, work, profile) = port_and_work(RefinementStage::CpuValidation, 1);
         let (_, grant) = first_grant(&mut port, &work, profile);
         let report = receipt(&port, &work, grant, 1, 12, 24, CpuCompletion::DepthLimit);
-        let observed = port.engine.stores.observations.len();
+        let observed = port.engine.semantic.stores.observations.len();
         assert!(port.commit_cpu_report(&work, &report).is_err());
         assert!(port.commit_cpu_report(&work, &report).is_err());
-        assert_eq!(port.engine.stores.observations.len(), observed);
+        assert_eq!(port.engine.semantic.stores.observations.len(), observed);
         assert_eq!(port.counters.cpu_nodes, 0);
         assert!(port.counters.cpu_work_observation_incomplete);
         assert_eq!(port.counters.cpu_tasks, 1);

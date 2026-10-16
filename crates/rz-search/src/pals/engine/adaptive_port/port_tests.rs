@@ -185,7 +185,7 @@ fn accepted_root_ranking(
             rz_contracts::pals::Move16::encode(rz_contracts::Move::try_from(*movement).unwrap());
         ordered_candidates.update(encoded.bits().to_le_bytes());
     }
-    let identity = port.engine.model.value_identity().unwrap();
+    let identity = port.engine.semantic.model.value_identity().unwrap();
     let key = RepresentationKey {
         input: ContractDigest(input.view.digest()),
         history: input.view_seal.root_state.semantic,
@@ -450,7 +450,7 @@ fn independently_pending_roles_keep_their_original_view_after_publication() {
     let (b, out_b) = output(&second, 2);
     port.commit_role(&first, &a, &out_a, None).unwrap();
     port.role_consumed(&a, &first.input.view).unwrap();
-    assert!(port.engine.revision > second_revision);
+    assert!(port.engine.semantic.revision > second_revision);
     port.validate_role(&second, &b, &out_b).unwrap();
     port.commit_role(&second, &b, &out_b, None).unwrap();
     port.role_consumed(&b, &second.input.view).unwrap();
@@ -475,9 +475,10 @@ fn recorded_role_consumption_is_read_only_and_survives_later_progress_or_deadlin
         .unwrap();
     port.record_hot(RecordKind::Counterexample, &counter, None)
         .unwrap();
-    let witness_revision = port.engine.revision;
+    let witness_revision = port.engine.semantic.revision;
     let bundle = port
         .engine
+        .semantic
         .review_index
         .as_ref()
         .unwrap()
@@ -485,6 +486,7 @@ fn recorded_role_consumption_is_read_only_and_survives_later_progress_or_deadlin
         .unwrap();
     let protected = |port: &Port| {
         port.engine
+            .semantic
             .review_index
             .as_ref()
             .unwrap()
@@ -554,13 +556,13 @@ fn recorded_role_consumption_is_read_only_and_survives_later_progress_or_deadlin
         port.role_consumption_recorded(&ticket, &other.input.view),
         Err(PalsError::Role(RoleError::InvalidOutput))
     ));
-    let revision_before = port.engine.revision;
+    let revision_before = port.engine.semantic.revision;
     let (other_ticket, other_out) = output(&other, 2);
     port.commit_role(&other, &other_ticket, &other_out, None)
         .unwrap();
     port.role_consumed(&other_ticket, &other.input.view)
         .unwrap();
-    assert!(port.engine.revision > revision_before);
+    assert!(port.engine.semantic.revision > revision_before);
     assert!(
         port.role_consumption_recorded(&ticket, &original.input.view)
             .unwrap()
@@ -574,10 +576,10 @@ fn recorded_role_consumption_is_read_only_and_survives_later_progress_or_deadlin
         Err(PalsError::Role(RoleError::Deadline))
     ));
     let counters = port.counters;
-    let observations = port.engine.stores.observations.len();
-    let pins = port.engine.stores.review_pin_count().unwrap();
+    let observations = port.engine.semantic.stores.observations.len();
+    let pins = port.engine.semantic.stores.review_pin_count().unwrap();
     let remaining = protected(&port);
-    let revision = port.engine.revision;
+    let revision = port.engine.semantic.revision;
     for _ in 0..3 {
         assert!(
             port.role_consumption_recorded(&ticket, &original.input.view)
@@ -585,9 +587,12 @@ fn recorded_role_consumption_is_read_only_and_survives_later_progress_or_deadlin
         );
         assert_eq!(protected(&port), remaining);
         assert_eq!(port.counters, counters);
-        assert_eq!(port.engine.stores.observations.len(), observations);
-        assert_eq!(port.engine.stores.review_pin_count().unwrap(), pins);
-        assert_eq!(port.engine.revision, revision);
+        assert_eq!(port.engine.semantic.stores.observations.len(), observations);
+        assert_eq!(
+            port.engine.semantic.stores.review_pin_count().unwrap(),
+            pins
+        );
+        assert_eq!(port.engine.semantic.revision, revision);
     }
 }
 #[test]
@@ -619,7 +624,10 @@ fn fresh_counter_rejects_changed_namespace_before_any_hot_publication() {
     let original = FreshPairSeal::from_ticket(
         &ticket,
         pending.input.public_context,
-        port.engine.nodes[port.root].position.side_to_move().into(),
+        port.engine.semantic.nodes[port.root]
+            .position
+            .side_to_move()
+            .into(),
     );
     let query = Arc::make_mut(&mut pending.input.question);
     query.paired_fresh_seal = Some(original);
@@ -627,7 +635,7 @@ fn fresh_counter_rejects_changed_namespace_before_any_hot_publication() {
     // existence of a comparison source observation.
     query.paired_repaired = Some(ObservationId(0));
     port.validate_role(&pending, &ticket, &out).unwrap();
-    let observations = port.engine.stores.observations.len();
+    let observations = port.engine.semantic.stores.observations.len();
     for changed in ["model", "encoding", "epoch", "revision"] {
         ticket.representation = out.key;
         match changed {
@@ -644,7 +652,7 @@ fn fresh_counter_rejects_changed_namespace_before_any_hot_publication() {
         );
         out.key = saved;
     }
-    assert_eq!(port.engine.stores.observations.len(), observations);
+    assert_eq!(port.engine.semantic.stores.observations.len(), observations);
     assert_eq!(port.counters.consumed_role_outputs, 0);
 }
 #[test]
@@ -914,15 +922,15 @@ fn immediate_rules_terminal_scan_precedes_every_model_beam() {
     port.prepare_root_rules().unwrap();
     for movement in mates {
         assert!(
-            port.engine.nodes[port.root]
+            port.engine.semantic.nodes[port.root]
                 .edges
                 .iter()
                 .any(|edge| edge.movement == movement
-                    && port.engine.nodes[edge.child].terminal.is_some())
+                    && port.engine.semantic.nodes[edge.child].terminal.is_some())
         );
     }
     let result = port.result(PalsCompletion::RoundLimit).unwrap();
-    let mut child = port.engine.nodes[port.root].position.clone();
+    let mut child = port.engine.semantic.nodes[port.root].position.clone();
     child.make_move(result.best_move.unwrap()).unwrap();
     assert!(matches!(
         child.classify_position().unwrap().play_status,
@@ -1039,7 +1047,7 @@ fn role_consumption_observation_preserves_rejections_and_refuses_late_enable() {
         event.outcome,
         AdaptiveRoleConsumptionOutcome::Rejected(AdaptiveRoleConsumptionRejection::InvalidOutput)
     );
-    port.engine.game_generation = Some(port.authority.game.0 + 1);
+    port.engine.semantic.game_generation = Some(port.authority.game.0 + 1);
     assert!(matches!(
         port.commit_role(&original, &ticket, &out, None),
         Err(PalsError::Store(StoreError::StaleConsumer))
@@ -1048,7 +1056,7 @@ fn role_consumption_observation_preserves_rejections_and_refuses_late_enable() {
         port.role_consumption_observation().unwrap().events()[1].outcome,
         AdaptiveRoleConsumptionOutcome::Rejected(AdaptiveRoleConsumptionRejection::StaleConsumer)
     );
-    port.engine.game_generation = Some(port.authority.game.0);
+    port.engine.semantic.game_generation = Some(port.authority.game.0);
     port.limits.deadline = Instant::now();
     assert!(matches!(
         port.commit_role(&original, &ticket, &out, None),
@@ -1087,8 +1095,8 @@ fn role_consumption_observation_overflow_cannot_change_idempotent_search_behavio
     port.commit_role(&original, &ticket, &out, None).unwrap();
     port.role_consumed(&ticket, &original.input.view).unwrap();
     let counters = port.counters;
-    let revision = port.engine.revision;
-    let observations = port.engine.stores.observations.len();
+    let revision = port.engine.semantic.revision;
+    let observations = port.engine.semantic.stores.observations.len();
     for _ in 0..MAX_ROLE_CONSUMPTION_EVENTS + 3 {
         port.role_consumed(&ticket, &original.input.view).unwrap();
     }
@@ -1107,8 +1115,8 @@ fn role_consumption_observation_overflow_cannot_change_idempotent_search_behavio
         1
     );
     assert_eq!(port.counters, counters);
-    assert_eq!(port.engine.revision, revision);
-    assert_eq!(port.engine.stores.observations.len(), observations);
+    assert_eq!(port.engine.semantic.revision, revision);
+    assert_eq!(port.engine.semantic.stores.observations.len(), observations);
     assert!(
         port.role_consumption_recorded(&ticket, &original.input.view)
             .unwrap()
@@ -1171,10 +1179,10 @@ fn repair_publication_metadata_is_original_and_does_not_change_semantic_result()
     let mut results = Vec::new();
     for observe in [false, true] {
         let (mut port, work) = repair_publication_work(3, observe);
-        let prior_revision = port.engine.revision;
+        let prior_revision = port.engine.semantic.revision;
         let (ticket, out) = output(&work, 1);
         let step = port.commit_role(&work, &ticket, &out, None).unwrap();
-        let record = port.engine.records.last().unwrap();
+        let record = port.engine.semantic.records.last().unwrap();
         assert_eq!(record.kind, RecordKind::Repair);
         assert_eq!(record.parent_revision, Some(prior_revision));
         assert_eq!(record.line.len(), 3);
@@ -1204,6 +1212,7 @@ fn repair_publication_metadata_is_original_and_does_not_change_semantic_result()
             assert_eq!(published.first_move, record.line.first().copied());
             let original_observation = port
                 .engine
+                .semantic
                 .stores
                 .observations
                 .get(published.observation)
@@ -1211,7 +1220,12 @@ fn repair_publication_metadata_is_original_and_does_not_change_semantic_result()
             assert_eq!(original_observation.line, Some(published.line));
             assert_eq!(original_observation.kind, ObservationKind::Repair);
             assert_eq!(
-                port.engine.stores.lines.moves(published.line).unwrap(),
+                port.engine
+                    .semantic
+                    .stores
+                    .lines
+                    .moves(published.line)
+                    .unwrap(),
                 record.line
             );
             port.role_consumed(&ticket, &work.input.view).unwrap();
@@ -1257,6 +1271,7 @@ fn unfinished_repair_semantic_result_is_not_a_published_repair_line() {
     assert!(
         !port
             .engine
+            .semantic
             .records
             .iter()
             .any(|r| r.kind == RecordKind::Repair)
@@ -1390,6 +1405,7 @@ fn repair_provenance_reaches_original_critic_query_and_first_consume_without_han
         let repaired_moves = repaired.input.question.repaired.as_ref().unwrap().clone();
         assert_eq!(
             port.engine
+                .semantic
                 .stores
                 .lines
                 .moves(original.published_line.line)

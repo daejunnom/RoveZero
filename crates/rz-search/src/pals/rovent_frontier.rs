@@ -1,0 +1,1663 @@
+//! Goal consumption for the real asynchronous single-writer manager.
+//!
+//! This module runs no role model, DFS, CPU search, archive I/O or external
+//! engine. The manager declares actual frame responsibilities, commits checked
+//! Store lines, and supplies its original native-owner acceptance/accounting
+//! receipts. Missing mate defenses are questions for that same manager queue.
+
+use super::coordinator::{AcceptedRoleStep, CoordinatorWork, FrameId, RefinementStage};
+use super::engine::RoleQueryPurpose;
+use super::engine::adaptive_port::{
+    AdaptiveModelNamespace, AdaptivePortQuestion, AdaptivePortRoleEvidence,
+};
+use super::review_context::ReviewView;
+use super::rovent_engine::{AdmittedRoleQuestion, ROVENT_NODE_UNIT, RootMoveDomain};
+use super::rovent_goals::{
+    HorizonBoundary, HorizonError, HorizonInterruption, HorizonObligationId, HorizonObligationKind,
+    HorizonSnapshot, RootPlyAnchor, SelectiveHorizon,
+};
+use super::rovent_solved::{
+    MateConclusion, MateNodeId, MateProofError, MateProofStore, RootMateConclusion,
+};
+use super::store::{LineId, PalsStores, StateId, StoreError, StorePins, StoreReadPin};
+use super::value::ModelValueOutput;
+use crate::cpu_worker::{
+    CpuLedgerIdentity, CpuSliceReport, ReleasedCpuReservation, SettledCpuSlice,
+};
+use rz_contracts::pals::{Role, RoleOutput, RolePayload, SearchAuthority};
+use rz_contracts::pals_adaptive::{CpuJobEnvelope, SliceGrant};
+use rz_contracts::rovent::{ChessPly, ExecutionMode, SearchGoal};
+use rz_contracts::{ClockDomain, ContractError, Deadline, Digest, MonotonicTick};
+use rz_position::contracts::ContractState;
+use rz_position::{BoardMove, Color, PlayStatus, Position, PositionError, PositionSnapshot};
+use std::collections::HashMap;
+use std::num::NonZeroU16;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_FRONTIER_OWNER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug)]
+pub struct FrontierLimits {
+    pub maximum_goal_plies: NonZeroU16,
+    pub maximum_frames: usize,
+    pub maximum_paths: usize,
+    pub maximum_mate_nodes: usize,
+    pub maximum_native_receipts: usize,
+}
+
+pub struct FrontierRegistration {
+    pub authority: SearchAuthority,
+    pub mode: ExecutionMode,
+    pub original_deadline: Deadline,
+    pub root_budget: Digest,
+    pub goal: SearchGoal,
+    pub nodes: Option<u64>,
+    pub selective_policy: Digest,
+    pub root_rules: Arc<ContractState>,
+    pub root_moves: Arc<RootMoveDomain>,
+    pub root_state: StateId,
+    pub model_namespace: Arc<AdaptiveModelNamespace>,
+    /// The actual native ledger instance, absent in P/C-only assembly.
+    pub native_ledger: Option<CpuLedgerIdentity>,
+}
+
+/// Borrowed actual port assembly. Matching a digest alone cannot replace the
+/// original Rules, root restriction, Store lease or native ledger owners.
+#[derive(Clone, Copy)]
+pub struct FrontierAttachment<'a> {
+    pub authority: SearchAuthority,
+    pub mode: ExecutionMode,
+    pub original_deadline: Deadline,
+    pub root_budget: Digest,
+    pub root_rules: &'a Arc<ContractState>,
+    pub root_moves: &'a Arc<RootMoveDomain>,
+    pub root_state: StateId,
+    pub model_namespace: &'a AdaptiveModelNamespace,
+    pub native_ledger: Option<&'a CpuLedgerIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrontierError {
+    Invalid(&'static str),
+    Capacity(&'static str),
+    ForeignRoot,
+    ForeignHandle,
+    Duplicate,
+    PolicySealed,
+    DepthHorizon,
+    NodeBudget,
+    /// Capacity is currently reserved by admitted native work. Wait for its
+    /// real receipt; this is not a spent-budget stop or permission to refund.
+    NodesReserved,
+    NativeUnknown,
+    MissingAcceptance,
+    Deadline,
+    Revoked,
+    StoreUnavailable,
+    Horizon(HorizonError),
+    Mate(MateProofError),
+}
+impl std::fmt::Display for FrontierError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Rovent frontier: {self:?}")
+    }
+}
+impl std::error::Error for FrontierError {}
+impl From<HorizonError> for FrontierError {
+    fn from(error: HorizonError) -> Self {
+        Self::Horizon(error)
+    }
+}
+impl From<MateProofError> for FrontierError {
+    fn from(error: MateProofError) -> Self {
+        Self::Mate(error)
+    }
+}
+impl From<StoreError> for FrontierError {
+    fn from(_: StoreError) -> Self {
+        Self::StoreUnavailable
+    }
+}
+impl From<PositionError> for FrontierError {
+    fn from(_: PositionError) -> Self {
+        Self::Invalid("Rules path")
+    }
+}
+impl From<ContractError> for FrontierError {
+    fn from(_: ContractError) -> Self {
+        Self::Invalid("clock or shared contract")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct FrontierPath {
+    owner: u64,
+    slot: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrontierObligation {
+    owner: u64,
+    slot: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrontierFrameKind {
+    Candidate,
+    Counter,
+    Repair,
+}
+impl FrontierFrameKind {
+    fn horizon_kind(self) -> HorizonObligationKind {
+        match self {
+            Self::Candidate => HorizonObligationKind::Candidate,
+            Self::Counter => HorizonObligationKind::Counter,
+            Self::Repair => HorizonObligationKind::Repair,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeCloseReason {
+    Executed,
+    OwnerRejectedBeforeWork,
+    RejectedBeforeEnqueue,
+}
+
+/// Linear manager custody of one original SliceGrant. The authoritative
+/// reservation remains in this controller even when a worker fails or drops.
+#[derive(Debug)]
+pub struct NativeReservation {
+    owner: u64,
+    slot: usize,
+    grant: SliceGrant,
+}
+impl NativeReservation {
+    pub fn grant(&self) -> SliceGrant {
+        self.grant
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativePhase {
+    Reserved,
+    Settled(NativeCloseReason),
+    Quarantined,
+}
+struct NativeAccount {
+    grant: SliceGrant,
+    phase: NativePhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrontierStop {
+    Canceled,
+    Deadline,
+    WorkBudget,
+    Capacity,
+    NativeUnknown,
+    EvidenceReclaimed,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrontierGoalStatus {
+    Pending,
+    DepthSatisfied,
+    MateSatisfied,
+    GoalUnresolved,
+    Stopped(FrontierStop),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FrontierNodeWork {
+    pub root_entries: u64,
+    pub checked_transitions: u64,
+    pub native_nodes: u64,
+    pub native_qsearch_nodes: u64,
+    pub reserved_native_nodes: u64,
+    pub outstanding_native_executions: usize,
+    pub native_usage_known: bool,
+}
+impl FrontierNodeWork {
+    pub fn total_node_visits(self) -> Option<u64> {
+        self.root_entries
+            .checked_add(self.checked_transitions)?
+            .checked_add(self.native_nodes)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FrontierSnapshot {
+    pub authority: SearchAuthority,
+    pub original_deadline: Deadline,
+    pub node_unit: &'static str,
+    pub requested_nodes: Option<u64>,
+    pub work: FrontierNodeWork,
+    pub horizon: HorizonSnapshot,
+    pub mate: [Option<RootMateConclusion>; 2],
+    pub goal: FrontierGoalStatus,
+    pub registered_frames: usize,
+    pub completed_frames: usize,
+    pub selection_sealed: bool,
+}
+
+struct PathEntry {
+    parent: Option<usize>,
+    movement: Option<BoardMove>,
+    anchor: RootPlyAnchor,
+}
+struct FrameEntry {
+    frame: FrameId,
+    kind: FrontierFrameKind,
+    original_first: BoardMove,
+    question: Digest,
+    horizon: Option<HorizonObligationId>,
+    finished: bool,
+}
+struct MateLane {
+    proof: MateProofStore,
+    paths: HashMap<MateNodeId, FrontierPath>,
+    ordered: Vec<(MateNodeId, FrontierPath)>,
+}
+
+/// Read-only request descriptor. Dispatch and duplicate-question ownership stay
+/// in the manager's existing queue. This descriptor grants no new node budget.
+pub struct MissingMateQuestion {
+    owner: u64,
+    lane: usize,
+    node: MateNodeId,
+    anchor: FrontierPath,
+    movement: BoardMove,
+    attacker: Color,
+    remaining: ChessPly,
+    original_deadline: Deadline,
+    kind: MateQuestionKind,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MateQuestionKind {
+    AttackCandidate,
+    RequiredDefense,
+}
+impl MissingMateQuestion {
+    pub fn kind(&self) -> MateQuestionKind {
+        self.kind
+    }
+    pub fn anchor(&self) -> FrontierPath {
+        self.anchor
+    }
+    pub fn movement(&self) -> BoardMove {
+        self.movement
+    }
+    pub fn attacker(&self) -> Color {
+        self.attacker
+    }
+    pub fn remaining(&self) -> ChessPly {
+        self.remaining
+    }
+    pub fn original_deadline(&self) -> Deadline {
+        self.original_deadline
+    }
+}
+
+pub struct RoventFrontier {
+    owner: u64,
+    registration: FrontierRegistration,
+    limits: FrontierLimits,
+    horizon: SelectiveHorizon,
+    paths: Vec<PathEntry>,
+    path_index: HashMap<(usize, BoardMove), usize>,
+    frames: Vec<FrameEntry>,
+    mate: [Option<MateLane>; 2],
+    native: Vec<NativeAccount>,
+    work: FrontierNodeWork,
+    selection_sealed: bool,
+    stop: Option<FrontierStop>,
+    pins: StorePins,
+    pin: StoreReadPin,
+}
+
+impl RoventFrontier {
+    pub fn new(
+        registration: FrontierRegistration,
+        limits: FrontierLimits,
+        stores: &PalsStores,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<Self, FrontierError> {
+        if limits.maximum_goal_plies.get() > 256
+            || limits.maximum_frames == 0
+            || limits.maximum_frames > 1024
+            || limits.maximum_paths == 0
+            || limits.maximum_paths > 65_536
+            || limits.maximum_mate_nodes == 0
+            || limits.maximum_mate_nodes > 65_536
+            || limits.maximum_native_receipts == 0
+            || limits.maximum_native_receipts > 65_536
+        {
+            return Err(FrontierError::Invalid("finite frontier limits"));
+        }
+        registration.goal.validate(limits.maximum_goal_plies)?;
+        registration.original_deadline.accepts(clock, now)?;
+        if registration.original_deadline.clock.0 != registration.authority.epoch
+            || registration.root_moves.root_identity()
+                != registration.root_rules.snapshot().identity()
+            || !stores
+                .states
+                .get(registration.root_state)?
+                .same_state(registration.root_rules.rules().snapshot())
+            || stores.generation() != registration.authority.root.0
+            || registration.mode.has_native_r() != registration.native_ledger.is_some()
+        {
+            return Err(FrontierError::ForeignRoot);
+        }
+        let root = Position::from_snapshot(
+            registration.root_rules.rules().snapshot(),
+            Default::default(),
+        )?;
+        let mut horizon = SelectiveHorizon::new(
+            &root,
+            registration.goal,
+            registration.selective_policy,
+            limits.maximum_frames,
+        )?;
+        let owner = NEXT_FRONTIER_OWNER
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| FrontierError::Capacity("frontier owner"))?;
+        let mut pins = StorePins::default();
+        pins.states.insert(registration.root_state);
+        let pin = stores.pin_review(pins.clone())?;
+        let mut mate: [Option<MateLane>; 2] = [None, None];
+        for (lane, attacker) in [root.side_to_move(), root.side_to_move().opposite()]
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(remaining) = registration.goal.mate_horizon(lane == 0)? {
+                let root_moves = if registration.root_moves.allowed().is_empty() {
+                    None
+                } else {
+                    Some(registration.root_moves.allowed().as_ref())
+                };
+                let proof = MateProofStore::new(
+                    &root,
+                    attacker,
+                    remaining,
+                    root_moves,
+                    limits.maximum_mate_nodes,
+                )?;
+                let mut paths = HashMap::new();
+                let root_node = proof.root();
+                let root_path = FrontierPath { owner, slot: 0 };
+                paths.insert(root_node, root_path);
+                mate[lane] = Some(MateLane {
+                    proof,
+                    paths,
+                    ordered: vec![(root_node, root_path)],
+                });
+            }
+        }
+        let stop = (registration.nodes == Some(0)).then_some(FrontierStop::WorkBudget);
+        if stop.is_some() {
+            horizon.interrupt(HorizonInterruption::WorkBudget);
+        }
+        let root_entry = PathEntry {
+            parent: None,
+            movement: None,
+            anchor: horizon.root_anchor(),
+        };
+        Ok(Self {
+            owner,
+            registration,
+            limits,
+            horizon,
+            paths: vec![root_entry],
+            path_index: HashMap::new(),
+            frames: Vec::new(),
+            mate,
+            native: Vec::new(),
+            work: FrontierNodeWork {
+                root_entries: u64::from(stop.is_none()),
+                native_usage_known: true,
+                ..Default::default()
+            },
+            selection_sealed: false,
+            stop,
+            pins,
+            pin,
+        })
+    }
+
+    pub fn root_path(&self) -> FrontierPath {
+        FrontierPath {
+            owner: self.owner,
+            slot: 0,
+        }
+    }
+    pub fn root_moves(&self) -> &Arc<RootMoveDomain> {
+        &self.registration.root_moves
+    }
+    pub fn original_deadline(&self) -> Deadline {
+        self.registration.original_deadline
+    }
+    pub fn registration(&self) -> &FrontierRegistration {
+        &self.registration
+    }
+    pub fn validate_attachment(
+        &self,
+        actual: FrontierAttachment<'_>,
+        stores: &PalsStores,
+    ) -> Result<(), FrontierError> {
+        let registered = &self.registration;
+        if actual.authority != registered.authority
+            || actual.mode != registered.mode
+            || actual.original_deadline != registered.original_deadline
+            || actual.root_budget != registered.root_budget
+            || !Arc::ptr_eq(actual.root_rules, &registered.root_rules)
+            || !Arc::ptr_eq(actual.root_moves, &registered.root_moves)
+            || actual.root_state != registered.root_state
+            || actual.model_namespace != registered.model_namespace.as_ref()
+            || actual.native_ledger != registered.native_ledger.as_ref()
+            || !self.pin.validates(stores)
+        {
+            return Err(FrontierError::ForeignRoot);
+        }
+        Ok(())
+    }
+    pub fn path_snapshot(&self, path: FrontierPath) -> Result<&PositionSnapshot, FrontierError> {
+        Ok(self.path(path)?.anchor.snapshot())
+    }
+    pub fn path_ply(&self, path: FrontierPath) -> Result<ChessPly, FrontierError> {
+        Ok(self.path(path)?.anchor.ply())
+    }
+    pub fn path_prefix(&self, path: FrontierPath) -> Result<Vec<BoardMove>, FrontierError> {
+        self.path(path)?;
+        let mut sequence = Vec::with_capacity(usize::from(self.paths[path.slot].anchor.ply().0));
+        let mut at = Some(path.slot);
+        while let Some(index) = at {
+            let entry = &self.paths[index];
+            if let Some(movement) = entry.movement {
+                sequence.push(movement);
+            }
+            at = entry.parent;
+        }
+        sequence.reverse();
+        Ok(sequence)
+    }
+
+    pub fn remaining_depth(&self, path: FrontierPath) -> Result<Option<ChessPly>, FrontierError> {
+        Ok(self.horizon.remaining(&self.path(path)?.anchor)?)
+    }
+    pub fn chunk_limit(&self, path: FrontierPath, configured: u16) -> Result<u16, FrontierError> {
+        Ok(self
+            .horizon
+            .chunk_limit(&self.path(path)?.anchor, configured)?)
+    }
+
+    /// This is actual Store evidence, never a generated string or raw value.
+    /// New prefixes are Rules checked, while cached edge lookup adds no visit.
+    pub fn observe_stored_line(
+        &mut self,
+        stores: &PalsStores,
+        line: LineId,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<FrontierPath, FrontierError> {
+        self.check_store(stores)?;
+        self.check_control(clock, now)?;
+        let start = stores.lines.get(line)?.start_state;
+        if !stores
+            .states
+            .get(start)?
+            .same_state(self.registration.root_rules.rules().snapshot())
+        {
+            return Err(FrontierError::ForeignRoot);
+        }
+        let moves = stores.lines.moves(line)?;
+        self.hold_line(stores, start, line)?;
+        let endpoint = self.observe_prefix(&moves, clock, now)?;
+        for lane in 0..2 {
+            self.observe_mate_path(lane, &moves, clock, now)?;
+        }
+        Ok(endpoint)
+    }
+
+    /// Port focus lines may start at a child state. Their real immutable Q
+    /// still carries the full original-root prefix; use it without fabricating
+    /// a new root-relative Store line, view or peer message.
+    pub fn observe_local_question(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        stores: &PalsStores,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<FrontierPath, FrontierError> {
+        self.check_control(clock, now)?;
+        self.check_local_work(work, stores)?;
+        self.hold_local_source(stores, work)?;
+        let prefix = &work.input.question.context.prefix;
+        let exact = self.observe_prefix(prefix, clock, now)?;
+        self.check_local_endpoint(exact, work)?;
+        for lane in 0..2 {
+            self.observe_mate_path(lane, prefix, clock, now)?;
+        }
+        Ok(exact)
+    }
+
+    /// Register only a real admitted manager frame. The immutable submitted
+    /// view remains in its existing ticket owner; no new view is synthesized.
+    pub fn register_frame(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        admitted: &AdmittedRoleQuestion,
+        stores: &PalsStores,
+        kind: FrontierFrameKind,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<FrontierObligation, FrontierError> {
+        self.check_control(clock, now)?;
+        self.check_peer_store(admitted, stores)?;
+        self.check_work(work, admitted)?;
+        let exact = self.observe_local_question(work, stores, clock, now)?;
+        self.check_endpoint(exact, admitted)?;
+        self.register_checked_frame(
+            work.frame,
+            work.original_first_move,
+            work.input.question_digest,
+            &admitted.context().prefix,
+            kind,
+            clock,
+            now,
+        )
+    }
+
+    /// A normal local continuation is not a reciprocal peer envelope. Its
+    /// actual private-construction port question and selected view are checked
+    /// directly, then bound to the same root-relative responsibility ledger.
+    pub fn register_local_frame(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        stores: &PalsStores,
+        kind: FrontierFrameKind,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<FrontierObligation, FrontierError> {
+        self.observe_local_question(work, stores, clock, now)?;
+        self.register_checked_frame(
+            work.frame,
+            work.original_first_move,
+            work.input.question_digest,
+            &work.input.question.context.prefix,
+            kind,
+            clock,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_checked_frame(
+        &mut self,
+        frame: FrameId,
+        first: rz_contracts::pals::Move16,
+        question: Digest,
+        prefix: &[BoardMove],
+        kind: FrontierFrameKind,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<FrontierObligation, FrontierError> {
+        if self.selection_sealed {
+            return Err(FrontierError::PolicySealed);
+        }
+        if self.frames.len() >= self.limits.maximum_frames {
+            return Err(FrontierError::Capacity("frame obligations"));
+        }
+        if self
+            .frames
+            .iter()
+            .any(|held| held.frame == frame && held.kind == kind && held.question == question)
+        {
+            return Err(FrontierError::Duplicate);
+        }
+        let original_first = BoardMove::try_from(first.decode()?)?;
+        let mut anchor = self.observe_prefix(prefix, clock, now)?;
+        // A root candidate's actual first move scopes its responsibility. The
+        // submitted root view stays root-anchored; this is a Rules transition,
+        // not an invented child tensor/view or a mandatory time-only pass.
+        if self.registration.goal.depth_plies.is_some() && self.path_ply(anchor)? == ChessPly(0) {
+            anchor = self.advance_path(anchor, original_first, clock, now)?;
+        }
+        self.frames
+            .try_reserve(1)
+            .map_err(|_| FrontierError::Capacity("frame obligation allocation"))?;
+        let obligation = if self.registration.goal.depth_plies.is_some() {
+            let exact_anchor = self.path(anchor)?.anchor.clone();
+            Some(self.horizon.declare(&exact_anchor, kind.horizon_kind())?)
+        } else {
+            None
+        };
+        let handle = FrontierObligation {
+            owner: self.owner,
+            slot: self.frames.len(),
+        };
+        self.frames.push(FrameEntry {
+            frame,
+            kind,
+            original_first,
+            question,
+            horizon: obligation,
+            finished: false,
+        });
+        Ok(handle)
+    }
+
+    /// Explicit manager selection boundary. An empty queue is not this proof.
+    pub fn seal_selected_policy(
+        &mut self,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
+        self.check_control(clock, now)?;
+        if self.selection_sealed {
+            return Err(FrontierError::PolicySealed);
+        }
+        if self.registration.goal.depth_plies.is_some() {
+            self.horizon.seal_policy()?;
+        }
+        self.selection_sealed = true;
+        Ok(())
+    }
+
+    pub fn accept_rules_endpoint(
+        &mut self,
+        obligation: FrontierObligation,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        admitted: &AdmittedRoleQuestion,
+        stores: &PalsStores,
+        endpoint: FrontierPath,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
+        self.check_control(clock, now)?;
+        self.check_peer_store(admitted, stores)?;
+        self.check_work(work, admitted)?;
+        self.check_local_work(work, stores)?;
+        let at = self.check_obligation(obligation, work.frame)?;
+        if !rules_stage_matches(self.frames[at].kind, work.input.stage) {
+            return Err(FrontierError::MissingAcceptance);
+        }
+        self.check_endpoint(endpoint, admitted)?;
+        self.check_local_endpoint(endpoint, work)?;
+        let position = Position::from_snapshot(self.path_snapshot(endpoint)?, Default::default())?;
+        let boundary = HorizonBoundary::rules_terminal(&position)?;
+        self.finish_obligation(at, endpoint, boundary)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_local_rules_endpoint(
+        &mut self,
+        obligation: FrontierObligation,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        stores: &PalsStores,
+        endpoint: FrontierPath,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
+        self.check_control(clock, now)?;
+        self.check_local_work(work, stores)?;
+        let at = self.check_obligation(obligation, work.frame)?;
+        if !rules_stage_matches(self.frames[at].kind, work.input.stage) {
+            return Err(FrontierError::MissingAcceptance);
+        }
+        self.check_local_endpoint(endpoint, work)?;
+        let position = Position::from_snapshot(self.path_snapshot(endpoint)?, Default::default())?;
+        let boundary = HorizonBoundary::rules_terminal(&position)?;
+        self.finish_obligation(at, endpoint, boundary)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_fresh_endpoint(
+        &mut self,
+        obligation: FrontierObligation,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        admitted: &AdmittedRoleQuestion,
+        stores: &PalsStores,
+        endpoint: FrontierPath,
+        accepted: &AcceptedRoleStep,
+        output: &RoleOutput,
+        physical: AdaptivePortRoleEvidence,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
+        self.check_control(clock, now)?;
+        self.check_peer_store(admitted, stores)?;
+        self.check_work(work, admitted)?;
+        self.check_local_work(work, stores)?;
+        let at = self.check_obligation(obligation, work.frame)?;
+        if !fresh_stage_matches(self.frames[at].kind, work.input.stage) {
+            return Err(FrontierError::MissingAcceptance);
+        }
+        self.check_endpoint(endpoint, admitted)?;
+        self.check_local_endpoint(endpoint, work)?;
+        self.accept_checked_fresh(
+            at,
+            work,
+            admitted.context().purpose,
+            endpoint,
+            accepted,
+            output,
+            physical,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_local_fresh_endpoint(
+        &mut self,
+        obligation: FrontierObligation,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        stores: &PalsStores,
+        endpoint: FrontierPath,
+        accepted: &AcceptedRoleStep,
+        output: &RoleOutput,
+        physical: AdaptivePortRoleEvidence,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
+        self.check_control(clock, now)?;
+        self.check_local_work(work, stores)?;
+        let at = self.check_obligation(obligation, work.frame)?;
+        if !fresh_stage_matches(self.frames[at].kind, work.input.stage) {
+            return Err(FrontierError::MissingAcceptance);
+        }
+        self.check_local_endpoint(endpoint, work)?;
+        self.accept_checked_fresh(
+            at,
+            work,
+            work.input.question.context.purpose,
+            endpoint,
+            accepted,
+            output,
+            physical,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accept_checked_fresh(
+        &mut self,
+        at: usize,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        purpose: RoleQueryPurpose,
+        endpoint: FrontierPath,
+        accepted: &AcceptedRoleStep,
+        output: &RoleOutput,
+        physical: AdaptivePortRoleEvidence,
+    ) -> Result<(), FrontierError> {
+        let ticket = accepted.ticket();
+        if ticket.authority != work.frame.authority
+            || ticket.question != work.input.question_digest
+            || ticket.view != work.input.view_seal
+            || ticket.original_deadline != self.registration.original_deadline
+            || ticket.role != Role::Proposer
+            || ticket.representation.record_revision != work.input.question.context.public_revision
+            || !accepted.validates_output(output)
+            || purpose != RoleQueryPurpose::ValueFresh
+            || physical.physical_fresh != Some(true)
+            || !physical.measurement_complete
+            || physical.completed_nn_inputs.is_none_or(|count| count == 0)
+            || physical
+                .execution
+                .is_none_or(|execution| execution.epoch != self.registration.authority.epoch)
+        {
+            return Err(FrontierError::MissingAcceptance);
+        }
+        self.registration
+            .model_namespace
+            .verify(
+                ticket,
+                output,
+                Some(self.registration.model_namespace.value_identity()),
+            )
+            .map_err(|_| FrontierError::MissingAcceptance)?;
+        let RolePayload::Proposal { wdl, .. } = output.payload else {
+            return Err(FrontierError::MissingAcceptance);
+        };
+        let position = Position::from_snapshot(self.path_snapshot(endpoint)?, Default::default())?;
+        let value = ModelValueOutput {
+            identity: self.registration.model_namespace.value_identity().clone(),
+            input_sha256: output.key.input.0,
+            state: position.position_identity(),
+            perspective: position.side_to_move(),
+            wdl: wdl.probabilities(),
+        };
+        let boundary = HorizonBoundary::fresh_value(
+            &position,
+            &value,
+            self.registration.model_namespace.value_identity(),
+        )?;
+        self.finish_obligation(at, endpoint, boundary)
+    }
+
+    pub fn native_capacity(
+        &mut self,
+        requested: u64,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<u64, FrontierError> {
+        self.check_control(clock, now)?;
+        Ok(requested.min(self.available_nodes()?))
+    }
+
+    /// Call after the actual native ledger reserved this exact capped grant,
+    /// before enqueueing its owner command. This is a second-purpose ledger of
+    /// the same work, not a second charge added to native ledger spent.
+    pub fn reserve_native(
+        &mut self,
+        job: &CpuJobEnvelope,
+        grant: SliceGrant,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<NativeReservation, FrontierError> {
+        self.check_control(clock, now)?;
+        grant.validate(job, clock, now)?;
+        if !self.registration.mode.has_native_r()
+            || job.id.authority != self.registration.authority
+            || job.hard_deadline != self.registration.original_deadline
+        {
+            return Err(FrontierError::ForeignRoot);
+        }
+        if self
+            .native
+            .iter()
+            .any(|held| held.grant.execution == grant.execution)
+        {
+            return Err(FrontierError::Duplicate);
+        }
+        if self.native.len() >= self.limits.maximum_native_receipts {
+            return Err(FrontierError::Capacity("native receipt journal"));
+        }
+        if grant.node_credit > self.available_nodes()? {
+            return Err(if self.work.reserved_native_nodes != 0 {
+                FrontierError::NodesReserved
+            } else {
+                FrontierError::Invalid("native grant exceeds remaining original node quota")
+            });
+        }
+        self.native
+            .try_reserve(1)
+            .map_err(|_| FrontierError::Capacity("native reservation allocation"))?;
+        let slot = self.native.len();
+        self.native.push(NativeAccount {
+            grant,
+            phase: NativePhase::Reserved,
+        });
+        self.work.reserved_native_nodes = self
+            .work
+            .reserved_native_nodes
+            .checked_add(grant.node_credit)
+            .ok_or(FrontierError::Invalid("native reservation overflow"))?;
+        self.work.outstanding_native_executions += 1;
+        Ok(NativeReservation {
+            owner: self.owner,
+            slot,
+            grant,
+        })
+    }
+
+    /// The real owner channel/report and this ledger-issued success receipt
+    /// are both required. Late settlement still charges known work after stop;
+    /// it does not reopen admission or accept an expired chess result.
+    pub fn settle_native(
+        &mut self,
+        reservation: &NativeReservation,
+        report: &CpuSliceReport,
+        settled: &SettledCpuSlice,
+    ) -> Result<NativeCloseReason, FrontierError> {
+        let at = self.native_account(reservation)?;
+        if self.native[at].phase != NativePhase::Reserved {
+            return Err(FrontierError::Duplicate);
+        }
+        let valid = self.registration.native_ledger.as_ref() == Some(settled.ledger_identity())
+            && settled.grant() == reservation.grant
+            && report.grant == reservation.grant
+            && report.actual_work == Some(settled.actual_work())
+            && report.admission_rejected == settled.admission_rejected()
+            && report.terminal == settled.terminal()
+            && settled.actual_work().nodes <= reservation.grant.node_credit;
+        if !valid {
+            self.quarantine_native_at(at);
+            return Err(FrontierError::NativeUnknown);
+        }
+        let actual = settled.actual_work();
+        if actual.quiescence_nodes > actual.nodes {
+            self.quarantine_native_at(at);
+            return Err(FrontierError::NativeUnknown);
+        }
+        if settled.admission_rejected() && (actual != Default::default() || report.result.is_ok()) {
+            self.quarantine_native_at(at);
+            return Err(FrontierError::NativeUnknown);
+        }
+        let native_nodes = self
+            .work
+            .native_nodes
+            .checked_add(actual.nodes)
+            .ok_or(FrontierError::Invalid("native spent overflow"))?;
+        let qnodes = self
+            .work
+            .native_qsearch_nodes
+            .checked_add(actual.quiescence_nodes)
+            .ok_or(FrontierError::Invalid("native qsearch overflow"))?;
+        let total = self
+            .work
+            .root_entries
+            .checked_add(self.work.checked_transitions)
+            .and_then(|spent| spent.checked_add(native_nodes))
+            .ok_or(FrontierError::Invalid("common spent overflow"))?;
+        if self.registration.nodes.is_some_and(|limit| total > limit) {
+            self.quarantine_native_at(at);
+            return Err(FrontierError::NativeUnknown);
+        }
+        let reason = if settled.admission_rejected() {
+            NativeCloseReason::OwnerRejectedBeforeWork
+        } else {
+            NativeCloseReason::Executed
+        };
+        self.work.native_nodes = native_nodes;
+        self.work.native_qsearch_nodes = qnodes;
+        self.close_native_at(at, reason)?;
+        Ok(reason)
+    }
+
+    /// A definite pre-enqueue rejection remains distinguishable from an
+    /// attested worker response whose actual delta happened to be zero.
+    pub fn release_unqueued(
+        &mut self,
+        reservation: &NativeReservation,
+        released: &ReleasedCpuReservation,
+    ) -> Result<NativeCloseReason, FrontierError> {
+        let at = self.native_account(reservation)?;
+        if self.native[at].phase != NativePhase::Reserved {
+            return Err(FrontierError::Duplicate);
+        }
+        if self.registration.native_ledger.as_ref() != Some(released.ledger_identity())
+            || released.grant() != reservation.grant
+        {
+            self.quarantine_native_at(at);
+            return Err(FrontierError::NativeUnknown);
+        }
+        self.close_native_at(at, NativeCloseReason::RejectedBeforeEnqueue)?;
+        Ok(NativeCloseReason::RejectedBeforeEnqueue)
+    }
+
+    /// Main-ledger rejection, disconnected owner or unknown actual usage does
+    /// not mint a zero-work receipt and never releases this reservation.
+    pub fn native_usage_unknown(
+        &mut self,
+        reservation: &NativeReservation,
+    ) -> Result<(), FrontierError> {
+        let at = self.native_account(reservation)?;
+        if self.native[at].phase != NativePhase::Reserved {
+            return Err(FrontierError::Duplicate);
+        }
+        self.quarantine_native_at(at);
+        Ok(())
+    }
+
+    pub fn missing_mate_questions(
+        &mut self,
+        maximum: usize,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<Vec<MissingMateQuestion>, FrontierError> {
+        self.check_control(clock, now)?;
+        if maximum > self.limits.maximum_frames {
+            return Err(FrontierError::Capacity("missing-question result bound"));
+        }
+        let mut questions = Vec::with_capacity(maximum);
+        if maximum == 0 {
+            return Ok(questions);
+        }
+        for (lane_index, lane) in self.mate.iter().enumerate() {
+            let Some(lane) = lane else {
+                continue;
+            };
+            // The owner maintains admission order incrementally; no complete
+            // per-tick clone, sort or quadratic path matching is required.
+            for &(node, path) in &lane.ordered {
+                if lane.proof.conclusion(node)? != MateConclusion::Unknown
+                    || lane.proof.remaining(node)?.0 == 0
+                    || self
+                        .registration
+                        .goal
+                        .depth_plies
+                        .is_some_and(|depth| self.paths[path.slot].anchor.ply().0 >= depth.get())
+                {
+                    continue;
+                }
+                for movement in lane.proof.missing_moves(node)? {
+                    questions.push(MissingMateQuestion {
+                        owner: self.owner,
+                        lane: lane_index,
+                        node,
+                        anchor: path,
+                        movement,
+                        attacker: lane.proof.root_conclusion().attacker,
+                        remaining: lane.proof.remaining(node)?,
+                        original_deadline: self.registration.original_deadline,
+                        kind: if self.paths[path.slot].anchor.snapshot().side_to_move()
+                            == lane.proof.root_conclusion().attacker
+                        {
+                            MateQuestionKind::AttackCandidate
+                        } else {
+                            MateQuestionKind::RequiredDefense
+                        },
+                    });
+                    if questions.len() == maximum {
+                        return Ok(questions);
+                    }
+                }
+            }
+        }
+        Ok(questions)
+    }
+
+    pub fn validate_missing_question(
+        &self,
+        question: &MissingMateQuestion,
+    ) -> Result<(), FrontierError> {
+        if question.owner != self.owner
+            || question.original_deadline != self.registration.original_deadline
+        {
+            return Err(FrontierError::ForeignHandle);
+        }
+        let lane = self
+            .mate
+            .get(question.lane)
+            .and_then(Option::as_ref)
+            .ok_or(FrontierError::ForeignHandle)?;
+        if lane.paths.get(&question.node) != Some(&question.anchor)
+            || !lane
+                .proof
+                .missing_moves(question.node)?
+                .contains(&question.movement)
+            || lane.proof.conclusion(question.node)? != MateConclusion::Unknown
+        {
+            return Err(FrontierError::ForeignHandle);
+        }
+        Ok(())
+    }
+
+    pub fn revoke_obligation(
+        &mut self,
+        obligation: FrontierObligation,
+    ) -> Result<(), FrontierError> {
+        if obligation.owner != self.owner {
+            return Err(FrontierError::ForeignHandle);
+        }
+        let held = self
+            .frames
+            .get_mut(obligation.slot)
+            .ok_or(FrontierError::ForeignHandle)?;
+        if let Some(horizon) = held.horizon {
+            self.horizon.revoke(horizon)?;
+        }
+        held.finished = false;
+        self.interrupt(FrontierStop::EvidenceReclaimed);
+        Ok(())
+    }
+
+    pub fn cancel(&mut self) {
+        self.interrupt(FrontierStop::Canceled);
+    }
+
+    pub fn snapshot(&self) -> FrontierSnapshot {
+        let horizon = self.horizon.snapshot();
+        let mate = std::array::from_fn(|lane| {
+            self.mate[lane]
+                .as_ref()
+                .map(|lane| lane.proof.root_conclusion())
+        });
+        let completed_frames = self.frames.iter().filter(|frame| frame.finished).count();
+        let exhausted = self.registration.nodes.is_some_and(|limit| {
+            self.work
+                .total_node_visits()
+                .is_none_or(|spent| spent >= limit)
+        });
+        let goal = if let Some(stop) = self.stop {
+            FrontierGoalStatus::Stopped(stop)
+        } else if exhausted {
+            FrontierGoalStatus::Stopped(FrontierStop::WorkBudget)
+        } else if self.work.outstanding_native_executions != 0 {
+            FrontierGoalStatus::Pending
+        } else if mate.iter().flatten().any(|proof| proof.goal_satisfied()) {
+            FrontierGoalStatus::MateSatisfied
+        } else if self.registration.goal.mate_moves.is_some()
+            && self.selection_sealed
+            && completed_frames == self.frames.len()
+        {
+            FrontierGoalStatus::GoalUnresolved
+        } else if horizon.target_satisfied {
+            FrontierGoalStatus::DepthSatisfied
+        } else {
+            FrontierGoalStatus::Pending
+        };
+        FrontierSnapshot {
+            authority: self.registration.authority,
+            original_deadline: self.registration.original_deadline,
+            node_unit: ROVENT_NODE_UNIT,
+            requested_nodes: self.registration.nodes,
+            work: self.work,
+            horizon,
+            mate,
+            goal,
+            registered_frames: self.frames.len(),
+            completed_frames,
+            selection_sealed: self.selection_sealed,
+        }
+    }
+
+    fn path(&self, path: FrontierPath) -> Result<&PathEntry, FrontierError> {
+        if path.owner != self.owner {
+            return Err(FrontierError::ForeignHandle);
+        }
+        self.paths
+            .get(path.slot)
+            .ok_or(FrontierError::ForeignHandle)
+    }
+    fn check_store(&mut self, stores: &PalsStores) -> Result<(), FrontierError> {
+        if !self.pin.validates(stores) {
+            self.interrupt(FrontierStop::EvidenceReclaimed);
+            return Err(FrontierError::StoreUnavailable);
+        }
+        Ok(())
+    }
+    fn check_control(
+        &mut self,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
+        if let Some(stop) = self.stop {
+            return Err(match stop {
+                FrontierStop::WorkBudget => FrontierError::NodeBudget,
+                FrontierStop::NativeUnknown => FrontierError::NativeUnknown,
+                FrontierStop::Deadline => FrontierError::Deadline,
+                _ => FrontierError::Revoked,
+            });
+        }
+        if clock != self.registration.original_deadline.clock {
+            return Err(FrontierError::ForeignRoot);
+        }
+        if self
+            .registration
+            .original_deadline
+            .accepts(clock, now)
+            .is_err()
+        {
+            self.interrupt(FrontierStop::Deadline);
+            return Err(FrontierError::Deadline);
+        }
+        if self.registration.nodes.is_some_and(|limit| {
+            self.work
+                .total_node_visits()
+                .is_none_or(|spent| spent >= limit)
+        }) {
+            self.interrupt(FrontierStop::WorkBudget);
+            return Err(FrontierError::NodeBudget);
+        }
+        Ok(())
+    }
+    fn available_nodes(&self) -> Result<u64, FrontierError> {
+        let spent = self
+            .work
+            .total_node_visits()
+            .and_then(|spent| spent.checked_add(self.work.reserved_native_nodes))
+            .ok_or(FrontierError::Invalid(
+                "common reserved accounting overflow",
+            ))?;
+        Ok(self
+            .registration
+            .nodes
+            .unwrap_or(u64::MAX)
+            .saturating_sub(spent))
+    }
+    fn spend_transition(&mut self) -> Result<(), FrontierError> {
+        if self.available_nodes()? == 0 {
+            return Err(if self.work.reserved_native_nodes != 0 {
+                FrontierError::NodesReserved
+            } else {
+                FrontierError::NodeBudget
+            });
+        }
+        self.work.checked_transitions = self
+            .work
+            .checked_transitions
+            .checked_add(1)
+            .ok_or(FrontierError::Invalid("checked transition overflow"))?;
+        Ok(())
+    }
+    fn interrupt(&mut self, stop: FrontierStop) {
+        if self.stop.is_none() {
+            self.stop = Some(stop);
+        }
+        self.horizon.interrupt(match stop {
+            FrontierStop::Canceled => HorizonInterruption::Stop,
+            FrontierStop::Deadline => HorizonInterruption::Deadline,
+            FrontierStop::WorkBudget => HorizonInterruption::WorkBudget,
+            FrontierStop::Capacity => HorizonInterruption::Capacity,
+            FrontierStop::EvidenceReclaimed => HorizonInterruption::EvidenceReclaimed,
+            _ => HorizonInterruption::Failed,
+        });
+    }
+    fn hold_line(
+        &mut self,
+        stores: &PalsStores,
+        state: StateId,
+        line: LineId,
+    ) -> Result<(), FrontierError> {
+        if self.pins.lines.contains(&line) {
+            return Ok(());
+        }
+        if self.pins.lines.len() >= self.limits.maximum_paths {
+            return Err(FrontierError::Capacity("retained line pins"));
+        }
+        let mut pins = self.pins.clone();
+        pins.states.insert(state);
+        pins.lines.insert(line);
+        let pin = stores.pin_review(pins.clone())?;
+        self.pin = pin;
+        self.pins = pins;
+        Ok(())
+    }
+    fn hold_local_source(
+        &mut self,
+        stores: &PalsStores,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), FrontierError> {
+        let source = &work.input.question.context;
+        if self.pins.states.contains(&source.state)
+            && self.pins.lines.contains(&source.focus)
+            && self.pins.situations.contains(&source.situation)
+        {
+            return Ok(());
+        }
+        if self.pins.lines.len() >= self.limits.maximum_paths
+            || self.pins.states.len() > self.limits.maximum_paths
+            || self.pins.situations.len() >= self.limits.maximum_paths
+        {
+            return Err(FrontierError::Capacity("retained local source pins"));
+        }
+        let mut pins = self.pins.clone();
+        pins.states.insert(source.state);
+        pins.lines.insert(source.focus);
+        pins.situations.insert(source.situation);
+        let pin = stores.pin_review(pins.clone())?;
+        self.pin = pin;
+        self.pins = pins;
+        Ok(())
+    }
+    fn observe_prefix(
+        &mut self,
+        prefix: &[BoardMove],
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<FrontierPath, FrontierError> {
+        if prefix.len() > usize::from(self.limits.maximum_goal_plies.get()) {
+            return Err(FrontierError::DepthHorizon);
+        }
+        if self
+            .registration
+            .goal
+            .depth_plies
+            .is_some_and(|depth| prefix.len() > usize::from(depth.get()))
+        {
+            return Err(FrontierError::DepthHorizon);
+        }
+        let mut path = self.root_path();
+        for movement in prefix {
+            path = self.advance_path(path, *movement, clock, now)?;
+        }
+        Ok(path)
+    }
+    fn advance_path(
+        &mut self,
+        parent: FrontierPath,
+        movement: BoardMove,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<FrontierPath, FrontierError> {
+        self.check_control(clock, now)?;
+        self.path(parent)?;
+        if let Some(slot) = self.path_index.get(&(parent.slot, movement)) {
+            return Ok(FrontierPath {
+                owner: self.owner,
+                slot: *slot,
+            });
+        }
+        if parent.slot == 0 && !self.registration.root_moves.allowed().contains(&movement) {
+            return Err(FrontierError::Invalid(
+                "first move is outside original searchmoves",
+            ));
+        }
+        let old_anchor = self.path(parent)?.anchor.clone();
+        if self
+            .registration
+            .goal
+            .depth_plies
+            .is_some_and(|depth| old_anchor.ply().0 >= depth.get())
+        {
+            return Err(FrontierError::DepthHorizon);
+        }
+        if self.paths.len() >= self.limits.maximum_paths {
+            return Err(FrontierError::Capacity("exact frontier paths"));
+        }
+        let position = Position::from_snapshot(old_anchor.snapshot(), Default::default())?;
+        let legal = position.ordered_legal_moves();
+        if position.play_status_from_view(&legal)? != PlayStatus::Ongoing
+            || !legal.moves().contains(&movement)
+        {
+            return Err(FrontierError::Invalid(
+                "non-legal or post-terminal frontier transition",
+            ));
+        }
+        self.paths
+            .try_reserve(1)
+            .map_err(|_| FrontierError::Capacity("frontier path allocation"))?;
+        self.path_index
+            .try_reserve(1)
+            .map_err(|_| FrontierError::Capacity("frontier edge index"))?;
+        // Exclusive single-writer custody reserves this credit before Rules
+        // mutation; no worker submission/await may intervene before its charge.
+        self.spend_transition()?;
+        let anchor = self.horizon.advance(&old_anchor, &position, movement)?;
+        let slot = self.paths.len();
+        self.paths.push(PathEntry {
+            parent: Some(parent.slot),
+            movement: Some(movement),
+            anchor,
+        });
+        self.path_index.insert((parent.slot, movement), slot);
+        Ok(FrontierPath {
+            owner: self.owner,
+            slot,
+        })
+    }
+    fn observe_mate_path(
+        &mut self,
+        lane_index: usize,
+        prefix: &[BoardMove],
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
+        let Some(lane) = self.mate[lane_index].as_ref() else {
+            return Ok(());
+        };
+        let mut node = lane.proof.root();
+        let mut path = self.root_path();
+        for movement in prefix {
+            self.check_control(clock, now)?;
+            let lane = self.mate[lane_index].as_ref().expect("registered lane");
+            if lane.proof.remaining(node)?.0 == 0
+                || lane.proof.conclusion(node)? != MateConclusion::Unknown
+            {
+                break;
+            }
+            let existing = lane.proof.child(node, *movement)?;
+            let slot =
+                *self
+                    .path_index
+                    .get(&(path.slot, *movement))
+                    .ok_or(FrontierError::Invalid(
+                        "mate edge lacks prior exact Rules path",
+                    ))?;
+            path = FrontierPath {
+                owner: self.owner,
+                slot,
+            };
+            node = match existing {
+                Some(child) => child,
+                None => {
+                    self.spend_transition()?;
+                    self.mate[lane_index]
+                        .as_mut()
+                        .expect("registered lane")
+                        .proof
+                        .open_child(node, *movement)?
+                }
+            };
+            let lane = self.mate[lane_index].as_mut().expect("registered lane");
+            if !lane.paths.contains_key(&node) {
+                lane.paths
+                    .try_reserve(1)
+                    .map_err(|_| FrontierError::Capacity("mate path index"))?;
+                lane.ordered
+                    .try_reserve(1)
+                    .map_err(|_| FrontierError::Capacity("mate path order"))?;
+                lane.paths.insert(node, path);
+                lane.ordered.push((node, path));
+            }
+        }
+        Ok(())
+    }
+    fn check_work(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        admitted: &AdmittedRoleQuestion,
+    ) -> Result<(), FrontierError> {
+        let question = admitted.envelope();
+        if work.frame.authority != self.registration.authority
+            || work.frame.sequence == 0
+            || work.original_deadline != self.registration.original_deadline
+            || question.id.authority != self.registration.authority
+            || question.root_budget != self.registration.root_budget
+            || question.original_deadline != self.registration.original_deadline
+            || question.original_first_move != Some(work.original_first_move)
+            || question.question_digest != work.input.question_digest
+            || question.view != work.input.view_seal
+            || !Arc::ptr_eq(&work.input.view, admitted.view())
+            || &work.input.question.context != admitted.context()
+            || !work
+                .input
+                .question
+                .position
+                .snapshot()
+                .same_state(admitted.rules().rules().snapshot())
+            || !Arc::ptr_eq(admitted.root_moves(), &self.registration.root_moves)
+            || admitted.root_rules().snapshot().identity()
+                != self.registration.root_rules.snapshot().identity()
+            || work.input.public_context.0 != work.input.view.record_scope_digest()
+        {
+            return Err(FrontierError::ForeignRoot);
+        }
+        Ok(())
+    }
+
+    fn check_local_work(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        stores: &PalsStores,
+    ) -> Result<(), FrontierError> {
+        self.check_store(stores)?;
+        AdaptivePortQuestion::validate_frontier_source(work, stores)
+            .map_err(|_| FrontierError::Invalid("actual local port question/view"))?;
+        let first = BoardMove::try_from(work.original_first_move.decode()?)?;
+        let view = &work.input.view;
+        if work.frame.authority != self.registration.authority
+            || work.frame.sequence == 0
+            || work.original_deadline != self.registration.original_deadline
+            || work.input.view_seal.authority != self.registration.authority
+            || work.input.view_seal.root_state != self.registration.root_rules.snapshot().identity()
+            || view.root_state() != self.registration.root_state
+            || view.generation() != self.registration.authority.root.0
+            || !self.registration.root_moves.allowed().contains(&first)
+            || work
+                .input
+                .question
+                .context
+                .prefix
+                .first()
+                .is_some_and(|movement| *movement != first)
+        {
+            return Err(FrontierError::ForeignRoot);
+        }
+        Ok(())
+    }
+
+    fn check_peer_store(
+        &mut self,
+        admitted: &AdmittedRoleQuestion,
+        stores: &PalsStores,
+    ) -> Result<(), FrontierError> {
+        self.check_store(stores)?;
+        if !admitted.view().validates(stores) {
+            return Err(FrontierError::StoreUnavailable);
+        }
+        Ok(())
+    }
+    fn check_obligation(
+        &self,
+        obligation: FrontierObligation,
+        frame: FrameId,
+    ) -> Result<usize, FrontierError> {
+        if obligation.owner != self.owner {
+            return Err(FrontierError::ForeignHandle);
+        }
+        let held = self
+            .frames
+            .get(obligation.slot)
+            .ok_or(FrontierError::ForeignHandle)?;
+        if held.frame != frame {
+            return Err(FrontierError::ForeignHandle);
+        }
+        if held.finished {
+            return Err(FrontierError::Duplicate);
+        }
+        Ok(obligation.slot)
+    }
+    fn check_endpoint(
+        &self,
+        endpoint: FrontierPath,
+        admitted: &AdmittedRoleQuestion,
+    ) -> Result<(), FrontierError> {
+        if !self
+            .path_snapshot(endpoint)?
+            .same_state(admitted.rules().rules().snapshot())
+            || self.path_prefix(endpoint)? != admitted.context().prefix
+        {
+            return Err(FrontierError::Invalid(
+                "endpoint differs from original exact question",
+            ));
+        }
+        Ok(())
+    }
+    fn check_local_endpoint(
+        &self,
+        endpoint: FrontierPath,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), FrontierError> {
+        if !self
+            .path_snapshot(endpoint)?
+            .same_state(&work.input.question.position.snapshot())
+            || self.path_prefix(endpoint)? != work.input.question.context.prefix
+        {
+            return Err(FrontierError::Invalid(
+                "local endpoint differs from exact root replay",
+            ));
+        }
+        Ok(())
+    }
+    fn finish_obligation(
+        &mut self,
+        at: usize,
+        endpoint: FrontierPath,
+        boundary: HorizonBoundary,
+    ) -> Result<(), FrontierError> {
+        let first = self.path_prefix(endpoint)?.first().copied();
+        if first != Some(self.frames[at].original_first) {
+            return Err(FrontierError::Invalid(
+                "endpoint escaped original first move",
+            ));
+        }
+        if let Some(obligation) = self.frames[at].horizon {
+            let anchor = self.path(endpoint)?.anchor.clone();
+            self.horizon.finish(obligation, &anchor, &boundary)?;
+        }
+        self.frames[at].finished = true;
+        Ok(())
+    }
+    fn native_account(&self, token: &NativeReservation) -> Result<usize, FrontierError> {
+        if token.owner != self.owner
+            || self
+                .native
+                .get(token.slot)
+                .is_none_or(|held| held.grant != token.grant)
+        {
+            return Err(FrontierError::ForeignHandle);
+        }
+        Ok(token.slot)
+    }
+    fn quarantine_native_at(&mut self, at: usize) {
+        self.native[at].phase = NativePhase::Quarantined;
+        self.work.native_usage_known = false;
+        self.interrupt(FrontierStop::NativeUnknown);
+    }
+    fn close_native_at(
+        &mut self,
+        at: usize,
+        reason: NativeCloseReason,
+    ) -> Result<(), FrontierError> {
+        self.work.reserved_native_nodes = self
+            .work
+            .reserved_native_nodes
+            .checked_sub(self.native[at].grant.node_credit)
+            .ok_or(FrontierError::Invalid("native reservation underflow"))?;
+        self.work.outstanding_native_executions = self
+            .work
+            .outstanding_native_executions
+            .checked_sub(1)
+            .ok_or(FrontierError::Invalid("native execution underflow"))?;
+        self.native[at].phase = NativePhase::Settled(reason);
+        Ok(())
+    }
+}
+
+fn fresh_stage_matches(kind: FrontierFrameKind, stage: RefinementStage) -> bool {
+    match kind {
+        FrontierFrameKind::Candidate => stage == RefinementStage::ProposalValueFresh,
+        FrontierFrameKind::Counter => matches!(
+            stage,
+            RefinementStage::CounterValueFresh | RefinementStage::FreshCounterEndpoint
+        ),
+        FrontierFrameKind::Repair => matches!(
+            stage,
+            RefinementStage::RepairValueFresh
+                | RefinementStage::FreshRepairedEndpoint
+                | RefinementStage::RecheckRepairedValueFresh
+        ),
+    }
+}
+
+fn rules_stage_matches(kind: FrontierFrameKind, stage: RefinementStage) -> bool {
+    fresh_stage_matches(kind, stage)
+        || match kind {
+            FrontierFrameKind::Candidate => matches!(
+                stage,
+                RefinementStage::ProposalContinuation | RefinementStage::CpuValidation
+            ),
+            FrontierFrameKind::Counter => matches!(
+                stage,
+                RefinementStage::CriticReply
+                    | RefinementStage::CounterContinuation
+                    | RefinementStage::CounterValidation
+                    | RefinementStage::CriticRecheck
+                    | RefinementStage::RecheckCounterValidation
+            ),
+            FrontierFrameKind::Repair => matches!(
+                stage,
+                RefinementStage::Repair | RefinementStage::RepairValidation
+            ),
+        }
+}
+
+#[cfg(test)]
+#[path = "rovent_frontier/tests.rs"]
+mod tests;

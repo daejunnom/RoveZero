@@ -574,9 +574,15 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         hash.update(target.input.question_digest.0);
         hash.update(target.input.public_context.0);
         hash.update(target.input.view.digest());
-        hash.update(self.engine.revision.to_le_bytes());
+        hash.update(self.engine.semantic.revision.to_le_bytes());
         hash.update(
-            (self.engine.stores.observations.next_observation_sequence() as u64).to_le_bytes(),
+            (self
+                .engine
+                .semantic
+                .stores
+                .observations
+                .next_observation_sequence() as u64)
+                .to_le_bytes(),
         );
         if let Some(admission) = self
             .cpu_admissions
@@ -632,7 +638,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         endpoints: CpuEndpointSelection,
     ) -> Result<AdaptiveValidatorQuestion, PalsError> {
         let prepared_at = Instant::now();
-        let observation_watermark = self.engine.stores.observations.next_observation_sequence();
+        let observation_watermark = self
+            .engine
+            .semantic
+            .stores
+            .observations
+            .next_observation_sequence();
         endpoints
             .validate_generation_collection()
             .map_err(|_| PalsError::InvalidConfig)?;
@@ -673,12 +684,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     .ok_or(RoleError::InvalidOutput)?
                     .to_vec();
                 let node = self.replay_node(&prefix)?;
-                let position = &self.engine.nodes[node].position;
+                let position = &self.engine.semantic.nodes[node].position;
                 // Response search is meaningful at the opponent's exact
                 // ongoing anchor; there is no board-only rebase.
-                if self.engine.nodes[node].terminal.is_none()
+                if self.engine.semantic.nodes[node].terminal.is_none()
                     && position.side_to_move()
-                        != self.engine.nodes[self.root].position.side_to_move()
+                        != self.engine.semantic.nodes[self.root]
+                            .position
+                            .side_to_move()
                     && position.legal_moves().contains(&response)
                 {
                     offers[AdaptiveValidatorAction::DefendResponse.index()] =
@@ -688,7 +701,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                             moves: vec![response],
                         });
                     unsupported[AdaptiveValidatorAction::DefendResponse.index()] = None;
-                    let examined = &self.engine.nodes[node].edges;
+                    let examined = &self.engine.semantic.nodes[node].edges;
                     let moves: Vec<_> = position
                         .legal_moves()
                         .into_iter()
@@ -895,7 +908,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         hash.update((self.engine.config.line_plies as u64).to_le_bytes());
         hash.update((self.engine.config.beam_width as u64).to_le_bytes());
         hash.update(self.engine.config.cpu_nodes_per_task.to_le_bytes());
-        validator_write_bytes(&mut hash, self.engine.cpu_registered_condition.as_bytes());
+        validator_write_bytes(
+            &mut hash,
+            self.engine.researcher.cpu_registered_condition.as_bytes(),
+        );
         for (index, offer) in offers.iter().enumerate() {
             hash.update([index as u8, u8::from(offer.is_some())]);
             match offer {
@@ -908,7 +924,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     hash.update([0]);
                     hash.update(
                         rz_position::contracts::rules_snapshot_semantic_digest(
-                            &self.engine.nodes[*node].position.snapshot(),
+                            &self.engine.semantic.nodes[*node].position.snapshot(),
                         )
                         .0,
                     );
@@ -919,7 +935,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     hash.update([1]);
                     hash.update(
                         rz_position::contracts::rules_snapshot_semantic_digest(
-                            &self.engine.nodes[*node].position.snapshot(),
+                            &self.engine.semantic.nodes[*node].position.snapshot(),
                         )
                         .0,
                     );
@@ -1041,18 +1057,18 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if depth >= 8 {
             return Err(PalsError::Capacity);
         }
-        let obs = self.engine.stores.observations.get(id)?;
+        let obs = self.engine.semantic.stores.observations.get(id)?;
         hash.update([obs.kind as u8]);
         hash.update(
             rz_position::contracts::rules_snapshot_semantic_digest(
-                self.engine.stores.states.get(obs.state)?,
+                self.engine.semantic.stores.states.get(obs.state)?,
             )
             .0,
         );
         for line in [obs.line, obs.cpu_pv] {
             hash.update([u8::from(line.is_some())]);
             if let Some(line) = line {
-                validator_write_moves(hash, &self.engine.stores.lines.moves(line)?)?;
+                validator_write_moves(hash, &self.engine.semantic.stores.lines.moves(line)?)?;
             }
         }
         hash.update(obs.budget.to_le_bytes());
@@ -1198,7 +1214,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         &self,
         id: ObservationId,
     ) -> Result<Option<ActionWitnessKind>, PalsError> {
-        let observation = self.engine.stores.observations.get(id)?;
+        let observation = self.engine.semantic.stores.observations.get(id)?;
         let Some(line) = observation.line else {
             return Ok(None);
         };
@@ -1211,9 +1227,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         };
         let root = self
             .engine
+            .semantic
             .stores
             .situations
-            .get(self.engine.nodes[self.root].situation)?;
+            .get(self.engine.semantic.nodes[self.root].situation)?;
         let Some(conclusion) = root.conclusions.get(line) else {
             return Ok(None);
         };
@@ -1223,7 +1240,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         };
         if !expected_status
             || conclusion.evidence != Some(id)
-            || observation.state != self.engine.nodes[self.root].state
+            || observation.state != self.engine.semantic.nodes[self.root].state
         {
             return Ok(None);
         }
@@ -1241,8 +1258,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if repaired.first() != counter.first() || repaired.first().copied() != q.first {
             return Ok(None);
         }
-        let root_color = self.engine.nodes[self.root].position.side_to_move();
-        let mut position = self.engine.nodes[self.root].position.clone();
+        let root_color = self.engine.semantic.nodes[self.root]
+            .position
+            .side_to_move();
+        let mut position = self.engine.semantic.nodes[self.root].position.clone();
         let mut changed = false;
         for (ply, movement) in repaired.iter().enumerate() {
             if ply > attack
@@ -1325,7 +1344,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             || ticket.view != question.input.view_seal
             || accepted.view().digest() != question.input.view.digest()
             || !Arc::ptr_eq(accepted.view(), &question.input.view)
-            || !accepted.view().validates(&self.engine.stores)
+            || !accepted.view().validates(&self.engine.semantic.stores)
         {
             return Err(RoleError::InvalidOutput.into());
         }
@@ -1361,7 +1380,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         };
         let effect = match offer {
             ActionOffer::Responses { node, moves, .. } => {
-                let actual_legal = self.engine.nodes[node].position.legal_moves();
+                let actual_legal = self.engine.semantic.nodes[node].position.legal_moves();
                 if moves.is_empty() || moves.iter().any(|mv| !actual_legal.contains(mv)) {
                     return Err(RoleError::InvalidOutput.into());
                 }
@@ -1369,7 +1388,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     .clone()
                     .ok_or(RoleError::InvalidOutput)?;
                 if input.question.validator_root_moves.as_ref() != Some(&moves)
-                    || !input.view.validates(&self.engine.stores)
+                    || !input.view.validates(&self.engine.semantic.stores)
                 {
                     return Err(RoleError::InvalidOutput.into());
                 }
@@ -1383,7 +1402,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     .clone()
                     .ok_or(RoleError::InvalidOutput)?;
                 if input.stage != RefinementStage::CriticRecheck
-                    || !input.view.validates(&self.engine.stores)
+                    || !input.view.validates(&self.engine.semantic.stores)
                 {
                     return Err(RoleError::InvalidOutput.into());
                 }
@@ -1546,8 +1565,13 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             frame: work.frame,
             question: work.input.question_digest,
             execution,
-            first_observation: self.engine.stores.observations.next_observation_sequence(),
-            generation: self.engine.stores.generation(),
+            first_observation: self
+                .engine
+                .semantic
+                .stores
+                .observations
+                .next_observation_sequence(),
+            generation: self.engine.semantic.stores.generation(),
         })
     }
 
@@ -1559,11 +1583,16 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         self.check_live()?;
         if guard.frame != work.frame
             || guard.question != work.input.question_digest
-            || guard.generation != self.engine.stores.generation()
+            || guard.generation != self.engine.semantic.stores.generation()
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        let end = self.engine.stores.observations.next_observation_sequence();
+        let end = self
+            .engine
+            .semantic
+            .stores
+            .observations
+            .next_observation_sequence();
         // Actual semantic consumption populated the owner's exact commit
         // receipt. A different frame's accepted ID or public StepEvidence
         // cannot attach that frame's publications to this action.
@@ -1589,7 +1618,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let mut witnesses = Vec::new();
         for sequence in guard.first_observation..end {
             let observation_id = ObservationId(sequence);
-            let observation = self.engine.stores.observations.get(observation_id)?;
+            let observation = self
+                .engine
+                .semantic
+                .stores
+                .observations
+                .get(observation_id)?;
             if observation.line.is_none() {
                 continue;
             }
@@ -1606,7 +1640,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             {
                 return Err(RoleError::InvalidOutput.into());
             }
-            let mut replay = self.engine.nodes[self.root].position.clone();
+            let mut replay = self.engine.semantic.nodes[self.root].position.clone();
             for movement in &actual_line {
                 replay.make_move(*movement)?;
             }

@@ -1,9 +1,9 @@
 //! Common logical ownership, independent of an R searcher or worker.
 //!
-//! This first extraction owns admitted initialization. Legacy construction
-//! explicitly moves its parts back into the unchanged flat engine layout;
-//! subsequent owner/port extraction must not infer R-free support from this
-//! initializer alone. No model, Store, or researcher is cloned here.
+//! Legacy engines retain this semantic state beside their actual registered
+//! researcher. A future NoResearcher port can own the same semantic type
+//! without constructing an R owner; the separate port/driver must still prove
+//! its supported execution path. No model, Store, or researcher is cloned here.
 
 use super::*;
 
@@ -17,6 +17,12 @@ pub struct PalsSemanticConfig {
     pub max_nodes: usize,
     pub max_records: usize,
     pub max_role_calls: u64,
+}
+
+impl Default for PalsSemanticConfig {
+    fn default() -> Self {
+        Self::from(&PalsConfig::default())
+    }
 }
 
 impl From<&PalsConfig> for PalsSemanticConfig {
@@ -73,11 +79,19 @@ pub struct PalsSemanticState<M: RoleModel> {
     pub(super) records: Vec<RoleRecord>,
     pub(super) review_index: Option<ReviewContextIndex>,
     pub(super) review_policy: Option<ReviewSelectionPolicy>,
+    /// Selected/compact consumers never allocate or scan a separate immutable
+    /// legacy full-record input unless that baseline was explicitly selected.
     pub(super) legacy_full_native_context: bool,
     pub(super) last_review_issue: Option<ReviewError>,
     pub(super) revision: u64,
+    /// Store handles may restart after reset; this independent namespace must
+    /// never let an old-game question acquire a successor game's authority.
     pub(super) game_generation: Option<u64>,
     pub(super) adaptive_root_registry: adaptive_root::AdaptiveRootRegistry,
+    /// Process-local owner follows the exact Store through port/archive/engine
+    /// moves. Only explicit terminal retirement may reclaim it. Declare before
+    /// Store so its pins are released before that Store on ordinary destruction.
+    pub(super) rovent_frontier: Option<Box<crate::pals::rovent_frontier::RoventFrontier>>,
     pub(super) stores: PalsStores,
     pub(super) clock_origin: Instant,
     pub(super) consumer_id: u64,
@@ -120,6 +134,7 @@ impl<M: RoleModel> PalsSemanticState<M> {
             revision: 0,
             game_generation: Some(0),
             adaptive_root_registry: adaptive_root::AdaptiveRootRegistry::default(),
+            rovent_frontier: None,
             stores,
             clock_origin: Instant::now(),
             consumer_id: 0,
@@ -131,6 +146,437 @@ impl<M: RoleModel> PalsSemanticState<M> {
             archive_state: archive_lifecycle::EngineArchiveLifecycle::default(),
             new_game_transition_error: None,
         })
+    }
+
+    pub(super) fn select_review_context(
+        &mut self,
+        policy: ReviewSelectionPolicy,
+        limits: ReviewIndexLimits,
+    ) -> Result<(), PalsError> {
+        policy.validate()?;
+        if !self.model.supports_selected_review_view() {
+            return Err(RoleError::Unavailable.into());
+        }
+        if self.stores.generation() != 0
+            || !self.nodes.is_empty()
+            || !self.records.is_empty()
+            || self.review_policy.is_some()
+        {
+            return Err(StoreError::InvalidConditions(
+                "review context is selected once before search",
+            )
+            .into());
+        }
+        self.review_index = Some(ReviewContextIndex::new(limits)?);
+        self.review_policy = Some(policy);
+        Ok(())
+    }
+
+    /// Exact hot-only Rules graph admission, shared by R-registered and R-free
+    /// ports. It never searches or loads/archives a cold record on the manager.
+    pub(super) fn intern_hot(
+        &mut self,
+        config: &PalsSemanticConfig,
+        position: Position,
+    ) -> Result<usize, PalsError> {
+        let snapshot = position.snapshot();
+        if let Some(state) = self.stores.states.find(&snapshot)
+            && let Some(index) = self.nodes.iter().position(|node| node.state == state)
+        {
+            return Ok(index);
+        }
+        if self.nodes.len() >= config.max_nodes {
+            return Err(PalsError::Capacity);
+        }
+        let situation = if let Some(root) = self.stores.root().filter(|root| {
+            self.stores.situations.get(*root).is_ok_and(|situation| {
+                self.stores
+                    .states
+                    .get(situation.state)
+                    .is_ok_and(|state| state.same_state(&snapshot))
+            })
+        }) {
+            root
+        } else {
+            self.stores.hot_insert_situation(snapshot)?
+        };
+        let state = self.stores.situations.get(situation)?.state;
+        let terminal = match position.classify_position()?.play_status {
+            PlayStatus::Ongoing => None,
+            PlayStatus::Terminal { reason, winner } => Some((
+                reason,
+                match winner {
+                    Some(color) if color == position.side_to_move() => CPU_MATE_SCORE,
+                    Some(_) => -CPU_MATE_SCORE,
+                    None => 0,
+                },
+            )),
+        };
+        if terminal.is_some() {
+            self.stores.hot_append_rules_terminal(&position, 0, 0)?;
+        }
+        self.nodes.push(Node {
+            position,
+            state,
+            situation,
+            terminal,
+            edges: Vec::new(),
+            evidence: None,
+            model_value: None,
+            model_observation: None,
+            model_value_revision: None,
+            resume: None,
+        });
+        Ok(self.nodes.len() - 1)
+    }
+
+    /// Returns whether a new edge was examined, so caller-owned work counters
+    /// charge exactly once. Reusing an edge does not create native-R work.
+    pub(super) fn connect_hot(
+        &mut self,
+        config: &PalsSemanticConfig,
+        parent: usize,
+        movement: BoardMove,
+    ) -> Result<(usize, bool), PalsError> {
+        let node = self
+            .nodes
+            .get(parent)
+            .ok_or(StoreError::InvalidHandle("semantic graph parent"))?;
+        if let Some(edge) = node.edges.iter().find(|edge| edge.movement == movement) {
+            return Ok((edge.child, false));
+        }
+        let mut position = node.position.clone();
+        position.make_move(movement)?;
+        let child = self.intern_hot(config, position)?;
+        self.nodes[parent].edges.push(Edge { movement, child });
+        Ok((child, true))
+    }
+
+    pub(super) fn ensure_frontier_retired(&self) -> Result<(), PalsError> {
+        if self.rovent_frontier.is_some() {
+            return Err(StoreError::InvalidConditions(
+                "Rovent frontier owner must be explicitly retired before root or game reset",
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl<M: RoleModel> PalsSemanticState<M> {
+    pub(super) fn role_context(
+        &self,
+        config: &PalsSemanticConfig,
+        node: usize,
+        question: RoleQuestion<'_>,
+    ) -> Result<RoleLogicalContext, PalsError> {
+        let game_generation = self.game_generation.ok_or(PalsError::Capacity)?;
+        let node = self
+            .nodes
+            .get(node)
+            .ok_or(StoreError::InvalidHandle("role node"))?;
+        let situation = self.stores.situations.get(node.situation)?;
+        if situation.state != node.state
+            || !self
+                .stores
+                .states
+                .get(node.state)?
+                .same_state(&node.position.snapshot())
+            || self.stores.lines.get(situation.focus)?.start_state != node.state
+        {
+            return Err(StoreError::InvalidHandle("role checked situation/state/focus").into());
+        }
+        if question.prefix.len() > config.line_plies
+            || question.proposal.len() > config.line_plies
+            || question
+                .refutation
+                .is_some_and(|line| line.len() > config.line_plies)
+            || question.divergences.len() > config.line_plies
+        {
+            return Err(PalsError::Capacity);
+        }
+        let focus = self.stores.lines.moves(situation.focus)?;
+        let mut prefix = Vec::new();
+        prefix
+            .try_reserve_exact(question.prefix.len())
+            .map_err(|_| PalsError::Capacity)?;
+        prefix.extend_from_slice(question.prefix);
+        Ok(RoleLogicalContext {
+            game_generation,
+            search_generation: self.stores.generation(),
+            situation: node.situation,
+            state: node.state,
+            focus: situation.focus,
+            purpose: question.purpose,
+            prefix,
+            focus_sha256: role_line_sha256(b"focus", &focus)?,
+            prefix_sha256: role_line_sha256(b"prefix", question.prefix)?,
+            proposal_sha256: role_line_sha256(b"proposal", question.proposal)?,
+            refutation_sha256: question
+                .refutation
+                .map(|line| role_line_sha256(b"refutation", line))
+                .transpose()?,
+            divergence_sha256: role_divergence_sha256(question.divergences)?,
+            public_revision: self.revision,
+            situation_revision: situation.revision,
+        })
+    }
+
+    pub(super) fn publish_record(
+        &mut self,
+        config: &PalsSemanticConfig,
+        record: RoleRecord,
+        obsolete: Option<usize>,
+        evidence: Option<ObservationId>,
+    ) -> Result<(), PalsError> {
+        self.publish_review_record(config, &record, evidence)?;
+        for previous in &mut self.records {
+            if previous.origin_state == record.origin_state
+                && previous.kind == record.kind
+                && previous.line.first() == record.line.first()
+            {
+                previous.critical = false;
+            }
+        }
+        if let Some(index) = obsolete {
+            self.records.remove(index);
+        }
+        self.revision = record.revision;
+        self.records.push(record);
+        Ok(())
+    }
+
+    pub(super) fn refresh_projection(&mut self, root_state: StateId) {
+        if let Some(index) = &mut self.review_index {
+            index.refresh_root(root_state);
+        }
+        let mut newest = HashSet::new();
+        for record in self.records.iter_mut().rev() {
+            record.critical = record.origin_state == root_state
+                && newest.insert((record.kind, record.line.first().copied()));
+        }
+    }
+
+    pub(super) fn rules_value(&self, node: usize) -> PalsResolvedValue {
+        let perspective = self.nodes[node].position.side_to_move();
+        match self.nodes[node].terminal {
+            Some((_, score)) => PalsResolvedValue::RulesTerminal {
+                winner: if score > 0 {
+                    Some(perspective)
+                } else if score < 0 {
+                    Some(perspective.opposite())
+                } else {
+                    None
+                },
+                perspective,
+            },
+            None => PalsResolvedValue::Unknown,
+        }
+    }
+
+    pub(super) fn model_value(&self, index: usize, remaining: usize) -> PalsResolvedValue {
+        let node = &self.nodes[index];
+        if node.terminal.is_some() {
+            return self.rules_value(index);
+        }
+        if remaining > 0 {
+            let mut best = PalsResolvedValue::Unknown;
+            // Equal W-L distributions/conditional outcomes preserve Rules order.
+            for movement in node.position.legal_moves() {
+                if let Some(edge) = node.edges.iter().find(|edge| edge.movement == movement) {
+                    let value = flip_resolved_value(self.model_value(edge.child, remaining - 1));
+                    if better_model_choice(value, best, false, false) {
+                        best = value;
+                    }
+                }
+            }
+            if !matches!(best, PalsResolvedValue::Unknown) {
+                return best;
+            }
+        }
+        node.model_value
+            .as_ref()
+            .filter(|output| {
+                Some(&output.identity) == self.model_registered_value.as_ref()
+                    && output.state == node.position.position_identity()
+                    && output.perspective == node.position.side_to_move()
+            })
+            .map_or(PalsResolvedValue::Unknown, |output| {
+                PalsResolvedValue::ModelWdl {
+                    wdl: output.wdl,
+                    perspective: output.perspective,
+                }
+            })
+    }
+
+    pub(super) fn root_model_value(
+        &self,
+        config: &PalsSemanticConfig,
+        child: usize,
+    ) -> (PalsResolvedValue, PalsValueScope) {
+        let terminal = self.nodes[child].terminal.is_some();
+        let value = self.model_value(child, config.line_plies.saturating_sub(1));
+        let mut flipped = flip_resolved_value(value);
+        if terminal {
+            // This is the directly selected child's current-state fact. Deeper
+            // terminal lines remain RestrictedRulesLine with estimate scope.
+            if let PalsResolvedValue::RestrictedRulesLine {
+                winner,
+                perspective,
+            } = flipped
+            {
+                flipped = PalsResolvedValue::RulesTerminal {
+                    winner,
+                    perspective,
+                };
+            }
+        }
+        let scope = if terminal {
+            PalsValueScope::RulesTerminal
+        } else if matches!(flipped, PalsResolvedValue::Unknown) {
+            PalsValueScope::Unknown
+        } else {
+            PalsValueScope::RestrictedEstimate
+        };
+        (flipped, scope)
+    }
+}
+
+/// P/C-only semantic owner. This type cannot contain a checker, native worker,
+/// TT or R credit ledger. Its port drives selected role tickets and uses the
+/// same exact Rules/public-memory implementation as the registered-R assembly.
+pub struct PcSemanticOwner<M: RoleModel> {
+    pub(super) config: PalsSemanticConfig,
+    pub(super) semantic: PalsSemanticState<M>,
+    researcher: NoResearcher,
+}
+
+impl<M: RoleModel> PcSemanticOwner<M> {
+    pub fn new_selected(
+        config: PalsSemanticConfig,
+        model: M,
+        policy: ReviewSelectionPolicy,
+        limits: ReviewIndexLimits,
+    ) -> Result<Self, PalsError> {
+        config.validate()?;
+        let identity = model
+            .value_identity()
+            .ok_or(RoleError::Unavailable)?
+            .clone();
+        identity.validate()?;
+        if identity.model != model.identity() || identity.semantics != MODEL_WDL_VALUE_SEMANTICS {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        if model.requires_registered_representation_namespace()
+            && model.registered_representation_namespace().is_none()
+        {
+            return Err(RoleError::Unsupported(
+                "native representation namespace is not registered",
+            )
+            .into());
+        }
+        if let Some(namespace) = model.registered_representation_namespace() {
+            namespace.verify_identity(model.identity(), Some(&identity))?;
+        }
+        let mut semantic = PalsSemanticState::new_admitted(&config, model, Some(identity))?;
+        semantic.select_review_context(policy, limits)?;
+        Ok(Self {
+            config,
+            semantic,
+            researcher: NoResearcher,
+        })
+    }
+
+    pub fn config(&self) -> PalsSemanticConfig {
+        self.config
+    }
+    pub fn researcher(&self) -> &NoResearcher {
+        &self.researcher
+    }
+    pub fn stores(&self) -> &PalsStores {
+        &self.semantic.stores
+    }
+    pub fn records(&self) -> &[RoleRecord] {
+        &self.semantic.records
+    }
+    pub fn model_identity(&self) -> &str {
+        self.semantic.model.identity()
+    }
+    pub fn model_value_identity(&self) -> Option<&ModelValueIdentity> {
+        self.semantic.model_registered_value.as_ref()
+    }
+    pub fn review_policy(&self) -> Option<ReviewSelectionPolicy> {
+        self.semantic.review_policy
+    }
+    pub fn last_review_issue(&self) -> Option<&ReviewError> {
+        self.semantic.last_review_issue.as_ref()
+    }
+
+    /// Explicit capability error for assembly validation. No success-valued
+    /// zero-node answer or fabricated checker identity is provided.
+    pub fn require_researcher(&self) -> Result<(), PalsError> {
+        Err(RoleError::Unsupported("R is structurally unavailable in the P-C owner").into())
+    }
+
+    pub(super) fn role_context(
+        &self,
+        node: usize,
+        question: RoleQuestion<'_>,
+    ) -> Result<RoleLogicalContext, PalsError> {
+        self.semantic.role_context(&self.config, node, question)
+    }
+    pub(super) fn prepare_review_view(
+        &mut self,
+        node: usize,
+        question: RoleQuestion<'_>,
+        legal: &[BoardMove],
+    ) -> Result<Option<Arc<ReviewView>>, PalsError> {
+        self.semantic
+            .prepare_review_view(&self.config, node, question, legal)
+    }
+    pub(super) fn prepare_frozen_review_views(
+        &mut self,
+        first_node: usize,
+        first_question: RoleQuestion<'_>,
+        first_legal: &[BoardMove],
+        second_node: usize,
+        second_question: RoleQuestion<'_>,
+        second_legal: &[BoardMove],
+    ) -> Result<Option<review_lifecycle::FrozenReviewViews>, PalsError> {
+        self.semantic.prepare_frozen_review_views(
+            &self.config,
+            first_node,
+            first_question,
+            first_legal,
+            second_node,
+            second_question,
+            second_legal,
+        )
+    }
+    pub(super) fn publish_record(
+        &mut self,
+        record: RoleRecord,
+        obsolete: Option<usize>,
+        evidence: Option<ObservationId>,
+    ) -> Result<(), PalsError> {
+        self.semantic
+            .publish_record(&self.config, record, obsolete, evidence)
+    }
+    pub(super) fn refresh_projection(&mut self, state: StateId) {
+        self.semantic.refresh_projection(state);
+    }
+    pub(super) fn root_model_value(&self, child: usize) -> (PalsResolvedValue, PalsValueScope) {
+        self.semantic.root_model_value(&self.config, child)
+    }
+    pub(super) fn intern_hot(&mut self, position: Position) -> Result<usize, PalsError> {
+        self.semantic.intern_hot(&self.config, position)
+    }
+    pub(super) fn connect_hot(
+        &mut self,
+        parent: usize,
+        movement: BoardMove,
+    ) -> Result<(usize, bool), PalsError> {
+        self.semantic.connect_hot(&self.config, parent, movement)
     }
 }
 
@@ -197,6 +643,106 @@ mod tests {
         fn divergences(&mut self, _: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
             panic!("admitted initialization must not run divergence");
         }
+    }
+
+    fn pc_owner() -> PcSemanticOwner<LegalOrderRoleMock> {
+        PcSemanticOwner::new_selected(
+            PalsSemanticConfig::default(),
+            LegalOrderRoleMock,
+            ReviewSelectionPolicy::default(),
+            ReviewIndexLimits::default(),
+        )
+        .unwrap()
+    }
+    fn authority(root: u64) -> rz_contracts::pals::SearchAuthority {
+        rz_contracts::pals::SearchAuthority {
+            epoch: rz_contracts::ProcessEpoch(2),
+            game: rz_contracts::GameGeneration(0),
+            root: rz_contracts::RootGeneration(root),
+            implementation: rz_contracts::Digest([3; 32]),
+        }
+    }
+
+    #[test]
+    fn pc_owner_uses_exact_registered_root_view_and_graph_without_researcher() {
+        // No CpuEngine/OwnedCpuChecker/CpuWorker or credit ledger is constructed.
+        let mut owner = pc_owner();
+        assert_eq!(std::mem::size_of_val(owner.researcher()), 0);
+        assert!(matches!(
+            owner.require_researcher(),
+            Err(PalsError::Role(RoleError::Unsupported(_)))
+        ));
+        let position = Position::startpos();
+        let scope = authority(7);
+        let registration = owner.register_adaptive_root(&position, scope).unwrap();
+        owner
+            .consume_adaptive_root_registration(registration, &position, scope)
+            .unwrap();
+        let root = owner.intern_hot(position).unwrap();
+        let movement = BoardMove::from_uci("e2e4").unwrap();
+        let (child, created) = owner.connect_hot(root, movement).unwrap();
+        assert!(created);
+        assert_eq!(owner.connect_hot(root, movement).unwrap(), (child, false));
+        assert_eq!(owner.semantic.nodes[root].edges.len(), 1);
+        assert!(
+            owner
+                .semantic
+                .nodes
+                .iter()
+                .all(|node| node.evidence.is_none() && node.resume.is_none())
+        );
+        let line = [movement];
+        let question = RoleQuestion {
+            purpose: RoleQueryPurpose::ReplyPolicy,
+            prefix: &line,
+            proposal: &[],
+            refutation: None,
+            divergences: &[],
+        };
+        let logical = owner.role_context(child, question).unwrap();
+        let legal = owner.semantic.nodes[child].position.legal_moves();
+        let view = owner
+            .prepare_review_view(child, question, &legal)
+            .unwrap()
+            .unwrap();
+        assert!(view.validates(owner.stores()));
+        assert_eq!(view.query().prefix, line);
+        assert_eq!(logical.prefix, line);
+        assert_eq!(logical.search_generation, scope.root.0);
+        assert_eq!(
+            owner
+                .semantic
+                .stores
+                .situations
+                .get(logical.situation)
+                .unwrap()
+                .state,
+            logical.state
+        );
+        assert!(matches!(
+            owner.root_model_value(child).0,
+            PalsResolvedValue::Unknown
+        ));
+        drop(view);
+        assert_eq!(owner.stores().review_pin_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn pc_root_registration_rejects_foreign_semantic_owner_without_mutation() {
+        let mut first = pc_owner();
+        let mut other = pc_owner();
+        let position = Position::startpos();
+        let scope = authority(11);
+        let proof = first.register_adaptive_root(&position, scope).unwrap();
+        assert!(
+            other
+                .consume_adaptive_root_registration(proof, &position, scope)
+                .is_err()
+        );
+        assert_eq!(other.stores().generation(), 0);
+        assert!(other.stores().root().is_none());
+        assert!(other.semantic.nodes.is_empty());
+        first.abandon_unconsumed_adaptive_root(scope).unwrap();
     }
 
     #[test]
