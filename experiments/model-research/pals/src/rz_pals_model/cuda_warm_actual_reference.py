@@ -16,6 +16,7 @@ from pathlib import Path
 import struct
 import time
 
+from .artifacts import publish_noreplace
 from .config import MAX_LINE_PLIES, ModelConfig, public_tensor_names
 from .warm_artifacts import (_read_immutable_bytes, _document_from_immutable_bytes,
                              _cpu_session, _descriptors, _feed, _reference,
@@ -881,8 +882,7 @@ def _write_reference(path, report):
         stream.write(contents)
         stream.flush()
         os.fsync(stream.fileno())
-    os.link(temporary, path)
-    temporary.unlink()
+    publish_noreplace(temporary, path)
     summary = {"schema": REFERENCE_SCHEMA, "reference_passed": True, "calls": len(report["calls"]),
                "output_json": str(path), "reference_sha256_hex": hashlib.sha256(contents).hexdigest(),
                "reference_bytes": len(contents), "optimizer_steps": 0, "gpu_execution": "not_run_by_reference"}

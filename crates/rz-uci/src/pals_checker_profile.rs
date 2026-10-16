@@ -35,8 +35,11 @@ use std::time::Duration;
 
 pub const PALS_CHECKER_PROFILE_SCHEMA: &str = "rz-pals-external-checker-profile/1";
 pub const PALS_CHECKER_REGISTRATION_SCHEMA: &str = "rz-pals-external-checker-registration/1";
+pub const PALS_ADAPTIVE_CHECKER_PROFILE_V5_SCHEMA: &str =
+    "rz-pals-adaptive-external-checker-profile-v5/1";
 pub const MAX_CHECKER_PROFILE_BYTES: usize = 64 * 1024;
 const CANONICAL_DOMAIN: &str = "rz-pals-external-checker-profile-canonical/1";
+const ADAPTIVE_CANONICAL_DOMAIN: &str = "rz-pals-adaptive-external-checker-profile-v5-canonical/1";
 const STOCKFISH_SOURCE: &str = "https://github.com/official-stockfish/Stockfish";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -73,6 +76,17 @@ pub struct PalsCheckerProfile {
 /// kept separate, and the declaration cannot be modified after verification.
 #[derive(Debug)]
 pub struct LoadedPalsCheckerProfile {
+    profile: PalsCheckerProfile,
+    file_sha256: String,
+    canonical_sha256: String,
+    file_bytes: u64,
+}
+
+/// V5 Full options have a different schema and canonical domain. This cannot
+/// be passed to the legacy checker/config consumer or constructed without the
+/// exact byte pin; it still attests only declaration admission, never spawn.
+#[derive(Debug)]
+pub struct LoadedPalsAdaptiveCheckerProfileV5 {
     profile: PalsCheckerProfile,
     file_sha256: String,
     canonical_sha256: String,
@@ -127,6 +141,24 @@ fn linux_path(value: &str, root_allowed: bool) -> bool {
 }
 
 impl PalsCheckerProfile {
+    /// Parse exact caller-pinned bytes without reopening a path. The caller
+    /// separately proves retained descriptor identity; this pure admission
+    /// validates byte size/hash, duplicate keys, schema and immutable meaning.
+    pub fn from_verified_adaptive_bytes(
+        bytes: &[u8],
+        expected_file_sha256: &str,
+    ) -> Result<LoadedPalsAdaptiveCheckerProfileV5, CheckerError> {
+        let (profile, file_sha256) = parse_verified_profile_bytes(bytes, expected_file_sha256)?;
+        profile.validate_adaptive_v5()?;
+        let canonical_sha256 = profile.canonical_digest_for(ADAPTIVE_CANONICAL_DOMAIN)?;
+        Ok(LoadedPalsAdaptiveCheckerProfileV5 {
+            profile,
+            file_sha256,
+            canonical_sha256,
+            file_bytes: bytes.len() as u64,
+        })
+    }
+
     /// Read at most 64 KiB from a pinned regular file. Every path component is
     /// opened without following links. Parsing uses these exact hashed bytes.
     /// This never reads the engine, a model, or starts a subprocess.
@@ -175,17 +207,7 @@ impl PalsCheckerProfile {
         {
             return Err(invalid("checker profile changed during bounded read"));
         }
-        let file_sha256 = format!("{:x}", Sha256::digest(&bytes));
-        if file_sha256 != expected_file_sha256 {
-            return Err(invalid("checker profile file SHA256 mismatch"));
-        }
-        // serde structs reject repeated fields, but BTreeMap would otherwise
-        // keep the last value. Check decoded keys in every object before the
-        // unchanged typed parser reads these same pinned UTF-8 bytes.
-        serde_json::from_slice::<UniqueJsonKeys>(&bytes)
-            .map_err(|_| invalid("invalid JSON or duplicate checker profile object key"))?;
-        let profile: Self = serde_json::from_slice(&bytes)
-            .map_err(|_| invalid("invalid stockfish_embedded_nnue profile JSON"))?;
+        let (profile, file_sha256) = parse_verified_profile_bytes(&bytes, expected_file_sha256)?;
         profile.validate()?;
         let canonical_sha256 = profile.canonical_digest()?;
         Ok(LoadedPalsCheckerProfile {
@@ -197,7 +219,12 @@ impl PalsCheckerProfile {
     }
 
     pub fn validate(&self) -> Result<(), CheckerError> {
-        if self.schema != PALS_CHECKER_PROFILE_SCHEMA {
+        self.validate_common(PALS_CHECKER_PROFILE_SCHEMA)?;
+        validate_options(&self.identity.options)
+    }
+
+    fn validate_common(&self, expected_schema: &str) -> Result<(), CheckerError> {
+        if self.schema != expected_schema {
             return Err(invalid("unsupported checker profile schema"));
         }
         if !self.identity.assets.is_empty() {
@@ -270,17 +297,53 @@ impl PalsCheckerProfile {
         {
             return Err(invalid("checker profile lifetime output/line cap"));
         }
-        validate_options(&self.identity.options)
+        Ok(())
+    }
+
+    fn validate_adaptive_v5(&self) -> Result<(), CheckerError> {
+        self.validate_common(PALS_ADAPTIVE_CHECKER_PROFILE_V5_SCHEMA)?;
+        use rz_search::external_cpu::{EXTERNAL_STOP_DRAIN_RESERVE, STOCKFISH19_SOURCE_COMMIT};
+        let expected = std::collections::BTreeMap::from([
+            ("Skill Level".into(), "20".into()),
+            ("UCI_LimitStrength".into(), "false".into()),
+            ("Threads".into(), "1".into()),
+            ("Hash".into(), "256".into()),
+            ("Ponder".into(), "false".into()),
+            ("NumaPolicy".into(), "none".into()),
+            ("SyzygyPath".into(), String::new()),
+            ("MultiPV".into(), "1".into()),
+        ]);
+        let pinned_source = [
+            format!("{STOCKFISH_SOURCE}/tree/{STOCKFISH19_SOURCE_COMMIT}"),
+            format!("{STOCKFISH_SOURCE}/commit/{STOCKFISH19_SOURCE_COMMIT}"),
+        ];
+        if self.identity.options != expected
+            || self.identity.declared_version != "19"
+            || self.identity.declared_name != "Stockfish 19"
+            || self.expected_uci_name != "Stockfish 19"
+            || !pinned_source.contains(&self.identity.declared_source)
+            || self.stop_grace_ms != EXTERNAL_STOP_DRAIN_RESERVE.as_millis() as u64
+            || self.max_task_wall_time_ms < 600
+        {
+            return Err(invalid(
+                "adaptive Stockfish 19 Full pin/options/stop reserve differ",
+            ));
+        }
+        Ok(())
     }
 
     fn canonical_digest(&self) -> Result<String, CheckerError> {
         self.validate()?;
+        self.canonical_digest_for(CANONICAL_DOMAIN)
+    }
+
+    fn canonical_digest_for(&self, domain: &str) -> Result<String, CheckerError> {
         let value = sorted_value(
             serde_json::to_value(self)
                 .map_err(|_| invalid("cannot encode checker profile declaration"))?,
         );
         let mut output = BoundedJson { bytes: Vec::new() };
-        serde_json::to_writer(&mut output, &(CANONICAL_DOMAIN, value))
+        serde_json::to_writer(&mut output, &(domain, value))
             .map_err(|_| invalid("canonical checker profile exceeds byte bound"))?;
         Ok(format!("{:x}", Sha256::digest(&output.bytes)))
     }
@@ -306,6 +369,59 @@ impl PalsCheckerProfile {
             max_output_bytes: self.max_output_bytes,
             max_line_bytes: self.max_line_bytes,
         }
+    }
+}
+
+fn parse_verified_profile_bytes(
+    bytes: &[u8],
+    expected_file_sha256: &str,
+) -> Result<(PalsCheckerProfile, String), CheckerError> {
+    if !sha(expected_file_sha256) {
+        return Err(invalid("checker profile requires lowercase file SHA256"));
+    }
+    if bytes.is_empty() || bytes.len() > MAX_CHECKER_PROFILE_BYTES {
+        return Err(invalid(
+            "checker profile must be a nonempty bounded regular file",
+        ));
+    }
+    let file_sha256 = format!("{:x}", Sha256::digest(bytes));
+    if file_sha256 != expected_file_sha256 {
+        return Err(invalid("checker profile file SHA256 mismatch"));
+    }
+    // BTreeMap would silently keep the last repeated option. Keep this check
+    // shared across schemas, before the unchanged typed JSON representation.
+    serde_json::from_slice::<UniqueJsonKeys>(bytes)
+        .map_err(|_| invalid("invalid JSON or duplicate checker profile object key"))?;
+    let profile = serde_json::from_slice(bytes)
+        .map_err(|_| invalid("invalid stockfish_embedded_nnue profile JSON"))?;
+    Ok((profile, file_sha256))
+}
+
+impl LoadedPalsAdaptiveCheckerProfileV5 {
+    pub fn profile(&self) -> &PalsCheckerProfile {
+        &self.profile
+    }
+    pub fn file_sha256(&self) -> &str {
+        &self.file_sha256
+    }
+    pub fn canonical_sha256(&self) -> &str {
+        &self.canonical_sha256
+    }
+    pub fn file_bytes(&self) -> u64 {
+        self.file_bytes
+    }
+    pub fn adaptive_config(&self) -> Result<ExternalCpuConfig, CheckerError> {
+        self.profile.validate_adaptive_v5()?;
+        #[cfg(target_os = "linux")]
+        {
+            let config = self.profile.external_config();
+            config.validate()?;
+            Ok(config)
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err(CheckerError::Unsupported(
+            "adaptive external CPU execution requires Linux",
+        ))
     }
 }
 
@@ -677,6 +793,110 @@ mod tests {
             first.create_checker(),
             Err(CheckerError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn adaptive_bytes_have_distinct_schema_full_options_and_no_legacy_promotion() {
+        // Fixed legacy digest was independently calculated from the documented
+        // sorted JSON/domain recipe; the new admission cannot change old bytes.
+        let legacy = profile();
+        assert_eq!(
+            legacy.canonical_digest().unwrap(),
+            "1341ead9e0b1f5bc7c07b84e7c29e6ef082fa3af160ff06b4fb3bd3ce39fda9c"
+        );
+        let legacy_raw = serde_json::to_vec(&legacy).unwrap();
+        let legacy_sha = format!("{:x}", Sha256::digest(&legacy_raw));
+        assert!(
+            PalsCheckerProfile::from_verified_adaptive_bytes(&legacy_raw, &legacy_sha).is_err()
+        );
+        let mut declared = legacy;
+        declared.schema = PALS_ADAPTIVE_CHECKER_PROFILE_V5_SCHEMA.into();
+        declared.identity.declared_name = "Stockfish 19".into();
+        declared.identity.declared_version = "19".into();
+        declared.identity.declared_source = format!(
+            "{STOCKFISH_SOURCE}/tree/{}",
+            rz_search::external_cpu::STOCKFISH19_SOURCE_COMMIT
+        );
+        declared.identity.options = BTreeMap::from([
+            ("Skill Level".into(), "20".into()),
+            ("UCI_LimitStrength".into(), "false".into()),
+            ("Threads".into(), "1".into()),
+            ("Hash".into(), "256".into()),
+            ("Ponder".into(), "false".into()),
+            ("NumaPolicy".into(), "none".into()),
+            ("SyzygyPath".into(), String::new()),
+            ("MultiPV".into(), "1".into()),
+        ]);
+        declared.expected_uci_name = "Stockfish 19".into();
+        declared.stop_grace_ms = 500;
+        let raw = serde_json::to_vec(&declared).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&raw));
+        let loaded = PalsCheckerProfile::from_verified_adaptive_bytes(&raw, &digest).unwrap();
+        assert_eq!(loaded.profile(), &declared);
+        assert_eq!(loaded.file_bytes(), raw.len() as u64);
+        assert_eq!(loaded.file_sha256(), digest);
+        assert!(declared.validate().is_err());
+        assert!(declared.canonical_digest().is_err());
+        let expected = declared
+            .canonical_digest_for(ADAPTIVE_CANONICAL_DOMAIN)
+            .unwrap();
+        assert_eq!(loaded.canonical_sha256(), expected);
+        #[cfg(target_os = "linux")]
+        {
+            use rz_search::cpu_checker::CpuChecker;
+            let config = loaded.adaptive_config().unwrap();
+            assert_eq!(config.identity, declared.identity);
+            assert_eq!(config.program, PathBuf::from(&declared.program));
+            let checker = ExternalUciCpuChecker::create(config).unwrap();
+            assert!(checker.last_attempt().is_none());
+            assert_eq!(checker.diagnostic_output(), (&[][..], &[][..]));
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(
+            loaded.adaptive_config(),
+            Err(CheckerError::Unsupported(_))
+        ));
+
+        for change in 0..6 {
+            let mut wrong = declared.clone();
+            match change {
+                0 => {
+                    wrong.identity.options.insert("Threads".into(), "2".into());
+                }
+                1 => {
+                    wrong
+                        .identity
+                        .options
+                        .insert("UCI_Chess960".into(), "false".into());
+                }
+                2 => {
+                    wrong.stop_grace_ms = 499;
+                }
+                3 => {
+                    wrong.identity.declared_version = "18".into();
+                }
+                4 => {
+                    wrong.identity.declared_source.push_str("/unrelated");
+                }
+                5 => {
+                    wrong.arguments.push("--ignored".into());
+                }
+                _ => unreachable!(),
+            }
+            let raw = serde_json::to_vec(&wrong).unwrap();
+            let digest = format!("{:x}", Sha256::digest(&raw));
+            assert!(PalsCheckerProfile::from_verified_adaptive_bytes(&raw, &digest).is_err());
+        }
+        assert!(PalsCheckerProfile::from_verified_adaptive_bytes(&raw, &"b".repeat(64)).is_err());
+        // A duplicate nested option must not silently replace its first value.
+        let text = std::str::from_utf8(&raw)
+            .unwrap()
+            .replace("\"Threads\":\"1\"", "\"Threads\":\"1\",\"Threads\":\"1\"");
+        let duplicate_sha = format!("{:x}", Sha256::digest(text.as_bytes()));
+        assert!(
+            PalsCheckerProfile::from_verified_adaptive_bytes(text.as_bytes(), &duplicate_sha)
+                .is_err()
+        );
     }
     #[test]
     fn profile_requires_bounded_bytes_regular_file_and_exact_wire_fields() {

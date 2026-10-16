@@ -4,6 +4,10 @@
 /// Separate caller-declared offline replay; not a product V or native closure capability.
 pub mod replay;
 
+use super::review_context::{
+    ReviewContextIndex, ReviewError, ReviewIndexLimits, ReviewSelectionPolicy, ReviewView,
+};
+
 use super::store::{
     BoundKind, ContinuationConclusion, ContinuationStatus, EvidenceScope, ExecutionId, LineId,
     Move16, Observation, ObservationId, ObservationKind, PalsStores, RawScore, SituationId,
@@ -28,13 +32,17 @@ use rz_position::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+pub mod adaptive_port;
+pub mod adaptive_root;
 mod archive_lifecycle;
 mod cpu_lifecycle;
 mod followup_execution;
 mod frozen_recheck;
+mod review_lifecycle;
 pub use followup_execution::{
     PALS_FOLLOWUP_EXECUTION_TRACE_MAX, PALS_FOLLOWUP_EXECUTION_VERSION,
     PalsExecutionEndpointSnapshot, PalsExecutionEndpointValue, PalsFollowupExecutionScope,
@@ -124,6 +132,58 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 include_str!("engine/archive_lifecycle.rs"),
             ),
             (
+                "pals/engine/review_lifecycle.rs",
+                include_str!("engine/review_lifecycle.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port.rs",
+                include_str!("engine/adaptive_port.rs"),
+            ),
+            (
+                "pals/engine/adaptive_root.rs",
+                include_str!("engine/adaptive_root.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/role_commit.rs",
+                include_str!("engine/adaptive_port/role_commit.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/consumption_observation.rs",
+                include_str!("engine/adaptive_port/consumption_observation.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/continuation_blueprint.rs",
+                include_str!("engine/adaptive_port/continuation_blueprint.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/model_namespace.rs",
+                include_str!("engine/adaptive_port/model_namespace.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/cpu_commit.rs",
+                include_str!("engine/adaptive_port/cpu_commit.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/external_commit.rs",
+                include_str!("engine/adaptive_port/external_commit.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/archive_worker.rs",
+                include_str!("engine/adaptive_port/archive_worker.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/branch_queue.rs",
+                include_str!("engine/adaptive_port/branch_queue.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/conditional_evidence.rs",
+                include_str!("engine/adaptive_port/conditional_evidence.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/validator_port.rs",
+                include_str!("engine/adaptive_port/validator_port.rs"),
+            ),
+            (
                 "pals/engine/cpu_lifecycle.rs",
                 include_str!("engine/cpu_lifecycle.rs"),
             ),
@@ -133,10 +193,23 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
             ),
             ("pals/store.rs", include_str!("store.rs")),
             ("pals/store/hot.rs", include_str!("store/hot.rs")),
+            ("pals/review_context.rs", include_str!("review_context.rs")),
+            (
+                "pals/store/hot_commit.rs",
+                include_str!("store/hot_commit.rs"),
+            ),
+            (
+                "pals/store/hot_commit/registered_root.rs",
+                include_str!("store/hot_commit/registered_root.rs"),
+            ),
             ("pals/store/archive.rs", include_str!("store/archive.rs")),
             (
                 "pals/store/archive/codec.rs",
                 include_str!("store/archive/codec.rs"),
+            ),
+            (
+                "pals/store/archive/foreign_permit.rs",
+                include_str!("store/archive/foreign_permit.rs"),
             ),
         ],
     )
@@ -359,6 +432,9 @@ pub enum RoleQueryPurpose {
     DivergencePolicy,
     /// Frontier WDL always uses a fresh evaluation, never a policy warm seed.
     ValueFresh,
+    /// V selects supported actions. Append-only: the existing five logical
+    /// purposes retain their framing and legacy codec discriminants.
+    TaskPolicy,
 }
 
 /// Current checked store handles and complete ordered continuation identity.
@@ -577,6 +653,7 @@ pub struct DivergenceQuery<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RoleError {
     Unavailable,
+    Unsupported(&'static str),
     InvalidOutput,
     Canceled,
     Deadline,
@@ -605,6 +682,28 @@ impl std::error::Error for RoleError {}
 /// logical cancellation alone never permits buffer/session reuse.
 pub trait RoleModel: Send {
     fn identity(&self) -> &str;
+    /// Explicit capability: the native consumer must use the sealed selected
+    /// records/anchors directly instead of running its old record selector.
+    fn supports_selected_review_view(&self) -> bool {
+        false
+    }
+    /// Actual async mirrors must expose their startup representation mapping.
+    /// Existing synchronous/mock providers retain their original namespace.
+    fn requires_registered_representation_namespace(&self) -> bool {
+        false
+    }
+    fn registered_representation_namespace(
+        &self,
+    ) -> Option<&adaptive_port::AdaptiveModelNamespace> {
+        None
+    }
+    fn bind_selected_review_view(
+        &mut self,
+        _view: Arc<ReviewView>,
+        _context: &RoleLogicalContext,
+    ) -> Result<(), RoleError> {
+        Err(RoleError::Unavailable)
+    }
     /// Separate frontier WDL namespace. Own CPU mode does not require this API.
     /// The provider returns the key from its actual prepared input, rather than
     /// a board-only/public-memory key or a digest reconstructed after inference.
@@ -717,6 +816,24 @@ impl<M: RoleModel + ?Sized> RoleModel for Box<M> {
     fn identity(&self) -> &str {
         (**self).identity()
     }
+    fn supports_selected_review_view(&self) -> bool {
+        (**self).supports_selected_review_view()
+    }
+    fn requires_registered_representation_namespace(&self) -> bool {
+        (**self).requires_registered_representation_namespace()
+    }
+    fn registered_representation_namespace(
+        &self,
+    ) -> Option<&adaptive_port::AdaptiveModelNamespace> {
+        (**self).registered_representation_namespace()
+    }
+    fn bind_selected_review_view(
+        &mut self,
+        view: Arc<ReviewView>,
+        context: &RoleLogicalContext,
+    ) -> Result<(), RoleError> {
+        (**self).bind_selected_review_view(view, context)
+    }
     fn value_identity(&self) -> Option<&ModelValueIdentity> {
         (**self).value_identity()
     }
@@ -818,6 +935,22 @@ impl LegalOrderRoleMock {
 impl RoleModel for LegalOrderRoleMock {
     fn identity(&self) -> &str {
         "explicit-legal-order-role-mock-v1"
+    }
+    fn supports_selected_review_view(&self) -> bool {
+        true
+    }
+    fn bind_selected_review_view(
+        &mut self,
+        view: Arc<ReviewView>,
+        context: &RoleLogicalContext,
+    ) -> Result<(), RoleError> {
+        if view.generation() != context.search_generation
+            || view.query().purpose != context.purpose
+            || view.query().prefix != context.prefix
+        {
+            return Err(RoleError::InvalidOutput);
+        }
+        Ok(())
     }
     fn value_identity(&self) -> Option<&ModelValueIdentity> {
         static IDENTITY: std::sync::OnceLock<ModelValueIdentity> = std::sync::OnceLock::new();
@@ -1016,6 +1149,12 @@ pub enum PalsError {
     Store(StoreError),
     Capacity,
     RoleCallLimit,
+    Review(ReviewError),
+}
+impl From<ReviewError> for PalsError {
+    fn from(error: ReviewError) -> Self {
+        Self::Review(error)
+    }
 }
 impl std::fmt::Display for PalsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1174,10 +1313,17 @@ pub struct PalsEngine<M: RoleModel> {
     external_attempts: Vec<CheckerAttempt>,
     nodes: Vec<Node>,
     records: Vec<RoleRecord>,
+    review_index: Option<ReviewContextIndex>,
+    review_policy: Option<ReviewSelectionPolicy>,
+    /// Explicit legacy-baseline input ownership. Selected/compact consumers
+    /// never allocate or scan this separate immutable raw-record snapshot.
+    legacy_full_native_context: bool,
+    last_review_issue: Option<ReviewError>,
     revision: u64,
     // Store handles may restart from zero after reset; this checked namespace
     // prevents old-game logical questions from acquiring the new authority.
     game_generation: Option<u64>,
+    adaptive_root_registry: adaptive_root::AdaptiveRootRegistry,
     stores: PalsStores,
     clock_origin: Instant,
     consumer_id: u64,
@@ -1192,6 +1338,55 @@ pub struct PalsEngine<M: RoleModel> {
     new_game_transition_error: Option<PalsError>,
 }
 impl<M: RoleModel> PalsEngine<M> {
+    /// Retain the original full-context encoder's raw public-memory input in
+    /// each adaptive question. The bounded ReviewView remains an independent
+    /// authorization envelope; its selected rows are not renamed full context.
+    /// Startup selects this once, after selecting CurrentRootOnly review
+    /// authorization and before any root/Store generation is registered.
+    pub fn with_legacy_full_native_context(mut self) -> Result<Self, PalsError> {
+        if self.stores.generation() != 0
+            || !self.nodes.is_empty()
+            || !self.records.is_empty()
+            || self.legacy_full_native_context
+            || self.review_index.is_none()
+            || !self.review_policy.is_some_and(|policy| {
+                policy.mode == crate::pals::review_context::ReviewAnchorMode::CurrentRootOnly
+            })
+        {
+            return Err(StoreError::InvalidConditions(
+                "legacy full native context is selected once before search",
+            )
+            .into());
+        }
+        self.legacy_full_native_context = true;
+        Ok(self)
+    }
+
+    /// An explicit A profile. Old constructors retain their full-context
+    /// synchronous behavior and unsupported native consumers fail before search.
+    pub fn with_selected_review_context(
+        mut self,
+        policy: ReviewSelectionPolicy,
+        limits: ReviewIndexLimits,
+    ) -> Result<Self, PalsError> {
+        policy.validate()?;
+        if !self.model.supports_selected_review_view() {
+            return Err(RoleError::Unavailable.into());
+        }
+        if self.stores.generation() != 0
+            || !self.nodes.is_empty()
+            || !self.records.is_empty()
+            || self.review_policy.is_some()
+        {
+            return Err(StoreError::InvalidConditions(
+                "review context is selected once before search",
+            )
+            .into());
+        }
+        self.review_index = Some(ReviewContextIndex::new(limits)?);
+        self.review_policy = Some(policy);
+        Ok(self)
+    }
     pub fn new(config: PalsConfig, model: M, cpu: CpuEngine) -> Result<Self, PalsError> {
         Self::new_with_cpu(config, model, cpu)
     }
@@ -1395,8 +1590,13 @@ impl<M: RoleModel> PalsEngine<M> {
             external_attempts: Vec::new(),
             nodes,
             records,
+            review_index: None,
+            review_policy: None,
+            legacy_full_native_context: false,
+            last_review_issue: None,
             revision: 0,
             game_generation: Some(0),
+            adaptive_root_registry: adaptive_root::AdaptiveRootRegistry::default(),
             stores,
             clock_origin: Instant::now(),
             consumer_id: 0,
@@ -1451,6 +1651,7 @@ impl<M: RoleModel> PalsEngine<M> {
         self.nodes.clear();
         self.held_cpu_task = None;
         self.records.clear();
+        self.reset_review_context();
         // Preserve the old synchronous own clear. A foreign reset can fail and
         // needs caller controls; defer it to search or explicit try_new_game.
         if self.is_external() {
@@ -1596,8 +1797,19 @@ impl<M: RoleModel> PalsEngine<M> {
     pub fn records(&self) -> &[RoleRecord] {
         &self.records
     }
+    pub fn review_policy(&self) -> Option<ReviewSelectionPolicy> {
+        self.review_policy
+    }
+    pub fn last_review_issue(&self) -> Option<&ReviewError> {
+        self.last_review_issue.as_ref()
+    }
     pub fn model_identity(&self) -> &str {
         self.model.identity()
+    }
+    /// Immutable startup metadata from the selected evaluator. This describes
+    /// its frozen value namespace; it is not evidence of a neural execution.
+    pub fn model_value_identity(&self) -> Option<&ModelValueIdentity> {
+        self.model.value_identity()
     }
     pub fn post_repair_recheck_policy(&self) -> PostRepairRecheckPolicy {
         self.post_repair_recheck
@@ -1698,6 +1910,7 @@ impl<M: RoleModel> PalsEngine<M> {
         progress: F,
     ) -> Result<PalsResult, PalsError> {
         self.last_recheck_observer_error = None;
+        self.last_review_issue = None;
         self.last_cpu_checkpoint_cleanup_error = None;
         self.repair_queue.clear();
         self.repair_questions.clear();
@@ -1922,6 +2135,21 @@ impl<M: RoleModel> PalsEngine<M> {
                 }
                 Err(PalsError::RoleCallLimit) => {
                     completion = PalsCompletion::RoleCallLimit;
+                    break;
+                }
+                Err(PalsError::Review(
+                    issue @ (ReviewError::ViewCapacity
+                    | ReviewError::AnchorMismatch
+                    | ReviewError::MissingRelation(_)
+                    | ReviewError::IndexCapacity
+                    | ReviewError::Store(
+                        StoreError::Capacity(_)
+                        | StoreError::PinSaturated(_)
+                        | StoreError::ColdRecord(_),
+                    )),
+                )) => {
+                    self.last_review_issue = Some(issue);
+                    completion = PalsCompletion::Capacity;
                     break;
                 }
                 Err(error) => return Err(error),
@@ -2246,8 +2474,7 @@ impl<M: RoleModel> PalsEngine<M> {
         if counters.role_calls >= self.config.max_role_calls {
             return Err(PalsError::RoleCallLimit);
         }
-        let position = &self.nodes[node].position;
-        let legal = position.legal_moves();
+        let legal = self.nodes[node].position.legal_moves();
         if legal.len() > 256 {
             return Err(PalsError::Capacity);
         }
@@ -2263,13 +2490,20 @@ impl<M: RoleModel> PalsEngine<M> {
             divergences: &[],
         };
         let context = self.role_context(node, question)?;
+        let review = self.prepare_review_view(node, question, &legal)?;
+        if let Some(view) = &review {
+            self.model
+                .bind_selected_review_view(Arc::clone(view), &context)?;
+        }
         let query = RoleQuery {
-            position,
+            position: &self.nodes[node].position,
             legal: &legal,
             prefix,
             proposal,
             counterexample: refutation,
-            records: &self.records,
+            records: review
+                .as_ref()
+                .map_or(self.records.as_slice(), |view| view.records()),
             revision: self.revision,
             deadline: limits.deadline,
             cancel,
@@ -2300,6 +2534,12 @@ impl<M: RoleModel> PalsEngine<M> {
             return Err(RoleError::Deadline.into());
         }
         self.accept_role_output(node, &context, question, limits, cancel)?;
+        if let Some(view) = &review {
+            self.review_index
+                .as_mut()
+                .ok_or(PalsError::InvalidConfig)?
+                .consume(view, &self.stores)?;
+        }
         if matches!(call, Call::Repair) {
             self.observe_repair_question(&context);
         }
@@ -2843,6 +3083,17 @@ impl<M: RoleModel> PalsEngine<M> {
         cancel: &AtomicBool,
         counters: &mut PalsCounters,
     ) -> Result<(), PalsError> {
+        self.evaluate_model_value_with_view(node, line, limits, cancel, counters, None)
+    }
+    fn evaluate_model_value_with_view(
+        &mut self,
+        node: usize,
+        line: &[BoardMove],
+        limits: PalsLimits,
+        cancel: &AtomicBool,
+        counters: &mut PalsCounters,
+        frozen: Option<Arc<ReviewView>>,
+    ) -> Result<(), PalsError> {
         if self.nodes[node].terminal.is_some() || self.stopped(limits, cancel).is_some() {
             return Ok(());
         }
@@ -2869,13 +3120,33 @@ impl<M: RoleModel> PalsEngine<M> {
             divergences: &[],
         };
         let context = self.role_context(node, question)?;
+        let review = match frozen {
+            Some(view) => {
+                if !view.validates(&self.stores)
+                    || view.query().prefix != line
+                    || view.query().proposal != line
+                    || view.query().legal != legal
+                    || view.query().purpose != RoleQueryPurpose::ValueFresh
+                {
+                    return Err(RoleError::InvalidOutput.into());
+                }
+                Some(view)
+            }
+            None => self.prepare_review_view(node, question, &legal)?,
+        };
+        if let Some(view) = &review {
+            self.model
+                .bind_selected_review_view(Arc::clone(view), &context)?;
+        }
         let query = RoleQuery {
             position: &self.nodes[node].position,
             legal: &legal,
             prefix: line,
             proposal: line,
             counterexample: None,
-            records: &self.records,
+            records: review
+                .as_ref()
+                .map_or(self.records.as_slice(), |view| view.records()),
             revision: self.revision,
             deadline: limits.deadline,
             cancel,
@@ -2956,6 +3227,12 @@ impl<M: RoleModel> PalsEngine<M> {
             return Err(RoleError::Deadline.into());
         }
         self.accept_role_output(node, &context, question, limits, cancel)?;
+        if let Some(view) = &review {
+            self.review_index
+                .as_mut()
+                .ok_or(PalsError::InvalidConfig)?
+                .consume(view, &self.stores)?;
+        }
         counters.consumed_role_outputs += 1;
         counters.accepted_value_outputs += 1;
         let observed_input = output.input_sha256;
@@ -4165,7 +4442,7 @@ impl<M: RoleModel> PalsEngine<M> {
         };
         if kind == RecordKind::CpuVerification || cpu_observation.is_some() {
             Self::check_logical_controls(controls)?;
-            self.publish_record(record, obsolete);
+            self.publish_record(record, obsolete, None)?;
             return Ok(None);
         }
         let line_id =
@@ -4204,10 +4481,16 @@ impl<M: RoleModel> PalsEngine<M> {
         )?;
         self.pin_archive_active_record(line_id, observation)?;
         Self::check_logical_controls(controls)?;
-        self.publish_record(record, obsolete);
+        self.publish_record(record, obsolete, Some(observation))?;
         Ok(Some((line_id, observation)))
     }
-    fn publish_record(&mut self, record: RoleRecord, obsolete: Option<usize>) {
+    fn publish_record(
+        &mut self,
+        record: RoleRecord,
+        obsolete: Option<usize>,
+        evidence: Option<ObservationId>,
+    ) -> Result<(), PalsError> {
+        self.publish_review_record(&record, evidence)?;
         for previous in &mut self.records {
             if previous.origin_state == record.origin_state
                 && previous.kind == record.kind
@@ -4221,6 +4504,7 @@ impl<M: RoleModel> PalsEngine<M> {
         }
         self.revision = record.revision;
         self.records.push(record);
+        Ok(())
     }
     fn check_logical_controls(controls: Option<(Instant, &AtomicBool)>) -> Result<(), PalsError> {
         if let Some((deadline, cancel)) = controls {
@@ -4234,6 +4518,9 @@ impl<M: RoleModel> PalsEngine<M> {
         Ok(())
     }
     fn refresh_projection(&mut self, root_state: StateId) {
+        if let Some(index) = &mut self.review_index {
+            index.refresh_root(root_state);
+        }
         let mut newest = HashSet::new();
         for record in self.records.iter_mut().rev() {
             record.critical = record.origin_state == root_state
@@ -4395,12 +4682,19 @@ impl<M: RoleModel> PalsEngine<M> {
                 divergences: &divergences,
             };
             let context = self.role_context(root, question)?;
+            let review = self.prepare_review_view(root, question, &[])?;
+            if let Some(view) = &review {
+                self.model
+                    .bind_selected_review_view(Arc::clone(view), &context)?;
+            }
             let scores = self.model.divergences_with_context(
                 DivergenceQuery {
                     root: &self.nodes[root].position,
                     proposal: &proposal,
                     candidates: &divergences,
-                    records: &self.records,
+                    records: review
+                        .as_ref()
+                        .map_or(self.records.as_slice(), |view| view.records()),
                     revision: self.revision,
                     deadline: limits.deadline,
                     cancel,
@@ -4418,6 +4712,12 @@ impl<M: RoleModel> PalsEngine<M> {
                 return Err(RoleError::Deadline.into());
             }
             self.accept_role_output(root, &context, question, limits, cancel)?;
+            if let Some(view) = &review {
+                self.review_index
+                    .as_mut()
+                    .ok_or(PalsError::InvalidConfig)?
+                    .consume(view, &self.stores)?;
+            }
             counters.consumed_role_outputs += 1;
             counters.accepted_critic_outputs += 1;
             let mut ranked: Vec<_> = (0..divergences.len()).collect();
@@ -5760,7 +6060,7 @@ fn better_root_choice(
 
 // Local provenance handles only. These never authorize exact NN cache identity;
 // neural adapters carry their full canonical model/input digests separately.
-fn role_line_sha256(domain: &[u8], line: &[BoardMove]) -> Result<[u8; 32], StoreError> {
+pub fn role_line_sha256(domain: &[u8], line: &[BoardMove]) -> Result<[u8; 32], StoreError> {
     let mut digest = Sha256::new();
     digest.update(b"rz-pals-role-ordered-move16/1\0");
     digest.update(
@@ -5780,7 +6080,7 @@ fn role_line_sha256(domain: &[u8], line: &[BoardMove]) -> Result<[u8; 32], Store
     Ok(digest.finalize().into())
 }
 
-fn role_divergence_sha256(candidates: &[usize]) -> Result<[u8; 32], StoreError> {
+pub fn role_divergence_sha256(candidates: &[usize]) -> Result<[u8; 32], StoreError> {
     let mut digest = Sha256::new();
     digest.update(b"rz-pals-role-ordered-divergence/1\0");
     digest.update(

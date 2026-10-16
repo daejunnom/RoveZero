@@ -1,17 +1,58 @@
 //! Search-driver executable acceptance, separate from NN/GPU evidence.
 use rz_position::{BoardMove, Position};
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, RecvTimeoutError},
+    },
     thread,
     time::{Duration, Instant},
 };
+
+const MAX_STDERR_BYTES: usize = 16 * 1024;
+const MAX_STDERR_LINES: usize = 64;
+
+struct StderrDiagnostics {
+    bytes: Vec<u8>,
+    lines: usize,
+    truncated: bool,
+    eof: bool,
+    read_error: Option<io::ErrorKind>,
+}
+impl StderrDiagnostics {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(MAX_STDERR_BYTES),
+            lines: 0,
+            truncated: false,
+            eof: false,
+            read_error: None,
+        }
+    }
+    fn capture(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.bytes.len() == MAX_STDERR_BYTES || self.lines == MAX_STDERR_LINES {
+                self.truncated = true;
+                break;
+            }
+            self.bytes.push(byte);
+            if byte == b'\n' {
+                self.lines += 1;
+            }
+        }
+    }
+    fn finished(&self) -> bool {
+        self.eof || self.read_error.is_some()
+    }
+}
 
 struct CpuChild {
     process: Child,
     stdout: Receiver<String>,
     lines: Vec<String>,
+    stderr: Arc<Mutex<StderrDiagnostics>>,
 }
 impl CpuChild {
     fn start() -> Self {
@@ -27,7 +68,7 @@ impl CpuChild {
             .args(arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let pipe = process.stdout.take().unwrap();
@@ -40,10 +81,35 @@ impl CpuChild {
                 }
             }
         });
+        let mut stderr_pipe = process.stderr.take().unwrap();
+        let stderr = Arc::new(Mutex::new(StderrDiagnostics::new()));
+        let reader_diagnostics = Arc::clone(&stderr);
+        thread::spawn(move || {
+            let mut buffer = [0_u8; 1024];
+            loop {
+                match stderr_pipe.read(&mut buffer) {
+                    Ok(0) => {
+                        reader_diagnostics.lock().unwrap().eof = true;
+                        break;
+                    }
+                    Ok(count) => {
+                        // Continue draining after the capture cap, so diagnostics
+                        // never introduce pipe backpressure into the UCI child.
+                        reader_diagnostics.lock().unwrap().capture(&buffer[..count]);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        reader_diagnostics.lock().unwrap().read_error = Some(error.kind());
+                        break;
+                    }
+                }
+            }
+        });
         Self {
             process,
             stdout,
             lines: Vec::new(),
+            stderr,
         }
     }
     fn send(&mut self, line: &str) {
@@ -53,15 +119,45 @@ impl CpuChild {
     fn wait(&mut self, prefix: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let line = self
+            let line = match self
                 .stdout
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap();
+            {
+                Ok(line) => line,
+                Err(error) => self.wait_failed(prefix, error, deadline),
+            };
             self.lines.push(line.clone());
             if line.starts_with(prefix) {
                 return line;
             }
         }
+    }
+    fn wait_failed(&mut self, prefix: &str, error: RecvTimeoutError, deadline: Instant) -> ! {
+        let mut status = self.process.try_wait();
+        // stdout and stderr have independent readers. Give an exiting child
+        // time to publish its final diagnostic, within the original wait bound.
+        while Instant::now() < deadline
+            && (matches!(status, Ok(None)) || !self.stderr.lock().unwrap().finished())
+        {
+            thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
+            status = self.process.try_wait();
+        }
+        let stderr = self.stderr.lock().unwrap();
+        let executable_bytes =
+            std::fs::metadata(env!("CARGO_BIN_EXE_rz-uci")).map(|metadata| metadata.len());
+        panic!(
+            "CPU UCI did not publish {prefix:?}; stdout_receive={error:?}; \
+             child_status={status:?}; stdout={:?}; stderr={:?}; \
+             stderr_eof={}; stderr_read_error={:?}; stderr_truncated={}; \
+             executable_bytes={executable_bytes:?}",
+            self.lines,
+            String::from_utf8_lossy(&stderr.bytes),
+            stderr.eof,
+            stderr.read_error,
+            stderr.truncated,
+        );
     }
     fn quit(&mut self) {
         self.send("quit");

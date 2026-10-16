@@ -1,0 +1,419 @@
+use crate::RuntimeFault;
+use std::time::Duration;
+
+pub const MAX_READY_JOBS: usize = 64;
+
+/// Unknown is retained as a fact, never interpreted as zero service time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadyServiceCost {
+    Known(Duration),
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadyJob<J, C, L> {
+    pub job: J,
+    pub candidate: C,
+    pub locality: L,
+    pub hard_deadline: Duration,
+    pub enqueued_at: Duration,
+    pub dependencies_ready: bool,
+    /// Bounded preference within one deadline; deficit eventually overrides it.
+    pub dependency_priority: u8,
+    pub service_cost: ReadyServiceCost,
+}
+
+#[derive(Debug)]
+pub struct ReadyRejected<J, C, L> {
+    pub reason: RuntimeFault,
+    pub job: ReadyJob<J, C, L>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadySelection<J, C, L> {
+    pub job: ReadyJob<J, C, L>,
+    pub selection_sequence: u64,
+    /// Dispatch fairness credit, not NN/CPU node, elapsed-time or utility credit.
+    pub candidate_deficit_after: i64,
+    pub starvation_age_before: u64,
+}
+
+#[derive(Debug)]
+struct Pending<J, C, L> {
+    descriptor: ReadyJob<J, C, L>,
+    admission: u64,
+}
+
+#[derive(Debug)]
+struct Candidate<C> {
+    id: C,
+    deficit: i64,
+    last_selected: u64,
+}
+
+/// Bounded EDF/dependency preference with per-candidate deficit and aging.
+/// No search data is encoded, no prepared input is copied and no task migrates
+/// here. Only never-started Jobs are eligible for idle-worker assignment; owner-
+/// bound paused continuations use their original worker's separate path.
+///
+/// Deadline priority takes precedence. A dependency preference is capped at
+/// four dispatch credits. Among repeatedly eligible candidates sharing a
+/// root's original hard deadline, deficit eventually overrides even the highest
+/// dependency preference and locality. No scheduler can promise service to a
+/// later-deadline tier under unlimited earlier-deadline arrivals; admission and
+/// the original deadline remain the coordinator's responsibility.
+#[derive(Debug)]
+pub struct ReadySelector<J, C, L> {
+    pending: Vec<Pending<J, C, L>>,
+    candidates: Vec<Candidate<C>>,
+    capacity: usize,
+    admission: u64,
+    selection: u64,
+}
+impl<J: Eq, C: Clone + Eq, L: Eq> ReadySelector<J, C, L> {
+    pub fn new(capacity: usize) -> Result<Self, RuntimeFault> {
+        if capacity == 0 || capacity > MAX_READY_JOBS {
+            return Err(RuntimeFault::InvalidLimits);
+        }
+        let mut pending = Vec::new();
+        let mut candidates = Vec::new();
+        pending
+            .try_reserve_exact(capacity)
+            .map_err(|_| RuntimeFault::ResourceLimit)?;
+        candidates
+            .try_reserve_exact(MAX_READY_JOBS)
+            .map_err(|_| RuntimeFault::ResourceLimit)?;
+        Ok(Self {
+            pending,
+            candidates,
+            capacity,
+            admission: 0,
+            selection: 0,
+        })
+    }
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+    pub fn candidate_count(&self) -> usize {
+        self.candidates.len()
+    }
+    pub fn admit(&mut self, job: ReadyJob<J, C, L>) -> Result<(), ReadyRejected<J, C, L>> {
+        let new_candidate = !self
+            .candidates
+            .iter()
+            .any(|entry| entry.id == job.candidate);
+        let reason = if self
+            .pending
+            .iter()
+            .any(|entry| entry.descriptor.job == job.job)
+        {
+            Some(RuntimeFault::DuplicateRequest)
+        } else if self.pending.len() == self.capacity {
+            Some(RuntimeFault::QueueFull)
+        } else if new_candidate && self.candidates.len() == MAX_READY_JOBS {
+            Some(RuntimeFault::ResourceLimit)
+        } else if job.enqueued_at >= job.hard_deadline {
+            Some(RuntimeFault::Expired)
+        } else if self.admission == u64::MAX {
+            Some(RuntimeFault::ResourceOverflow)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(ReadyRejected { reason, job });
+        }
+        self.admission += 1;
+        if new_candidate {
+            self.candidates.push(Candidate {
+                id: job.candidate.clone(),
+                deficit: 0,
+                last_selected: self.selection,
+            });
+        }
+        self.pending.push(Pending {
+            descriptor: job,
+            admission: self.admission,
+        });
+        Ok(())
+    }
+    pub fn set_dependencies_ready(&mut self, job: &J, ready: bool) -> Result<(), RuntimeFault> {
+        let entry = self
+            .pending
+            .iter_mut()
+            .find(|entry| &entry.descriptor.job == job)
+            .ok_or(RuntimeFault::Stale)?;
+        entry.descriptor.dependencies_ready = ready;
+        Ok(())
+    }
+    /// Explicit removal never reports an unknown task as successfully canceled.
+    pub fn remove(&mut self, job: &J) -> Result<ReadyJob<J, C, L>, RuntimeFault> {
+        let position = self
+            .pending
+            .iter()
+            .position(|entry| &entry.descriptor.job == job)
+            .ok_or(RuntimeFault::Stale)?;
+        Ok(self.pending.swap_remove(position).descriptor)
+    }
+    /// The owner calls this only after proving the candidate has no in-flight
+    /// work/token. The selector can verify only its own pending references.
+    pub fn retire_candidate(&mut self, candidate: &C) -> Result<(), RuntimeFault> {
+        if self
+            .pending
+            .iter()
+            .any(|entry| &entry.descriptor.candidate == candidate)
+        {
+            return Err(RuntimeFault::InvalidCompletion);
+        }
+        let position = self
+            .candidates
+            .iter()
+            .position(|entry| &entry.id == candidate)
+            .ok_or(RuntimeFault::Stale)?;
+        self.candidates.swap_remove(position);
+        Ok(())
+    }
+    /// Returns only a descriptor. A SliceGrant is still needed before work can
+    /// run. Scans are bounded by 64 and queries do not clone/sort snapshots.
+    pub fn select(
+        &mut self,
+        now: Duration,
+        preferred_locality: Option<&L>,
+    ) -> Result<Option<ReadySelection<J, C, L>>, RuntimeFault> {
+        let deadline = self
+            .pending
+            .iter()
+            .filter(|entry| {
+                entry.descriptor.dependencies_ready
+                    && entry.descriptor.enqueued_at <= now
+                    && entry.descriptor.hard_deadline > now
+            })
+            .map(|entry| entry.descriptor.hard_deadline)
+            .min();
+        let Some(deadline) = deadline else {
+            return Ok(None);
+        };
+        let next_sequence = self
+            .selection
+            .checked_add(1)
+            .ok_or(RuntimeFault::ResourceOverflow)?;
+        let mut eligible_candidates = [false; MAX_READY_JOBS];
+        for entry in &self.pending {
+            if eligible(&entry.descriptor, now, deadline) {
+                let index = self
+                    .candidates
+                    .iter()
+                    .position(|candidate| candidate.id == entry.descriptor.candidate)
+                    .expect("admitted job retains candidate registration");
+                eligible_candidates[index] = true;
+            }
+        }
+        let count = eligible_candidates
+            .iter()
+            .filter(|eligible| **eligible)
+            .count() as i64;
+        // Compute all overflow checks before mutating fairness state.
+        for (index, candidate) in self.candidates.iter().enumerate() {
+            if eligible_candidates[index] {
+                candidate
+                    .deficit
+                    .checked_add(5)
+                    .ok_or(RuntimeFault::ResourceOverflow)?;
+            }
+        }
+        let mut selected: Option<(usize, usize)> = None;
+        for (index, entry) in self.pending.iter().enumerate() {
+            if !eligible(&entry.descriptor, now, deadline) {
+                continue;
+            }
+            let candidate_index = self
+                .candidates
+                .iter()
+                .position(|candidate| candidate.id == entry.descriptor.candidate)
+                .expect("admitted job retains candidate registration");
+            if selected.is_none_or(|(previous, previous_candidate)| {
+                let candidate = &self.candidates[candidate_index];
+                let old_candidate = &self.candidates[previous_candidate];
+                let old = &self.pending[previous];
+                let score =
+                    candidate.deficit + i64::from(entry.descriptor.dependency_priority.min(4));
+                let old_score =
+                    old_candidate.deficit + i64::from(old.descriptor.dependency_priority.min(4));
+                score
+                    .cmp(&old_score)
+                    .then_with(|| old_candidate.last_selected.cmp(&candidate.last_selected))
+                    .then_with(|| {
+                        old.descriptor
+                            .enqueued_at
+                            .cmp(&entry.descriptor.enqueued_at)
+                    })
+                    .then_with(|| {
+                        let local = preferred_locality
+                            .is_some_and(|locality| locality == &entry.descriptor.locality);
+                        let old_local = preferred_locality
+                            .is_some_and(|locality| locality == &old.descriptor.locality);
+                        local.cmp(&old_local)
+                    })
+                    .then_with(|| old.admission.cmp(&entry.admission))
+                    .is_gt()
+            }) {
+                selected = Some((index, candidate_index));
+            }
+        }
+        let (index, candidate_index) = selected.expect("deadline contains an eligible job");
+        let deficit_after = self.candidates[candidate_index]
+            .deficit
+            .checked_add(1)
+            .and_then(|deficit| deficit.checked_sub(count))
+            .ok_or(RuntimeFault::ResourceOverflow)?;
+        let age = next_sequence - self.candidates[candidate_index].last_selected;
+        for (index, candidate) in self.candidates.iter_mut().enumerate() {
+            if eligible_candidates[index] {
+                candidate.deficit += 1;
+            }
+        }
+        self.candidates[candidate_index].deficit = deficit_after;
+        self.candidates[candidate_index].last_selected = next_sequence;
+        self.selection = next_sequence;
+        Ok(Some(ReadySelection {
+            job: self.pending.swap_remove(index).descriptor,
+            selection_sequence: next_sequence,
+            candidate_deficit_after: deficit_after,
+            starvation_age_before: age,
+        }))
+    }
+}
+
+fn eligible<J, C, L>(job: &ReadyJob<J, C, L>, now: Duration, deadline: Duration) -> bool {
+    job.dependencies_ready
+        && job.enqueued_at <= now
+        && job.hard_deadline > now
+        && job.hard_deadline == deadline
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn job(id: u64, candidate: u8) -> ReadyJob<u64, u8, u8> {
+        ReadyJob {
+            job: id,
+            candidate,
+            locality: candidate,
+            hard_deadline: Duration::from_secs(10),
+            enqueued_at: Duration::ZERO,
+            dependencies_ready: true,
+            dependency_priority: 0,
+            service_cost: ReadyServiceCost::Unknown,
+        }
+    }
+    #[test]
+    fn dependency_and_original_deadline_precede_fairness_and_locality() {
+        let mut selector = ReadySelector::new(8).unwrap();
+        selector.admit(job(1, 1)).unwrap();
+        let mut earlier = job(2, 2);
+        earlier.hard_deadline = Duration::from_secs(2);
+        selector.admit(earlier).unwrap();
+        let mut blocked = job(3, 3);
+        blocked.hard_deadline = Duration::from_secs(1);
+        blocked.dependencies_ready = false;
+        selector.admit(blocked).unwrap();
+        assert_eq!(
+            selector
+                .select(Duration::ZERO, Some(&1))
+                .unwrap()
+                .unwrap()
+                .job
+                .job,
+            2
+        );
+        selector.set_dependencies_ready(&3, true).unwrap();
+        assert_eq!(
+            selector
+                .select(Duration::ZERO, Some(&1))
+                .unwrap()
+                .unwrap()
+                .job
+                .job,
+            3
+        );
+        let mut dependency = job(4, 4);
+        dependency.dependency_priority = 1;
+        selector.admit(dependency).unwrap();
+        assert_eq!(
+            selector
+                .select(Duration::ZERO, Some(&1))
+                .unwrap()
+                .unwrap()
+                .job
+                .job,
+            4
+        );
+        assert_eq!(
+            selector.select(Duration::from_secs(11), None).unwrap(),
+            None
+        );
+    }
+    #[test]
+    fn repeated_local_preference_does_not_starve_eligible_candidates() {
+        let mut selector = ReadySelector::new(8).unwrap();
+        for candidate in 1..=4 {
+            selector
+                .admit(job(u64::from(candidate), candidate))
+                .unwrap();
+        }
+        let mut counts = [0; 4];
+        for id in 10..110 {
+            let selection = selector.select(Duration::ZERO, Some(&1)).unwrap().unwrap();
+            assert_eq!(selection.job.service_cost, ReadyServiceCost::Unknown);
+            assert!(selection.starvation_age_before <= 4);
+            counts[usize::from(selection.job.candidate - 1)] += 1;
+            selector.admit(job(id, selection.job.candidate)).unwrap();
+        }
+        assert_eq!(counts, [25; 4]);
+    }
+    #[test]
+    fn repeated_high_dependency_priority_cannot_starve_other_candidate() {
+        let mut selector = ReadySelector::new(2).unwrap();
+        selector.admit(job(1, 1)).unwrap();
+        let mut urgent = job(2, 2);
+        urgent.dependency_priority = u8::MAX;
+        selector.admit(urgent).unwrap();
+        let mut counts = [0; 2];
+        for id in 10..110 {
+            let selection = selector.select(Duration::ZERO, Some(&2)).unwrap().unwrap();
+            assert!(selection.starvation_age_before <= 4);
+            counts[usize::from(selection.job.candidate - 1)] += 1;
+            let mut next = job(id, selection.job.candidate);
+            if next.candidate == 2 {
+                next.dependency_priority = u8::MAX;
+            }
+            selector.admit(next).unwrap();
+        }
+        assert!((48..=52).contains(&counts[0]));
+        assert!((48..=52).contains(&counts[1]));
+    }
+    #[test]
+    fn bounded_admission_and_candidate_retirement_do_not_reassign_ids() {
+        let mut selector = ReadySelector::new(1).unwrap();
+        selector.admit(job(1, 1)).unwrap();
+        assert_eq!(
+            selector.admit(job(1, 2)).unwrap_err().reason,
+            RuntimeFault::DuplicateRequest
+        );
+        assert_eq!(
+            selector.admit(job(2, 2)).unwrap_err().reason,
+            RuntimeFault::QueueFull
+        );
+        assert_eq!(
+            selector.retire_candidate(&1),
+            Err(RuntimeFault::InvalidCompletion)
+        );
+        let descriptor = selector.remove(&1).unwrap();
+        assert_eq!(descriptor.job, 1);
+        selector.retire_candidate(&1).unwrap();
+        assert_eq!(selector.candidate_count(), 0);
+        assert_eq!(selector.remove(&1), Err(RuntimeFault::Stale));
+    }
+}

@@ -17,12 +17,19 @@ experimental-compact-child = []
 experimental-backup-scratch = []
 
 [dependencies]
+cap-std = { workspace = true }
+cap-fs-ext = { workspace = true }
 rz-contracts.workspace = true
-rz-position.workspace = true
+rz-position = { workspace = true, features = ["contracts"] }
 rz-telemetry.workspace = true
+rz-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["fs", "signal", "process"] }
+
+[dev-dependencies]
+# Failure injection uses the existing platform error type only in CPU tests.
+rz-platform.workspace = true

@@ -120,16 +120,22 @@ pub enum PriorCompletion {
     QuiescenceLimit,
     RulesTerminal,
 }
-impl From<CpuCompletion> for PriorCompletion {
-    fn from(value: CpuCompletion) -> Self {
-        match value {
+impl TryFrom<CpuCompletion> for PriorCompletion {
+    type Error = AdmissionFault;
+    fn try_from(value: CpuCompletion) -> Result<Self, Self::Error> {
+        Ok(match value {
             CpuCompletion::DepthLimit => Self::DepthLimit,
             CpuCompletion::NodeLimit => Self::NodeLimit,
             CpuCompletion::Deadline => Self::Deadline,
             CpuCompletion::Canceled => Self::Canceled,
+            CpuCompletion::Yielded => {
+                return Err(fault(
+                    "cooperative Yield is unsupported by legacy replay prior",
+                ));
+            }
             CpuCompletion::QuiescenceLimit => Self::QuiescenceLimit,
             CpuCompletion::Terminal(_) => Self::RulesTerminal,
-        }
+        })
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -433,7 +439,7 @@ impl ReplayQueryPrior {
             if let Some(report) = stage.report() {
                 out.report_present = true;
                 out.completed_depth = Some(report.completed_depth);
-                out.completion = Some(report.completion.into());
+                out.completion = Some(PriorCompletion::try_from(report.completion)?);
                 out.completed_iteration = report.score_scope == CpuScoreScope::CompletedIteration;
                 out.root_restricted = Some(report.root_restricted);
                 out.reused_completed_depth = Some(report.reused_completed_depth);

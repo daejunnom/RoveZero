@@ -178,6 +178,25 @@ _REVIEWED_DISABLED_FOLLOWUP_ORDERED_SCOPE_SOURCES = (
     {"bytes": 402843, "sha256": "70d4bae5ad4e19e86137e47cc66922182c5232cbe35b9b30d42bf43ec6850171"},
     {"bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
 )
+# Independently reviewed optional-review successor, legacy Disabled scope only.
+# Old constructors keep review_index/review_policy unset: input selection,
+# publication and Fresh-pair hooks preserve the original full-record path.
+# The collector adds only an Err/Review classification; no success is issued.
+# Selected views, adaptive ports, archive and V4/ModelWdl remain unadmitted.
+# Original build/source checks and the closed policy gate retain authority;
+# this whole literal pair grants no execution, cost, utility or training proof.
+_REVIEWED_DISABLED_FOLLOWUP_OPTIONAL_REVIEW_SOURCES = (
+    {"bytes": 414372, "sha256": "ce40b6f9ff8d13a41da8c9482b48528c1437896e9571c9630790c4b11b262726"},
+    {"bytes": 233208, "sha256": "02af59b9edbc350e6e1a204eb6543033bb4a859729eb2ed79c8b470cc6823a01"},
+)
+# Reviewed compiled-source inventory-only successor of the same Disabled lane.
+# Engine adds only the consumption_observation source tuple to its implementation
+# digest; collector bytes and all legacy control paths are unchanged. This pair
+# grants no adaptive consumption, selected context, execution or target authority.
+_REVIEWED_DISABLED_FOLLOWUP_COMPILED_CONSUMPTION_SOURCES = (
+    {"bytes": 414554, "sha256": "0ba7c9e41b106f35516b8b234872a839f5b2f4227153ed79aa7ff1c503d12837"},
+    {"bytes": 233208, "sha256": "02af59b9edbc350e6e1a204eb6543033bb4a859729eb2ed79c8b470cc6823a01"},
+)
 _SOURCE_REVIEW_PROFILES = (
     ("legacy_prepared_lineage_4469f9d", _REVIEWED_SOURCES),
     ("legacy_disabled_recheck_9c0de959", _REVIEWED_DISABLED_RECHECK_SOURCES),
@@ -198,6 +217,8 @@ _SOURCE_REVIEW_PROFILES = (
     ("legacy_disabled_followup_live_binding_004db31f_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_LIVE_BINDING_SOURCES),
     ("legacy_disabled_followup_observed_progress_4b272ed8_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_OBSERVED_PROGRESS_SOURCES),
     ("legacy_disabled_followup_ordered_scope_70d4bae5_native_1ba6d1e5", _REVIEWED_DISABLED_FOLLOWUP_ORDERED_SCOPE_SOURCES),
+    ("legacy_disabled_followup_optional_review_ce40b6f9_native_02af59b9", _REVIEWED_DISABLED_FOLLOWUP_OPTIONAL_REVIEW_SOURCES),
+    ("legacy_disabled_followup_compiled_consumption_0ba7c9e4_native_02af59b9", _REVIEWED_DISABLED_FOLLOWUP_COMPILED_CONSUMPTION_SOURCES),
 )
 _DISABLED_SEARCH_VERSION = "pals-restricted-refinement/0.1"
 _OPT_IN_LANE_FIELDS = ("pals_search_policy", "refinement_registration", "refinement_registration_sha256", "post_repair_recheck", "post_repair_recheck_policy", "post_repair_recheck_conditions",

@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+"""Build a bounded same-HEAD validation bundle; never run a neural workload.
+
+CPU compilation and four explicit static metadata getters only. Cargo ELF
+FD/copy custody and component framing follow the reviewed report payload;
+process-tree custody reuses managed_process.run_group. No Cloud entry, model,
+runtime DSO, weight, credential discovery, cache adoption, or retry is present.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import selectors
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tarfile
+import time
+import tomllib
+
+# Also works for the isolated -I -S child wrapper: only these tracked sibling
+# supervisors are added, never a caller PYTHONPATH or user package directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from managed_process import run_group
+from managed_storage import checked, tree_size
+
+ROOT_CAP = 12 << 30
+ARTIFACT_CAP = 512 << 20
+ELF_CAP = 256 << 20
+LOG_CAP = 8 << 20
+SOURCE_CAP = 128 << 20
+SINGLETONS = {'Cargo.toml', 'Cargo.lock', 'LICENSE', 'rust-toolchain.toml',
+              'experiments/model-research/pals/pyproject.toml',
+              'experiments/baselines/fastchess-clock-ponder-v2.patch'}
+PREFIXES = ('crates/', 'scripts/', 'experiments/model-research/pals/src/')
+CONTROL = '.github/workflows/contracts.yml'
+CORE5 = ('model_native', 'model_encoding', 'nn_runtime', 'model_reference', 'model_export')
+# Explicit compile capabilities preserve the original native report profile;
+# compiling CUDA support does not load a provider or execute GPU/NN work.
+SPECS = (
+    ('rz-arena', 'bin', 'rz-pals-g0-bootstrap-numerical', 'pals-collection-onnx,native-cuda'),
+    ('rz-arena', 'bin', 'rz-pals-g0-collection-deployment-numerical', 'pals-collection-onnx,native-cuda'),
+    ('rz-eval', 'example', 'virtual_review_numeric_capture', 'onnx,contracts'),
+    ('rz-uci', 'bin', 'rz-pals-adaptive', 'pals-adaptive,onnx-cuda'),
+    ('rz-uci', 'example', 'pals_rules_descriptor', 'pals-adaptive,onnx-cuda'),
+    ('rz-uci', 'example', 'pals_continuation_diagnostic', 'pals-adaptive-diagnostics'),
+)
+WARM = ('rz-uci', 'example', 'virtual_review_warm_numeric_capture',
+        'pals-adaptive,onnx-cpu,experimental-io-binding')
+# This standalone example calls the CUDA-enabled eval backend directly. Its
+# required features do not certify the separate engine/native_bootstrap path.
+
+
+def require(value, code):
+    if not value:
+        raise RuntimeError(code)
+
+
+def strict_json(raw):
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            require(key not in value, 'DuplicateJsonKey')
+            value[key] = item
+        return value
+    return json.loads(raw, object_pairs_hook=unique,
+                      parse_constant=lambda _: (_ for _ in ()).throw(RuntimeError('NonfiniteJson')))
+
+
+def identity(meta):
+    return (meta.st_dev, meta.st_ino, meta.st_mode, meta.st_nlink,
+            meta.st_size, meta.st_mtime_ns, meta.st_ctime_ns)
+
+
+def pinned_file(path, maximum=SOURCE_CAP, cargo=False, allow_empty=False):
+    """Hash a retained O_NOFOLLOW FD; Cargo alone may own up to 32 hardlinks."""
+    checked(path)
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    stream = os.fdopen(fd, 'rb')
+    try:
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and 1 <= before.st_nlink <= (32 if cargo else 1)
+                and (0 if allow_empty else 1) <= before.st_size <= maximum, 'ArtifactTypeOrSize')
+        digest = hashlib.sha256()
+        blob = hashlib.sha1(b'blob ' + str(before.st_size).encode() + b'\0')
+        while raw := stream.read(65536):
+            digest.update(raw)
+            blob.update(raw)
+        require(identity(before) == identity(os.fstat(fd)) == identity(path.lstat()), 'ArtifactIdentityChanged')
+        stream.seek(0)
+        return stream, {'bytes': before.st_size, 'sha256': digest.hexdigest()}, before, blob.hexdigest()
+    except BaseException:
+        stream.close()
+        raise
+
+
+def file_pin(path, maximum=SOURCE_CAP):
+    stream, pin, _, _ = pinned_file(path, maximum)
+    stream.close()
+    return pin
+
+
+def copy_cargo_elf(source, destination, check_budget):
+    """Original report's Cargo FD -> private nlink=1 custody, no source unlink."""
+    require(not destination.exists(), 'CargoElfCopyPlacement')
+    stream, expected, before, _ = pinned_file(source, ELF_CAP, cargo=True)
+    with stream:
+        check_budget(expected['bytes'])
+        require(stream.read(4) == b'\x7fELF', 'CargoOutputNotElf')
+        stream.seek(0)
+        digest, count = hashlib.sha256(), 0
+        with destination.open('xb') as target:
+            while raw := stream.read(65536):
+                check_budget(0)
+                target.write(raw)
+                digest.update(raw)
+                count += len(raw)
+            target.flush()
+            os.fsync(target.fileno())
+        require(identity(before) == identity(os.fstat(stream.fileno())) == identity(source.lstat()), 'CargoOriginalElfChanged')
+    destination.chmod(0o700)
+    actual = file_pin(destination, ELF_CAP)
+    require(actual == expected == {'bytes': count, 'sha256': digest.hexdigest()}
+            and destination.lstat().st_nlink == 1, 'PrivateElfCopyReadback')
+    return {'original_cargo': {**expected, 'device': before.st_dev, 'inode': before.st_ino,
+                               'nlink': before.st_nlink, 'mtime_ns': before.st_mtime_ns},
+            'private_copy': {**actual, 'nlink': 1}, 'original_fd_and_named_identity_stable': True}
+
+
+def allowed_source(path):
+    parts = path.split('/')
+    forbidden = {'.git', 'node_modules', 'dist', 'dist-server', 'build', 'coverage',
+                 'models', 'checkpoints', '.cache', '__pycache__'}
+    require(0 < len(path) <= 512 and '\\' not in path and ':' not in path
+            and all(p not in ('', '.', '..') and p.lower() not in forbidden
+                    and not p.lower().startswith('.env') for p in parts)
+            and not any(s in path.lower() for s in ('credential', 'service_account', 'service-account',
+                                                     'ssh-key', 'api-key', 'api_key')),
+            'ForbiddenSourcePath')
+    return path == CONTROL or path in SINGLETONS or path.startswith(PREFIXES)
+
+
+def source_inventory(source, tree_raw):
+    rows, controls = [], {}
+    for entry in tree_raw.split(b'\0'):
+        if not entry:
+            continue
+        header, name = entry.split(b'\t', 1)
+        name = name.decode('utf-8')
+        require(allowed_source(name), 'SourceOutsideExplicitRoster')
+        mode, kind, oid = header.decode('ascii').split()
+        require(mode in ('100644', '100755') and kind == 'blob' and re.fullmatch('[a-f0-9]{40}', oid), 'GitTrackedRegularSource')
+        stream, pin, _, blob = pinned_file(source / name, 16 << 20, allow_empty=True)
+        stream.close()
+        require(blob == oid, 'CheckoutBytesDifferFromGitBlob:' + name)
+        row = {'path': name, **pin, 'git_blob': oid, 'git_mode': mode}
+        if name == CONTROL:
+            controls[name] = row
+        else:
+            rows.append(row)
+    require(1 <= len(rows) <= 10000 and len({r['path'] for r in rows}) == len(rows)
+            and sum(r['bytes'] for r in rows) <= SOURCE_CAP
+            and SINGLETONS <= {r['path'] for r in rows} and set(controls) == {CONTROL}, 'ExactTrackedSourceRoster')
+    return sorted(rows, key=lambda row: row['path']), controls
+
+
+def component_inventory(catalog, rows):
+    require(set(catalog) == {'domain', 'algorithm', 'components'}
+            and catalog['domain'] == 'rz-pals-source-inventory-v5/1'
+            and catalog['algorithm'] == 'sha256-domain-u64le;sorted-path-u64le-utf8;size-u64le;sha256-raw32'
+            and len(catalog['components']) == 25, 'CatalogFraming')
+    by_path = {row['path']: row for row in rows}
+    result = {}
+    for name, paths in catalog['components'].items():
+        require(1 <= len(paths) <= 256 and len(set(paths)) == len(paths)
+                and all(p in by_path for p in paths), 'CatalogSourceMissing')
+        domain = b'rz-pals-source-component-v5/1'
+        digest = hashlib.sha256(len(domain).to_bytes(8, 'little') + domain)
+        for path in sorted(paths):
+            encoded, row = path.encode(), by_path[path]
+            digest.update(len(encoded).to_bytes(8, 'little') + encoded)
+            digest.update(row['bytes'].to_bytes(8, 'little') + bytes.fromhex(row['sha256']))
+        result[name] = digest.hexdigest()
+    require(set(CORE5) <= set(result), 'Core5Missing')
+    return result
+
+
+def warm_spec(manifest, paths):
+    target = next((r for r in manifest.get('example', []) if r.get('name') == WARM[2]), None)
+    source_path = 'crates/rz-uci/examples/' + WARM[2] + '.rs'
+    if target is None or source_path not in paths:
+        return None, 'NOT_PRESENT_IN_REGISTERED_SOURCE_AND_EXPLICIT_TARGET'
+    if (set(target.get('required-features', [])) != set(WARM[3].split(','))
+            or not set(WARM[3].split(',')) <= set(manifest['features'])
+            or target.get('path', 'examples/' + WARM[2] + '.rs') != 'examples/' + WARM[2] + '.rs'):
+        return None, 'NOT_READY_REQUIRED_FEATURE_OR_SOURCE_CONTRACT'
+    return WARM, 'SOURCE_PRESENT_REQUIRES_ACTUAL_BUILD'
+
+
+def cargo_artifact(raw, metadata, source, target_root, spec, registered_paths):
+    package_name, kind, name, features = spec
+    packages = [p for p in metadata['packages'] if p['name'] == package_name
+                and p['manifest_path'] == str(source / 'crates' / package_name / 'Cargo.toml')]
+    require(len(packages) == 1, 'ExactCargoPackage')
+    targets = [t for t in packages[0]['targets'] if t['name'] == name
+               and t['kind'] == [kind] and t['crate_types'] == ['bin']]
+    require(len(targets) == 1 and Path(targets[0]['src_path']).is_relative_to(source)
+            and Path(targets[0]['src_path']).relative_to(source).as_posix() in registered_paths, 'ExactRegisteredCargoTarget')
+    messages = [strict_json(line) for line in raw.splitlines() if line.strip()]
+    artifacts = [m for m in messages if m.get('reason') == 'compiler-artifact'
+                 and m.get('package_id') == packages[0]['id'] and m.get('target', {}).get('name') == name]
+    finishes = [m for m in messages if m.get('reason') == 'build-finished']
+    require(len(artifacts) == len(finishes) == 1 and finishes[0].get('success') is True, 'ExactlyOneSuccessfulCargoArtifact')
+    artifact = artifacts[0]
+    output = target_root / 'release' / ('examples' if kind == 'example' else '') / name
+    require(all(artifact['target'][k] == targets[0][k] for k in ('name', 'kind', 'crate_types', 'src_path', 'edition'))
+            and artifact['executable'] == str(output) and artifact['profile']['test'] is False
+            and len(artifact['features']) == len(set(artifact['features']))
+            and set(features.split(',')) <= set(artifact['features'])
+            and 'default' not in artifact['features'], 'ActualReleaseTargetPathFeatures')
+    if name == 'pals_continuation_diagnostic':
+        require(sorted(artifact['features']) == ['onnx-cpu', 'pals-adaptive', 'pals-adaptive-diagnostics', 'search-work-receipts'], 'FreshDiagnosticCannotAcquireWarmFeatures')
+    return output, artifact
+
+
+def validate_registry(value):
+    require(value.get('schema') == 'rz-pals-report-model-registry-query/1'
+            and value.get('model_profile') == 'virtual_review_v1'
+            and value.get('registry_methods') == [
+                'PalsModelProfile::VirtualReviewV1.registered_semantics_sha256',
+                'pals_model::virtual_review::registered_encoding_sha256']
+            and all(value.get(name) is False for name in (
+                'numerical_authority_issued', 'model_initialized', 'ort_loaded', 'neural_executed', 'training_executed'))
+            and all(type(value.get(name)) is str and re.fullmatch('[a-f0-9]{64}', value[name])
+                    for name in ('model_semantic_sha256', 'encoding_sha256')),
+            'StaticRegistryGetterOutput')
+
+
+def stream_child(argv):
+    """Drain both pipes but save at most 8MiB each; remain in the owned group.
+
+    The shared non-reaping supervisor owns this wrapper's original session and
+    drains/kills the entire group even when the command exits or leaves pipes.
+    No new session, detached process, shell, fallback or retry is created here.
+    """
+    affinity = [int(value) for value in os.environ['RZ_CI_CPU_AFFINITY'].split(',')]
+    require(len(affinity) == 2 and sorted(os.sched_getaffinity(0)) == affinity, 'ChildCpu2AffinityReadback')
+    child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, close_fds=True)
+    counts, kept = [0, 0], [0, 0]
+    selector = selectors.DefaultSelector()
+    try:
+        for index, pipe in enumerate((child.stdout, child.stderr)):
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ, index)
+        while selector.get_map():
+            for key, _ in selector.select(0.2):
+                data = os.read(key.fileobj.fileno(), 65536)
+                if not data:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                index = key.data
+                counts[index] += len(data)
+                save = memoryview(data[:max(0, LOG_CAP - kept[index])])
+                while save:
+                    written = os.write(index + 1, save)
+                    require(written > 0, 'CommandLogShortWrite')
+                    save = save[written:]
+                    kept[index] += written
+        code = child.wait()
+        return code if counts == kept else 125
+    finally:
+        selector.close()
+
+
+class Build:
+    def __init__(self, root, source, seconds):
+        self.root, self.source = root, source
+        self.deadline = time.monotonic() + seconds
+        self.commands = []
+        self.next_scan = 0.0
+        (root / 'logs').mkdir(mode=0o700)
+
+    def budget(self, extra=0):
+        now = time.monotonic()
+        require(now < self.deadline, 'OriginalWholeBuildDeadline')
+        if extra or now >= self.next_scan:
+            require(tree_size(self.root, allow_disappearing=True) + extra + (16 << 20) <= ROOT_CAP, 'OwnedRoot12GiBCap')
+            require(shutil.disk_usage(self.root).free >= extra + (16 << 20), 'ActualFreeSpaceReserve')
+            self.next_scan = now + 5
+
+    def command(self, label, argv, env):
+        self.budget()
+        out, err = self.root / 'logs' / (label + '.stdout'), self.root / 'logs' / (label + '.stderr')
+        row = {'label': label, 'argv': argv, 'cwd': str(self.source), 'stdout': out.name, 'stderr': err.name}
+        row['build_environment'] = {key: env[key] for key in (
+            'CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL', 'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT')}
+        row['cargo_target_dir'] = env.get('CARGO_TARGET_DIR')
+        self.commands.append(row)
+
+        def check():
+            self.budget()
+            require(all(p.stat().st_size <= LOG_CAP for p in (out, err)), 'CommandLog8MiBCap')
+
+        # run_group inherits actual OS stdout/stderr descriptors. There are no
+        # shell wrappers and no changes to the shared supervisor/default jobs.
+        with out.open('xb') as stdout, err.open('xb') as stderr:
+            saved = [os.dup(1), os.dup(2)]
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os.dup2(stdout.fileno(), 1)
+                os.dup2(stderr.fileno(), 2)
+                wrapper = [sys.executable, '-I', '-S', '-B', str(Path(__file__).resolve()), '--internal-command', *argv]
+                row['supervised_wrapper_argv'] = wrapper
+                code, gone, failure = run_group(wrapper, self.source, env,
+                                                max(1, int(self.deadline - time.monotonic())), check)
+            finally:
+                os.dup2(saved[0], 1)
+                os.dup2(saved[1], 2)
+                for fd in saved:
+                    os.close(fd)
+                stdout.flush()
+                stderr.flush()
+                os.fsync(stdout.fileno())
+                os.fsync(stderr.fileno())
+        row.update(exit_code=code, original_tree_cleanup_verified=gone, supervisor_error=failure)
+        require(code == 0 and gone is True and failure is None, 'CommandOrOriginalTreeClosureFailed:' + label)
+        check()
+        stream, row['stdout_pin'], before, _ = pinned_file(out, LOG_CAP)
+        with stream:
+            raw = stream.read()
+            require(identity(before) == identity(os.fstat(stream.fileno())) == identity(out.lstat()), 'CommandStdoutFDChanged')
+        # Empty stderr is ordinary; stdout-consuming commands are nonempty.
+        row['stderr_bytes'] = err.stat().st_size
+        stream, row['stderr_pin'], _, _ = pinned_file(err, LOG_CAP, allow_empty=True)
+        stream.close()
+        return raw
+
+
+def write_json(path, value):
+    raw = (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + '\n').encode()
+    require(len(raw) <= 4 << 20, 'SmallMetadata4MiBCap')
+    with path.open('xb') as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def run(source, root, expected_head, seconds):
+    require(sys.platform == 'linux' and platform.machine() in ('x86_64', 'AMD64')
+            and re.fullmatch('[a-f0-9]{40}', expected_head)
+            and 1 <= seconds <= 2700, 'LinuxFiniteBuildProfile')
+    source, root = checked(source), checked(root)
+    runner_temp = checked(Path(os.environ['RUNNER_TEMP']))
+    require(root.is_relative_to(runner_temp / 'RoveZero') and not root.is_relative_to(source)
+            and not source.is_relative_to(root) and not root.exists(), 'FreshRunnerTempOwnedRoot')
+    root.parent.mkdir(parents=True, exist_ok=True)
+    root.mkdir(mode=0o700)
+    artifact = root / 'artifact'
+    artifact.mkdir(mode=0o700)
+    private = root / 'private-elf'
+    private.mkdir(mode=0o700)
+    available = sorted(os.sched_getaffinity(0))
+    require(len(available) >= 2, 'TwoAvailableCpusRequired')
+    affinity = available[:2]
+    os.sched_setaffinity(0, affinity)
+    require(sorted(os.sched_getaffinity(0)) == affinity, 'Cpu2AffinityReadback')
+    build = Build(root, source, seconds)
+    def cancelled(_signum, _frame):
+        # The shared supervisor handles KeyboardInterrupt by draining the
+        # reserved original process group before returning an unsuccessful row.
+        raise KeyboardInterrupt('OwnedBuildCancelled')
+    signal.signal(signal.SIGTERM, cancelled)
+    receipt = {'schema': 'rovezero.ci-cpu-validation-bundle/1', 'status': 'FAILED_NOT_ADMITTED',
+               'source_commit': expected_head, 'commands': build.commands,
+               'resource': {'cpu_affinity_actual': affinity, 'build_jobs': 2, 'seconds': seconds,
+                            'child_affinity_guard': 'isolated_wrapper_exact_readback_before_exec',
+                            'managed_bytes_cap': ROOT_CAP, 'artifact_bytes_cap': ARTIFACT_CAP},
+               'neural_execution': False, 'gpu_execution': False, 'training_execution': False,
+               'optimizer_updates': 0, 'mapped_image': None, 'numerical_or_runtime_acceptance': None,
+               'host': {'machine': platform.machine(), 'libc_observed': platform.libc_ver(),
+                        'glibc_compatibility_claim': None},
+               'metadata_getter_scope': 'static_source_inventory_core5_registry_rules_only', 'binaries': {}}
+    receipt['uploaded_command_log_directory'] = 'command-logs'
+    env = {key: os.environ[key] for key in ('PATH', 'HOME', 'RUSTUP_HOME') if key in os.environ}
+    for folder in ('cargo-home', 'tmp'):
+        (root / folder).mkdir(mode=0o700)
+    env.update(LANG='C.UTF-8', LC_ALL='C.UTF-8', CARGO_HOME=str(root / 'cargo-home'),
+               TMPDIR=str(root / 'tmp'), CARGO_BUILD_JOBS='2', CARGO_INCREMENTAL='0',
+               RUSTUP_TOOLCHAIN='1.96.0', RZ_PALS_SOURCE_COMMIT=expected_head,
+               CARGO_TERM_COLOR='never', CARGO_NET_GIT_FETCH_WITH_CLI='false',
+               PYTHONDONTWRITEBYTECODE='1',
+               RZ_CI_CPU_AFFINITY=','.join(str(cpu) for cpu in affinity),
+               GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null')
+    lock = None
+    try:
+        tools = {name: shutil.which(name) for name in ('git', 'cargo', 'rustc')}
+        require(all(tools.values()), 'RequiredBuildTools')
+        actual_head = build.command('git-head', [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip()
+        require(actual_head == expected_head, 'SameCheckoutHead')
+        tree = build.command('git-source-roster', [tools['git'], 'ls-tree', '-r', '-z', '--full-tree', 'HEAD', '--',
+                             *sorted(SINGLETONS), *PREFIXES, CONTROL], env)
+        rows, controls = source_inventory(source, tree)
+        components = component_inventory(strict_json((source / 'crates/rz-experiments/src/pals_source_inventory_v5.json').read_bytes()), rows)
+        lock, lock_pin, lock_meta, _ = pinned_file(source / 'Cargo.lock')
+        toolchain = tomllib.loads((source / 'rust-toolchain.toml').read_text())
+        require(toolchain['toolchain']['channel'] == '1.96.0', 'RegisteredRustToolchain')
+        for name in ('rustc', 'cargo'):
+            raw = build.command(name + '-version', [tools[name], '--version', '--verbose'], env)
+            require((name + ' 1.96.0 ').encode() in raw, 'ActualToolchainVersion')
+        env['CARGO_TARGET_DIR'] = str(root / 'target-native')
+        metadata = strict_json(build.command('cargo-metadata', [tools['cargo'], 'metadata', '--locked', '--no-deps',
+                                                             '--no-default-features', '--format-version', '1'], env))
+        require(metadata['workspace_root'] == str(source), 'ActualCargoWorkspace')
+        manifest = tomllib.loads((source / 'crates/rz-uci/Cargo.toml').read_text())
+        warm, receipt['warm_status'] = warm_spec(manifest, {r['path'] for r in rows})
+        for spec in SPECS + ((warm,) if warm else ()):
+            package, kind, name, features = spec
+            slot = 'target-warm' if spec == warm else ('target-diagnostic' if name == 'pals_continuation_diagnostic' else 'target-native')
+            env['CARGO_TARGET_DIR'] = str(root / slot)
+            argv = [tools['cargo'], 'build', '--locked', '--release', '--no-default-features',
+                    '-p', package, '--features', features, '--' + kind, name, '--message-format=json-render-diagnostics']
+            output, compiled = cargo_artifact(build.command('build-' + name, argv, env), metadata, source,
+                                              Path(env['CARGO_TARGET_DIR']), spec, {r['path'] for r in rows})
+            copy_result = copy_cargo_elf(output, private / name, build.budget)
+            required = next(t.get('required-features', []) for p in metadata['packages'] if p['name'] == package
+                            for t in p['targets'] if t['name'] == name and t['kind'] == [kind])
+            receipt['binaries'][name] = {'pin': copy_result['private_copy'], 'cargo_copy': copy_result,
+                                         'compiler_artifact': compiled, 'requested_features': features.split(','),
+                                         'cargo_metadata_required_features': required,
+                                         'compiled_capability_scope': 'standalone_eval_warm_capture_only_not_engine_native_bootstrap_acceptance' if spec == warm else 'explicit_cargo_target_only_runtime_not_admitted',
+                                         'role': 'optional_warm_validation' if spec == warm else ('diagnostic_auxiliary' if name == 'pals_continuation_diagnostic' else 'native_validation')}
+        if warm:
+            receipt['warm_status'] = 'BUILT_SAME_HEAD_NOT_EXECUTED_OR_NUMERICALLY_ADMITTED'
+        compiled = strict_json(build.command('compiled-source-inventory', [str(private / 'rz-pals-adaptive'), '--source-inventory'], env))
+        require(compiled == {'domain': 'rz-pals-compiled-source-registration-v5/1', 'source_commit': expected_head,
+                             'components': components, 'neural_execution': False, 'training_execution': False}, 'CompiledInventorySourceMismatch')
+        native = strict_json(build.command('native-source-pins', [str(private / 'virtual_review_numeric_capture'), '--source-pins'], env))
+        require(native == {name: components[name] for name in CORE5}, 'NativeCore5SourceMismatch')
+        registry = strict_json(build.command('static-model-registry', [str(private / 'virtual_review_numeric_capture'), '--model-registry'], env))
+        validate_registry(registry)
+        receipt['static_registry_binding'] = {
+            'capture_ELF': receipt['binaries']['virtual_review_numeric_capture']['pin'],
+            'registered_source_core5': native,
+            'registered_semantic_sha256': registry['model_semantic_sha256'],
+            'registered_encoding_sha256': registry['encoding_sha256'],
+            'scope': 'same_actual_ELF_public_registry_methods_and_compiled_source_pins_no_numerical_authority'}
+        rules = strict_json(build.command('rules-descriptor', [str(private / 'pals_rules_descriptor'), '--model-profile=virtual_review_v1'], env))
+        require(rules.get('schema') == 'rovezero.pals-rules-descriptor.v3'
+                and rules.get('rules_input_profile') == 'rz-pals-rules-virtual-review-v1'
+                and rules.get('config', {}).get('profile') == 'virtual_review_v1'
+                and rules.get('learned_input_compatibility') == 'unverified_declaration_only'
+                and rules.get('bounds') == {'max_records': 64, 'max_anchors': 4, 'max_line_plies': 256,
+                                            'line_buckets': [8, 16, 32, 64, 128, 256], 'max_candidates': 256,
+                                            'token_budgets': [128, 256, 512], 'root_anchor': 0}, 'StaticRulesDescriptorProfile')
+        semantic = hashlib.sha256()
+        for field in rules['semantic_fields']:
+            encoded = field.encode('utf-8')
+            semantic.update(len(encoded).to_bytes(8, 'little') + encoded)
+        encoder = hashlib.sha256(b'rz-pals-virtual-rules-encoder-source/1\0')
+        for name, logical in (
+                ('pals_native.rs', 'crates/rz-uci/src/pals_native.rs'),
+                ('pals_native/virtual_encoding.rs', 'crates/rz-uci/src/pals_native/virtual_encoding.rs'),
+                ('pals_native/virtual_selected_input.rs', 'crates/rz-uci/src/pals_native/virtual_selected_input.rs'),
+                ('pals_native/ticketed/virtual_bridge.rs', 'crates/rz-uci/src/pals_native/ticketed/virtual_bridge.rs'),
+                ('rz-eval/pals_model/virtual_review.rs', 'crates/rz-eval/src/pals_model/virtual_review.rs')):
+            stream, _, _, _ = pinned_file(source / logical, 16 << 20)
+            with stream:
+                raw = stream.read()
+            encoded = name.encode()
+            encoder.update(len(encoded).to_bytes(8, 'little') + encoded)
+            encoder.update(len(raw).to_bytes(8, 'little') + raw)
+        require(rules.get('rules_input_semantic_sha256') == semantic.hexdigest()
+                and rules.get('rules_encoder_source_sha256') == encoder.hexdigest(), 'StaticRulesDescriptorSourceFraming')
+        require(source_inventory(source, tree) == (rows, controls)
+                and identity(lock_meta) == identity(os.fstat(lock.fileno())) == identity((source / 'Cargo.lock').lstat())
+                and file_pin(source / 'Cargo.lock') == lock_pin, 'SourceOrLockChangedDuringBuild')
+        require(build.command('git-head-final', [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
+                'HeadChangedDuringBuild')
+        pins = [{key: row[key] for key in ('path', 'bytes', 'sha256')} for row in rows]
+        for name, value in (('source-file-pins.json', {'schema': 'rovezero.ci-native-source-pins/1',
+                                                     'source_commit': expected_head, 'files': pins, 'source_components': components}),
+                            ('git-source-provenance.json', {'schema': 'rovezero.ci-git-source-provenance/1',
+                                                            'source_commit': expected_head, 'tracked_files': rows, 'build_controls': controls}),
+                            ('compiled-source-inventory.json', compiled), ('native-source-pins.json', native),
+                            ('static-model-registry.json', registry), ('rules-descriptor.json', rules)):
+            write_json(artifact / name, value)
+        lock.seek(0)
+        with (artifact / 'Cargo.lock').open('xb') as target:
+            shutil.copyfileobj(lock, target, 65536)
+            target.flush()
+            os.fsync(target.fileno())
+        require(identity(lock_meta) == identity(os.fstat(lock.fileno())) == identity((source / 'Cargo.lock').lstat()),
+                'BundledLockOriginalFDChanged')
+        require(file_pin(artifact / 'Cargo.lock') == lock_pin, 'BundledLockPin')
+        members = sorted(receipt['binaries'])
+        total = sum(receipt['binaries'][name]['pin']['bytes'] for name in members)
+        require(total + (16 << 20) <= ARTIFACT_CAP, 'SelectedELF512MiBBundleBudget')
+        build.budget(total)
+        bundle = artifact / 'native-validation-binaries.tar.gz'
+        with bundle.open('xb') as raw, tarfile.open(fileobj=raw, mode='w:gz', format=tarfile.USTAR_FORMAT) as archive:
+            for name in members:
+                stream, actual, before, _ = pinned_file(private / name, ELF_CAP)
+                with stream:
+                    require(actual == {k: receipt['binaries'][name]['pin'][k] for k in ('bytes', 'sha256')}, 'PreBundlePrivatePin')
+                    info = tarfile.TarInfo('bin/' + name)
+                    info.size, info.mode = actual['bytes'], 0o700
+                    archive.addfile(info, stream)
+                    require(identity(before) == identity(os.fstat(stream.fileno())) == identity((private / name).lstat()), 'BundleMemberFDChanged')
+        receipt.update(status='SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED',
+                       source_files=len(rows), component_count=len(components), source_components=components,
+                       Cargo_lock_before_after=lock_pin, Cargo_lock_same_fd_stable=True,
+                       binary_bundle=file_pin(bundle, ARTIFACT_CAP), metadata={p.name: file_pin(p) for p in artifact.iterdir() if p.name != bundle.name})
+        build.budget()
+    except BaseException as error:
+        receipt['status'] = 'FAILED_NOT_ADMITTED'
+        receipt['error'] = {'type': type(error).__name__, 'message': str(error)[:2048]}
+    finally:
+        if lock is not None:
+            lock.close()
+        # Preserve only bounded closed logs. An unresolved tree never produces
+        # a successful bundle/closure claim; the job's managed root is retained.
+        if all(row.get('original_tree_cleanup_verified') is True for row in build.commands):
+            logs = artifact / 'command-logs'
+            logs.mkdir(mode=0o700)
+            for path in sorted((root / 'logs').iterdir()):
+                try:
+                    stream, _, before, _ = pinned_file(path, LOG_CAP, allow_empty=True)
+                    with stream, (logs / path.name).open('xb') as target:
+                        shutil.copyfileobj(stream, target, 65536)
+                        target.flush()
+                        os.fsync(target.fileno())
+                        require(identity(before) == identity(os.fstat(stream.fileno())) == identity(path.lstat()), 'ClosedCommandLogFDChanged')
+                except (OSError, RuntimeError) as error:
+                    receipt['status'] = 'FAILED_NOT_ADMITTED'
+                    receipt['log_preservation_error'] = {'type': type(error).__name__, 'message': str(error)[:512]}
+                    break
+        write_json(artifact / 'build-receipt.json', receipt)
+        require(tree_size(artifact) <= ARTIFACT_CAP, 'Artifact512MiBCap')
+        if os.environ.get('GITHUB_OUTPUT'):
+            with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+                output.write('artifact_ready=true\n')
+    print(json.dumps({'status': receipt['status'], 'artifact': str(artifact), 'source_commit': expected_head}))
+    return 0 if receipt['status'] == 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED' else 1
+
+
+if __name__ == '__main__':
+    if sys.argv[1:2] == ['--internal-command']:
+        require(sys.platform == 'linux' and bool(sys.argv[2:]), 'LinuxOwnedInternalCommand')
+        sys.exit(stream_child(sys.argv[2:]))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source-root', type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument('--output-root', type=Path, required=True)
+    parser.add_argument('--expected-head', required=True)
+    parser.add_argument('--timeout', type=int, default=2700)
+    args = parser.parse_args()
+    sys.exit(run(args.source_root, args.output_root, args.expected_head, args.timeout))

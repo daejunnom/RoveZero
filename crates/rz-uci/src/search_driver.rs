@@ -21,7 +21,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-mod work;
+pub(crate) mod work;
 use work::{AttemptObservation, ProcessWorkJournal};
 pub use work::{
     CpuWorkTotals, PalsResolverIdentity, PalsSearchPolicyIdentity, PalsWorkTotals,
@@ -105,7 +105,7 @@ impl PalsCheckerRegistration {
         };
         Self::capture_with_resolver(checker, model, policy)
     }
-    fn capture_with_resolver<M: rz_search::pals::engine::RoleModel>(
+    pub(crate) fn capture_with_resolver<M: rz_search::pals::engine::RoleModel>(
         checker: &dyn CpuChecker,
         model: &M,
         policy: ResolverPolicy,

@@ -1,6 +1,8 @@
 //! Atomic, bounded archive storage. Cold records have no growing RAM directory.
 //! Lookup scans only this game's committed segments under an explicit I/O budget.
 use super::*;
+use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions as CapabilityOpenOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -10,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 mod codec;
+mod foreign_permit;
 use codec::{Bundle, LineWire, ObservationWire, RoleRecordWire, StateWire};
+pub use foreign_permit::{ForeignAppendPermit, ForeignGoIssuedProof};
 const MAGIC: &[u8; 8] = b"RZPALS01";
 const HEADER: u64 = 56;
 pub const GAME_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
@@ -153,6 +157,79 @@ impl ArchiveConfig {
         config.global_bytes = global_bytes;
         config.record_bytes = ARCHIVE_RECORD_PAYLOAD_BYTES.min(game_bytes);
         Ok(config)
+    }
+}
+
+/// A startup-owned directory, rather than authority recovered from a pathname.
+/// The path is retained only for boundary checks and public path accounting;
+/// archive I/O stays relative to the held directory. New game owners share this
+/// capability without reopening a replaced ambient parent.
+#[derive(Clone, Debug)]
+pub struct ArchiveRootCapability {
+    root: PathBuf,
+    directory: Arc<Dir>,
+    identity: ArchiveDirectoryIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArchiveDirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+impl ArchiveDirectoryIdentity {
+    fn capture(directory: &Dir) -> Result<Self, StoreError> {
+        // dir_metadata obtains the information from the held directory handle.
+        // cap-fs-ext exposes the Windows by-handle identity as well as Unix IDs.
+        let metadata = directory
+            .dir_metadata()
+            .map_err(|error| io("held archive directory identity", error))?;
+        if !metadata.is_dir() {
+            return Err(StoreError::ArchiveIntegrity(
+                "held archive root is not a directory",
+            ));
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+impl ArchiveRootCapability {
+    pub fn from_directory(root: PathBuf, directory: Dir) -> Result<Self, StoreError> {
+        if !root.is_absolute() {
+            return Err(StoreError::InvalidConditions(
+                "held archive root must be absolute",
+            ));
+        }
+        for ancestor in root.ancestors() {
+            no_link(ancestor)?;
+        }
+        let root =
+            fs::canonicalize(root).map_err(|error| io("held archive root canonicalize", error))?;
+        let identity = ArchiveDirectoryIdentity::capture(&directory)?;
+        let capability = Self {
+            root,
+            directory: Arc::new(directory),
+            identity,
+        };
+        capability.verify_named_root()?;
+        Ok(capability)
+    }
+
+    fn verify_named_root(&self) -> Result<(), StoreError> {
+        for ancestor in self.root.ancestors() {
+            no_link(ancestor)?;
+        }
+        let named = Dir::open_ambient_dir(&self.root, cap_std::ambient_authority())
+            .map_err(|error| io("named archive root ownership", error))?;
+        if ArchiveDirectoryIdentity::capture(&named)? != self.identity
+            || ArchiveDirectoryIdentity::capture(&self.directory)? != self.identity
+        {
+            return Err(StoreError::ArchiveIntegrity(
+                "held archive root was renamed or replaced",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -329,6 +406,11 @@ pub struct EngineArchiveReceipt {
     pub nodes: usize,
     actual_root: Option<(SituationId, StateId, u64)>,
 }
+impl EngineArchiveReceipt {
+    pub(crate) fn actual_root(&self) -> Option<(SituationId, StateId, u64)> {
+        self.actual_root
+    }
+}
 
 mod sealed {
     pub trait Sealed {}
@@ -357,6 +439,9 @@ kind!(SituationId, situations);
 #[derive(Debug)]
 pub(super) struct ArchiveManager {
     config: ArchiveConfig,
+    root_capability: Option<ArchiveRootCapability>,
+    directory_capability: Option<Arc<Dir>>,
+    directory_identity: Option<ArchiveDirectoryIdentity>,
     identity: Arc<()>,
     directory: PathBuf,
     next_generation: u64,
@@ -390,6 +475,7 @@ pub(super) struct ArchiveWriteLedger {
     id: u64,
     maximum: u64,
     root: PathBuf,
+    root_capability: Option<ArchiveRootCapability>,
     runtime_limits: ArchiveRuntimeLimits,
     state: std::sync::Mutex<ArchiveWriteLedgerState>,
 }
@@ -400,7 +486,11 @@ struct ArchiveWriteLedgerState {
     invalid: bool,
 }
 impl ArchiveWriteLedger {
-    fn new(root: PathBuf, runtime_limits: ArchiveRuntimeLimits) -> Result<Arc<Self>, StoreError> {
+    fn new(
+        root: PathBuf,
+        runtime_limits: ArchiveRuntimeLimits,
+        root_capability: Option<ArchiveRootCapability>,
+    ) -> Result<Arc<Self>, StoreError> {
         static LEDGERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = LEDGERS
             .fetch_update(
@@ -413,6 +503,7 @@ impl ArchiveWriteLedger {
             id,
             maximum: runtime_limits.game_bytes_max,
             root,
+            root_capability,
             runtime_limits,
             state: std::sync::Mutex::new(ArchiveWriteLedgerState::default()),
         }))
@@ -544,6 +635,10 @@ pub fn archive_accounting_source_sha256() -> [u8; 32] {
             ("store.rs", include_str!("../store.rs")),
             ("store/archive.rs", include_str!("archive.rs")),
             ("store/hot.rs", include_str!("hot.rs")),
+            (
+                "store/archive/foreign_permit.rs",
+                include_str!("archive/foreign_permit.rs"),
+            ),
         ] {
             digest.update((name.len() as u64).to_le_bytes());
             digest.update(name.as_bytes());
@@ -574,8 +669,168 @@ fn no_link(path: &Path) -> Result<(), StoreError> {
     }
     Ok(())
 }
+
+// A streaming facade keeps legacy std::fs behaviour while the opted-in owner
+// never turns a display path back into I/O authority. It does not build a RAM
+// directory proportional to archived games or segments.
+enum ArchiveEntries {
+    Ambient(fs::ReadDir),
+    Held {
+        entries: cap_std::fs::ReadDir,
+        parent: Arc<Dir>,
+        display: PathBuf,
+    },
+}
+enum ArchiveEntry {
+    Ambient(fs::DirEntry),
+    Held {
+        entry: cap_std::fs::DirEntry,
+        parent: Arc<Dir>,
+        display: PathBuf,
+    },
+}
+struct ArchiveEntryMetadata {
+    bytes: u64,
+    file: bool,
+}
+impl ArchiveEntryMetadata {
+    fn len(&self) -> u64 {
+        self.bytes
+    }
+    fn is_file(&self) -> bool {
+        self.file
+    }
+}
+struct ArchiveEntryType {
+    file: bool,
+    directory: bool,
+}
+impl ArchiveEntryType {
+    fn is_file(&self) -> bool {
+        self.file
+    }
+    fn is_dir(&self) -> bool {
+        self.directory
+    }
+}
+impl ArchiveEntries {
+    fn held(parent: Arc<Dir>, display: PathBuf) -> std::io::Result<Self> {
+        Ok(Self::Held {
+            entries: parent.entries()?,
+            parent,
+            display,
+        })
+    }
+}
+impl Iterator for ArchiveEntries {
+    type Item = std::io::Result<ArchiveEntry>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Ambient(entries) => entries.next().map(|item| item.map(ArchiveEntry::Ambient)),
+            Self::Held {
+                entries,
+                parent,
+                display,
+            } => entries.next().map(|item| {
+                item.map(|entry| {
+                    let path = display.join(entry.file_name());
+                    ArchiveEntry::Held {
+                        entry,
+                        parent: Arc::clone(parent),
+                        display: path,
+                    }
+                })
+            }),
+        }
+    }
+}
+impl ArchiveEntry {
+    fn file_name(&self) -> std::ffi::OsString {
+        match self {
+            Self::Ambient(entry) => entry.file_name(),
+            Self::Held { entry, .. } => entry.file_name(),
+        }
+    }
+    fn path(&self) -> PathBuf {
+        match self {
+            Self::Ambient(entry) => entry.path(),
+            Self::Held { display, .. } => display.clone(),
+        }
+    }
+    fn file_type(&self) -> std::io::Result<ArchiveEntryType> {
+        match self {
+            Self::Ambient(entry) => entry.file_type().map(|kind| ArchiveEntryType {
+                file: kind.is_file(),
+                directory: kind.is_dir(),
+            }),
+            Self::Held { entry, .. } => entry.file_type().map(|kind| ArchiveEntryType {
+                file: kind.is_file(),
+                directory: kind.is_dir(),
+            }),
+        }
+    }
+    fn metadata(&self) -> std::io::Result<ArchiveEntryMetadata> {
+        match self {
+            Self::Ambient(entry) => entry.metadata().map(|metadata| ArchiveEntryMetadata {
+                bytes: metadata.len(),
+                file: metadata.is_file(),
+            }),
+            Self::Held { entry, .. } => entry.metadata().map(|metadata| ArchiveEntryMetadata {
+                bytes: metadata.len(),
+                file: metadata.is_file(),
+            }),
+        }
+    }
+    fn no_link(&self) -> Result<(), StoreError> {
+        match self {
+            Self::Ambient(entry) => no_link(&entry.path()),
+            Self::Held { entry, parent, .. } => {
+                let metadata = parent
+                    .symlink_metadata(entry.file_name())
+                    .map_err(|e| io("held archive entry metadata", e))?;
+                if metadata.is_symlink() {
+                    return Err(StoreError::ArchiveIntegrity("archive symbolic link"));
+                }
+                #[cfg(windows)]
+                {
+                    use cap_std::fs::MetadataExt;
+                    if metadata.file_attributes() & 0x400 != 0 {
+                        return Err(StoreError::ArchiveIntegrity("archive reparse point"));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+    fn entries(&self) -> std::io::Result<ArchiveEntries> {
+        match self {
+            Self::Ambient(entry) => fs::read_dir(entry.path()).map(ArchiveEntries::Ambient),
+            Self::Held {
+                entry,
+                parent,
+                display,
+            } => {
+                let directory = parent.open_dir_nofollow(entry.file_name())?;
+                ArchiveEntries::held(Arc::new(directory), display.clone())
+            }
+        }
+    }
+}
 impl ArchiveManager {
     fn open(config: ArchiveConfig) -> Result<Self, StoreError> {
+        Self::open_inner(config, None)
+    }
+    fn open_with_capability(
+        config: ArchiveConfig,
+        capability: ArchiveRootCapability,
+    ) -> Result<Self, StoreError> {
+        capability.verify_named_root()?;
+        Self::open_inner(config, Some(capability))
+    }
+    fn open_inner(
+        config: ArchiveConfig,
+        capability: Option<ArchiveRootCapability>,
+    ) -> Result<Self, StoreError> {
         if !config.root.is_absolute()
             || !config.repository_root.is_absolute()
             || config.game_bytes == 0
@@ -607,7 +862,18 @@ impl ArchiveManager {
                 "archive must be outside repository",
             ));
         }
-        fs::create_dir_all(&config.root).map_err(|e| io("archive root create", e))?;
+        if let Some(capability) = &capability {
+            capability.verify_named_root()?;
+            if fs::canonicalize(&config.root).map_err(|e| io("archive root canonicalize", e))?
+                != capability.root
+            {
+                return Err(StoreError::ArchiveIntegrity(
+                    "archive configuration differs from held root",
+                ));
+            }
+        } else {
+            fs::create_dir_all(&config.root).map_err(|e| io("archive root create", e))?;
+        }
         no_link(&config.root)?;
         let root =
             fs::canonicalize(&config.root).map_err(|e| io("archive root canonicalize", e))?;
@@ -628,9 +894,25 @@ impl ArchiveManager {
                 |value| value.checked_add(1),
             )
             .map_err(|_| StoreError::RevisionExhausted)?;
-        let directory = root.join(format!("game-{now}-{}-{serial}", std::process::id()));
-        fs::create_dir(&directory).map_err(|e| io("archive game create", e))?;
-        Ok(Self {
+        let game_name = format!("game-{now}-{}-{serial}", std::process::id());
+        let directory = root.join(&game_name);
+        let (directory_capability, directory_identity) = if let Some(capability) = &capability {
+            capability.verify_named_root()?;
+            capability
+                .directory
+                .create_dir(&game_name)
+                .map_err(|e| io("held archive game create", e))?;
+            let game = capability
+                .directory
+                .open_dir_nofollow(&game_name)
+                .map_err(|e| io("held archive game open", e))?;
+            let identity = ArchiveDirectoryIdentity::capture(&game)?;
+            (Some(Arc::new(game)), Some(identity))
+        } else {
+            fs::create_dir(&directory).map_err(|e| io("archive game create", e))?;
+            (None, None)
+        };
+        let manager = Self {
             telemetry: std::sync::Mutex::new(ArchiveOwnerSnapshot {
                 measurement_contract: ARCHIVE_MEASUREMENT_CONTRACT,
                 owner_method: "archive_actual_owner_events_v4",
@@ -662,6 +944,9 @@ impl ArchiveManager {
                 repository_root: repository,
                 ..config
             },
+            root_capability: capability,
+            directory_capability,
+            directory_identity,
             identity: Arc::new(()),
             directory,
             next_generation: 0,
@@ -679,7 +964,135 @@ impl ArchiveManager {
             pending_cleanup: false,
             #[cfg(test)]
             test_commit_fault: None,
-        })
+        };
+        // An ambient parent replacement during owner opening cannot silently
+        // publish an owner for the replacement. Any created game remains in the
+        // held directory as failure evidence; it is never redirected or erased.
+        manager.verify_directory_boundary()?;
+        Ok(manager)
+    }
+    fn verify_directory_boundary(&self) -> Result<(), StoreError> {
+        let Some(root) = &self.root_capability else {
+            return Ok(());
+        };
+        root.verify_named_root()?;
+        let name = self
+            .directory
+            .file_name()
+            .ok_or(StoreError::ArchiveIntegrity("archive game name"))?;
+        let named = root
+            .directory
+            .open_dir_nofollow(name)
+            .map_err(|e| io("named archive game ownership", e))?;
+        let held = self
+            .directory_capability
+            .as_ref()
+            .ok_or(StoreError::ArchiveIntegrity(
+                "held archive game capability missing",
+            ))?;
+        let expected = self.directory_identity.ok_or(StoreError::ArchiveIntegrity(
+            "held archive game identity missing",
+        ))?;
+        if ArchiveDirectoryIdentity::capture(&named)? != expected
+            || ArchiveDirectoryIdentity::capture(held)? != expected
+        {
+            return Err(StoreError::ArchiveIntegrity(
+                "held archive game was renamed or replaced",
+            ));
+        }
+        Ok(())
+    }
+    fn root_entries(&self) -> std::io::Result<ArchiveEntries> {
+        match &self.root_capability {
+            Some(root) => {
+                ArchiveEntries::held(Arc::clone(&root.directory), self.config.root.clone())
+            }
+            None => fs::read_dir(&self.config.root).map(ArchiveEntries::Ambient),
+        }
+    }
+    fn game_entries(&self) -> std::io::Result<ArchiveEntries> {
+        match &self.directory_capability {
+            Some(directory) => ArchiveEntries::held(Arc::clone(directory), self.directory.clone()),
+            None => fs::read_dir(&self.directory).map(ArchiveEntries::Ambient),
+        }
+    }
+    fn game_file(&self, name: &std::ffi::OsStr, create_new: bool) -> std::io::Result<File> {
+        match &self.directory_capability {
+            Some(directory) => {
+                let mut options = CapabilityOpenOptions::new();
+                options.follow(FollowSymlinks::No);
+                #[cfg(target_os = "linux")]
+                {
+                    use cap_std::fs::OpenOptionsExt;
+                    // Check the actual descriptor type after opening without
+                    // blocking forever on a substituted FIFO/device pathname.
+                    options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+                }
+                if create_new {
+                    options.write(true).create_new(true);
+                } else {
+                    options.read(true);
+                }
+                directory
+                    .open_with(Path::new(name), &options)
+                    .map(|file| file.into_std())
+            }
+            None if create_new => OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(self.directory.join(name)),
+            None => File::open(self.directory.join(name)),
+        }
+    }
+    fn game_file_size(&self, name: &std::ffi::OsStr) -> Result<u64, StoreError> {
+        match &self.directory_capability {
+            Some(directory) => directory
+                .symlink_metadata(Path::new(name))
+                .map_err(|e| io("held archive extent", e))
+                .and_then(|metadata| {
+                    if !metadata.is_file() || metadata.is_symlink() {
+                        return Err(StoreError::ArchiveIntegrity("archive record type"));
+                    }
+                    Ok(metadata.len())
+                }),
+            None => fs::metadata(self.directory.join(name))
+                .map(|metadata| metadata.len())
+                .map_err(|e| io("engine archive committed size", e)),
+        }
+    }
+    fn rename_game_file(
+        &self,
+        source: &std::ffi::OsStr,
+        target: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        match &self.directory_capability {
+            Some(directory) => directory.rename(Path::new(source), directory, Path::new(target)),
+            None => fs::rename(self.directory.join(source), self.directory.join(target)),
+        }
+    }
+    fn remove_game_file(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        match &self.directory_capability {
+            Some(directory) => directory.remove_file(Path::new(name)),
+            None => fs::remove_file(self.directory.join(name)),
+        }
+    }
+    #[cfg(unix)]
+    fn sync_game_directory(&self) -> std::io::Result<()> {
+        match &self.directory_capability {
+            Some(directory) => {
+                let mut options = CapabilityOpenOptions::new();
+                options.read(true).follow(FollowSymlinks::No);
+                #[cfg(target_os = "linux")]
+                {
+                    use cap_std::fs::OpenOptionsExt;
+                    options.custom_flags(
+                        nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK,
+                    );
+                }
+                directory.open_with(".", &options)?.into_std().sync_all()
+            }
+            None => File::open(&self.directory)?.sync_all(),
+        }
     }
     fn note(&self, event: impl FnOnce(&mut ArchiveOwnerSnapshot)) {
         let mut meter = self.telemetry.lock().unwrap_or_else(|poison| {
@@ -846,15 +1259,17 @@ impl ArchiveManager {
     }
     fn usage_inner(&self, budget: ArchiveIoBudget) -> Result<(u64, u64), StoreError> {
         budget.check()?;
+        self.verify_directory_boundary()?;
         let mut total = 0u64;
         let mut game = 0u64;
-        for entry in
-            fs::read_dir(&self.config.root).map_err(|e| io("global archive directory", e))?
+        for entry in self
+            .root_entries()
+            .map_err(|e| io("global archive directory", e))?
         {
             budget.check()?;
             let entry = entry.map_err(|e| io("global archive entry", e))?;
             let path = entry.path();
-            no_link(&path)?;
+            entry.no_link()?;
             if entry.file_name() == ".quota.lock" {
                 if !entry
                     .file_type()
@@ -875,10 +1290,13 @@ impl ArchiveManager {
                     "archive root is not exclusively managed",
                 ));
             }
-            for record in fs::read_dir(&path).map_err(|e| io("game archive directory", e))? {
+            for record in entry
+                .entries()
+                .map_err(|e| io("game archive directory", e))?
+            {
                 budget.check()?;
                 let record = record.map_err(|e| io("game archive entry", e))?;
-                no_link(&record.path())?;
+                record.no_link()?;
                 let metadata = record.metadata().map_err(|e| io("archive size", e))?;
                 if !metadata.is_file() {
                     return Err(StoreError::ArchiveIntegrity("archive record type"));
@@ -894,6 +1312,7 @@ impl ArchiveManager {
             }
         }
         budget.check()?;
+        self.verify_directory_boundary()?;
         Ok((game, total))
     }
     fn commit(
@@ -922,11 +1341,12 @@ impl ArchiveManager {
         before: ArchiveStats,
     ) -> Result<ArchiveReceipt, StoreError> {
         budget.check()?;
+        self.verify_directory_boundary()?;
         let next = self
             .next_generation
             .checked_add(1)
             .ok_or(StoreError::RevisionExhausted)?;
-        let lock = QuotaLock::take(&self.config.root)?;
+        let lock = QuotaLock::take(&self.config.root, self.root_capability.as_ref())?;
         let (game, total) = self.usage(*budget)?;
         let remaining = self
             .config
@@ -1025,10 +1445,8 @@ impl ArchiveManager {
         });
         let temporary = self.directory.join(format!("seg-{generation:020}.pending"));
         let final_path = self.path(generation);
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
+        let file = self
+            .game_file(temporary.file_name().expect("private segment name"), true)
             .map_err(|e| io("archive temporary create", e));
         let mut file = match file {
             Ok(file) => Some(file),
@@ -1074,7 +1492,12 @@ impl ArchiveManager {
                 .map_err(|e| io("archive write and sync", e))?;
             budget.check()?;
             drop(file.take());
-            fs::rename(&temporary, &final_path).map_err(|e| io("archive atomic commit", e))?;
+            self.verify_directory_boundary()?;
+            self.rename_game_file(
+                temporary.file_name().expect("private segment name"),
+                final_path.file_name().expect("private segment name"),
+            )
+            .map_err(|e| io("archive atomic commit", e))?;
             renamed = true;
             self.note(|meter| {
                 add_counter(&mut meter.committed_chunks, 1, &mut meter.complete);
@@ -1083,8 +1506,7 @@ impl ArchiveManager {
                 meter.global_scan_after_last_commit = false;
             });
             #[cfg(unix)]
-            File::open(&self.directory)
-                .and_then(|f| f.sync_all())
+            self.sync_game_directory()
                 .map_err(|e| io("archive directory sync", e))?;
             self.read(generation, Some(checksum), budget)?;
             self.note(|meter| {
@@ -1125,7 +1547,8 @@ impl ArchiveManager {
         } else if renamed {
             Some(written)
         } else {
-            fs::metadata(&temporary).ok().map(|metadata| metadata.len())
+            self.game_file_size(temporary.file_name().expect("private segment name"))
+                .ok()
         };
         drop(file);
         // Drop releases only unwritten reserved bytes; CountedWriter already
@@ -1161,8 +1584,14 @@ impl ArchiveManager {
         if result.is_ok() {
             self.pending_cleanup = false;
         }
-        if self.runtime_limits.is_none() && result.is_err() && temporary.exists() {
-            fs::remove_file(&temporary).map_err(|e| io("archive temporary cleanup", e))?;
+        if self.runtime_limits.is_none()
+            && result.is_err()
+            && self
+                .game_file_size(temporary.file_name().expect("private segment name"))
+                .is_ok()
+        {
+            self.remove_game_file(temporary.file_name().expect("private segment name"))
+                .map_err(|e| io("archive temporary cleanup", e))?;
             self.note(|meter| {
                 meter.pending_commit_bytes = Some(0);
                 meter.pending_files_retained = false;
@@ -1199,13 +1628,19 @@ impl ArchiveManager {
         budget: &mut ArchiveIoBudget,
     ) -> Result<(Bundle, [u8; 32]), StoreError> {
         budget.check()?;
+        self.verify_directory_boundary()?;
         let path = self.path(generation);
-        no_link(&path)?;
-        let mut file = File::open(&path).map_err(|e| io("archive open", e))?;
-        let size = file
-            .metadata()
-            .map_err(|e| io("archive file size", e))?
-            .len();
+        if self.directory_capability.is_none() {
+            no_link(&path)?;
+        }
+        let mut file = self
+            .game_file(path.file_name().expect("private segment name"), false)
+            .map_err(|e| io("archive open", e))?;
+        let metadata = file.metadata().map_err(|e| io("archive file size", e))?;
+        if self.directory_capability.is_some() && !metadata.is_file() {
+            return Err(StoreError::ArchiveIntegrity("archive record type"));
+        }
+        let size = metadata.len();
         if size < HEADER || size > self.config.record_bytes.saturating_add(HEADER) {
             return Err(StoreError::ArchiveIntegrity("archive file bounds"));
         }
@@ -1253,6 +1688,7 @@ impl ArchiveManager {
         {
             return Err(StoreError::ArchiveIntegrity("archive schema or generation"));
         }
+        self.verify_directory_boundary()?;
         Ok((bundle, checksum))
     }
 }
@@ -1277,21 +1713,77 @@ impl<W: Write> Write for CountedWriter<'_, W> {
         self.inner.flush()
     }
 }
-struct QuotaLock(PathBuf);
+enum QuotaLock {
+    Ambient(PathBuf),
+    Held { root: Arc<Dir>, file: File },
+}
 impl QuotaLock {
-    fn take(root: &Path) -> Result<Self, StoreError> {
+    fn take(root: &Path, capability: Option<&ArchiveRootCapability>) -> Result<Self, StoreError> {
+        if let Some(capability) = capability {
+            let mut options = CapabilityOpenOptions::new();
+            options
+                .write(true)
+                .create_new(true)
+                .follow(FollowSymlinks::No);
+            let file = capability
+                .directory
+                .open_with(".quota.lock", &options)
+                .map_err(|e| io("held archive quota lock", e))?
+                .into_std();
+            return Ok(Self::Held {
+                root: Arc::clone(&capability.directory),
+                file,
+            });
+        }
         let path = root.join(".quota.lock");
         OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .map_err(|e| io("archive quota lock", e))?;
-        Ok(Self(path))
+        Ok(Self::Ambient(path))
     }
 }
 impl Drop for QuotaLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        match self {
+            Self::Ambient(path) => {
+                let _ = fs::remove_file(path);
+            }
+            Self::Held { root, file } => {
+                // Never unlink a substituted lock or redirect cleanup through a
+                // renamed ambient parent. This is not an atomic compare-unlink
+                // guarantee against another writer mutating the private root.
+                let owned = cap_std::fs::Metadata::from_file(file);
+                let mut options = CapabilityOpenOptions::new();
+                options.read(true).follow(FollowSymlinks::No);
+                #[cfg(target_os = "linux")]
+                {
+                    use cap_std::fs::OpenOptionsExt;
+                    options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+                }
+                // Capture named metadata from a real open file, not pathname
+                // metadata lacking the Windows by-handle file identifier.
+                let named_file = root.open_with(".quota.lock", &options);
+                let named = named_file
+                    .as_ref()
+                    .ok()
+                    .and_then(|file| file.metadata().ok());
+                if owned
+                    .as_ref()
+                    .ok()
+                    .zip(named.as_ref())
+                    .is_some_and(|(owned, named)| {
+                        named.is_file()
+                            && !named.is_symlink()
+                            && owned.dev() == named.dev()
+                            && owned.ino() == named.ino()
+                    })
+                {
+                    let _ = root.remove_file(".quota.lock");
+                }
+            }
+        }
     }
 }
 struct BoundedBuffer {
@@ -1408,6 +1900,7 @@ impl PalsStores {
         manager.note(|_| {}); // Accepted explicit read scope; never getter work.
         let result = operation(&mut budget).and_then(|value| {
             budget.check()?;
+            manager.verify_directory_boundary()?;
             Ok(value)
         });
         let bytes = initial - budget.max_bytes;
@@ -1418,6 +1911,22 @@ impl PalsStores {
         result
     }
     pub fn enable_archive(&mut self, config: ArchiveConfig) -> Result<(), StoreError> {
+        self.enable_archive_inner(config, None)
+    }
+    /// Opt-in startup authority. Legacy path-based callers retain their format
+    /// and behaviour; this owner additionally retains the caller's directory.
+    pub fn enable_archive_with_capability(
+        &mut self,
+        config: ArchiveConfig,
+        capability: ArchiveRootCapability,
+    ) -> Result<(), StoreError> {
+        self.enable_archive_inner(config, Some(capability))
+    }
+    fn enable_archive_inner(
+        &mut self,
+        config: ArchiveConfig,
+        capability: Option<ArchiveRootCapability>,
+    ) -> Result<(), StoreError> {
         if self.archive.is_some() {
             return Err(StoreError::InvalidConditions("archive already enabled"));
         }
@@ -1426,7 +1935,10 @@ impl PalsStores {
                 "archive session write authority requires a replacement store",
             ));
         }
-        let mut manager = ArchiveManager::open(config)?;
+        let mut manager = match capability {
+            Some(capability) => ArchiveManager::open_with_capability(config, capability)?,
+            None => ArchiveManager::open(config)?,
+        };
         manager.state_owner = Arc::downgrade(&self.states.identity);
         manager.line_owner = Arc::downgrade(&self.lines.identity);
         self.archive = Some(manager);
@@ -1489,7 +2001,11 @@ impl PalsStores {
         {
             return Err(StoreError::InvalidConditions("archive runtime selectors"));
         }
-        let ledger = ArchiveWriteLedger::new(manager.config.root.clone(), limits)?;
+        let ledger = ArchiveWriteLedger::new(
+            manager.config.root.clone(),
+            limits,
+            manager.root_capability.clone(),
+        )?;
         manager.config.game_bytes = limits.game_bytes_max;
         manager.config.global_bytes = limits.global_bytes_max;
         manager.config.record_bytes = limits.record_payload_bytes_max;
@@ -1538,7 +2054,19 @@ impl PalsStores {
                 .ok_or(StoreError::InvalidConditions(
                     "archive write budget selectors mismatch",
                 ))?;
-        if source.root != manager.config.root || source.runtime_limits != limits {
+        if let Some(capability) = &source.root_capability {
+            capability.verify_named_root()?;
+        }
+        manager.verify_directory_boundary()?;
+        let same_capability = match (&source.root_capability, &manager.root_capability) {
+            (None, None) => true,
+            (Some(source), Some(target)) => {
+                source.root == target.root && source.identity == target.identity
+            }
+            _ => false,
+        };
+        if source.root != manager.config.root || source.runtime_limits != limits || !same_capability
+        {
             return Err(StoreError::InvalidConditions(
                 "archive write budget domain mismatch",
             ));
@@ -1594,6 +2122,7 @@ impl PalsStores {
         };
         let snapshot = manager.snapshot();
         if manager.allocation_active
+            || self.review_pin_count()? != 0
             || manager.auto_budget.is_some()
             || !manager.load_pins.is_empty()
             || manager.pending_cleanup
@@ -1637,7 +2166,7 @@ impl PalsStores {
         }
         result
     }
-    fn reject_archive_allocation_scope(&self) -> Result<(), StoreError> {
+    pub(super) fn reject_archive_allocation_scope(&self) -> Result<(), StoreError> {
         if self
             .archive
             .as_ref()
@@ -1884,7 +2413,9 @@ impl PalsStores {
     ) -> Result<(), StoreError> {
         let manager = self.archive.as_ref().ok_or(StoreError::ArchiveDisabled)?;
         manager.verify_hot_owner(self)?;
-        for entry in fs::read_dir(&manager.directory)
+        manager.verify_directory_boundary()?;
+        for entry in manager
+            .game_entries()
             .map_err(|e| io("foreign archive uniqueness directory", e))?
         {
             budget.check()?;
@@ -2007,6 +2538,7 @@ impl PalsStores {
     }
     fn protected_pins(&self, manager: &ArchiveManager) -> Result<StorePins, StoreError> {
         let mut pins = manager.pins.clone();
+        pins.extend(&self.review_pin_union()?);
         pins.situations.extend(self.root);
         for loaded in manager.load_pins.values() {
             pins.extend(loaded);
@@ -2230,6 +2762,9 @@ impl PalsStores {
             self.tasks
                 .latest
                 .retain(|_, id| !selection.executions.contains(id));
+            self.tasks
+                .owned_instances
+                .retain(|id| !selection.executions.contains(id));
             self.states.snapshots.compact();
             self.states.index.shrink_to_fit();
             self.lines.chunks.compact();
@@ -2423,8 +2958,10 @@ impl PalsStores {
         self.reject_archive_allocation_scope()?;
         budget.check()?;
         let manager = self.archive.as_ref().ok_or(StoreError::ArchiveDisabled)?;
-        for entry in
-            fs::read_dir(&manager.directory).map_err(|e| io("archive lookup directory", e))?
+        manager.verify_directory_boundary()?;
+        for entry in manager
+            .game_entries()
+            .map_err(|e| io("archive lookup directory", e))?
         {
             budget.check()?;
             let entry = entry.map_err(|e| io("archive lookup entry", e))?;
@@ -2486,8 +3023,10 @@ impl PalsStores {
         if state.0 >= self.states.snapshots.next_id() {
             return Err(StoreError::InvalidHandle("cold state serial"));
         }
-        for entry in
-            fs::read_dir(&manager.directory).map_err(|e| io("archive state lookup directory", e))?
+        manager.verify_directory_boundary()?;
+        for entry in manager
+            .game_entries()
+            .map_err(|e| io("archive state lookup directory", e))?
         {
             budget.check()?;
             let entry = entry.map_err(|e| io("archive state lookup entry", e))?;
@@ -2571,7 +3110,9 @@ impl PalsStores {
         let initial = budget.max_bytes;
         let manager = self.archive.as_ref().ok_or(StoreError::ArchiveDisabled)?;
         let mut newest = None;
-        for entry in fs::read_dir(&manager.directory)
+        manager.verify_directory_boundary()?;
+        for entry in manager
+            .game_entries()
             .map_err(|e| io("engine archive lookup directory", e))?
         {
             budget.check()?;
@@ -2612,9 +3153,12 @@ impl PalsStores {
                         checksum,
                         before: self.hot_stats(),
                         after: self.hot_stats(),
-                        committed_bytes: fs::metadata(manager.path(generation))
-                            .map_err(|e| io("engine archive committed size", e))?
-                            .len(),
+                        committed_bytes: manager.game_file_size(
+                            manager
+                                .path(generation)
+                                .file_name()
+                                .expect("private segment name"),
+                        )?,
                         io_bytes: 0,
                     },
                 });

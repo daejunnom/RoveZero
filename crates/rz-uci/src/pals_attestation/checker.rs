@@ -197,7 +197,7 @@ fn attempt(observed: &CheckerAttempt) -> Result<Value, SearchSessionFailure> {
                 "reported_depth": report.reported_depth,
                 "seldepth": report.seldepth,
                 "root_restricted": report.root_restricted,
-                "completion": match report.completion { ExternalCompletion::Pending => "pending", ExternalCompletion::BestMove => "best_move", ExternalCompletion::StoppedDeadline => "stopped_deadline", ExternalCompletion::StoppedCanceled => "stopped_canceled" },
+                "completion": match report.completion { ExternalCompletion::Pending => "pending", ExternalCompletion::BestMove => "best_move", ExternalCompletion::StoppedDeadline => "stopped_deadline", ExternalCompletion::StoppedCanceled => "stopped_canceled", ExternalCompletion::StoppedYield => "stopped_yield" },
                 "nodes": report.work.nodes,
                 "qnodes": report.work.qnodes,
                 "tt_hits": report.work.tt_hits,

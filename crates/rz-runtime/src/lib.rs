@@ -4,12 +4,11 @@
 //! construction. This crate owns only admission, batching and execution lifetime.
 #![forbid(unsafe_code)]
 
+pub mod adaptive;
 mod boundary;
-#[cfg(feature = "experimental-notify")]
 mod notification;
 mod observation;
 mod scheduler;
-#[cfg(feature = "experimental-notify")]
 pub use notification::CompletionSignal;
 
 #[cfg(feature = "contracts")]

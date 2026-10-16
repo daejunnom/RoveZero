@@ -19,6 +19,26 @@ use std::collections::BTreeSet;
 use std::time::Instant;
 
 pub const PALS_RULES_ENCODING: &str = "rz-pals-rules-fields-v1";
+#[path = "pals_native/selected_view.rs"]
+mod selected_view;
+use selected_view::{selected_records, validate_selected_query};
+#[cfg(feature = "search-work-receipts")]
+#[path = "pals_native/legacy_descriptor.rs"]
+mod legacy_descriptor;
+#[cfg(test)]
+#[path = "pals_native/selected_view_tests.rs"]
+mod selected_view_tests;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub mod startup_legacy;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[path = "pals_native/startup_virtual.rs"]
+pub mod startup_virtual;
+#[path = "pals_native/virtual_encoding.rs"]
+pub mod virtual_encoding;
+#[cfg(feature = "search-work-receipts")]
+pub use legacy_descriptor::{
+    LegacyRulesDescriptorSummary, validate_pals_legacy_rules_descriptor_bytes,
+};
 pub const PALS_RULES_FULL_LINE_ENCODING: &str = "rz-pals-rules-full-line-v2";
 pub const PALS_RULES_BASE_SEMANTICS: &str = "board:a1-h8;empty=0;white_PNBRQK=1..6;black_PNBRQK=7..12;history:newest_first_exact_fen;records:latest_kinds_and_author_critical_pinned;candidate_order:Rules;divergence_query:fields_1,3,4,8..14=0";
 const MAX_HISTORY: usize = 4096;
@@ -102,6 +122,9 @@ pub const PALS_FULL_LINE_FEATURES: [&str; 9] = [
     "full_line.supersedes_local_index",
 ];
 pub fn pals_rules_profile_for_config(config: &PalsModelConfig) -> &'static str {
+    if config.profile.uses_virtual_review() {
+        return virtual_encoding::PALS_VIRTUAL_RULES_ENCODING;
+    }
     if config.profile.uses_full_line() {
         PALS_RULES_FULL_LINE_ENCODING
     } else {
@@ -126,6 +149,11 @@ pub fn pals_query_features_for_config(config: &PalsModelConfig) -> [&'static str
 pub fn pals_rules_semantic_fields_for_config(
     config: &PalsModelConfig,
 ) -> impl Iterator<Item = &'static str> {
+    if config.profile.uses_virtual_review() {
+        return virtual_encoding::pals_virtual_rules_semantic_fields()
+            .collect::<Vec<_>>()
+            .into_iter();
+    }
     let mut fields = vec![
         pals_rules_profile_for_config(config),
         PALS_RULES_BASE_SEMANTICS,
@@ -183,6 +211,13 @@ pub fn pals_fresh_encoding_semantic_digest_for_config(config: &PalsModelConfig) 
 }
 pub fn pals_native_source_digest() -> [u8; 32] {
     Sha256::digest(include_bytes!("pals_native.rs")).into()
+}
+pub fn pals_native_selected_review_source_digest() -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"rz-pals-native-selected-view/1");
+    hash.update(pals_native_source_digest());
+    hash.update(include_bytes!("pals_native/selected_view.rs"));
+    hash.finalize().into()
 }
 #[cfg(feature = "onnx-cpu")]
 pub fn pals_native_private_warm_source_digest() -> [u8; 32] {
@@ -522,6 +557,30 @@ pub fn prepare_role_input_for_config(
     model_epoch: [u8; 32],
     config: &PalsModelConfig,
 ) -> Result<PalsModelInput, RoleError> {
+    prepare_role_input_with_view(query, kind, model_epoch, config, None)
+}
+pub fn prepare_selected_role_input_for_config(
+    query: &RoleQuery<'_>,
+    kind: NativeQueryKind,
+    model_epoch: [u8; 32],
+    config: &PalsModelConfig,
+    view: &rz_search::pals::review_context::ReviewView,
+) -> Result<PalsModelInput, RoleError> {
+    if view.query().purpose == rz_search::pals::engine::RoleQueryPurpose::TaskPolicy {
+        return Err(RoleError::Unsupported(
+            "TaskPolicy requires the explicit V3 collection adapter",
+        ));
+    }
+    validate_selected_query(view, query)?;
+    prepare_role_input_with_view(query, kind, model_epoch, config, Some(view))
+}
+fn prepare_role_input_with_view(
+    query: &RoleQuery<'_>,
+    kind: NativeQueryKind,
+    model_epoch: [u8; 32],
+    config: &PalsModelConfig,
+    view: Option<&rz_search::pals::review_context::ReviewView>,
+) -> Result<PalsModelInput, RoleError> {
     query.check_control()?;
     if kind == NativeQueryKind::Divergence
         || query.prefix.len() > 256
@@ -536,8 +595,10 @@ pub fn prepare_role_input_for_config(
         ));
     }
     let (board, metadata) = board_and_metadata(query.position)?;
-    let (records, required_critical_records, full_line_records) =
-        records(query.records, query.revision, config)?;
+    let (records, required_critical_records, full_line_records) = match view {
+        Some(view) => selected_records(view, query.revision, config)?,
+        None => records(query.records, query.revision, config)?,
+    };
     let candidates = query.legal.iter().copied().map(candidate).collect();
     let mut features = [0.0; 16];
     features[0] = match kind {
@@ -621,6 +682,30 @@ pub fn prepare_divergence_input_for_config(
     model_epoch: [u8; 32],
     config: &PalsModelConfig,
 ) -> Result<PalsModelInput, RoleError> {
+    prepare_divergence_input_with_view(query, model_epoch, config, None)
+}
+pub fn prepare_selected_divergence_input_for_config(
+    query: &DivergenceQuery<'_>,
+    model_epoch: [u8; 32],
+    config: &PalsModelConfig,
+    view: &rz_search::pals::review_context::ReviewView,
+) -> Result<PalsModelInput, RoleError> {
+    let anchor = view.anchors().first().ok_or(RoleError::InvalidOutput)?;
+    if !query.root.snapshot().same_state(&anchor.snapshot)
+        || !view.query().prefix.is_empty()
+        || query.proposal != view.query().proposal
+        || query.candidates != view.query().divergences
+    {
+        return Err(RoleError::InvalidOutput);
+    }
+    prepare_divergence_input_with_view(query, model_epoch, config, Some(view))
+}
+fn prepare_divergence_input_with_view(
+    query: &DivergenceQuery<'_>,
+    model_epoch: [u8; 32],
+    config: &PalsModelConfig,
+    view: Option<&rz_search::pals::review_context::ReviewView>,
+) -> Result<PalsModelInput, RoleError> {
     if query.cancel.load(std::sync::atomic::Ordering::Acquire) {
         return Err(RoleError::Canceled);
     }
@@ -641,8 +726,10 @@ pub fn prepare_divergence_input_for_config(
         return Err(RoleError::InvalidOutput);
     }
     let (board, metadata) = board_and_metadata(query.root)?;
-    let (records, required_critical_records, full_line_records) =
-        records(query.records, query.revision, config)?;
+    let (records, required_critical_records, full_line_records) = match view {
+        Some(view) => selected_records(view, query.revision, config)?,
+        None => records(query.records, query.revision, config)?,
+    };
     let mut prefix = query.root.clone();
     let mut by_ply = Vec::with_capacity(query.proposal.len());
     for (ply, movement) in query.proposal.iter().enumerate() {
@@ -711,6 +798,9 @@ pub fn prepare_divergence_input_for_config(
     Ok(input)
 }
 
+#[path = "pals_native/ticketed.rs"]
+pub mod ticketed;
+
 #[cfg(feature = "onnx-cpu")]
 #[path = "pals_native/private_warm.rs"]
 mod private_warm;
@@ -744,8 +834,9 @@ mod native {
         HostRecordPageObservationBoundary, HostRecordPageObservationHandle,
         HostRecordPageObservationOutcome, HostRecordPageObservationSnapshot,
         HostRecordPageObservationStatus, HostRecordPagePolicy, HostRecordPageSnapshot,
-        PalsBackendStats, PalsCudaControlPolicy, PalsCudaPlacementWitness, PalsGraphOptimization,
-        PalsNativeCommand, PalsNativeMappingWitness, PalsNativeResult, PalsOnnxBackend,
+        PalsAppliedSessionSettings, PalsBackendStats, PalsCudaControlPolicy,
+        PalsCudaPlacementWitness, PalsGraphOptimization, PalsNativeCommand,
+        PalsNativeMappingWitness, PalsNativeOwnerAccounting, PalsNativeResult, PalsOnnxBackend,
         PalsSessionResidency, PalsStartupInputCompletionBinding, PalsStartupSnapshotStatus,
         PalsStartupStageProbe, PalsStartupStageSnapshot, PalsWarmCapability, PalsWarmInput,
     };
@@ -843,7 +934,13 @@ mod native {
         adapter_source_digest: [u8; 32],
         trained: bool,
         residency: PalsSessionResidency,
+        // 실제 SessionBuilder가 성공한 record만 보존. synthetic worker는 None이다.
+        applied_session_settings: Option<Arc<[PalsAppliedSessionSettings]>>,
         process_epoch: ProcessEpoch,
+        // The original startup FDs and profile directory stay with the actual
+        // worker owner, including retained physical leases and quarantine.
+        // Legacy path loaders have no registered source capability.
+        _registered_sources: Option<Arc<dyn rz_eval::pals_onnx::PalsOwnedSources>>,
         last_failure: Mutex<Option<NativeFailureReceipt>>,
         final_stats: Mutex<Option<NativeBackendStatsReceipt>>,
         stats_lease: Mutex<Option<NativePhysicalLease>>,
@@ -1103,6 +1200,40 @@ mod native {
         fresh: Option<bool>,
         completed_nn_inputs: Option<u64>,
         measurement_complete: bool,
+        owner_accounting: Option<PalsNativeOwnerAccounting>,
+    }
+    impl ObservedRoleExecution {
+        fn ticket_execution_evidence(&self) -> Option<super::ticketed::TicketExecutionEvidence> {
+            if !self.ready_observed || self.unknown_observed {
+                return None;
+            }
+            Some(super::ticketed::TicketExecutionEvidence {
+                execution: Some(self.binding.execution),
+                completed_nn_inputs: self.completed_nn_inputs,
+                measurement_complete: self.measurement_complete,
+                physical_fresh: self.fresh,
+                accounting: self.owner_accounting.map(native_ticket_accounting),
+            })
+        }
+    }
+    fn native_ticket_accounting(
+        accounting: PalsNativeOwnerAccounting,
+    ) -> super::ticketed::TicketNativeAccountingEvidence {
+        // 동일 binding으로 수신한 producer 소유 계수를 그대로 투영한다.
+        // 명령 수·출력 유효성·검색 소비로 physical 사용량을 추정하지 않는다.
+        super::ticketed::TicketNativeAccountingEvidence {
+            public_cache_hits: accounting.public_cache_hits(),
+            public_cache_misses: accounting.public_cache_misses(),
+            public_nn_runs_attempted: accounting.public_nn_runs_attempted(),
+            public_nn_runs_completed: accounting.public_nn_runs_completed(),
+            public_nn_runs_failed_known: accounting.public_nn_runs_failed_known(),
+            role_nn_runs_attempted: accounting.role_nn_runs_attempted(),
+            role_nn_runs_completed: accounting.role_nn_runs_completed(),
+            role_nn_runs_failed_known: accounting.role_nn_runs_failed_known(),
+            validator_nn_runs_attempted: accounting.validator_nn_runs_attempted(),
+            validator_nn_runs_completed: accounting.validator_nn_runs_completed(),
+            validator_nn_runs_failed_known: accounting.validator_nn_runs_failed_known(),
+        }
     }
     /// Optional bounded collector. All callbacks run on the calling/search
     /// thread and use its clock; startup probe inputs never enter this stream.
@@ -2203,6 +2334,7 @@ mod native {
     #[serde(rename_all = "snake_case")]
     pub enum NativeStartupErrorKind {
         Unavailable,
+        Unsupported,
         InvalidOutput,
         Canceled,
         Deadline,
@@ -2213,6 +2345,7 @@ mod native {
         fn from(error: &RoleError) -> Self {
             match error {
                 RoleError::Unavailable => Self::Unavailable,
+                RoleError::Unsupported(_) => Self::Unsupported,
                 RoleError::InvalidOutput => Self::InvalidOutput,
                 RoleError::Canceled => Self::Canceled,
                 RoleError::Deadline => Self::Deadline,
@@ -3977,6 +4110,7 @@ mod native {
                 fresh,
                 completed_nn_inputs: None,
                 measurement_complete: false,
+                owner_accounting: None,
             });
             if let Err(error) = self
                 .owner
@@ -4068,6 +4202,7 @@ mod native {
                 outcome,
                 actual_completed_nn_inputs_delta,
                 complete,
+                owner_accounting,
             }) = &result
             {
                 if let Err(error) = outcome {
@@ -4078,6 +4213,7 @@ mod native {
                 {
                     observed.completed_nn_inputs = *actual_completed_nn_inputs_delta;
                     observed.measurement_complete = *complete;
+                    observed.owner_accounting = *owner_accounting;
                 }
             }
             if let Err(error) = self
@@ -4263,6 +4399,8 @@ mod native {
         startup_probe_configured: bool,
         delivered_request: Option<RequestId>,
         last_value_execution: Option<RoleValueExecutionEvidence>,
+        selected_review: Option<Arc<rz_search::pals::review_context::ReviewView>>,
+        ticketed_delivered: Vec<rz_contracts::pals_adaptive::RoleTicketEnvelope>,
         startup_loading_elapsed_ns: Option<u64>,
         startup_clock: Option<Instant>,
         startup_diagnostic: Option<NativeStartupFailureDiagnostic>,
@@ -4270,6 +4408,243 @@ mod native {
         cpu_invocation_load_interval: Option<(Instant, Instant)>,
     }
     impl NativeRoleModel {
+        pub(super) fn ticketed_clock(&self) -> ContractSystemClock {
+            self.clock.clone()
+        }
+        pub(super) fn ticketed_config(&self) -> PalsModelConfig {
+            self.owner.model_config.clone()
+        }
+        pub(super) fn ticketed_model_epoch(&self) -> [u8; 32] {
+            self.model_epoch
+        }
+        pub(super) fn ticketed_require_fresh(&self) -> Result<(), RoleError> {
+            if self.owner.private_warm.is_some()
+                || self.sequence != 0
+                || self.delivered_request.is_some()
+            {
+                return Err(RoleError::Backend("UnsupportedCapability: ticketed native requires an unused Fresh owner; synchronous Warm is preserved separately".into()));
+            }
+            Ok(())
+        }
+        pub(super) fn ticketed_representation(
+            &self,
+            input: &PalsModelInput,
+        ) -> Result<RepresentationKey, RoleError> {
+            let packed = input
+                .candidates
+                .iter()
+                .map(|candidate| candidate.packed().map_err(model_error))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut candidates = Sha256::new();
+            for value in packed {
+                candidates.update(value.to_le_bytes());
+            }
+            let mut masks = Sha256::new();
+            for value in [
+                input.records.len(),
+                input.candidates.len(),
+                input.divergence_features.len(),
+            ] {
+                masks.update((value as u64).to_le_bytes());
+            }
+            Ok(RepresentationKey {
+                input: Digest(
+                    input
+                        .canonical_input_key(&self.owner.model_config)
+                        .map_err(model_error)?,
+                ),
+                history: Digest(input.history_digest),
+                candidates: Digest(candidates.finalize().into()),
+                mask_positions: Digest(masks.finalize().into()),
+                model: self.model,
+                encoding: self.encoding,
+                precision: PrecisionProfile::Fp32,
+                frozen_epoch: DEPLOYMENT_FROZEN_EPOCH,
+                record_revision: input.situation_revision,
+                role: if input.role == PalsRole::Critic {
+                    Role::Critic
+                } else {
+                    Role::Proposer
+                },
+            })
+        }
+        // Ticket authority, exact Rules position, prepared view and cancellation
+        // remain independent inputs at the physical owner's admission boundary.
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn ticketed_run(
+            &mut self,
+            ticket: &rz_contracts::pals_adaptive::RoleTicketEnvelope,
+            input: PalsModelInput,
+            position: &Position,
+            until: Instant,
+            canceled: &AtomicBool,
+            prepared_context: NativePreparedContext<'_>,
+            logical: &RoleLogicalContext,
+        ) -> Result<super::ticketed::NativeTicketOutput, RoleError> {
+            if ticket.authority.game.0 > self.game {
+                self.owner.request_game_target(ticket.authority.game.0)?;
+                self.game = ticket.authority.game.0;
+                self.pending_new_game = true;
+            }
+            let output = self.run_with_ticket(
+                input,
+                position,
+                until,
+                canceled,
+                prepared_context,
+                Some(logical),
+                Some(ticket),
+            )?;
+            if self.delivered_request.take() != Some(ticket.id)
+                || output.id != ticket.id
+                || output.authority != ticket.authority
+                || output.key != ticket.representation
+            {
+                self.unusable = true;
+                return Err(RoleError::InvalidOutput);
+            }
+            // The previous request is now independent of all recent slots.
+            // Later submissions cannot overwrite this output or its evidence.
+            let mut slot = self
+                .owner
+                .role_execution
+                .lock()
+                .map_err(|_| RoleError::Unavailable)?;
+            let observed = slot
+                .as_ref()
+                .filter(|entry| entry.binding.request == ticket.id);
+            // 완료 불명 상태에서는 원본 관측과 lease 근거를 보존한다.
+            // slot을 먼저 소비하면 실패 증거/격리에 필요한 소유자를 잃는다.
+            if observed.is_some_and(|entry| !entry.ready_observed || entry.unknown_observed) {
+                self.owner.quarantined.store(true, Ordering::Release);
+                return Err(RoleError::PhysicalCompletionUnknown);
+            }
+            let evidence = observed.and_then(ObservedRoleExecution::ticket_execution_evidence);
+            if observed.is_some() {
+                slot.take();
+            }
+            drop(slot);
+            self.ticketed_delivered.push(*ticket);
+            Ok(super::ticketed::NativeTicketOutput {
+                output,
+                execution: evidence.and_then(|entry| entry.execution),
+                completed_nn_inputs: evidence.and_then(|entry| entry.completed_nn_inputs),
+                measurement_complete: evidence.is_some_and(|entry| entry.measurement_complete),
+                physical_fresh: evidence.and_then(|entry| entry.physical_fresh),
+                accounting: evidence.and_then(|entry| entry.accounting),
+            })
+        }
+        pub(super) fn ticketed_acknowledge(
+            &mut self,
+            ticket: &rz_contracts::pals_adaptive::RoleTicketEnvelope,
+            accepted: bool,
+        ) -> Result<(), RoleError> {
+            if accepted
+                && (self
+                    .scope
+                    .get()
+                    .is_none_or(|scope| scope.authority != ticket.authority)
+                    || ticket
+                        .original_deadline
+                        .accepts(self.clock.domain(), self.clock.now())
+                        .is_err()
+                    || self.owner.quarantined.load(Ordering::Acquire))
+            {
+                return Err(RoleError::Canceled);
+            }
+            let Some(index) = self
+                .ticketed_delivered
+                .iter()
+                .position(|entry| entry == ticket)
+            else {
+                return if accepted {
+                    Err(RoleError::InvalidOutput)
+                } else {
+                    Ok(())
+                };
+            };
+            if accepted {
+                self.owner
+                    .observe("accepted_ticket", |observer| observer.accepted(ticket.id))?;
+                self.ticketed_delivered.remove(index);
+                self.owner.consumed.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            } else {
+                self.ticketed_delivered.remove(index);
+                self.owner.observe("closed_ticket", |observer| {
+                    observer.rejected(ticket.id, NativeRoleRejection::SearchFinishedUnconsumed)
+                })
+            }
+        }
+        pub(super) fn ticketed_close_pending(&mut self) {
+            for ticket in std::mem::take(&mut self.ticketed_delivered) {
+                let _ = self.owner.observe("closed_ticket", |observer| {
+                    observer.rejected(ticket.id, NativeRoleRejection::Canceled)
+                });
+            }
+        }
+        /// Root fence preserves the loaded session and its physical worker.
+        /// Unlike finish(), this never closes scheduler admission or joins the
+        /// worker. Every reservation/control lease must already be reclaimed.
+        pub(super) fn ticketed_quiesce(&mut self, until: Instant) -> bool {
+            if !self.ticketed_delivered.is_empty()
+                || self
+                    .preflight_new_game(until, &AtomicBool::new(false))
+                    .is_err()
+                || self
+                    .close_unconsumed(NativeRoleRejection::Canceled)
+                    .is_err()
+                || !self.owner.startup_ready.load(Ordering::Acquire)
+                || !self
+                    .owner
+                    .stats_lease
+                    .try_lock()
+                    .is_ok_and(|slot| slot.is_none())
+            {
+                return false;
+            }
+            let state = self.runtime.state();
+            if state.closed
+                || state.logical_requests != 0
+                || state.reserved_requests != 0
+                || state.queued != 0
+                || state.executions != 0
+                || state.reserved.host_bytes != 0
+                || state.reserved.device_bytes != 0
+                || state.reserved.pinned_bytes != 0
+            {
+                return false;
+            }
+            let Ok(mut execution) = self.owner.role_execution.try_lock() else {
+                return false;
+            };
+            if execution
+                .as_ref()
+                .is_some_and(|entry| !entry.ready_observed || entry.unknown_observed)
+            {
+                return false;
+            }
+            let Ok(mut perspective) = self.owner.prepared_perspective.try_lock() else {
+                return false;
+            };
+            execution.take();
+            perspective.take();
+            self.last_value_execution = None;
+            self.selected_review = None;
+            Instant::now() < until
+        }
+        pub(super) fn ticketed_take_execution_evidence(
+            &self,
+            ticket: &rz_contracts::pals_adaptive::RoleTicketEnvelope,
+        ) -> Option<super::ticketed::TicketExecutionEvidence> {
+            let mut slot = self.owner.role_execution.lock().ok()?;
+            let observed = slot
+                .as_ref()
+                .filter(|entry| entry.binding.request == ticket.id)?;
+            let evidence = observed.ticket_execution_evidence()?;
+            slot.take();
+            Some(evidence)
+        }
         /// Enable metadata from the same physical execution before the first
         /// startup/search admission. Legacy callers keep the Evaluate wire.
         pub fn enable_followup_execution_evidence(&mut self) -> Result<(), RoleError> {
@@ -4679,6 +5054,53 @@ mod native {
         ) -> Result<Self, RoleError> {
             Self::new_with_optional_cuda_record_pages(backend, options, None)
         }
+        /// Additive V5 Fresh owner construction. The supplied clock is the
+        /// process owner's immutable epoch and origin, used from the beginning
+        /// by scope, runtime, request/execution IDs and physical worker metadata.
+        /// Existing V1-V4 factories keep their internally allocated clocks.
+        #[cfg(feature = "pals-adaptive")]
+        pub(crate) fn new_registered_fresh_owner(
+            backend: PalsOnnxBackend,
+            options: NativeOwnerOptions,
+            clock: ContractSystemClock,
+            sources: Arc<dyn rz_eval::pals_onnx::PalsOwnedSources>,
+        ) -> Result<Self, (RoleError, Option<NativeRoleFinishHandle>)> {
+            if clock.domain().0.0 == 0
+                || clock.origin() > Instant::now()
+                || backend.model_config().profile != PalsModelProfile::FullLineInteractionV2
+                || backend.private_warm_capability().is_some()
+            {
+                return Err((RoleError::InvalidOutput, None));
+            }
+            #[cfg(feature = "experimental-io-binding")]
+            if backend.private_cuda_warm_capability().is_some() {
+                return Err((RoleError::InvalidOutput, None));
+            }
+            let mut finish = None;
+            Self::new_with_owner_registration(
+                backend,
+                options,
+                None,
+                Some(&mut finish),
+                None,
+                Some(clock),
+                Some(sources),
+            )
+            .map_err(|cause| (cause, finish))
+        }
+        #[cfg(feature = "pals-adaptive")]
+        pub(crate) fn registered_adaptive_namespace(
+            &self,
+        ) -> Result<rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace, RoleError>
+        {
+            rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace::new(
+                self.value_identity.clone(),
+                self.model,
+                self.encoding,
+                PrecisionProfile::Fp32,
+                DEPLOYMENT_FROZEN_EPOCH,
+            )
+        }
         #[cfg(feature = "experimental-io-binding")]
         pub fn new_with_cuda_warm_observations(
             backend: PalsOnnxBackend,
@@ -4751,11 +5173,31 @@ mod native {
             )
         }
         fn new_with_optional_cuda_record_pages_and_capture(
+            backend: PalsOnnxBackend,
+            options: NativeOwnerOptions,
+            registration: Option<NativeCudaRecordPagesRegistration>,
+            finish_capture: Option<&mut Option<NativeRoleFinishHandle>>,
+            warm_observation_limits: Option<NativeCudaWarmObservationLimits>,
+        ) -> Result<Self, RoleError> {
+            Self::new_with_owner_registration(
+                backend,
+                options,
+                registration,
+                finish_capture,
+                warm_observation_limits,
+                None,
+                None,
+            )
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn new_with_owner_registration(
             mut backend: PalsOnnxBackend,
             options: NativeOwnerOptions,
             registration: Option<NativeCudaRecordPagesRegistration>,
             finish_capture: Option<&mut Option<NativeRoleFinishHandle>>,
             warm_observation_limits: Option<NativeCudaWarmObservationLimits>,
+            registered_clock: Option<ContractSystemClock>,
+            registered_sources: Option<Arc<dyn rz_eval::pals_onnx::PalsOwnedSources>>,
         ) -> Result<Self, RoleError> {
             options.validate(&backend.config())?;
             let drain_limit = options.drain_limit;
@@ -4921,6 +5363,7 @@ mod native {
             };
             let trained = backend.is_trained();
             let residency = backend.residency().clone();
+            let applied_session_settings = backend.applied_session_settings();
             let mut identity = format!(
                 "pals-onnx-pc-fp32-{}",
                 model
@@ -4949,7 +5392,10 @@ mod native {
             // Each delivered value still carries its actual prepared input key.
             let value_identity = frontier_value_identity(&identity, model_epoch, encoding);
             value_identity.validate()?;
-            let epoch = ProcessEpoch(next(&EPOCHS)?);
+            let epoch = match &registered_clock {
+                Some(clock) => clock.domain().0,
+                None => ProcessEpoch(next(&EPOCHS)?),
+            };
             let cuda_record_pages = if let Some(registration) = registration {
                 #[cfg(feature = "experimental-io-binding")]
                 {
@@ -5013,7 +5459,7 @@ mod native {
                     })
                 })
                 .transpose()?;
-            let clock = ContractSystemClock::new(epoch);
+            let clock = registered_clock.unwrap_or_else(|| ContractSystemClock::new(epoch));
             let authority = SearchAuthority {
                 epoch,
                 game: GameGeneration(game),
@@ -5064,7 +5510,9 @@ mod native {
                 adapter_source_digest,
                 trained,
                 residency,
+                applied_session_settings: Some(applied_session_settings),
                 process_epoch: epoch,
+                _registered_sources: registered_sources,
                 last_failure: Mutex::new(None),
                 final_stats: Mutex::new(None),
                 stats_lease: Mutex::new(None),
@@ -5151,6 +5599,8 @@ mod native {
                 startup_probe_configured: false,
                 delivered_request: None,
                 last_value_execution: None,
+                selected_review: None,
+                ticketed_delivered: Vec::with_capacity(16),
                 startup_loading_elapsed_ns: None,
                 startup_clock: None,
                 startup_diagnostic: None,
@@ -5168,6 +5618,10 @@ mod native {
         }
         pub fn model_config(&self) -> &PalsModelConfig {
             &self.owner.model_config
+        }
+        /// 원본 session 생성 성공 설정. OS thread inventory/affinity/첫 NN 증명은 아니다.
+        pub fn applied_session_settings(&self) -> Option<Arc<[PalsAppliedSessionSettings]>> {
+            self.owner.applied_session_settings.as_ref().map(Arc::clone)
         }
         fn fresh_command(&self, input: PalsModelInput) -> Result<PalsNativeCommand, RoleError> {
             #[cfg(feature = "experimental-io-binding")]
@@ -5596,6 +6050,11 @@ mod native {
                     self.unusable = true;
                     return Err(error);
                 }
+            }
+            if self.runtime.state().executions == 0
+                && !self.owner.quarantined.load(Ordering::Acquire)
+            {
+                self.selected_review = None;
             }
             Ok(())
         }
@@ -6329,6 +6788,29 @@ mod native {
             prepared_context: NativePreparedContext<'_>,
             logical: Option<&RoleLogicalContext>,
         ) -> Result<RoleOutput, RoleError> {
+            self.run_with_ticket(
+                input,
+                position,
+                until,
+                canceled,
+                prepared_context,
+                logical,
+                None,
+            )
+        }
+        // The synchronous compatibility path and ticketed path share one owner;
+        // keep optional ticket authority distinct from model input and context.
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn run_with_ticket(
+            &mut self,
+            input: PalsModelInput,
+            position: &Position,
+            until: Instant,
+            canceled: &AtomicBool,
+            prepared_context: NativePreparedContext<'_>,
+            logical: Option<&RoleLogicalContext>,
+            ticket: Option<&rz_contracts::pals_adaptive::RoleTicketEnvelope>,
+        ) -> Result<RoleOutput, RoleError> {
             if self
                 .owner
                 .private_warm
@@ -6354,29 +6836,58 @@ mod native {
                 return Err(RoleError::Deadline);
             }
             self.ensure_new_game(until, canceled)?;
-            self.close_unconsumed(NativeRoleRejection::SupersededUnconsumed)?;
-            self.sequence = self
-                .sequence
-                .checked_add(1)
-                .ok_or_else(|| RoleError::Backend("PALS request sequence exhausted".into()))?;
+            if let Some(ticket) = ticket {
+                if self.owner.private_warm.is_some() {
+                    return Err(RoleError::Backend(
+                        "ticketed Warm capability is not installed; Fresh is an explicit profile"
+                            .into(),
+                    ));
+                }
+                if ticket.id.epoch != self.epoch
+                    || ticket.authority.epoch != self.epoch
+                    || ticket.id.sequence <= self.sequence
+                    || ticket.authority.game.0 != self.game
+                    || ticket.original_deadline.clock != self.clock.domain()
+                    || self.ticketed_delivered.len() >= 16
+                    || self.delivered_request.is_some()
+                {
+                    return Err(RoleError::InvalidOutput);
+                }
+                self.sequence = ticket.id.sequence;
+            } else {
+                if self.delivered_request.is_some() {
+                    self.close_unconsumed(NativeRoleRejection::SupersededUnconsumed)?;
+                }
+                self.sequence = self
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| RoleError::Backend("PALS request sequence exhausted".into()))?;
+            }
             self.owner
                 .request_high_water
                 .store(self.sequence, Ordering::Release);
             let mut scope = self.scope.get().ok_or(RoleError::Unavailable)?;
-            scope.authority.game = GameGeneration(self.game);
-            scope.authority.root = RootGeneration(self.sequence);
+            if let Some(ticket) = ticket {
+                scope.authority = ticket.authority;
+            } else {
+                scope.authority.game = GameGeneration(self.game);
+                scope.authority.root = RootGeneration(self.sequence);
+            }
             self.scope.update(scope).map_err(model_error)?;
             let now = self.clock.now();
             let remaining = u64::try_from(
                 until.saturating_duration_since(Instant::now()).as_nanos(),
             )
             .map_err(|_| RoleError::Backend("PALS deadline outside finite clock domain".into()))?;
-            let deadline = Deadline {
-                clock: self.clock.domain(),
-                at: MonotonicTick(now.0.checked_add(remaining).ok_or_else(|| {
-                    RoleError::Backend("PALS monotonic deadline exhausted".into())
-                })?),
-            };
+            let deadline = ticket.map_or(
+                Deadline {
+                    clock: self.clock.domain(),
+                    at: MonotonicTick(now.0.checked_add(remaining).ok_or_else(|| {
+                        RoleError::Backend("PALS monotonic deadline exhausted".into())
+                    })?),
+                },
+                |ticket| ticket.original_deadline,
+            );
             let state_owner = OwnerId(next(&RULE_OWNERS)?);
             let exact = ContractPosition::new(state_owner, position.clone())
                 .export()
@@ -6511,6 +7022,9 @@ mod native {
                 record_revision: input.situation_revision,
                 role,
             };
+            if ticket.is_some_and(|ticket| ticket.representation != key || ticket.role != role) {
+                return Err(RoleError::InvalidOutput);
+            }
             let candidates: Vec<_> = packed_candidates
                 .into_iter()
                 .map(|bits| Move16::try_from_bits(bits).map_err(model_error))
@@ -6761,12 +7275,22 @@ mod native {
             kind: NativeQueryKind,
             logical: Option<&RoleLogicalContext>,
         ) -> Result<RoleEvaluation, RoleError> {
-            let input = prepare_role_input_for_config(
-                &query,
-                kind,
-                self.model_epoch,
-                &self.owner.model_config,
-            )?;
+            let input = if let Some(view) = &self.selected_review {
+                prepare_selected_role_input_for_config(
+                    &query,
+                    kind,
+                    self.model_epoch,
+                    &self.owner.model_config,
+                    view,
+                )?
+            } else {
+                prepare_role_input_for_config(
+                    &query,
+                    kind,
+                    self.model_epoch,
+                    &self.owner.model_config,
+                )?
+            };
             let output = self.run(
                 input,
                 query.position,
@@ -6796,6 +7320,30 @@ mod native {
         }
     }
     impl RoleModel for NativeRoleModel {
+        fn supports_selected_review_view(&self) -> bool {
+            true
+        }
+        fn bind_selected_review_view(
+            &mut self,
+            view: Arc<rz_search::pals::review_context::ReviewView>,
+            context: &RoleLogicalContext,
+        ) -> Result<(), RoleError> {
+            if context.purpose == RoleQueryPurpose::TaskPolicy {
+                return Err(RoleError::Unsupported(
+                    "V1/V2 native adapter does not implement TaskPolicy",
+                ));
+            }
+            if self.owner.in_flight.load(Ordering::Acquire) != 0
+                || self.delivered_request.is_some()
+                || view.generation() != context.search_generation
+                || view.query().purpose != context.purpose
+                || view.query().prefix != context.prefix
+            {
+                return Err(RoleError::InvalidOutput);
+            }
+            self.selected_review = Some(view);
+            Ok(())
+        }
         fn identity(&self) -> &str {
             &self.identity
         }
@@ -6809,12 +7357,22 @@ mod native {
             // model estimate, not a candidate value or foreign-CP calibration.
             let state = query.position.position_identity();
             let perspective = query.position.side_to_move();
-            let input = prepare_role_input_for_config(
-                &query,
-                NativeQueryKind::Propose,
-                self.model_epoch,
-                &self.owner.model_config,
-            )?;
+            let input = if let Some(view) = &self.selected_review {
+                prepare_selected_role_input_for_config(
+                    &query,
+                    NativeQueryKind::Propose,
+                    self.model_epoch,
+                    &self.owner.model_config,
+                    view,
+                )?
+            } else {
+                prepare_role_input_for_config(
+                    &query,
+                    NativeQueryKind::Propose,
+                    self.model_epoch,
+                    &self.owner.model_config,
+                )?
+            };
             let output = self.run(
                 input,
                 query.position,
@@ -6862,11 +7420,20 @@ mod native {
             })
         }
         fn divergences(&mut self, query: DivergenceQuery<'_>) -> Result<Vec<f32>, RoleError> {
-            let input = prepare_divergence_input_for_config(
-                &query,
-                self.model_epoch,
-                &self.owner.model_config,
-            )?;
+            let input = if let Some(view) = &self.selected_review {
+                prepare_selected_divergence_input_for_config(
+                    &query,
+                    self.model_epoch,
+                    &self.owner.model_config,
+                    view,
+                )?
+            } else {
+                prepare_divergence_input_for_config(
+                    &query,
+                    self.model_epoch,
+                    &self.owner.model_config,
+                )?
+            };
             let output = self.run(
                 input,
                 query.root,
@@ -6964,11 +7531,20 @@ mod native {
                     "Native divergence logical context mismatch".into(),
                 ));
             }
-            let input = prepare_divergence_input_for_config(
-                &query,
-                self.model_epoch,
-                &self.owner.model_config,
-            )?;
+            let input = if let Some(view) = &self.selected_review {
+                prepare_selected_divergence_input_for_config(
+                    &query,
+                    self.model_epoch,
+                    &self.owner.model_config,
+                    view,
+                )?
+            } else {
+                prepare_divergence_input_for_config(
+                    &query,
+                    self.model_epoch,
+                    &self.owner.model_config,
+                )?
+            };
             let output = self.run(
                 input,
                 query.root,
@@ -7001,12 +7577,22 @@ mod native {
             }
             let state = query.position.position_identity();
             let perspective = query.position.side_to_move();
-            let input = prepare_role_input_for_config(
-                &query,
-                NativeQueryKind::Propose,
-                self.model_epoch,
-                &self.owner.model_config,
-            )?;
+            let input = if let Some(view) = &self.selected_review {
+                prepare_selected_role_input_for_config(
+                    &query,
+                    NativeQueryKind::Propose,
+                    self.model_epoch,
+                    &self.owner.model_config,
+                    view,
+                )?
+            } else {
+                prepare_role_input_for_config(
+                    &query,
+                    NativeQueryKind::Propose,
+                    self.model_epoch,
+                    &self.owner.model_config,
+                )?
+            };
             let output = self.run(
                 input,
                 query.position,
@@ -7166,6 +7752,11 @@ mod native {
                     self.unusable = true;
                 }
             }
+            if self.runtime.state().executions == 0
+                && !self.owner.quarantined.load(Ordering::Acquire)
+            {
+                self.selected_review = None;
+            }
         }
         fn finish_search(&mut self, reason: RoleSearchClosure) {
             let reason = match reason {
@@ -7178,6 +7769,21 @@ mod native {
                 }
             };
             let _ = self.close_unconsumed(reason);
+        }
+    }
+
+    impl Drop for NativeRoleModel {
+        fn drop(&mut self) {
+            if self.owner.quarantined.load(Ordering::Acquire)
+                || self.owner.in_flight.load(Ordering::Acquire) != 0
+                || self.runtime.state().executions != 0
+            {
+                if let Some(view) = self.selected_review.take() {
+                    // Dropping a model is no proof of a physical fence. Keep
+                    // the one bounded synchronous selected-view pin on unknown.
+                    std::mem::forget(view);
+                }
+            }
         }
     }
 
@@ -8367,6 +8973,149 @@ mod native {
             assert!(!receipt.quarantined);
             assert!(handle.owner.stats_lease.lock().unwrap().is_none());
         }
+        #[test]
+        fn ticketed_actual_worker_keeps_fixed_root_and_accepts_older_original_output() {
+            // Deterministic raw heads through the existing native runtime and
+            // SingleWorker. No ORT library, model asset or GPU is loaded.
+            let mut model = recorded_fixture_model(None, false);
+            assert!(model.applied_session_settings().is_none());
+            let position = Position::startpos();
+            let legal = position.legal_moves();
+            let cancel = AtomicBool::new(false);
+            let until = Instant::now() + Duration::from_secs(2);
+            let authority = SearchAuthority {
+                epoch: model.epoch,
+                game: GameGeneration(1),
+                root: RootGeneration(7),
+                implementation: Digest([9; 32]),
+            };
+            let state = ContractPosition::new(OwnerId(2), position.clone())
+                .export()
+                .unwrap()
+                .snapshot()
+                .identity();
+            let mut outputs = Vec::new();
+            for sequence in 1..=2 {
+                let query = RoleQuery {
+                    position: &position,
+                    legal: &legal,
+                    prefix: &[],
+                    proposal: &[],
+                    counterexample: None,
+                    records: &[],
+                    revision: sequence,
+                    deadline: until,
+                    cancel: &cancel,
+                };
+                let input = prepare_role_input_for_config(
+                    &query,
+                    NativeQueryKind::Propose,
+                    model.model_epoch,
+                    &model.owner.model_config,
+                )
+                .unwrap();
+                let ticket = rz_contracts::pals_adaptive::RoleTicketEnvelope {
+                    id: RequestId::new(model.epoch, sequence),
+                    authority,
+                    question: Digest([sequence as u8; 32]),
+                    view: rz_contracts::pals_adaptive::ReviewViewSeal {
+                        authority,
+                        view_sequence: sequence,
+                        context_policy: Digest([8; 32]),
+                        view_digest: Digest([sequence as u8; 32]),
+                        root_state: state,
+                        actual_tokens: 0,
+                        selected_records: 0,
+                        anchors: 1,
+                        length_bucket: 8,
+                    },
+                    representation: model.ticketed_representation(&input).unwrap(),
+                    role: Role::Proposer,
+                    original_deadline: Deadline {
+                        clock: model.clock.domain(),
+                        at: MonotonicTick(model.clock.now().0 + 1_500_000_000),
+                    },
+                };
+                let context = RoleLogicalContext {
+                    game_generation: 1,
+                    search_generation: 7,
+                    situation: rz_search::pals::store::SituationId {
+                        slot: 0,
+                        generation: 7,
+                    },
+                    state: rz_search::pals::store::StateId(0),
+                    focus: rz_search::pals::store::LineId(0),
+                    purpose: RoleQueryPurpose::ProposePolicy,
+                    prefix: vec![],
+                    focus_sha256: [1; 32],
+                    prefix_sha256: [2; 32],
+                    proposal_sha256: [3; 32],
+                    refutation_sha256: None,
+                    divergence_sha256: [4; 32],
+                    public_revision: sequence,
+                    situation_revision: sequence,
+                };
+                let output = model
+                    .ticketed_run(
+                        &ticket,
+                        input,
+                        &position,
+                        until,
+                        &cancel,
+                        NativePreparedContext::Role {
+                            query: &query,
+                            kind: NativeQueryKind::Propose,
+                        },
+                        &context,
+                    )
+                    .unwrap();
+                assert_eq!(output.output.id, ticket.id);
+                assert_eq!(output.output.key, ticket.representation);
+                // 이 synthetic worker는 owner 계수를 발급하지 않는다. 실제 요청/
+                // 출력 하나를 public/private/V 실행 수로 추정하면 안 된다.
+                assert!(output.accounting.is_none());
+                let mut observation = ObservedRoleExecution {
+                    binding: NativeRoleExecutionBinding {
+                        request: ticket.id,
+                        execution: output.execution.unwrap(),
+                    },
+                    ready_observed: false,
+                    unknown_observed: false,
+                    observer_error: Some(RoleError::Unavailable),
+                    prepared_state: state,
+                    prepared_perspective: Some(rz_contracts::Color::White),
+                    input_sha256: ticket.representation.input.0,
+                    fresh: Some(true),
+                    completed_nn_inputs: Some(1),
+                    measurement_complete: true,
+                    owner_accounting: None,
+                };
+                assert!(observation.ticket_execution_evidence().is_none());
+                observation.ready_observed = true;
+                let known = observation.ticket_execution_evidence().unwrap();
+                assert_eq!(known.completed_nn_inputs, Some(1));
+                assert!(known.accounting.is_none());
+                observation.unknown_observed = true;
+                assert!(observation.ticket_execution_evidence().is_none());
+                assert_eq!(observation.completed_nn_inputs, Some(1));
+                assert_eq!(model.scope.get().unwrap().authority.root, RootGeneration(7));
+                assert!(model.delivered_request.is_none());
+                assert!(model.owner.role_execution.lock().unwrap().is_none());
+                outputs.push((ticket, output));
+            }
+            assert_eq!(model.owner.physical_completed.load(Ordering::Acquire), 2);
+            assert_eq!(model.owner.consumed.load(Ordering::Acquire), 0);
+            assert_eq!(model.ticketed_delivered.len(), 2);
+            model.ticketed_acknowledge(&outputs[0].0, true).unwrap();
+            model.ticketed_acknowledge(&outputs[1].0, true).unwrap();
+            assert!(model.ticketed_acknowledge(&outputs[0].0, true).is_err());
+            assert_eq!(model.owner.consumed.load(Ordering::Acquire), 2);
+            let receipt = model
+                .finish_handle()
+                .finish(Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            assert!(receipt.physical_shutdown_confirmed && receipt.native_buffers_released);
+        }
         fn fixture_model<F>(run: F) -> NativeRoleModel
         where
             F: FnMut(&PalsNativeCommand) -> PhysicalRun<Result<PalsNativeResult, BackendError>>
@@ -8429,6 +9178,7 @@ mod native {
                 trained: false,
                 finishing: AtomicBool::new(false),
                 process_epoch: epoch,
+                _registered_sources: None,
                 last_failure: Mutex::new(None),
                 final_stats: Mutex::new(None),
                 stats_lease: Mutex::new(None),
@@ -8436,6 +9186,7 @@ mod native {
                 cuda_record_page_snapshot: Mutex::new(None),
                 cuda_record_page_snapshot_error: Mutex::new(None),
                 host_record_page_observer: None,
+                applied_session_settings: None,
                 residency: PalsSessionResidency {
                     graphs: vec![],
                     native_sessions: 0,
@@ -8524,6 +9275,8 @@ mod native {
                 startup_probe_configured: false,
                 delivered_request: None,
                 last_value_execution: None,
+                selected_review: None,
+                ticketed_delivered: Vec::with_capacity(16),
                 startup_loading_elapsed_ns: None,
                 startup_clock: None,
                 startup_diagnostic: None,
@@ -9123,6 +9876,7 @@ mod native {
                             outcome: Ok(raw),
                             actual_completed_nn_inputs_delta: delta,
                             complete: true,
+                            owner_accounting: None,
                         }))
                     }
                     PalsNativeCommand::SnapshotStats => PhysicalRun::Complete(Ok(

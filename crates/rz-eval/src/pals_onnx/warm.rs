@@ -16,13 +16,11 @@ pub(super) mod cuda;
 
 pub const PRIVATE_WARM_SCHEMA: &str = "rovezero.pals-private-warm.v1";
 const WARM_LAYOUT: &str = "shared_pc_if_approx_warm_v1";
-pub const PRIVATE_WARM_GRAPH_SEMANTICS: &str =
-    "rz-pals-private-native-warm/1;accepted-final-latent;no-query-double-add;fixed-2-iterations;private-self-kv-recomputed;fp32;pc-only";
+pub const PRIVATE_WARM_GRAPH_SEMANTICS: &str = "rz-pals-private-native-warm/1;accepted-final-latent;no-query-double-add;fixed-2-iterations;private-self-kv-recomputed;fp32;pc-only";
 /// This is the consumer's opt-in query meaning, not a change to legacy input.
 /// It requires the first actual 16 FP32 query bits to be consumed unchanged in
 /// later Warm calls. Actual record revision and original controls remain live.
-pub const FROZEN_QUERY_SEMANTICS_V1: &str =
-    "rz-pals-private-frozen-query/1;first-actual-query-fp32-bits;logical-game-search-situation-prefix-focus-role-isolated;records-revision-current;original-deadline-cancel-fixed;value-fresh";
+pub const FROZEN_QUERY_SEMANTICS_V1: &str = "rz-pals-private-frozen-query/1;first-actual-query-fp32-bits;logical-game-search-situation-prefix-focus-role-isolated;records-revision-current;original-deadline-cancel-fixed;value-fresh";
 const LATENT_ELEMENTS: usize = 16 * 384;
 const MANIFEST_LIMIT: usize = 64 * 1024;
 const GRAPH_LIMIT: usize = 256 * 1024 * 1024;
@@ -641,9 +639,11 @@ impl PalsOnnxBackend {
             graph_bytes.push(bytes);
         }
         let mut sessions = BTreeMap::new();
+        let mut applied_session_settings = Vec::with_capacity(manifest.graphs.len());
         for (graph, bytes) in manifest.graphs.iter().zip(graph_bytes) {
-            let (session, _) = load_session(bytes, config, &graph.role, None)?;
+            let (session, _, applied) = load_session(bytes, config, &graph.role, None)?;
             validate_warm_session(&session, graph, &manifest)?;
+            applied_session_settings.push(applied);
             sessions.insert(graph.role.as_str(), session);
         }
         let rules = parse_sha256(&manifest.rules_input_semantic_sha256)?;
@@ -684,14 +684,23 @@ impl PalsOnnxBackend {
             public_owner_bytes(2 * tokens * 64, 2 * tokens * 64, tokens),
         )
         .map_err(public_bank_error)?;
+        // 검증된 Warm manifest와 실제 로드된 두 session에서만 V 부재를 확인한다.
+        let validator_absence_verified = !manifest.validator_present
+            && sessions.len() == 2
+            && sessions.contains_key("public")
+            && sessions.contains_key("shared_pc_warm")
+            && !sessions.contains_key("validator");
         Ok(Self {
             public: sessions.remove("public"),
             proposer: None,
             critic: None,
             shared_pc: sessions.remove("shared_pc_warm"),
+            validator_absence_verified,
+            applied_session_settings: applied_session_settings.into(),
             layout: Layout::SharedPcIf,
             private_warm: Some(capability),
             runtime,
+            owned_sources: None,
             config,
             model_config: manifest.config,
             epoch: model_epoch,
@@ -778,7 +787,11 @@ fn capability_token(identity: PrivateModelIdentity, rules: [u8; 32], source: [u8
 fn validate_cpu(config: PalsOnnxConfig, bundle: Option<[u8; 32]>) -> Result<(), BackendError> {
     config.validate()?;
     if config.provider != Provider::Cpu || config.device_public_memory || bundle.is_some() {
-        return Err(fail(K::UnsupportedModel, S::Admission, "PALS private Warm v1 requires explicit CPU and host public memory; CUDA/device/V unsupported"));
+        return Err(fail(
+            K::UnsupportedModel,
+            S::Admission,
+            "PALS private Warm v1 requires explicit CPU and host public memory; CUDA/device/V unsupported",
+        ));
     }
     Ok(())
 }

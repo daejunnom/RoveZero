@@ -68,7 +68,7 @@ fn check_metadata_budget(artifact: &ArtifactRef, max_bytes: u64) -> Result<(), M
     Ok(())
 }
 
-fn open_verified_in(
+pub(crate) fn open_verified_in(
     directory: &Dir,
     artifact: &ArtifactRef,
     max_bytes: u64,

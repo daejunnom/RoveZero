@@ -1,0 +1,1245 @@
+use crate::RuntimeFault;
+use std::collections::{BTreeMap, VecDeque};
+use std::time::Duration;
+
+pub const COST_WINDOW: usize = 128;
+pub const CALIBRATION_SAMPLES: usize = 8;
+pub const MAX_ROLE_BACKLOG: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum InvocationClass {
+    Fresh,
+    Warm,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CacheClass {
+    Cold,
+    Hit,
+    Miss,
+    /// Actual completed owner work contained both public-cache hits and misses.
+    /// Only the separate scheduling prediction envelope may use this class.
+    Mixed,
+    /// No complete owner observation. Retained raw
+    /// observations in this class never authorize calibrated control advice.
+    Unknown,
+}
+
+/// Full semantic digest bytes, never neural-network numeric features.
+/// The embedding contract owns canonicalization of model/role/device meaning.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CostClass {
+    pub model: [u8; 32],
+    pub role_or_checker: [u8; 32],
+    pub input_bucket: u16,
+    pub invocation: InvocationClass,
+    pub cache: CacheClass,
+    pub device: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CostStage {
+    QueueWait,
+    CpuSearch,
+    YieldLatency,
+    Preparation,
+    GpuService,
+    PhysicalCompletionWait,
+    Acceptance,
+    CpuProgressInterval,
+    FeedbackReturn,
+    CpuResumeAdmissionAndRestore,
+    ExternalCoherentTupleInterval,
+    ExternalStopDrain,
+}
+impl CostStage {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+const STAGES: usize = 12;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CensorReason {
+    Interrupted,
+    Throttled,
+    PhysicalUnknown,
+    Failed,
+    ResourceContention,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CostDisposition {
+    Completed,
+    Censored(CensorReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservedCost {
+    Known(Duration),
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CostObservation {
+    pub elapsed: ObservedCost,
+    pub disposition: CostDisposition,
+}
+impl CostObservation {
+    fn completed_elapsed(self) -> Option<Duration> {
+        match (self.disposition, self.elapsed) {
+            (CostDisposition::Completed, ObservedCost::Known(value)) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CostEstimate {
+    pub ewma: Duration,
+    pub p95: Duration,
+    /// Completed observations with known elapsed time, eligible for calibration.
+    pub completed_in_window: usize,
+    pub censored_in_window: usize,
+    pub unknown_in_window: usize,
+    pub total_completed: u64,
+    pub total_censored: u64,
+    pub total_unknown: u64,
+}
+
+/// Conservative S-policy prediction across observed invocation/cache classes.
+/// This is neither the pending request's actual cache disposition nor a
+/// physical completion witness. Its estimate is the largest source-class p95.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServicePredictionEnvelope {
+    estimate: CostEstimate,
+    source_class_count: usize,
+}
+impl ServicePredictionEnvelope {
+    pub fn estimate(&self) -> CostEstimate {
+        self.estimate
+    }
+    pub fn source_class_count(&self) -> usize {
+        self.source_class_count
+    }
+}
+
+/// Predicted scheduling wait reduction from owner-observed completed timings.
+/// It does not attest a new feedback witness, utility or realized time saving.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FeedbackWaitPrediction {
+    baseline_wait: Duration,
+    gain_before_return_cost: Duration,
+    return_cost: CostEstimate,
+    resume_cost: CostEstimate,
+}
+impl FeedbackWaitPrediction {
+    pub fn baseline_wait(&self) -> Duration {
+        self.baseline_wait
+    }
+    pub fn gain_before_return_cost(&self) -> Duration {
+        self.gain_before_return_cost
+    }
+    pub fn return_cost(&self) -> CostEstimate {
+        self.return_cost
+    }
+    pub fn resume_cost(&self) -> CostEstimate {
+        self.resume_cost
+    }
+    pub fn net_reduction(&self) -> Duration {
+        self.gain_before_return_cost - self.return_cost.p95
+    }
+}
+
+/// Predicted external feedback wait reduction from completed owner timings.
+/// This forecast does not assert exact resume, utility or realized time saving.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalFeedbackWaitPrediction {
+    baseline_wait: Duration,
+    gain_before_return_cost: Duration,
+    return_cost: CostEstimate,
+    stop_drain_cost: CostEstimate,
+}
+impl ExternalFeedbackWaitPrediction {
+    pub fn baseline_wait(&self) -> Duration {
+        self.baseline_wait
+    }
+    pub fn gain_before_return_cost(&self) -> Duration {
+        self.gain_before_return_cost
+    }
+    pub fn return_cost(&self) -> CostEstimate {
+        self.return_cost
+    }
+    pub fn stop_drain_cost(&self) -> CostEstimate {
+        self.stop_drain_cost
+    }
+    pub fn net_reduction(&self) -> Duration {
+        self.gain_before_return_cost - self.return_cost.p95
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CostCounts {
+    pub completed_in_window: usize,
+    pub censored_in_window: usize,
+    pub unknown_in_window: usize,
+    pub total_completed: u64,
+    pub total_censored: u64,
+    pub total_unknown: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemainingCost {
+    Known(Duration),
+    /// Includes unfinished jobs with no calibrated conditional tail sample.
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BacklogEstimate {
+    Known(Duration),
+    /// Known portions are a lower bound, not an estimate of the unknown jobs.
+    Unknown {
+        known_lower_bound: Duration,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RunningCost {
+    pub class: CostClass,
+    pub elapsed: ObservedCost,
+}
+
+#[derive(Debug)]
+struct Series {
+    window: VecDeque<CostObservation>,
+    /// Kept sorted at observation time; manager queries do not clone or sort.
+    completed: Vec<Duration>,
+    ewma_ns: Option<u128>,
+    total_completed: u64,
+    total_censored: u64,
+    total_unknown: u64,
+    window_censored: usize,
+    window_unknown: usize,
+}
+impl Series {
+    fn try_new() -> Result<Self, RuntimeFault> {
+        let mut window = VecDeque::new();
+        let mut completed = Vec::new();
+        window
+            .try_reserve_exact(COST_WINDOW)
+            .map_err(|_| RuntimeFault::ResourceLimit)?;
+        completed
+            .try_reserve_exact(COST_WINDOW)
+            .map_err(|_| RuntimeFault::ResourceLimit)?;
+        Ok(Self {
+            window,
+            completed,
+            ewma_ns: None,
+            total_completed: 0,
+            total_censored: 0,
+            total_unknown: 0,
+            window_censored: 0,
+            window_unknown: 0,
+        })
+    }
+    fn observe(&mut self, observation: CostObservation) -> Result<(), RuntimeFault> {
+        // Refuse counter overflow before mutating the retained observations.
+        let next_completed = self.total_completed.checked_add(u64::from(
+            observation.disposition == CostDisposition::Completed,
+        ));
+        let next_censored = self.total_censored.checked_add(u64::from(matches!(
+            observation.disposition,
+            CostDisposition::Censored(_)
+        )));
+        let next_unknown = self
+            .total_unknown
+            .checked_add(u64::from(observation.elapsed == ObservedCost::Unknown));
+        let (Some(next_completed), Some(next_censored), Some(next_unknown)) =
+            (next_completed, next_censored, next_unknown)
+        else {
+            return Err(RuntimeFault::ResourceOverflow);
+        };
+        if self.window.len() == COST_WINDOW {
+            let old = self.window.pop_front().expect("bounded window is nonempty");
+            self.window_censored -=
+                usize::from(matches!(old.disposition, CostDisposition::Censored(_)));
+            self.window_unknown -= usize::from(old.elapsed == ObservedCost::Unknown);
+            if let Some(elapsed) = old.completed_elapsed() {
+                let position = self
+                    .completed
+                    .binary_search(&elapsed)
+                    .expect("completed observation has one sorted entry");
+                self.completed.remove(position);
+            }
+        }
+        self.window.push_back(observation);
+        self.window_censored += usize::from(matches!(
+            observation.disposition,
+            CostDisposition::Censored(_)
+        ));
+        self.window_unknown += usize::from(observation.elapsed == ObservedCost::Unknown);
+        self.total_completed = next_completed;
+        self.total_censored = next_censored;
+        self.total_unknown = next_unknown;
+        if let Some(elapsed) = observation.completed_elapsed() {
+            let position = self
+                .completed
+                .binary_search(&elapsed)
+                .unwrap_or_else(|position| position);
+            self.completed.insert(position, elapsed);
+            self.ewma_ns = Some(match self.ewma_ns {
+                None => elapsed.as_nanos(),
+                Some(previous) => (previous * 7 + elapsed.as_nanos()) / 8,
+            });
+        }
+        Ok(())
+    }
+    fn counts(&self) -> CostCounts {
+        CostCounts {
+            completed_in_window: self.completed.len(),
+            censored_in_window: self.window_censored,
+            unknown_in_window: self.window_unknown,
+            total_completed: self.total_completed,
+            total_censored: self.total_censored,
+            total_unknown: self.total_unknown,
+        }
+    }
+    fn estimate(&self) -> Option<CostEstimate> {
+        if self.completed.len() < CALIBRATION_SAMPLES {
+            return None;
+        }
+        let counts = self.counts();
+        Some(CostEstimate {
+            ewma: from_ns(self.ewma_ns.expect("completed sample initializes EWMA")),
+            p95: percentile95(&self.completed),
+            completed_in_window: counts.completed_in_window,
+            censored_in_window: counts.censored_in_window,
+            unknown_in_window: counts.unknown_in_window,
+            total_completed: counts.total_completed,
+            total_censored: counts.total_censored,
+            total_unknown: counts.total_unknown,
+        })
+    }
+    fn remaining(&self, elapsed: Duration) -> RemainingCost {
+        let Some(estimate) = self.estimate() else {
+            return RemainingCost::Unknown;
+        };
+        if elapsed < estimate.p95 {
+            return RemainingCost::Known(estimate.p95 - elapsed);
+        }
+        // An expected completion time is not a physical completion fence.
+        // An overdue job needs observed tail evidence; zero is never invented.
+        let first_tail = self.completed.partition_point(|sample| *sample <= elapsed);
+        let tail = &self.completed[first_tail..];
+        if tail.is_empty() {
+            RemainingCost::Unknown
+        } else {
+            RemainingCost::Known(percentile95(tail) - elapsed)
+        }
+    }
+    fn conditional_prediction_remaining(&self, elapsed: Duration) -> RemainingCost {
+        if self.estimate().is_none() {
+            return RemainingCost::Unknown;
+        }
+        // An already-running source is conditioned on not having completed.
+        // Even before the unconditional p95, use only observed surviving work.
+        let first_tail = self.completed.partition_point(|sample| *sample <= elapsed);
+        let tail = &self.completed[first_tail..];
+        if tail.is_empty() {
+            RemainingCost::Unknown
+        } else {
+            RemainingCost::Known(percentile95(tail) - elapsed)
+        }
+    }
+}
+
+fn from_ns(nanos: u128) -> Duration {
+    // Every input is Duration and this is its convex average.
+    Duration::new(
+        (nanos / 1_000_000_000) as u64,
+        (nanos % 1_000_000_000) as u32,
+    )
+}
+fn percentile95(sorted: &[Duration]) -> Duration {
+    let rank = (sorted.len() * 95).div_ceil(100);
+    sorted[rank - 1]
+}
+
+/// Bounded and deterministic: no allocation or sorting on an estimate query.
+#[derive(Debug)]
+pub struct CostEstimator {
+    classes: BTreeMap<CostClass, [Series; STAGES]>,
+    max_classes: usize,
+}
+impl CostEstimator {
+    pub fn new(max_classes: usize) -> Result<Self, RuntimeFault> {
+        if max_classes == 0 || max_classes > 4096 {
+            return Err(RuntimeFault::InvalidLimits);
+        }
+        Ok(Self {
+            classes: BTreeMap::new(),
+            max_classes,
+        })
+    }
+    pub fn observe(
+        &mut self,
+        class: CostClass,
+        stage: CostStage,
+        observation: CostObservation,
+    ) -> Result<(), RuntimeFault> {
+        if !self.classes.contains_key(&class) {
+            if self.classes.len() == self.max_classes {
+                return Err(RuntimeFault::ResourceLimit);
+            }
+            // Allocate the complete bounded class before registering it.
+            let series = [
+                Series::try_new()?,
+                Series::try_new()?,
+                Series::try_new()?,
+                Series::try_new()?,
+                Series::try_new()?,
+                Series::try_new()?,
+                Series::try_new()?,
+                Series::try_new()?,
+                Series::try_new()?,
+                Series::try_new()?,
+                Series::try_new()?,
+                Series::try_new()?,
+            ];
+            self.classes.insert(class, series);
+        }
+        self.classes.get_mut(&class).expect("class is registered")[stage.index()]
+            .observe(observation)
+    }
+    pub fn class_count(&self) -> usize {
+        self.classes.len()
+    }
+    pub fn counts(&self, class: CostClass, stage: CostStage) -> Option<CostCounts> {
+        self.classes
+            .get(&class)
+            .map(|series| series[stage.index()].counts())
+    }
+    pub fn estimate(&self, class: CostClass, stage: CostStage) -> Option<CostEstimate> {
+        if matches!(class.cache, CacheClass::Unknown | CacheClass::Mixed) {
+            return None;
+        }
+        self.classes
+            .get(&class)
+            .and_then(|series| series[stage.index()].estimate())
+    }
+    pub fn remaining(
+        &self,
+        class: CostClass,
+        stage: CostStage,
+        elapsed: Duration,
+    ) -> RemainingCost {
+        if matches!(class.cache, CacheClass::Unknown | CacheClass::Mixed) {
+            return RemainingCost::Unknown;
+        }
+        self.classes
+            .get(&class)
+            .map_or(RemainingCost::Unknown, |series| {
+                series[stage.index()].remaining(elapsed)
+            })
+    }
+    /// Pending invocation/cache disposition is not yet observed. Consider
+    /// both Fresh and Warm, and each matching Hit/Miss/Mixed source separately;
+    /// never pool their observations to manufacture eight completed samples.
+    pub fn service_prediction_envelope(
+        &self,
+        query: CostClass,
+    ) -> Option<ServicePredictionEnvelope> {
+        let mut envelope: Option<ServicePredictionEnvelope> = None;
+        for source in prediction_sources(query) {
+            let Some(stages) = self.classes.get(&source) else {
+                continue;
+            };
+            let series = &stages[CostStage::GpuService.index()];
+            if series.completed.is_empty() {
+                continue;
+            }
+            // A known but uncalibrated possible source must not disappear from
+            // the envelope merely because another class has faster samples.
+            let estimate = series.estimate()?;
+            match &mut envelope {
+                Some(envelope) => {
+                    envelope.source_class_count += 1;
+                    if estimate.p95 > envelope.estimate.p95 {
+                        envelope.estimate = estimate;
+                    }
+                }
+                None => {
+                    envelope = Some(ServicePredictionEnvelope {
+                        estimate,
+                        source_class_count: 1,
+                    });
+                }
+            }
+        }
+        envelope
+    }
+    fn predicted_service_remaining(&self, query: CostClass, elapsed: Duration) -> RemainingCost {
+        let mut remaining = None;
+        for source in prediction_sources(query) {
+            let Some(stages) = self.classes.get(&source) else {
+                continue;
+            };
+            let series = &stages[CostStage::GpuService.index()];
+            if series.completed.is_empty() {
+                continue;
+            }
+            match series.conditional_prediction_remaining(elapsed) {
+                RemainingCost::Known(value) => {
+                    remaining = Some(remaining.map_or(value, |old: Duration| old.max(value)));
+                }
+                // Includes an uncalibrated source or an overdue source with
+                // no conditional tail. Another source cannot prove its fence.
+                RemainingCost::Unknown => return RemainingCost::Unknown,
+            }
+        }
+        remaining.map_or(RemainingCost::Unknown, RemainingCost::Known)
+    }
+    /// Separate S prediction API. Strict actual-class estimates/backlog
+    /// remain unchanged; this envelope does not establish a pending cache hit.
+    pub fn predicted_gpu_backlog(
+        &self,
+        running: Option<RunningCost>,
+        queued: &[CostClass],
+    ) -> Result<BacklogEstimate, RuntimeFault> {
+        if queued.len() > MAX_ROLE_BACKLOG {
+            return Err(RuntimeFault::ResourceLimit);
+        }
+        let mut total = Duration::ZERO;
+        let mut unknown = false;
+        if let Some(running) = running {
+            let remaining = match running.elapsed {
+                ObservedCost::Known(elapsed) => {
+                    self.predicted_service_remaining(running.class, elapsed)
+                }
+                ObservedCost::Unknown => RemainingCost::Unknown,
+            };
+            match remaining {
+                RemainingCost::Known(value) => total = value,
+                RemainingCost::Unknown => unknown = true,
+            }
+        }
+        for class in queued {
+            match self.service_prediction_envelope(*class) {
+                Some(envelope) => {
+                    total = total
+                        .checked_add(envelope.estimate.p95)
+                        .ok_or(RuntimeFault::ResourceOverflow)?;
+                }
+                None => unknown = true,
+            }
+        }
+        Ok(if unknown {
+            BacklogEstimate::Unknown {
+                known_lower_bound: total,
+            }
+        } else {
+            BacklogEstimate::Known(total)
+        })
+    }
+    /// The caller separately proves a live question and an eligible post-Yield
+    /// consumer. Inputs must be owner-observed active intervals, excluding the
+    /// paused gap. This method only predicts wait, never semantic gain/utility.
+    pub fn feedback_wait_prediction(
+        &self,
+        class: CostClass,
+        since_publication: Duration,
+        lease_remaining: Duration,
+    ) -> Option<FeedbackWaitPrediction> {
+        self.estimate(class, CostStage::CpuProgressInterval)?;
+        let return_cost = self.estimate(class, CostStage::FeedbackReturn)?;
+        let resume_cost = self.estimate(class, CostStage::CpuResumeAdmissionAndRestore)?;
+        let minimum_interval = *self.classes.get(&class)?[CostStage::CpuProgressInterval.index()]
+            .completed
+            .first()?;
+        let baseline_wait = minimum_interval
+            .saturating_sub(since_publication)
+            .min(lease_remaining);
+        let gain_before_return_cost = baseline_wait.saturating_sub(resume_cost.p95);
+        if gain_before_return_cost <= return_cost.p95 {
+            return None;
+        }
+        Some(FeedbackWaitPrediction {
+            baseline_wait,
+            gain_before_return_cost,
+            return_cost,
+            resume_cost,
+        })
+    }
+    /// The caller separately proves an owner-issued go, an actual coherent
+    /// tuple and a live exact scope. Completed owner timings predict only
+    /// scheduling wait; they do not attest utility or native work completion.
+    pub fn external_feedback_wait_prediction(
+        &self,
+        class: CostClass,
+        since_publication: Duration,
+        quantum_remaining: Duration,
+    ) -> Option<ExternalFeedbackWaitPrediction> {
+        self.estimate(class, CostStage::ExternalCoherentTupleInterval)?;
+        let stop_drain_cost = self.estimate(class, CostStage::ExternalStopDrain)?;
+        let return_cost = self.estimate(class, CostStage::FeedbackReturn)?;
+        let minimum_interval = *self.classes.get(&class)?
+            [CostStage::ExternalCoherentTupleInterval.index()]
+        .completed
+        .first()?;
+        let baseline_wait = minimum_interval
+            .saturating_sub(since_publication)
+            .min(quantum_remaining);
+        let gain_before_return_cost = baseline_wait.saturating_sub(stop_drain_cost.p95);
+        if gain_before_return_cost <= return_cost.p95 {
+            return None;
+        }
+        Some(ExternalFeedbackWaitPrediction {
+            baseline_wait,
+            gain_before_return_cost,
+            return_cost,
+            stop_drain_cost,
+        })
+    }
+    /// One physical GPU execution plus at most sixteen logically queued roles.
+    /// These are physical role jobs. A public cache hit may still execute a
+    /// private role head; cache class alone never proves zero GPU work.
+    pub fn gpu_backlog(
+        &self,
+        running: Option<RunningCost>,
+        queued: &[CostClass],
+    ) -> Result<BacklogEstimate, RuntimeFault> {
+        if queued.len() > MAX_ROLE_BACKLOG {
+            return Err(RuntimeFault::ResourceLimit);
+        }
+        let mut total = Duration::ZERO;
+        let mut unknown = false;
+        if let Some(running) = running {
+            let remaining = match running.elapsed {
+                ObservedCost::Known(elapsed) => {
+                    self.remaining(running.class, CostStage::GpuService, elapsed)
+                }
+                ObservedCost::Unknown => RemainingCost::Unknown,
+            };
+            match remaining {
+                RemainingCost::Known(value) => total = value,
+                RemainingCost::Unknown => unknown = true,
+            }
+        }
+        for class in queued {
+            match self.estimate(*class, CostStage::GpuService) {
+                Some(estimate) => {
+                    total = total
+                        .checked_add(estimate.p95)
+                        .ok_or(RuntimeFault::ResourceOverflow)?
+                }
+                None => unknown = true,
+            }
+        }
+        Ok(if unknown {
+            BacklogEstimate::Unknown {
+                known_lower_bound: total,
+            }
+        } else {
+            BacklogEstimate::Known(total)
+        })
+    }
+}
+
+fn prediction_sources(query: CostClass) -> [CostClass; 6] {
+    // All other identity fields stay exact. Six map lookups avoid scanning or
+    // copying the full class table on each manager control tick.
+    [
+        (InvocationClass::Fresh, CacheClass::Hit),
+        (InvocationClass::Fresh, CacheClass::Miss),
+        (InvocationClass::Fresh, CacheClass::Mixed),
+        (InvocationClass::Warm, CacheClass::Hit),
+        (InvocationClass::Warm, CacheClass::Miss),
+        (InvocationClass::Warm, CacheClass::Mixed),
+    ]
+    .map(|(invocation, cache)| CostClass {
+        invocation,
+        cache,
+        ..query
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn class() -> CostClass {
+        CostClass {
+            model: [1; 32],
+            role_or_checker: [2; 32],
+            input_bucket: 8,
+            invocation: InvocationClass::Fresh,
+            cache: CacheClass::Miss,
+            device: [3; 32],
+        }
+    }
+    fn complete(estimator: &mut CostEstimator, stage: CostStage, nanos: u64) {
+        complete_class(estimator, class(), stage, nanos);
+    }
+    fn complete_class(
+        estimator: &mut CostEstimator,
+        class: CostClass,
+        stage: CostStage,
+        nanos: u64,
+    ) {
+        estimator
+            .observe(
+                class,
+                stage,
+                CostObservation {
+                    elapsed: ObservedCost::Known(Duration::from_nanos(nanos)),
+                    disposition: CostDisposition::Completed,
+                },
+            )
+            .unwrap();
+    }
+    fn calibrate(estimator: &mut CostEstimator, class: CostClass, stage: CostStage, nanos: u64) {
+        for _ in 0..CALIBRATION_SAMPLES {
+            complete_class(estimator, class, stage, nanos);
+        }
+    }
+    #[test]
+    fn stage_and_class_calibration_never_use_censored_samples() {
+        let mut estimator = CostEstimator::new(2).unwrap();
+        for _ in 0..7 {
+            complete(&mut estimator, CostStage::GpuService, 80);
+        }
+        for _ in 0..9 {
+            estimator
+                .observe(
+                    class(),
+                    CostStage::GpuService,
+                    CostObservation {
+                        elapsed: ObservedCost::Known(Duration::from_secs(99)),
+                        disposition: CostDisposition::Censored(CensorReason::Interrupted),
+                    },
+                )
+                .unwrap();
+        }
+        assert!(estimator.estimate(class(), CostStage::GpuService).is_none());
+        complete(&mut estimator, CostStage::GpuService, 160);
+        let estimate = estimator.estimate(class(), CostStage::GpuService).unwrap();
+        assert_eq!(estimate.ewma, Duration::from_nanos(90));
+        assert_eq!(estimate.p95, Duration::from_nanos(160));
+        assert_eq!(estimate.censored_in_window, 9);
+        assert!(estimator.estimate(class(), CostStage::Acceptance).is_none());
+        let mut warm = class();
+        warm.invocation = InvocationClass::Warm;
+        assert!(estimator.estimate(warm, CostStage::GpuService).is_none());
+        for _ in 0..COST_WINDOW {
+            estimator
+                .observe(
+                    class(),
+                    CostStage::GpuService,
+                    CostObservation {
+                        elapsed: ObservedCost::Known(Duration::ZERO),
+                        disposition: CostDisposition::Censored(CensorReason::Throttled),
+                    },
+                )
+                .unwrap();
+        }
+        assert!(estimator.estimate(class(), CostStage::GpuService).is_none());
+        assert_eq!(
+            estimator
+                .counts(class(), CostStage::GpuService)
+                .unwrap()
+                .total_completed,
+            8
+        );
+    }
+    #[test]
+    fn unobserved_cache_retains_raw_counts_without_calibrating() {
+        let mut estimator = CostEstimator::new(1).unwrap();
+        let mut unknown = class();
+        unknown.cache = CacheClass::Unknown;
+        for _ in 0..CALIBRATION_SAMPLES {
+            estimator
+                .observe(
+                    unknown,
+                    CostStage::GpuService,
+                    CostObservation {
+                        elapsed: ObservedCost::Known(Duration::from_millis(2)),
+                        disposition: CostDisposition::Completed,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            estimator
+                .counts(unknown, CostStage::GpuService)
+                .unwrap()
+                .total_completed,
+            8
+        );
+        assert!(estimator.estimate(unknown, CostStage::GpuService).is_none());
+        assert_eq!(
+            estimator.remaining(unknown, CostStage::GpuService, Duration::ZERO),
+            RemainingCost::Unknown
+        );
+        assert_eq!(
+            estimator.gpu_backlog(None, &[unknown]).unwrap(),
+            BacklogEstimate::Unknown {
+                known_lower_bound: Duration::ZERO,
+            }
+        );
+    }
+    #[test]
+    fn overdue_physical_work_has_unknown_or_positive_observed_tail() {
+        let mut estimator = CostEstimator::new(1).unwrap();
+        for value in 1..=20 {
+            complete(&mut estimator, CostStage::GpuService, value);
+        }
+        assert_eq!(
+            estimator.remaining(class(), CostStage::GpuService, Duration::from_nanos(19)),
+            RemainingCost::Known(Duration::from_nanos(1))
+        );
+        assert_eq!(
+            estimator.remaining(class(), CostStage::GpuService, Duration::from_nanos(20)),
+            RemainingCost::Unknown
+        );
+        assert_eq!(
+            estimator
+                .gpu_backlog(
+                    Some(RunningCost {
+                        class: class(),
+                        elapsed: ObservedCost::Known(Duration::from_nanos(21))
+                    }),
+                    &[class()]
+                )
+                .unwrap(),
+            BacklogEstimate::Unknown {
+                known_lower_bound: Duration::from_nanos(19)
+            }
+        );
+    }
+    #[test]
+    fn class_limit_and_queue_limit_are_explicit() {
+        let mut estimator = CostEstimator::new(1).unwrap();
+        complete(&mut estimator, CostStage::GpuService, 1);
+        let mut other = class();
+        other.device = [4; 32];
+        assert_eq!(
+            estimator.observe(
+                other,
+                CostStage::GpuService,
+                CostObservation {
+                    elapsed: ObservedCost::Known(Duration::ZERO),
+                    disposition: CostDisposition::Completed
+                }
+            ),
+            Err(RuntimeFault::ResourceLimit)
+        );
+        assert_eq!(estimator.class_count(), 1);
+        assert_eq!(
+            estimator.gpu_backlog(None, &[class(); 17]),
+            Err(RuntimeFault::ResourceLimit)
+        );
+    }
+    #[test]
+    fn unknown_completed_and_censored_costs_remain_independent_facts() {
+        let mut estimator = CostEstimator::new(1).unwrap();
+        for _ in 0..7 {
+            complete(&mut estimator, CostStage::GpuService, 8);
+        }
+        estimator
+            .observe(
+                class(),
+                CostStage::GpuService,
+                CostObservation {
+                    elapsed: ObservedCost::Unknown,
+                    disposition: CostDisposition::Completed,
+                },
+            )
+            .unwrap();
+        estimator
+            .observe(
+                class(),
+                CostStage::GpuService,
+                CostObservation {
+                    elapsed: ObservedCost::Unknown,
+                    disposition: CostDisposition::Censored(CensorReason::ResourceContention),
+                },
+            )
+            .unwrap();
+        assert!(estimator.estimate(class(), CostStage::GpuService).is_none());
+        let counts = estimator.counts(class(), CostStage::GpuService).unwrap();
+        assert_eq!(counts.completed_in_window, 7);
+        assert_eq!(counts.censored_in_window, 1);
+        assert_eq!(counts.unknown_in_window, 2);
+        assert_eq!(counts.total_completed, 8);
+        assert_eq!(counts.total_censored, 1);
+        assert_eq!(counts.total_unknown, 2);
+        complete(&mut estimator, CostStage::GpuService, 8);
+        let estimate = estimator.estimate(class(), CostStage::GpuService).unwrap();
+        assert_eq!(estimate.p95, Duration::from_nanos(8));
+        assert_eq!(estimate.unknown_in_window, 2);
+    }
+    #[test]
+    fn prediction_envelope_spans_observed_cache_and_invocation_without_claiming_them() {
+        let mut estimator = CostEstimator::new(10).unwrap();
+        let mut hit = class();
+        hit.cache = CacheClass::Hit;
+        hit.invocation = InvocationClass::Warm;
+        let mut mixed = class();
+        mixed.cache = CacheClass::Mixed;
+        calibrate(&mut estimator, class(), CostStage::GpuService, 20);
+        calibrate(&mut estimator, hit, CostStage::GpuService, 10);
+        calibrate(&mut estimator, mixed, CostStage::GpuService, 40);
+        for cache in [CacheClass::Unknown, CacheClass::Cold] {
+            let mut excluded = class();
+            excluded.cache = cache;
+            calibrate(&mut estimator, excluded, CostStage::GpuService, 1000);
+        }
+        let mut mismatches = [class(); 4];
+        mismatches[0].model[0] = 4;
+        mismatches[1].role_or_checker[0] = 4;
+        mismatches[2].input_bucket = 16;
+        mismatches[3].device[0] = 4;
+        for mismatch in mismatches {
+            calibrate(&mut estimator, mismatch, CostStage::GpuService, 1000);
+        }
+        let mut pending = class();
+        pending.cache = CacheClass::Unknown;
+        let envelope = estimator.service_prediction_envelope(pending).unwrap();
+        assert_eq!(envelope.source_class_count(), 3);
+        assert_eq!(envelope.estimate().p95, Duration::from_nanos(40));
+        assert_eq!(envelope.estimate().completed_in_window, CALIBRATION_SAMPLES);
+        assert!(estimator.estimate(mixed, CostStage::GpuService).is_none());
+        assert!(estimator.estimate(pending, CostStage::GpuService).is_none());
+        assert_eq!(
+            estimator.remaining(mixed, CostStage::GpuService, Duration::ZERO),
+            RemainingCost::Unknown
+        );
+        assert_eq!(
+            estimator
+                .predicted_gpu_backlog(None, &[pending, hit])
+                .unwrap(),
+            BacklogEstimate::Known(Duration::from_nanos(80))
+        );
+    }
+    #[test]
+    fn possible_uncalibrated_source_cannot_be_omitted_or_pooled() {
+        let mut estimator = CostEstimator::new(2).unwrap();
+        calibrate(&mut estimator, class(), CostStage::GpuService, 10);
+        let mut mixed = class();
+        mixed.cache = CacheClass::Mixed;
+        for _ in 0..CALIBRATION_SAMPLES - 1 {
+            complete_class(&mut estimator, mixed, CostStage::GpuService, 100);
+        }
+        estimator
+            .observe(
+                mixed,
+                CostStage::GpuService,
+                CostObservation {
+                    elapsed: ObservedCost::Known(Duration::from_secs(1)),
+                    disposition: CostDisposition::Censored(CensorReason::Interrupted),
+                },
+            )
+            .unwrap();
+        assert!(estimator.service_prediction_envelope(class()).is_none());
+        assert_eq!(
+            estimator.predicted_gpu_backlog(None, &[class()]).unwrap(),
+            BacklogEstimate::Unknown {
+                known_lower_bound: Duration::ZERO,
+            }
+        );
+        complete_class(&mut estimator, mixed, CostStage::GpuService, 100);
+        assert_eq!(
+            estimator
+                .service_prediction_envelope(class())
+                .unwrap()
+                .estimate()
+                .p95,
+            Duration::from_nanos(100)
+        );
+    }
+    #[test]
+    fn prediction_requires_sources_and_preserves_any_unknown_running_tail() {
+        let mut estimator = CostEstimator::new(3).unwrap();
+        let mut pending = class();
+        pending.cache = CacheClass::Unknown;
+        calibrate(&mut estimator, pending, CostStage::GpuService, 200);
+        assert!(estimator.service_prediction_envelope(pending).is_none());
+        calibrate(&mut estimator, class(), CostStage::GpuService, 20);
+        let mut hit = class();
+        hit.cache = CacheClass::Hit;
+        calibrate(&mut estimator, hit, CostStage::GpuService, 10);
+        assert_eq!(
+            estimator
+                .predicted_gpu_backlog(
+                    Some(RunningCost {
+                        class: pending,
+                        elapsed: ObservedCost::Known(Duration::from_nanos(5)),
+                    }),
+                    &[pending],
+                )
+                .unwrap(),
+            BacklogEstimate::Known(Duration::from_nanos(35))
+        );
+        // The Hit source is overdue and has no tail. The Miss source's longer
+        // samples cannot turn it into a known remaining execution.
+        assert_eq!(
+            estimator
+                .predicted_gpu_backlog(
+                    Some(RunningCost {
+                        class: pending,
+                        elapsed: ObservedCost::Known(Duration::from_nanos(10)),
+                    }),
+                    &[pending],
+                )
+                .unwrap(),
+            BacklogEstimate::Unknown {
+                known_lower_bound: Duration::from_nanos(20),
+            }
+        );
+        assert_eq!(
+            estimator.predicted_gpu_backlog(None, &[pending; 17]),
+            Err(RuntimeFault::ResourceLimit)
+        );
+    }
+    #[test]
+    fn predicted_backlog_keeps_overflow_explicit() {
+        let mut estimator = CostEstimator::new(1).unwrap();
+        for _ in 0..CALIBRATION_SAMPLES {
+            estimator
+                .observe(
+                    class(),
+                    CostStage::GpuService,
+                    CostObservation {
+                        elapsed: ObservedCost::Known(Duration::MAX),
+                        disposition: CostDisposition::Completed,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            estimator.predicted_gpu_backlog(None, &[class(), class()]),
+            Err(RuntimeFault::ResourceOverflow)
+        );
+    }
+    #[test]
+    fn running_prediction_uses_surviving_tail_even_before_unconditional_p95() {
+        let mut estimator = CostEstimator::new(1).unwrap();
+        for elapsed in 1..=20 {
+            complete(&mut estimator, CostStage::GpuService, elapsed);
+        }
+        assert_eq!(
+            estimator.remaining(class(), CostStage::GpuService, Duration::from_nanos(18)),
+            RemainingCost::Known(Duration::from_nanos(1))
+        );
+        assert_eq!(
+            estimator
+                .predicted_gpu_backlog(
+                    Some(RunningCost {
+                        class: class(),
+                        elapsed: ObservedCost::Known(Duration::from_nanos(18)),
+                    }),
+                    &[],
+                )
+                .unwrap(),
+            BacklogEstimate::Known(Duration::from_nanos(2))
+        );
+    }
+    #[test]
+    fn feedback_wait_requires_all_three_owner_costs_and_a_positive_net_reduction() {
+        let mut estimator = CostEstimator::new(1).unwrap();
+        calibrate(&mut estimator, class(), CostStage::CpuProgressInterval, 10);
+        calibrate(&mut estimator, class(), CostStage::FeedbackReturn, 2);
+        for _ in 0..CALIBRATION_SAMPLES - 1 {
+            complete(&mut estimator, CostStage::CpuResumeAdmissionAndRestore, 1);
+        }
+        assert!(estimator
+            .feedback_wait_prediction(class(), Duration::ZERO, Duration::from_nanos(20))
+            .is_none());
+        complete(&mut estimator, CostStage::CpuResumeAdmissionAndRestore, 1);
+        let prediction = estimator
+            .feedback_wait_prediction(class(), Duration::from_nanos(2), Duration::from_nanos(20))
+            .unwrap();
+        assert_eq!(prediction.baseline_wait(), Duration::from_nanos(8));
+        assert_eq!(
+            prediction.gain_before_return_cost(),
+            Duration::from_nanos(7)
+        );
+        assert_eq!(prediction.return_cost().p95, Duration::from_nanos(2));
+        assert_eq!(prediction.resume_cost().p95, Duration::from_nanos(1));
+        assert_eq!(prediction.net_reduction(), Duration::from_nanos(5));
+        assert!(estimator
+            .feedback_wait_prediction(class(), Duration::from_nanos(11), Duration::MAX)
+            .is_none());
+        assert!(estimator
+            .feedback_wait_prediction(class(), Duration::ZERO, Duration::from_nanos(3))
+            .is_none());
+        assert_eq!(
+            estimator
+                .feedback_wait_prediction(class(), Duration::ZERO, Duration::from_nanos(4))
+                .unwrap()
+                .net_reduction(),
+            Duration::from_nanos(1)
+        );
+    }
+    #[test]
+    fn feedback_baseline_uses_observed_minimum_not_a_slow_percentile() {
+        let mut estimator = CostEstimator::new(1).unwrap();
+        for interval in [5, 100, 100, 100, 100, 100, 100, 100] {
+            complete(&mut estimator, CostStage::CpuProgressInterval, interval);
+        }
+        calibrate(&mut estimator, class(), CostStage::FeedbackReturn, 2);
+        calibrate(
+            &mut estimator,
+            class(),
+            CostStage::CpuResumeAdmissionAndRestore,
+            1,
+        );
+        let prediction = estimator
+            .feedback_wait_prediction(class(), Duration::ZERO, Duration::MAX)
+            .unwrap();
+        assert_eq!(prediction.baseline_wait(), Duration::from_nanos(5));
+        assert_eq!(prediction.net_reduction(), Duration::from_nanos(2));
+    }
+    #[test]
+    fn external_wait_requires_eight_completed_known_samples_for_each_owner_phase() {
+        let phases = [
+            (CostStage::ExternalCoherentTupleInterval, 20),
+            (CostStage::ExternalStopDrain, 3),
+            (CostStage::FeedbackReturn, 2),
+        ];
+        for (missing_stage, missing_nanos) in phases {
+            let mut estimator = CostEstimator::new(1).unwrap();
+            for (stage, nanos) in phases {
+                let count = if stage == missing_stage {
+                    CALIBRATION_SAMPLES - 1
+                } else {
+                    CALIBRATION_SAMPLES
+                };
+                for _ in 0..count {
+                    complete(&mut estimator, stage, nanos);
+                }
+            }
+            for observation in [
+                CostObservation {
+                    elapsed: ObservedCost::Known(Duration::from_nanos(99)),
+                    disposition: CostDisposition::Censored(CensorReason::Interrupted),
+                },
+                CostObservation {
+                    elapsed: ObservedCost::Unknown,
+                    disposition: CostDisposition::Completed,
+                },
+            ] {
+                estimator
+                    .observe(class(), missing_stage, observation)
+                    .unwrap();
+            }
+            assert!(estimator
+                .external_feedback_wait_prediction(class(), Duration::ZERO, Duration::MAX)
+                .is_none());
+            complete(&mut estimator, missing_stage, missing_nanos);
+            assert_eq!(
+                estimator
+                    .external_feedback_wait_prediction(class(), Duration::ZERO, Duration::MAX)
+                    .unwrap()
+                    .net_reduction(),
+                Duration::from_nanos(15)
+            );
+        }
+    }
+    #[test]
+    fn external_wait_uses_minimum_tuple_interval_and_both_return_costs() {
+        let mut estimator = CostEstimator::new(1).unwrap();
+        for interval in [20, 100, 100, 100, 100, 100, 100, 100] {
+            complete(
+                &mut estimator,
+                CostStage::ExternalCoherentTupleInterval,
+                interval,
+            );
+        }
+        for (stop_drain, feedback_return) in [
+            (1, 1),
+            (1, 1),
+            (1, 1),
+            (1, 1),
+            (1, 1),
+            (1, 1),
+            (1, 1),
+            (5, 3),
+        ] {
+            complete(&mut estimator, CostStage::ExternalStopDrain, stop_drain);
+            complete(&mut estimator, CostStage::FeedbackReturn, feedback_return);
+        }
+        let prediction = estimator
+            .external_feedback_wait_prediction(
+                class(),
+                Duration::from_nanos(2),
+                Duration::from_nanos(17),
+            )
+            .unwrap();
+        assert_eq!(prediction.baseline_wait(), Duration::from_nanos(17));
+        assert_eq!(prediction.stop_drain_cost().p95, Duration::from_nanos(5));
+        assert_eq!(prediction.return_cost().p95, Duration::from_nanos(3));
+        assert_eq!(
+            prediction.gain_before_return_cost(),
+            Duration::from_nanos(12)
+        );
+        assert_eq!(prediction.net_reduction(), Duration::from_nanos(9));
+        // Equal or negative net reduction cannot issue scheduling advice.
+        assert!(estimator
+            .external_feedback_wait_prediction(class(), Duration::ZERO, Duration::from_nanos(8))
+            .is_none());
+        assert!(estimator
+            .external_feedback_wait_prediction(class(), Duration::from_nanos(20), Duration::MAX)
+            .is_none());
+    }
+    #[test]
+    fn external_wait_rejects_unknown_and_mixed_cache_even_with_raw_samples() {
+        let mut estimator = CostEstimator::new(2).unwrap();
+        for cache in [CacheClass::Unknown, CacheClass::Mixed] {
+            let source = CostClass { cache, ..class() };
+            for (stage, nanos) in [
+                (CostStage::ExternalCoherentTupleInterval, 20),
+                (CostStage::ExternalStopDrain, 3),
+                (CostStage::FeedbackReturn, 2),
+            ] {
+                calibrate(&mut estimator, source, stage, nanos);
+            }
+            assert!(estimator
+                .external_feedback_wait_prediction(source, Duration::ZERO, Duration::MAX)
+                .is_none());
+        }
+    }
+    #[test]
+    fn external_wait_neither_requires_nor_attests_an_exact_stack_resume() {
+        let mut estimator = CostEstimator::new(1).unwrap();
+        for (stage, nanos) in [
+            (CostStage::ExternalCoherentTupleInterval, 20),
+            (CostStage::ExternalStopDrain, 3),
+            (CostStage::FeedbackReturn, 2),
+        ] {
+            calibrate(&mut estimator, class(), stage, nanos);
+        }
+        let prediction = estimator
+            .external_feedback_wait_prediction(class(), Duration::ZERO, Duration::MAX)
+            .unwrap();
+        assert!(estimator
+            .estimate(class(), CostStage::CpuResumeAdmissionAndRestore)
+            .is_none());
+        assert!(estimator
+            .feedback_wait_prediction(class(), Duration::ZERO, Duration::MAX)
+            .is_none());
+        calibrate(&mut estimator, class(), CostStage::CpuProgressInterval, 100);
+        calibrate(
+            &mut estimator,
+            class(),
+            CostStage::CpuResumeAdmissionAndRestore,
+            99,
+        );
+        assert_eq!(
+            estimator
+                .external_feedback_wait_prediction(class(), Duration::ZERO, Duration::MAX)
+                .unwrap(),
+            prediction
+        );
+    }
+}

@@ -73,6 +73,16 @@ pub struct OriginalProcessInput<'a> {
     pub window: OriginalProcessWindow,
 }
 
+/// 수치 캡처의 고정 FP32 조건만 전달한다. 임의 환경이나 부모의 CUDA/
+/// 인증/검색 경로를 상속하는 접점이 아니며 기존 실행의 환경은 보존한다.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OriginalNumericalEnvironment {
+    // Keep the closed policy constructible at the platform refusal boundary.
+    // Its actual original-process consumer is Linux-only.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Fp32Tf32Off,
+}
+
 /// Observed transport only. This is not model/source admission, physical native
 /// completion, a cgroup resource proof or a checked next Query capability.
 #[derive(Debug, Serialize)]
@@ -91,6 +101,8 @@ pub struct OriginalProcessObservation {
     finished_before_whole: bool,
     cancelled_at_return: bool,
     ownership_lost: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    numerical_environment: Option<&'static str>,
     // Process-local observations are not added to the legacy transport/1 JSON.
     #[serde(skip)]
     loaded_image: Option<LoadedImageObservation>,
@@ -148,6 +160,7 @@ impl OriginalProcessObservation {
             finished_before_whole: false,
             cancelled_at_return: false,
             ownership_lost: false,
+            numerical_environment: None,
             loaded_image: None,
             first_input_written_ns: None,
             loaded_image_progress: LoadedImageProgress::default(),
@@ -155,6 +168,9 @@ impl OriginalProcessObservation {
     }
     pub fn written_bytes(&self) -> Option<usize> {
         self.written_bytes
+    }
+    pub fn numerical_environment(&self) -> Option<&'static str> {
+        self.numerical_environment
     }
     pub fn stdout_eof(&self) -> bool {
         self.stdout_eof
@@ -457,7 +473,9 @@ pub struct ArtifactWatch {
 pub struct OwnedArtifactTreeWatch {
     pub max_total_bytes: u64,
     pub max_file_bytes: u64,
-    /// Maximum regular files. Directories have a separate equal count limit,
+    /// Maximum regular files in a generic watch; an admitted delegated domain
+    /// also counts each explicitly verified alias as a nondirectory entry.
+    /// Directories have a separate equal count limit,
     /// and at most twice this many entries are examined per snapshot, including
     /// entries that disappear before their inode can be opened.
     pub max_files: usize,
@@ -466,15 +484,80 @@ pub struct OwnedArtifactTreeWatch {
 }
 
 impl OwnedArtifactTreeWatch {
+    const MAX_FILES: usize = 4096;
+    const MAX_DEPTH: usize = 32;
+
+    /// Use the supervisor's finite traversal bounds with the caller's original
+    /// byte budgets. Admission still validates positive byte limits before spawn.
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn bounded_output(max_total_bytes: u64, max_file_bytes: u64) -> Self {
+        Self {
+            max_total_bytes,
+            max_file_bytes,
+            max_files: Self::MAX_FILES,
+            max_depth: Self::MAX_DEPTH,
+        }
+    }
+
     fn validate(&self) -> Result<(), ArenaError> {
         if self.max_total_bytes == 0
             || self.max_file_bytes == 0
-            || !(1..=4096).contains(&self.max_files)
-            || self.max_depth > 32
+            || !(1..=Self::MAX_FILES).contains(&self.max_files)
+            || self.max_depth > Self::MAX_DEPTH
         {
             return Err(ArenaError::Budget(
                 "artifact tree requires positive bytes, 1..4096 files and depth at most 32".into(),
             ));
+        }
+        Ok(())
+    }
+}
+
+/// A crate-owned, already admitted immutable subtree. Generic watches never
+/// construct this capability or admit links. Implementations must bind both the
+/// retained directory inode and its original named parent/entry on every match
+/// check, including checks against a different directory.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) trait DelegatedArtifactTreeWatch {
+    fn matches_directory(&self, directory: &File) -> Result<bool, &'static str>;
+    fn observe_directory(&self, directory: &File) -> Result<DelegatedTreeSnapshot, &'static str>;
+}
+
+/// Descendants only: the caller already counted the delegated root directory.
+/// `files` includes explicitly verified aliases; `bytes` sums their nofollow
+/// sizes and regular sizes, never a second copy of an alias target payload.
+/// `depth` is the maximum descendant directory depth, with this root at zero.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DelegatedTreeSnapshot {
+    pub(crate) bytes: u64,
+    pub(crate) files: usize,
+    pub(crate) directories: usize,
+    pub(crate) entries: usize,
+    pub(crate) max_file_bytes: u64,
+    pub(crate) depth: usize,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl DelegatedTreeSnapshot {
+    /// Internal units and count coherence, before each caller applies its own
+    /// original aggregate caps. This does not establish admission or ownership.
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        let counted = self
+            .files
+            .checked_add(self.directories)
+            .ok_or("process.artifact_tree.delegated_snapshot")?;
+        let upper_bytes = u64::try_from(self.files)
+            .ok()
+            .and_then(|files| files.checked_mul(self.max_file_bytes));
+        if counted > self.entries
+            || self.depth > self.directories
+            || (self.directories == 0 && self.depth != 0)
+            || (self.directories != 0 && self.depth == 0)
+            || self.bytes > upper_bytes.ok_or("process.artifact_tree.delegated_snapshot")?
+            || (self.files == 0 && self.max_file_bytes != 0)
+        {
+            return Err("process.artifact_tree.delegated_snapshot");
         }
         Ok(())
     }
@@ -797,7 +880,9 @@ pub fn supervise_input_in_original_window(
     watch: &OwnedArtifactTreeWatch,
     input: OriginalProcessInput<'_>,
 ) -> Result<OriginalProcessOutput, ArenaError> {
-    supervise_original_input(program, args, directory, limits, cancel, watch, input, None)
+    supervise_original_input(
+        program, args, directory, limits, cancel, watch, input, None, None, None,
+    )
 }
 
 /// Only internal callers may add content checks on the actual proc executable.
@@ -824,6 +909,92 @@ pub(crate) fn supervise_verified_input_in_original_window(
         watch,
         input,
         Some(verify_loaded),
+        None,
+        None,
+    )
+}
+
+#[cfg(all(target_os = "linux", any(feature = "pals-collection-onnx", test)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_numerical_input_in_original_window(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    input: OriginalProcessInput<'_>,
+    verify_loaded: LoadedImageVerifier<'_>,
+    environment: OriginalNumericalEnvironment,
+) -> Result<OriginalProcessOutput, ArenaError> {
+    supervise_original_input(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        watch,
+        input,
+        Some(verify_loaded),
+        Some(environment),
+        None,
+    )
+}
+
+/// The same original process owner with one crate-admitted immutable subtree.
+/// Ordinary callers have no link permission and keep the original entrypoint.
+#[cfg(all(target_os = "linux", any(feature = "pals-collection-onnx", test)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_verified_input_with_delegated_tree_in_original_window(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    input: OriginalProcessInput<'_>,
+    verify_loaded: LoadedImageVerifier<'_>,
+    delegated: &dyn DelegatedArtifactTreeWatch,
+) -> Result<OriginalProcessOutput, ArenaError> {
+    supervise_original_input(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        watch,
+        input,
+        Some(verify_loaded),
+        None,
+        Some(delegated),
+    )
+}
+
+#[cfg(all(target_os = "linux", any(feature = "pals-collection-onnx", test)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supervise_numerical_input_with_delegated_tree_in_original_window(
+    program: &File,
+    args: &[OsString],
+    directory: &File,
+    limits: ProcessLimits,
+    cancel: Option<&AtomicBool>,
+    watch: &OwnedArtifactTreeWatch,
+    input: OriginalProcessInput<'_>,
+    verify_loaded: LoadedImageVerifier<'_>,
+    environment: OriginalNumericalEnvironment,
+    delegated: &dyn DelegatedArtifactTreeWatch,
+) -> Result<OriginalProcessOutput, ArenaError> {
+    supervise_original_input(
+        program,
+        args,
+        directory,
+        limits,
+        cancel,
+        watch,
+        input,
+        Some(verify_loaded),
+        Some(environment),
+        Some(delegated),
     )
 }
 
@@ -837,6 +1008,8 @@ fn supervise_original_input(
     watch: &OwnedArtifactTreeWatch,
     input: OriginalProcessInput<'_>,
     verify_loaded: Option<LoadedImageVerifier<'_>>,
+    numerical_environment: Option<OriginalNumericalEnvironment>,
+    delegated: Option<&dyn DelegatedArtifactTreeWatch>,
 ) -> Result<OriginalProcessOutput, ArenaError> {
     input.window.check_before_spawn(limits)?;
     watch.validate()?;
@@ -848,6 +1021,7 @@ fn supervise_original_input(
     #[cfg(target_os = "linux")]
     {
         let mut observation = OriginalProcessObservation::new(input.bytes.len());
+        observation.numerical_environment = numerical_environment.map(|_| "NVIDIA_TF32_OVERRIDE=0");
         observation.original_supervisor_entry_ns = input.window.elapsed_ns(Instant::now());
         if !directory
             .metadata()
@@ -867,13 +1041,17 @@ fn supervise_original_input(
             directory,
             limits,
             cancel,
-            Some(linux::ArtifactObservation::Tree(watch)),
+            Some(match delegated {
+                Some(delegated) => linux::ArtifactObservation::TreeDelegated(watch, delegated),
+                None => linux::ArtifactObservation::Tree(watch),
+            }),
             None,
             linux::InvocationIo {
                 commands: Some(input.bytes),
                 original: Some(input.window),
                 observation: Some(&mut observation),
                 verify_loaded,
+                numerical_environment,
             },
         )?;
         let returned = Instant::now();
@@ -889,7 +1067,15 @@ fn supervise_original_input(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (program, args, directory, cancel, verify_loaded);
+        let _ = (
+            program,
+            args,
+            directory,
+            cancel,
+            verify_loaded,
+            numerical_environment,
+            delegated,
+        );
         Err(ArenaError::Invalid(
             "original input supervision currently requires Linux".into(),
         ))
@@ -922,19 +1108,37 @@ mod linux {
         pub original: Option<OriginalProcessWindow>,
         pub observation: Option<&'b mut OriginalProcessObservation>,
         pub verify_loaded: Option<LoadedImageVerifier<'v>>,
+        pub numerical_environment: Option<OriginalNumericalEnvironment>,
     }
 
     #[derive(Clone, Copy)]
     pub(super) enum ArtifactObservation<'a> {
         Flat(&'a ArtifactWatch),
         Tree(&'a OwnedArtifactTreeWatch),
+        TreeDelegated(
+            &'a OwnedArtifactTreeWatch,
+            &'a dyn DelegatedArtifactTreeWatch,
+        ),
     }
 
-    impl ArtifactObservation<'_> {
+    impl<'a> ArtifactObservation<'a> {
         fn enforcement(self) -> String {
             match self {
                 Self::Flat(_) => "regular_file_snapshot".into(),
-                Self::Tree(_) => "owned_tree_snapshot".into(),
+                Self::Tree(_) | Self::TreeDelegated(..) => "owned_tree_snapshot".into(),
+            }
+        }
+
+        fn tree(
+            self,
+        ) -> Option<(
+            &'a OwnedArtifactTreeWatch,
+            Option<&'a dyn DelegatedArtifactTreeWatch>,
+        )> {
+            match self {
+                Self::Flat(_) => None,
+                Self::Tree(watch) => Some((watch, None)),
+                Self::TreeDelegated(watch, delegated) => Some((watch, Some(delegated))),
             }
         }
     }
@@ -965,6 +1169,7 @@ mod linux {
             original,
             mut observation,
             mut verify_loaded,
+            numerical_environment,
         } = io;
         if let Some(window) = original {
             window.check_before_spawn(limits)?;
@@ -1002,6 +1207,10 @@ mod linux {
             .envs(source_profile_environment(std::env::var_os(
                 "RZ_ARENA_SOURCE_PROFILE",
             )))
+            .envs(
+                numerical_environment
+                    .map(|OriginalNumericalEnvironment::Fp32Tf32Off| ("NVIDIA_TF32_OVERRIDE", "0")),
+            )
             .stdin(if commands.is_some() {
                 Stdio::piped()
             } else {
@@ -1068,7 +1277,7 @@ mod linux {
         let mut stdout_eof = false;
         let mut stderr_eof = false;
         let mut cleanup_started = None;
-        let preserve_unverified = matches!(watch, Some(ArtifactObservation::Tree(_)));
+        let preserve_unverified = watch.is_some_and(|watch| watch.tree().is_some());
         let mut loaded_image_checked = false;
         let mut loaded_image_progress = LoadedImageProgress::default();
         loop {
@@ -1098,8 +1307,8 @@ mod linux {
                     }
                 }
             }
-            if let Some(ArtifactObservation::Tree(watch)) = watch {
-                observe_tree(&cwd_file, watch, &mut receipt, &mut stop);
+            if let Some((watch, delegated)) = watch.and_then(ArtifactObservation::tree) {
+                observe_tree(&cwd_file, watch, delegated, &mut receipt, &mut stop);
             }
             if stop.is_none()
                 && !loaded_image_checked
@@ -1305,8 +1514,8 @@ mod linux {
                 // pass's snapshot and exit observation. Inspect that final
                 // tree before reporting a completed run, without changing the
                 // older flat API's observation schedule.
-                if let Some(ArtifactObservation::Tree(watch)) = watch {
-                    observe_tree(&cwd_file, watch, &mut receipt, &mut stop);
+                if let Some((watch, delegated)) = watch.and_then(ArtifactObservation::tree) {
+                    observe_tree(&cwd_file, watch, delegated, &mut receipt, &mut stop);
                 }
                 receipt.group_cleanup = CleanupStatus::Gone;
                 break;
@@ -1618,15 +1827,21 @@ mod linux {
         files: usize,
         directories: usize,
         entries: usize,
+        delegated_matches: usize,
     }
 
     fn observe_tree(
         cwd: &File,
         watch: &OwnedArtifactTreeWatch,
+        delegated: Option<&dyn DelegatedArtifactTreeWatch>,
         receipt: &mut ProcessReceipt,
         stop: &mut Option<ProcessStop>,
     ) {
-        let (bytes, failure) = match watched_tree_size(cwd, watch) {
+        let observed = match delegated {
+            Some(delegated) => watched_tree_size_with_delegation(cwd, watch, Some(delegated)),
+            None => watched_tree_size(cwd, watch),
+        };
+        let (bytes, failure) = match observed {
             Ok(bytes) => (bytes, None),
             Err(failure) => (failure.bytes, Some(failure)),
         };
@@ -1647,8 +1862,25 @@ mod linux {
         cwd: &File,
         watch: &OwnedArtifactTreeWatch,
     ) -> Result<u64, TreeWatchFailure> {
+        watched_tree_size_with_delegation(cwd, watch, None)
+    }
+
+    fn watched_tree_size_with_delegation(
+        cwd: &File,
+        watch: &OwnedArtifactTreeWatch,
+        delegated: Option<&dyn DelegatedArtifactTreeWatch>,
+    ) -> Result<u64, TreeWatchFailure> {
         let mut snapshot = TreeSnapshot::default();
-        match visit_tree(cwd, watch, 0, &mut snapshot) {
+        let result = visit_tree(cwd, watch, delegated, 0, &mut snapshot).and_then(|()| {
+            if delegated.is_some() && snapshot.delegated_matches != 1 {
+                return Err((
+                    ProcessStop::IoFailure,
+                    "process.artifact_tree.delegated_missing",
+                ));
+            }
+            Ok(())
+        });
+        match result {
             Ok(()) => Ok(snapshot.bytes),
             Err((stop, code)) => Err(TreeWatchFailure {
                 bytes: snapshot.bytes,
@@ -1661,9 +1893,33 @@ mod linux {
     fn visit_tree(
         directory: &File,
         watch: &OwnedArtifactTreeWatch,
+        delegated: Option<&dyn DelegatedArtifactTreeWatch>,
         depth: usize,
         snapshot: &mut TreeSnapshot,
     ) -> Result<(), (ProcessStop, &'static str)> {
+        if let Some(delegated) = delegated {
+            let matched = delegated
+                .matches_directory(directory)
+                .map_err(|code| (ProcessStop::IoFailure, code))?;
+            if matched {
+                // The stage root itself is never an exempt domain. One
+                // exact entry must be observed once per complete snapshot.
+                if depth == 0 || snapshot.delegated_matches != 0 {
+                    return Err((
+                        ProcessStop::IoFailure,
+                        "process.artifact_tree.delegated_identity",
+                    ));
+                }
+                snapshot.delegated_matches += 1;
+                let observed = delegated
+                    .observe_directory(directory)
+                    .map_err(|code| (ProcessStop::IoFailure, code))?;
+                observed
+                    .validate()
+                    .map_err(|code| (ProcessStop::IoFailure, code))?;
+                return merge_delegated(watch, depth, snapshot, &observed);
+            }
+        }
         // Opening '.' obtains a fresh readable directory description from the
         // already pinned inode, including an O_PATH root. It never reopens the
         // entry's former name, and its offset is not shared with the caller.
@@ -1731,7 +1987,7 @@ mod linux {
                 if depth >= watch.max_depth {
                     return Err((ProcessStop::ArtifactLimit, "process.artifact_tree.depth"));
                 }
-                visit_tree(&inode, watch, depth + 1, snapshot)?;
+                visit_tree(&inode, watch, delegated, depth + 1, snapshot)?;
             } else if metadata.is_file() {
                 if metadata.nlink() != 1 {
                     return Err((ProcessStop::IoFailure, "process.artifact_tree.hard_link"));
@@ -1766,6 +2022,70 @@ mod linux {
             } else {
                 return Err((ProcessStop::IoFailure, "process.artifact_tree.kind"));
             }
+        }
+        Ok(())
+    }
+
+    fn merge_delegated(
+        watch: &OwnedArtifactTreeWatch,
+        depth: usize,
+        snapshot: &mut TreeSnapshot,
+        observed: &DelegatedTreeSnapshot,
+    ) -> Result<(), (ProcessStop, &'static str)> {
+        if observed.max_file_bytes > watch.max_file_bytes {
+            return Err((
+                ProcessStop::ArtifactLimit,
+                "process.artifact_tree.file_bytes",
+            ));
+        }
+        if depth
+            .checked_add(observed.depth)
+            .is_none_or(|depth| depth > watch.max_depth)
+        {
+            return Err((ProcessStop::ArtifactLimit, "process.artifact_tree.depth"));
+        }
+        snapshot.files = snapshot.files.checked_add(observed.files).ok_or((
+            ProcessStop::ArtifactLimit,
+            "process.artifact_tree.file_count",
+        ))?;
+        if snapshot.files > watch.max_files {
+            return Err((
+                ProcessStop::ArtifactLimit,
+                "process.artifact_tree.file_count",
+            ));
+        }
+        snapshot.directories = snapshot
+            .directories
+            .checked_add(observed.directories)
+            .ok_or((
+                ProcessStop::ArtifactLimit,
+                "process.artifact_tree.directory_count",
+            ))?;
+        if snapshot.directories > watch.max_files {
+            return Err((
+                ProcessStop::ArtifactLimit,
+                "process.artifact_tree.directory_count",
+            ));
+        }
+        snapshot.entries = snapshot.entries.checked_add(observed.entries).ok_or((
+            ProcessStop::ArtifactLimit,
+            "process.artifact_tree.entry_count",
+        ))?;
+        if snapshot.entries > watch.max_files * 2 {
+            return Err((
+                ProcessStop::ArtifactLimit,
+                "process.artifact_tree.entry_count",
+            ));
+        }
+        snapshot.bytes = snapshot.bytes.checked_add(observed.bytes).ok_or((
+            ProcessStop::ArtifactLimit,
+            "process.artifact_tree.size_overflow",
+        ))?;
+        if snapshot.bytes > watch.max_total_bytes {
+            return Err((
+                ProcessStop::ArtifactLimit,
+                "process.artifact_tree.total_bytes",
+            ));
         }
         Ok(())
     }
@@ -2003,6 +2323,360 @@ mod linux {
                 // through a replacement entry or remove another test's tree.
                 let _ = std::fs::remove_dir(&self.0);
             }
+        }
+
+        struct FakeDelegatedTree {
+            root: OriginalTestDirectory,
+            directory: File,
+            name: PathBuf,
+            snapshot: DelegatedTreeSnapshot,
+        }
+        impl FakeDelegatedTree {
+            fn new() -> Self {
+                let root = OriginalTestDirectory::new();
+                let name = root.0.join("registered-cache");
+                std::fs::create_dir(&name).unwrap();
+                std::fs::write(name.join("payload.bin"), b"1234").unwrap();
+                std::os::unix::fs::symlink("payload.bin", name.join("alias")).unwrap();
+                Self {
+                    directory: File::open(&name).unwrap(),
+                    name,
+                    root,
+                    snapshot: DelegatedTreeSnapshot {
+                        bytes: 15,
+                        files: 2,
+                        directories: 0,
+                        entries: 2,
+                        max_file_bytes: 11,
+                        depth: 0,
+                    },
+                }
+            }
+        }
+        impl DelegatedArtifactTreeWatch for FakeDelegatedTree {
+            fn matches_directory(&self, directory: &File) -> Result<bool, &'static str> {
+                let held = self
+                    .directory
+                    .metadata()
+                    .map_err(|_| "test.delegated.metadata")?;
+                let named =
+                    std::fs::symlink_metadata(&self.name).map_err(|_| "test.delegated.binding")?;
+                if !named.is_dir() || (named.dev(), named.ino()) != (held.dev(), held.ino()) {
+                    return Err("test.delegated.binding");
+                }
+                let observed = directory
+                    .metadata()
+                    .map_err(|_| "test.delegated.metadata")?;
+                Ok((observed.dev(), observed.ino()) == (held.dev(), held.ino()))
+            }
+            fn observe_directory(
+                &self,
+                directory: &File,
+            ) -> Result<DelegatedTreeSnapshot, &'static str> {
+                if !self.matches_directory(directory)? {
+                    return Err("test.delegated.identity");
+                }
+                let names: std::collections::BTreeSet<_> = std::fs::read_dir(&self.name)
+                    .map_err(|_| "test.delegated.enumerate")?
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                if names != [OsString::from("alias"), OsString::from("payload.bin")].into() {
+                    return Err("test.delegated.unknown");
+                }
+                Ok(self.snapshot)
+            }
+        }
+        impl Drop for FakeDelegatedTree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(self.name.join("alias"));
+                let _ = std::fs::remove_file(self.name.join("payload.bin"));
+                let _ = std::fs::remove_dir(&self.name);
+            }
+        }
+
+        #[test]
+        fn delegated_tree_keeps_original_process_clock_and_generic_link_refusal() {
+            let tree = FakeDelegatedTree::new();
+            let cwd = tree.root.file();
+            let watch = OwnedArtifactTreeWatch::bounded_output(32, 16);
+            assert_eq!(
+                watched_tree_size(&cwd, &watch).unwrap_err().code,
+                "process.artifact_tree.kind"
+            );
+            assert_eq!(
+                watched_tree_size_with_delegation(&cwd, &watch, Some(&tree))
+                    .unwrap_or_else(|failure| panic!("{}", failure.code)),
+                15
+            );
+            let program = File::open("/bin/cat").unwrap();
+            let started = Instant::now();
+            let input = OriginalProcessInput {
+                bytes: b"original-delegated-input",
+                window: OriginalProcessWindow::new(
+                    started,
+                    started + Duration::from_secs(5),
+                    started + Duration::from_millis(5500),
+                )
+                .unwrap(),
+            };
+            let mut verify = |_: &File| Ok(());
+            let result = supervise_numerical_input_with_delegated_tree_in_original_window(
+                &program,
+                &[],
+                &cwd,
+                original_limits(),
+                None,
+                &watch,
+                input,
+                &mut verify,
+                OriginalNumericalEnvironment::Fp32Tf32Off,
+                &tree,
+            )
+            .unwrap();
+            assert!(result.transport_complete(), "{result:?}");
+            assert_eq!(result.process().stdout, input.bytes);
+            assert_eq!(result.process().receipt.watched_artifact_bytes, Some(15));
+            assert_eq!(result.checked_timing().unwrap().original_started(), started);
+            assert_eq!(
+                result.observation().numerical_environment(),
+                Some("NVIDIA_TF32_OVERRIDE=0")
+            );
+        }
+
+        #[test]
+        fn delegated_tree_refuses_extra_links_unknown_entries_rename_and_missing_match() {
+            let tree = FakeDelegatedTree::new();
+            let cwd = tree.root.file();
+            let watch = OwnedArtifactTreeWatch::bounded_output(32, 16);
+            let outside = tree.root.0.join("outside-alias");
+            std::os::unix::fs::symlink("registered-cache/payload.bin", &outside).unwrap();
+            assert_eq!(
+                watched_tree_size_with_delegation(&cwd, &watch, Some(&tree))
+                    .unwrap_err()
+                    .code,
+                "process.artifact_tree.kind"
+            );
+            std::fs::remove_file(outside).unwrap();
+            let inside = tree.name.join("undeclared");
+            std::os::unix::fs::symlink("payload.bin", &inside).unwrap();
+            assert_eq!(
+                watched_tree_size_with_delegation(&cwd, &watch, Some(&tree))
+                    .unwrap_err()
+                    .code,
+                "test.delegated.unknown"
+            );
+            std::fs::remove_file(inside).unwrap();
+            let moved = tree.root.0.join("moved-cache");
+            std::fs::rename(&tree.name, &moved).unwrap();
+            assert_eq!(
+                watched_tree_size_with_delegation(&cwd, &watch, Some(&tree))
+                    .unwrap_err()
+                    .code,
+                "test.delegated.binding"
+            );
+            std::fs::rename(&moved, &tree.name).unwrap();
+            let unrelated = OriginalTestDirectory::new();
+            assert_eq!(
+                watched_tree_size_with_delegation(&unrelated.file(), &watch, Some(&tree))
+                    .unwrap_err()
+                    .code,
+                "process.artifact_tree.delegated_missing"
+            );
+            assert_eq!(
+                watched_tree_size_with_delegation(&tree.directory, &watch, Some(&tree))
+                    .unwrap_err()
+                    .code,
+                "process.artifact_tree.delegated_identity"
+            );
+        }
+
+        #[test]
+        fn delegated_tree_sums_original_caps_and_refuses_incoherent_or_unknown_snapshot() {
+            let mut tree = FakeDelegatedTree::new();
+            let cwd = tree.root.file();
+            let plain = tree.root.0.join("plain.bin");
+            std::fs::write(&plain, b"123").unwrap();
+            // Both the 15-byte delegated domain and the 3-byte generic file
+            // fit independently; their total must still fail the original cap.
+            let total = OwnedArtifactTreeWatch::bounded_output(16, 16);
+            assert_eq!(
+                watched_tree_size_with_delegation(&cwd, &total, Some(&tree))
+                    .unwrap_err()
+                    .code,
+                "process.artifact_tree.total_bytes"
+            );
+            std::fs::remove_file(plain).unwrap();
+            let file = OwnedArtifactTreeWatch::bounded_output(32, 10);
+            assert_eq!(
+                watched_tree_size_with_delegation(&cwd, &file, Some(&tree))
+                    .unwrap_err()
+                    .code,
+                "process.artifact_tree.file_bytes"
+            );
+            let watch = OwnedArtifactTreeWatch::bounded_output(32, 16);
+            let limit_cases = [
+                (
+                    OwnedArtifactTreeWatch {
+                        max_files: 1,
+                        ..watch
+                    },
+                    tree.snapshot,
+                    "process.artifact_tree.file_count",
+                ),
+                (
+                    OwnedArtifactTreeWatch {
+                        max_depth: 0,
+                        ..watch
+                    },
+                    tree.snapshot,
+                    "process.artifact_tree.depth",
+                ),
+                (
+                    OwnedArtifactTreeWatch {
+                        max_files: 2,
+                        ..watch
+                    },
+                    DelegatedTreeSnapshot {
+                        entries: 4,
+                        ..tree.snapshot
+                    },
+                    "process.artifact_tree.entry_count",
+                ),
+                (
+                    OwnedArtifactTreeWatch {
+                        max_files: 2,
+                        ..watch
+                    },
+                    DelegatedTreeSnapshot {
+                        directories: 2,
+                        entries: 4,
+                        depth: 1,
+                        ..tree.snapshot
+                    },
+                    "process.artifact_tree.directory_count",
+                ),
+                (
+                    OwnedArtifactTreeWatch {
+                        max_depth: 1,
+                        ..watch
+                    },
+                    DelegatedTreeSnapshot {
+                        directories: 1,
+                        entries: 3,
+                        depth: 1,
+                        ..tree.snapshot
+                    },
+                    "process.artifact_tree.depth",
+                ),
+            ];
+            for (limits, observed, code) in limit_cases {
+                let mut aggregate = TreeSnapshot {
+                    directories: 1,
+                    entries: 1,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    merge_delegated(&limits, 1, &mut aggregate, &observed)
+                        .unwrap_err()
+                        .1,
+                    code
+                );
+            }
+            tree.snapshot.entries = 1;
+            assert_eq!(
+                watched_tree_size_with_delegation(&cwd, &watch, Some(&tree))
+                    .unwrap_err()
+                    .code,
+                "process.artifact_tree.delegated_snapshot"
+            );
+            assert!(
+                DelegatedTreeSnapshot {
+                    bytes: 1,
+                    files: 0,
+                    directories: 0,
+                    entries: 0,
+                    max_file_bytes: 0,
+                    depth: 0
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                DelegatedTreeSnapshot {
+                    bytes: 0,
+                    files: 0,
+                    directories: 1,
+                    entries: 1,
+                    max_file_bytes: 0,
+                    depth: 0
+                }
+                .validate()
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn bounded_output_watch_reaches_original_supervisor_and_keeps_owned_tree_guards() {
+            struct TreeEntries(std::path::PathBuf);
+            impl Drop for TreeEntries {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(self.0.join("artifact.bin"));
+                    let _ = std::fs::remove_dir(&self.0);
+                }
+            }
+
+            let directory = OriginalTestDirectory::new();
+            let entries = TreeEntries(directory.0.join("outputs"));
+            std::fs::create_dir(&entries.0).unwrap();
+            let artifact = entries.0.join("artifact.bin");
+            std::fs::write(&artifact, b"12345678").unwrap();
+            let cwd = directory.file();
+            // This is the same production constructor used by both numerical
+            // owners, with small byte budgets so the real tree limits are tested.
+            let watch = OwnedArtifactTreeWatch::bounded_output(16, 8);
+            let program = File::open("/bin/cat").unwrap();
+            let input = b"original-numerical-input";
+            let started = Instant::now();
+            let window = OriginalProcessWindow::new(
+                started,
+                started + Duration::from_secs(5),
+                started + Duration::from_millis(5500),
+            )
+            .unwrap();
+            let output = supervise_input_in_original_window(
+                &program,
+                &[],
+                &cwd,
+                original_limits(),
+                None,
+                &watch,
+                OriginalProcessInput {
+                    bytes: input,
+                    window,
+                },
+            )
+            .unwrap();
+            assert!(output.transport_complete(), "{output:?}");
+            assert_eq!(output.process().stdout, input);
+            assert_eq!(output.process().receipt.watched_artifact_bytes, Some(8));
+            assert_eq!(output.checked_timing().unwrap().original_started(), started);
+
+            let total_cap = OwnedArtifactTreeWatch::bounded_output(7, 8);
+            total_cap.validate().unwrap();
+            let failure = watched_tree_size(&cwd, &total_cap).unwrap_err();
+            assert_eq!(failure.stop, ProcessStop::ArtifactLimit);
+            assert_eq!(failure.code, "process.artifact_tree.total_bytes");
+
+            std::fs::write(&artifact, b"123456789").unwrap();
+            let failure = watched_tree_size(&cwd, &watch).unwrap_err();
+            assert_eq!(failure.stop, ProcessStop::ArtifactLimit);
+            assert_eq!(failure.code, "process.artifact_tree.file_bytes");
+
+            std::fs::remove_file(&artifact).unwrap();
+            std::os::unix::fs::symlink("/nonexistent-unowned-artifact", &artifact).unwrap();
+            let failure = watched_tree_size(&cwd, &watch).unwrap_err();
+            assert_eq!(failure.stop, ProcessStop::IoFailure);
+            assert_eq!(failure.code, "process.artifact_tree.kind");
         }
 
         #[test]

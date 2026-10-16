@@ -10,6 +10,8 @@
 //! LegalSeeV1은 명시적으로 선택하는 ordering 변경이다. 제한된 동일 칸의
 //! material 교환 minimax만 계산하며 게임 값·전술 증명·pruning bound가 아니다.
 
+#[cfg(test)]
+mod cooperative_tests;
 mod see;
 mod stack;
 
@@ -199,9 +201,78 @@ pub enum CpuCompletion {
     NodeLimit,
     Deadline,
     Canceled,
+    /// Cooperative worker release. This is neither cancellation nor expiry;
+    /// an owned PausedStack continuation remains live for the same job.
+    Yielded,
     /// A checked quiescence frontier cannot be statically evaluated safely.
     QuiescenceLimit,
     Terminal(TerminalReason),
+}
+
+/// The runtime owns atomic queue-independent control. Search supplies immutable
+/// Job/worker scope; a successor job always receives a different mailbox.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuMailboxScope {
+    pub job: rz_contracts::pals_adaptive::CpuJobId,
+    pub owner: rz_contracts::pals_adaptive::CpuWorkerId,
+}
+pub type CpuControlMailbox = rz_runtime::adaptive::ControlMailbox<CpuMailboxScope>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CpuYieldCause {
+    Requested,
+    NodeCredit,
+    SoftLease,
+}
+
+/// One worker occupancy grant. The hard job deadline stays in CpuLimits; the
+/// soft lease is checked separately and never pretends to expire the job.
+pub struct CpuSliceControl {
+    pub node_credit: u64,
+    pub soft_lease: Option<Instant>,
+    pub mailbox: Arc<CpuControlMailbox>,
+    observed_yield_sequence: AtomicU64,
+    observed_yield_cause: AtomicU64,
+}
+
+impl CpuSliceControl {
+    pub fn new(
+        node_credit: u64,
+        soft_lease: Option<Instant>,
+        mailbox: Arc<CpuControlMailbox>,
+    ) -> Result<Self, CpuError> {
+        if node_credit == 0 {
+            return Err(CpuError::InvalidLimits("slice node credit is zero"));
+        }
+        Ok(Self {
+            node_credit,
+            soft_lease,
+            mailbox,
+            observed_yield_sequence: AtomicU64::new(0),
+            observed_yield_cause: AtomicU64::new(0),
+        })
+    }
+    fn observe_yield(&self, cause: CpuYieldCause, sequence: u64) {
+        self.observed_yield_sequence
+            .store(sequence, Ordering::Release);
+        self.observed_yield_cause.store(
+            match cause {
+                CpuYieldCause::Requested => 1,
+                CpuYieldCause::NodeCredit => 2,
+                CpuYieldCause::SoftLease => 3,
+            },
+            Ordering::Release,
+        );
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CpuControlledReport {
+    pub report: CpuReport,
+    pub yield_cause: Option<CpuYieldCause>,
+    pub yield_ack_sequence: Option<u64>,
+    /// This sequence only acknowledges a completed iteration publication.
+    pub publish_ack_sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,6 +346,9 @@ pub struct CpuPausedStackSnapshot {
     pub tokens_peak: u32,
     pub bytes_current: u64,
     pub bytes_peak: u64,
+    /// Current immutable owner ceiling, enforced by the retained traversal.
+    /// This is a configured limit, not an observed RSS or allocation peak.
+    pub bytes_limit_current: u64,
     pub stale_context_attempts: u64,
     pub stale_context_rejections: u64,
     /// Previously consumed nodes present in a resumed invocation's initial
@@ -306,6 +380,7 @@ impl CpuPausedStackSnapshot {
             tokens_peak: 0,
             bytes_current: 0,
             bytes_peak: 0,
+            bytes_limit_current: CPU_PAUSED_STACK_MAX_BYTES as u64,
             stale_context_attempts: 0,
             stale_context_rejections: 0,
             replayed_consumed_work: 0,
@@ -476,6 +551,10 @@ pub struct CpuEngine {
     value_identity: Arc<CpuValueIdentity>,
     last_attempt_work: Option<CpuWork>,
     resume_policy: CpuResumePolicy,
+    paused_stack_max_bytes: usize,
+    /// Owner configuration remains sealed across new-game cleanup. Token
+    /// serials and last-attempt observations deliberately reset at that boundary.
+    paused_stack_limit_sealed: bool,
     paused: Option<stack::PausedTask>,
     stack_owner: Arc<()>,
     stack_serial: u64,
@@ -776,6 +855,7 @@ impl CpuSearcher for CpuEngine {
 struct Control<'a> {
     limits: CpuLimits,
     cancellation: &'a AtomicBool,
+    cooperative: Option<&'a CpuSliceControl>,
     nodes: u64,
     quiescence_nodes: u64,
     tt_hits: u64,
@@ -874,6 +954,8 @@ impl CpuEngine {
             evaluator,
             last_attempt_work: None,
             resume_policy,
+            paused_stack_max_bytes: CPU_PAUSED_STACK_MAX_BYTES,
+            paused_stack_limit_sealed: false,
             paused: None,
             stack_owner: Arc::new(()),
             stack_serial: 0,
@@ -971,6 +1053,51 @@ impl CpuEngine {
         self.resume_policy
     }
 
+    /// Configure the actual retained-frame ceiling before the first search.
+    /// The legacy constructors keep the 8MiB ceiling. This never transfers or
+    /// recreates the TT, ordering state, value namespace or token owner.
+    /// A held side scope receives the same ceiling before either owner starts.
+    pub fn set_paused_stack_max_bytes(&mut self, maximum_bytes: usize) -> Result<(), CpuError> {
+        if !(1..=CPU_PAUSED_STACK_MAX_BYTES).contains(&maximum_bytes) {
+            return Err(CpuError::InvalidConfig(
+                "paused stack limit must be in 1..=8388608 bytes",
+            ));
+        }
+        if maximum_bytes == self.paused_stack_max_bytes {
+            return Ok(());
+        }
+        if self.paused_stack_limit_sealed
+            || self.paused.is_some()
+            || self.last_attempt_work.is_some()
+            || self.stack_serial != 0
+            || self.paused_side_scope.as_ref().is_some_and(|side| {
+                side.paused_stack_limit_sealed
+                    || side.paused.is_some()
+                    || side.last_attempt_work.is_some()
+                    || side.stack_serial != 0
+            })
+        {
+            return Err(CpuError::InvalidConfig(
+                "paused stack limit is immutable after either CPU scope starts",
+            ));
+        }
+        if let Some(side) = self.paused_side_scope.as_mut() {
+            side.paused_stack_max_bytes = maximum_bytes;
+            if let Some(telemetry) = side.paused_stack_telemetry.as_mut() {
+                telemetry.bytes_limit_current = maximum_bytes as u64;
+            }
+        }
+        self.paused_stack_max_bytes = maximum_bytes;
+        if let Some(telemetry) = self.paused_stack_telemetry.as_mut() {
+            telemetry.bytes_limit_current = maximum_bytes as u64;
+        }
+        Ok(())
+    }
+
+    pub fn paused_stack_max_bytes(&self) -> usize {
+        self.paused_stack_max_bytes
+    }
+
     pub fn paused_stack_bytes(&self) -> Option<usize> {
         self.paused.as_ref().map(|task| task.retained_bytes())
     }
@@ -991,7 +1118,8 @@ impl CpuEngine {
             None => 0,
         };
         snapshot.complete &= snapshot.owner_id != 0
-            && snapshot.bytes_current <= CPU_PAUSED_STACK_MAX_BYTES as u64
+            && snapshot.bytes_limit_current == self.paused_stack_max_bytes as u64
+            && snapshot.bytes_current <= snapshot.bytes_limit_current
             && snapshot
                 .tokens_resumed
                 .checked_add(snapshot.tokens_invalidated)
@@ -1054,8 +1182,9 @@ impl CpuEngine {
         let conditions = match self.resume_policy {
             CpuResumePolicy::CompletedIteration => conditions,
             CpuResumePolicy::PausedStack => format!(
-                "{conditions};resume={};paused-owner:single-use-root-full-history-restriction-profile-value-conditions-target-depth;paused-memory:max-1-task-8388608-bytes;consumed-work:no-replay-no-recharge;{}",
+                "{conditions};resume={};paused-owner:single-use-root-full-history-restriction-profile-value-conditions-target-depth;paused-memory:max-1-task-{}-bytes;consumed-work:no-replay-no-recharge;{}",
                 self.resume_policy.identity(),
+                self.paused_stack_max_bytes,
                 if self.paused_side_scope.is_some() {
                     "cancel-newgame:invalidate;fresh-analysis:held-parent-side-scope"
                 } else {
@@ -1149,6 +1278,72 @@ impl CpuEngine {
         self.run(position, None, limits, cancellation, None, &mut observer)
     }
 
+    /// Execute one real slice of an immutable job. Only PausedStack owns the
+    /// unfinished root/PVS/qsearch/SEE frames required for exact continuation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn analyze_controlled(
+        &mut self,
+        position: &Position,
+        root_moves: Option<&[BoardMove]>,
+        limits: CpuLimits,
+        cancellation: &AtomicBool,
+        control: &CpuSliceControl,
+        resume: Option<&CpuResumeToken>,
+        mut observer: impl FnMut(CpuIterationProgress),
+    ) -> Result<CpuControlledReport, CpuError> {
+        self.paused_stack_limit_sealed = true;
+        self.last_attempt_work = Some(CpuWork::default());
+        if self.resume_policy != CpuResumePolicy::PausedStack {
+            return Err(CpuError::Unsupported(
+                "cooperative control requires PausedStack",
+            ));
+        }
+        if control.node_credit == 0 || control.mailbox.snapshot().terminal {
+            return Err(CpuError::InvalidLimits(
+                "slice credit is zero or its job is closed",
+            ));
+        }
+        if resume.is_some_and(|token| token.root_moves.as_deref() != root_moves) {
+            return Err(CpuError::ResumeMismatch("slice root restriction changed"));
+        }
+        let report = stack::run_controlled(
+            self,
+            position,
+            root_moves,
+            limits,
+            cancellation,
+            resume,
+            &mut observer,
+            control,
+        )?;
+        let yield_cause = if report.completion == CpuCompletion::Yielded {
+            match control.observed_yield_cause.load(Ordering::Acquire) {
+                1 => Some(CpuYieldCause::Requested),
+                2 => Some(CpuYieldCause::NodeCredit),
+                3 => Some(CpuYieldCause::SoftLease),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let yield_ack_sequence = if yield_cause == Some(CpuYieldCause::Requested) {
+            let sequence = control.observed_yield_sequence.load(Ordering::Acquire);
+            if control.mailbox.acknowledge_yield(sequence).is_err() {
+                self.discard_paused_stack();
+                return Err(CpuError::InvalidLimits("CPU Yield acknowledgement failed"));
+            }
+            Some(sequence)
+        } else {
+            None
+        };
+        Ok(CpuControlledReport {
+            report,
+            yield_cause,
+            yield_ack_sequence,
+            publish_ack_sequence: control.mailbox.snapshot().publish_ack,
+        })
+    }
+
     /// Restrict only root choices. Every response below the root remains legal
     /// Rules search; restricted root values never enter the unrestricted TT.
     pub fn analyze_root_moves(
@@ -1177,6 +1372,7 @@ impl CpuEngine {
         limits: CpuLimits,
         cancellation: &AtomicBool,
     ) -> Result<CpuReport, CpuError> {
+        self.paused_stack_limit_sealed = true;
         self.last_attempt_work = Some(CpuWork::default());
         if self.paused_side_scope.is_none() || cancellation.load(Ordering::Acquire) {
             self.invalidate_paused_stack();
@@ -1198,6 +1394,7 @@ impl CpuEngine {
         limits: CpuLimits,
         cancellation: &AtomicBool,
     ) -> Result<CpuReport, CpuError> {
+        self.paused_stack_limit_sealed = true;
         self.last_attempt_work = Some(CpuWork::default());
         if self.resume_policy == CpuResumePolicy::PausedStack {
             return stack::run(
@@ -1311,6 +1508,7 @@ impl CpuEngine {
         resume: Option<&CpuResumeToken>,
         observer: &mut dyn FnMut(CpuIterationProgress),
     ) -> Result<CpuReport, CpuError> {
+        self.paused_stack_limit_sealed = true;
         if resume.is_none() && self.paused.is_some() && self.paused_side_scope.is_some() {
             return self.run_paused_side_scope(
                 position,
@@ -1379,6 +1577,7 @@ impl CpuEngine {
         let mut control = Control {
             limits,
             cancellation,
+            cooperative: None,
             nodes: 0,
             quiescence_nodes: 0,
             tt_hits: 0,
@@ -1505,12 +1704,17 @@ impl CpuEngine {
         })
     }
 
-    fn validate_limits(&self, position: &Position, limits: CpuLimits) -> Result<(), CpuError> {
+    pub(crate) fn validate_frozen_value_namespace(&self) -> Result<(), CpuError> {
         if self.evaluator.identity() != self.value_identity.as_ref() {
             return Err(CpuError::InvalidConfig(
                 "evaluator semantics or frozen weights changed",
             ));
         }
+        Ok(())
+    }
+
+    fn validate_limits(&self, position: &Position, limits: CpuLimits) -> Result<(), CpuError> {
+        self.validate_frozen_value_namespace()?;
         if limits.max_depth == 0 || limits.max_depth > self.config.max_depth {
             return Err(CpuError::InvalidLimits("depth outside configured bound"));
         }
@@ -1930,7 +2134,12 @@ impl Control<'_> {
     }
 
     fn check_stop(&self) -> Result<(), Abort> {
-        if self.cancellation.load(Ordering::Acquire) {
+        if self.cancellation.load(Ordering::Acquire)
+            || self.cooperative.is_some_and(|slice| {
+                let snapshot = slice.mailbox.snapshot();
+                snapshot.is_cancelled() || snapshot.terminal
+            })
+        {
             Err(Abort::Stop(CpuCompletion::Canceled))
         } else if self
             .limits
@@ -1938,6 +2147,26 @@ impl Control<'_> {
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
             Err(Abort::Stop(CpuCompletion::Deadline))
+        } else if let Some(slice) = self.cooperative {
+            // The hard remaining credit wins over a soft slice boundary.
+            if self.nodes >= self.limits.max_nodes {
+                return Err(Abort::Stop(CpuCompletion::NodeLimit));
+            }
+            if let Some(sequence) = slice.mailbox.snapshot().pending_yield() {
+                slice.observe_yield(CpuYieldCause::Requested, sequence);
+                Err(Abort::Stop(CpuCompletion::Yielded))
+            } else if self.nodes >= slice.node_credit {
+                slice.observe_yield(CpuYieldCause::NodeCredit, 0);
+                Err(Abort::Stop(CpuCompletion::Yielded))
+            } else if slice
+                .soft_lease
+                .is_some_and(|lease| Instant::now() >= lease)
+            {
+                slice.observe_yield(CpuYieldCause::SoftLease, 0);
+                Err(Abort::Stop(CpuCompletion::Yielded))
+            } else {
+                Ok(())
+            }
         } else {
             Ok(())
         }
@@ -2255,6 +2484,7 @@ mod tests {
         Control {
             limits,
             cancellation: cancel,
+            cooperative: None,
             nodes: 0,
             quiescence_nodes: 0,
             tt_hits: 0,
@@ -2587,6 +2817,7 @@ mod tests {
         let mut control = Control {
             limits: limits(1),
             cancellation: &cancel,
+            cooperative: None,
             nodes: 0,
             quiescence_nodes: 0,
             tt_hits: 0,
@@ -2662,6 +2893,7 @@ mod tests {
                 ..limits(10)
             },
             cancellation: &cancel,
+            cooperative: None,
             nodes: 0,
             quiescence_nodes: 0,
             tt_hits: 0,
@@ -2815,6 +3047,7 @@ mod tests {
         let mut control = Control {
             limits: limits(1),
             cancellation: &cancel,
+            cooperative: None,
             nodes: 0,
             quiescence_nodes: 0,
             tt_hits: 0,
@@ -2826,6 +3059,7 @@ mod tests {
         let mut fresh = Control {
             limits: limits(1),
             cancellation: &cancel,
+            cooperative: None,
             nodes: 0,
             quiescence_nodes: 0,
             tt_hits: 0,
@@ -2841,6 +3075,7 @@ mod tests {
         let mut uncached = Control {
             limits: limits(1),
             cancellation: &cancel,
+            cooperative: None,
             nodes: 0,
             quiescence_nodes: 0,
             tt_hits: 0,

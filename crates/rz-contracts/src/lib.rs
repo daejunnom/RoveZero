@@ -6,6 +6,7 @@
 
 mod evaluation;
 pub mod pals;
+pub mod pals_adaptive;
 mod primitives;
 mod state;
 

@@ -53,7 +53,7 @@ fn readable_directory(directory: &Dir) -> Result<File, ArenaError> {
 pub(crate) fn admit(root: &Dir, reservation: u64) -> Result<(), ArenaError> {
     admit_bounded(root, reservation, OUTPUT_ROOT_BUDGET_BYTES)
 }
-fn admit_bounded(root: &Dir, reservation: u64, limit: u64) -> Result<(), ArenaError> {
+pub(crate) fn admit_bounded(root: &Dir, reservation: u64, limit: u64) -> Result<(), ArenaError> {
     fn size(
         directory: &Dir,
         depth: usize,
@@ -96,7 +96,9 @@ fn admit_bounded(root: &Dir, reservation: u64, limit: u64) -> Result<(), ArenaEr
                 .checked_add(amount)
                 .ok_or_else(|| invalid("retention size overflow"))?;
             if bytes > limit {
-                return Err(ArenaError::Budget("native output root exceeds 32 GiB; preserve evidence and perform owner-aware maintenance".into()));
+                return Err(ArenaError::Budget(format!(
+                    "native output root exceeds {limit} bytes; preserve evidence and perform owner-aware maintenance"
+                )));
             }
         }
         Ok(bytes)
@@ -105,9 +107,9 @@ fn admit_bounded(root: &Dir, reservation: u64, limit: u64) -> Result<(), ArenaEr
         .checked_add(reservation)
         .is_none_or(|n| n > limit)
     {
-        return Err(ArenaError::Budget(
-            "native output root plus reserved attempt exceeds 32 GiB".into(),
-        ));
+        return Err(ArenaError::Budget(format!(
+            "native output root plus reserved attempt exceeds {limit} bytes"
+        )));
     }
     Ok(())
 }

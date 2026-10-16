@@ -37,10 +37,12 @@ mod device_packing_assets;
 mod device_packing_graph;
 mod device_pages_plan;
 mod public_pages;
+pub mod virtual_review;
 mod warm;
 pub use cuda_control::{
     PalsControlTransfer, PalsControlTransferKind, PalsCudaControlPolicy, PalsCudaPlacementWitness,
-    PalsGraphOptimization, PalsGraphPlacement, PalsKernelWitness,
+    PalsGraphOptimization, PalsGraphPlacement, PalsKernelWitness, VirtualReviewControlLayout,
+    VirtualReviewCudaPlacementWitness,
 };
 pub use device_packing_admission::{
     DevicePackingAdmissionError, DevicePackingDeclaredResources, DevicePackingResourceDeclaration,
@@ -1846,12 +1848,70 @@ fn session_optimization(config: PalsOnnxConfig, explicit_control: bool) -> PalsG
         PalsGraphOptimization::Level1
     }
 }
+/// 원래 모델 SessionBuilder의 setter, EP 등록, session commit이 성공한 설정이다.
+/// OS thread 생성 수·helper affinity·CUDA kernel placement·첫 NN 완료를
+/// 관측한 값이 아니다. 공개 생성자는 없으며 성공한 loader만 발급한다.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PalsAppliedSessionSettings {
+    role: String,
+    provider: Provider,
+    intra_threads: usize,
+    inter_threads: usize,
+    intra_op_spinning: bool,
+    inter_op_spinning: bool,
+    parallel_execution: bool,
+    cuda_provider_available: Option<bool>,
+}
+impl PalsAppliedSessionSettings {
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+    pub fn provider(&self) -> Provider {
+        self.provider
+    }
+    pub fn intra_threads(&self) -> usize {
+        self.intra_threads
+    }
+    pub fn inter_threads(&self) -> usize {
+        self.inter_threads
+    }
+    pub fn intra_op_spinning(&self) -> bool {
+        self.intra_op_spinning
+    }
+    pub fn inter_op_spinning(&self) -> bool {
+        self.inter_op_spinning
+    }
+    pub fn parallel_execution(&self) -> bool {
+        self.parallel_execution
+    }
+    /// CPU는 해당 CUDA 가용성 조회를 하지 않았으므로 None이다.
+    pub fn cuda_provider_available(&self) -> Option<bool> {
+        self.cuda_provider_available
+    }
+    pub fn evidence_scope(&self) -> &'static str {
+        "session_builder_accepted_settings"
+    }
+    /// 별도 weight-free packing session이나 프로세스 전체 native inventory는 제외한다.
+    pub fn coverage_scope(&self) -> &'static str {
+        "loaded_model_sessions_only"
+    }
+    pub fn evidence_method(&self) -> &'static str {
+        "setters_execution_provider_registration_and_session_commit_success"
+    }
+}
 fn load_session(
     bytes: Vec<u8>,
     config: PalsOnnxConfig,
     role: &str,
     audit: Option<(&PalsCudaControlPolicy, &Path)>,
-) -> Result<(Session, Option<PalsGraphPlacement>), BackendError> {
+) -> Result<
+    (
+        Session,
+        Option<PalsGraphPlacement>,
+        PalsAppliedSessionSettings,
+    ),
+    BackendError,
+> {
     let configure = |e| {
         native(
             CauseCode::SessionConfiguration,
@@ -1882,6 +1942,7 @@ fn load_session(
             PalsGraphOptimization::Level1 => GraphOptimizationLevel::Level1,
         })
         .map_err(configure)?;
+    let mut cuda_provider_available = None;
     builder = match config.provider {
         Provider::Cpu => builder
             .with_execution_providers([CPUExecutionProvider::default()
@@ -1908,6 +1969,7 @@ fn load_session(
                     "PALS CUDA provider unavailable; CPU fallback forbidden",
                 ));
             }
+            cuda_provider_available = Some(true);
             builder
                 // Strict is unchanged unless the caller registered an exact
                 // metadata-only policy. Its complete init gate runs before Run.
@@ -1945,14 +2007,24 @@ fn load_session(
     } else {
         None
     };
-    let recorded = if let (Some((_, root)), Some(log)) = (audit, &placement_log) {
-        cuda_control::record_initial_log(
-            log,
-            &root.join(format!("{role}-initial-placement.json")),
-            role,
-            loaded.is_ok(),
-            placement.as_ref(),
-        )
+    let recorded = if let (Some((policy, root)), Some(log)) = (audit, &placement_log) {
+        if policy.virtual_review_layout().is_some() {
+            policy.record_initial_log_virtual(
+                log,
+                &root.join(format!("{role}-initial-placement.json")),
+                role,
+                loaded.is_ok(),
+                placement.as_ref(),
+            )
+        } else {
+            cuda_control::record_initial_log(
+                log,
+                &root.join(format!("{role}-initial-placement.json")),
+                role,
+                loaded.is_ok(),
+                placement.as_ref(),
+            )
+        }
     } else {
         Ok(())
     };
@@ -1964,7 +2036,18 @@ fn load_session(
     // Preserve that primary error; a successful gate cannot bypass failed IO.
     let placement = placement.transpose()?;
     recorded?;
-    Ok((session, placement))
+    // 위 setter/EP 등록/commit과 모든 기존 초기화 검사가 성공한 뒤에만 발급한다.
+    let applied = PalsAppliedSessionSettings {
+        role: role.to_owned(),
+        provider: config.provider,
+        intra_threads: config.intra_threads,
+        inter_threads: 1,
+        intra_op_spinning: false,
+        inter_op_spinning: false,
+        parallel_execution: false,
+        cuda_provider_available,
+    };
+    Ok((session, placement, applied))
 }
 
 struct ActiveInputs {
@@ -2158,6 +2241,9 @@ pub enum PalsNativeResult {
         actual_completed_nn_inputs_delta: Option<u64>,
         /// Completeness of measurement only; this is not output acceptance.
         complete: bool,
+        /// 같은 단일 physical owner의 원본 호출에서 관측한 단계별 계수.
+        /// 알려지지 않은 완료나 검증되지 않은 역할 capability는 None이다.
+        owner_accounting: Option<PalsNativeOwnerAccounting>,
     },
     NewGame,
     ResetTo {
@@ -2430,6 +2516,126 @@ impl PalsNNInputEvidence {
     }
 }
 
+/// 한 원본 호출의 cache/public/private 실행 계수. 생성자는 공개하지 않는다.
+/// 단일 physical worker가 같은 owner의 호출 전후를 비교한 경우에만 발급하며,
+/// 출력 수락·검색 소비·프로세스 전체 V 부재를 증명하지 않는다.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PalsNativeOwnerAccounting {
+    public_cache_hits: u64,
+    public_cache_misses: u64,
+    public_nn_runs_attempted: u64,
+    public_nn_runs_completed: u64,
+    public_nn_runs_failed_known: u64,
+    role_nn_runs_attempted: u64,
+    role_nn_runs_completed: u64,
+    role_nn_runs_failed_known: u64,
+    validator_nn_runs_attempted: u64,
+    validator_nn_runs_completed: u64,
+    validator_nn_runs_failed_known: u64,
+}
+impl PalsNativeOwnerAccounting {
+    fn between(
+        before: &PalsBackendStats,
+        after: &PalsBackendStats,
+        physical_completion_known: bool,
+        validator_absence_verified: bool,
+    ) -> Option<Self> {
+        if !validator_absence_verified
+            || !PalsNNInputEvidence::between(before, after, physical_completion_known).complete
+        {
+            return None;
+        }
+        let admitted = after
+            .admitted_role_requests
+            .checked_sub(before.admitted_role_requests)?;
+        let value = Self {
+            public_cache_hits: after
+                .public_cache_hits
+                .checked_sub(before.public_cache_hits)?,
+            public_cache_misses: after
+                .public_cache_misses
+                .checked_sub(before.public_cache_misses)?,
+            public_nn_runs_attempted: after
+                .public_nn_runs_attempted
+                .checked_sub(before.public_nn_runs_attempted)?,
+            public_nn_runs_completed: after
+                .public_nn_runs_completed
+                .checked_sub(before.public_nn_runs_completed)?,
+            public_nn_runs_failed_known: after
+                .public_nn_runs_failed_known
+                .checked_sub(before.public_nn_runs_failed_known)?,
+            role_nn_runs_attempted: after
+                .role_nn_runs_attempted
+                .checked_sub(before.role_nn_runs_attempted)?,
+            role_nn_runs_completed: after
+                .role_nn_runs_completed
+                .checked_sub(before.role_nn_runs_completed)?,
+            role_nn_runs_failed_known: after
+                .role_nn_runs_failed_known
+                .checked_sub(before.role_nn_runs_failed_known)?,
+            // 로드된 manifest와 실제 session 집합으로 확인한 owner capability다.
+            // 요청 role을 보고 V 실행 수를 추정하지 않는다.
+            validator_nn_runs_attempted: 0,
+            validator_nn_runs_completed: 0,
+            validator_nn_runs_failed_known: 0,
+        };
+        if admitted > 1
+            || after.new_game_resets != before.new_game_resets
+            || value
+                .public_cache_hits
+                .checked_add(value.public_cache_misses)?
+                > admitted
+            || value.role_nn_runs_attempted > admitted
+            || value
+                .public_nn_runs_completed
+                .checked_add(value.public_nn_runs_failed_known)?
+                != value.public_nn_runs_attempted
+            || value
+                .role_nn_runs_completed
+                .checked_add(value.role_nn_runs_failed_known)?
+                != value.role_nn_runs_attempted
+        {
+            return None;
+        }
+        // record-page 경로는 한 요청 안에서 여러 public graph를 실행할 수 있다.
+        // 실제 public run 계수를 B1 요청 수 하나로 축소하지 않는다.
+        Some(value)
+    }
+    pub fn public_cache_hits(&self) -> u64 {
+        self.public_cache_hits
+    }
+    pub fn public_cache_misses(&self) -> u64 {
+        self.public_cache_misses
+    }
+    pub fn public_nn_runs_attempted(&self) -> u64 {
+        self.public_nn_runs_attempted
+    }
+    pub fn public_nn_runs_completed(&self) -> u64 {
+        self.public_nn_runs_completed
+    }
+    pub fn public_nn_runs_failed_known(&self) -> u64 {
+        self.public_nn_runs_failed_known
+    }
+    pub fn role_nn_runs_attempted(&self) -> u64 {
+        self.role_nn_runs_attempted
+    }
+    pub fn role_nn_runs_completed(&self) -> u64 {
+        self.role_nn_runs_completed
+    }
+    pub fn role_nn_runs_failed_known(&self) -> u64 {
+        self.role_nn_runs_failed_known
+    }
+    pub fn validator_nn_runs_attempted(&self) -> u64 {
+        self.validator_nn_runs_attempted
+    }
+    pub fn validator_nn_runs_completed(&self) -> u64 {
+        self.validator_nn_runs_completed
+    }
+    pub fn validator_nn_runs_failed_known(&self) -> u64 {
+        self.validator_nn_runs_failed_known
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PalsGraphIdentity {
     pub role: String,
@@ -2474,11 +2680,18 @@ pub struct PalsOnnxBackend {
     proposer: Option<Session>,
     critic: Option<Session>,
     shared_pc: Option<Session>,
+    // 검증된 manifest와 실제 로드된 session 집합에서만 얻는 불변 capability.
+    // 일반 PALS 모델이 항상 P/C-only라고 가정하지 않는다.
+    validator_absence_verified: bool,
+    applied_session_settings: Arc<[PalsAppliedSessionSettings]>,
     layout: Layout,
     private_warm: Option<PalsWarmCapability>,
     #[cfg(feature = "experimental-io-binding")]
     private_cuda_warm: Option<PalsCudaWarmCapability>,
     runtime: OrtRuntime,
+    // Registered descriptor sources outlive their sessions and profile I/O.
+    // Unknown physical completion retains this same owner with native values.
+    owned_sources: Option<Arc<dyn PalsOwnedSources>>,
     config: PalsOnnxConfig,
     model_config: PalsModelConfig,
     epoch: [u8; 32],
@@ -2523,7 +2736,99 @@ struct CudaControlAudit {
     witness: Option<PalsCudaPlacementWitness>,
     rejected: Option<BackendError>,
 }
+/// Immutable artifact access owned by a native startup capability. A callback
+/// must not infer graph identity from a role name or replace a missing graph.
+/// Returning bytes grants no acceptance: native loading independently repeats
+/// bounded manifest validation and each complete graph hash before ORT sees it.
+pub trait PalsOwnedSources: Send + Sync {
+    fn read_manifest(&self, maximum: usize) -> Result<Vec<u8>, BackendError>;
+    fn read_graph(
+        &self,
+        role: &str,
+        registered_file: &str,
+        expected_sha256: [u8; 32],
+        maximum: usize,
+    ) -> Result<Vec<u8>, BackendError>;
+}
+// Historical path loaders preserve their ordinary-path access and validation;
+// only the new registered startup loader supplies retained descriptor sources.
+struct PathPalsSources<'a> {
+    path: &'a Path,
+}
+impl PalsOwnedSources for PathPalsSources<'_> {
+    fn read_manifest(&self, maximum: usize) -> Result<Vec<u8>, BackendError> {
+        asset::read_bounded(self.path, maximum)
+    }
+    fn read_graph(
+        &self,
+        _role: &str,
+        registered_file: &str,
+        _expected_sha256: [u8; 32],
+        maximum: usize,
+    ) -> Result<Vec<u8>, BackendError> {
+        let parent = self.path.parent().ok_or_else(|| {
+            fail(
+                K::InvalidInput,
+                S::Asset,
+                "PALS export manifest has no parent",
+            )
+        })?;
+        asset::read_bounded(&parent.join(registered_file), maximum)
+    }
+}
 impl PalsOnnxBackend {
+    /// A startup owner may retain its original read-only descriptors instead of
+    /// reopening ambient model paths. These callbacks supply bytes only: the
+    /// existing manifest, digest, shape, provider and session validators below
+    /// remain the native admission authority.
+    pub fn load_owned_sources(
+        sources: Arc<dyn PalsOwnedSources>,
+        expected_manifest_sha256: &str,
+        runtime: OrtRuntime,
+        config: PalsOnnxConfig,
+    ) -> Result<Self, BackendError> {
+        let mut backend = Self::load_sources_inner(
+            sources.as_ref(),
+            expected_manifest_sha256,
+            runtime,
+            config,
+            None,
+        )?;
+        backend.owned_sources = Some(sources);
+        Ok(backend)
+    }
+    /// The profile owner is a retained directory descriptor, rather than a
+    /// checked-then-reopened path. It must outlive this backend, including any
+    /// physical-completion quarantine, as part of the startup source owner.
+    pub fn load_owned_sources_with_cuda_control_policy(
+        sources: Arc<dyn PalsOwnedSources>,
+        expected_manifest_sha256: &str,
+        runtime: OrtRuntime,
+        config: PalsOnnxConfig,
+        policy: PalsCudaControlPolicy,
+        profile: &virtual_review::VirtualReviewProfileDirectory,
+    ) -> Result<Self, BackendError> {
+        if config.cudnn_conv_search != PalsCuDnnConvSearch::LegacyImplicitExhaustive {
+            config.validate_execution_selection(runtime.native_loading_profile(), true)?;
+        }
+        if !matches!(config.provider, Provider::Cuda { .. }) || config.device_public_memory {
+            return Err(fail(
+                K::BackendUnavailable,
+                S::Admission,
+                "PALS owned metadata-control requires explicit CUDA with host public memory",
+            ));
+        }
+        profile.validate_live()?;
+        let mut backend = Self::load_sources_inner(
+            sources.as_ref(),
+            expected_manifest_sha256,
+            runtime,
+            config,
+            Some((policy, profile.path().to_owned())),
+        )?;
+        backend.owned_sources = Some(sources);
+        Ok(backend)
+    }
     pub fn load(
         path: &Path,
         expected_manifest_sha256: &str,
@@ -2576,7 +2881,25 @@ impl PalsOnnxBackend {
                 "PALS manifest path must be absolute",
             ));
         }
-        let bytes = asset::read_bounded(path, MAX_MANIFEST_BYTES)?;
+        let sources = PathPalsSources { path };
+        Self::load_sources_inner(&sources, expected_manifest_sha256, runtime, config, audit)
+    }
+    fn load_sources_inner(
+        sources: &dyn PalsOwnedSources,
+        expected_manifest_sha256: &str,
+        runtime: OrtRuntime,
+        config: PalsOnnxConfig,
+        audit: Option<(PalsCudaControlPolicy, std::path::PathBuf)>,
+    ) -> Result<Self, BackendError> {
+        config.validate_execution_selection(runtime.native_loading_profile(), audit.is_some())?;
+        let bytes = sources.read_manifest(MAX_MANIFEST_BYTES)?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(fail(
+                K::ResourceExhausted,
+                S::Asset,
+                "PALS manifest source exceeded its bound",
+            ));
+        }
         let manifest_digest = asset::sha256(&bytes);
         if manifest_digest != parse_sha256(expected_manifest_sha256)? {
             return Err(fail(
@@ -2617,14 +2940,8 @@ impl PalsOnnxBackend {
             }
             _ => {}
         }
-        let parent = path.parent().ok_or_else(|| {
-            fail(
-                K::InvalidInput,
-                S::Asset,
-                "PALS export manifest has no parent",
-            )
-        })?;
         let mut sessions = BTreeMap::new();
+        let mut applied_session_settings = Vec::with_capacity(manifest.graphs.len());
         let mut graph_identities = Vec::with_capacity(3);
         let mut total = 0_u64;
         let mut placements = Vec::new();
@@ -2632,7 +2949,20 @@ impl PalsOnnxBackend {
             if let Some((policy, _)) = &audit {
                 policy.validate_pins(manifest_digest, graph)?;
             }
-            let graph_bytes = asset::read_bounded(&parent.join(&graph.file), MAX_GRAPH_BYTES)?;
+            let expected_graph_sha256 = parse_sha256(&graph.sha256)?;
+            let graph_bytes = sources.read_graph(
+                &graph.role,
+                &graph.file,
+                expected_graph_sha256,
+                MAX_GRAPH_BYTES,
+            )?;
+            if graph_bytes.len() > MAX_GRAPH_BYTES {
+                return Err(fail(
+                    K::ResourceExhausted,
+                    S::Asset,
+                    "PALS graph source exceeded its bound",
+                ));
+            }
             total = total.checked_add(graph_bytes.len() as u64).ok_or_else(|| {
                 fail(
                     K::ResourceExhausted,
@@ -2648,7 +2978,7 @@ impl PalsOnnxBackend {
                 ));
             }
             let graph_digest = asset::sha256(&graph_bytes);
-            if graph_digest != parse_sha256(&graph.sha256)? {
+            if graph_digest != expected_graph_sha256 {
                 return Err(fail(
                     K::IdentityMismatch,
                     S::Asset,
@@ -2660,7 +2990,7 @@ impl PalsOnnxBackend {
                 sha256: graph_digest,
                 serialized_bytes: graph_bytes.len() as u64,
             });
-            let (session, placement) = load_session(
+            let (session, placement, applied) = load_session(
                 graph_bytes,
                 config,
                 &graph.role,
@@ -2691,6 +3021,7 @@ impl PalsOnnxBackend {
                 placements.push(placement);
             }
             validate_session(&session, graph, &manifest)?;
+            applied_session_settings.push(applied);
             sessions.insert(graph.role.clone(), session);
         }
         let max_tokens = manifest
@@ -2702,16 +3033,30 @@ impl PalsOnnxBackend {
             public_owner_bytes(2 * max_tokens * 64, 2 * max_tokens * 64, max_tokens),
         )
         .map_err(public_bank_error)?;
+        let validator_absence_verified = !manifest.validator_present
+            && !sessions.contains_key("validator")
+            && sessions.contains_key("public")
+            && match layout {
+                Layout::SharedPcIf => sessions.len() == 2 && sessions.contains_key("shared_pc"),
+                Layout::SeparatePc => {
+                    sessions.len() == 3
+                        && sessions.contains_key("proposer")
+                        && sessions.contains_key("critic")
+                }
+            };
         Ok(Self {
             public: sessions.remove("public"),
             proposer: sessions.remove("proposer"),
             critic: sessions.remove("critic"),
             shared_pc: sessions.remove("shared_pc"),
+            validator_absence_verified,
+            applied_session_settings: applied_session_settings.into(),
             layout,
             private_warm: None,
             #[cfg(feature = "experimental-io-binding")]
             private_cuda_warm: None,
             runtime,
+            owned_sources: None,
             config,
             model_config: manifest.config,
             epoch,
@@ -3103,6 +3448,10 @@ impl PalsOnnxBackend {
     pub fn config(&self) -> PalsOnnxConfig {
         self.config
     }
+    /// 성공한 session 생성에서 받은 불변 원본 설정 기록. 요청 config와 구분한다.
+    pub fn applied_session_settings(&self) -> Arc<[PalsAppliedSessionSettings]> {
+        Arc::clone(&self.applied_session_settings)
+    }
     pub fn cudnn_conv_search_diagnostic(
         &self,
     ) -> Result<Option<PalsCuDnnExecutionDiagnostic>, BackendError> {
@@ -3433,6 +3782,12 @@ impl PalsOnnxBackend {
                         &self.stats,
                         self.quarantine_cause().is_none(),
                     );
+                    let owner_accounting = PalsNativeOwnerAccounting::between(
+                        &before,
+                        &self.stats,
+                        self.quarantine_cause().is_none(),
+                        self.validator_absence_verified,
+                    );
                     match self.quarantine_cause() {
                         Some(cause) => Err(cause.clone()),
                         None => Ok(PalsNativeResult::EvaluationWithEvidence {
@@ -3440,6 +3795,7 @@ impl PalsOnnxBackend {
                             actual_completed_nn_inputs_delta: evidence
                                 .actual_completed_nn_inputs_delta,
                             complete: evidence.complete,
+                            owner_accounting,
                         }),
                     }
                 }
@@ -4156,6 +4512,9 @@ impl Drop for PalsOnnxBackend {
             .flatten()
             {
                 std::mem::forget(session);
+            }
+            if let Some(sources) = self.owned_sources.take() {
+                std::mem::forget(sources);
             }
             if let Some(active) = self.active.take() {
                 std::mem::forget(active);
@@ -5432,6 +5791,7 @@ mod tests {
             outcome: Err(error),
             actual_completed_nn_inputs_delta: Some(1),
             complete: true,
+            owner_accounting: None,
         });
         for result in [&legacy, &evidence] {
             assert_eq!(
@@ -5559,6 +5919,118 @@ mod tests {
         bad.validate().unwrap();
         regressed_failure.validate().unwrap();
         assert!(!PalsNNInputEvidence::between(&bad, &regressed_failure, true).complete);
+    }
+    #[test]
+    fn native_owner_accounting_retains_exact_miss_hit_and_private_counts() {
+        let before = PalsBackendStats::default();
+        let miss = PalsBackendStats {
+            admitted_role_requests: 1,
+            public_cache_misses: 1,
+            public_nn_runs_attempted: 1,
+            public_nn_runs_completed: 1,
+            role_nn_runs_attempted: 1,
+            role_nn_runs_completed: 1,
+            completed_nn_inputs: 2,
+            ..Default::default()
+        };
+        let actual = PalsNativeOwnerAccounting::between(&before, &miss, true, true).unwrap();
+        assert_eq!(actual.public_cache_hits(), 0);
+        assert_eq!(actual.public_cache_misses(), 1);
+        assert_eq!(actual.public_nn_runs_attempted(), 1);
+        assert_eq!(actual.public_nn_runs_completed(), 1);
+        assert_eq!(actual.role_nn_runs_attempted(), 1);
+        assert_eq!(actual.role_nn_runs_completed(), 1);
+        assert_eq!(actual.validator_nn_runs_attempted(), 0);
+        assert_eq!(actual.validator_nn_runs_completed(), 0);
+        let hit = PalsBackendStats {
+            admitted_role_requests: 2,
+            public_cache_hits: 1,
+            role_nn_runs_attempted: 2,
+            role_nn_runs_completed: 2,
+            completed_nn_inputs: 3,
+            ..miss.clone()
+        };
+        let actual = PalsNativeOwnerAccounting::between(&miss, &hit, true, true).unwrap();
+        assert_eq!(actual.public_cache_hits(), 1);
+        assert_eq!(actual.public_cache_misses(), 0);
+        assert_eq!(actual.public_nn_runs_attempted(), 0);
+        assert_eq!(actual.public_nn_runs_completed(), 0);
+        assert_eq!(actual.role_nn_runs_completed(), 1);
+        assert_eq!(actual.validator_nn_runs_failed_known(), 0);
+    }
+    #[test]
+    fn native_owner_accounting_preserves_known_partial_failure_and_public_pages() {
+        let before = PalsBackendStats::default();
+        let failure = PalsBackendStats {
+            admitted_role_requests: 1,
+            public_cache_misses: 1,
+            public_nn_runs_attempted: 1,
+            public_nn_runs_completed: 1,
+            role_nn_runs_attempted: 1,
+            role_nn_runs_failed_known: 1,
+            completed_nn_inputs: 1,
+            ..Default::default()
+        };
+        let actual = PalsNativeOwnerAccounting::between(&before, &failure, true, true).unwrap();
+        assert_eq!(actual.public_nn_runs_completed(), 1);
+        assert_eq!(actual.role_nn_runs_completed(), 0);
+        assert_eq!(actual.role_nn_runs_failed_known(), 1);
+        let pages_failure = PalsBackendStats {
+            public_nn_runs_attempted: 3,
+            public_nn_runs_completed: 2,
+            public_nn_runs_failed_known: 1,
+            role_nn_runs_attempted: 0,
+            role_nn_runs_failed_known: 0,
+            completed_nn_inputs: 2,
+            ..failure
+        };
+        let actual =
+            PalsNativeOwnerAccounting::between(&before, &pages_failure, true, true).unwrap();
+        assert_eq!(actual.public_nn_runs_attempted(), 3);
+        assert_eq!(actual.public_nn_runs_completed(), 2);
+        assert_eq!(actual.public_nn_runs_failed_known(), 1);
+        assert_eq!(actual.role_nn_runs_attempted(), 0);
+    }
+    #[test]
+    fn native_owner_accounting_requires_loaded_capability_and_known_completion() {
+        let empty = PalsBackendStats::default();
+        // 시작 전 거부된 요청도 실제 로드된 P/C owner가 반환했다면 known zero다.
+        let no_run = PalsNativeOwnerAccounting::between(&empty, &empty, true, true).unwrap();
+        assert_eq!(no_run.public_nn_runs_attempted(), 0);
+        assert_eq!(no_run.role_nn_runs_attempted(), 0);
+        assert!(PalsNativeOwnerAccounting::between(&empty, &empty, false, true).is_none());
+        // 일반 native PALS/V capability를 확인하지 못했다면 V=0을 발급하지 않는다.
+        assert!(PalsNativeOwnerAccounting::between(&empty, &empty, true, false).is_none());
+    }
+    #[test]
+    fn native_owner_accounting_rejects_saturation_regression_and_mixed_calls() {
+        let empty = PalsBackendStats::default();
+        let mut invalid = PalsBackendStats {
+            admitted_role_requests: 2,
+            public_cache_hits: 2,
+            ..Default::default()
+        };
+        assert!(PalsNativeOwnerAccounting::between(&empty, &invalid, true, true).is_none());
+        invalid.admitted_role_requests = u64::MAX;
+        assert!(PalsNativeOwnerAccounting::between(&empty, &invalid, true, true).is_none());
+        let previous = PalsBackendStats {
+            admitted_role_requests: 1,
+            public_cache_hits: 1,
+            ..Default::default()
+        };
+        assert!(PalsNativeOwnerAccounting::between(&previous, &empty, true, true).is_none());
+        let reset = PalsBackendStats {
+            new_game_resets: 1,
+            ..Default::default()
+        };
+        assert!(PalsNativeOwnerAccounting::between(&empty, &reset, true, true).is_none());
+        let unfinished = PalsBackendStats {
+            admitted_role_requests: 1,
+            role_nn_runs_attempted: 1,
+            ..Default::default()
+        };
+        // 완료/known-failure 계수가 없는 attempted work를 known zero로 숨기지 않는다.
+        assert!(PalsNativeOwnerAccounting::between(&empty, &unfinished, true, true).is_none());
     }
     #[test]
     fn cuda_full_audit_waits_for_completed_run_and_latches_origin_failure() {

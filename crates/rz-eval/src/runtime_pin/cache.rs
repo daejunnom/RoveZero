@@ -195,6 +195,16 @@ impl RuntimeCache {
         source_root: &Path,
         spec: &CudaRuntimeBundleSpec,
     ) -> Result<RuntimeLibraryPin, BackendError> {
+        self.cuda_bundle_observed(source_root, spec, &mut |_| Ok(()))
+    }
+
+    pub(super) fn cuda_bundle_observed(
+        &self,
+        source_root: &Path,
+        spec: &CudaRuntimeBundleSpec,
+        checkpoint: &mut dyn FnMut(u64) -> Result<(), BackendError>,
+    ) -> Result<RuntimeLibraryPin, BackendError> {
+        checkpoint(0)?;
         check_directory(&self.root, false)?;
         let key = spec.digest()?;
         #[cfg(target_os = "linux")]
@@ -205,20 +215,42 @@ impl RuntimeCache {
                 "cuda"
             };
             let entry = self.root.join(format!("{prefix}-{}", hex(key)));
-            let read = |origin| read_cuda(&entry, spec, key, origin);
             if exists(&entry)? {
-                return read(RuntimeStorageOrigin::CacheReused);
+                return read_cuda(
+                    &entry,
+                    spec,
+                    key,
+                    RuntimeStorageOrigin::CacheReused,
+                    checkpoint,
+                );
             }
-            let _lock = match self.lock(LOCK_WAIT) {
+            let _lock = match self.lock_observed(LOCK_WAIT, checkpoint) {
                 Ok(lock) => lock,
-                Err(error) => {
+                // A caller deadline/cancel/read rejection is terminal. Only an
+                // ordinary publication race may reuse a completed entry.
+                Err((error, true)) => return Err(error),
+                Err((error, false)) => {
                     return reuse_after_lock_error(&entry, error, || {
-                        read(RuntimeStorageOrigin::CacheReused)
+                        checkpoint(0)?;
+                        read_cuda(
+                            &entry,
+                            spec,
+                            key,
+                            RuntimeStorageOrigin::CacheReused,
+                            checkpoint,
+                        )
                     })
                 }
             };
+            checkpoint(0)?;
             if exists(&entry)? {
-                return read(RuntimeStorageOrigin::CacheReused);
+                return read_cuda(
+                    &entry,
+                    spec,
+                    key,
+                    RuntimeStorageOrigin::CacheReused,
+                    checkpoint,
+                );
             }
             let incoming = spec.files.iter().map(|file| file.bytes).sum::<u64>()
                 + spec
@@ -229,11 +261,25 @@ impl RuntimeCache {
                     .map(|alias| alias.target.len() as u64)
                     .sum::<u64>();
             self.check_budget(incoming)?;
-            let pin = RuntimeLibraryPin::copy_cuda_bundle(source_root, &self.root, spec)?;
+            checkpoint(0)?;
+            let pin = RuntimeLibraryPin::copy_linux_cuda_bundle_observed(
+                source_root,
+                &self.root,
+                spec,
+                checkpoint,
+            )?;
             let stage = Unpublished::from_pin(&pin)?;
             drop(pin);
+            checkpoint(0)?;
             stage.publish(&entry)?;
-            read(RuntimeStorageOrigin::CacheCreated)
+            checkpoint(0)?;
+            read_cuda(
+                &entry,
+                spec,
+                key,
+                RuntimeStorageOrigin::CacheCreated,
+                checkpoint,
+            )
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -247,17 +293,27 @@ impl RuntimeCache {
     }
 
     fn lock(&self, timeout: Duration) -> Result<PublishLock, BackendError> {
-        check_directory(&self.root, false)?;
+        self.lock_observed(timeout, &mut |_| Ok(()))
+            .map_err(|(error, _)| error)
+    }
+
+    fn lock_observed(
+        &self,
+        timeout: Duration,
+        checkpoint: &mut dyn FnMut(u64) -> Result<(), BackendError>,
+    ) -> Result<PublishLock, (BackendError, bool)> {
+        check_directory(&self.root, false).map_err(|error| (error, false))?;
         let path = self.root.join(LOCK_NAME);
         let until = Instant::now() + timeout;
         loop {
+            checkpoint(0).map_err(|error| (error, true))?;
             match private_directory(&path) {
                 Ok(()) => return Ok(PublishLock(path)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    check_directory(&path, false)?;
+                    check_directory(&path, false).map_err(|error| (error, false))?;
                     if Instant::now() >= until {
-                        return Err(BackendError::new(K::ResourceExhausted, S::Backend,
-                            "runtime cache publication is busy; inspect an inactive crashed owner before removing its lock"));
+                        return Err((BackendError::new(K::ResourceExhausted, S::Backend,
+                            "runtime cache publication is busy; inspect an inactive crashed owner before removing its lock"), false));
                     }
                     thread::sleep(
                         Duration::from_millis(25)
@@ -265,7 +321,10 @@ impl RuntimeCache {
                     );
                 }
                 Err(error) => {
-                    return Err(cache_io("cannot lock runtime cache publication", &error))
+                    return Err((
+                        cache_io("cannot lock runtime cache publication", &error),
+                        false,
+                    ))
                 }
             }
         }
@@ -561,6 +620,16 @@ fn pinned_file(
     expected_bytes: Option<u64>,
     expected_digest: [u8; 32],
 ) -> Result<File, BackendError> {
+    pinned_file_observed(path, expected_bytes, expected_digest, &mut |_| Ok(()))
+}
+
+fn pinned_file_observed(
+    path: &Path,
+    expected_bytes: Option<u64>,
+    expected_digest: [u8; 32],
+    checkpoint: &mut dyn FnMut(u64) -> Result<(), BackendError>,
+) -> Result<File, BackendError> {
+    checkpoint(0)?;
     let named = fs::symlink_metadata(path)
         .map_err(|error| cache_io("runtime cached file is unavailable", &error))?;
     if !named.is_file() || is_link(&named) {
@@ -615,6 +684,7 @@ fn pinned_file(
     let mut buffer = [0_u8; 64 * 1024];
     let mut remaining = opened.len();
     while remaining > 0 {
+        checkpoint(remaining.min(64 * 1024))?;
         let count = file
             .read(&mut buffer[..remaining.min(64 * 1024) as usize])
             .map_err(|error| cache_io("cannot verify runtime cached bytes", &error))?;
@@ -624,6 +694,7 @@ fn pinned_file(
         digest.update(&buffer[..count]);
         remaining -= count as u64;
     }
+    checkpoint(1)?;
     if file
         .read(&mut buffer[..1])
         .map_err(|error| cache_io("cannot verify runtime cached end", &error))?
@@ -671,7 +742,9 @@ fn read_cuda(
     spec: &CudaRuntimeBundleSpec,
     key: [u8; 32],
     origin: RuntimeStorageOrigin,
+    checkpoint: &mut dyn FnMut(u64) -> Result<(), BackendError>,
 ) -> Result<RuntimeLibraryPin, BackendError> {
+    checkpoint(0)?;
     entry_names(
         entry,
         &spec
@@ -694,7 +767,7 @@ fn read_cuda(
     for file in &files {
         let path = entry.join(&file.filename);
         let digest = bundle_file_digest(file)?;
-        let pin = pinned_file(&path, Some(file.bytes), digest)?;
+        let pin = pinned_file_observed(&path, Some(file.bytes), digest, checkpoint)?;
         if file.role == RuntimeBundleFileRole::Core {
             core = Some((path, digest, pin));
         } else {

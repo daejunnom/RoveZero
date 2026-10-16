@@ -75,11 +75,31 @@ REVIEWED_OBSERVED_PROGRESS_SOURCE_PINS = {
 }
 
 
-REVIEWED_CURRENT_SOURCE_PINS = {
+REVIEWED_ORDERED_SCOPE_SOURCE_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
         "bytes": 402843, "sha256": "70d4bae5ad4e19e86137e47cc66922182c5232cbe35b9b30d42bf43ec6850171"},
     "crates/rz-arena/src/pals_collect/native.rs": {
         "bytes": 233158, "sha256": "1ba6d1e5c7c6928dc9962cc51fd28dfe9a01fff91076c37da646390ae6973aa9"},
+}
+
+
+# Historical optional-review pair, independent of the production closed table.
+# This preserves enrollment only, never a historical build or execution claim.
+REVIEWED_OPTIONAL_REVIEW_SOURCE_PINS = {
+    "crates/rz-search/src/pals/engine.rs": {
+        "bytes": 414372, "sha256": "ce40b6f9ff8d13a41da8c9482b48528c1437896e9571c9630790c4b11b262726"},
+    "crates/rz-arena/src/pals_collect/native.rs": {
+        "bytes": 233208, "sha256": "02af59b9edbc350e6e1a204eb6543033bb4a859729eb2ed79c8b470cc6823a01"},
+}
+
+
+# Independent live-fixture pins after the compiled-source inventory-only review.
+# Only the engine digest's source tuple changes; the collector body is unchanged.
+REVIEWED_CURRENT_SOURCE_PINS = {
+    "crates/rz-search/src/pals/engine.rs": {
+        "bytes": 414554, "sha256": "0ba7c9e41b106f35516b8b234872a839f5b2f4227153ed79aa7ff1c503d12837"},
+    "crates/rz-arena/src/pals_collect/native.rs": {
+        "bytes": 233208, "sha256": "02af59b9edbc350e6e1a204eb6543033bb4a859729eb2ed79c8b470cc6823a01"},
 }
 
 
@@ -513,6 +533,14 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.assertEqual(slot_witness._reviewed_source_pair(earlier_revision_fixture), earlier_revision_fixture)
         self.assertNotEqual(earlier_revision_fixture, old)
 
+    def test_optional_review_pair_remains_a_separate_historical_profile(self):
+        reviewed = slot_witness._reviewed_source_pair(REVIEWED_OPTIONAL_REVIEW_SOURCE_PINS)
+        self.assertEqual(reviewed, REVIEWED_OPTIONAL_REVIEW_SOURCE_PINS)
+        self.assertNotEqual(reviewed, REVIEWED_CURRENT_SOURCE_PINS)
+        reviewed[slot_witness._SOURCE_PATHS[0]]["sha256"] = "0" * 64
+        self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_OPTIONAL_REVIEW_SOURCE_PINS),
+                         REVIEWED_OPTIONAL_REVIEW_SOURCE_PINS)
+
     def test_unknown_engine_or_native_source_pair_remains_unsupported(self):
         for name, index in (("engine_source", 0), ("native_source", 1)):
             with self.subTest(component=name):
@@ -538,6 +566,7 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_CONTROLLED_FALLBACK_SOURCE_PINS), REVIEWED_CONTROLLED_FALLBACK_SOURCE_PINS)
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_LIVE_BINDING_SOURCE_PINS), REVIEWED_LIVE_BINDING_SOURCE_PINS)
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_OBSERVED_PROGRESS_SOURCE_PINS), REVIEWED_OBSERVED_PROGRESS_SOURCE_PINS)
+        self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_ORDERED_SCOPE_SOURCE_PINS), REVIEWED_ORDERED_SCOPE_SOURCE_PINS)
         historical = dict(zip(slot_witness._SOURCE_PATHS, (
             {"bytes": 355881, "sha256": "32e393b4ad83bfd33a1b2205cd110cdc0cf007909e7e9c7f617819ccf5c4e93c"},
             {"bytes": 224380, "sha256": "a286a2403317be7f5f058b65488e7c9722d2b7f4b9bf683ea95e5c9f51a7aaf8"})))
@@ -545,6 +574,11 @@ class NativeSlotRepairTests(unittest.TestCase):
             with self.subTest(historical_component=path):
                 hybrid = copy.deepcopy(observed)
                 hybrid[path] = copy.deepcopy(historical[path])
+                with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
+                    slot_witness._reviewed_source_pair(hybrid)
+            with self.subTest(ordered_scope_component=path):
+                hybrid = copy.deepcopy(observed)
+                hybrid[path] = copy.deepcopy(REVIEWED_ORDERED_SCOPE_SOURCE_PINS[path])
                 with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
                     slot_witness._reviewed_source_pair(hybrid)
 

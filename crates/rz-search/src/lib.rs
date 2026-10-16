@@ -6,6 +6,7 @@ pub mod contracts;
 pub mod cpu;
 pub mod cpu_checker;
 pub mod cpu_value;
+pub mod cpu_worker;
 pub mod driver;
 pub mod external_cpu;
 pub mod pals;

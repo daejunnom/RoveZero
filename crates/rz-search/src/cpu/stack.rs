@@ -12,6 +12,7 @@ const MAX_EXCHANGE_FRAMES: usize = 32;
 pub(super) struct PausedTask {
     root: PositionIdentity,
     search_conditions: String,
+    maximum_bytes: usize,
     value_identity: CpuValueIdentity,
     root_moves: Option<Vec<BoardMove>>,
     legal: Vec<BoardMove>,
@@ -67,6 +68,7 @@ impl PausedTask {
         let task = Self {
             root: position.position_identity(),
             search_conditions: engine.search_conditions(),
+            maximum_bytes: engine.paused_stack_max_bytes,
             value_identity: (*engine.value_identity).clone(),
             root_moves: root_moves.map(<[BoardMove]>::to_vec),
             legal,
@@ -121,10 +123,10 @@ impl PausedTask {
 
     fn check_memory(&self) -> Result<(), CpuError> {
         let retained_bytes = self.retained_bytes();
-        if retained_bytes > CPU_PAUSED_STACK_MAX_BYTES {
+        if retained_bytes > self.maximum_bytes {
             Err(CpuError::PausedStackMemoryLimit {
                 retained_bytes,
-                maximum_bytes: CPU_PAUSED_STACK_MAX_BYTES,
+                maximum_bytes: self.maximum_bytes,
             })
         } else {
             Ok(())
@@ -188,7 +190,8 @@ pub(super) fn token_is_current(engine: &CpuEngine, token: &CpuResumeToken) -> bo
         && task.score == token.score
         && task.cumulative == handle.cumulative
         && retained_bytes == handle.retained_bytes
-        && retained_bytes <= CPU_PAUSED_STACK_MAX_BYTES
+        && task.maximum_bytes == engine.paused_stack_max_bytes
+        && retained_bytes <= task.maximum_bytes
         && task.search_conditions == token.search_conditions
         && token.search_conditions == engine.search_conditions()
         && task.value_identity == token.value_identity
@@ -208,6 +211,46 @@ pub(super) fn run(
     resume: Option<&CpuResumeToken>,
     observer: &mut dyn FnMut(CpuIterationProgress),
 ) -> Result<CpuReport, CpuError> {
+    run_inner(
+        engine, position, root_moves, limits, cancel, resume, observer, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_controlled(
+    engine: &mut CpuEngine,
+    position: &Position,
+    root_moves: Option<&[BoardMove]>,
+    limits: CpuLimits,
+    cancel: &AtomicBool,
+    resume: Option<&CpuResumeToken>,
+    observer: &mut dyn FnMut(CpuIterationProgress),
+    slice: &CpuSliceControl,
+) -> Result<CpuReport, CpuError> {
+    run_inner(
+        engine,
+        position,
+        root_moves,
+        limits,
+        cancel,
+        resume,
+        observer,
+        Some(slice),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_inner(
+    engine: &mut CpuEngine,
+    position: &Position,
+    root_moves: Option<&[BoardMove]>,
+    limits: CpuLimits,
+    cancel: &AtomicBool,
+    resume: Option<&CpuResumeToken>,
+    observer: &mut dyn FnMut(CpuIterationProgress),
+    cooperative: Option<&CpuSliceControl>,
+) -> Result<CpuReport, CpuError> {
+    engine.paused_stack_limit_sealed = true;
     engine.last_attempt_work = Some(CpuWork::default());
     if resume.is_none() {
         engine.invalidate_paused_stack();
@@ -223,6 +266,7 @@ pub(super) fn run(
     }
     if engine.paused.as_ref().is_some_and(|task| {
         task.search_conditions != engine.search_conditions()
+            || task.maximum_bytes != engine.paused_stack_max_bytes
             || task.value_identity != *engine.value_identity
     }) {
         engine.invalidate_paused_stack();
@@ -346,6 +390,7 @@ pub(super) fn run(
     let mut control = Control {
         limits,
         cancellation: cancel,
+        cooperative,
         nodes: 0,
         quiescence_nodes: 0,
         tt_hits: 0,
@@ -356,12 +401,14 @@ pub(super) fn run(
         // task.cumulative diagnostics never initialize these counters.
         engine.observe_paused_stack_initial_work(control.actual_work());
     }
-    observer(CpuIterationProgress {
-        best_move: task.best.first().copied(),
-        score: task.score,
-        completed_depth: task.completed_depth,
-        nodes: 0,
-    });
+    if cooperative.is_none() || task.completed_depth > 0 {
+        observer(CpuIterationProgress {
+            best_move: task.best.first().copied(),
+            score: task.score,
+            completed_depth: task.completed_depth,
+            nodes: 0,
+        });
+    }
     let result = drive(engine, &mut task, &mut control, observer);
     let work = control.actual_work();
     task.value = Some(control.value);
@@ -399,10 +446,14 @@ pub(super) fn run(
             return Err(error);
         }
     };
-    let can_pause = matches!(
-        completion,
-        CpuCompletion::NodeLimit | CpuCompletion::Deadline
-    );
+    let can_pause = if cooperative.is_some() {
+        completion == CpuCompletion::Yielded
+    } else {
+        matches!(
+            completion,
+            CpuCompletion::NodeLimit | CpuCompletion::Deadline
+        )
+    };
     let mut token = None;
     if can_pause {
         if let Err(error) = task.check_memory() {
@@ -486,6 +537,51 @@ fn drive(
     observer: &mut dyn FnMut(CpuIterationProgress),
 ) -> Result<(), Abort> {
     loop {
+        // A coherent completed iteration is the only publishable score. A
+        // control request never exposes frame alpha or an unfinished child.
+        if let Some(slice) = control.cooperative {
+            if let Some(sequence) = slice
+                .mailbox
+                .snapshot()
+                .pending_publish()
+                .filter(|_| task.completed_depth > 0)
+            {
+                observer(CpuIterationProgress {
+                    best_move: task.best.first().copied(),
+                    score: task.score,
+                    completed_depth: task.completed_depth,
+                    nodes: control.nodes,
+                });
+                slice
+                    .mailbox
+                    .acknowledge_publish_progress(sequence)
+                    .map_err(|_| {
+                        Abort::Error(CpuError::InvalidLimits(
+                            "CPU progress acknowledgement failed",
+                        ))
+                    })?;
+            }
+            if task.frames.is_empty()
+                && task.returned.is_none()
+                && task.completed_depth >= task.target_depth
+            {
+                let controls = slice.mailbox.snapshot();
+                if control.cancellation.load(Ordering::Acquire)
+                    || controls.is_cancelled()
+                    || controls.terminal
+                {
+                    return Err(Abort::Stop(CpuCompletion::Canceled));
+                }
+                if control
+                    .limits
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return Err(Abort::Stop(CpuCompletion::Deadline));
+                }
+                return Ok(());
+            }
+        }
         control.check_stop()?;
         if task.frames.is_empty() {
             if let Some(value) = task.returned.take() {
@@ -1120,6 +1216,160 @@ mod tests {
             CpuResumePolicy::PausedStack,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn configured_paused_frame_limit_is_validated_declared_and_enforced() {
+        let mut engine = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+        let original_conditions = engine.search_conditions();
+        assert_eq!(engine.paused_stack_max_bytes(), CPU_PAUSED_STACK_MAX_BYTES);
+        assert!(original_conditions.contains("paused-memory:max-1-task-8388608-bytes"));
+        for invalid in [0, CPU_PAUSED_STACK_MAX_BYTES + 1] {
+            assert!(matches!(
+                engine.set_paused_stack_max_bytes(invalid),
+                Err(CpuError::InvalidConfig(_))
+            ));
+            assert_eq!(engine.search_conditions(), original_conditions);
+        }
+        engine.set_paused_stack_max_bytes(1).unwrap();
+        assert!(
+            engine
+                .search_conditions()
+                .contains("paused-memory:max-1-task-1-bytes")
+        );
+        assert_eq!(
+            engine.paused_stack_snapshot().unwrap().bytes_limit_current,
+            1
+        );
+        assert!(matches!(
+            engine.analyze(&Position::startpos(), limits(1), &AtomicBool::new(false)),
+            Err(CpuError::PausedStackMemoryLimit {
+                retained_bytes,
+                maximum_bytes: 1,
+            }) if retained_bytes > 1
+        ));
+        assert_eq!(engine.last_attempt_work(), Some(CpuWork::default()));
+        let snapshot = engine.paused_stack_snapshot().unwrap();
+        assert_eq!(snapshot.tokens_created, 0);
+        assert_eq!(snapshot.bytes_current, 0);
+        assert!(snapshot.complete);
+    }
+
+    #[test]
+    fn configured_ceiling_survives_pause_resume_and_cannot_relabel_live_owner() {
+        let position = Position::startpos();
+        let cancel = AtomicBool::new(false);
+        let mut engine = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 64);
+        let maximum_bytes = 1024 * 1024;
+        engine.set_paused_stack_max_bytes(maximum_bytes).unwrap();
+        let token = engine
+            .analyze(&position, limits(1), &cancel)
+            .unwrap()
+            .resume
+            .unwrap();
+        assert!(token.is_paused_stack());
+        assert!(engine.token_is_current(&token));
+        let before = engine.paused_stack_snapshot().unwrap();
+        assert_eq!(before.bytes_limit_current, maximum_bytes as u64);
+        assert!(before.bytes_current <= before.bytes_limit_current);
+        engine.set_paused_stack_max_bytes(maximum_bytes).unwrap();
+        assert!(matches!(
+            engine.set_paused_stack_max_bytes(2 * maximum_bytes),
+            Err(CpuError::InvalidConfig(_))
+        ));
+        assert_eq!(engine.paused_stack_snapshot(), Some(before));
+        assert!(engine.token_is_current(&token));
+        assert_eq!(
+            engine
+                .resume(&position, &token, limits(1), &cancel)
+                .unwrap()
+                .nodes,
+            1
+        );
+        assert_eq!(
+            engine.paused_stack_snapshot().unwrap().bytes_limit_current,
+            maximum_bytes as u64
+        );
+        let before_clear = engine.paused_stack_snapshot().unwrap();
+        engine.clear();
+        let after_clear = engine.paused_stack_snapshot().unwrap();
+        assert_eq!(after_clear.owner_id, before_clear.owner_id);
+        assert_eq!(after_clear.bytes_peak, before_clear.bytes_peak);
+        assert_eq!(after_clear.bytes_limit_current, maximum_bytes as u64);
+        assert_eq!(after_clear.bytes_current, 0);
+        engine.set_paused_stack_max_bytes(maximum_bytes).unwrap();
+        assert!(matches!(
+            engine.set_paused_stack_max_bytes(2 * maximum_bytes),
+            Err(CpuError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn task_memory_checks_use_the_captured_ceiling_at_safe_boundaries() {
+        let engine = cpu(CpuOrderingPolicy::LegacyMvvLvaV1, 0);
+        let position = Position::startpos();
+        let mut task = PausedTask::new(
+            &engine,
+            &position,
+            None,
+            position.ordered_legal_moves().moves().to_vec(),
+            limits(1),
+            None,
+        )
+        .unwrap();
+        let retained = task.retained_bytes();
+        task.maximum_bytes = retained;
+        task.check_memory().unwrap();
+        assert!(matches!(
+            task.start_iteration(false),
+            Err(CpuError::PausedStackMemoryLimit {
+                retained_bytes,
+                maximum_bytes,
+            }) if maximum_bytes == retained && retained_bytes > retained
+        ));
+    }
+
+    #[test]
+    fn held_side_scope_gets_one_exact_ceiling_before_either_owner_starts() {
+        let mut engine = CpuEngine::with_paused_side_scope(
+            config(64),
+            Arc::new(BootstrapCpuValue::default()),
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+        )
+        .unwrap();
+        let maximum_bytes = 1024 * 1024;
+        engine.set_paused_stack_max_bytes(maximum_bytes).unwrap();
+        assert_eq!(engine.paused_stack_max_bytes(), maximum_bytes);
+        assert_eq!(
+            engine
+                .paused_side_scope
+                .as_ref()
+                .unwrap()
+                .paused_stack_max_bytes(),
+            maximum_bytes
+        );
+        let cancel = AtomicBool::new(false);
+        let position = Position::startpos();
+        let token = engine
+            .analyze(&position, limits(1), &cancel)
+            .unwrap()
+            .resume
+            .unwrap();
+        let side_before = engine.paused_side_scope_snapshot();
+        assert!(matches!(
+            engine.set_paused_stack_max_bytes(2 * maximum_bytes),
+            Err(CpuError::InvalidConfig(_))
+        ));
+        assert_eq!(engine.paused_side_scope_snapshot(), side_before);
+        assert!(engine.token_is_current(&token));
+        assert_eq!(
+            engine
+                .paused_side_scope
+                .as_ref()
+                .unwrap()
+                .paused_stack_max_bytes(),
+            maximum_bytes
+        );
     }
 
     fn add(total: &mut CpuWork, part: CpuWork) {
@@ -2038,6 +2288,7 @@ mod tests {
             let mut control = Control {
                 limits: limits(100_000),
                 cancellation: &AtomicBool::new(false),
+                cooperative: None,
                 nodes: 0,
                 quiescence_nodes: 0,
                 tt_hits: 0,

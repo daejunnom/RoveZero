@@ -239,6 +239,9 @@ pub enum ExternalCompletion {
     BestMove,
     StoppedDeadline,
     StoppedCanceled,
+    /// External stop/drain returned partial observations; this does not own an
+    /// exact native stack continuation or certify a completed minimax bound.
+    StoppedYield,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -76,6 +76,7 @@ mod check {
             stage,
             code: match error {
                 RoleError::Unavailable => "unavailable",
+                RoleError::Unsupported(_) => "unsupported",
                 RoleError::InvalidOutput => "invalid_output",
                 RoleError::Canceled => "canceled",
                 RoleError::Deadline => "deadline",

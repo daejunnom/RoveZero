@@ -64,6 +64,8 @@ mod cache;
 pub use cache::RuntimeCache;
 mod aliases;
 pub use aliases::RuntimeBundleAlias;
+mod artifact_tree;
+pub use artifact_tree::{PreparedCudaArtifactTree, PreparedCudaArtifactTreeObservation};
 
 /// Storage provenance is distinct from model-evaluation cache provenance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -617,7 +619,18 @@ impl RuntimeLibraryPin {
         output_root: &Path,
         spec: &CudaRuntimeBundleSpec,
     ) -> Result<Self, BackendError> {
+        Self::copy_linux_cuda_bundle_observed(source_root, output_root, spec, &mut |_| Ok(()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn copy_linux_cuda_bundle_observed(
+        source_root: &Path,
+        output_root: &Path,
+        spec: &CudaRuntimeBundleSpec,
+        checkpoint: &mut dyn FnMut(u64) -> Result<(), BackendError>,
+    ) -> Result<Self, BackendError> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+        checkpoint(0)?;
         let source_root = real_bundle_root(source_root)?;
         let output_root = real_bundle_root(output_root)?;
         let bundle_digest = spec.digest()?;
@@ -640,6 +653,7 @@ impl RuntimeLibraryPin {
             let mut core = None;
             let mut pins = Vec::with_capacity(files.len() - 1);
             for file in &files {
+                checkpoint(0)?;
                 let source = source_root.join(&file.filename);
                 let metadata = fs::symlink_metadata(&source).map_err(|error| {
                     bundle_io_error("CUDA bundle source metadata failed", &error)
@@ -681,7 +695,13 @@ impl RuntimeLibraryPin {
                     })?;
                 created_files.push(path.clone());
                 let expected = bundle_file_digest(file)?;
-                if stream_bundle_file(&mut reader, Some(&mut writer), file.bytes)? != expected {
+                if stream_bundle_file_observed(
+                    &mut reader,
+                    Some(&mut writer),
+                    file.bytes,
+                    checkpoint,
+                )? != expected
+                {
                     return Err(bundle_identity_error("CUDA bundle source digest differs"));
                 }
                 writer
@@ -694,7 +714,8 @@ impl RuntimeLibraryPin {
                 let mut pin = File::open(&path)
                     .map_err(|error| bundle_io_error("cannot pin CUDA bundle file", &error))?;
                 verify_bundle_file_length(&pin, file.bytes)?;
-                if stream_bundle_file(&mut pin, None, file.bytes)? != expected {
+                if stream_bundle_file_observed(&mut pin, None, file.bytes, checkpoint)? != expected
+                {
                     return Err(bundle_identity_error(
                         "CUDA bundle owned copy digest differs",
                     ));
@@ -709,6 +730,7 @@ impl RuntimeLibraryPin {
                 }
             }
             for alias in spec.loader_aliases.as_deref().unwrap_or(&[]) {
+                checkpoint(0)?;
                 let path = directory.join(&alias.filename);
                 std::os::unix::fs::symlink(&alias.target, &path).map_err(|error| {
                     bundle_io_error("cannot create declared CUDA loader alias", &error)
@@ -787,16 +809,18 @@ fn verify_bundle_file_length(file: &File, expected: u64) -> Result<(), BackendEr
 }
 
 #[cfg(target_os = "linux")]
-fn stream_bundle_file(
+fn stream_bundle_file_observed(
     reader: &mut File,
     mut writer: Option<&mut File>,
     expected_bytes: u64,
+    checkpoint: &mut dyn FnMut(u64) -> Result<(), BackendError>,
 ) -> Result<[u8; 32], BackendError> {
     let mut buffer = [0_u8; 64 * 1024];
     let mut remaining = expected_bytes;
     let mut digest = Sha256::new();
     while remaining > 0 {
         let capacity = remaining.min(buffer.len() as u64) as usize;
+        checkpoint(capacity as u64)?;
         let count = reader
             .read(&mut buffer[..capacity])
             .map_err(|error| bundle_io_error("cannot read CUDA bundle bytes", &error))?;
@@ -813,6 +837,9 @@ fn stream_bundle_file(
         digest.update(&buffer[..count]);
         remaining -= count as u64;
     }
+    // Reserve the bounded EOF probe too; short reads remain conservatively
+    // charged and a failing owner never refunds an uncertain read.
+    checkpoint(1)?;
     if reader
         .read(&mut buffer[..1])
         .map_err(|error| bundle_io_error("cannot verify CUDA bundle end", &error))?

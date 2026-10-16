@@ -299,6 +299,11 @@ impl NativeWarmState {
         cancel: CancelToken,
         external_cancel: &AtomicBool,
     ) -> Result<PreparedWarm, RoleError> {
+        if logical.purpose == RoleQueryPurpose::TaskPolicy {
+            return Err(RoleError::Unsupported(
+                "V1/V2 private Warm does not implement TaskPolicy",
+            ));
+        }
         if self.is_closed() {
             return Err(if self.is_quarantined() {
                 RoleError::PhysicalCompletionUnknown
@@ -339,6 +344,11 @@ impl NativeWarmState {
                     PalsRole::Critic
                 }
                 RoleQueryPurpose::ValueFresh => unreachable!(),
+                RoleQueryPurpose::TaskPolicy => {
+                    return Err(RoleError::Unsupported(
+                        "TaskPolicy requires the explicit V3 collection adapter",
+                    ));
+                }
             };
             if input.role != expected {
                 return Err(RoleError::InvalidOutput);

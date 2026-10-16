@@ -9,9 +9,14 @@ mod native_cuda_batch;
 mod native_cuda_pilot;
 mod native_cuda_v2;
 mod native_launch;
+mod pals_compiled_sources_v5;
 mod pals_data;
+pub mod pals_data_v3;
 mod pals_manifest;
 mod pals_manifest_v4;
+mod pals_manifest_v5;
+mod pals_source_pins_v5;
+mod pals_startup_v5;
 mod validation;
 
 pub use manifest::*;
@@ -22,9 +27,13 @@ pub use native_cuda_batch::*;
 pub use native_cuda_pilot::*;
 pub use native_cuda_v2::*;
 pub use native_launch::*;
+pub use pals_compiled_sources_v5::*;
 pub use pals_data::*;
 pub use pals_manifest::*;
 pub use pals_manifest_v4::*;
+pub use pals_manifest_v5::*;
+pub use pals_source_pins_v5::*;
+pub use pals_startup_v5::*;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};

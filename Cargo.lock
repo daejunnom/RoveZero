@@ -454,6 +454,7 @@ dependencies = [
  "ort",
  "rz-contracts",
  "rz-encoding",
+ "rz-experiments",
  "rz-native-loader",
  "rz-position",
  "rz-runtime",
@@ -470,6 +471,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "libc",
+ "rz-eval",
  "serde",
  "serde_json",
  "sha2",
@@ -485,6 +487,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rz-platform"
+version = "0.1.0"
+
+[[package]]
 name = "rz-position"
 version = "0.1.0"
 dependencies = [
@@ -497,6 +503,7 @@ name = "rz-runtime"
 version = "0.1.0"
 dependencies = [
  "rz-contracts",
+ "rz-platform",
  "rz-telemetry",
 ]
 
@@ -504,9 +511,13 @@ dependencies = [
 name = "rz-search"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "nix",
  "rz-contracts",
+ "rz-platform",
  "rz-position",
+ "rz-runtime",
  "rz-telemetry",
  "serde",
  "serde_json",
@@ -527,6 +538,8 @@ dependencies = [
  "rz-contracts",
  "rz-encoding",
  "rz-eval",
+ "rz-experiments",
+ "rz-native-loader",
  "rz-position",
  "rz-runtime",
  "rz-search",

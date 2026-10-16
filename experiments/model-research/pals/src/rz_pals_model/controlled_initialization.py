@@ -24,6 +24,45 @@ MAX_OUTPUT_BYTES = 512 * 1024 * 1024
 MAX_WALL_SECONDS = 300
 
 
+def copy_parameters_with_semantic_allowlist(source_model, target_model, allowlist, *, source_semantics, target_semantics):
+    """Explicit partial initialization, never automatic old-asset conversion.
+
+    Validate complete membership, name, shape, dtype and declared meaning before
+    modifying a target. The receipt records actual copied FP32 parameter bits.
+    Untrained source parameters carry no pretrained-knowledge transfer claim.
+    Caller owns the model slot and publication; this function runs no forward,
+    optimizer, session creation or file operation.
+    """
+    import torch
+    from .virtual_review import controlled_copy_plan
+    if type(allowlist) is not dict or not allowlist:
+        raise ValueError("partial initialization requires an explicit semantic allowlist")
+    source, target = dict(source_model.named_parameters()), dict(target_model.named_parameters())
+    source_inventory, target_inventory = {}, {}
+    for name in allowlist:
+        if name not in source or name not in target:
+            raise ValueError("partial initialization parameter missing: " + name)
+        left, right = source[name], target[name]
+        if left.dtype != torch.float32 or right.dtype != torch.float32 or left.device.type != "cpu" or right.device.type != "cpu" or not torch.isfinite(left).all() or not torch.isfinite(right).all():
+            raise ValueError("partial initialization requires finite CPU FP32 before publication")
+        raw = left.detach().contiguous().numpy().astype("<f4",copy=False).tobytes()
+        source_inventory[name] = {"shape":list(left.shape),"dtype":"fp32_le","semantics":source_semantics.get(name),"sha256":hashlib.sha256(raw).hexdigest()}
+        target_inventory[name] = {"shape":list(right.shape),"dtype":"fp32_le","semantics":target_semantics.get(name)}
+    plan = controlled_copy_plan(source_inventory,target_inventory,allowlist)
+    with torch.no_grad():
+        for entry in plan["parameters"]:
+            target[entry["name"]].copy_(source[entry["name"]])
+    actual = []
+    for entry in plan["parameters"]:
+        digest = hashlib.sha256(target[entry["name"]].detach().contiguous().numpy().astype("<f4",copy=False).tobytes()).hexdigest()
+        if digest != entry["source_sha256"]:
+            raise ValueError("partial initialization bit-copy mismatch")
+        actual.append({**entry,"target_sha256":digest,"operation":"copied_exact_fp32_bits"})
+    return {**plan,"parameters":actual,"copies_executed":len(actual),"source_profile":source_model.config.profile,
+            "target_profile":target_model.config.profile,"source_and_target_assets_automatically_converted":False,
+            "nn_forwards":0,"optimizer_steps":0}
+
+
 def initialization_plan(seed=23):
     """Pure preparation. No dependency import, model construction or file write."""
     if type(seed) is not int or not 0 <= seed < 1 << 63:

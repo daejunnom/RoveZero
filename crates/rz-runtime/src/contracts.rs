@@ -28,10 +28,22 @@ pub struct ContractSystemClock {
 
 impl ContractSystemClock {
     pub fn new(epoch: ProcessEpoch) -> Self {
+        Self::with_origin(epoch, Instant::now())
+    }
+
+    /// The process owner supplies the same origin used by UCI and CPU workers.
+    /// Sharing an epoch with a newly sampled origin would misinterpret deadlines.
+    pub fn with_origin(epoch: ProcessEpoch, origin: Instant) -> Self {
         Self {
             domain: ClockDomain(epoch),
-            origin: Arc::new(Instant::now()),
+            origin: Arc::new(origin),
         }
+    }
+
+    /// Worker adapters must reuse this origin with the declared domain. Creating
+    /// another Instant for the same epoch would give deadlines different meaning.
+    pub fn origin(&self) -> Instant {
+        *self.origin
     }
 
     pub fn try_now(&self) -> Result<MonotonicTick, ContractError> {

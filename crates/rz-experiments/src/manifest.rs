@@ -131,6 +131,16 @@ impl ArtifactRef {
     ) -> Result<std::fs::File, ManifestError> {
         crate::artifact::open_verified(self, root, max_bytes)
     }
+
+    /// Preserve the caller's already pinned directory rather than reopening an
+    /// ambient pathname between startup verification and asset consumption.
+    pub fn open_verified_at(
+        &self,
+        root: &cap_std::fs::Dir,
+        max_bytes: u64,
+    ) -> Result<std::fs::File, ManifestError> {
+        crate::artifact::open_verified_in(root, self, max_bytes)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

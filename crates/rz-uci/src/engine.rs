@@ -233,6 +233,11 @@ impl ProcessClock {
     pub fn b_clock(&self) -> rz_search::contract_time::InstantClock {
         rz_search::contract_time::InstantClock::new(self.domain(), self.origin)
     }
+    /// Native preparation and coordinator deadlines retain the process origin
+    /// established before any model loading or UCI go command.
+    pub fn runtime_clock(&self) -> rz_runtime::contracts::ContractSystemClock {
+        rz_runtime::contracts::ContractSystemClock::with_origin(self.epoch, self.origin)
+    }
     pub fn now(&self) -> Result<contract::MonotonicTick, contract::ContractError> {
         self.tick_at(Instant::now())
     }

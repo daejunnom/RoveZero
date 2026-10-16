@@ -276,6 +276,24 @@ pub fn validate_pilot_clock_trace(
     opening: &OpeningSpec,
     clock: NativeGameClockV3,
 ) -> Result<NativePilotClockAudit, ArenaError> {
+    validate_pilot_clock_trace_with_ply_limit(stdout, pgn, opening, clock, 256)
+}
+
+/// Same pinned runner codec and Rules-audited charges, with the independently
+/// declared V5 collection ceiling. The legacy entry retains its 256-ply limit.
+/// This never infers charges from engine-reported time or a PGN header.
+pub fn validate_pilot_clock_trace_with_ply_limit(
+    stdout: &[u8],
+    pgn: &PairPgnAudit,
+    opening: &OpeningSpec,
+    clock: NativeGameClockV3,
+    max_game_plies: u32,
+) -> Result<NativePilotClockAudit, ArenaError> {
+    if !matches!(max_game_plies, 256 | 512) {
+        return Err(invalid(
+            "pilot clock ply ceiling is not a registered 256/512 profile",
+        ));
+    }
     if stdout.is_empty()
         || stdout.len() > 64 * 1024 * 1024
         || !stdout.ends_with(b"\n")
@@ -299,15 +317,38 @@ pub fn validate_pilot_clock_trace(
         records.push(record(message)?);
         trace.update(line.as_bytes());
         trace.update(b"\n");
-        if records.len() > 512 {
-            return Err(invalid("pilot clock exceeds two 256 ply games"));
+        if records.len() > max_game_plies as usize * 2 {
+            return Err(invalid(if max_game_plies == 256 {
+                "pilot clock exceeds two 256 ply games"
+            } else {
+                "pilot clock exceeds two 512 ply games"
+            }));
         }
     }
     let mut cursor = 0;
+    let black_origin = match opening.initial {
+        rz_experiments::InitialPosition::Startpos => false,
+        rz_experiments::InitialPosition::Fen => {
+            rz_position::Position::from_fen(
+                opening
+                    .fen
+                    .as_deref()
+                    .ok_or_else(|| invalid("clock FEN opening lacks exact origin"))?,
+            )
+            .map_err(|_| invalid("clock FEN opening is invalid"))?
+            .side_to_move()
+                == rz_position::Color::Black
+        }
+    };
     let mut games = Vec::new();
     let time_control = clock.pgn_time_control();
     let mut pgn_time_control_warnings = Vec::new();
     for g in &pgn.games {
+        if g.uci_moves.len() > max_game_plies as usize {
+            return Err(invalid(
+                "one audited game exceeds its registered ply ceiling",
+            ));
+        }
         if g.time_control.as_deref() != Some(time_control.as_str()) {
             pgn_time_control_warnings.push(format!(
                 "{}: PGN TimeControl {:?} differs from actual clock {}; header diagnostic only",
@@ -325,7 +366,7 @@ pub fn validate_pilot_clock_trace(
         let mut remaining = [clock.base_ms; 2];
         let mut charged = [0_u64; 2];
         for ply in opening.moves.len()..g.uci_moves.len() {
-            let side = ply % 2;
+            let side = (ply + usize::from(black_origin)) % 2;
             let engine = if side == 0 {
                 &g.white_engine
             } else {
@@ -381,4 +422,95 @@ pub fn validate_pilot_clock_trace(
         pgn_time_control_warnings,
         games,
     })
+}
+
+#[cfg(test)]
+mod ply_ceiling_tests {
+    use super::*;
+    use crate::{GamePgnAudit, GameResult};
+    use rz_experiments::{HistoryCompleteness, InitialPosition};
+    fn fixture(count: usize, black_origin: bool) -> (OpeningSpec, PairPgnAudit, Vec<u8>) {
+        let opening = OpeningSpec {
+            id: "clock-codec-fixture".into(),
+            initial: if black_origin {
+                InitialPosition::Fen
+            } else {
+                InitialPosition::Startpos
+            },
+            fen: black_origin
+                .then(|| "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1".into()),
+            moves: vec![],
+            history: if black_origin {
+                HistoryCompleteness::UnknownPrefix
+            } else {
+                HistoryCompleteness::Complete
+            },
+            history_origin: "authored clock-only fixture".into(),
+        };
+        // This is a clock-codec fixture, not an independently Rules-audited
+        // game. Production receives the existing Rules audit before this gate.
+        let mut trace = String::new();
+        let mut games = Vec::new();
+        for game in 0..2 {
+            let white = if game == 0 { "a" } else { "b" };
+            let black = if game == 0 { "b" } else { "a" };
+            let mut remaining = [120000u64; 2];
+            for ply in 0..count {
+                let side = (ply + usize::from(black_origin)) % 2;
+                let before = remaining[side];
+                remaining[side] = before - 1 + 1000;
+                let name = if side == 0 { white } else { black };
+                trace.push_str(&format!("[TRACE ] [10:51:44.181984] <     137433152747200> fastchess --- RZ_CLOCK_V1 engine={name} before={before} increment=1000 elapsed_ns=1 after={} valid=true\n",remaining[side]));
+            }
+            games.push(GamePgnAudit {
+                game_id: format!("g{game}"),
+                white_engine: white.into(),
+                black_engine: black.into(),
+                time_control: Some("120+1".into()),
+                uci_moves: vec!["g8f6".into(); count],
+                result: GameResult::Draw,
+                termination: "fixture-only".into(),
+                final_fen: "not a Rules claim".into(),
+                classification: "fixture-only".into(),
+                loser_engine: None,
+                terminal_reason: None,
+                engine_failure: None,
+                failure_evidence: None,
+            });
+        }
+        (
+            opening,
+            PairPgnAudit {
+                audit_version: 1,
+                rules_source_commit: "fixture".into(),
+                contract_source_commit: "fixture".into(),
+                engine_contract_revision: "0.1".into(),
+                opening_input_sha256: "0".repeat(64),
+                start_state_semantic_sha256: "0".repeat(64),
+                games,
+            },
+            trace.into_bytes(),
+        )
+    }
+    fn clock() -> NativeGameClockV3 {
+        NativeGameClockV3 {
+            base_ms: 120000,
+            increment_ms: 1000,
+        }
+    }
+    #[test]
+    fn explicit_collection_clock_does_not_expand_legacy_ceiling() {
+        let (o, p, t) = fixture(257, false);
+        assert!(validate_pilot_clock_trace(&t, &p, &o, clock()).is_err());
+        assert!(validate_pilot_clock_trace_with_ply_limit(&t, &p, &o, clock(), 512).is_ok());
+        assert!(validate_pilot_clock_trace_with_ply_limit(&t, &p, &o, clock(), 1024).is_err());
+    }
+    #[test]
+    fn clock_replay_preserves_black_fen_origin() {
+        let (o, p, t) = fixture(1, true);
+        let a = validate_pilot_clock_trace_with_ply_limit(&t, &p, &o, clock(), 256).unwrap();
+        assert_eq!(a.games[0].charged_ms, [0, 1]);
+        assert_eq!(a.games[0].white_remaining_ms, 120000);
+        assert_eq!(a.games[0].black_remaining_ms, 120999);
+    }
 }

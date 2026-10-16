@@ -1388,6 +1388,7 @@ mod tests {
             tokens_peak: 1,
             bytes_current: 1024,
             bytes_peak: 2048,
+            bytes_limit_current: 8 * 1024 * 1024,
             stale_context_attempts: 0,
             stale_context_rejections: 0,
             replayed_consumed_work: 0,

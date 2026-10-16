@@ -49,6 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "full_line_v2" => PalsModelProfile::FullLineV2,
             "interaction_head_v2" => PalsModelProfile::InteractionHeadV2,
             "full_line_interaction_v2" => PalsModelProfile::FullLineInteractionV2,
+            "virtual_review_v1" => PalsModelProfile::VirtualReviewV1,
             _ => return Err("unsupported PALS descriptor model profile".into()),
         };
         if profile.replace(selected).is_some() {
@@ -57,6 +58,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let c =
         PalsModelConfig::for_profile(profile.unwrap_or(PalsModelProfile::FullLineInteractionV2));
+    if c.profile == PalsModelProfile::VirtualReviewV1 {
+        #[cfg(feature = "search-work-receipts")]
+        {
+            println!(
+                "{}",
+                rz_uci::pals_native::virtual_encoding::pals_virtual_rules_descriptor()
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "search-work-receipts"))]
+        return Err("V3 Rules descriptor requires search-work-receipts feature".into());
+    }
     let full_line = c.profile.uses_full_line();
     let additional = if full_line {
         format!(

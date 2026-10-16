@@ -286,7 +286,7 @@ fn fault() -> ContractError {
 // per node. Keeping it inline avoids a heap allocation on failure/cancel
 // accounting paths; this bounded scalar snapshot has no owned buffers.
 #[allow(clippy::large_enum_variant)]
-pub(super) enum AttemptObservation {
+pub(crate) enum AttemptObservation {
     NoWork,
     CpuStarted,
     CpuFailed(CpuWork),
@@ -297,7 +297,7 @@ pub(super) enum AttemptObservation {
         root_coverage_observed: bool,
     },
 }
-pub(super) struct CpuObservation {
+pub(crate) struct CpuObservation {
     nodes: u64,
     quiescence_nodes: u64,
     tt_hits: u64,
@@ -325,7 +325,7 @@ struct PendingCpuOutput {
     best_move: Option<BoardMove>,
     complete: bool,
 }
-pub(super) struct ProcessWorkJournal {
+pub(crate) struct ProcessWorkJournal {
     receipt: Mutex<ProcessSearchWorkReceipt>,
     // A bounded set of unacknowledged reports, never a growing go journal.
     pending_cpu: Mutex<Vec<PendingCpuOutput>>,

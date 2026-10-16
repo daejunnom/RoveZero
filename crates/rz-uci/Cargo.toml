@@ -9,6 +9,11 @@ description = "RoveZero UCI parser and injected session control boundary"
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "rz-pals-adaptive"
+path = "src/bin/pals-adaptive.rs"
+required-features = ["pals-adaptive", "onnx-cpu"]
+
 [[example]]
 name = "search_probe"
 required-features = ["onnx-cpu"]
@@ -24,6 +29,14 @@ required-features = ["search-work-receipts"]
 [[example]]
 name = "pals_private_warm_cpu_check"
 required-features = ["onnx-cpu"]
+
+[[example]]
+name = "pals_continuation_diagnostic"
+required-features = ["pals-adaptive-diagnostics"]
+
+[[example]]
+name = "virtual_review_warm_numeric_capture"
+required-features = ["pals-adaptive", "onnx-cpu", "experimental-io-binding"]
 
 [features]
 experimental-batch = ["rz-search/experimental-batch", "rz-eval/experimental-batch"]
@@ -41,10 +54,12 @@ default = []
 experimental-best-move = []
 experimental-raw-cache = ["rz-eval/experimental-raw-cache"]
 onnx-cpu = [
-    "rz-eval/onnx", "search-work-receipts",
+    "rz-eval/onnx", "search-work-receipts", "dep:rz-native-loader",
 ]
 search-work-receipts = ["dep:serde", "dep:serde_json", "dep:cap-std", "dep:cap-fs-ext", "dep:nix"]
 onnx-cuda = ["onnx-cpu"]
+pals-adaptive = ["dep:rz-experiments", "rz-experiments/pals-content-admission", "search-work-receipts"]
+pals-adaptive-diagnostics = ["pals-adaptive", "onnx-cpu"]
 
 [dependencies]
 rz-search.workspace = true
@@ -54,6 +69,7 @@ rz-runtime = { workspace = true, features = ["contracts"] }
 rz-eval = { workspace = true, features = ["contracts"] }
 rz-encoding.workspace = true
 rz-telemetry.workspace = true
+rz-experiments = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2.workspace = true
@@ -63,3 +79,7 @@ cap-fs-ext = { workspace = true, optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 # Safe Linux proc/cgroup filesystem checks and nonblocking observer opens.
 nix = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Keep retained-handle Win32 calls in the existing native FFI owner.
+rz-native-loader = { workspace = true, optional = true }
