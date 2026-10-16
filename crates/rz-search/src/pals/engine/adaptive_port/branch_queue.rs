@@ -209,7 +209,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     pub(super) fn defer_fixed_recheck(
         &mut self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
-        blueprint: AdaptiveContinuationBlueprint,
+        mut blueprint: AdaptiveContinuationBlueprint,
     ) -> Result<AdaptivePortTransition, PalsError> {
         self.check_work(work)?;
         if self.root_fanout != AdaptiveRootFanoutPolicy::SequentialFixed
@@ -258,6 +258,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .repair_queue_enqueued
             .checked_add(1)
             .ok_or(PalsError::Capacity)?;
+        blueprint.carry_diagnostic_repair_line(work.input.question.diagnostic_repair_line);
         self.deferred_rechecks.push_back(DeferredRecheck {
             parent: work.frame,
             original_question: work.input.question_digest,
@@ -554,8 +555,24 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     pub(super) fn finish_branch(
         &mut self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
-        transition: AdaptivePortTransition,
+        mut transition: AdaptivePortTransition,
     ) -> Result<AdaptivePortTransition, PalsError> {
+        // Only the same continuing branch inherits the immutable provenance.
+        // Completed branches selecting a queued sibling below do not transfer it.
+        // A new Repair (including a zero-step one) must not inherit the
+        // preceding Repair's identity from CounterValidation/CounterValueFresh.
+        if matches!(
+            work.input.stage,
+            RefinementStage::RepairValidation
+                | RefinementStage::RepairValueFresh
+                | RefinementStage::RecheckRepairedValueFresh
+                | RefinementStage::CriticRecheck
+                | RefinementStage::RecheckCounterValidation
+                | RefinementStage::FreshRepairedEndpoint
+                | RefinementStage::FreshCounterEndpoint
+        ) {
+            transition.carry_diagnostic_repair_line(work.input.question.diagnostic_repair_line);
+        }
         let outcome = match &transition {
             AdaptivePortTransition::Continue(_) => return Ok(transition),
             AdaptivePortTransition::Complete { scope } => AdaptiveBranchOutcome::Complete(*scope),

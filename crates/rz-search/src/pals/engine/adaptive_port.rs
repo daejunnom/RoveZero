@@ -29,7 +29,8 @@ mod role_commit;
 pub mod validator_port;
 pub use branch_queue::{AdaptiveDeferredRepair, AdaptiveQueuedRecheck};
 pub use consumption_observation::{
-    AdaptivePublishedRepairLine, AdaptiveRoleConsumptionEvent, AdaptiveRoleConsumptionObservation,
+    AdaptivePublishedRepairLine, AdaptiveRepairLineInput, AdaptiveRepairLineProvenance,
+    AdaptiveRoleConsumptionEvent, AdaptiveRoleConsumptionObservation,
     AdaptiveRoleConsumptionOutcome, AdaptiveRoleConsumptionRejection, AdaptiveRoleConsumptionStage,
     AdaptiveRoleConsumptionUnavailable, MAX_ROLE_CONSUMPTION_EVENTS,
 };
@@ -136,6 +137,9 @@ pub struct AdaptivePortQuestion {
     paired_repaired: Option<ObservationId>,
     paired_fresh_seal: Option<FreshPairSeal>,
     question_digest: ContractDigest,
+    // Observer-only inline Copy metadata. Never hashed, encoded, selected or
+    // consulted by Rules, a cache, acceptance, scheduling or the model.
+    diagnostic_repair_line: Option<AdaptiveRepairLineProvenance>,
 }
 impl AdaptivePortQuestion {
     /// Conservative known owned host backing, never an RSS/physical peak.
@@ -1444,6 +1448,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 completed_evidence: None,
                 prior_semantic_attempt: None,
                 published_repair_line: None,
+                repair_line_input: None,
             });
         }
     }
@@ -1687,6 +1692,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             paired_repaired,
             paired_fresh_seal: None,
             question_digest,
+            diagnostic_repair_line: None,
         };
         Ok(FrameInput {
             stage,

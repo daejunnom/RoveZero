@@ -20,8 +20,20 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .role_consumption_observation
             .is_some()
             .then_some(&mut published_repair_line);
-        let returned =
+        let mut returned =
             self.commit_role_unobserved(work, ticket, output, physical, repair_publication_sink);
+        if let (Some(published_line), Ok(step)) = (published_repair_line, &mut returned) {
+            step.transition
+                .carry_diagnostic_repair_line(Some(AdaptiveRepairLineProvenance {
+                    producer_frame: work.frame,
+                    producer_request: ticket.id,
+                    submitted_question: work.input.question_digest,
+                    submitted_view: work.input.view_seal.view_digest,
+                    completed_evidence: step.evidence,
+                    original_deadline: work.original_deadline,
+                    published_line,
+                }));
+        }
         if let Some(journal) = &mut self.role_consumption_observation {
             let (outcome, completed_evidence) = match &returned {
                 Ok(step) => (
@@ -49,6 +61,19 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 completed_evidence,
                 prior_semantic_attempt,
                 published_repair_line,
+                repair_line_input: work
+                    .input
+                    .question
+                    .diagnostic_repair_line
+                    .map(|provenance| AdaptiveRepairLineInput {
+                        refinement_stage: work.input.stage,
+                        provenance,
+                        model_proposal_sha256: ContractDigest(
+                            work.input.question.context.proposal_sha256,
+                        ),
+                        model_proposal_plies: work.input.view.query().proposal.len(),
+                        repaired_plies: work.input.question.repaired.as_ref().map(Vec::len),
+                    }),
             });
         }
         returned

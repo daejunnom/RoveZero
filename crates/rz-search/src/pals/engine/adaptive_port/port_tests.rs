@@ -1262,3 +1262,251 @@ fn unfinished_repair_semantic_result_is_not_a_published_repair_line() {
             .any(|r| r.kind == RecordKind::Repair)
     );
 }
+
+// Exercise original owner continuation builders and selected query construction.
+// These authored outputs do not stand for CPU validation, machine acceptance,
+// live pending concurrency, an actual model graph or case acceptance.
+fn repair_provenance_source_fixture(offset_store: bool, frame_sequence: u64) -> (Port, Work) {
+    let mut port = setup(Position::startpos(), 4);
+    assert!(port.enable_role_consumption_observation());
+    if offset_store {
+        port.record_hot(
+            RecordKind::Proposal,
+            &[BoardMove::from_uci("a2a3").unwrap()],
+            None,
+        )
+        .unwrap();
+    }
+    let proposal = ["e2e4", "c7c5", "g1f3", "d7d6"]
+        .map(|m| BoardMove::from_uci(m).unwrap())
+        .to_vec();
+    let counter = ["e2e4", "e7e5", "g1f3", "b8c6"]
+        .map(|m| BoardMove::from_uci(m).unwrap())
+        .to_vec();
+    port.record_hot(RecordKind::Proposal, &proposal, None)
+        .unwrap();
+    port.record_hot(RecordKind::Counterexample, &counter, None)
+        .unwrap();
+    let prefix = counter[..2].to_vec();
+    let node = port.replay_node(&prefix).unwrap();
+    let input = port
+        .input(
+            node,
+            RefinementStage::Repair,
+            Some(proposal[0]),
+            prefix,
+            proposal,
+            Some(counter),
+            None,
+            Some(1),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+    let mut current = Work {
+        frame: FrameId {
+            authority: port.authority,
+            sequence: frame_sequence,
+        },
+        original_first_move: rz_contracts::pals::Move16::encode(
+            rz_contracts::Move::try_from(input.question.first.unwrap()).unwrap(),
+        ),
+        original_deadline: port.deadline,
+        budget: FrameBudget {
+            original_cpu_credit: port.limits.max_cpu_nodes,
+            role_submissions_remaining: port.engine.config.max_role_calls,
+            original_store_byte_limit: 8 * 1024 * 1024,
+        },
+        input,
+    };
+    for (sequence, chosen) in [(1, "b1c3"), (2, "b8c6")] {
+        let (ticket, mut out) = output(&current, sequence);
+        if let RolePayload::Proposal {
+            candidate_logits, ..
+        } = &mut out.payload
+        {
+            let chosen = BoardMove::from_uci(chosen).unwrap();
+            let index = current
+                .input
+                .view
+                .query()
+                .legal
+                .iter()
+                .position(|m| *m == chosen)
+                .unwrap();
+            candidate_logits[index] = 1.0;
+        } else {
+            panic!("authored Repair must use P output")
+        }
+        let step = port.commit_role(&current, &ticket, &out, None).unwrap();
+        port.role_consumed(&ticket, &current.input.view).unwrap();
+        let step = port.materialize_step(step).unwrap();
+        let FrameTransition::Continue(input) = step.transition else {
+            panic!("Repair lost original continuation")
+        };
+        current = Work { input, ..current };
+    }
+    assert_eq!(current.input.stage, RefinementStage::RepairValidation);
+    assert!(current.input.question.diagnostic_repair_line.is_some());
+    (port, current)
+}
+fn materialize_authored_source_transition(
+    port: &mut Port,
+    work: &Work,
+    transition: AdaptivePortTransition,
+) -> Work {
+    let transition = port.finish_branch(work, transition).unwrap();
+    let step = port
+        .materialize_step(AdaptivePortStep {
+            evidence: ContractDigest([0x55; 32]),
+            transition,
+            fresh_pair: None,
+            rules_pair: None,
+            consumption_gate: None,
+            feedback_gate: None,
+            queue_question: None,
+        })
+        .unwrap();
+    let FrameTransition::Continue(input) = step.transition else {
+        panic!("authored source continuation missing")
+    };
+    Work {
+        input,
+        frame: work.frame,
+        original_first_move: work.original_first_move,
+        original_deadline: work.original_deadline,
+        budget: work.budget,
+    }
+}
+#[test]
+fn repair_provenance_reaches_original_critic_query_and_first_consume_without_handle_lookup() {
+    let mut observed = Vec::new();
+    for (offset, frame_sequence) in [(false, 1), (true, 2)] {
+        let (mut port, repaired) = repair_provenance_source_fixture(offset, frame_sequence);
+        let original = repaired.input.question.diagnostic_repair_line.unwrap();
+        assert_eq!(original.producer_frame, repaired.frame);
+        assert_eq!(original.producer_request.sequence, 2);
+        let repaired_moves = repaired.input.question.repaired.as_ref().unwrap().clone();
+        assert_eq!(
+            port.engine
+                .stores
+                .lines
+                .moves(original.published_line.line)
+                .unwrap(),
+            repaired_moves
+        );
+        // The actual owner helper builds C from its repaired line. Calling the
+        // helper is an authored source fixture, not a CPU/Fresh admission proof.
+        let next = port
+            .critic_recheck_after_repaired_fresh(&repaired.input.question)
+            .unwrap();
+        let critic = materialize_authored_source_transition(&mut port, &repaired, next);
+        assert_eq!(critic.input.stage, RefinementStage::CriticRecheck);
+        assert_eq!(critic.input.question.diagnostic_repair_line, Some(original));
+        assert_eq!(
+            critic.input.question.repaired.as_deref(),
+            Some(repaired_moves.as_slice())
+        );
+        assert_eq!(critic.input.question.proposal, repaired_moves);
+        assert_eq!(critic.input.view.query().proposal, repaired_moves);
+        assert_eq!(
+            critic.input.question.context.proposal_sha256,
+            role_line_sha256(b"proposal", &repaired_moves).unwrap()
+        );
+        let (ticket, out) = output(&critic, 3);
+        port.commit_role(&critic, &ticket, &out, None).unwrap();
+        let event = *port
+            .role_consumption_observation()
+            .unwrap()
+            .events()
+            .last()
+            .unwrap();
+        assert_eq!(
+            event.outcome,
+            AdaptiveRoleConsumptionOutcome::SemanticResult
+        );
+        let source = event.repair_line_input.unwrap();
+        assert_eq!(source.refinement_stage, RefinementStage::CriticRecheck);
+        assert_eq!(source.provenance, original);
+        assert_eq!(
+            source.model_proposal_sha256,
+            ContractDigest(critic.input.question.context.proposal_sha256)
+        );
+        assert_eq!(source.model_proposal_plies, 4);
+        assert_eq!(source.repaired_plies, Some(4));
+        assert_eq!(event.submitted_question, Some(critic.input.question_digest));
+        assert_eq!(event.submitted_view, critic.input.view_seal.view_digest);
+        port.role_consumed(&ticket, &critic.input.view).unwrap();
+        let consumed = *port
+            .role_consumption_observation()
+            .unwrap()
+            .events()
+            .last()
+            .unwrap();
+        assert_eq!(
+            consumed.outcome,
+            AdaptiveRoleConsumptionOutcome::ConsumedView
+        );
+        assert_eq!(consumed.request, event.request);
+        assert_eq!(consumed.submitted_question, event.submitted_question);
+        assert_eq!(consumed.submitted_view, event.submitted_view);
+        assert!(consumed.repair_line_input.is_none());
+        observed.push((original, repaired_moves));
+    }
+    // Independent owned Store fixtures deliberately allocate equal move values
+    // under different original handles/producer frames; values are no join key.
+    assert_eq!(observed[0].1, observed[1].1);
+    assert_ne!(
+        observed[0].0.published_line.line,
+        observed[1].0.published_line.line
+    );
+    assert_ne!(observed[0].0.producer_frame, observed[1].0.producer_frame);
+}
+#[test]
+fn zero_step_repair_does_not_inherit_an_earlier_p_line_identity() {
+    let (mut port, prior) = repair_provenance_source_fixture(false, 1);
+    let provenance = prior.input.question.diagnostic_repair_line.unwrap();
+    let proposal = ["e2e4", "e7e5", "g1f3", "b8c6"]
+        .map(|m| BoardMove::from_uci(m).unwrap())
+        .to_vec();
+    let counter = ["e2e4", "e7e5", "g1f3", "d7d6"]
+        .map(|m| BoardMove::from_uci(m).unwrap())
+        .to_vec();
+    port.record_hot(RecordKind::Counterexample, &counter, None)
+        .unwrap();
+    let node = port.replay_node(&counter).unwrap();
+    let mut input = port
+        .input(
+            node,
+            RefinementStage::CounterValidation,
+            Some(proposal[0]),
+            counter.clone(),
+            proposal.clone(),
+            Some(counter.clone()),
+            Some(proposal.clone()),
+            Some(3),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+    // Authored previous-line metadata on a valid newly submitted counter.
+    Arc::make_mut(&mut input.question).diagnostic_repair_line = Some(provenance);
+    let counter_work = Work { input, ..prior };
+    let zero = port
+        .begin_repair_continuation(
+            node,
+            Some(proposal[0]),
+            counter.clone(),
+            proposal,
+            counter,
+            3,
+            None,
+        )
+        .unwrap();
+    let repaired = materialize_authored_source_transition(&mut port, &counter_work, zero);
+    assert_eq!(repaired.input.stage, RefinementStage::RepairValidation);
+    assert!(repaired.input.question.repaired.is_some());
+    assert!(repaired.input.question.diagnostic_repair_line.is_none());
+}

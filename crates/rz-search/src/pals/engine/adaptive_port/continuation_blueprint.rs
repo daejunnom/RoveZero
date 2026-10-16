@@ -75,8 +75,28 @@ pub struct AdaptiveContinuationBlueprint {
     seal: BlueprintSeal,
     cause: Option<RoleCause>,
     content: BlueprintContent,
+    // This branch's original scalar provenance, never a global/latest record.
+    diagnostic_repair_line: Option<AdaptiveRepairLineProvenance>,
 }
 impl AdaptiveContinuationBlueprint {
+    pub(super) fn carry_diagnostic_repair_line(
+        &mut self,
+        source: Option<AdaptiveRepairLineProvenance>,
+    ) {
+        if source.is_none() {
+            return;
+        }
+        // Input recipes with a new/unrepaired branch deliberately keep None.
+        // FrozenSecond already contains the exact metadata captured on both
+        // endpoints at their original shared-view materialization.
+        match &self.content {
+            BlueprintContent::Input(recipe) if recipe.repaired.is_some() => {
+                self.diagnostic_repair_line = source;
+            }
+            BlueprintContent::FreshPair { .. } => self.diagnostic_repair_line = source,
+            _ => {}
+        }
+    }
     pub(super) fn queued_recheck_identity(&self) -> Result<(BoardMove, Vec<BoardMove>), PalsError> {
         match &self.content {
             BlueprintContent::Input(recipe) => Ok((
@@ -126,6 +146,14 @@ impl AdaptiveContinuationBlueprint {
     }
 }
 impl AdaptivePortTransition {
+    pub(super) fn carry_diagnostic_repair_line(
+        &mut self,
+        source: Option<AdaptiveRepairLineProvenance>,
+    ) {
+        if let Self::Continue(blueprint) = self {
+            blueprint.carry_diagnostic_repair_line(source);
+        }
+    }
     pub(super) fn bind_role_cause(
         &mut self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
@@ -208,6 +236,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         Ok(AdaptiveContinuationBlueprint {
             seal,
             cause: None,
+            diagnostic_repair_line: None,
             content: BlueprintContent::Input(InputRecipe {
                 node,
                 stage,
@@ -239,6 +268,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         Ok(AdaptiveContinuationBlueprint {
             seal,
             cause: None,
+            diagnostic_repair_line: input.question.diagnostic_repair_line,
             content: BlueprintContent::FrozenSecond(input),
         })
     }
@@ -266,6 +296,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         Ok(AdaptiveContinuationBlueprint {
             seal,
             cause: None,
+            diagnostic_repair_line: query.diagnostic_repair_line,
             content: BlueprintContent::FreshPair {
                 first: query.first,
                 attack_ply: query.attack_ply,
@@ -349,6 +380,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             AdaptivePortTransition::Unknown { reason } => FrameTransition::Unknown { reason },
             AdaptivePortTransition::Continue(blueprint) => {
                 self.validate_blueprint(&blueprint)?;
+                let diagnostic_repair_line = blueprint.diagnostic_repair_line;
                 let input = match blueprint.content {
                     BlueprintContent::Input(recipe) => {
                         let mut input = self.input(
@@ -367,6 +399,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                         let query = Arc::make_mut(&mut input.question);
                         query.counter_source = recipe.counter_source;
                         query.discovery_restricted = recipe.discovery_restricted;
+                        query.diagnostic_repair_line = diagnostic_repair_line;
                         input
                     }
                     BlueprintContent::FrozenSecond(input) => {
@@ -420,7 +453,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                                 &self.engine.nodes[counter_node].position.legal_moves(),
                             )?
                             .ok_or(PalsError::InvalidConfig)?;
-                        let first_input = self.input(
+                        let mut first_input = self.input(
                             repaired_node,
                             RefinementStage::FreshRepairedEndpoint,
                             first,
@@ -433,7 +466,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                             Some(pair.0),
                             None,
                         )?;
-                        let second_input = self.input(
+                        let mut second_input = self.input(
                             counter_node,
                             RefinementStage::FreshCounterEndpoint,
                             first,
@@ -446,6 +479,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                             Some(pair.1),
                             None,
                         )?;
+                        // Both newly allocated opaque Questions still have a
+                        // unique Arc here. Default-off adds no mutation/clone.
+                        if diagnostic_repair_line.is_some() {
+                            Arc::make_mut(&mut first_input.question).diagnostic_repair_line =
+                                diagnostic_repair_line;
+                            Arc::make_mut(&mut second_input.question).diagnostic_repair_line =
+                                diagnostic_repair_line;
+                        }
                         // Full-baseline endpoints must retain the very same
                         // submission-time raw scope, not merely two equal
                         // selected views rebuilt around newer public rows.

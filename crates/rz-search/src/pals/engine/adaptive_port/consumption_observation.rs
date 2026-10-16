@@ -1,9 +1,9 @@
 //! Opt-in copied scalar facts at the original Search semantic boundaries.
 //! No output/model/view payload, callback or coordinator-transition authority.
 use super::{BoardMove, LineId, ObservationId, PalsError, RoleError, StateId, StoreError};
-use crate::pals::coordinator::FrameId;
+use crate::pals::coordinator::{FrameId, RefinementStage};
 use rz_contracts::pals::{Role, SearchAuthority};
-use rz_contracts::{Digest, RequestId};
+use rz_contracts::{Deadline, Digest, RequestId};
 
 pub const MAX_ROLE_CONSUMPTION_EVENTS: usize = 128;
 
@@ -80,6 +80,29 @@ pub struct AdaptivePublishedRepairLine {
     pub first_move: Option<BoardMove>,
 }
 
+/// Original successful semantic producer attached this copy to its own
+/// continuation. It is diagnostic provenance, never a continuation permit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdaptiveRepairLineProvenance {
+    pub producer_frame: FrameId,
+    pub producer_request: RequestId,
+    pub submitted_question: Digest,
+    pub submitted_view: Digest,
+    pub completed_evidence: Digest,
+    pub original_deadline: Deadline,
+    pub published_line: AdaptivePublishedRepairLine,
+}
+/// Copied from the consumer's ORIGINAL submitted opaque Question and selected
+/// query. No lookup by equal moves, latest slot, digest or public revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdaptiveRepairLineInput {
+    pub refinement_stage: RefinementStage,
+    pub provenance: AdaptiveRepairLineProvenance,
+    pub model_proposal_sha256: Digest,
+    pub model_proposal_plies: usize,
+    pub repaired_plies: Option<usize>,
+}
+
 /// RequestId is the original role ticket's id. Every field is a copied scalar
 /// identity/digest; neither the ReviewView nor RoleOutput is retained here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +130,10 @@ pub struct AdaptiveRoleConsumptionEvent {
     /// None for an unfinished Repair prefix, a pre-publication error, all other
     /// roles and consume-only events. Never copied from a previous invocation.
     pub published_repair_line: Option<AdaptivePublishedRepairLine>,
+    /// Actual submitted input lineage; consume-only events have no Question.
+    /// SemanticResult and the original first ConsumedView must be joined by
+    /// request/question/view before claiming consumption of this input.
+    pub repair_line_input: Option<AdaptiveRepairLineInput>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

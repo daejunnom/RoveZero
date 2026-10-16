@@ -452,7 +452,7 @@ mod actual {
                 .as_ref()
                 .is_ok_and(|p| p.permits_archive_close() && p.store_archive_closed());
         emit(&json!({
-            "domain":"rovezero.actual-continuation-diagnostic-raw/4",
+            "domain":"rovezero.actual-continuation-diagnostic-raw/5",
             "case":opaque(&case), "case_acceptance":"NOT_ISSUED_BY_DIAGNOSTIC_RUNNER",
             "source_commit":env!("RZ_PALS_COMPILED_SOURCE_COMMIT"),
             "startup_config_sha256":config_pin,"registered_image":registered_image,
@@ -485,7 +485,8 @@ mod actual {
         use rz_contracts::{Deadline, Digest, ExecutionId, RequestId, StateIdentity};
         use rz_search::pals::coordinator::{FrameId, StepExecution};
         use rz_search::pals::engine::adaptive_port::{
-            AdaptiveRoleConsumptionEvent, AdaptiveRoleConsumptionOutcome,
+            AdaptivePublishedRepairLine, AdaptiveRepairLineInput, AdaptiveRoleConsumptionEvent,
+            AdaptiveRoleConsumptionOutcome,
         };
         use rz_uci::engine::ProcessClock;
         use rz_uci::pals_adaptive::{
@@ -498,7 +499,7 @@ mod actual {
         };
         use serde_json::{Value, json};
         use std::time::Instant;
-        const DOMAIN: &str = "rovezero.continuation-diagnostic-scalar/2";
+        const DOMAIN: &str = "rovezero.continuation-diagnostic-scalar/3";
         fn hex(value: Digest) -> String {
             const HEX: &[u8; 16] = b"0123456789abcdef";
             let mut text = String::with_capacity(64);
@@ -603,6 +604,18 @@ mod actual {
                     "completed_nn_inputs":evidence.and_then(|e|e.completed_nn_inputs),
                     "measurement_complete":evidence.map(|e|e.measurement_complete),
                     "physical_fresh":evidence.and_then(|e|e.physical_fresh),
+                    "native_accounting":evidence.and_then(|e|e.accounting).map(|a|json!({
+                        "domain":"ticket-native-owner-accounting/1",
+                        "public_nn_runs_attempted":a.public_nn_runs_attempted(),
+                        "public_nn_runs_completed":a.public_nn_runs_completed(),
+                        "public_nn_runs_failed_known":a.public_nn_runs_failed_known(),
+                        "role_nn_runs_attempted":a.role_nn_runs_attempted(),
+                        "role_nn_runs_completed":a.role_nn_runs_completed(),
+                        "role_nn_runs_failed_known":a.role_nn_runs_failed_known(),
+                        "validator_nn_runs_attempted":a.validator_nn_runs_attempted(),
+                        "validator_nn_runs_completed":a.validator_nn_runs_completed(),
+                        "validator_nn_runs_failed_known":a.validator_nn_runs_failed_known(),
+                        "scope":"ORIGINAL_TICKET_OWNER_DELTAS_NOT_LOGICAL_CONSUMPTION_OR_PROCESS_TOTALS"})),
                     "physical_invocation":invocation.map(|i|json!({"invocation_key":hex(i.invocation_key),
                         "accepted_seed_digest":i.accepted_seed_digest.map(hex),"physical_fresh":i.physical_fresh}))
                 }),
@@ -654,6 +667,35 @@ mod actual {
                 "queue_admitted_at":event.queue_admitted_at.map(|instant|original_instant(clock,instant)),
                 "snapshot":snapshot})
         }
+
+        fn published_repair_line(
+            line: AdaptivePublishedRepairLine,
+            source: &SearchAuthority,
+        ) -> Value {
+            json!({"domain":"search-published-repair-line/1","authority":authority(source),
+                "line":{"domain":"search_store_line","store_local_index":line.line.0.to_string()},
+                "observation":{"domain":"search_store_observation","store_local_index":line.observation.0.to_string()},
+                "record_revision":line.record_revision.to_string(),
+                "parent_record_revision":line.parent_revision.map(|v|v.to_string()),
+                "supersedes_record_revision":line.supersedes_revision.map(|v|v.to_string()),
+                "origin_state":{"domain":"search_store_state","store_local_index":line.origin_state.0.to_string()},
+                "committed_plies":line.committed_plies,"first_move_uci":line.first_move.map(|m|m.to_uci()),
+                "source_boundary":"ORIGINAL_REPAIR_PUBLISH_RECORD_RETURNED_OK",
+                "semantic_and_machine_acceptance":"REQUIRE_SEPARATE_ORIGINAL_EVENTS"})
+        }
+        fn repair_line_input(input: AdaptiveRepairLineInput) -> Value {
+            let source = input.provenance;
+            json!({"domain":"search-repair-line-input/1","consumer_refinement_stage":opaque(&input.refinement_stage),
+                "source":{"producer_frame":frame(source.producer_frame),"producer_request":request(source.producer_request),
+                    "submitted_source_question_digest":hex(source.submitted_question),"submitted_view_digest":hex(source.submitted_view),
+                    "completed_evidence_digest":hex(source.completed_evidence),"original_deadline":deadline(source.original_deadline),
+                    "published_repair_line":published_repair_line(source.published_line,&source.producer_frame.authority)},
+                "submitted_model_proposal_digest":hex(input.model_proposal_sha256),
+                "submitted_model_proposal_plies":input.model_proposal_plies,"submitted_repaired_plies":input.repaired_plies,
+                "source_boundary":"ORIGINAL_SUBMITTED_OPAQUE_QUESTION",
+                "consumption":"REQUIRES_SEPARATE_FIRST_CONSUMED_VIEW_EVENT"})
+        }
+
         fn consumed(event: &AdaptiveRoleConsumptionEvent) -> Value {
             let outcome = match event.outcome {
                 AdaptiveRoleConsumptionOutcome::SemanticResult => json!({"kind":"SemanticResult"}),
@@ -670,17 +712,8 @@ mod actual {
                 "ticket_view_digest":hex(event.ticket_view),"submitted_view_digest":hex(event.submitted_view),
                 "frame":event.frame.map(frame),"source_stage":opaque(&event.stage),"outcome":outcome,
                 "completed_evidence_digest":event.completed_evidence.map(hex),"prior_semantic_attempt":event.prior_semantic_attempt,
-                "published_repair_line":event.published_repair_line.map(|line|json!({
-                    "domain":"search-published-repair-line/1","authority":authority(&event.authority),
-                    "line":{"domain":"search_store_line","store_local_index":line.line.0.to_string()},
-                    "observation":{"domain":"search_store_observation","store_local_index":line.observation.0.to_string()},
-                    "record_revision":line.record_revision.to_string(),
-                    "parent_record_revision":line.parent_revision.map(|v|v.to_string()),
-                    "supersedes_record_revision":line.supersedes_revision.map(|v|v.to_string()),
-                    "origin_state":{"domain":"search_store_state","store_local_index":line.origin_state.0.to_string()},
-                    "committed_plies":line.committed_plies,"first_move_uci":line.first_move.map(|m|m.to_uci()),
-                    "source_boundary":"ORIGINAL_REPAIR_PUBLISH_RECORD_RETURNED_OK",
-                    "semantic_and_machine_acceptance":"REQUIRE_SEPARATE_ORIGINAL_EVENTS"}))})
+                "published_repair_line":event.published_repair_line.map(|line|published_repair_line(line,&event.authority)),
+                "repair_line_input":event.repair_line_input.map(repair_line_input)})
         }
         fn resolved(event: &ContinuationResolutionObservation) -> Value {
             let transition = match event.transition {
@@ -1070,6 +1103,7 @@ mod actual {
                     ),
                     completed_evidence: None,
                     prior_semantic_attempt: Some(false),
+                    repair_line_input: None,
                     published_repair_line: Some(AdaptivePublishedRepairLine {
                         line: LineId(11),
                         observation: ObservationId(12),
@@ -1092,9 +1126,90 @@ mod actual {
                 assert_eq!(line["first_move_uci"], "e2e4");
                 let none = AdaptiveRoleConsumptionEvent {
                     published_repair_line: None,
+                    repair_line_input: None,
                     ..event
                 };
                 assert!(consumed(&none)["published_repair_line"].is_null());
+            }
+
+            #[test]
+            fn repair_input_wire_keeps_original_producer_and_consumer_domains_distinct() {
+                use rz_search::pals::engine::adaptive_port::AdaptiveRepairLineProvenance;
+                use rz_search::pals::store::{LineId, ObservationId, StateId};
+                let source = AdaptiveRepairLineProvenance {
+                    producer_frame: FrameId {
+                        authority: scope(),
+                        sequence: 5,
+                    },
+                    producer_request: RequestId::new(scope().epoch, 11),
+                    submitted_question: Digest([11; 32]),
+                    submitted_view: Digest([12; 32]),
+                    completed_evidence: Digest([13; 32]),
+                    original_deadline: Deadline {
+                        clock: ClockDomain(scope().epoch),
+                        at: MonotonicTick(1000),
+                    },
+                    published_line: AdaptivePublishedRepairLine {
+                        line: LineId(7),
+                        observation: ObservationId(8),
+                        record_revision: 9,
+                        parent_revision: Some(3),
+                        supersedes_revision: None,
+                        origin_state: StateId(1),
+                        committed_plies: 4,
+                        first_move: Some(rz_position::BoardMove::from_uci("e2e4").unwrap()),
+                    },
+                };
+                let event = AdaptiveRoleConsumptionEvent {
+                    authority: scope(),
+                    request: RequestId::new(scope().epoch, 99),
+                    role: Role::Critic,
+                    question: Digest([21; 32]),
+                    submitted_question: Some(Digest([21; 32])),
+                    ticket_view: Digest([22; 32]),
+                    submitted_view: Digest([22; 32]),
+                    frame: Some(FrameId {
+                        authority: scope(),
+                        sequence: 6,
+                    }),
+                    stage: AdaptiveRoleConsumptionStage::SemanticCommit,
+                    outcome: AdaptiveRoleConsumptionOutcome::SemanticResult,
+                    completed_evidence: Some(Digest([23; 32])),
+                    prior_semantic_attempt: Some(false),
+                    published_repair_line: None,
+                    repair_line_input: Some(AdaptiveRepairLineInput {
+                        refinement_stage: RefinementStage::CriticRecheck,
+                        provenance: source,
+                        model_proposal_sha256: Digest([31; 32]),
+                        model_proposal_plies: 4,
+                        repaired_plies: Some(4),
+                    }),
+                };
+                let value = consumed(&event);
+                assert_eq!(value["request"]["request_sequence"], "99");
+                assert_eq!(
+                    value["repair_line_input"]["source"]["producer_request"]["request_sequence"],
+                    "11"
+                );
+                assert_eq!(
+                    value["repair_line_input"]["consumer_refinement_stage"],
+                    "CriticRecheck"
+                );
+                assert_eq!(value["completed_evidence_digest"], hex(Digest([23; 32])));
+                assert_eq!(
+                    value["repair_line_input"]["source"]["completed_evidence_digest"],
+                    hex(Digest([13; 32]))
+                );
+                assert!(value["published_repair_line"].is_null());
+                assert_eq!(
+                    value["repair_line_input"]["consumption"],
+                    "REQUIRES_SEPARATE_FIRST_CONSUMED_VIEW_EVENT"
+                );
+                let missing = AdaptiveRoleConsumptionEvent {
+                    repair_line_input: None,
+                    ..event
+                };
+                assert!(consumed(&missing)["repair_line_input"].is_null());
             }
 
             #[test]
@@ -1178,6 +1293,7 @@ mod actual {
                     completed_evidence: Some(Digest([5; 32])),
                     prior_semantic_attempt: Some(false),
                     published_repair_line: None,
+                    repair_line_input: None,
                 };
                 let mut first_consume = semantic;
                 first_consume.stage = AdaptiveRoleConsumptionStage::ViewConsumption;
@@ -1253,9 +1369,9 @@ mod actual {
                 "hot":{"event_presence":match hot_value {Ok(events)=>presence(true,events.is_empty()),Err(_)=>"UNAVAILABLE"},
                     "source_error":hot_value.as_ref().err(),"records":hot_value.as_ref().ok().map(|events|events.iter().map(hot).collect::<Vec<_>>())},
                 "cpu_slices":cpu_channel(cpu),"continuation":continuation_channel(continuation,options,clock),
-                "repair_to_critic_line_identity":{"status":"UNAVAILABLE_NO_ORIGINAL_REPAIR_LINE_ID",
-                    "repair_line":null,"consumer_line":null,
-                    "reason":"Original submitted C question carries line values but no producer-preserved Repair LineId/revision; length/digest/frame matches do not issue a causal link"},
+                "repair_to_critic_line_identity":{"status":"REQUEST_SCOPED_ORIGINAL_PROVENANCE_ONLY",
+                    "event_field":"repair_line_input","acceptance":"ROOT_INDEPENDENT_AUDIT_REQUIRED",
+                    "missing_input_provenance":"UNAVAILABLE_NOT_RECOVERED_BY_DIGEST_LENGTH_OR_FRAME"},
                 "case_acceptance":"NOT_ISSUED_BY_DIAGNOSTIC_RUNNER"})
         }
     }
@@ -1267,7 +1383,7 @@ mod actual {
             Err(error) => {
                 let detail: String = error.to_string().chars().take(512).collect();
                 let _ = emit(
-                    &json!({"domain":"rovezero.actual-continuation-diagnostic-raw/4",
+                    &json!({"domain":"rovezero.actual-continuation-diagnostic-raw/5",
                     "status":"PREPARATION_OR_PUBLICATION_FAILED","detail":detail,
                     "case_acceptance":"NOT_ISSUED_BY_DIAGNOSTIC_RUNNER",
                     "actual_nn_scope":"UNKNOWN_UNLESS_ORIGINAL_RAW_PROVES_IT","scalar_observations":null,"runtime_closure":null}),
