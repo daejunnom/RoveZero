@@ -212,7 +212,7 @@ def reseal_native(record):
     native["raw_retirement_sha256"] = data.digest(corpus.NATIVE_RAW_DOMAIN, native["raw_retirement"])
 
 
-def write_corpus(root, manifest, records):
+def write_corpus(root, manifest, records, *, ancestors=()):
     origins = []
     for record in records:
         origin = {key: record[key] for key in ("record_sha256", "input_sha256", "origin_sha256", "split")}
@@ -229,7 +229,25 @@ def write_corpus(root, manifest, records):
         "sha256": hashlib.sha256(chunk).hexdigest(), "records": len(records)}], "origins": origins}
     index_path, index_sha, _ = raw_pin(root, raw(index), "index.json")
     return corpus.RoventTrainingCorpus.from_files(manifest_path, manifest_sha256=manifest_sha,
-        index_path=index_path, index_sha256=index_sha)
+        index_path=index_path, index_sha256=index_sha, ancestors=ancestors)
+
+
+def parent_and_current(root):
+    """Distinct stage origins intentionally sharing one exact input seal."""
+    recipe, parent_manifest, parent_record = original_fixture()
+    parent_root, current_root = root / "parent", root / "current"
+    parent_root.mkdir()
+    current_root.mkdir()
+    parent = write_corpus(parent_root, parent_manifest, [parent_record])
+    manifest, record = copy.deepcopy(parent_manifest), copy.deepcopy(parent_record)
+    manifest.update(corpus_id="same-stage-resume-contract-only", stage_id="sf-ft", round=1, round_id="sf-ft-round",
+        teachers={"stockfish": manifest["teachers"]["stockfish"]},
+        inherited_input_sha256=[parent_record["input_sha256"]], inherited_origin_sha256=[parent_record["origin_sha256"]],
+        ancestor_index_sha256=[parent.index_semantic_sha256])
+    record["lineage"]["ancestor_origin_sha256"] = [parent_record["origin_sha256"]]
+    seal_record(manifest, record)
+    current = write_corpus(current_root, manifest, [record], ancestors=(parent,))
+    return recipe, manifest, parent_record, record, current
 
 
 class OriginalCorpusFileTests(unittest.TestCase):
@@ -398,6 +416,83 @@ class OriginalCorpusOwnerTests(unittest.TestCase):
             second.admit_stage(recipe, "common", 1, 1, [], [])
             with self.assertRaisesRegex(ValueError, "same admitted original corpus row owner"):
                 second.training_sample(first.rows("proposer")[0])
+
+    def test_same_stage_retained_rows_require_checkpoint_authority_without_changing_frozen_base(self):
+        recipe, manifest, record = original_fixture()
+        before = copy.deepcopy(manifest)
+        with tempfile.TemporaryDirectory() as directory:
+            owner = write_corpus(Path(directory), manifest, [record])
+            report = owner.admit_stage(recipe, "common", 1, 1, [record["input_sha256"]], [record["origin_sha256"]])
+            self.assertEqual(report["base_inherited_input_sha256"], [])
+            self.assertEqual(report["base_inherited_origin_sha256"], [])
+            self.assertEqual(report["same_stage_retained_input_sha256"], [record["input_sha256"]])
+            self.assertEqual(report["same_stage_retained_origin_sha256"], [record["origin_sha256"]])
+            requirement = report["same_stage_checkpoint_authority"]
+            self.assertEqual(requirement["schema"], "rz-rovent-same-stage-checkpoint-authority-requirement/1")
+            self.assertEqual(requirement["kind"], "original_checkpoint_authority_required")
+            self.assertTrue(requirement["required"])
+            self.assertFalse(requirement["verified"])
+            self.assertFalse(requirement["execution_authorized"])
+            self.assertFalse(report["execution_authorized"])
+            self.assertFalse(report["actual_training_admissible"])
+            self.assertEqual(manifest, before)
+            with self.assertRaisesRegex(ValueError, "retained original origin/input seal projection mismatch"):
+                owner.admit_stage(recipe, "common", 1, 1, [h("unrelated-input")], [record["origin_sha256"]])
+            self.assertEqual(len(owner.rows("proposer")), 1)
+
+    def test_base_and_same_stage_input_projections_may_overlap_without_erasing_either_origin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recipe, manifest, parent_record, record, owner = parent_and_current(Path(directory))
+            self.assertEqual(parent_record["input_sha256"], record["input_sha256"])
+            origins = sorted([parent_record["origin_sha256"], record["origin_sha256"]])
+            report = owner.admit_stage(recipe, "sf-ft", 1, 1, [record["input_sha256"]], origins)
+            self.assertEqual(report["base_inherited_input_sha256"], [record["input_sha256"]])
+            self.assertEqual(report["same_stage_retained_input_sha256"], [record["input_sha256"]])
+            self.assertEqual(report["base_inherited_origin_sha256"], [parent_record["origin_sha256"]])
+            self.assertEqual(report["same_stage_retained_origin_sha256"], [record["origin_sha256"]])
+            self.assertEqual(report["base_inherited_origin_count"], 1)
+            self.assertEqual(report["same_stage_retained_origin_count"], 1)
+            expected = data.digest("rz-rovent-corpus-same-stage-retained-seals/1",
+                {"input_sha256": [record["input_sha256"]], "origin_sha256": [record["origin_sha256"]]})
+            self.assertEqual(report["same_stage_retained_seals_sha256"], expected)
+            self.assertEqual(manifest["inherited_origin_sha256"], [parent_record["origin_sha256"]])
+
+    def test_same_stage_resume_cannot_erase_the_manifest_ancestor_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recipe, _, _, record, owner = parent_and_current(Path(directory))
+            with self.assertRaisesRegex(ValueError, "erased/changed ancestor-base training seals"):
+                owner.admit_stage(recipe, "sf-ft", 1, 1, [record["input_sha256"]], [record["origin_sha256"]])
+
+    def test_same_stage_retention_rejects_validation_and_holdout_rows(self):
+        for opening in ("valid", "held"):
+            with self.subTest(opening=opening), tempfile.TemporaryDirectory() as directory:
+                recipe, manifest, record = original_fixture(opening=opening)
+                owner = write_corpus(Path(directory), manifest, [record])
+                with self.assertRaisesRegex(ValueError, "same-stage retained origin is not an original current-stage self corpus train row"):
+                    owner.admit_stage(recipe, "common", 1, 1, [record["input_sha256"]], [record["origin_sha256"]])
+
+    def test_same_stage_retention_rejects_foreign_or_known_nonself_stage_origins(self):
+        for other_stage, actor in (("common", None), ("sf-ft", "stockfish"), ("reckless-ft", "reckless")):
+            with self.subTest(other_stage=other_stage), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                recipe, manifest, record = original_fixture()
+                _, other_manifest, other_record = original_fixture(request_sequence=2)
+                other_manifest.update(corpus_id="foreign-" + other_stage, stage_id=other_stage,
+                    round_id=other_stage + "-round", round=1)
+                if actor is not None:
+                    other_manifest["teachers"] = {actor: other_manifest["teachers"][actor]}
+                seal_record(other_manifest, other_record)
+                other_root, current_root = root / "other", root / "current"
+                other_root.mkdir()
+                current_root.mkdir()
+                other = write_corpus(other_root, other_manifest, [other_record])
+                manifest["ancestor_index_sha256"] = [other.index_semantic_sha256]
+                current = write_corpus(current_root, manifest, [record], ancestors=(other,))
+                with self.assertRaisesRegex(ValueError, "same-stage retained origin is not an original current-stage self corpus train row"):
+                    current.admit_stage(recipe, "common", 1, 1,
+                        [other_record["input_sha256"]], [other_record["origin_sha256"]])
+                with self.assertRaisesRegex(ValueError, "same-stage retained origin is not an original current-stage self corpus train row"):
+                    current.admit_stage(recipe, "common", 1, 1, [record["input_sha256"]], [h("unknown-foreign-origin")])
 
 
 if __name__ == "__main__":

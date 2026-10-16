@@ -155,6 +155,30 @@ class ReferenceInput:
         return digest.hexdigest()
 
 
+def numeric_input_sha256(inputs, base_weights_sha256, weights_sha256):
+    """Seal actual numerical B/L/target inputs, separately from live view authority."""
+    digest = hashlib.sha256()
+    current = inputs.base_input
+    digest.update((INPUT_SCHEMA + "\0numeric\0" + base_weights_sha256 + "\0"
+                   + weights_sha256 + "\0" + current.context_sha256 + "\0").encode("ascii"))
+    for features in current.board_features:
+        digest.update(struct.pack("<I", len(features)))
+        for feature in features:
+            digest.update(struct.pack("<H", feature))
+    digest.update(bytes((current.side_to_move == "black",)))
+    digest.update(struct.pack("<I", len(current.local_line.anchor_features)))
+    for feature in current.local_line.anchor_features:
+        digest.update(struct.pack("<H", feature))
+    digest.update(bytes((current.local_line.perspective == "black",)))
+    digest.update(struct.pack("<I", len(current.local_line.moves)))
+    for move in current.local_line.moves:
+        digest.update(struct.pack("<BBB", move.from_square, move.to_square, move.promotion))
+    digest.update(struct.pack("<I", len(inputs.target_ids)))
+    for identifier in inputs.target_ids:
+        digest.update(struct.pack("<Q", identifier))
+    return digest.hexdigest()
+
+
 def evaluate(base_checkpoint, checkpoint, inputs):
     if type(checkpoint) is not UtilityCheckpoint or type(inputs) is not ReferenceInput:
         raise ValueError("validated utility checkpoint and selected input required")
@@ -187,6 +211,7 @@ def evaluate(base_checkpoint, checkpoint, inputs):
     return {"schema": OUTPUT_SCHEMA, "semantics": SEMANTICS, "base_weights_sha256": base_checkpoint.weights_sha256,
             "weights_sha256": checkpoint.weights_sha256, "context_sha256": current.context_sha256,
             "target_sha256": inputs.target_sha256,
+            "input_sha256": numeric_input_sha256(inputs, base_checkpoint.weights_sha256, checkpoint.weights_sha256),
             "hidden": list(hidden), "raw_outputs": list(raw), "output_names": list(OUTPUT_NAMES),
             "target_contribution": list(target), "global_context": list(context), "clipped_input": list(values),
             "reference_scope": REFERENCE_SCOPE, "policy_actions_authorized": False, "target_known_mask": [False] * 7,

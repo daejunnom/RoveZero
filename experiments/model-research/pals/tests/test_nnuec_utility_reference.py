@@ -169,6 +169,34 @@ class NnuecUtilityReferenceTests(unittest.TestCase):
         self.assertEqual(result["target_known_mask"], [False] * 7)
         self.assertEqual(result["input_bytes_sha256"], hashlib.sha256(raw_input).hexdigest())
 
+    def test_numeric_input_binary_seal_includes_both_boards_local_suffix_and_weights(self):
+        original = base_checkpoint()
+        frozen = v2.NnuecV2Checkpoint.from_mapping(original)
+        checkpoint = reference.UtilityCheckpoint.from_mapping(checkpoint_mapping(original), frozen)
+        inputs = reference.ReferenceInput.from_mapping(input_mapping(records=(record(7),), target=(7,)), frozen.base.config)
+        wire = bytearray((reference.INPUT_SCHEMA + "\0numeric\0" + frozen.weights_sha256 + "\0"
+                          + checkpoint.weights_sha256 + "\0" + inputs.base_input.context_sha256 + "\0").encode("ascii"))
+        for features in ((768, 774, 783), (769, 774, 783)):
+            wire.extend((3).to_bytes(4, "little"))
+            for feature in features:
+                wire.extend(feature.to_bytes(2, "little"))
+        wire.extend(bytes((0,)))
+        wire.extend((3).to_bytes(4, "little"))
+        for feature in (768, 774, 783):
+            wire.extend(feature.to_bytes(2, "little"))
+        wire.extend(bytes((0,)))
+        wire.extend((0).to_bytes(4, "little"))
+        wire.extend((1).to_bytes(4, "little"))
+        wire.extend((7).to_bytes(8, "little"))
+        self.assertEqual(reference.numeric_input_sha256(inputs, frozen.weights_sha256, checkpoint.weights_sha256),
+                         hashlib.sha256(wire).hexdigest())
+        before = reference.evaluate(frozen, checkpoint, inputs)
+        changed = inputs.to_mapping()
+        changed["base_input"]["local_line"]["moves"] = [{"from_square": 0, "to_square": 8, "promotion": 0}]
+        later = reference.evaluate(frozen, checkpoint, reference.ReferenceInput.from_mapping(changed, frozen.base.config))
+        self.assertEqual(before["target_sha256"], later["target_sha256"])
+        self.assertNotEqual(before["input_sha256"], later["input_sha256"])
+
 
 if __name__ == "__main__":
     unittest.main()

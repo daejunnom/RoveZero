@@ -16,6 +16,7 @@ pub const NATIVE_RAW_DOMAIN: &str = "rz-rovent-native-owner-event/1";
 pub const NNUEC_INPUT_DOMAIN: &str = "rz-rovent-nnuec-reference-input/1";
 pub const MAX_CORPUS_ROWS: usize = 262_144;
 pub const MAX_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_CORPUS_BYTES: u64 = 18 * 1024 * 1024 * 1024;
 
 fn check(ok: bool, why: &str) -> Result<(), ManifestError> {
     if ok {
@@ -662,7 +663,12 @@ impl RoventCorpusIndex {
                     .chunks
                     .iter()
                     .try_fold(0u64, |n, c| n.checked_add(c.records))
-                    == Some(self.record_count),
+                    == Some(self.record_count)
+                && self
+                    .chunks
+                    .iter()
+                    .try_fold(0u64, |n, c| n.checked_add(c.bytes))
+                    .is_some_and(|n| n <= MAX_CORPUS_BYTES),
             "corpus index domain/count/bounds",
         )?;
         let mut paths = BTreeSet::new();

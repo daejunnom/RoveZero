@@ -908,8 +908,12 @@ class RoventTrainingCorpus:
         for key, values in (("inherited_input_sha256", inherited_input_sha256),
                             ("inherited_origin_sha256", inherited_origin_sha256)):
             _sha_list(values, 262144, key)
-            if manifest[key] != values:
-                raise ValueError("original corpus erased/changed inherited training seals")
+            # A frozen collection manifest owns only the ancestor base. A
+            # resumed tensor owner can additionally retain rows consumed by
+            # earlier windows of this same stage. Data checks below separate
+            # them; a JSON list cannot attest that those updates happened.
+            if not set(manifest[key]) <= set(values):
+                raise ValueError("original corpus erased/changed ancestor-base training seals")
         _validate_teachers(recipe, stage, manifest)
         owners = (*self._ancestors, self)
         if sum(len(owner._records) for owner in owners) > 262144:
@@ -950,16 +954,40 @@ class RoventTrainingCorpus:
         lineage = GlobalLineageIndex(recipe, original)
         allowed_records = {row["record_sha256"] for row in lineage.rows("train", optimization=True)}
         inherited = set(inherited_origin_sha256)
+        base_origins = set(manifest["inherited_origin_sha256"])
+        base_inputs = set(manifest["inherited_input_sha256"])
+        same_stage_origins = inherited - base_origins
         parent_scope = {item.stage_id for item in recipe.lineage(stage_id)[:-1]}
         if any(origin not in raw_by_origin or raw_by_origin[origin][0]._manifest["stage_id"] not in parent_scope
-               or raw_by_origin[origin][1]["record_sha256"] not in allowed_records for origin in inherited):
-            raise ValueError("inherited training origin is missing, cross-split, future or sibling")
+               or raw_by_origin[origin][1]["record_sha256"] not in allowed_records for origin in base_origins):
+            raise ValueError("ancestor-base training origin is missing, cross-split, future or sibling")
+        if {raw_by_origin[origin][1]["input_sha256"] for origin in base_origins} != base_inputs:
+            raise ValueError("ancestor-base original origin/input seal projection mismatch")
+        if any(origin not in raw_by_origin or raw_by_origin[origin][0] is not self
+               or raw_by_origin[origin][0]._manifest["stage_id"] != stage_id
+               or raw_by_origin[origin][1]["split"] != "train"
+               or raw_by_origin[origin][1]["record_sha256"] not in allowed_records for origin in same_stage_origins):
+            raise ValueError("same-stage retained origin is not an original current-stage self corpus train row")
+        # These are projections of origin sets, not a set difference between
+        # input lists: a base origin and a retained origin may share one input.
+        same_stage_inputs = {raw_by_origin[origin][1]["input_sha256"] for origin in same_stage_origins}
         if {raw_by_origin[origin][1]["input_sha256"] for origin in inherited} != set(inherited_input_sha256):
-            raise ValueError("inherited original origin/input seal projection mismatch")
+            raise ValueError("retained original origin/input seal projection mismatch")
         for owner in self._ancestors:
             if owner._manifest["stage_id"] in parent_scope:
-                if not set(owner._manifest["inherited_origin_sha256"]) <= inherited:
+                if not set(owner._manifest["inherited_origin_sha256"]) <= base_origins:
                     raise ValueError("original corpus erased an ancestor training origin")
+        base_seals = {"input_sha256": sorted(base_inputs), "origin_sha256": sorted(base_origins)}
+        retained_seals = {"input_sha256": sorted(same_stage_inputs), "origin_sha256": sorted(same_stage_origins)}
+        base_digest = digest("rz-rovent-corpus-ancestor-base-seals/1", base_seals)
+        retained_digest = digest("rz-rovent-corpus-same-stage-retained-seals/1", retained_seals)
+        checkpoint_authority = {
+            "schema": "rz-rovent-same-stage-checkpoint-authority-requirement/1",
+            "kind": "original_checkpoint_authority_required" if same_stage_origins else "no_same_stage_rows_retained",
+            "required": bool(same_stage_origins), "verified": False, "execution_authorized": False,
+            "recipe_sha256": recipe.sha256, "stage_id": stage_id, "corpus_sha256": self.corpus_sha256,
+            "base_inherited_seals_sha256": base_digest, "same_stage_retained_seals_sha256": retained_digest,
+        }
         split_records = {split: {row["record_sha256"] for row in lineage.rows(split)}
                          for split in ("train", "validation", "holdout")}
         self._admission = {"recipe_sha256": recipe.sha256, "stage_id": stage_id,
@@ -972,6 +1000,16 @@ class RoventTrainingCorpus:
                                                   "model_epoch", "context_epoch")},
                 "records": len(self._records), "global_index_sha256": lineage.sha256,
                 "cross_split_identities": lineage.cross_split_identities,
+                "base_inherited_input_sha256": base_seals["input_sha256"],
+                "base_inherited_origin_sha256": base_seals["origin_sha256"],
+                "base_inherited_input_count": len(base_inputs), "base_inherited_origin_count": len(base_origins),
+                "base_inherited_seals_sha256": base_digest,
+                "same_stage_retained_input_sha256": retained_seals["input_sha256"],
+                "same_stage_retained_origin_sha256": retained_seals["origin_sha256"],
+                "same_stage_retained_input_count": len(same_stage_inputs),
+                "same_stage_retained_origin_count": len(same_stage_origins),
+                "same_stage_retained_seals_sha256": retained_digest,
+                "same_stage_checkpoint_authority": checkpoint_authority,
                 "source_receipts_verified": True, "original_producer_authority_present": False,
                 "execution_authorized": False, "actual_training_admissible": False,
                 "actual_training_executed": False, "optimizer_updates": 0, "arena_eligible": False}
