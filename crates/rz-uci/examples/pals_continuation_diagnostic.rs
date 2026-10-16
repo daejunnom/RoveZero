@@ -420,6 +420,7 @@ mod actual {
             &continuation_snapshot,
             continuation.as_ref().map(ContinuationDiagnostic::options),
         );
+        let runtime_closure = scalar_wire::runtime_closure(&execution, &process, &completion);
         let available = hot.unavailable.load(Ordering::Acquire) == 0
             && hot_snapshot.is_ok()
             && authority.is_some()
@@ -448,13 +449,14 @@ mod actual {
                 .as_ref()
                 .is_ok_and(|p| p.permits_archive_close() && p.store_archive_closed());
         emit(&json!({
-            "domain":"rovezero.actual-continuation-diagnostic-raw/2",
+            "domain":"rovezero.actual-continuation-diagnostic-raw/3",
             "case":opaque(&case), "case_acceptance":"NOT_ISSUED_BY_DIAGNOSTIC_RUNNER",
             "source_commit":env!("RZ_PALS_COMPILED_SOURCE_COMMIT"),
             "startup_config_sha256":config_pin,"registered_image":registered_image,
             "authority":authority.as_ref().map(opaque),"original_wall_ms":wall_ms,
             "root_hard_ms":ROOT.as_millis(),"run_elapsed_ns":run_elapsed,
             "scalar_observations":scalar_observations,
+            "runtime_closure":runtime_closure,
             "driver_execution_debug":opaque(&execution),"completion_debug":opaque(&completion),
             "original_process_finish_debug":opaque(&process),
             "diagnostic_capture_available":available,"hot_unavailable_bits":hot.unavailable.load(Ordering::Acquire),
@@ -796,6 +798,123 @@ mod actual {
             }
         }
 
+        // Direct final DTO projection after the original finish_process call.
+        // A logical return, root reuse, process shutdown and parent supervision
+        // are separate facts. None of these observations replaces a guard.
+        fn physical(value: rz_uci::search_driver::DriverPhysicalCompletion) -> &'static str {
+            use rz_uci::search_driver::DriverPhysicalCompletion;
+            match value {
+                DriverPhysicalCompletion::Confirmed => "Confirmed",
+                DriverPhysicalCompletion::Unknown => "Unknown",
+            }
+        }
+        fn failure(value: &rz_uci::search_driver::SearchSessionFailure) -> Value {
+            json!({"code":value.code,"detail":value.detail,
+                "physical_completion_classification":physical(value.physical_completion),
+                "classification_scope":"ORIGINAL_DRIVER_FAILURE_ONLY_NOT_A_PHYSICAL_FENCE"})
+        }
+        fn root_closure(value: &rz_uci::pals_adaptive::AdaptiveShutdownReceipt) -> Value {
+            json!({"domain":"adaptive_root_shutdown_receipt","authority":authority(&value.authority),
+                "native_owner_joined":value.native_owner_joined,
+                "native_owner_quiesced":value.native_owner_quiesced,
+                "native_physical_shutdown_confirmed":value.native_physical_shutdown_confirmed,
+                "own_cpu_joined":value.own_cpu_joined,"expected_own_cpu_owners":value.expected_own_cpu_owners,
+                "own_cpu_panicked":value.own_cpu_panicked,
+                "external_shutdown_confirmed":value.external_shutdown_confirmed,
+                "external_owner_quiesced":value.external_owner_quiesced,
+                "auxiliary_shutdown_confirmed":value.auxiliary_shutdown_confirmed,
+                "native_cpu_spent":value.native_cpu_spent,"native_cpu_reserved":value.native_cpu_reserved,
+                "pending_tickets":value.pending_tickets,"quarantined":value.quarantined,
+                "permits_semantic_closure":value.permits_semantic_closure(),
+                "permits_root_reuse":value.permits_root_reuse(),
+                "permits_archive_close":value.permits_archive_close(),
+                "native_os_owner":null,"native_os_owner_observation":"NOT_OBSERVED_BY_THIS_CONSUMER"})
+        }
+        fn checker_shutdown(value: rz_search::cpu_checker::CheckerShutdown) -> Value {
+            json!({"domain":"external_checker_shutdown_receipt",
+                "process_identity":value.process_identity.map(|p|json!({"domain":"external_os_process",
+                    "pid":p.pid.to_string(),"process_group":p.process_group.to_string(),"proc_start_ticks":p.proc_start_ticks.to_string()})),
+                "stop_sent":value.stop_sent,"quit_sent":value.quit_sent,"exit_observed":value.exit_observed,
+                "stdout_drained":value.stdout_drained,"stderr_drained":value.stderr_drained,
+                "exit_code":value.exit_code,"exit_signal":value.exit_signal,"cleanup_complete":value.cleanup_complete,
+                "quarantined":value.quarantined,"ownership_lost":value.ownership_lost,
+                "stdout_bytes":value.stdout_bytes,"stderr_bytes":value.stderr_bytes})
+        }
+        fn semantic_completion(value: rz_search::pals::engine::PalsCompletion) -> &'static str {
+            use rz_search::pals::engine::PalsCompletion;
+            match value {
+                PalsCompletion::RoundLimit => "RoundLimit",
+                PalsCompletion::CpuNodeLimit => "CpuNodeLimit",
+                PalsCompletion::RoleCallLimit => "RoleCallLimit",
+                PalsCompletion::Deadline => "Deadline",
+                PalsCompletion::Canceled => "Canceled",
+                PalsCompletion::Capacity => "Capacity",
+                PalsCompletion::Terminal => "Terminal",
+            }
+        }
+        pub(super) fn runtime_closure(
+            execution: &Result<
+                Result<
+                    rz_uci::search_driver::SearchSessionReport,
+                    rz_uci::search_driver::SearchSessionFailure,
+                >,
+                Box<dyn std::error::Error>,
+            >,
+            process: &Result<
+                rz_uci::pals_adaptive::AdaptiveSessionProcessReceipt,
+                rz_uci::search_driver::SearchSessionFailure,
+            >,
+            completion: &Result<
+                rz_uci::pals_adaptive::AdaptiveCompletionDiagnostic,
+                rz_contracts::ContractError,
+            >,
+        ) -> Value {
+            let driver = match execution {
+                Ok(Ok(_)) => json!({"status":"DRIVER_RETURNED_OK","failure":null,
+                    "consumer_error":null,"physical_completion_classification":null}),
+                Ok(Err(error)) => json!({"status":"DRIVER_RETURNED_ERROR","failure":failure(error),
+                    "consumer_error":null,"physical_completion_classification":physical(error.physical_completion)}),
+                Err(error) => {
+                    json!({"status":"CONSUMER_FAILED_DRIVER_RETURN_NOT_OBSERVED","failure":null,
+                    "consumer_error":error.to_string().chars().take(512).collect::<String>(),"physical_completion_classification":null})
+                }
+            };
+            let process = match process {
+                Ok(receipt) => json!({"status":"ORIGINAL_PROCESS_RECEIPT_RETURNED","failure":null,
+                    "receipt":{"domain":"adaptive_session_process_receipt","process_epoch":receipt.epoch().0.to_string(),
+                        "last_authority":receipt.last_authority().as_ref().map(authority),
+                        "native_owner_joined":receipt.native_owner_joined(),
+                        "native_physical_shutdown_confirmed":receipt.native_physical_shutdown_confirmed(),
+                        "store_archive_closed":receipt.store_archive_closed(),
+                        "permits_archive_close":receipt.permits_archive_close(),"permits_process_close":receipt.permits_process_close(),
+                        "external_shutdown":receipt.external_shutdown().map(checker_shutdown),
+                        "latest_root":receipt.latest_root().map(root_closure),
+                        "native_os_owner":null,"native_os_owner_observation":"NOT_OBSERVED_BY_THIS_CONSUMER"}}),
+                Err(error) => {
+                    json!({"status":"ORIGINAL_PROCESS_FINISH_ERROR","failure":failure(error),
+                    "receipt":null,"receipt_unavailable_reason":"ORIGINAL_FINISH_DID_NOT_RETURN_A_RECEIPT"})
+                }
+            };
+            let completion = match completion {
+                Ok(value) => {
+                    json!({"status":if value.unavailable_reason.is_some(){"UNAVAILABLE"}else if value.last.is_some(){"OBSERVED"}else{"NOT_OBSERVED"},
+                    "process_epoch":value.process_epoch.0.to_string(),"implementation_digest":hex(value.implementation),
+                    "unavailable_reason":value.unavailable_reason,"last":value.last.as_ref().map(|last|json!({
+                        "authority":authority(&last.authority),"semantic_completion":last.semantic_completion.map(semantic_completion),
+                        "driver_return":match last.driver_return{rz_uci::pals_adaptive::AdaptiveCompletionReturn::Ok=>"Ok",rz_uci::pals_adaptive::AdaptiveCompletionReturn::Err=>"Err"},
+                        "failure":last.failure.as_ref().map(|f|json!({"code":f.code,"detail":f.detail,"detail_truncated":f.detail_truncated,
+                            "physical_completion_classification":physical(f.physical_completion)}))}))})
+                }
+                Err(error) => {
+                    json!({"status":"UNAVAILABLE","last":null,"source_error_debug":opaque(error)})
+                }
+            };
+            json!({"domain":"rovezero.continuation-diagnostic-runtime-closure/1",
+                "driver_execution":driver,"final_semantic_observation":completion,"process_finish":process,
+                "parent_supervision":"NOT_OBSERVED_BY_THIS_CONSUMER",
+                "case_acceptance":"NOT_ISSUED_BY_DIAGNOSTIC_RUNNER"})
+        }
+
         #[cfg(test)]
         mod tests {
             use super::*;
@@ -834,6 +953,85 @@ mod actual {
                     length_bucket: 128,
                 }
             }
+
+            #[test]
+            fn closure_wire_keeps_failure_classification_separate_from_missing_receipt() {
+                use rz_uci::search_driver::{DriverPhysicalCompletion, SearchSessionFailure};
+                let execution = Ok(Err(SearchSessionFailure {
+                    physical_completion: DriverPhysicalCompletion::Confirmed,
+                    code: "OriginalDriverFailure",
+                    detail: "authored DTO".into(),
+                }));
+                let process = Err(SearchSessionFailure::physical_completion_unknown());
+                let completion = Ok(rz_uci::pals_adaptive::AdaptiveCompletionDiagnostic {
+                    process_epoch: rz_contracts::ProcessEpoch(9),
+                    implementation: Digest([4; 32]),
+                    last: None,
+                    observed_driver_returns: None,
+                    successful_driver_return_reason_counts: None,
+                    semantic_observed_but_driver_failed: None,
+                    unobserved_completion_returns: None,
+                    unavailable_reason: Some("authored unavailable"),
+                });
+                let value = runtime_closure(&execution, &process, &completion);
+                assert_eq!(
+                    value["driver_execution"]["physical_completion_classification"],
+                    "Confirmed"
+                );
+                assert_eq!(
+                    value["process_finish"]["failure"]["physical_completion_classification"],
+                    "Unknown"
+                );
+                assert!(value["process_finish"]["receipt"].is_null());
+                assert_eq!(value["final_semantic_observation"]["status"], "UNAVAILABLE");
+                assert!(value["final_semantic_observation"]["last"].is_null());
+                assert_eq!(value["parent_supervision"], "NOT_OBSERVED_BY_THIS_CONSUMER");
+            }
+            #[test]
+            fn closure_wire_semantic_result_does_not_mint_driver_or_physical_success() {
+                use rz_uci::pals_adaptive::{
+                    AdaptiveCompletionDiagnostic, AdaptiveCompletionObservation,
+                    AdaptiveCompletionReturn,
+                };
+                use rz_uci::search_driver::SearchSessionFailure;
+                let execution = Err(Box::<dyn std::error::Error>::from(
+                    "authored consumer failure",
+                ));
+                let process = Err(SearchSessionFailure::physical_completion_unknown());
+                let completion = Ok(AdaptiveCompletionDiagnostic {
+                    process_epoch: rz_contracts::ProcessEpoch(9),
+                    implementation: Digest([4; 32]),
+                    last: Some(AdaptiveCompletionObservation {
+                        authority: scope(),
+                        semantic_completion: Some(
+                            rz_search::pals::engine::PalsCompletion::RoleCallLimit,
+                        ),
+                        driver_return: AdaptiveCompletionReturn::Err,
+                        failure: None,
+                    }),
+                    observed_driver_returns: None,
+                    successful_driver_return_reason_counts: None,
+                    semantic_observed_but_driver_failed: None,
+                    unobserved_completion_returns: None,
+                    unavailable_reason: Some("authored prefix"),
+                });
+                let value = runtime_closure(&execution, &process, &completion);
+                assert_eq!(
+                    value["driver_execution"]["status"],
+                    "CONSUMER_FAILED_DRIVER_RETURN_NOT_OBSERVED"
+                );
+                assert!(value["driver_execution"]["physical_completion_classification"].is_null());
+                assert_eq!(
+                    value["final_semantic_observation"]["last"]["semantic_completion"],
+                    "RoleCallLimit"
+                );
+                assert_eq!(
+                    value["final_semantic_observation"]["last"]["driver_return"],
+                    "Err"
+                );
+                assert!(value["process_finish"]["receipt"].is_null());
+            }
+
             #[test]
             fn scalar_wire_keeps_large_ids_and_typed_domains_distinct() {
                 let a = scope();
@@ -1000,10 +1198,10 @@ mod actual {
             Err(error) => {
                 let detail: String = error.to_string().chars().take(512).collect();
                 let _ = emit(
-                    &json!({"domain":"rovezero.actual-continuation-diagnostic-raw/2",
+                    &json!({"domain":"rovezero.actual-continuation-diagnostic-raw/3",
                     "status":"PREPARATION_OR_PUBLICATION_FAILED","detail":detail,
                     "case_acceptance":"NOT_ISSUED_BY_DIAGNOSTIC_RUNNER",
-                    "actual_nn_scope":"UNKNOWN_UNLESS_ORIGINAL_RAW_PROVES_IT","scalar_observations":null}),
+                    "actual_nn_scope":"UNKNOWN_UNLESS_ORIGINAL_RAW_PROVES_IT","scalar_observations":null,"runtime_closure":null}),
                 );
                 ExitCode::FAILURE
             }
