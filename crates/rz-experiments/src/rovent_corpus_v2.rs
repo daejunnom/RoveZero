@@ -267,7 +267,7 @@ pub fn validate_submitted_root_admission(
                     && process["proc_start_ticks"].as_u64().is_some_and(|n| n > 0)
                     && source["profile_file_bytes"]
                         .as_u64()
-                        .is_some_and(|n| n > 0 && n <= 1 << 20)
+                        .is_some_and(|n| n > 0 && n <= 64 << 10)
                     && [
                         "profile_file_sha256",
                         "profile_canonical_sha256",

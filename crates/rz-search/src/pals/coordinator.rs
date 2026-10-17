@@ -77,6 +77,10 @@ pub fn coordinator_source_digest() -> rz_contracts::Digest {
             include_bytes!("coordinator/reciprocal.rs").as_slice(),
         ),
         (
+            "coordinator/reciprocal/utility_dependency.rs",
+            include_bytes!("coordinator/reciprocal/utility_dependency.rs").as_slice(),
+        ),
+        (
             "coordinator/tickets.rs",
             include_bytes!("coordinator/tickets.rs").as_slice(),
         ),

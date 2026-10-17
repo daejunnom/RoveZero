@@ -127,6 +127,13 @@ fn cpu_fixture(stage: RefinementStage) -> (CpuJobEnvelope, SliceGrant) {
 fn accepted_policy(
     stage: RefinementStage,
 ) -> (RoleTicketEnvelope, super::super::super::AcceptedRoleStep) {
+    accepted_policy_at(stage, 1)
+}
+
+fn accepted_policy_at(
+    stage: RefinementStage,
+    first_request_sequence: u64,
+) -> (RoleTicketEnvelope, super::super::super::AcceptedRoleStep) {
     use crate::pals::coordinator::{
         NativeAcceptanceIssuer, PhysicalRoleCompletion, RoleCompletion, RoleSubmission,
         RoleTicketRegistry,
@@ -137,7 +144,7 @@ fn accepted_policy(
         authority(),
         512,
         rz_runtime::adaptive::CoordinatorPolicy::Fixed,
-        1,
+        first_request_sequence,
     )
     .unwrap();
     let ticket = registry
@@ -256,6 +263,219 @@ fn accepted_role_checkpoint_keeps_original_execution_until_child_returns() {
         machine.frame(parent).unwrap().phase,
         FramePhase::Waiting(evidence.execution)
     );
+}
+
+#[test]
+fn dependency_proof_requires_actual_accepted_edge_and_exact_weak_target_identity() {
+    // These are the existing CPU/mock registry permit/accept owners. No NN,
+    // worker execution, native CPU completion or additional receipt is forged.
+    let mut machine = machine(ExecutionMode::CpuPcr);
+    let source = parent(&mut machine, RefinementStage::ProposalContinuation);
+    let unrelated = parent(&mut machine, RefinementStage::CriticReply);
+    assert!(
+        machine
+            .reciprocal_dependency_proof(source, unrelated, deadline().clock, MonotonicTick(0))
+            .is_err()
+    );
+    let (ticket, accepted) = accepted_policy(RefinementStage::ProposalContinuation);
+    machine
+        .bind_role(source, &ticket, deadline().clock, MonotonicTick(0))
+        .unwrap();
+    let evidence = StepEvidence {
+        frame: source,
+        stage: RefinementStage::ProposalContinuation,
+        execution: StepExecution::Role(ticket.id),
+        submitted_question: ticket.question,
+        submitted_view: ticket.view,
+        completed_evidence: accepted.output_digest(),
+    };
+    let requested = question(&machine, source, RefinementStage::CriticReply, 1);
+    let DependentFrameAdmission::Admitted(child) = machine
+        .admit_after_accepted_role(
+            evidence,
+            &accepted,
+            requested,
+            input(RefinementStage::CriticReply),
+            2,
+            deadline().clock,
+            MonotonicTick(0),
+        )
+        .unwrap()
+    else {
+        panic!("fresh accepted source unexpectedly joined")
+    };
+    let work = machine
+        .ready_work(child, deadline().clock, MonotonicTick(0))
+        .unwrap();
+    let source_strong = Arc::strong_count(&machine.frame(source).unwrap().input.view);
+    let target_strong = Arc::strong_count(&work.input.view);
+    let budget_before = machine.frame(source).unwrap().budget;
+    let proof = machine
+        .reciprocal_dependency_proof(source, child, deadline().clock, MonotonicTick(0))
+        .unwrap();
+    assert_eq!(proof.parent(), source);
+    assert_eq!(proof.child(), child);
+    assert_eq!(proof.origin(), Some(accepted.origin(source, None).unwrap()));
+    assert_eq!(proof.question(), requested);
+    assert_eq!(proof.alias_question(), requested);
+    assert_eq!(proof.parent_question(), None);
+    assert!(proof.validates_child(&work));
+    assert_eq!(
+        Arc::strong_count(&machine.frame(source).unwrap().input.view),
+        source_strong
+    );
+    assert_eq!(Arc::strong_count(&work.input.view), target_strong);
+    assert_eq!(machine.frame(source).unwrap().budget, budget_before);
+    assert!(
+        machine
+            .reciprocal_dependency_proof(unrelated, child, deadline().clock, MonotonicTick(0))
+            .is_err()
+    );
+    assert!(
+        machine
+            .reciprocal_dependency_proof(source, unrelated, deadline().clock, MonotonicTick(0))
+            .is_err()
+    );
+
+    // Equal public values are insufficient when they do not retain the actual
+    // manager-issued target Q and view allocation identities.
+    let mut changed = work.clone();
+    changed.input.question = Arc::new(*work.input.question);
+    assert!(!proof.validates_child(&changed));
+    let mut changed = work.clone();
+    changed.input.view = Arc::new(*work.input.view);
+    assert!(!proof.validates_child(&changed));
+    let mut changed = work.clone();
+    changed.frame = unrelated;
+    assert!(!proof.validates_child(&changed));
+    let mut changed = work.clone();
+    changed.input.public_context = Digest([98; 32]);
+    assert!(!proof.validates_child(&changed));
+
+    let response = bind_role(&mut machine, child, 3);
+    machine
+        .resolve_reciprocal_response(response, deadline().clock, MonotonicTick(0))
+        .unwrap();
+    assert_eq!(machine.waiting_on(source), None);
+    assert!(
+        machine
+            .reciprocal_dependency_proof(source, child, deadline().clock, MonotonicTick(0))
+            .is_err()
+    );
+    // A previously issued proof remains a historical identity record. It
+    // grants neither a second dependency nor permission to execute this Work.
+    assert!(proof.validates_child(&work));
+}
+
+#[test]
+fn joined_dependency_proofs_keep_canonical_child_and_exact_accepted_alias_origins() {
+    let mut machine = machine(ExecutionMode::CpuPcr);
+    let first = parent(&mut machine, RefinementStage::ProposalContinuation);
+    let second = parent(&mut machine, RefinementStage::ProposalContinuation);
+    let (first_ticket, first_accepted) =
+        accepted_policy_at(RefinementStage::ProposalContinuation, 1);
+    let (second_ticket, second_accepted) =
+        accepted_policy_at(RefinementStage::ProposalContinuation, 2);
+    assert_ne!(first_ticket.id, second_ticket.id);
+    for (source, ticket) in [(first, &first_ticket), (second, &second_ticket)] {
+        machine
+            .bind_role(source, ticket, deadline().clock, MonotonicTick(0))
+            .unwrap();
+    }
+    let source_evidence =
+        |frame, ticket: &RoleTicketEnvelope, accepted: &super::super::super::AcceptedRoleStep| {
+            StepEvidence {
+                frame,
+                stage: RefinementStage::ProposalContinuation,
+                execution: StepExecution::Role(ticket.id),
+                submitted_question: ticket.question,
+                submitted_view: ticket.view,
+                completed_evidence: accepted.output_digest(),
+            }
+        };
+    let canonical = question(&machine, first, RefinementStage::CriticReply, 1);
+    let DependentFrameAdmission::Admitted(child) = machine
+        .admit_after_accepted_role(
+            source_evidence(first, &first_ticket, &first_accepted),
+            &first_accepted,
+            canonical,
+            input(RefinementStage::CriticReply),
+            2,
+            deadline().clock,
+            MonotonicTick(0),
+        )
+        .unwrap()
+    else {
+        panic!("first actual accepted source unexpectedly joined")
+    };
+    let alias = question(&machine, second, RefinementStage::CriticReply, 2);
+    assert_eq!(
+        machine
+            .admit_after_accepted_role(
+                source_evidence(second, &second_ticket, &second_accepted),
+                &second_accepted,
+                alias,
+                input(RefinementStage::CriticReply),
+                2,
+                deadline().clock,
+                MonotonicTick(0),
+            )
+            .unwrap(),
+        DependentFrameAdmission::Joined(child)
+    );
+    let work = machine
+        .ready_work(child, deadline().clock, MonotonicTick(0))
+        .unwrap();
+    let first_strong = Arc::strong_count(&machine.frame(first).unwrap().input.view);
+    let second_strong = Arc::strong_count(&machine.frame(second).unwrap().input.view);
+    let target_strong = Arc::strong_count(&work.input.view);
+    let first_budget = machine.frame(first).unwrap().budget;
+    let second_budget = machine.frame(second).unwrap().budget;
+    let first_proof = machine
+        .reciprocal_dependency_proof(first, child, deadline().clock, MonotonicTick(0))
+        .unwrap();
+    let second_proof = machine
+        .reciprocal_dependency_proof(second, child, deadline().clock, MonotonicTick(0))
+        .unwrap();
+    assert_eq!(first_proof.question(), canonical);
+    assert_eq!(second_proof.question(), canonical);
+    assert_eq!(first_proof.alias_question(), canonical);
+    assert_eq!(second_proof.alias_question(), alias);
+    assert_ne!(second_proof.question().id, second_proof.alias_question().id);
+    assert_eq!(
+        first_proof.origin(),
+        Some(first_accepted.origin(first, None).unwrap())
+    );
+    assert_eq!(
+        second_proof.origin(),
+        Some(second_accepted.origin(second, None).unwrap())
+    );
+    assert_ne!(first_proof.origin(), second_proof.origin());
+    assert!(first_proof.validates_child(&work));
+    assert!(second_proof.validates_child(&work));
+    assert_eq!(
+        Arc::strong_count(&machine.frame(first).unwrap().input.view),
+        first_strong
+    );
+    assert_eq!(
+        Arc::strong_count(&machine.frame(second).unwrap().input.view),
+        second_strong
+    );
+    assert_eq!(Arc::strong_count(&work.input.view), target_strong);
+    assert_eq!(machine.frame(first).unwrap().budget, first_budget);
+    assert_eq!(machine.frame(second).unwrap().budget, second_budget);
+    let response = bind_role(&mut machine, child, 3);
+    machine
+        .resolve_reciprocal_response(response, deadline().clock, MonotonicTick(0))
+        .unwrap();
+    for source in [first, second] {
+        assert_eq!(machine.waiting_on(source), None);
+        assert!(
+            machine
+                .reciprocal_dependency_proof(source, child, deadline().clock, MonotonicTick(0))
+                .is_err()
+        );
+    }
 }
 
 #[test]

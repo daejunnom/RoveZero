@@ -361,6 +361,14 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 include_str!("engine/adaptive_port/validator_port.rs"),
             ),
             (
+                "pals/engine/adaptive_port/utility_route.rs",
+                include_str!("engine/adaptive_port/utility_route.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/utility_dependencies.rs",
+                include_str!("engine/adaptive_port/utility_dependencies.rs"),
+            ),
+            (
                 "pals/engine/cpu_lifecycle.rs",
                 include_str!("engine/cpu_lifecycle.rs"),
             ),
@@ -1886,6 +1894,15 @@ impl<M: RoleModel> PalsEngine<M> {
     pub fn retired_profiled_external_host_bytes(&self) -> Option<u64> {
         self.semantic
             .retired_profiled_external
+            .as_ref()
+            .map_or(Some(0), |custody| custody.owned_host_bytes())
+    }
+    /// Backing retained by the exact retired GoalLocal owner. This projection
+    /// excludes allocator/shared overhead and does not certify physical peak
+    /// memory, completion, or permission to release the retained Store pins.
+    pub fn retired_goal_local_host_bytes(&self) -> Option<u64> {
+        self.semantic
+            .retired_goal_local
             .as_ref()
             .map_or(Some(0), |custody| custody.owned_host_bytes())
     }
@@ -5800,6 +5817,7 @@ impl<M: RoleModel> PalsEngine<M> {
     fn rules_value(&self, node: usize) -> PalsResolvedValue {
         self.semantic.rules_value(node)
     }
+    #[cfg(test)]
     fn model_value(&self, index: usize, remaining: usize) -> PalsResolvedValue {
         self.semantic.model_value(index, remaining)
     }

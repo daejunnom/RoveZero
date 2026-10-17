@@ -89,10 +89,14 @@ mod admitted;
 mod cleanup;
 mod collection;
 mod cpu_semantic;
+mod utility_route;
 pub use cpu_semantic::{
     AdaptiveCpuCaptureCustody, AdaptiveCpuCapturePlan, AdaptiveCpuSemanticObserver,
     AdaptiveCpuSemanticObserverBox, AdaptiveCpuSemanticRetirement,
     AdaptiveCpuSemanticRetirementParts,
+};
+pub use utility_route::{
+    UtilityRouteClosureProof, UtilityRouteFinalizationRejection, UtilityRoutePendingClosure,
 };
 mod effective_clock;
 mod researcher_resources;
@@ -301,6 +305,147 @@ pub struct CandidateFrame<Q> {
 /// archive I/O, an external pipe drain, or wait for a worker. Archive effects
 /// remain with the independent archive owner and finish after worker fences.
 pub trait AdaptiveSearchDriver<Q> {
+    fn prepare_utility_route(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: u16,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual utility source",
+        ))
+    }
+    fn prepare_utility_route_input_request(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::cpu_value::nnuec::v2::Model,
+        _: Arc<AtomicBool>,
+    ) -> Result<rz_search::cpu_value::nnuec::v2::review::Request, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual utility Request factory",
+        ))
+    }
+    #[allow(clippy::result_large_err)]
+    fn bind_utility_route_input(
+        &self,
+        preparation: rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        _: &CoordinatorWork<ReviewView, Q>,
+        input: Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+            Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+        ),
+    > {
+        Err((
+            AdaptiveManagerError::Invalid("driver has no utility input binding"),
+            preparation,
+            input,
+        ))
+    }
+    fn validate_utility_route_work(
+        &self,
+        _: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual utility dependency",
+        ))
+    }
+    fn begin_utility_route_commit(
+        &self,
+        _: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: StepExecution,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteCommitGuard,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no utility precommit guard",
+        ))
+    }
+    fn register_utility_route_descendant(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no original utility descendant source",
+        ))
+    }
+    fn register_utility_route_peer(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::ReciprocalDependencyProof<ReviewView, Q>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual sealed utility peer",
+        ))
+    }
+    fn commit_utility_route_step(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteCommitGuard,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual utility CPU consumption",
+        ))
+    }
+    fn commit_utility_route_await(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuSliceReport,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual utility Await source",
+        ))
+    }
+    fn commit_utility_route_role(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteCommitGuard,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual utility accepted head consumption",
+        ))
+    }
+    fn record_utility_route_r_pc_consumption(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &rz_search::pals::engine::adaptive_port::CpuSemanticWitness,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no utility selected R observation",
+        ))
+    }
+    #[allow(clippy::result_large_err)]
+    fn finish_utility_route_semantics(
+        &self,
+        action: rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteSemanticOutcome,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        ),
+    > {
+        Err((
+            AdaptiveManagerError::Invalid("driver has no utility semantic closure"),
+            action,
+        ))
+    }
     fn reserve_cpu_nnuec_capture(
         &self,
         _: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
@@ -1764,6 +1909,8 @@ where
     collection_observer: Option<AdaptiveCollectionObserverBox<Q, B::Output>>,
     collection_admission: Option<RoventCollectionRootAdmission>,
     cpu_semantic: Option<cpu_semantic::CpuSemanticState<Q>>,
+    utility_route: Option<utility_route::UtilityRouteState<Q>>,
+    utility_route_sequence: u64,
     // Failed unique prepared-job cleanup retains the same job and grant. No
     // unverified rejection can refund credit or discard its capture custody.
     retained_cpu_jobs: Vec<(rz_search::cpu_worker::CpuJob, SliceGrant)>,
@@ -2718,6 +2865,7 @@ where
         self.ordinary_pending_work()
             || self.goal_prepared.is_some()
             || self.goal_continuation_pending
+            || self.utility_scope_open()
     }
     fn ordinary_pending_work(&self) -> bool {
         !self.roles.is_empty()
@@ -2950,6 +3098,15 @@ where
     ) -> Result<PreparationId, AdaptiveManagerError> {
         if !self.can_admit_work() {
             return Err(AdaptiveManagerError::AdmissionClosed);
+        }
+        if self.utility_scope_open()
+            && work
+                .as_ref()
+                .is_none_or(|work| !self.utility_allows_frame(work.frame))
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "unrelated role in utility route scope",
+            ));
         }
         if let Some(scope) = &self.exclusive_scope {
             let allowed = match purpose {
@@ -3210,6 +3367,7 @@ where
             || self.ordinary_pending_work()
             || !self.failures.is_empty()
             || self.exclusive_scope.is_some()
+            || self.utility_scope_open()
             || !self.role_call_admission_available()
         {
             return Ok(false);
@@ -3311,7 +3469,7 @@ where
         }
         let unsafe_completion = matches!(error, AdaptiveManagerError::PhysicalUnknown)
             || (matches!(error, AdaptiveManagerError::NnuecPreparation(_))
-                && !self.nnuec_cleanup_settled())
+                && (!self.nnuec_cleanup_settled() || !self.utility_cleanup_settled()))
             || matches!(
                 error,
                 AdaptiveManagerError::GoalLocalBlocked(GoalLocalBlockReason::Frontier(
@@ -3328,6 +3486,7 @@ where
                     CpuWorkerError::UnknownUsage | CpuWorkerError::Quarantined
                 )
             );
+        self.fail_utility_route();
         self.failures.push_back(error);
         if unsafe_completion {
             self.phase = ManagerPhase::Quarantined;
@@ -3971,6 +4130,10 @@ where
                     .ok_or(AdaptiveManagerError::Invalid(
                         "accepted native ack has no output",
                     ))?;
+            if let Some(work) = &work {
+                self.utility_begin_commit(work, StepExecution::Role(ticket.id))?;
+            }
+            let utility_work = work.clone();
             let attempted = (|| -> Result<(), AdaptiveManagerError> {
                 if purpose == RolePurpose::RoventGoalLocal {
                     self.consume_goal_local_role(
@@ -4021,6 +4184,7 @@ where
                         )?;
                     }
                     self.mark_role_consumed(index)?;
+                    self.utility_role_at(index, &work, output.proposer_ranking_output())?;
                     self.resolve(work, StepExecution::Role(ticket.id), committed)?;
                 } else if purpose == RolePurpose::RootRanking {
                     let ranking = self.registry.accept_proposer_ranking(
@@ -4189,6 +4353,15 @@ where
                     }
                     Ok(_) => {}
                     Err(readback) => self.record_failure(readback),
+                }
+                if self.roles[index].consumption_recorded {
+                    if let Some(work) = &utility_work {
+                        if let Err(observation) =
+                            self.utility_role_at(index, work, output.proposer_ranking_output())
+                        {
+                            self.record_failure(observation);
+                        }
+                    }
                 }
                 return Err(error);
             }
@@ -5421,6 +5594,11 @@ where
         binding: &OwnBinding<Q>,
         report: &CpuSliceReport,
     ) -> Result<(), AdaptiveManagerError> {
+        let utility_execution = StepExecution::Cpu {
+            job: binding.envelope.id,
+            execution: report.grant.execution,
+        };
+        self.utility_begin_commit(&binding.work, utility_execution)?;
         if let Some(original) = &binding.nnuec {
             if original.seal.frame() != binding.work.frame
                 || original.seal.question_digest() != binding.envelope.question
@@ -5448,6 +5626,7 @@ where
                     .driver
                     .cpu_semantic_publication_recorded(&binding.work, report)
             {
+                self.utility_cpu_committed(&binding.work, utility_execution)?;
                 self.observe_cpu_semantic_use(binding, report);
             }
             let digest = consumed?;
@@ -5477,6 +5656,7 @@ where
                 .driver
                 .cpu_semantic_publication_recorded(&binding.work, report)
         {
+            self.utility_cpu_committed(&binding.work, utility_execution)?;
             self.observe_cpu_semantic_use(binding, report);
         }
         let checked = committed?;
@@ -5615,6 +5795,7 @@ where
             published?;
         } else {
             self.rovent_lane_after_resolve(&work)?;
+            self.utility_register_descendant(work.frame)?;
         }
         Ok(())
     }
@@ -5626,6 +5807,9 @@ where
             return Ok(false);
         }
         let peers_changed = self.drive_accepted_role_parents()?;
+        if self.maybe_close_utility_route()? {
+            return Ok(true);
+        }
         if !self.can_admit_work() {
             return Ok(peers_changed);
         }
@@ -5639,6 +5823,7 @@ where
             .frames()
             .filter(|frame| {
                 frame.phase == FramePhase::Ready
+                    && self.utility_allows_frame(frame.id)
                     && self.machine.waiting_on(frame.id).is_none()
                     && self
                         .exclusive_scope
@@ -5788,6 +5973,20 @@ where
                         .map_err(|_| AdaptiveManagerError::Invalid("detached CPU cancel"))?;
                     binding.resume_pending = false;
                     changed = true;
+                } else if self.utility_scope_open() {
+                    // The completed action step's old stack is sunk custody,
+                    // not another utility route. Cancel the same owner/token;
+                    // its terminal and final drain remain inside this cost.
+                    let sequence = self.issue_control()?;
+                    let binding = self.own[index]
+                        .binding
+                        .as_mut()
+                        .expect("original utility CPU owner");
+                    binding.controls.request_cancel(sequence).map_err(|_| {
+                        AdaptiveManagerError::Invalid("utility detached CPU cancel")
+                    })?;
+                    binding.resume_pending = false;
+                    changed = true;
                 } else if let Some(slice) = advice.and_then(|advice| advice.slice) {
                     let result = self.resume_cpu(index, slice.node_credit, slice.soft_lease);
                     changed |= self.native_admission_result(result)?;
@@ -5915,10 +6114,11 @@ where
                                 (own_available && self.nnuec_work_eligible(frame.id))
                                     || (self.external.is_some() && self.foreign.is_none())
                                     || self.profiled_dispatch_available()
-                            }) && self
-                                .exclusive_scope
-                                .as_ref()
-                                .is_none_or(|scope| scope.allows(frame.id)),
+                            }) && self.utility_allows_frame(frame.id)
+                                && self
+                                    .exclusive_scope
+                                    .as_ref()
+                                    .is_none_or(|scope| scope.allows(frame.id)),
                         )
                     })
                 })
@@ -5948,6 +6148,24 @@ where
                 self.clock.domain(),
                 self.check_running()?,
             )?;
+            let utility_started = match self.maybe_start_utility_route(&work) {
+                Ok(started) => started,
+                Err(AdaptiveManagerError::AuxiliaryPending) => {
+                    self.ready.admit(selected.job).map_err(|_| {
+                        AdaptiveManagerError::Capacity("original utility waiting descriptor")
+                    })?;
+                    self.ready_ids.push(work.frame);
+                    return Ok(changed);
+                }
+                Err(error) => return Err(error),
+            };
+            if utility_started && work.input.stage.role().is_some() {
+                self.ready.admit(selected.job).map_err(|_| {
+                    AdaptiveManagerError::Capacity("original utility ready descriptor")
+                })?;
+                self.ready_ids.push(work.frame);
+                return Ok(true);
+            }
             let reciprocal_child = self.is_reciprocal_child(work.frame);
             if let Some(mut terminal) = if reciprocal_child {
                 None
@@ -7217,6 +7435,7 @@ where
         }
         self.registry.revoke_all();
         self.machine.revoke();
+        self.cancel_utility_preparation();
         // The same semantic owner closes its non-submitted local duties now.
         // If an archive transfer owns it, manager admission is already closed
         // and the exact owner close is retried before post-fence retirement.
@@ -7390,6 +7609,7 @@ where
             && self.external_owner_closed()
             && self.deferred.is_empty()
             && self.nnuec_cleanup_settled()
+            && self.utility_cleanup_settled()
             && self.native_frontier_events.is_empty()
             && self.own.iter().all(|slot| {
                 slot.binding
@@ -7414,6 +7634,7 @@ where
             && self.driver.auxiliary_shutdown_confirmed()
             && self.deferred.is_empty()
             && self.nnuec_cleanup_settled()
+            && self.utility_cleanup_settled()
             && self.native_frontier_events.is_empty()
             && self.own.iter().all(|slot| {
                 slot.binding
@@ -7491,6 +7712,7 @@ where
             }),
             auxiliary_shutdown_confirmed: self.driver.auxiliary_shutdown_confirmed()
                 && self.nnuec_cleanup_settled()
+                && self.utility_cleanup_settled()
                 && self.nnuec_pending.is_none()
                 && self.nnuec_jobs.is_empty()
                 && self.goal_prepared.is_none()

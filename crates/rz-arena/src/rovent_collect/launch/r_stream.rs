@@ -61,6 +61,8 @@ struct RootRStream {
     archive_acknowledged: bool,
     semantic: Option<RoventRSemanticObservations>,
     semantic_file: Option<RoventPublicationFile>,
+    unsubmitted: Option<RoventRUnsubmittedObservations>,
+    unsubmitted_file: Option<RoventPublicationFile>,
 }
 fn select_r(
     indices: &[u16],
@@ -176,6 +178,8 @@ impl RStream {
             archive_acknowledged: false,
             semantic: None,
             semantic_file: None,
+            unsubmitted: None,
+            unsubmitted_file: None,
         });
         Ok(Box::new(observer))
     }
@@ -223,10 +227,13 @@ impl RStream {
             cleanup_until: until,
             cancellation: Arc::new(AtomicBool::new(false)),
         };
+        let mut published_file_sha = None;
         for original in closure.captures() {
-            let retirement = original.retirement().ok_or_else(|| {
-                invalid("original R capture has no worker terminal; custody retained")
-            })?;
+            // terminal 부재 자체는 미시작 근거가 아니다. 아래 원 manager
+            // unsubmitted cap 전수 대조가 성공한 경우에만 별도로 ACK한다.
+            let Some(retirement) = original.retirement() else {
+                continue;
+            };
             let captured = root.collector.capture_retirement(
                 &root.admission,
                 Arc::clone(&root.source),
@@ -336,6 +343,32 @@ impl RStream {
                 &publication_sha,
                 until,
             )?);
+            published_file_sha = Some(publication_sha);
+        }
+        root.unsubmitted = capture_rovent_r_unsubmitted_observations(
+            closure,
+            &root.captured,
+            published_file_sha.as_deref(),
+        )?;
+        if let Some(observation) = &root.unsubmitted {
+            let bytes =
+                serde_json::to_vec(observation).map_err(|error| invalid(error.to_string()))?;
+            root.unsubmitted_file = Some(publish_sidecar(
+                &root.directory,
+                &bytes,
+                "r-unsubmitted-observations",
+                ROVENT_R_UNSUBMITTED_MAX_BYTES,
+                until,
+                |readback| {
+                    RoventRUnsubmittedObservations::from_json_historical(
+                        readback,
+                        root.admission.raw_sha256(),
+                        root.publication.as_ref(),
+                        published_file_sha.as_deref(),
+                    )?;
+                    Ok(())
+                },
+            )?);
         }
         check(
             closure.original_retirement().failures().is_empty()
@@ -357,6 +390,21 @@ impl RStream {
         self.closed
             .iter()
             .filter_map(|root| root.dataset.clone())
+            .collect()
+    }
+    pub(super) fn sidecars(&self) -> Vec<RoventTrainingFilePin> {
+        self.closed
+            .iter()
+            .flat_map(|root| {
+                root.semantic_file
+                    .iter()
+                    .chain(root.unsubmitted_file.iter())
+                    .map(move |pin| RoventTrainingFilePin {
+                        path: root.path.join(&pin.path),
+                        sha256: pin.sha256.clone(),
+                        bytes: pin.bytes,
+                    })
+            })
             .collect()
     }
     pub(super) fn fully_closed(&self) -> bool {
@@ -383,39 +431,61 @@ fn publish_semantic(
     publication_sha: &str,
     until: Instant,
 ) -> Result<RoventPublicationFile, ArenaError> {
+    publish_sidecar(
+        directory,
+        raw,
+        "r-semantic-observations",
+        ROVENT_R_SEMANTIC_MAX_BYTES,
+        until,
+        |readback| {
+            RoventRSemanticObservations::from_json_historical(
+                readback,
+                publication,
+                publication_sha,
+            )?;
+            Ok(())
+        },
+    )
+}
+fn publish_sidecar(
+    directory: &Dir,
+    raw: &[u8],
+    stem: &str,
+    maximum: usize,
+    until: Instant,
+    validate: impl FnOnce(&str) -> Result<(), ArenaError>,
+) -> Result<RoventPublicationFile, ArenaError> {
     check(
-        raw.len() <= ROVENT_R_SEMANTIC_MAX_BYTES && Instant::now() < until,
+        raw.len() <= maximum && Instant::now() < until,
         "R semantic file cap/deadline",
     )?;
-    let pending = "r-semantic-observations.pending.json";
-    let name = "r-semantic-observations.json";
+    let pending = format!("{stem}.pending.json");
+    let name = format!("{stem}.json");
     let mut options = cap_std::fs::OpenOptions::new();
     options
         .write(true)
         .create_new(true)
         .follow(FollowSymlinks::No);
-    let mut file = directory.open_with(pending, &options).map_err(io)?;
+    let mut file = directory.open_with(&pending, &options).map_err(io)?;
     for bytes in raw.chunks(64 * 1024) {
         check(Instant::now() < until, "R semantic write deadline")?;
         file.write_all(bytes).map_err(io)?;
     }
     file.sync_all().map_err(io)?;
     let file_pin = RoventPublicationFile {
-        path: pending.into(),
+        path: pending.clone(),
         sha256: hex(Digest(Sha256::digest(raw).into())),
         bytes: raw.len() as u64,
     };
-    let readback = read_pin(directory, &file_pin, ROVENT_R_SEMANTIC_MAX_BYTES as u64)?;
-    RoventRSemanticObservations::from_json_historical(
-        std::str::from_utf8(&readback).map_err(|_| invalid("R semantic file UTF8"))?,
-        publication,
-        publication_sha,
-    )?;
+    let readback = read_pin(directory, &file_pin, maximum as u64)?;
+    validate(std::str::from_utf8(&readback).map_err(|_| invalid("R sidecar file UTF8"))?)?;
     let root = crate::pals_collect_v3::training_process::directory_file(directory)?;
     root.sync_all().map_err(io)?;
     check(Instant::now() < until, "R semantic commit deadline")?;
-    directory.hard_link(pending, directory, name).map_err(io)?;
-    directory.remove_file(pending).map_err(io)?;
+    directory
+        .hard_link(&pending, directory, &name)
+        .map_err(io)?;
+    directory.remove_file(&pending).map_err(io)?;
     root.sync_all().map_err(io)?;
     Ok(RoventPublicationFile {
         path: name.into(),

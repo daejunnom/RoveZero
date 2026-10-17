@@ -5,7 +5,10 @@
 //! most one nonblocking actor boundary. The parent retains its cleanup deadline
 //! and UCI gate; this helper never waits, joins an actor, or creates an owner.
 
-use crate::pals_adaptive::{AdaptiveCheckerMetadata, AdaptiveNnuecRetiredOwner};
+use crate::pals_adaptive::{
+    AdaptiveCheckerMetadata, AdaptiveManagerError, AdaptiveNnuecRetiredOwner,
+    CompletedUtilityRouteAction, UtilityRouteFinalizationRejection, UtilityRoutePendingClosure,
+};
 use rz_contracts::Digest;
 use rz_search::cpu_value::nnuec::v2::retirement::{NnuecCacheInvalidation, NnuecCacheReleaseAck};
 use rz_search::cpu_value::nnuec::v2::review::{PreparationActor, PreparationError, Provenance};
@@ -15,7 +18,7 @@ use rz_search::cpu_worker::{
     RecoveredNnuecEngine, ValueInstallReceipt,
 };
 use rz_search::pals::engine::adaptive_port::{
-    AdaptivePortModel, AdaptivePreparingRootCustody, PreparingRootViewSeal,
+    AdaptivePortModel, AdaptivePortQuestion, AdaptivePreparingRootCustody, PreparingRootViewSeal,
 };
 use rz_search::pals::engine::preparing_root::{
     ReleasedResearcherReadback, ResearcherPreparingOwner, ResearcherRetirementRejection,
@@ -124,6 +127,7 @@ pub enum NnuecRootRetirementPhase {
     AwaitCache,
     ReleaseOriginalPins,
     AwaitPinZero,
+    FinalizeUtilityRoute,
     ReturnPreparingOwner,
 }
 
@@ -133,6 +137,7 @@ pub enum NnuecRootRetirementError {
     Worker(CpuWorkerError),
     Store(StoreError),
     Semantic(PalsError),
+    UtilityRoute(AdaptiveManagerError),
     Invalid(&'static str),
 }
 
@@ -158,6 +163,9 @@ struct RetirementOwners {
     invalidation: Option<NnuecCacheInvalidation>,
     cache_release: Option<NnuecCacheReleaseAck>,
     unmatched_completion: Option<NnuecEngineRetirementCompletion>,
+    utility_route_pending: Option<Box<UtilityRoutePendingClosure<AdaptivePortQuestion>>>,
+    utility_route: Option<Box<CompletedUtilityRouteAction>>,
+    utility_route_rejection: Option<Box<UtilityRouteFinalizationRejection<AdaptivePortQuestion>>>,
 }
 
 /// Opaque original custody for the parent's failure/deadline state. Holding or
@@ -209,6 +217,7 @@ pub struct NnuecRootRetired {
     pub actor: PreparationActor,
     pub engine_release: NnuecEngineReleaseAck,
     pub cache_release: NnuecCacheReleaseAck,
+    pub utility_route: Option<CompletedUtilityRouteAction>,
 }
 
 #[must_use = "pending and failure variants retain actual cleanup obligations"]
@@ -249,12 +258,53 @@ impl NnuecRootRetirement {
                 invalidation: None,
                 cache_release: None,
                 unmatched_completion: None,
+                utility_route_pending: None,
+                utility_route: None,
+                utility_route_rejection: None,
             }),
         }
     }
 
     pub fn phase(&self) -> NnuecRootRetirementPhase {
         self.phase
+    }
+
+    /// Move the manager's original unfinished whole-cost owner alongside the
+    /// same actor/engine custody before retirement begins. A rejected attach
+    /// returns that exact pending owner without finalizing or discarding it.
+    #[allow(clippy::result_large_err)]
+    pub fn attach_utility_route_pending(
+        &mut self,
+        pending: UtilityRoutePendingClosure<AdaptivePortQuestion>,
+    ) -> Result<
+        (),
+        (
+            NnuecRootRetirementError,
+            UtilityRoutePendingClosure<AdaptivePortQuestion>,
+        ),
+    > {
+        if self.phase != NnuecRootRetirementPhase::ValidateOriginalOwners {
+            return Err((
+                NnuecRootRetirementError::Invalid(
+                    "utility route pending must attach before original retirement",
+                ),
+                pending,
+            ));
+        }
+        let owners = self.owners_mut();
+        if owners.utility_route_pending.is_some()
+            || owners.utility_route.is_some()
+            || owners.utility_route_rejection.is_some()
+        {
+            return Err((
+                NnuecRootRetirementError::Invalid(
+                    "original utility route retirement custody already attached",
+                ),
+                pending,
+            ));
+        }
+        owners.utility_route_pending = Some(Box::new(pending));
+        Ok(())
     }
 
     pub fn into_retained(self) -> NnuecRootRetained {
@@ -451,6 +501,48 @@ impl NnuecRootRetirement {
                     }
                 }
             }
+            NnuecRootRetirementPhase::FinalizeUtilityRoute => {
+                let owners = self.owners_mut();
+                let (Some(release), Some(cache)) = (
+                    owners.engine_release.as_ref(),
+                    owners.cache_release.as_ref(),
+                ) else {
+                    return self
+                        .invalid("utility finalization requires actual release acknowledgements");
+                };
+                if !release.matches_source(&owners.source)
+                    || !release.matches_cache_release(cache)
+                    || owners.pins.is_some()
+                    || owners.utility_route.is_some()
+                    || owners.utility_route_rejection.is_some()
+                {
+                    return self
+                        .invalid("utility finalization differs from original retirement custody");
+                }
+                if let Some(pending) = owners.utility_route_pending.take() {
+                    // Original handoff pins and actual Store pin zero precede
+                    // this original pending owner's final cost boundary. The
+                    // leaf observes that boundary; no elapsed duration or
+                    // replacement cost proof is supplied here.
+                    match (*pending).finish_with_nnuec_release(
+                        &owners.source,
+                        std::slice::from_ref(release),
+                        cache,
+                    ) {
+                        Ok(completed) => owners.utility_route = Some(Box::new(completed)),
+                        Err(rejection) => {
+                            let error = rejection.error.clone();
+                            // The whole rejected pending/capability/cost owner,
+                            // including any leaf closure proof, remains beside
+                            // the original actor, semantic engine and actual
+                            // engine/cache release acknowledgements.
+                            owners.utility_route_rejection = Some(Box::new(rejection));
+                            return self.fail(NnuecRootRetirementError::UtilityRoute(error));
+                        }
+                    }
+                }
+                self.phase = NnuecRootRetirementPhase::ReturnPreparingOwner;
+            }
             NnuecRootRetirementPhase::ReleaseOriginalPins => {
                 let owners = self.owners_mut();
                 let witnessed = match (
@@ -478,7 +570,13 @@ impl NnuecRootRetirement {
                     return self.invalid("same semantic engine absent before pin check");
                 };
                 match engine.stores().review_pin_count() {
-                    Ok(0) => self.phase = NnuecRootRetirementPhase::ReturnPreparingOwner,
+                    Ok(0) => {
+                        self.phase = if self.owners().utility_route_pending.is_some() {
+                            NnuecRootRetirementPhase::FinalizeUtilityRoute
+                        } else {
+                            NnuecRootRetirementPhase::ReturnPreparingOwner
+                        };
+                    }
                     Ok(_) => {}
                     Err(error) => return self.fail(NnuecRootRetirementError::Store(error)),
                 }
@@ -492,6 +590,8 @@ impl NnuecRootRetirement {
                     || owners.pins.is_some()
                     || owners.recovered.is_some()
                     || owners.unmatched_completion.is_some()
+                    || owners.utility_route_pending.is_some()
+                    || owners.utility_route_rejection.is_some()
                 {
                     return self.invalid("retirement owner or acknowledgement custody incomplete");
                 }
@@ -521,6 +621,7 @@ impl NnuecRootRetirement {
                             actor,
                             engine_release: retired.engine_release,
                             cache_release: retired.cache_release,
+                            utility_route: owners.utility_route.take().map(|completed| *completed),
                         });
                     }
                     Err(ResearcherRetirementRejection {

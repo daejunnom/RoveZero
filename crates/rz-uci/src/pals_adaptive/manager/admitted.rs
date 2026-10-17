@@ -152,6 +152,8 @@ where
             nnuec_observations: Vec::with_capacity(CPU_JOB_CAPACITY),
             nnuec_observations_omitted: 0,
             cpu_semantic: None,
+            utility_route: None,
+            utility_route_sequence: 0,
             retained_cpu_jobs: Vec::new(),
         }
     }

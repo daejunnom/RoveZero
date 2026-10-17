@@ -136,6 +136,17 @@ where
 {
     pub root_admission: Option<AdaptiveRootAdmissionObserver<B>>,
     pub root_closure: Option<AdaptiveCompletedRootObserver<B>>,
+    /// Historical N05 output from the same original ticket/input lineage.
+    /// Only the Session's actual same-actor engine/cache ACK boundary issues
+    /// this cap; an earlier root_closure callback cannot mint whole cost.
+    /// The Session retains the original Arc on callback error or unwinding.
+    pub utility_route_completed: Option<
+        Arc<
+            dyn Fn(&Arc<super::CompletedUtilityRouteAction>) -> Result<(), AdaptiveManagerError>
+                + Send
+                + Sync,
+        >,
+    >,
     pub external_teacher: Option<AdaptiveExternalTeacherObserver>,
     /// Nonblocking outer-session pump. It does not run inside a native/CPU
     /// worker and cannot change the manager's original execution authority.
@@ -150,6 +161,7 @@ where
         Self {
             root_admission: None,
             root_closure: None,
+            utility_route_completed: None,
             external_teacher: None,
             cooperative: None,
         }

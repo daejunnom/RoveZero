@@ -477,6 +477,7 @@ pub struct DependentFrameResponse {
 struct FrameDependency {
     waiter: FrameId,
     dependency: FrameId,
+    question: ReciprocalQuestionId,
     origin_seal: Option<Digest>,
 }
 
@@ -2701,3 +2702,4 @@ mod tests;
 
 #[path = "reciprocal.rs"]
 mod reciprocal;
+pub use reciprocal::ReciprocalDependencyProof;

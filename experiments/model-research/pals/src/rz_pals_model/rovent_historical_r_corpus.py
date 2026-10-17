@@ -549,6 +549,14 @@ class HistoricalRoventRCorpus:
                 raise ValueError("historical R row differs from original whole retirement/source declaration")
         owner = cls.__new__(cls)
         owner._corpus, owner._registration, owner._publication = corpus, registration, publication
+        # Preserve the original empty/error terminals as well as terminals
+        # with readouts. A later metadata supplement must not invent a row to
+        # recover them or reopen an unpinned historical path.
+        owner._retirements = terminals
+        owner._retirement_observation_pins = {identity: digest("rz-rovent-historical-r-retirement-owner/1", body)
+            for identity, body in terminals.items()}
+        owner._retirement_lookup_sha256 = digest("rz-rovent-historical-r-retirement-lookup/1",
+            owner._retirement_observation_pins)
         owner._observation = {"schema": OBSERVATION_DOMAIN, "publication_sha256": registration["publication"]["sha256"],
             "manifest_file_sha256": corpus.corpus_sha256, "index_file_sha256": corpus.index_sha256,
             "canonical_manifest_sha256": corpus.manifest_semantic_sha256, "canonical_index_sha256": corpus.index_semantic_sha256,
@@ -570,6 +578,10 @@ class HistoricalRoventRCorpus:
         self._corpus._check_owner(full=True)
         if digest("rz-rovent-historical-r-owner-state/1", [self._registration, self._publication, self._observation]) != self._metadata_sha256:
             raise ValueError("historical R immutable publication/registration observation changed")
+        if (set(self._retirements) != set(self._retirement_observation_pins)
+                or digest("rz-rovent-historical-r-retirement-lookup/1", self._retirement_observation_pins)
+                    != self._retirement_lookup_sha256):
+            raise ValueError("historical R original retirement lookup coverage changed")
 
     @property
     def corpus(self):
@@ -579,3 +591,23 @@ class HistoricalRoventRCorpus:
     def observation(self):
         self._check_owner()
         return copy.deepcopy(self._observation)
+
+    def original_publication_metadata(self):
+        """Original parsed publication and its separately verified raw file pin."""
+        self._check_owner()
+        return copy.deepcopy({"publication_file": self._registration["publication"],
+            "publication": self._publication, "execution_authorized": False})
+
+    def original_retirement_evidence(self, retirement_sha256):
+        """Return one original terminal without fabricating an empty input row."""
+        self._check_owner()
+        identity = sha(retirement_sha256)
+        body = self._retirements.get(identity)
+        if body is None:
+            raise ValueError("original historical R retirement is absent from this owner")
+        if digest("rz-rovent-historical-r-retirement-owner/1", body) != self._retirement_observation_pins[identity]:
+            raise ValueError("original historical R retirement evidence changed")
+        entry = next(item for item in self._publication["retirements"] if item["retirement_sha256"] == identity)
+        _retirement_body(body["retirement"], identity, entry["readout_record_sha256"], body["native_admission"])
+        return copy.deepcopy({"publication_file_sha256": self._registration["publication"]["sha256"],
+            "file": entry["file"], "observation": body, "execution_authorized": False})

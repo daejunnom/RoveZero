@@ -171,6 +171,15 @@ where
                                 proof,
                                 output.proposer_ranking_output(),
                             );
+                            if let Some(work) = &held.binding.work {
+                                if let Err(error) = self.utility_role_committed(
+                                    work,
+                                    proof,
+                                    output.proposer_ranking_output(),
+                                ) {
+                                    self.record_failure(error);
+                                }
+                            }
                         }
                         Ok(false) => {}
                         Err(error) => self.record_failure(error),
@@ -220,6 +229,7 @@ where
         let source = held.binding.ticket.ok_or(AdaptiveManagerError::Invalid(
             "accepted peer lost original ticket",
         ))?;
+        self.utility_begin_commit(&work, StepExecution::Role(source.id))?;
         let recipient = if !held.peer_done {
             match source.role {
                 Role::Proposer => Some(SearchRecipient::Critic),
@@ -285,6 +295,7 @@ where
                 held.binding.consumption_recorded = true;
                 self.observe_cpu_pc_head(&held.binding.input, accepted, output);
             }
+            self.utility_role_committed(&work, accepted, output)?;
             let preparation = self.driver.prepare_accepted_role_reciprocal(
                 &work,
                 accepted,
@@ -383,6 +394,7 @@ where
             };
             held.child = Some(child);
             held.alias = Some(prepared.question);
+            self.utility_register_peer(work.frame, child)?;
             if recipient == SearchRecipient::Researcher {
                 held.researcher_done = true;
             } else {
@@ -408,6 +420,14 @@ where
                 self.observe_cpu_pc_head(&held.binding.input, accepted, output);
             }
         }
+        self.utility_role_committed(
+            &work,
+            held.binding
+                .reciprocal_acceptance
+                .as_ref()
+                .expect("actual accepted source"),
+            output,
+        )?;
         self.resolve(work, StepExecution::Role(source.id), checked)?;
         Ok(true)
     }
@@ -654,6 +674,7 @@ where
             let parent = binding.work.clone();
             let observed = custody.observed;
             let report = custody.report.clone();
+            let utility_settled = binding.semantic_settlement.clone();
             let request = custody
                 .report
                 .reciprocal_request
@@ -664,6 +685,7 @@ where
                 .clone();
             if !observed {
                 self.driver.cpu_reciprocal_wait(&parent, &report)?;
+                self.utility_await_committed(&parent, &report, utility_settled.as_ref())?;
                 self.own[index]
                     .binding
                     .as_mut()
@@ -703,6 +725,7 @@ where
                 .expect("retained reciprocal checkpoint");
             custody.child = Some(child);
             custody.question = Some(prepared.question);
+            self.utility_register_peer(parent.frame, child)?;
             changed = true;
         }
         Ok(changed)
@@ -778,6 +801,7 @@ where
         // is one canonical output even when several sealed parents joined it.
         self.driver.role_consumed(ticket, &work.input.view)?;
         self.mark_role_consumed(index)?;
+        self.utility_role_at(index, work, output)?;
         let now = self.check_running()?;
         self.machine.resolve_reciprocal_response(
             StepEvidence {

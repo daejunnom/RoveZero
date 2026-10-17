@@ -3,6 +3,10 @@
 
 use super::*;
 
+#[path = "reciprocal/utility_dependency.rs"]
+mod utility_dependency;
+pub use utility_dependency::ReciprocalDependencyProof;
+
 fn recipient(stage: RefinementStage) -> Option<SearchRecipient> {
     match stage.role() {
         Some(Role::Proposer) => Some(SearchRecipient::Proposer),
@@ -452,6 +456,7 @@ impl<V, Q> RefinementMachine<V, Q> {
             self.dependencies.push(FrameDependency {
                 waiter: parent,
                 dependency: existing,
+                question: question.id,
                 origin_seal: accepted.map(|evidence| {
                     root.accepted_origins[&(parent, evidence.submitted_question)].seal_digest()
                 }),
@@ -494,6 +499,7 @@ impl<V, Q> RefinementMachine<V, Q> {
         self.dependencies.push(FrameDependency {
             waiter: parent,
             dependency: child,
+            question: question.id,
             origin_seal: accepted.map(|evidence| {
                 self.reciprocal
                     .as_ref()

@@ -13,7 +13,7 @@ use rz_search::cpu_worker::{
     PreparedValueInstallation, ValueInstallReceipt,
 };
 use rz_search::pals::coordinator::CoordinatorWork;
-use rz_search::pals::engine::adaptive_port::{AdaptiveNnuecReviewRequest, AdaptiveNnuecReviewSeal};
+use rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal;
 use rz_search::pals::review_context::ReviewView;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -126,10 +126,10 @@ impl<Q> NnuecWorkPreparation<Q> {
         >,
         slot: usize,
         owner: CpuWorkerId,
-        original: AdaptiveNnuecReviewRequest,
+        original: (Request, AdaptiveNnuecReviewSeal),
         canceled: Arc<AtomicBool>,
     ) -> Result<Self, NnuecWorkError> {
-        let (request, seal) = original.into_parts();
+        let (request, seal) = original;
         let expected = request.provenance().clone();
         if selection.job.job != work.frame
             || selection.job.candidate != work.original_first_move
@@ -484,18 +484,30 @@ where
         &mut self,
         actor: &PreparationActor,
     ) -> Result<bool, AdaptiveManagerError> {
+        let utility_changed = self.pump_utility_preparation(actor)?;
+        // The utility P/C preparation is the same actor's sole request. It
+        // cannot compete with or drain a separate original R completion.
         let may_submit = self.phase == ManagerPhase::Running && self.can_admit_work();
         let Some(pending) = &mut self.nnuec_pending else {
-            return Ok(false);
+            return Ok(utility_changed);
         };
         let closing = self.phase != ManagerPhase::Running;
-        let mut changed = match pending.pump_actor(actor, may_submit) {
-            Ok(changed) => changed,
-            Err(NnuecWorkError::Preparation(
-                PreparationError::Cancelled | PreparationError::Expired,
-            )) if closing => true,
-            Err(error) => return Err(AdaptiveManagerError::NnuecPreparation(error)),
-        };
+        let mut changed = utility_changed
+            | match pending.pump_actor(actor, may_submit) {
+                Ok(changed) => changed,
+                Err(NnuecWorkError::Preparation(
+                    PreparationError::Cancelled | PreparationError::Expired,
+                )) if closing => true,
+                Err(error) => return Err(AdaptiveManagerError::NnuecPreparation(error)),
+            };
+        let utility_bound = pending.prepared_bound().cloned();
+        if let Some(bound) = utility_bound.filter(|_| !closing) {
+            // Release the mutable pending borrow before the utility owner
+            // validates the exact same Bound/input capture.
+            let _ = pending;
+            changed |= self.utility_bind_bound(bound)?;
+        }
+        let pending = self.nnuec_pending.as_mut().expect("original R preparation");
         if closing {
             if let Some(worker) = self.own[pending.slot].worker.as_mut() {
                 changed |= pending
@@ -607,6 +619,9 @@ where
             &original.model,
             Arc::clone(&original.canceled),
         )?;
+        let canceled = Arc::clone(&original.canceled);
+        let (request, seal) = request.into_parts();
+        let request = self.utility_attach_r_request(work, request)?;
         self.nnuec_pending = Some(
             NnuecWorkPreparation::new(
                 work.clone(),
@@ -620,8 +635,8 @@ where
                     ))?
                     .profile()
                     .owner,
-                request,
-                Arc::clone(&original.canceled),
+                (request, seal),
+                canceled,
             )
             .map_err(AdaptiveManagerError::NnuecPreparation)?,
         );
@@ -695,6 +710,7 @@ where
             Ok(receipt)
                 if self.nnuec.is_some()
                     && self.cpu_semantic.is_none()
+                    && self.utility_route.is_none()
                     && self.retained_cpu_jobs.is_empty()
                     && self.phase == ManagerPhase::Finished
                     && self.close_mode == AdaptiveCloseMode::RootQuiesce

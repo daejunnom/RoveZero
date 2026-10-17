@@ -15,12 +15,19 @@ fn main() -> std::process::ExitCode {
             }
             RoventCollectionCliParse::Run { plan, arguments } => {
                 let receipt = run_rovent_collection_from_cli(&plan, arguments)?;
+                let resource = receipt.resource_observation()?;
+                let r_data = receipt
+                    .r_datasets
+                    .iter()
+                    .map(|dataset| dataset.observation())
+                    .collect::<Vec<_>>();
                 Ok(Some(
                     serde_json::json!({"schema":"rz-rovent-collection-launch-result/1",
                     "publication":receipt.publication_file,"root":receipt.output_directory,
                     "roots":receipt.roots,"records":receipt.records,
                     "teacher_failure_count":receipt.teacher_failure_count,
                     "historical_data":receipt.historical_dataset.observation(),
+                    "resource":resource,"r_data":r_data,"r_sidecars":receipt.r_sidecars,
                     "training_executed":false}),
                 ))
             }

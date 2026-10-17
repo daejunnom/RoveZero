@@ -387,6 +387,36 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 return Err(StoreError::StaleConsumer.into());
             }
         }
+        let utility_cause = if self.utility_continuations.enabled() {
+            match &step.transition {
+                AdaptivePortTransition::Continue(blueprint) => {
+                    self.validate_blueprint(blueprint)?;
+                    if let Some(cause) = &blueprint.cause {
+                        if step.consumption_gate
+                            != Some((cause.request, cause.question, cause.view))
+                        {
+                            return Err(RoleError::InvalidOutput.into());
+                        }
+                        Some(utility_dependencies::UtilityContinuationCause::Role {
+                            request: cause.request,
+                            frame: cause.frame,
+                            question: cause.question,
+                            view: cause.view,
+                        })
+                    } else if let Some((question, observation)) = step.feedback_gate {
+                        self.utility_cpu_continuation_cause(question, observation)?
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if utility_cause.is_some() {
+            self.utility_continuations.reserve()?;
+        }
         let transition = match step.transition {
             AdaptivePortTransition::Complete { scope } => FrameTransition::Complete { scope },
             AdaptivePortTransition::Unknown { reason } => FrameTransition::Unknown { reason },
@@ -530,6 +560,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 FrameTransition::Continue(input)
             }
         };
+        if let (Some(cause), FrameTransition::Continue(input)) = (utility_cause, &transition) {
+            self.record_utility_continuation(cause, input)?;
+        }
         let queued_recheck = self.seal_queued_recheck(step.queue_question, step.evidence)?;
         Ok(AdaptivePortMaterializedStep {
             evidence: step.evidence,

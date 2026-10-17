@@ -14,6 +14,9 @@ use std::{
     path::Path,
 };
 
+#[path = "r_observation_wire_tests.rs"]
+mod observation_wire;
+
 const FIXTURE_SCHEMA: &str = "rz-rovent-r-wire-fixture/1";
 const RESULT_SCHEMA: &str = "rz-rovent-r-wire-result/1";
 fn h(label: &str) -> String {

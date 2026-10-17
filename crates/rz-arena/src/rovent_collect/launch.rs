@@ -717,6 +717,7 @@ pub struct RoventCollectionLaunchReceipt {
     pub historical_dataset: Arc<VerifiedRoventDataset>,
     pub r_datasets:
         Vec<Arc<crate::rovent_training_process::recovery::VerifiedRoventRAuxiliaryDataset>>,
+    pub r_sidecars: Vec<RoventTrainingFilePin>,
     original: Arc<Mutex<CollectionCaller>>,
 }
 impl RoventCollectionLaunchReceipt {
@@ -987,6 +988,7 @@ pub fn run_rovent_collection(
                             })
                         })),
                         external_teacher: None,
+                        utility_route_completed: None,
                         cooperative: Some(poll),
                     };
                     match native {
@@ -1132,6 +1134,11 @@ pub fn run_rovent_collection(
             teacher_failure_count: state.teacher_failures.len(),
             historical_dataset,
             r_datasets,
+            r_sidecars: state
+                .r
+                .as_ref()
+                .map(|stream| stream.sidecars())
+                .unwrap_or_default(),
             original: Arc::clone(&shared),
         })
     };

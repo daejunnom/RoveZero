@@ -777,6 +777,7 @@ fn prepare_actual(
                     AdaptiveSessionCollectionHooks {
                         root_admission: Some(hooks.root_admission),
                         root_closure: Some(hooks.root_closure),
+                        utility_route_completed: None,
                         external_teacher: Some(hooks.teacher_observer),
                         cooperative: None,
                     },

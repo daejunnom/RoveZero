@@ -41,10 +41,13 @@ mod preparing_port;
 mod profiled_external_port;
 mod reciprocal_port;
 mod role_commit;
+mod utility_dependencies;
 pub use reciprocal_port::{
     AdaptiveAcceptedReciprocalAnswer, AdaptiveCpuReciprocalQuestion, AdaptivePeerQuestion,
     AdaptiveSourceOpinion,
 };
+pub use utility_dependencies::UtilityContinuationSource;
+pub mod utility_route;
 pub mod validator_port;
 pub use branch_queue::{AdaptiveDeferredRepair, AdaptiveQueuedRecheck};
 pub use consumption_observation::{
@@ -506,6 +509,7 @@ pub struct AdaptiveEnginePort<M: RoleModel> {
     reciprocal: reciprocal_port::ReciprocalPortState,
     nnuec_installations: nnuec_installation::NnuecQuestionInstallations,
     goal_local: goal_local::GoalLocalPortState,
+    utility_continuations: utility_dependencies::UtilityContinuationRegistry,
 }
 #[derive(Clone)]
 struct CpuPortAdmission {
@@ -775,6 +779,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             reciprocal: reciprocal_port::ReciprocalPortState::default(),
             nnuec_installations: nnuec_installation::NnuecQuestionInstallations::default(),
             goal_local: goal_local::GoalLocalPortState::default(),
+            utility_continuations: utility_dependencies::UtilityContinuationRegistry::default(),
         }
     }
     /// Explicit root-local diagnostic opt-in before the first observed call.

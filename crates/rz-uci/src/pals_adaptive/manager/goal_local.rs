@@ -12,7 +12,7 @@ where
     /// Called only after the explicit ordinary root-round selection seal. One
     /// turn asks the owner for at most one paid edge or one immutable input.
     pub(super) fn drive_goal_local(&mut self) -> Result<bool, AdaptiveManagerError> {
-        if !self.can_admit_work() {
+        if !self.can_admit_work() || self.utility_scope_open() {
             return Ok(false);
         }
         if self.driver.rovent_root_budget()?.is_none() {

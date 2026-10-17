@@ -1613,12 +1613,21 @@ impl RoventNnuecSessionDriver {
         };
         if collection_admitted {
             if let Some(observer) = &self.collection_hooks.root_closure {
-                if let Err(error) = observer(&mut manager, result.completion) {
-                    return Err(self.retain(
-                        (manager, actor, pins),
-                        "RoventNnuecCollectionClosure",
-                        &error.to_string(),
-                    ));
+                match catch_unwind(AssertUnwindSafe(|| observer(&mut manager, result.completion))) {
+                    Ok(Ok(())) => {},
+                    Ok(Err(error)) => {
+                        let detail = error.to_string();
+                        return Err(self.retain(
+                            (manager, actor, pins, error),
+                            "RoventNnuecCollectionClosure",
+                            &detail,
+                        ));
+                    }
+                    Err(payload) => return Err(self.retain(
+                        (manager, actor, pins, payload),
+                        "RoventNnuecCollectionClosurePanic",
+                        "root closure panicked; original pending utility and physical owners retained",
+                    )),
                 }
             }
         }
@@ -1660,19 +1669,33 @@ impl RoventNnuecSessionDriver {
                 "actual result escaped original move domain",
             ));
         }
+        // A manager root fence transfers pending cost custody only. Its final
+        // completion must still consume the same actor's engine/cache ACKs.
+        let utility_route = match manager.take_utility_route_retirement() {
+            Ok(pending) => pending,
+            Err(error) => {
+                let detail = error.to_string();
+                return Err(self.retain(
+                    (manager, actor, pins, error),
+                    "RoventNnuecUtilityRetirement",
+                    &detail,
+                ));
+            }
+        };
         let mut parts = match manager.into_nnuec_root_parts() {
             Ok(p) => p,
             Err(r) => {
+                let detail = r.error.to_string();
                 return Err(self.retain(
-                    (r.manager, actor, pins),
+                    (r, actor, pins, utility_route),
                     "RoventNnuecRootTransfer",
-                    &r.error.to_string(),
+                    &detail,
                 ));
             }
         };
         if parts.cpu.len() != 1 || parts.external.is_some() {
             return Err(self.retain(
-                (parts, actor, pins),
+                (parts, actor, pins, utility_route),
                 "RoventNnuecCpuTransfer",
                 "actual researcher owner set differs",
             ));
@@ -1681,6 +1704,7 @@ impl RoventNnuecSessionDriver {
         let port = match parts.driver.into_port(&parts.receipt) {
             Ok(p) => p,
             Err((driver, e)) => {
+                let detail = e.to_string();
                 return Err(self.retain(
                     (
                         parts.native,
@@ -1691,9 +1715,11 @@ impl RoventNnuecSessionDriver {
                         driver,
                         actor,
                         pins,
+                        utility_route,
+                        e,
                     ),
                     "RoventNnuecSemanticFence",
-                    &e.to_string(),
+                    &detail,
                 ));
             }
         };
@@ -1703,7 +1729,16 @@ impl RoventNnuecSessionDriver {
             pins,
             port.into_engine(),
         );
-        let retired = loop {
+        if let Some(pending) = utility_route {
+            if let Err((error, pending)) = retirement.attach_utility_route_pending(pending) {
+                return Err(self.retain(
+                    (parts.native, retirement, pending, error),
+                    "RoventNnuecUtilityRetirement",
+                    "original utility pending owner was rejected before same-actor retirement",
+                ));
+            }
+        }
+        let mut retired = loop {
             if Instant::now() >= context.shutdown_deadline {
                 return Err(self.retain(
                     (parts.native, retirement),
@@ -1731,6 +1766,44 @@ impl RoventNnuecSessionDriver {
                     .min(Duration::from_millis(1)),
             );
         };
+        if let Some(completed) = retired.utility_route.take() {
+            // Cloning this historical Arc grants no execution or preparation
+            // authority. Keep the original cap even if its consumer fails.
+            let completed = Arc::new(completed);
+            if !collection_admitted
+                || completed.id().authority() != context.authority
+                || completed.semantic().root_budget() != receipt.root_admission.root_budget_digest()
+            {
+                return Err(self.retain(
+                    (parts.native, retired, completed, receipt),
+                    "RoventNnuecUtilityScope",
+                    "completed utility action differs from the original admitted collection root",
+                ));
+            }
+            let Some(observer) = &self.collection_hooks.utility_route_completed else {
+                return Err(self.retain(
+                    (parts.native, retired, completed, receipt),
+                    "RoventNnuecUtilityObserverMissing",
+                    "actual utility completion has no final collection consumer",
+                ));
+            };
+            match catch_unwind(AssertUnwindSafe(|| observer(&completed))) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let detail = error.to_string();
+                    return Err(self.retain(
+                        (parts.native, retired, completed, receipt, error),
+                        "RoventNnuecUtilityPublication",
+                        &detail,
+                    ));
+                }
+                Err(payload) => return Err(self.retain(
+                    (parts.native, retired, completed, receipt, payload),
+                    "RoventNnuecUtilityPublicationPanic",
+                    "final utility consumer panicked; original action and actual owners retained",
+                )),
+            }
+        }
         let mate_strategy = receipt
             .frontier
             .as_ref()

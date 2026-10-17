@@ -558,6 +558,132 @@ impl AdaptiveAcceptedReciprocalAnswer {
 }
 
 impl<M: RoleModel> AdaptiveEnginePort<M> {
+    /// Read only the original actual peer input retained by this owner. Alias
+    /// ambiguity cannot select a new/latest envelope for a utility action.
+    pub(super) fn validated_utility_peer(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<Option<(QuestionEnvelope, Option<AcceptedRoleOrigin>)>, PalsError> {
+        self.check_work(work)?;
+        AdaptivePortQuestion::validate_frontier_source(work, &self.engine.semantic.stores)?;
+        let mut matching = self
+            .reciprocal
+            .pending
+            .values()
+            .filter(|pending| pending.envelope.question_digest == work.input.question_digest);
+        let Some(pending) = matching.next() else {
+            return Ok(None);
+        };
+        if matching.next().is_some()
+            || pending.envelope.original_first_move != Some(work.original_first_move)
+            || pending.envelope.original_deadline != work.original_deadline
+            || pending.envelope.view != work.input.view_seal
+            || pending.input.stage != work.input.stage
+            || pending.input.question_digest != work.input.question_digest
+            || pending.input.public_context != work.input.public_context
+            || !Arc::ptr_eq(&pending.input.question, &work.input.question)
+            || !Arc::ptr_eq(&pending.input.view, &work.input.view)
+            || !pending.input.view.validates(&self.engine.semantic.stores)
+            || !pending
+                .anchor
+                .rules()
+                .snapshot()
+                .same_state(&work.input.question.position.snapshot())
+            || self.rovent_frontier().is_none_or(|frontier| {
+                frontier.registration().root_budget != pending.envelope.root_budget
+            })
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        Ok(Some((pending.envelope, pending.origin)))
+    }
+
+    /// Join ancestry uses its actual edge alias; the head still belongs to the
+    /// canonical child input. Neither identity is selected from a latest slot.
+    pub(super) fn validated_utility_peer_dependency(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        proof: &crate::pals::coordinator::ReciprocalDependencyProof<
+            ReviewView,
+            AdaptivePortQuestion,
+        >,
+    ) -> Result<(QuestionEnvelope, Option<AcceptedRoleOrigin>), PalsError> {
+        self.check_work(work)?;
+        AdaptivePortQuestion::validate_frontier_source(work, &self.engine.semantic.stores)?;
+        if !proof.validates_child(work) {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        let canonical = proof.question();
+        let alias = proof.alias_question();
+        let input = self
+            .reciprocal
+            .pending
+            .get(&canonical.id)
+            .ok_or(RoleError::InvalidOutput)?;
+        let original_alias = self
+            .reciprocal
+            .pending
+            .get(&alias.id)
+            .ok_or(RoleError::InvalidOutput)?;
+        AdaptivePortQuestion::validate_frontier_input(
+            &original_alias.input,
+            &self.engine.semantic.stores,
+        )?;
+        if input.envelope != canonical
+            || original_alias.envelope != alias
+            || original_alias.origin != proof.origin()
+            || input.input.stage != work.input.stage
+            || input.input.question_digest != work.input.question_digest
+            || input.input.view_seal != work.input.view_seal
+            || input.input.public_context != work.input.public_context
+            || !Arc::ptr_eq(&input.input.question, &work.input.question)
+            || !Arc::ptr_eq(&input.input.view, &work.input.view)
+            || canonical.original_first_move != Some(work.original_first_move)
+            || canonical.original_deadline != work.original_deadline
+            || !input
+                .anchor
+                .rules()
+                .snapshot()
+                .same_state(&work.input.question.position.snapshot())
+            || self.rovent_frontier().is_none_or(|frontier| {
+                frontier.registration().root_budget != canonical.root_budget
+                    || frontier.registration().root_budget != alias.root_budget
+            })
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        Ok((canonical, proof.origin()))
+    }
+
+    /// Existing R descriptors are issued at actual job admission. This does
+    /// not create a parent question from a public frame or a root snapshot.
+    pub(super) fn validated_utility_r_parent(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<Option<QuestionEnvelope>, PalsError> {
+        self.check_work(work)?;
+        AdaptivePortQuestion::validate_frontier_source(work, &self.engine.semantic.stores)?;
+        let Some(parent) = self
+            .reciprocal
+            .parents
+            .get(&(work.frame, work.input.question_digest))
+        else {
+            return Ok(None);
+        };
+        if parent.recipient != SearchRecipient::Researcher
+            || parent.original_first_move != Some(work.original_first_move)
+            || parent.original_deadline != work.original_deadline
+            || parent.view != work.input.view_seal
+            || parent.question_digest != work.input.question_digest
+            || self
+                .rovent_frontier()
+                .is_none_or(|frontier| frontier.registration().root_budget != parent.root_budget)
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        Ok(Some(*parent))
+    }
+
     /// Preserve an already-issued peer R question instead of replacing its
     /// parent/origin with an unrelated local descriptor for an external job.
     pub(super) fn profiled_reciprocal_question(

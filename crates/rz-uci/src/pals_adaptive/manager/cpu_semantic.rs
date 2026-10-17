@@ -90,6 +90,9 @@ pub struct AdaptiveCpuSemanticRetirementParts<Q> {
     pub admission: RoventCollectionRootAdmission,
     pub observer: AdaptiveCpuSemanticObserverBox<Q>,
     pub captures: Vec<AdaptiveCpuCaptureCustody>,
+    /// Only the actual post-fence unsubmitted observer boundary populates
+    /// this owner list. A missing worker terminal cannot construct it.
+    pub unsubmitted: Vec<AdaptiveCpuCaptureCustody>,
     pub witnesses: Vec<CpuSemanticWitness>,
     pub delivered_witnesses: usize,
     /// Attempts, not a count of distinct facts or a zero-valued target.
@@ -102,6 +105,9 @@ impl<Q> AdaptiveCpuSemanticRetirement<Q> {
     }
     pub fn retained_captures(&self) -> &[AdaptiveCpuCaptureCustody] {
         &self.state.captures
+    }
+    pub fn unsubmitted_captures(&self) -> &[AdaptiveCpuCaptureCustody] {
+        &self.state.unsubmitted
     }
     pub fn witnesses(&self) -> &[CpuSemanticWitness] {
         &self.state.witnesses
@@ -123,6 +129,7 @@ impl<Q> AdaptiveCpuSemanticRetirement<Q> {
             admission: self.state.admission,
             observer: self.state.observer,
             captures: self.state.captures,
+            unsubmitted: self.state.unsubmitted,
             witnesses: self.state.witnesses,
             delivered_witnesses: self.state.delivered_witnesses,
             unrecorded_witness_attempts: self.state.unrecorded_witness_attempts,
@@ -137,6 +144,7 @@ pub(super) struct CpuSemanticState<Q> {
     planned: Vec<(FrameId, Digest)>,
     sequences: Vec<u64>,
     captures: Vec<AdaptiveCpuCaptureCustody>,
+    unsubmitted: Vec<AdaptiveCpuCaptureCustody>,
     witnesses: Vec<CpuSemanticWitness>,
     delivered_witnesses: usize,
     witness_delivery_failed: bool,
@@ -199,6 +207,7 @@ impl<Q> CpuSemanticState<Q> {
             planned: Vec::new(),
             sequences: Vec::new(),
             captures: Vec::new(),
+            unsubmitted: Vec::new(),
             witnesses: Vec::new(),
             delivered_witnesses: 0,
             witness_delivery_failed: false,
@@ -368,7 +377,9 @@ impl<Q> CpuSemanticState<Q> {
             }
             match self.observer.capture_unsubmitted(&held.reservation) {
                 Ok(()) => {
-                    self.captures.remove(index);
+                    // Only this actual post-fence not-enqueued boundary
+                    // preserves custody for the sidecar acknowledgement.
+                    self.unsubmitted.push(self.captures.remove(index));
                 }
                 Err(error) => {
                     held.delivery_failed = true;

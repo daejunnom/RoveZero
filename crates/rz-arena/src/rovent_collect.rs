@@ -1096,6 +1096,10 @@ pub use r_observer::*;
 mod r_semantic;
 #[cfg(feature = "pals-collection-onnx")]
 pub use r_semantic::*;
+#[cfg(feature = "pals-collection-onnx")]
+mod r_unsubmitted;
+#[cfg(feature = "pals-collection-onnx")]
+pub use r_unsubmitted::*;
 mod r_publication;
 pub use r_publication::*;
 mod r_writer;

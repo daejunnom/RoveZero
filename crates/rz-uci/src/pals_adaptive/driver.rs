@@ -630,6 +630,175 @@ fn checked(step: AdaptivePortMaterializedStep) -> CheckedStep<AdaptivePortQuesti
     }
 }
 impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for AdaptivePortDriver<M> {
+    fn prepare_utility_route(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        target: u16,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        AdaptiveManagerError,
+    > {
+        self.port
+            .as_deref_mut()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .prepare_utility_route(work, target)
+            .map_err(semantic)
+    }
+    fn prepare_utility_route_input_request(
+        &self,
+        prep: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        model: &rz_search::cpu_value::nnuec::v2::Model,
+        canceled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<rz_search::cpu_value::nnuec::v2::review::Request, AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .prepare_utility_route_input_request(prep, work, model, canceled)
+            .map_err(|error| AdaptiveManagerError::Semantic(format!("{error:?}")))
+    }
+    fn bind_utility_route_input(
+        &self,
+        prep: rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        input: Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+            Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+        ),
+    > {
+        let Some(port) = self.port.as_deref() else {
+            return Err((AdaptiveManagerError::AuxiliaryPending, prep, input));
+        };
+        port.bind_utility_route_input(prep, work, input)
+            .map_err(|rejected| {
+                (
+                    semantic(rejected.error),
+                    rejected.preparation,
+                    rejected.input,
+                )
+            })
+    }
+    fn validate_utility_route_work(
+        &self,
+        action: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .validate_utility_route_work(action, work)
+            .map_err(semantic)
+    }
+    fn begin_utility_route_commit(
+        &self,
+        action: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        execution: StepExecution,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteCommitGuard,
+        AdaptiveManagerError,
+    > {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .begin_utility_route_commit(action, work, execution)
+            .map_err(semantic)
+    }
+    fn register_utility_route_descendant(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .register_utility_route_descendant(action, work)
+            .map_err(semantic)
+    }
+    fn register_utility_route_peer(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        proof: &rz_search::pals::coordinator::ReciprocalDependencyProof<
+            ReviewView,
+            AdaptivePortQuestion,
+        >,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .register_utility_route_peer(action, work, proof)
+            .map_err(semantic)
+    }
+    fn commit_utility_route_step(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        guard: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteCommitGuard,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .commit_utility_route_step(action, guard, work)
+            .map_err(semantic)
+    }
+    fn commit_utility_route_await(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        report: &CpuSliceReport,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .commit_utility_route_await(action, work, report)
+            .map_err(semantic)
+    }
+    fn commit_utility_route_role(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        guard: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteCommitGuard,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .commit_utility_route_role(action, guard, work, accepted, output)
+            .map_err(semantic)
+    }
+    fn record_utility_route_r_pc_consumption(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        witness: &rz_search::pals::engine::adaptive_port::CpuSemanticWitness,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .record_utility_route_r_pc_consumption(action, witness)
+            .map_err(semantic)
+    }
+    fn finish_utility_route_semantics(
+        &self,
+        action: rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteSemanticOutcome,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        ),
+    > {
+        let Some(port) = self.port.as_deref() else {
+            return Err((AdaptiveManagerError::AuxiliaryPending, action));
+        };
+        port.finish_utility_route_semantics(action)
+            .map_err(|(error, action)| (semantic(error), action))
+    }
     fn reserve_cpu_nnuec_capture(
         &self,
         seal: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,

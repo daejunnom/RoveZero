@@ -1041,6 +1041,31 @@ class RoventRCorpus:
             "wdl_raw_sha256": None if row["wdl"] is None else row["wdl"]["raw_receipt_sha256"],
             "execution_authorized": False}
 
+    def original_semantic_evidence(self, record_sha256):
+        """Detached original fields for a separate Job-level observation join.
+
+        The auxiliary RPC above remains unchanged. This lookup performs no
+        file read, changes no input/target, and grants no historical worker,
+        Store, physical or per-readout consumption authority.
+        """
+        self._check_owner(full=True)
+        identity = sha(record_sha256)
+        index = self._record_indices.get(identity)
+        if index is None:
+            raise ValueError("original R semantic record is absent from this owner")
+        row = self._records[uint(index, len(self._records) - 1)]
+        if row["record_sha256"] != identity or wire.record_digest(row) != identity:
+            raise ValueError("original R semantic record evidence changed")
+        return copy.deepcopy({"source_domain": R_SOURCE, "record_sha256": identity,
+            "origin_sha256": row["origin_sha256"], "native_admission_sha256": row["native_admission_sha256"],
+            "root_descriptor_sha256": row["root_descriptor_sha256"],
+            "startup_input_lock_sha256": row["startup_input_lock_sha256"],
+            "question": row["question"], "bound": row["bound"],
+            "input": {key: row["input"][key] for key in ("native_input_sha256", "semantic_input_sha256")},
+            "retirement": row["retirement"], "retirement_sha256": row["retirement_sha256"],
+            "semantic_consumption": row["semantic_consumption"], "whole_action_cost": row["whole_action_cost"],
+            "execution_authorized": False})
+
     def observation(self):
         self._check_owner(full=True)
         allowed = tuple(self.rows("train", optimization=True))

@@ -886,7 +886,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         })
     }
 
-    fn validator_witness_identity(
+    pub(super) fn validator_witness_identity(
         &self,
         kind: ActionWitnessKind,
         line: &[BoardMove],
@@ -1076,7 +1076,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
 
     /// Follow only already-resident dependencies, with a bounded recursion.
     /// Missing/cold evidence is an explicit error; the manager does no I/O.
-    fn validator_write_observation(
+    pub(super) fn validator_write_observation(
         &self,
         hash: &mut Sha256,
         id: ObservationId,
@@ -1239,7 +1239,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         }
         Ok(())
     }
-    fn validator_existing_witnesses(&self) -> Result<HashSet<ContractDigest>, PalsError> {
+    pub(super) fn validator_existing_witnesses(
+        &self,
+    ) -> Result<HashSet<ContractDigest>, PalsError> {
         let mut existing = HashSet::new();
         // Keep the bounded owner's publication history, including superseded
         // counters. Rediscovering a formerly supported line is not a new
@@ -1260,7 +1262,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
 
     /// Only an actual owner's accepted conditional publication has utility
     /// authority. A raw Estimate/CP/terminal label cannot mint this proof.
-    fn validator_committed_witness_kind(
+    pub(super) fn validator_committed_witness_kind(
         &self,
         id: ObservationId,
     ) -> Result<Option<ActionWitnessKind>, PalsError> {
