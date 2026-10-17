@@ -15,7 +15,7 @@ use rz_experiments::rovent_utility_intervention_preparation::ROVENT_UTILITY_INTE
 use serde_json::{Value, json};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum UtilityNumericalFamily {
+enum UtilityNumericalFamily {
     CohortV1,
     InterventionV2,
 }
@@ -26,10 +26,8 @@ pub(super) enum UtilityNumericalFamily {
 /// held by the actual dataset/runtime/checkpoint owner.
 #[derive(Clone)]
 pub(super) struct ValidatedUtilityNumericalParts {
-    family: UtilityNumericalFamily,
-    recipe: RoventUtilityTrainingRecipe,
+    optimizer_owner: String,
     registration: RoventUtilityCohortSourceRegistration,
-    parameter_spec: RoventUtilityParameterSpec,
     recipe_sha256: String,
     source_registration_sha256: String,
     parameter_spec_sha256: String,
@@ -46,9 +44,9 @@ impl ValidatedUtilityNumericalParts {
             .map_err(|e| ArenaError::Integrity(format!("original utility parameter spec: {e}")))?;
         Self::validated(
             UtilityNumericalFamily::CohortV1,
-            recipe,
+            &recipe,
             registration,
-            parameter_spec,
+            &parameter_spec,
             preparation_sha256,
         )
     }
@@ -65,26 +63,26 @@ impl ValidatedUtilityNumericalParts {
         value.validate().map_err(ArenaError::Manifest)?;
         Self::validated(
             UtilityNumericalFamily::InterventionV2,
-            value.recipe.clone(),
+            &value.recipe,
             value.registration.clone(),
-            value.parameter_spec.clone(),
+            &value.parameter_spec,
             value.preparation_sha256.clone(),
         )
     }
     fn validated(
         family: UtilityNumericalFamily,
-        recipe: RoventUtilityTrainingRecipe,
+        recipe: &RoventUtilityTrainingRecipe,
         registration: RoventUtilityCohortSourceRegistration,
-        parameter_spec: RoventUtilityParameterSpec,
+        parameter_spec: &RoventUtilityParameterSpec,
         preparation_sha256: String,
     ) -> Result<Self, ArenaError> {
-        registration.validate(&recipe, &parameter_spec)?;
+        registration.validate(recipe, parameter_spec)?;
         let recipe_sha256 = recipe.canonical_sha256()?;
         let parameter_spec_sha256 = parameter_spec
             .canonical_sha256(&registration.frozen_base.config, &recipe.optimizer_owner)?;
         let source_registration_sha256 = match family {
             UtilityNumericalFamily::CohortV1 => {
-                registration.canonical_sha256(&recipe, &parameter_spec)?
+                registration.canonical_sha256(recipe, parameter_spec)?
             }
             UtilityNumericalFamily::InterventionV2 => generation_digest(
                 ROVENT_UTILITY_INTERVENTION_PREPARATION_DOMAIN,
@@ -92,28 +90,21 @@ impl ValidatedUtilityNumericalParts {
             )
             .map_err(ArenaError::Manifest)?,
         };
+        // The exact preparation remains with the dataset/runtime owner. Only
+        // values used after validation are retained here: family selects the
+        // source seal above, and the full recipe/spec need not be cloned into
+        // every later ledger metadata view.
         Ok(Self {
-            family,
-            recipe,
+            optimizer_owner: recipe.optimizer_owner.clone(),
             registration,
-            parameter_spec,
             recipe_sha256,
             source_registration_sha256,
             parameter_spec_sha256,
             preparation_sha256,
         })
     }
-    pub(super) fn family(&self) -> UtilityNumericalFamily {
-        self.family
-    }
-    pub(super) fn recipe(&self) -> &RoventUtilityTrainingRecipe {
-        &self.recipe
-    }
     pub(super) fn registration(&self) -> &RoventUtilityCohortSourceRegistration {
         &self.registration
-    }
-    pub(super) fn parameter_spec(&self) -> &RoventUtilityParameterSpec {
-        &self.parameter_spec
     }
     pub(super) fn recipe_sha256(&self) -> &str {
         &self.recipe_sha256
@@ -128,7 +119,7 @@ impl ValidatedUtilityNumericalParts {
         &self.preparation_sha256
     }
     pub(super) fn optimizer_owner(&self) -> &str {
-        &self.recipe.optimizer_owner
+        &self.optimizer_owner
     }
     pub(super) fn frozen_base_config(&self) -> &RoventUtilityBaseConfig {
         &self.registration.frozen_base.config

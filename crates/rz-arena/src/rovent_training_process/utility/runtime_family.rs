@@ -29,7 +29,7 @@ use crate::{
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use std::{collections::BTreeSet, fs::File, ops::Deref, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, ops::Deref, path::PathBuf, sync::Arc};
 fn invalid(reason: &str) -> ArenaError {
     ArenaError::Integrity(format!("utility family: {reason}"))
 }

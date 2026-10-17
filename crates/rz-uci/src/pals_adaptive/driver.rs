@@ -809,22 +809,13 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         port.bind_utility_intervention_arm_capture(action, work, input)
             .map_err(|(e, i)| (semantic(e), i))
     }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn utility_intervention_arm_metadata(
         &self,
         action: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
     ) -> Result<serde_json::Value, AdaptiveManagerError> {
-        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-        {
-            super::utility_intervention_historical::arm_query(action, work)
-        }
-        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
-        {
-            let _ = (action, work);
-            Err(AdaptiveManagerError::Invalid(
-                "intervention needs CPU native path",
-            ))
-        }
+        super::utility_intervention_historical::arm_query(action, work)
     }
     fn bind_utility_route_input(
         &self,

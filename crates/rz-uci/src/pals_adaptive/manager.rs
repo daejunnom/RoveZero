@@ -471,6 +471,7 @@ pub trait AdaptiveSearchDriver<Q> {
             input,
         ))
     }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn utility_intervention_arm_metadata(
         &self,
         _: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,

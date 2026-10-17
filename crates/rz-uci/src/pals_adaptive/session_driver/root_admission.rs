@@ -108,6 +108,8 @@ where
         position: &Position,
         context: &SearchSessionContext,
     ) -> Result<Option<RoventPcrRootSource>, SearchSessionFailure> {
+        #[cfg(not(feature = "pals-adaptive"))]
+        let _ = (position, context);
         let Some(profile) = &self.rovent else {
             return Ok(None);
         };
