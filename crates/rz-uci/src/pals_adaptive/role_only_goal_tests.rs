@@ -359,7 +359,11 @@ fn close_and_recover(mut manager: ActualGoalManager, until: Instant) -> RoleOnly
         .run_root_until(until, &AtomicBool::new(false))
         .unwrap();
     assert!(receipt.permits_semantic_closure(), "{receipt:?}");
-    assert!(manager.failures().next().is_none());
+    assert!(
+        manager.failures().next().is_none(),
+        "actual PC quiesce failures: {:?}",
+        manager.failures().collect::<Vec<_>>()
+    );
     assert_eq!(receipt.counters.cpu_slice_receipts, 0);
     assert_eq!(receipt.counters.validator_ticket_admissions, 0);
     let mut sources = manager
