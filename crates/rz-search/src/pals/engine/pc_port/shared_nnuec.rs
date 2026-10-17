@@ -537,7 +537,9 @@ mod tests {
             PalsSemanticConfig {
                 beam_width: 1,
                 line_plies: 2,
-                max_nodes: 64,
+                // The unchanged semantic owner reserves its minimum root/
+                // transition space even when this fixture never invokes R.
+                max_nodes: 257,
                 max_records: 64,
                 max_role_calls: 32,
             },
