@@ -862,7 +862,7 @@ impl RoventNnuecSessionDriver {
                 Ok(Some(shutdown)) => break shutdown,
                 Ok(None) => {}
                 Err(error) => {
-                    let detail = error.to_string();
+                    let detail = format!("{error:?}");
                     return Err(self.retain(
                         (native, port, worker, actor, pins, ledger, root_moves, error),
                         "RoventNnuecAdoptedJoin",
@@ -890,7 +890,7 @@ impl RoventNnuecSessionDriver {
         let recovered = match worker.take_nnuec_retirement() {
             Ok(engine) => engine,
             Err(error) => {
-                let detail = error.to_string();
+                let detail = format!("{error:?}");
                 return Err(self.retain(
                     (
                         native, port, worker, actor, pins, ledger, root_moves, shutdown, error,

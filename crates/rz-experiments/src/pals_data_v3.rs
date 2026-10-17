@@ -1,7 +1,7 @@
 //! Actual generation V3, separate from the historical diagnostic data codecs.
 //! Rules/native/CPU owners issue the evidence consumed here. A serialized
 //! `source_kind` declaration alone is never collection authority.
-use crate::{digest, ManifestError};
+use crate::{ManifestError, digest};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -369,7 +369,7 @@ pub(crate) fn project_generation_input_float_bits(
 }
 
 fn validate_encoded(input: &GenerationInputV3) -> Result<(), ManifestError> {
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     fn keys(value: &Value, required: &[&str]) -> bool {
         value.as_object().is_some_and(|o| {
             o.len() == required.len() && required.iter().all(|key| o.contains_key(*key))

@@ -4,9 +4,9 @@
 //! original question/view seal. Manager frame liveness is still independent.
 use super::FrontierError;
 use crate::pals::coordinator::{CoordinatorWork, FrameId, FrameInput, RefinementStage};
+use crate::pals::engine::RoleLogicalContext;
 use crate::pals::engine::adaptive_port::AdaptivePortQuestion;
 use crate::pals::engine::pc_port::PcPortQuestion;
-use crate::pals::engine::RoleLogicalContext;
 use crate::pals::review_context::ReviewView;
 use crate::pals::store::PalsStores;
 use rz_contracts::pals::Move16;

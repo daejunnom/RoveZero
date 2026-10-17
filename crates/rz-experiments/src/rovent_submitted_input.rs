@@ -1,7 +1,7 @@
 //! Rovent 원 제출 입력의 명시 형식이다. legacy GenerationInputV3의
 //! divergence record-index 의미를 공격 ply로 재해석하지 않는다.
-use crate::pals_data_v3::*;
 use crate::ManifestError;
+use crate::pals_data_v3::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 

@@ -6,13 +6,13 @@
 //! receipts. Missing mate defenses are questions for that same manager queue.
 
 use super::coordinator::{AcceptedRoleStep, CoordinatorWork, FrameId, FrameInput, RefinementStage};
+use super::engine::RoleQueryPurpose;
 use super::engine::adaptive_port::{
     AdaptiveModelNamespace, AdaptivePortQuestion, AdaptivePortRoleEvidence,
 };
 use super::engine::pc_port::{PcPortQuestion, PcResponsibilitySource};
-use super::engine::RoleQueryPurpose;
 use super::review_context::ReviewView;
-use super::rovent_engine::{AdmittedRoleQuestion, RootMoveDomain, ROVENT_NODE_UNIT};
+use super::rovent_engine::{AdmittedRoleQuestion, ROVENT_NODE_UNIT, RootMoveDomain};
 use super::rovent_goals::{
     HorizonBoundary, HorizonError, HorizonInterruption, HorizonObligationId, HorizonObligationKind,
     HorizonSnapshot, RootPlyAnchor, SelectiveHorizon,
