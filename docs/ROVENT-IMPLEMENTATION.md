@@ -657,3 +657,40 @@ publication을 보존한다. 선언이나 역직렬화 자체는 실행 권한�
 trial 인수, 네 모드의 실제 UCI 및 외부 교사 연결, 현재 source/binary/CI 확인이다.
 로컬 RTX 4050 수치·물리 수명·정상 종료는 별도로 진행하며 성능 자료로 사용하지 않는다.
 실제 학습·대규모 수집·원격 성능/기력 비교·PR 병합은 이번 목표에서 제외한다.
+
+## 열세 번째 통합 체크포인트
+
+`5341d90`의 정식 미학습 G0와 원 P/C export를 로컬 RTX 4050에서 검사했다.
+새 CUDA bindings에 맞춘 CPU Torch reference와 실제 Rust·ORT CUDA raw를 각각
+생성했다. 기존 numerical validator가 Fresh B1·FP32·TF32 off의 P/C 12그룹·100사례,
+입력 tensor 974,988 bytes, 실제 native NN 입력 완료 200개를 대조해 통과했다.
+최대 절대 차이는 logits `1.9073486328125e-6`, policy `1.874199417883915e-8`,
+WDL `1.1690709406098065e-7`이다. 기존 절대·상대 허용 오차를 바꾸지 않았다.
+
+원 GPU 수집의 native worker join과 외부 process exit 0을 별도 기록으로 보존했다.
+저장된 raw를 다시 검증하는 CLI는 이 과거 자료의 수치만 판정하며, 현재 프로세스의
+물리 완료나 실행 권한을 새로 발급하지 않는다. 모델·runtime source 다섯 component의
+원 식별을 보존하며 이후 다른 통합 SHA에 자동으로 소급하지 않는다. optimizer update와
+backward 실행은 0회다. 이 결과는 GPU tensor 수치·기본 수명 검사이며 네 모드의 전체
+UCI, 실제 conditional witness, 외부 교사, 대국·성능·기력·학습 인수를 대신하지 않는다.
+
+첫 saved-scope 조립은 원 CUDA kit 소유자와 root 실행자의 UID 차이를 거부해 실패했다.
+원 실패를 보존하고, 후속 조립은 명시한 원 소유자 UID와 같은 장치·retained FD·정규
+파일·원 SHA를 확인했다. CUDA DSO만 원 inode의 읽기 전용 hardlink로 공유하고 원
+checkpoint·모델·raw는 각각 복사했다. 원 파일의 내용·권한·소유자는 바꾸지 않았다.
+이 saved-scope는 startup의 `owned_files` 요건을 만족하는 실행 자산으로 사용하지 않는다.
+
+`5bc1d09`의 순수 명세 검사는 두 suite에서 각각 5개 통과했다. Windows에서 Linux 전용
+arena metadata·wire fixture 필터는 0개였으므로 해당 검사를 실행했다고 표시하지 않는다.
+같은 SHA의 Linux 대상 workspace 전체 feature 타입 검사는 통과했다. CI의 Linux·Windows·
+bindings 세 job은 `rustfmt` 불일치에서 중단됐으며, `2be377f`가 그 형식을 수정했다.
+
+`2be377f`에는 원 machine 소유의 중립 custody와 별도 개입 arm, 엄격한 Python `/2`
+reader를 연결했다. 신경망 import를 차단한 자료 검사 44개가 통과했으나 실제 witness의
+양성 효용 검사는 아니다. 첫 Rust 검사048은 계약·Store의 서로 다른 `Move16` 혼용으로
+컴파일에 실패했다. `67177e2`에서 명시 변환으로 수정했으며 후속 실제 검사로 확인한다.
+
+남은 연결은 `/2`의 UCI·Arena 실행과 원 Store/Rules 근거를 재사용하는 strict historical
+join, 같은 고정 소스의 컴파일·실행·source inventory, 네 모드 및 외부 교사의 실제 인수다.
+서로 다른 trial의 원 cost epoch·authority·clock을 유지하며 공통 비교 맥락으로 위장하지
+않는다. 준비 명세는 계속 실행 권한 `false`, optimizer update `0`인 수동 자료다.
