@@ -282,6 +282,12 @@ class ParentSocketUtilityTrainerAuthority:
         payload = {"schema": "rz-rovent-utility-trainer-begin/1", "preparation_sha256": owner.preparation["preparation_sha256"],
             "window_spec_sha256": utility_window_digest(checked), "dataset_sha256": checked["dataset_sha256"],
             "completed_updates": owner.completed_updates, "ancestor_updates": owner.ancestor_updates,
+            # These are the same actual owner's numerical metadata observations.
+            # The parent checks raw/semantic assets separately; its serde float
+            # spelling must never be substituted for the Python mapping seal.
+            "initial_source_declaration": copy.deepcopy(owner.metadata["initial_training"]),
+            "frozen_base_mapping_sha256": owner.metadata["frozen_base_mapping_sha256"],
+            "frozen_base_weights_sha256": owner.metadata["base_weights_sha256"],
             "derived_training_state_sha256": self._derived(owner), **self._state(owner)}
         self._rpc("begin_window", payload)
         self._lease = _UtilityLease(self, owner, intake, checked, admission)

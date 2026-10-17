@@ -39,8 +39,8 @@ pub const ROVENT_UTILITY_MAX_UPDATES: u64 = 131_072;
 pub const ROVENT_UTILITY_MAX_WALL_NS: u64 = 86_400_000_000_000;
 pub const ROVENT_UTILITY_MAX_CLEANUP_NS: u64 = 30_000_000_000;
 pub const ROVENT_UTILITY_MAX_READ_BYTES: u64 = MAX_TRAINER_OUTPUT_BYTES * 260;
-const MAX_METADATA_BYTES: u64 = 16 << 20;
-const MAX_BINARY_BYTES: u64 = 2 << 30;
+pub(super) const MAX_METADATA_BYTES: u64 = 16 << 20;
+pub(super) const MAX_BINARY_BYTES: u64 = 2 << 30;
 
 fn invalid(reason: impl Into<String>) -> ArenaError {
     ArenaError::Integrity(format!(
@@ -55,7 +55,7 @@ fn check(condition: bool, reason: &str) -> Result<(), ArenaError> {
         Err(invalid(reason))
     }
 }
-fn execution_identifier(value: &str) -> bool {
+pub(super) fn execution_identifier(value: &str) -> bool {
     let bytes = value.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= 128
@@ -75,7 +75,7 @@ fn canonical_device(value: &str) -> bool {
                     .is_ok_and(|number| number < 64 && number.to_string() == index)
         })
 }
-fn canonical_python_version(value: &str) -> bool {
+pub(super) fn canonical_python_version(value: &str) -> bool {
     let parts = value.split('.').collect::<Vec<_>>();
     parts.len() == 3
         && parts[0] == "3"
@@ -87,7 +87,7 @@ fn canonical_python_version(value: &str) -> bool {
                     .is_ok_and(|number| number.to_string() == *part)
         })
 }
-fn normalized_absolute(path: &Path) -> bool {
+pub(super) fn normalized_absolute(path: &Path) -> bool {
     if !path.is_absolute() || path.components().count() > 64 {
         return false;
     }
@@ -104,7 +104,7 @@ fn normalized_absolute(path: &Path) -> bool {
     // repeated separators and a trailing slash are not silently normalized.
     path.components().collect::<PathBuf>().as_os_str() == path.as_os_str()
 }
-fn pin_shape(pin: &RoventTrainingFilePin, maximum: u64) -> Result<(), ArenaError> {
+pub(super) fn pin_shape(pin: &RoventTrainingFilePin, maximum: u64) -> Result<(), ArenaError> {
     GenerationTrainingFilePinV3 {
         path: pin.path.clone(),
         sha256: pin.sha256.clone(),
@@ -119,7 +119,7 @@ fn pin_shape(pin: &RoventTrainingFilePin, maximum: u64) -> Result<(), ArenaError
 
 /// Existing pure DTOs have struct deserializers which also accept sequences.
 /// Adapt them at this new wire boundary without changing their original codecs.
-fn deserialize_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(super) fn deserialize_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
@@ -183,7 +183,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for ObjectOnly<T> {
         deserialize_object(deserializer).map(Self)
     }
 }
-fn deserialize_endpoints<'de, D: Deserializer<'de>>(
+pub(super) fn deserialize_endpoints<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<RoventTrainerRuntimeEndpoint>, D::Error> {
     #[derive(Deserialize)]
@@ -498,7 +498,7 @@ impl<'de> Deserialize<'de> for RoventUtilityInitializationSource {
     }
 }
 impl RoventUtilityInitializationSource {
-    fn validate(&self) -> Result<(), ArenaError> {
+    pub(super) fn validate(&self) -> Result<(), ArenaError> {
         match self {
             Self::Initialize { utility } => pin_shape(utility, MAX_BINARY_BYTES),
             Self::Resume { checkpoint } | Self::Fork { checkpoint } => checkpoint.validate(),
@@ -702,7 +702,7 @@ impl RoventUtilityExecutionRegistration {
         check(
             source.trainer_source_sha256 == self.trainer_source_sha256
                 && window.device == self.resources_policy.device
-                && window.max_read_bytes <= self.max_child_read_bytes
+                && window.max_read_bytes == self.max_child_read_bytes
                 && window.max_output_bytes <= self.max_output_bytes,
             "window changed declared utility trainer/resource/read/output allowances",
         )
@@ -723,7 +723,7 @@ impl RoventUtilityExecutionRegistration {
         check(
             source.trainer_source_sha256 == self.trainer_source_sha256
                 && window.device == self.resources_policy.device
-                && window.max_read_bytes <= self.max_child_read_bytes
+                && window.max_read_bytes == self.max_child_read_bytes
                 && window.max_output_bytes <= self.max_output_bytes,
             "cohort window changed original trainer/resource/read/output allowances",
         )
@@ -838,7 +838,7 @@ mod tests {
             max_rpc_messages: 100,
             max_rpc_bytes: 1 << 20,
             max_read_bytes: 4 << 20,
-            max_child_read_bytes: 2 << 20,
+            max_child_read_bytes: 1 << 20,
             max_output_bytes: 2 << 20,
             max_artifact_files: 64,
         }
@@ -924,6 +924,13 @@ mod tests {
             RoventUtilityPreparationFamily::CohortV2
         );
         execution.join_cohort_window(&window, &v2).unwrap();
+        let mut different_credit = window.clone();
+        different_credit.max_read_bytes -= 1;
+        assert!(
+            execution
+                .join_cohort_window(&different_credit, &v2)
+                .is_err()
+        );
         assert!(execution.join_window(&window, &v2).is_err());
         let mut changed = v1.clone();
         changed["schema"] = json!(ROVENT_UTILITY_COHORT_PREPARATION_DOMAIN);
@@ -990,6 +997,8 @@ mod tests {
         assert!(changed.join_window(&window, &preparation).is_err());
         let mut changed = window.clone();
         changed.max_read_bytes = execution.max_child_read_bytes + 1;
+        assert!(execution.join_window(&changed, &preparation).is_err());
+        changed.max_read_bytes = execution.max_child_read_bytes - 1;
         assert!(execution.join_window(&changed, &preparation).is_err());
         let mut changed = window;
         changed.max_output_bytes = execution.max_output_bytes + 1;

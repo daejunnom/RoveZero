@@ -22,6 +22,7 @@ from .rovent_training_bootstrap import (MAX_JSON_BYTES, MAX_READ_BYTES, MAX_SOUR
 
 STARTUP_DOMAIN = "rz-rovent-utility-trainer-startup/1"
 REGISTRATION_DOMAIN = "rz-rovent-utility-training-registration/1"
+REGISTRATION_V2_DOMAIN = "rz-rovent-utility-training-registration/2"
 SOURCE_DOMAIN = "rz-rovent-utility-trainer-source-bundle/1"
 RESULT_DOMAIN = "rz-rovent-utility-trainer-result/1"
 REGISTRATION_FIELDS = ("schema", "execution_id", "action", "export_request", "preparation", "window_spec",
@@ -54,8 +55,39 @@ def _dataset_reference(value):
 
 def validate_registration(value):
     """Validate declaration bytes only, never original dataset/lease authority."""
+    return _validate_registration(value, expected_domain=REGISTRATION_DOMAIN)
+
+
+def _ancestor_v2(value):
+    if type(value) is not dict:
+        raise ValueError("explicit original mixed ancestor object required")
+    kind = value.get("kind")
+    if kind in ("pc_legacy", "pc_submitted_input_v1"):
+        _fields(value, ("kind", "registration"), "original PC ancestor")
+        from .rovent_historical_corpus import _registration as validate_pc_registration
+        validate_pc_registration(value["registration"])
+    elif kind == "r_auxiliary":
+        _fields(value, ("kind", "registration", "recipe"), "original R ancestor")
+        from .rovent_historical_r_corpus import _registration as validate_r_registration
+        validate_r_registration(value["registration"])
+        _pin(value["recipe"], MAX_JSON_BYTES)
+    elif kind == "utility_cohort":
+        _fields(value, ("kind", "registration", "preparation"), "original utility ancestor")
+        _dataset_reference(value["registration"])
+        _pin(value["preparation"], 65536)
+    else:
+        raise ValueError("explicit original PC/R/utility ancestor kind required")
+    return value["registration"]["publication"]["sha256"]
+
+
+def validate_utility_registration_v2(value):
+    """Separate mixed-ancestry codec; never re-tag an original /1 object."""
+    return _validate_registration(value, expected_domain=REGISTRATION_V2_DOMAIN)
+
+
+def _validate_registration(value, *, expected_domain):
     _fields(value, REGISTRATION_FIELDS, "utility execution registration")
-    if value["schema"] != REGISTRATION_DOMAIN:
+    if value["schema"] != expected_domain:
         raise ValueError("separate utility execution registration required; no codec conversion")
     _identifier(value["execution_id"])
     _pin(value["preparation"], 65536); _pin(value["window_spec"], 1024**2)
@@ -78,8 +110,11 @@ def validate_registration(value):
         raise ValueError("bounded original utility dataset ancestry required")
     seen = {value["current_dataset"]["publication"]["sha256"]}
     for ancestor in value["ancestor_datasets"]:
-        _dataset_reference(ancestor)
-        identity = ancestor["publication"]["sha256"]
+        if expected_domain == REGISTRATION_V2_DOMAIN:
+            identity = _ancestor_v2(ancestor)
+        else:
+            _dataset_reference(ancestor)
+            identity = ancestor["publication"]["sha256"]
         if identity in seen:
             raise ValueError("duplicate or current utility ancestor publication")
         seen.add(identity)
@@ -143,7 +178,11 @@ def validate_startup(raw, *, expected_sha256, expected_bytes, execution_until_ns
     if value["schema"] != STARTUP_DOMAIN:
         raise ValueError("separate utility startup domain required")
     _identifier(value["execution_id"]); _identifier(value["window_id"]); _sha(value["registration_sha256"])
-    registration = validate_registration(value["registration"])
+    original_registration = value["registration"]
+    if type(original_registration) is dict and original_registration.get("schema") == REGISTRATION_V2_DOMAIN:
+        registration = validate_utility_registration_v2(original_registration)
+    else:
+        registration = validate_registration(original_registration)
     if value["execution_id"] != registration["execution_id"]:
         raise ValueError("utility startup execution differs from original registration")
     for number in (value["original_started_ns"], value["execution_until_ns"], value["whole_until_ns"], execution_until_ns, whole_until_ns, now_ns):

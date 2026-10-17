@@ -9,12 +9,16 @@
 mod registration;
 mod cost;
 mod execution;
+mod execution_v2;
 mod registration_cohort;
 
 pub use cost::*;
 pub use execution::*;
+pub use execution_v2::*;
 pub use registration::*;
 pub use registration_cohort::*;
 
 #[cfg(test)]
 mod wire_tests;
+#[cfg(test)]
+mod wire_v2_tests;

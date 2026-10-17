@@ -1056,6 +1056,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/rovent_training_process/utility.rs"),
             source!("crates/rz-arena/src/rovent_training_process/utility/cost.rs"),
             source!("crates/rz-arena/src/rovent_training_process/utility/execution.rs"),
+            source!("crates/rz-arena/src/rovent_training_process/utility/execution_v2.rs"),
             source!("crates/rz-arena/src/rovent_training_process/utility/registration.rs"),
             source!("crates/rz-arena/src/rovent_training_process/utility/registration_cohort.rs"),
             source!("experiments/model-research/pals/src/rz_pals_model/artifacts.py"),
@@ -1118,12 +1119,28 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_training_window_v2.py"
             ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_cohort_payload.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_historical_checkpoint.py"
+            ),
+            source!("experiments/model-research/pals/src/rz_pals_model/rovent_utility_route.py"),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_tensor_training.py"
+            ),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_utility_training.py"),
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_utility_training_authority.py"
             ),
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_utility_training_bootstrap.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_training_child.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_training_run.py"
             ),
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_utility_training_window.py"
@@ -1157,6 +1174,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/rovent_training_process/utility.rs"),
             source!("crates/rz-arena/src/rovent_training_process/utility/cost.rs"),
             source!("crates/rz-arena/src/rovent_training_process/utility/execution.rs"),
+            source!("crates/rz-arena/src/rovent_training_process/utility/execution_v2.rs"),
             source!("crates/rz-arena/src/rovent_training_process/utility/registration.rs"),
             source!("crates/rz-arena/src/rovent_training_process/utility/registration_cohort.rs"),
             source!("experiments/model-research/pals/src/rz_pals_model/artifacts.py"),
@@ -1368,6 +1386,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/rovent_training_process/utility.rs"),
             source!("crates/rz-arena/src/rovent_training_process/utility/cost.rs"),
             source!("crates/rz-arena/src/rovent_training_process/utility/execution.rs"),
+            source!("crates/rz-arena/src/rovent_training_process/utility/execution_v2.rs"),
             source!("crates/rz-arena/src/rovent_training_process/utility/registration.rs"),
             source!("crates/rz-arena/src/rovent_training_process/utility/registration_cohort.rs"),
             source!("crates/rz-arena/src/runner.rs"),

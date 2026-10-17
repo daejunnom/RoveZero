@@ -124,6 +124,35 @@ class UtilityBootstrapTests(unittest.TestCase):
         value["registration"]["initialization_source"]["checkpoint"]["durable_ack"] = pin("/data/old-utility/durable-ack.json", "63")
         with self.assertRaises(ValueError): validate(value)
 
+    def test_registration_v2_is_a_separate_explicit_mixed_ancestry_codec(self):
+        value = fixture()["registration"]
+        old = copy.deepcopy(value)
+        value["schema"] = "rz-rovent-utility-training-registration/2"
+        ancestor = {"kind": "utility_cohort", "registration": {"root": "/data/ancestor",
+            "publication": pin("/data/ancestor/utility-cohort-publication.json", "71"),
+            "durable_ack": pin("/data/ancestor/utility-cohort-durable-ack.json", "72")},
+            "preparation": pin("/data/ancestor-preparation.json", "73")}
+        value["ancestor_datasets"] = [ancestor]
+        self.assertEqual(bootstrap.validate_utility_registration_v2(value), value)
+        self.assertEqual(bootstrap.validate_registration(old), old)
+        with self.assertRaises(ValueError): bootstrap.validate_registration(value)
+        with self.assertRaises(ValueError): bootstrap.validate_utility_registration_v2(old)
+
+    def test_v2_ancestor_tags_do_not_infer_or_drop_original_preparation_and_ack(self):
+        value = fixture()["registration"]
+        value["schema"] = "rz-rovent-utility-training-registration/2"
+        ancestor = {"kind": "utility_cohort", "registration": {"root": "/data/ancestor",
+            "publication": pin("/data/ancestor/publication.json", "71"),
+            "durable_ack": pin("/data/ancestor/ack.json", "72")},
+            "preparation": pin("/data/preparation-other.json", "73")}
+        for mutate in (lambda item: item.pop("preparation"), lambda item: item.update(kind="unknown"),
+                       lambda item: item["registration"].pop("durable_ack"),
+                       lambda item: item.update(recipe=pin("/data/recipe.json", "74")),
+                       lambda item: item["registration"]["publication"].update(sha256=value["current_dataset"]["publication"]["sha256"])):
+            changed = copy.deepcopy(value); changed["ancestor_datasets"] = [copy.deepcopy(ancestor)]
+            mutate(changed["ancestor_datasets"][0])
+            with self.assertRaises(ValueError): bootstrap.validate_utility_registration_v2(changed)
+
 
 if __name__ == "__main__":
     unittest.main()
