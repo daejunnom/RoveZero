@@ -218,6 +218,7 @@ fn accepted_policy_at(
 fn revoked_reciprocal_permit_check_never_grants_acceptance_or_releases_credit() {
     use crate::pals::coordinator::{
         NativeAcceptanceIssuer, PhysicalRoleCompletion, RoleCompletion, RoleTicketRegistry,
+        TicketPhase,
     };
     use rz_contracts::pals::{RoleOutput, RolePayload};
     let mut registry = RoleTicketRegistry::<u64, RoleOutput>::new(

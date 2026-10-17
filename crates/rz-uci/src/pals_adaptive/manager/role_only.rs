@@ -925,6 +925,7 @@ where
                     return Ok(());
                 }
                 let now = self.now()?;
+                let input = &self.bindings[index].input;
                 let ticket = self.registry.admit(
                     RoleSubmission {
                         question: prepared.question,
