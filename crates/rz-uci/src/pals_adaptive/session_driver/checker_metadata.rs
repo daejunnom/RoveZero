@@ -624,6 +624,9 @@ impl CpuChecker for AdaptiveCheckerMetadataMirror {
     fn owned_resume_policy(&self) -> Option<CpuResumePolicy> {
         self.metadata.resume_policy()
     }
+    fn registered_worker_stack_owner_id(&self) -> Option<u64> {
+        self.metadata.actual_owner_id
+    }
     fn start(&mut self, _: Instant, _: &AtomicBool) -> Result<(), CheckerError> {
         Err(CheckerError::Unsupported(METADATA_ONLY))
     }

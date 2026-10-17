@@ -6,6 +6,7 @@ use rz_position::contracts::ContractState;
 use rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace;
 use rz_search::pals::rovent_engine::RootMoveDomain;
 use rz_search::pals::rovent_frontier::RoventFrontier;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ fn reject(message: impl Into<String>) -> AdaptiveCollectionError {
         message,
     )
 }
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 fn text_sha(value: Digest) -> String {
     value.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -26,11 +28,15 @@ fn text_sha(value: Digest) -> String {
 struct LoadedOrigin {
     // Retains the original pinned source descriptors without copying weights.
     _source_custody: Arc<dyn Send + Sync>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    sources: Arc<crate::rovent_bootstrap::RoventPinnedNativeSources>,
     process_epoch: u64,
     mode: rz_contracts::rovent::ExecutionMode,
     input_lock: Digest,
     namespace: AdaptiveModelNamespace,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     raw: Value,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     raw_sha256: String,
 }
 
@@ -41,7 +47,7 @@ pub struct RoventNativeCollectionOrigin {
     original: Arc<LoadedOrigin>,
 }
 impl RoventNativeCollectionOrigin {
-    #[cfg(feature = "onnx-cpu")]
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub(crate) fn from_loaded(
         snapshot: &crate::rovent_bootstrap::RoventNativeStartupSnapshot,
         sources: Arc<crate::rovent_bootstrap::RoventPinnedNativeSources>,
@@ -89,8 +95,13 @@ impl RoventNativeCollectionOrigin {
             "runtime_bundle_sha256":snapshot.runtime_bundle.map(text_sha),
             "native_configuration_sha256":text_sha(snapshot.native_configuration),
             "model_semantics":pc.proposer.semantics,
+            "model_semantics_sha256":text_sha(Digest(rz_eval::pals_model::PalsModelProfile::VirtualReviewV1.registered_semantics_sha256())),
             "encoding":pc.proposer.encoding,
+            "encoding_sha256":text_sha(Digest({use sha2::Digest as _; sha2::Sha256::digest(rz_eval::pals_model::virtual_review::ENCODING.as_bytes()).into()})),
+            "encoding_registry_sha256":text_sha(Digest(rz_eval::pals_model::virtual_review::registered_encoding_sha256())),
             "model_implementation_sha256":pc.proposer.implementation_sha256,
+            "representation_model_domain":"loaded_checkpoint_sha256",
+            "teacher_profiles":manifest.engine.teachers,
             "frozen_epoch":1,
             "runtime_sha256_domain":"loaded_runtime_library_file_sha256",
             "runtime_sha256":text_sha(snapshot.runtime_library),
@@ -103,7 +114,8 @@ impl RoventNativeCollectionOrigin {
         let input_lock = snapshot.input_lock;
         Ok(Self {
             original: Arc::new(LoadedOrigin {
-                _source_custody: sources,
+                _source_custody: Arc::clone(&sources) as Arc<dyn Send + Sync>,
+                sources,
                 process_epoch,
                 mode,
                 input_lock,
@@ -113,11 +125,54 @@ impl RoventNativeCollectionOrigin {
             }),
         })
     }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub fn raw_receipt(&self) -> &Value {
         &self.original.raw
     }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub fn raw_sha256(&self) -> &str {
         &self.original.raw_sha256
+    }
+    /// Original immutable parsed lock, retained by the actual loaded source.
+    /// Serializing this snapshot preserves meaning, not original whitespace.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn original_input_lock(&self) -> &rz_experiments::RoventInputLock {
+        self.original.sources.lock()
+    }
+    /// Original metadata bytes only; neither this read nor historical replay
+    /// grants runtime, native, physical or training execution authority.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn runtime_bundle_publication_bytes(
+        &self,
+    ) -> Result<Option<(rz_experiments::ArtifactRef, Vec<u8>)>, AdaptiveCollectionError> {
+        let original = self
+            .original
+            .sources
+            .runtime_bundle_publication_bytes()
+            .map_err(|error| reject(error.to_string()))?;
+        match &original {
+            Some((_, bytes)) => {
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| reject("original bundle metadata is not UTF-8"))?;
+                let spec = rz_eval::runtime_pin::CudaRuntimeBundleSpec::from_json(text)
+                    .map_err(|error| reject(error.to_string()))?;
+                let digest = text_sha(Digest(
+                    spec.digest().map_err(|error| reject(error.to_string()))?,
+                ));
+                if self.original.raw["runtime_bundle_sha256"] != digest {
+                    return Err(reject(
+                        "original bundle file bytes do not join loaded binary-codec digest",
+                    ));
+                }
+            }
+            None if !self.original.raw["runtime_bundle_sha256"].is_null() => {
+                return Err(reject(
+                    "loaded CUDA bundle lacks original retained metadata bytes",
+                ));
+            }
+            None => {}
+        }
+        Ok(original)
     }
     pub(crate) fn verify_profile(
         &self,
@@ -147,12 +202,17 @@ pub struct RoventCollectionRootAdmission {
     rules: Arc<ContractState>,
     root_moves: Arc<RootMoveDomain>,
     root_state: rz_contracts::StateIdentity,
+    root_budget: Digest,
+    selective_policy: Digest,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     raw: Arc<Value>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     raw_sha256: Arc<str>,
 }
 impl RoventCollectionRootAdmission {
     /// Call only immediately after the actual port's attach_rovent_frontier
     /// has checked independent Rules/Store/namespace/root-domain/ledger owners.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub(crate) fn from_attached_frontier(
         original: &RoventNativeCollectionOrigin,
         frontier: &RoventFrontier,
@@ -207,12 +267,43 @@ impl RoventCollectionRootAdmission {
             rules: Arc::clone(&registration.root_rules),
             root_moves: Arc::clone(&registration.root_moves),
             root_state,
+            root_budget,
+            selective_policy,
             raw: Arc::new(raw),
             raw_sha256: raw_sha256.into(),
         })
     }
+    #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+    pub(crate) fn from_attached_frontier(
+        _: &RoventNativeCollectionOrigin,
+        _: &RoventFrontier,
+        _: Digest,
+        _: Digest,
+        _: Digest,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        Err(AdaptiveCollectionError::new(
+            AdaptiveCollectionStage::Accepted,
+            "RoventCollectionUnsupported",
+            "actual native collection requires pals-adaptive and onnx-cpu",
+        ))
+    }
     pub fn authority(&self) -> SearchAuthority {
         self.authority
+    }
+    pub fn validates_registration(
+        &self,
+        authority: SearchAuthority,
+        mode: rz_contracts::rovent::ExecutionMode,
+        root_budget: Digest,
+        deadline: Deadline,
+    ) -> bool {
+        self.authority == authority
+            && self.original.original.mode == mode
+            && self.root_budget == root_budget
+            && self.deadline == deadline
+    }
+    pub fn selective_policy(&self) -> Digest {
+        self.selective_policy
     }
     pub fn rules(&self) -> &Arc<ContractState> {
         &self.rules
@@ -223,9 +314,11 @@ impl RoventCollectionRootAdmission {
     pub fn native_origin(&self) -> &RoventNativeCollectionOrigin {
         &self.original
     }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub fn raw_receipt(&self) -> &Value {
         &self.raw
     }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub fn raw_sha256(&self) -> &str {
         &self.raw_sha256
     }

@@ -4,13 +4,16 @@
 //! A PCR or typed R-free product owner must subsequently consume it; loading a
 //! model is not a complete engine, first inference, resource or numeric proof.
 
+pub mod configuration;
 mod pinned;
+pub mod process_boundary;
 
 pub use pinned::{RoventNativeAssetSelection, RoventNativeGraphAsset, RoventPinnedNativeSources};
 
 use crate::pals_adaptive::{NativeQuestionProjection, ProjectedNativeBackend};
 use crate::pals_native::ticketed::{
-    NativeVirtualReviewTicketBackend, TicketNativeEvent, TicketServiceLimits, TicketedNativeService,
+    NativeVirtualReviewTicketBackend, TicketNativeEvent, TicketServiceLimits,
+    TicketedNativeService, VirtualReviewCollectionObserver,
 };
 use rz_contracts::rovent::ExecutionMode;
 use rz_contracts::{Digest, PrecisionProfile};
@@ -106,6 +109,8 @@ pub struct RoventNativeStartupSnapshot {
     pub runtime_library: Digest,
     pub runtime_bundle: Option<Digest>,
     pub native_configuration: Digest,
+    pub startup_configuration: Digest,
+    pub search_configuration: Digest,
     pub validator_loaded: bool,
     pub physical_workers_created: usize,
     pub session_residency: PalsSessionResidency,
@@ -213,6 +218,28 @@ pub fn prepare_native<Q: NativeQuestionProjection>(
     clock: ContractSystemClock,
     control: RoventStartupControl,
 ) -> Result<PreparedRoventNative<Q>, RoventNativeStartupRejection<Q>> {
+    prepare_native_with_optional_observer(sources, resources, clock, control, None)
+}
+
+/// 원 native owner가 입력을 준비하는 시점에만 수집기를 호출한다. observer는
+/// Ready 이전에 설치되며 기존 호출자의 기본 경로·모델·물리 worker 수는 같다.
+pub fn prepare_native_with_collection_observer<Q: NativeQuestionProjection>(
+    sources: Arc<RoventPinnedNativeSources>,
+    resources: RoventNativeResources,
+    clock: ContractSystemClock,
+    control: RoventStartupControl,
+    observer: Box<dyn VirtualReviewCollectionObserver>,
+) -> Result<PreparedRoventNative<Q>, RoventNativeStartupRejection<Q>> {
+    prepare_native_with_optional_observer(sources, resources, clock, control, Some(observer))
+}
+
+fn prepare_native_with_optional_observer<Q: NativeQuestionProjection>(
+    sources: Arc<RoventPinnedNativeSources>,
+    resources: RoventNativeResources,
+    clock: ContractSystemClock,
+    control: RoventStartupControl,
+    observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+) -> Result<PreparedRoventNative<Q>, RoventNativeStartupRejection<Q>> {
     let before = || -> Result<(), BackendError> {
         control.check()?;
         sources.validate_lock()?;
@@ -246,7 +273,13 @@ pub fn prepare_native<Q: NativeQuestionProjection>(
     let (sender, receiver) = mpsc::sync_channel(1);
     let native = TicketedNativeService::spawn_with_capacity(
         move || {
-            let loaded = load_native(factory_sources, resources, factory_clock, &factory_control);
+            let loaded = load_native(
+                factory_sources,
+                resources,
+                factory_clock,
+                &factory_control,
+                observer,
+            );
             let observation = loaded
                 .as_ref()
                 .map(|(_, snapshot)| snapshot.clone())
@@ -344,6 +377,7 @@ fn load_native(
     resources: RoventNativeResources,
     clock: ContractSystemClock,
     control: &RoventStartupControl,
+    observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
 ) -> Result<
     (
         NativeVirtualReviewTicketBackend,
@@ -405,13 +439,20 @@ fn load_native(
         runtime_library: Digest(backend.runtime_binary_digest()),
         runtime_bundle: backend.runtime_bundle_digest().map(Digest),
         native_configuration: Digest(config_digest),
+        startup_configuration: Digest(sources.configuration().configuration_digest()?),
+        search_configuration: Digest(sources.configuration().search_configuration_digest()?),
         validator_loaded: backend.validator_present(),
         physical_workers_created: 1,
         session_residency: backend.residency().clone(),
         neural_service_executed: false,
     };
-    let backend = NativeVirtualReviewTicketBackend::new(backend, clock, resources.drain_limit)
-        .map_err(|_| fail(K::BackendFailure, "Rovent ticket backend creation failed"))?;
+    let backend = NativeVirtualReviewTicketBackend::new_with_collection_observer(
+        backend,
+        clock,
+        resources.drain_limit,
+        observer,
+    )
+    .map_err(|_| fail(K::BackendFailure, "Rovent ticket backend creation failed"))?;
     // This constructor has created the inner physical worker. Always transfer
     // it to the outer service, even if admission expires now; Ready admission
     // will reject it while retaining the real finish/join owner for cleanup.
@@ -424,6 +465,47 @@ fn validate_native_resources(
 ) -> Result<(), BackendError> {
     let lock = sources.lock();
     let pc = &lock.manifest.engine.pc;
+    let startup = sources.configuration();
+    let expected = startup
+        .native
+        .onnx(&pc.device, resources.cuda_profile.is_some())?;
+    let tickets = startup.native.tickets(startup.review.token_budget)?;
+    let provider_matches = match (expected.provider, resources.configuration.provider) {
+        (Provider::Cpu, Provider::Cpu) => true,
+        (
+            Provider::Cuda {
+                device_id: a,
+                arena_bytes: b,
+            },
+            Provider::Cuda {
+                device_id: c,
+                arena_bytes: d,
+            },
+        ) => a == c && b == d,
+        _ => false,
+    };
+    if !provider_matches
+        || expected.intra_threads != resources.configuration.intra_threads
+        || expected.cache_public_memory != resources.configuration.cache_public_memory
+        || expected.device_public_memory != resources.configuration.device_public_memory
+        || expected.cudnn_conv_search != resources.configuration.cudnn_conv_search
+        || startup
+            .native
+            .loading_profile
+            .map(configuration::LoadingProfile::actual)
+            != resources.loading_profile
+        || startup.native.command_capacity != resources.command_capacity
+        || Duration::from_millis(startup.native.drain_ms) != resources.drain_limit
+        || tickets.review_token_budget != resources.tickets.review_token_budget
+        || tickets.prepared_host_bytes_per_ticket
+            != resources.tickets.prepared_host_bytes_per_ticket
+        || tickets.output_host_bytes_per_ticket != resources.tickets.output_host_bytes_per_ticket
+    {
+        return Err(fail(
+            K::IdentityMismatch,
+            "actual native constructor values differ from pinned startup configuration",
+        ));
+    }
     if resources.drain_limit.is_zero()
         || resources.drain_limit > Duration::from_millis(lock.manifest.cleanup_max_ms)
         || resources.configuration.intra_threads != 1
@@ -578,6 +660,8 @@ pub fn compiled_bootstrap_source_digest() -> [u8; 32] {
     for source in [
         include_str!("rovent_bootstrap.rs"),
         include_str!("rovent_bootstrap/pinned.rs"),
+        include_str!("rovent_bootstrap/configuration.rs"),
+        include_str!("pals_adaptive_bootstrap/runtime_assets.rs"),
     ] {
         hash.update((source.len() as u64).to_le_bytes());
         hash.update(source.as_bytes());

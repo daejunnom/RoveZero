@@ -40,7 +40,7 @@ use rz_search::pals::engine::adaptive_port::{
 use rz_search::pals::engine::{PalsCompletion, PalsError, PalsResult, RoleModel};
 use rz_search::pals::review_context::ReviewView;
 use rz_search::pals::rovent_frontier::{
-    FrontierLimits, FrontierRegistration, NativeCloseReason, NativeReservation,
+    FrontierFrameKind, FrontierLimits, FrontierRegistration, NativeCloseReason, NativeReservation,
 };
 use rz_search::pals::store::{ForeignAppendPermit, ObservationId, StoreError, StorePins};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -565,6 +565,7 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
 }
 fn semantic(error: PalsError) -> AdaptiveManagerError {
     match error {
+        PalsError::Rovent(error) => AdaptiveManagerError::Frontier(error),
         PalsError::Store(StoreError::ReviewLeaseBackpressure {
             current,
             capacity,
@@ -806,6 +807,136 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
     }
     fn root_rules(&self) -> Arc<ContractState> {
         Arc::clone(&self.rules)
+    }
+    fn validate_collection_admission(
+        &self,
+        admission: &RoventCollectionRootAdmission,
+    ) -> Result<(), AdaptiveManagerError> {
+        let frontier = self
+            .port
+            .as_ref()
+            .and_then(|port| port.rovent_frontier())
+            .ok_or(AdaptiveManagerError::Invalid(
+                "collection requires the actual attached Rovent frontier",
+            ))?;
+        let original = frontier.registration();
+        if !admission.validates_registration(
+            self.authority,
+            original.mode,
+            original.root_budget,
+            original.original_deadline,
+        ) || admission.selective_policy() != original.selective_policy
+            || !Arc::ptr_eq(admission.rules(), &original.root_rules)
+            || !Arc::ptr_eq(admission.root_moves(), &original.root_moves)
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "collection cap differs from the actual PCR registration",
+            ));
+        }
+        Ok(())
+    }
+    fn rovent_root_budget(&self) -> Result<Option<Digest>, AdaptiveManagerError> {
+        Ok(self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .rovent_frontier()
+            .map(|frontier| frontier.registration().root_budget))
+    }
+    fn rovent_frame_admitted(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        kind: FrontierFrameKind,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        self.hot()?
+            .rovent_frame_admitted(work, kind, clock, now)
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn rovent_fresh_accepted(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        physical: Option<TicketExecutionEvidence>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        let evidence = physical.ok_or(AdaptiveManagerError::Invalid(
+            "Fresh endpoint lacks original native execution evidence",
+        ))?;
+        let physical = AdaptivePortRoleEvidence {
+            execution: evidence.execution,
+            completed_nn_inputs: evidence.completed_nn_inputs,
+            measurement_complete: evidence.measurement_complete,
+            physical_fresh: evidence.physical_fresh,
+        };
+        self.hot()?
+            .rovent_fresh_accepted(work, accepted, output, physical, clock, now)
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn rovent_rules_endpoint(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        self.hot()?
+            .rovent_rules_endpoint(work, clock, now)
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn rovent_root_round_sealed(
+        &mut self,
+        root_budget: Digest,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        self.hot()?
+            .rovent_root_round_sealed(root_budget, clock, now)
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn validate_registered_native_ledger(
+        &self,
+        identity: &rz_search::cpu_worker::CpuLedgerIdentity,
+        observed: &rz_search::cpu_worker::CpuLedgerRegistrationObservation,
+        root_budget: Digest,
+        hard_deadline: Instant,
+    ) -> Result<(), AdaptiveManagerError> {
+        let port = self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?;
+        let frontier = port.rovent_frontier().ok_or(AdaptiveManagerError::Invalid(
+            "original ledger requires the actual attached frontier",
+        ))?;
+        let registration = frontier.registration();
+        let work = frontier.snapshot().work;
+        let clock = rz_search::contract_time::InstantClock::new(
+            observed.clock_domain,
+            observed.clock_origin,
+        );
+        if registration.authority != self.authority
+            || observed.authority != self.authority
+            || registration.original_deadline.clock != observed.clock_domain
+            || clock
+                .instant_at(registration.original_deadline.at)
+                .map_err(|_| AdaptiveManagerError::Deadline)?
+                != hard_deadline
+            || self.hard_deadline != hard_deadline
+            || registration.root_budget != root_budget
+            || registration.native_ledger.as_ref() != Some(identity)
+            || !Arc::ptr_eq(&registration.root_rules, &self.rules)
+            || !work.native_usage_known
+            || work.native_nodes != observed.spent_native_nodes
+            || work.reserved_native_nodes != observed.reserved_native_nodes
+            || work.outstanding_native_executions != observed.outstanding_executions
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "original native ledger differs from its actual root frontier",
+            ));
+        }
+        Ok(())
     }
     fn root_role_call_limit(&self) -> Result<Option<u64>, AdaptiveManagerError> {
         Ok(Some(

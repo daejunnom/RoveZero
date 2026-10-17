@@ -6,7 +6,7 @@ pub mod diagnostic;
 pub mod external;
 mod native_backend;
 mod observations;
-mod protocol;
+pub(crate) mod protocol;
 mod resource_plan;
 mod resource_readback;
 pub mod runtime_assets;

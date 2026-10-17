@@ -8,10 +8,18 @@ use rz_search::pals::engine::pc_port::{PcPortQuestion, PcPortResult, PcSemanticP
 
 pub struct PcPortDriver<M: RoleModel> {
     port: PcSemanticPort<M>,
+    original_root_budget: Option<Digest>,
+    original_rules: Arc<ContractState>,
 }
 impl<M: RoleModel> PcPortDriver<M> {
     pub fn new(port: PcSemanticPort<M>) -> Self {
-        Self { port }
+        let original_root_budget = port.original_root_budget();
+        let original_rules = port.root_rules();
+        Self {
+            port,
+            original_root_budget,
+            original_rules,
+        }
     }
     pub fn port(&self) -> &PcSemanticPort<M> {
         &self.port
@@ -31,7 +39,12 @@ impl<M: RoleModel> PcPortDriver<M> {
         if !receipt.permits_semantic_closure()
             || receipt.authority != self.port.authority()
             || receipt.mode != self.port.mode()
-            || self.port.original_root_budget() != Some(receipt.root_budget)
+            || self.original_root_budget != Some(receipt.root_budget)
+            || !Arc::ptr_eq(&self.original_rules, &self.port.root_rules())
+            || self
+                .port
+                .original_root_budget()
+                .is_some_and(|actual| actual != receipt.root_budget)
         {
             return Err((self, AdaptiveManagerError::PhysicalUnknown));
         }
@@ -53,6 +66,8 @@ impl<M: RoleModel> RoleOnlySearchDriver<PcPortQuestion> for PcPortDriver<M> {
         if authority != self.port.authority()
             || mode != self.port.mode()
             || hard_deadline != self.port.hard_deadline()
+            || self.original_root_budget != Some(root_budget)
+            || !Arc::ptr_eq(&self.original_rules, &self.port.root_rules())
             || self.port.original_root_budget() != Some(root_budget)
         {
             return Err(AdaptiveManagerError::Invalid(
@@ -110,12 +125,43 @@ impl<M: RoleModel> RoleOnlySearchDriver<PcPortQuestion> for PcPortDriver<M> {
     fn is_complete(&self) -> bool {
         self.port.is_complete()
     }
+    fn quiesce_satisfied_goal(&mut self) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .quiesce_satisfied_goal()
+            .map_err(AdaptiveManagerError::Frontier)
+    }
     fn revoke(&mut self) -> Result<(), AdaptiveManagerError> {
         self.port.revoke();
         Ok(())
     }
     fn review_lease_admission(&self) -> Result<AdaptiveReviewLeaseAdmission, AdaptiveManagerError> {
         self.port.review_lease_admission().map_err(semantic)
+    }
+    fn validate_collection_admission(
+        &self,
+        admission: &crate::pals_adaptive::RoventCollectionRootAdmission,
+    ) -> Result<(), AdaptiveManagerError> {
+        let frontier = self
+            .port
+            .rovent_frontier()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "P/C collection has no actual attached frontier",
+            ))?;
+        let registered = frontier.registration();
+        if !admission.validates_registration(
+            registered.authority,
+            registered.mode,
+            registered.root_budget,
+            registered.original_deadline,
+        ) || !Arc::ptr_eq(admission.rules(), &self.original_rules)
+            || !Arc::ptr_eq(admission.root_moves(), &registered.root_moves)
+            || admission.selective_policy() != registered.selective_policy
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C collection is outside its actual frontier owner",
+            ));
+        }
+        Ok(())
     }
 }
 

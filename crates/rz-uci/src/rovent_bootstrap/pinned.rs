@@ -1,9 +1,14 @@
 //! Exact Rovent asset selection over retained, verified descriptor owners.
 //! No legacy manifest or V5 success record is synthesized for this model.
 
+use super::configuration::{ROVENT_STARTUP_CONFIGURATION_MAX_BYTES, RoventStartupConfiguration};
 use super::{
     RoventStartupControl, RoventStartupTopology, admitted_topology,
     compiled_bootstrap_source_digest, fail, hex,
+};
+use crate::pals_adaptive_bootstrap::runtime_assets::{
+    RuntimeAssetDeclaration, RuntimeAssetKind, RuntimeAssetView, RuntimeBackend,
+    admit_runtime_roster, pin_retained_runtime,
 };
 use crate::pals_native::virtual_encoding::validate_pals_virtual_rules_descriptor_bytes;
 use cap_std::fs::Dir;
@@ -20,7 +25,7 @@ use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeSet,
     fs::File,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
@@ -37,10 +42,13 @@ pub struct RoventNativeGraphAsset {
 }
 #[derive(Clone, Debug)]
 pub struct RoventNativeAssetSelection {
+    pub startup_configuration: ArtifactRef,
     pub export_manifest: ArtifactRef,
     pub rules_descriptor: ArtifactRef,
     pub graphs: Vec<RoventNativeGraphAsset>,
     pub cuda_control_inventory: Option<ArtifactRef>,
+    /// A bundle manifest is separate from the exact regular-library roster.
+    pub runtime_bundle_manifest: Option<ArtifactRef>,
 }
 
 struct PinnedBlob {
@@ -60,23 +68,35 @@ pub struct RoventPinnedNativeSources {
     lock: Arc<RoventInputLock>,
     topology: RoventStartupTopology,
     _root: Dir,
+    private_root_path: PathBuf,
+    configuration_blob: PinnedBlob,
+    configuration: RoventStartupConfiguration,
     export: PinnedBlob,
     rules: PinnedBlob,
     graphs: Vec<PinnedGraph>,
     control: Option<PinnedBlob>,
     _weights: PinnedBlob,
     _provenance: PinnedBlob,
+    runtime: Vec<PinnedBlob>,
+    runtime_bundle_manifest: Option<PinnedBlob>,
 }
 impl RoventPinnedNativeSources {
     /// Pure byte/descriptor admission. No ORT runtime, model or R worker starts.
     pub fn open(
         lock: Arc<RoventInputLock>,
         root: Dir,
+        private_root_path: PathBuf,
         selection: RoventNativeAssetSelection,
         control: &RoventStartupControl,
     ) -> Result<Self, BackendError> {
         control.check()?;
         let topology = admitted_topology(&lock)?;
+        if !private_root_path.is_absolute() {
+            return Err(fail(
+                K::InvalidInput,
+                "original private root path must be absolute",
+            ));
+        }
         if selection.graphs.len() != 2 {
             return Err(fail(
                 K::UnsupportedModel,
@@ -106,13 +126,15 @@ impl RoventPinnedNativeSources {
             ));
         }
         let mut selected_paths = BTreeSet::new();
-        for artifact in std::iter::once(&selection.export_manifest)
+        for artifact in std::iter::once(&selection.startup_configuration)
+            .chain(std::iter::once(&selection.export_manifest))
             .chain(std::iter::once(&selection.rules_descriptor))
             .chain(selection.graphs.iter().map(|graph| &graph.artifact))
             .chain(selection.cuda_control_inventory.iter())
+            .chain(selection.runtime_bundle_manifest.iter())
         {
             if !lock.manifest.provenance.contains(artifact)
-                || !selected_paths.insert(artifact.path.as_str())
+                || !selected_paths.insert(artifact.path.clone())
             {
                 return Err(fail(
                     K::IdentityMismatch,
@@ -120,6 +142,17 @@ impl RoventPinnedNativeSources {
                 ));
             }
         }
+        let configuration_blob = open_blob(
+            &root,
+            selection.startup_configuration,
+            ROVENT_STARTUP_CONFIGURATION_MAX_BYTES as u64,
+        )?;
+        let configuration = RoventStartupConfiguration::from_json(&read_blob(
+            &configuration_blob,
+            ROVENT_STARTUP_CONFIGURATION_MAX_BYTES,
+        )?)?;
+        configuration.admit_against(&lock)?;
+        control.check()?;
         let export = open_blob(&root, selection.export_manifest, 256 << 10)?;
         control.check()?;
         let rules = open_blob(&root, selection.rules_descriptor, 64 << 10)?;
@@ -151,16 +184,60 @@ impl RoventPinnedNativeSources {
         control.check()?;
         let provenance = open_blob(&root, model.provenance.clone(), MAX_PROVENANCE_BYTES)?;
         control.check()?;
+        let runtime_bundle_manifest = selection
+            .runtime_bundle_manifest
+            .map(|artifact| {
+                if !rz_experiments::pals_private_snapshot_path_v5(&artifact.path) {
+                    return Err(fail(
+                        K::InvalidInput,
+                        "runtime bundle requires the closed private snapshot namespace",
+                    ));
+                }
+                open_blob(&root, artifact, 64 << 10)
+            })
+            .transpose()?;
+        let mut runtime = Vec::new();
+        for artifact in &lock.manifest.engine.pc.runtime_artifacts {
+            if !rz_experiments::pals_private_snapshot_path_v5(&artifact.path) {
+                return Err(fail(
+                    K::InvalidInput,
+                    "runtime library requires the closed private snapshot namespace",
+                ));
+            }
+            if !selected_paths.insert(artifact.path.clone()) {
+                return Err(fail(
+                    K::IdentityMismatch,
+                    "runtime roster duplicates another selected artifact",
+                ));
+            }
+            runtime.push(open_blob(&root, artifact.clone(), 1 << 30)?);
+            control.check()?;
+        }
+        if matches!(
+            lock.manifest.engine.pc.device,
+            rz_experiments::RoventDevice::Cpu
+        ) != runtime_bundle_manifest.is_none()
+        {
+            return Err(fail(
+                K::IdentityMismatch,
+                "explicit runtime bundle manifest/provider mismatch",
+            ));
+        }
         let owner = Self {
             lock,
             topology,
             _root: root,
+            private_root_path,
+            configuration_blob,
+            configuration,
             export,
             rules,
             graphs,
             control: control_blob,
             _weights: weights,
             _provenance: provenance,
+            runtime,
+            runtime_bundle_manifest,
         };
         owner.validate_lock()?;
         control.check()?;
@@ -169,8 +246,106 @@ impl RoventPinnedNativeSources {
     pub fn lock(&self) -> &RoventInputLock {
         &self.lock
     }
+    /// Read only the original retained metadata descriptor. Its ArtifactRef
+    /// pins JSON bytes; a CUDA runtime bundle's binary-codec digest is separate.
+    /// No library, model, runtime or worker is loaded by this read.
+    pub fn runtime_bundle_publication_bytes(
+        &self,
+    ) -> Result<Option<(ArtifactRef, Vec<u8>)>, BackendError> {
+        self.runtime_bundle_manifest
+            .as_ref()
+            .map(|blob| read_blob(blob, 64 * 1024).map(|bytes| (blob.declaration.clone(), bytes)))
+            .transpose()
+    }
     pub fn topology(&self) -> RoventStartupTopology {
         self.topology
+    }
+    pub fn configuration(&self) -> &RoventStartupConfiguration {
+        &self.configuration
+    }
+    pub fn configuration_artifact(&self) -> &ArtifactRef {
+        &self.configuration_blob.declaration
+    }
+    pub fn private_root_path(&self) -> &Path {
+        &self.private_root_path
+    }
+    /// The same generic retained-FD loader serves V5 and Rovent. This owner
+    /// issues the roster from its original lock/FDs; callers provide no path
+    /// or verified flag that could bypass the root/named-file guards.
+    pub fn pin_runtime(&self) -> Result<RuntimeLibraryPin, BackendError> {
+        self.validate_lock()?;
+        let backend = match self.lock.manifest.engine.pc.backend {
+            rz_experiments::RoventBackend::OrtCpu => RuntimeBackend::OrtCpu,
+            rz_experiments::RoventBackend::OrtCuda => RuntimeBackend::OrtCuda,
+            _ => {
+                return Err(fail(
+                    K::UnsupportedModel,
+                    "native runtime requires explicit ORT selection",
+                ));
+            }
+        };
+        let kind = |artifact: &ArtifactRef| {
+            if backend == RuntimeBackend::OrtCpu
+                || Path::new(&artifact.path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some("libonnxruntime.so.1.22.0")
+            {
+                RuntimeAssetKind::Core
+            } else {
+                RuntimeAssetKind::CudaDependency
+            }
+        };
+        let mut expected: Vec<_> = self
+            .lock
+            .manifest
+            .engine
+            .pc
+            .runtime_artifacts
+            .iter()
+            .map(|artifact| runtime_declaration(artifact, kind(artifact)))
+            .collect();
+        let mut held: Vec<_> = self
+            .runtime
+            .iter()
+            .map(|blob| RuntimeAssetView {
+                declaration: runtime_declaration(&blob.declaration, kind(&blob.declaration)),
+                file: &blob.file,
+            })
+            .collect();
+        if let Some(manifest) = &self.runtime_bundle_manifest {
+            let original = self
+                .lock
+                .manifest
+                .provenance
+                .iter()
+                .find(|artifact| **artifact == manifest.declaration)
+                .ok_or_else(|| {
+                    fail(
+                        K::IdentityMismatch,
+                        "original runtime manifest provenance disappeared",
+                    )
+                })?;
+            expected.push(runtime_declaration(
+                original,
+                RuntimeAssetKind::BundleManifest,
+            ));
+            held.push(RuntimeAssetView {
+                declaration: runtime_declaration(
+                    &manifest.declaration,
+                    RuntimeAssetKind::BundleManifest,
+                ),
+                file: &manifest.file,
+            });
+        }
+        let roster = admit_runtime_roster(backend, &expected, &held)?;
+        let root = self
+            ._root
+            .try_clone()
+            .map_err(|_| fail(K::Io, "cannot retain original runtime root capability"))?;
+        let pin = pin_retained_runtime(&self.private_root_path, root, roster)?;
+        self.validate_runtime(&pin)?;
+        Ok(pin)
     }
     pub fn lock_digest(&self) -> Digest {
         // Construction has already validated this exact immutable lock string.
@@ -203,6 +378,17 @@ impl RoventPinnedNativeSources {
             return Err(fail(
                 K::IdentityMismatch,
                 "native topology changed after pinning",
+            ));
+        }
+        let configuration = RoventStartupConfiguration::from_json(&read_blob(
+            &self.configuration_blob,
+            ROVENT_STARTUP_CONFIGURATION_MAX_BYTES,
+        )?)?;
+        configuration.admit_against(&self.lock)?;
+        if configuration != self.configuration {
+            return Err(fail(
+                K::IdentityMismatch,
+                "original pinned startup configuration changed",
             ));
         }
         let raw = read_blob(&self.export, 256 << 10)?;
@@ -335,6 +521,16 @@ impl VirtualReviewOwnedSources for RoventPinnedNativeSources {
     }
 }
 
+fn runtime_declaration(
+    artifact: &ArtifactRef,
+    kind: RuntimeAssetKind,
+) -> RuntimeAssetDeclaration<'_> {
+    RuntimeAssetDeclaration {
+        artifact,
+        snapshot_path: artifact.path.as_str(),
+        kind,
+    }
+}
 fn open_blob(
     root: &Dir,
     declaration: ArtifactRef,

@@ -72,7 +72,9 @@ use rz_search::pals::engine::adaptive_port::{
     AdaptiveRulesPairProof, CheckedRootCandidate, DeferredRootCandidate,
 };
 use rz_search::pals::review_context::ReviewView;
-use rz_search::pals::rovent_frontier::{FrontierError, NativeCloseReason, NativeReservation};
+use rz_search::pals::rovent_frontier::{
+    FrontierError, FrontierFrameKind, NativeCloseReason, NativeReservation,
+};
 use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -85,7 +87,9 @@ const MAX_ROLE_PENDING: usize = 16;
 mod cleanup;
 mod collection;
 mod frontier;
+mod goals;
 mod reciprocal;
+mod registered_ledger;
 mod role_only;
 use cleanup::{CleanupBoundary, automatic_cleanup_deadline};
 pub use collection::*;
@@ -93,6 +97,9 @@ pub use frontier::{RoventNativeAccountingObservation, RoventReviewLeaseObservati
 pub use reciprocal::{
     PeerFollowupDisposition, PeerFollowupObservation, RoventPeerFollowupPolicy,
     RoventReciprocalPolicy,
+};
+pub use registered_ledger::{
+    AdaptiveRegisteredLedgerAdmissionRejection, AdaptiveRegisteredLedgerSources,
 };
 pub use role_only::*;
 
@@ -250,6 +257,64 @@ pub struct CandidateFrame<Q> {
 /// remain with the independent archive owner and finish after worker fences.
 pub trait AdaptiveSearchDriver<Q> {
     fn root_rules(&self) -> Arc<ContractState>;
+    fn validate_collection_admission(
+        &self,
+        _: &RoventCollectionRootAdmission,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual Rovent collection frontier",
+        ))
+    }
+    fn rovent_root_budget(&self) -> Result<Option<Digest>, AdaptiveManagerError> {
+        Ok(None)
+    }
+    fn rovent_frame_admitted(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: FrontierFrameKind,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    fn rovent_fresh_accepted(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+        _: Option<TicketExecutionEvidence>,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    fn rovent_rules_endpoint(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    fn rovent_root_round_sealed(
+        &mut self,
+        _: Digest,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    fn validate_registered_native_ledger(
+        &self,
+        _: &CpuLedgerIdentity,
+        _: &rz_search::cpu_worker::CpuLedgerRegistrationObservation,
+        _: Digest,
+        _: Instant,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no original registered native ledger",
+        ))
+    }
     fn review_lease_admission(
         &self,
     ) -> Result<Option<AdaptiveReviewLeaseAdmission>, AdaptiveManagerError> {
@@ -1128,6 +1193,7 @@ enum RolePurpose {
     Validator,
     Reciprocal,
     RoventRefinement,
+    RoventFresh,
 }
 struct NativeAck {
     preparation: PreparationId,
@@ -1492,6 +1558,55 @@ where
         sources: AdaptiveManagerSources<Q, B, D>,
         check_native_limits: bool,
     ) -> Result<Self, AdaptiveManagerAdmissionRejection<Q, B, D>> {
+        Self::admit_sources_with_ledger(
+            registration,
+            clock,
+            limits,
+            sources,
+            check_native_limits,
+            None,
+        )
+        .map_err(|rejected| {
+            debug_assert!(rejected.original.is_none());
+            AdaptiveManagerAdmissionRejection {
+                error: rejected.error,
+                sources: rejected.sources,
+                continuation: None,
+            }
+        })
+    }
+    #[allow(clippy::result_large_err)]
+    fn admit_sources_with_ledger(
+        registration: AdaptiveManagerRegistration,
+        clock: ContractSystemClock,
+        limits: AdaptiveExecutionLimits,
+        sources: AdaptiveManagerSources<Q, B, D>,
+        check_native_limits: bool,
+        original: Option<registered_ledger::RegisteredLedger>,
+    ) -> Result<Self, registered_ledger::SourceAdmissionRejection<Q, B, D>> {
+        // Preserve the move-only ledger outside every fallible source check.
+        // In particular, no temporary replacement ledger is constructed.
+        let original_registration = match original
+            .as_ref()
+            .map(|original| {
+                registered_ledger::validate_registered_ledger::<Q, D>(
+                    &registration,
+                    &clock,
+                    &sources.driver,
+                    original,
+                )
+            })
+            .transpose()
+        {
+            Ok(registered) => registered,
+            Err(error) => {
+                return Err(registered_ledger::SourceAdmissionRejection {
+                    error,
+                    sources,
+                    original,
+                });
+            }
+        };
         let native = &sources.native;
         let own_workers = &sources.own_workers;
         let external = &sources.external;
@@ -1561,6 +1676,19 @@ where
                     })?;
             }
             for (at, worker) in own_workers.iter().enumerate() {
+                if original_registration.is_some() {
+                    if !matches!(worker.ready_readback(), Some(Ok(_)))
+                        || (worker.thread_affinity_requested()
+                            && !matches!(worker.thread_affinity_ready(), Some(Ok(_))))
+                    {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "original ledger requires an actually ready CPU owner",
+                        ));
+                    }
+                    // This actual owner API excludes an in-progress value
+                    // replacement; a declared profile is not Ready evidence.
+                    worker.acknowledged_profile()?;
+                }
                 if worker.command_capacity() != limits.worker_commands_max
                     || worker.paused_bytes_limit() != limits.paused_bytes_per_worker_max
                 {
@@ -1615,11 +1743,6 @@ where
                 deadline,
                 registration.token_budget,
             )?;
-            let ledger = CpuCreditLedger::new(
-                registration.authority,
-                registration.native_cpu_node_limit,
-                cpu_clock,
-            )?;
             let ready = ReadySelector::new(limits.waiting_jobs_max)
                 .map_err(|_| AdaptiveManagerError::Capacity("ready selector"))?;
             let costs = CostEstimator::new(4096)
@@ -1633,7 +1756,6 @@ where
                 registry,
                 native_verifier_registered,
                 machine,
-                ledger,
                 ready,
                 costs,
                 controller,
@@ -1647,7 +1769,6 @@ where
             registry,
             native_verifier_registered,
             machine,
-            ledger,
             ready,
             costs,
             controller,
@@ -1655,12 +1776,39 @@ where
         ) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                return Err(AdaptiveManagerAdmissionRejection {
+                return Err(registered_ledger::SourceAdmissionRejection {
                     error,
                     sources,
-                    continuation: None,
+                    original,
                 });
             }
+        };
+        let (ledger, next_job, next_execution, cleanup_boundary) = if let Some(original) = original
+        {
+            let (observed, cleanup) = original_registration
+                .expect("same retained ledger validated before source admission");
+            (
+                original.ledger,
+                observed.highest_job_sequence + 1,
+                observed.highest_execution_sequence + 1,
+                Some(cleanup),
+            )
+        } else {
+            let ledger = match CpuCreditLedger::new(
+                registration.authority,
+                registration.native_cpu_node_limit,
+                cpu_clock,
+            ) {
+                Ok(ledger) => ledger,
+                Err(error) => {
+                    return Err(registered_ledger::SourceAdmissionRejection {
+                        error: error.into(),
+                        sources,
+                        original: None,
+                    });
+                }
+            };
+            (ledger, 1, 1, None)
         };
         let AdaptiveManagerSources {
             native,
@@ -1707,8 +1855,8 @@ where
             advised_yield: None,
             observed_role_classes: Vec::with_capacity(64),
             observation_sequence: 0,
-            next_job: 1,
-            next_execution: 1,
+            next_job,
+            next_execution,
             next_control: 1,
             phase: ManagerPhase::Running,
             native_finished: None,
@@ -1721,7 +1869,7 @@ where
             counters: AdaptiveManagerCounters::default(),
             native_accounting: AdaptiveNativeAccountingSnapshot::default(),
             shutdown_until: None,
-            cleanup_boundary: None,
+            cleanup_boundary,
             native_ready,
             native_verifier_registered,
             retained_native_permits: Vec::with_capacity(limits.role_tickets_max),
@@ -1988,6 +2136,7 @@ where
         &mut self,
         admission: RoventCollectionRootAdmission,
     ) -> Result<(), AdaptiveManagerError> {
+        self.driver.validate_collection_admission(&admission)?;
         if self.root_started
             || !self.roles.is_empty()
             || self.collection_admission.is_some()
@@ -2491,7 +2640,8 @@ where
                 RolePurpose::Validator => scope.action.is_none(),
                 RolePurpose::Refinement
                 | RolePurpose::Reciprocal
-                | RolePurpose::RoventRefinement => {
+                | RolePurpose::RoventRefinement
+                | RolePurpose::RoventFresh => {
                     work.as_ref().is_some_and(|work| scope.allows(work.frame))
                 }
             };
@@ -2771,6 +2921,7 @@ where
             };
             self.driver
                 .root_candidate_admitted(frame, candidate.first_move, &input)?;
+            self.rovent_candidate_ready(frame)?;
             return Ok(true);
         }
         if let Some(recheck) = self.driver.next_fixed_iterative_repair()? {
@@ -2781,6 +2932,7 @@ where
         }
         self.root_ranking_proof = None;
         let Some(input) = self.driver.next_root_round_input()? else {
+            self.rovent_seal_root_round()?;
             return Ok(false);
         };
         self.prepare_root_ranking(input)?;
@@ -3153,7 +3305,7 @@ where
                             RolePurpose::Reciprocal => {
                                 self.registry.complete_reciprocal_role(completion)
                             }
-                            RolePurpose::RoventRefinement => {
+                            RolePurpose::RoventRefinement | RolePurpose::RoventFresh => {
                                 self.registry.complete_reciprocal_role(completion)
                             }
                         };
@@ -3301,7 +3453,9 @@ where
                     if accepted
                         && matches!(
                             self.roles[index].purpose,
-                            RolePurpose::Reciprocal | RolePurpose::RoventRefinement
+                            RolePurpose::Reciprocal
+                                | RolePurpose::RoventRefinement
+                                | RolePurpose::RoventFresh
                         )
                     {
                         let receipt = native_receipt.ok_or(AdaptiveManagerError::Invalid(
@@ -3481,6 +3635,21 @@ where
                         physical,
                     )?;
                 } else if let Some(work) = work {
+                    if purpose == RolePurpose::RoventFresh {
+                        let accepted = self.roles[index].reciprocal_acceptance.as_ref().ok_or(
+                            AdaptiveManagerError::Invalid(
+                                "Fresh endpoint lost original retired native proof",
+                            ),
+                        )?;
+                        self.driver.rovent_fresh_accepted(
+                            &work,
+                            accepted,
+                            output.proposer_ranking_output(),
+                            physical,
+                            self.clock.domain(),
+                            self.check_running()?,
+                        )?;
+                    }
                     let committed = self.driver.commit_role(
                         &work,
                         &ticket,
@@ -3488,8 +3657,13 @@ where
                         physical,
                     )?;
                     self.driver.role_consumed(&ticket, &input.view)?;
-                    self.registry
-                        .accept(&ticket, self.clock.domain(), self.check_running()?)?;
+                    if purpose != RolePurpose::RoventFresh {
+                        self.registry.accept(
+                            &ticket,
+                            self.clock.domain(),
+                            self.check_running()?,
+                        )?;
+                    }
                     self.mark_role_consumed(index)?;
                     self.resolve(work, StepExecution::Role(ticket.id), committed)?;
                 } else if purpose == RolePurpose::RootRanking {
@@ -3560,6 +3734,7 @@ where
                         };
                         self.driver
                             .root_candidate_admitted(frame, candidate.first_move, &input)?;
+                        self.rovent_candidate_ready(frame)?;
                     }
                 } else if purpose == RolePurpose::Validator {
                     let published = self.registry.accept_validator_task(
@@ -3933,7 +4108,9 @@ where
             let permit = if accepted
                 && matches!(
                     self.roles[index].purpose,
-                    RolePurpose::Reciprocal | RolePurpose::RoventRefinement
+                    RolePurpose::Reciprocal
+                        | RolePurpose::RoventRefinement
+                        | RolePurpose::RoventFresh
                 ) {
                 Some(self.registry.issue_reciprocal_native_acceptance(
                     &ticket,
@@ -4983,6 +5160,8 @@ where
                 });
             }
             published?;
+        } else {
+            self.rovent_lane_after_resolve(&work)?;
         }
         Ok(())
     }
@@ -5299,6 +5478,11 @@ where
             } else {
                 self.driver.short_circuit(&work)?
             } {
+                self.driver.rovent_rules_endpoint(
+                    &work,
+                    self.clock.domain(),
+                    self.check_running()?,
+                )?;
                 if terminal.checked.fresh_pair.is_some() {
                     return Err(AdaptiveManagerError::Invalid(
                         "Rules proof cannot claim neural Fresh pair",
@@ -5424,6 +5608,10 @@ where
                 let input = work.input.clone();
                 let purpose = if reciprocal_child {
                     RolePurpose::Reciprocal
+                } else if goals::is_fresh_endpoint(work.input.stage)
+                    && self.driver.rovent_root_budget()?.is_some()
+                {
+                    RolePurpose::RoventFresh
                 } else if self.peer_policy.is_some()
                     && matches!(
                         work.input.stage,

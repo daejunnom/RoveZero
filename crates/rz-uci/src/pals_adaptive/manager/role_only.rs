@@ -1,7 +1,7 @@
 //! Actual P/C-only ticket manager. There is no CPU worker, native-node ledger,
 //! adaptive CPU controller, R frame machine, evaluator or stack in this owner.
 //! Encoding and inference stay on the existing single native service worker.
-use super::collection::AdaptiveCollectionObserver;
+use super::collection::{AdaptiveCollectionObserver, RoventCollectionRootAdmission};
 use super::*;
 use rz_search::pals::coordinator::AcceptedRoleStep;
 use rz_search::pals::engine::NoResearcher;
@@ -40,8 +40,21 @@ pub trait RoleOnlySearchDriver<Q> {
         ticket: Option<&RoleTicketEnvelope>,
     ) -> Result<(), AdaptiveManagerError>;
     fn is_complete(&self) -> bool;
+    fn quiesce_satisfied_goal(&mut self) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual satisfied root goal",
+        ))
+    }
     fn revoke(&mut self) -> Result<(), AdaptiveManagerError>;
     fn review_lease_admission(&self) -> Result<AdaptiveReviewLeaseAdmission, AdaptiveManagerError>;
+    fn validate_collection_admission(
+        &self,
+        _: &RoventCollectionRootAdmission,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual native collection root admission",
+        ))
+    }
 }
 
 /// Pure role configuration. R counts, R credit and R control are absent by type.
@@ -154,6 +167,7 @@ where
     retained_receipts: Vec<NativeAcceptanceReceipt>,
     retained_permits: Vec<NativeAcceptancePermit>,
     collection: Option<Box<dyn AdaptiveCollectionObserver<Q, B::Output>>>,
+    collection_admission: Option<RoventCollectionRootAdmission>,
     collection_settled: bool,
 }
 
@@ -250,6 +264,7 @@ where
             retained_receipts: Vec::with_capacity(16),
             retained_permits: Vec::with_capacity(16),
             collection: None,
+            collection_admission: None,
             collection_settled: false,
         })
     }
@@ -306,9 +321,11 @@ where
     }
     pub fn install_collection_observer(
         &mut self,
-        observer: Box<dyn AdaptiveCollectionObserver<Q, B::Output>>,
+        admission: RoventCollectionRootAdmission,
+        mut observer: Box<dyn AdaptiveCollectionObserver<Q, B::Output>>,
     ) -> Result<(), AdaptiveManagerError> {
         if self.collection.is_some()
+            || self.collection_admission.is_some()
             || self.phase != ManagerPhase::Running
             || self.registry.cumulative_observation().admitted != 0
             || !self.bindings.is_empty()
@@ -318,6 +335,19 @@ where
                 "P/C collection root observer admission",
             ));
         }
+        if !admission.validates_registration(
+            self.registration.authority,
+            self.registration.mode,
+            self.registration.root_budget,
+            self.deadline,
+        ) {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C collection differs from original root registration",
+            ));
+        }
+        self.driver.validate_collection_admission(&admission)?;
+        observer.admitted(&admission)?;
+        self.collection_admission = Some(admission);
         self.collection = Some(observer);
         Ok(())
     }
@@ -981,6 +1011,27 @@ where
         Ok(())
     }
     pub fn begin_root_quiesce(&mut self, until: Instant) -> Result<(), AdaptiveManagerError> {
+        self.begin_close(until, AdaptiveCloseMode::RootQuiesce)
+    }
+    /// A normal goal close is separate from stop/replacement/expiry. The
+    /// actual semantic owner must verify its original live satisfied goal;
+    /// a copied snapshot or an empty role queue cannot authorize this path.
+    pub fn begin_goal_quiesce(&mut self, until: Instant) -> Result<(), AdaptiveManagerError> {
+        if self.phase != ManagerPhase::Running
+            || self.shutdown_until.is_some()
+            || !self.failures.is_empty()
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "satisfied goal cannot replace prior root termination",
+            ));
+        }
+        self.now()?;
+        self.driver.quiesce_satisfied_goal()?;
+        if !self.driver.is_complete() {
+            return Err(AdaptiveManagerError::Invalid(
+                "satisfied goal did not close role admission",
+            ));
+        }
         self.begin_close(until, AdaptiveCloseMode::RootQuiesce)
     }
     pub fn begin_shutdown(&mut self, until: Instant) -> Result<(), AdaptiveManagerError> {

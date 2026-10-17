@@ -139,6 +139,8 @@ fn native_snapshot_uses_original_model_namespace_without_claiming_first_inferenc
         runtime_library: Digest([5; 32]),
         runtime_bundle: None,
         native_configuration: Digest([6; 32]),
+        startup_configuration: Digest([7; 32]),
+        search_configuration: Digest([8; 32]),
         validator_loaded: false,
         physical_workers_created: 1,
         session_residency: PalsSessionResidency {
