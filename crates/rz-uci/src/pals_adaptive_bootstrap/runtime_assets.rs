@@ -385,7 +385,7 @@ impl<'a> RuntimePlan<'a> {
 #[cfg(target_os = "linux")]
 fn split_snapshot<'a>(asset: &RuntimeAssetView<'a>) -> Result<(&'a str, &'a str), BackendError> {
     require(
-        rz_experiments::pals_private_snapshot_path_v5(&asset.declaration.snapshot_path),
+        rz_experiments::pals_private_snapshot_path_v5(asset.declaration.snapshot_path),
         "unsafe runtime snapshot name",
     )?;
     asset
@@ -428,7 +428,7 @@ fn verify_descriptor(asset: &RuntimeAssetView<'_>) -> Result<FileIdentity, Backe
         .artifact
         .validate()
         .map_err(|_| invalid("runtime artifact declaration is invalid"))?;
-    let before = identity(&asset.file)?;
+    let before = identity(asset.file)?;
     require(
         before.bytes == asset.declaration.artifact.bytes
             && before.bytes > 0
@@ -462,7 +462,7 @@ fn verify_descriptor(asset: &RuntimeAssetView<'_>) -> Result<FileIdentity, Backe
     )?;
     require(
         format!("{:x}", hash.finalize()) == asset.declaration.artifact.sha256
-            && identity(&asset.file)? == before,
+            && identity(asset.file)? == before,
         "runtime descriptor SHA or identity changed during verification",
     )?;
     Ok(before)
@@ -481,7 +481,7 @@ fn read_small(asset: &RuntimeAssetView<'_>, limit: u64) -> Result<Vec<u8>, Backe
         .map_err(|_| io("runtime manifest positional read failed"))?;
     require(
         format!("{:x}", Sha256::digest(&bytes)) == asset.declaration.artifact.sha256
-            && identity(&asset.file)? == before,
+            && identity(asset.file)? == before,
         "runtime manifest changed while read",
     )?;
     Ok(bytes)
@@ -606,7 +606,7 @@ impl<'a> SnapshotGuards<'a> {
                 "runtime snapshot parent was replaced",
             )?;
             require(
-                identity(&guard.asset.file)? == guard.identity
+                identity(guard.asset.file)? == guard.identity
                     && identity(&open_named(&ambient_parent, &guard.basename)?)? == guard.identity,
                 "runtime snapshot named file or original descriptor changed",
             )?;
@@ -627,7 +627,7 @@ fn pin_plan(
         cache.cuda_bundle(&root.join(&cuda.parent), &cuda.spec)
     } else {
         cache.library(
-            &root.join(&plan.core.declaration.snapshot_path),
+            &root.join(plan.core.declaration.snapshot_path),
             &plan.core.declaration.artifact.sha256,
         )
     };

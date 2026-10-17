@@ -13,6 +13,9 @@ pub(super) struct NativeResearcherResources {
     pub controller: AdaptiveController,
 }
 
+// A manager holds exactly one researcher selection. Keep its actual ledger or
+// external owner in that slot without changing ownership on a variant switch.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum ResearcherResources {
     Native(NativeResearcherResources),
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]

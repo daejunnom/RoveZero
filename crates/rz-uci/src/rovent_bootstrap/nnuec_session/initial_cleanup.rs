@@ -126,6 +126,9 @@ impl Drop for NnuecInitialCleanupRetained {
 }
 
 #[must_use = "retain pending or terminal actual cleanup custody"]
+// The caller holds one cleanup step at a time. Ready moves the same retired
+// owner, actor and release observations; it does not grow a pending queue.
+#[allow(clippy::large_enum_variant)]
 pub enum NnuecInitialCleanupStep {
     Pending(NnuecInitialCleanup),
     Ready(NnuecInitialCleaned),

@@ -12,6 +12,9 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Weak;
 use validator_port::{ActionWitnessKind, MAX_ACTION_WITNESSES};
 
+mod conditional_witness;
+pub use conditional_witness::{UtilityConditionalWitnessBodies, UtilityConditionalWitnessBody};
+
 /// Array indices belong to NNUEC utility, not the legacy seven V tasks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum UtilityRouteRecipient {
@@ -211,6 +214,8 @@ impl UtilityRoutePcConsumption {
 }
 /// No public constructor or deserialization path supplies a utility witness.
 pub struct UtilityRouteWitness {
+    source_question: ContractDigest,
+    source_frame: FrameId,
     kind: ActionWitnessKind,
     observation: ObservationId,
     identity: ContractDigest,
@@ -218,6 +223,13 @@ pub struct UtilityRouteWitness {
     line: Vec<BoardMove>,
 }
 impl UtilityRouteWitness {
+    pub fn source_question(&self) -> ContractDigest {
+        self.source_question
+    }
+    pub fn source_frame(&self) -> FrameId {
+        self.source_frame
+    }
+
     pub fn kind(&self) -> ActionWitnessKind {
         self.kind
     }
@@ -1162,6 +1174,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             raw.update(identity.0);
             self.validator_write_observation(&mut raw, observation, 0)?;
             fresh.push(UtilityRouteWitness {
+                source_question: guard.question,
+                source_frame: guard.frame,
                 kind,
                 observation,
                 identity,

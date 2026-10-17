@@ -13,6 +13,9 @@ pub(super) struct RoventPcrRootAdmission {
     #[cfg(feature = "pals-adaptive")]
     pub(super) original: Option<Arc<crate::rovent_root_admission::RoventRootAdmission>>,
 }
+// One original source is consumed for each root admission; keeping its seal
+// inline preserves the same final gate and stopped-source ownership.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum RoventPcrRootSource {
     Legacy(Digest),
     #[cfg(feature = "pals-adaptive")]

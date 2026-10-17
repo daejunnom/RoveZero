@@ -361,8 +361,16 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 include_str!("engine/adaptive_port/validator_port.rs"),
             ),
             (
+                "pals/engine/adaptive_port/validator_port/observation_writer.rs",
+                include_str!("engine/adaptive_port/validator_port/observation_writer.rs"),
+            ),
+            (
                 "pals/engine/adaptive_port/utility_route.rs",
                 include_str!("engine/adaptive_port/utility_route.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/utility_route/conditional_witness.rs",
+                include_str!("engine/adaptive_port/utility_route/conditional_witness.rs"),
             ),
             (
                 "pals/engine/adaptive_port/utility_dependencies.rs",

@@ -418,6 +418,9 @@ impl<Q> NnuecWorkPreparation<Q> {
         }
     }
 
+    // The manager has one pending preparation. A not-ready transfer returns
+    // that exact Request/Bound/ACK owner without allocating on failure.
+    #[allow(clippy::result_large_err)]
     pub fn into_job_custody(self) -> Result<NnuecJobCustody, Self> {
         if !self.job_ready() {
             return Err(self);
@@ -484,10 +487,56 @@ where
         &mut self,
         actor: &PreparationActor,
     ) -> Result<bool, AdaptiveManagerError> {
-        let utility_changed = self.pump_utility_preparation(actor)?;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self.phase == ManagerPhase::Running && self.cohort_action_expired(Instant::now()) {
+            self.begin_root_quiesce(self.cleanup_until()?)?;
+        }
+        let utility_changed = match self.pump_utility_preparation(actor) {
+            Ok(changed) => changed,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            Err(AdaptiveManagerError::AdmissionClosed)
+                if self.cohort_action_expired(Instant::now()) =>
+            {
+                self.begin_root_quiesce(self.cleanup_until()?)?;
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        };
         // The utility P/C preparation is the same actor's sole request. It
         // cannot compete with or drain a separate original R completion.
         let may_submit = self.phase == ManagerPhase::Running && self.can_admit_work();
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self.cohort_cache_request_pending() && may_submit {
+            if let Some(request) = self
+                .nnuec_pending
+                .as_mut()
+                .and_then(|pending| pending.request.take())
+            {
+                let request = match self.attach_cohort_cache_prelude(request) {
+                    Ok(request) => request,
+                    Err((AdaptiveManagerError::AuxiliaryPending, request)) => {
+                        self.nnuec_pending
+                            .as_mut()
+                            .expect("original R preparation")
+                            .request = Some(request);
+                        return Ok(utility_changed);
+                    }
+                    Err((error, request)) => {
+                        self.nnuec_pending
+                            .as_mut()
+                            .expect("original R preparation")
+                            .request = Some(request);
+                        return Err(error);
+                    }
+                };
+                self.nnuec_pending
+                    .as_mut()
+                    .expect("original R preparation")
+                    .request = Some(request);
+            }
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let may_submit = may_submit && !self.cohort_cache_request_pending();
         let Some(pending) = &mut self.nnuec_pending else {
             return Ok(utility_changed);
         };
@@ -505,7 +554,17 @@ where
             // Release the mutable pending borrow before the utility owner
             // validates the exact same Bound/input capture.
             let _ = pending;
-            changed |= self.utility_bind_bound(bound)?;
+            match self.utility_bind_bound(bound) {
+                Ok(bound) => changed |= bound,
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                Err(AdaptiveManagerError::AdmissionClosed)
+                    if self.cohort_action_expired(Instant::now()) =>
+                {
+                    self.begin_root_quiesce(self.cleanup_until()?)?;
+                    return Ok(true);
+                }
+                Err(error) => return Err(error),
+            }
         }
         let pending = self.nnuec_pending.as_mut().expect("original R preparation");
         if closing {
@@ -520,6 +579,21 @@ where
             {
                 self.driver.release_cpu_nnuec_installation(&pending.seal)?;
                 let observation = pending.observation();
+                let work = pending.work.clone();
+                let input = pending
+                    .bound
+                    .as_ref()
+                    .and_then(|bound| bound.utility_input_capture().cloned());
+                let terminal = pending.terminal_ack.take();
+                let actor_observation = pending.observation;
+                let submitted = pending.submitted;
+                self.retain_utility_preparation_cleanup(
+                    &work,
+                    input,
+                    terminal,
+                    actor_observation,
+                    submitted,
+                )?;
                 self.nnuec_pending = None;
                 self.retain_nnuec_observation(observation);
                 changed = true;
@@ -711,6 +785,18 @@ where
                 if self.nnuec.is_some()
                     && self.cpu_semantic.is_none()
                     && self.utility_route.is_none()
+                    && {
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        {
+                            self.utility_cohort
+                                .as_ref()
+                                .is_none_or(|state| !state.observer_retained())
+                        }
+                        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+                        {
+                            true
+                        }
+                    }
                     && self.retained_cpu_jobs.is_empty()
                     && self.phase == ManagerPhase::Finished
                     && self.close_mode == AdaptiveCloseMode::RootQuiesce

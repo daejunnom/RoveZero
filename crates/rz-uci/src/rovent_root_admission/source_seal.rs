@@ -30,6 +30,9 @@ pub enum InitialStopReason {
 }
 
 /// A live admission and an initially stopped source carry different authority.
+// This is one final-gate outcome per root, not a queue. Preserve the original
+// admission/stopped-source custody and their distinct capabilities.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum InitialAdmissionOutcome {
     Admitted(RoventRootAdmission),
@@ -402,6 +405,9 @@ impl SourceSeal {
 
     /// Issue live authority only after both original acceptance and hard gate.
     /// Every rejection retains this exact source for a typed stopped outcome.
+    // Return the original seal and error without a fresh failure allocation;
+    // the seal's rejected state still prevents a later live-admission retry.
+    #[allow(clippy::result_large_err)]
     pub fn try_into_live(
         mut self,
     ) -> Result<RoventRootAdmission, (Self, RoventRootAdmissionError)> {

@@ -31,6 +31,9 @@ pub type RoventExternalProductSession =
     AdaptiveSessionDriver<RoventNativeBackend<AdaptivePortQuestion>>;
 
 /// Every rejected transition retains its original physical/native/FD owners.
+// This is one startup rejection slot, not a queue. Preserve its actual rejected
+// session/source owners instead of changing their transfer or drop boundary.
+#[allow(clippy::large_enum_variant)]
 pub enum RoventExternalProductStartupOwners {
     Prepared {
         prepared: PreparedRoventNative<AdaptivePortQuestion>,

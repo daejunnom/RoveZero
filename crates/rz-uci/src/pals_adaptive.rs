@@ -18,6 +18,14 @@ mod validator;
 pub use validator::*;
 mod utility_route;
 pub use utility_route::*;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod utility_cohort;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use utility_cohort::*;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod utility_cohort_historical;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use utility_cohort_historical::*;
 mod native_accounting;
 mod session_driver;
 pub use native_accounting::AdaptiveNativeAccountingSnapshot;

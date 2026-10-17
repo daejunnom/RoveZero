@@ -12,6 +12,10 @@ use rz_contracts::ExecutionId as NativeExecutionId;
 use rz_contracts::pals_adaptive::{CpuJobId, CpuWorkerId};
 use std::collections::{BTreeSet, HashMap};
 
+mod observation_writer;
+use observation_writer::ObservationShaSink;
+pub(super) use observation_writer::{BoundedObservationPreimage, ObservationSink};
+
 pub const MAX_VALIDATOR_CONTEXTS_PER_ROOT: usize = 128;
 pub const MAX_VALIDATOR_ACTIONS_PENDING: usize = 64;
 pub const MAX_ACTION_WITNESSES: usize = 64;
@@ -19,43 +23,10 @@ pub const MAX_ACTION_EXECUTIONS: usize = 4096;
 pub const MAX_ACTION_ROLE_SUBMISSIONS: u64 = 64;
 
 fn validator_write_bytes(hash: &mut Sha256, bytes: &[u8]) {
-    hash.update((bytes.len() as u64).to_le_bytes());
-    hash.update(bytes);
-}
-fn validator_write_profiled_constraint(
-    hash: &mut Sha256,
-    constraint: crate::pals::store::ProfiledExternalConstraint,
-) {
-    use crate::pals::store::ProfiledExternalConstraint as Limit;
-    match constraint {
-        Limit::Combined {
-            depth,
-            reported_nodes,
-        } => {
-            hash.update([0]);
-            hash.update(depth.to_le_bytes());
-            hash.update(reported_nodes.to_le_bytes());
-        }
-        Limit::Nodes { reported_nodes } => {
-            hash.update([1]);
-            hash.update(reported_nodes.to_le_bytes());
-        }
-        Limit::Depth { depth } => {
-            hash.update([2]);
-            hash.update(depth.to_le_bytes());
-        }
-        Limit::MoveTime { milliseconds } => {
-            hash.update([3]);
-            hash.update(milliseconds.to_le_bytes());
-        }
-    }
+    observation_writer::write_bytes(&mut ObservationShaSink(hash), bytes);
 }
 fn validator_write_moves(hash: &mut Sha256, moves: &[BoardMove]) -> Result<(), PalsError> {
-    hash.update((moves.len() as u64).to_le_bytes());
-    for movement in moves {
-        hash.update(Move16::pack(*movement)?.bits().to_le_bytes());
-    }
-    Ok(())
+    observation_writer::write_moves(&mut ObservationShaSink(hash), moves)
 }
 fn validator_write_optional_moves(
     hash: &mut Sha256,
@@ -1082,6 +1053,15 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         id: ObservationId,
         depth: u8,
     ) -> Result<(), PalsError> {
+        self.validator_write_observation_into(&mut ObservationShaSink(hash), id, depth)
+    }
+    pub(super) fn validator_write_observation_into<S: ObservationSink>(
+        &self,
+        hash: &mut S,
+        id: ObservationId,
+        depth: u8,
+    ) -> Result<(), PalsError> {
+        hash.check()?;
         if depth >= 8 {
             return Err(PalsError::Capacity);
         }
@@ -1097,69 +1077,75 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             bound,
         } = obs.scope
         {
-            hash.update(b"rz-validator-profiled-external-observation/1\0");
-            validator_write_profiled_constraint(hash, requested);
-            validator_write_profiled_constraint(hash, issued);
+            hash.write(b"rz-validator-profiled-external-observation/1\0");
+            observation_writer::write_profiled_constraint(hash, requested);
+            observation_writer::write_profiled_constraint(hash, issued);
             for depth in [reported_depth, seldepth] {
-                hash.update([u8::from(depth.is_some())]);
+                hash.write([u8::from(depth.is_some())]);
                 if let Some(depth) = depth {
-                    hash.update(depth.to_le_bytes());
+                    hash.write(depth.to_le_bytes());
                 }
             }
-            hash.update([bound as u8]);
+            hash.write([bound as u8]);
         }
-        hash.update([obs.kind as u8]);
-        hash.update(
+        hash.write([obs.kind as u8]);
+        hash.write(
             rz_position::contracts::rules_snapshot_semantic_digest(
                 self.engine.semantic.stores.states.get(obs.state)?,
             )
             .0,
         );
         for line in [obs.line, obs.cpu_pv] {
-            hash.update([u8::from(line.is_some())]);
+            hash.write([u8::from(line.is_some())]);
             if let Some(line) = line {
-                validator_write_moves(hash, &self.engine.semantic.stores.lines.moves(line)?)?;
+                observation_writer::write_moves(
+                    hash,
+                    &self.engine.semantic.stores.lines.moves(line)?,
+                )?;
             }
         }
-        hash.update(obs.budget.to_le_bytes());
-        validator_write_bytes(hash, obs.cpu_condition.as_deref().unwrap_or("").as_bytes());
+        hash.write(obs.budget.to_le_bytes());
+        observation_writer::write_bytes(
+            hash,
+            obs.cpu_condition.as_deref().unwrap_or("").as_bytes(),
+        );
         if let Some(identity) = &obs.value_identity {
-            hash.update([1]);
-            validator_write_bytes(hash, identity.semantics.as_bytes());
-            validator_write_bytes(
+            hash.write([1]);
+            observation_writer::write_bytes(hash, identity.semantics.as_bytes());
+            observation_writer::write_bytes(
                 hash,
                 identity.weights_sha256.as_deref().unwrap_or("").as_bytes(),
             );
         } else {
-            hash.update([0]);
+            hash.write([0]);
         }
         if let Some(identity) = &obs.model_value_identity {
-            hash.update([1]);
+            hash.write([1]);
             for field in [
                 &identity.semantics,
                 &identity.model,
                 &identity.encoding,
                 &identity.precision,
             ] {
-                validator_write_bytes(hash, field.as_bytes());
+                observation_writer::write_bytes(hash, field.as_bytes());
             }
-            hash.update(identity.model_epoch);
+            hash.write(identity.model_epoch);
         } else {
-            hash.update([0]);
+            hash.write([0]);
         }
         match obs.score {
-            RawScore::Unknown => hash.update([0]),
+            RawScore::Unknown => hash.write([0]),
             RawScore::Estimate { value, perspective } => {
-                hash.update([1, u8::from(perspective == Color::Black)]);
-                hash.update(value.to_bits().to_le_bytes());
+                hash.write([1, u8::from(perspective == Color::Black)]);
+                hash.write(value.to_bits().to_le_bytes());
             }
             RawScore::Cpu {
                 value,
                 perspective,
                 bound,
             } => {
-                hash.update([2, u8::from(perspective == Color::Black), bound as u8]);
-                hash.update(value.to_le_bytes());
+                hash.write([2, u8::from(perspective == Color::Black), bound as u8]);
+                hash.write(value.to_le_bytes());
             }
             RawScore::ExternalUci {
                 value,
@@ -1167,22 +1153,22 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 perspective,
                 wdl_per_mille,
             } => {
-                hash.update([3, bound as u8, u8::from(perspective == Color::Black)]);
+                hash.write([3, bound as u8, u8::from(perspective == Color::Black)]);
                 match value {
                     crate::cpu_checker::ExternalRawScore::Centipawns(value) => {
-                        hash.update([0]);
-                        hash.update(value.to_le_bytes());
+                        hash.write([0]);
+                        hash.write(value.to_le_bytes());
                     }
                     crate::cpu_checker::ExternalRawScore::MateMoves(value) => {
-                        hash.update([1]);
-                        hash.update(value.to_le_bytes());
+                        hash.write([1]);
+                        hash.write(value.to_le_bytes());
                     }
-                    crate::cpu_checker::ExternalRawScore::Unknown => hash.update([2]),
+                    crate::cpu_checker::ExternalRawScore::Unknown => hash.write([2]),
                 }
-                hash.update([u8::from(wdl_per_mille.is_some())]);
+                hash.write([u8::from(wdl_per_mille.is_some())]);
                 if let Some(wdl) = wdl_per_mille {
                     for value in wdl {
-                        hash.update(value.to_le_bytes());
+                        hash.write(value.to_le_bytes());
                     }
                 }
             }
@@ -1199,9 +1185,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 perspective,
                 ..
             } => {
-                hash.update([4, u8::from(perspective == Color::Black)]);
+                hash.write([4, u8::from(perspective == Color::Black)]);
                 for value in [win, draw, loss] {
-                    hash.update(value.to_bits().to_le_bytes());
+                    hash.write(value.to_bits().to_le_bytes());
                 }
             }
             RawScore::ConditionalWdl {
@@ -1211,10 +1197,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 counter,
                 ..
             } => {
-                hash.update([5, u8::from(perspective == Color::Black)]);
-                hash.update(expectation.to_bits().to_le_bytes());
-                self.validator_write_observation(hash, repaired, depth + 1)?;
-                self.validator_write_observation(hash, counter, depth + 1)?;
+                hash.write([5, u8::from(perspective == Color::Black)]);
+                hash.write(expectation.to_bits().to_le_bytes());
+                self.validator_write_observation_into(hash, repaired, depth + 1)?;
+                self.validator_write_observation_into(hash, counter, depth + 1)?;
             }
             RawScore::ConditionalRepairWdl {
                 expectation,
@@ -1223,12 +1209,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 after,
                 ..
             } => {
-                hash.update([6, u8::from(perspective == Color::Black)]);
-                hash.update(expectation.to_bits().to_le_bytes());
-                self.validator_write_observation(hash, before, depth + 1)?;
-                self.validator_write_observation(hash, after, depth + 1)?;
+                hash.write([6, u8::from(perspective == Color::Black)]);
+                hash.write(expectation.to_bits().to_le_bytes());
+                self.validator_write_observation_into(hash, before, depth + 1)?;
+                self.validator_write_observation_into(hash, after, depth + 1)?;
             }
-            RawScore::Terminal { winner } => hash.update([
+            RawScore::Terminal { winner } => hash.write([
                 7,
                 match winner {
                     None => 0,
@@ -1237,7 +1223,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 },
             ]),
         }
-        Ok(())
+        hash.check()
     }
     pub(super) fn validator_existing_witnesses(
         &self,

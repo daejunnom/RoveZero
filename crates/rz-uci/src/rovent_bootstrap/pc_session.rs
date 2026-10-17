@@ -252,6 +252,9 @@ impl NativeOwner {
         }
     }
 }
+// One mutex-protected session slot owns the current native/semantic custody.
+// RejectedPort retains that exact port until actual cleanup, not in a queue.
+#[allow(clippy::large_enum_variant)]
 enum State {
     Idle(Box<Idle>),
     Manager(Box<Manager>),
@@ -1100,15 +1103,14 @@ impl RoventPcSessionDriver {
                     return result;
                 }
                 State::Manager(mut manager) => {
-                    if manager.phase() != ManagerPhase::Finished {
-                        if manager.begin_shutdown(until).is_err()
+                    if manager.phase() != ManagerPhase::Finished
+                        && (manager.begin_shutdown(until).is_err()
                             || !manager
                                 .run_root_until(until, &AtomicBool::new(false))
-                                .is_ok_and(|receipt| receipt.permits_semantic_closure())
-                        {
-                            *state = State::Manager(manager);
-                            return Err(SearchSessionFailure::physical_completion_unknown());
-                        }
+                                .is_ok_and(|receipt| receipt.permits_semantic_closure()))
+                    {
+                        *state = State::Manager(manager);
+                        return Err(SearchSessionFailure::physical_completion_unknown());
                     }
                     let receipt = match manager.shutdown_receipt() {
                         Ok(value) if value.permits_semantic_closure() => value,

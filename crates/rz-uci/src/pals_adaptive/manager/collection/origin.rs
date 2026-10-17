@@ -9,6 +9,8 @@ use rz_search::pals::rovent_frontier::RoventFrontier;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 use serde_json::{Value, json};
 use std::sync::Arc;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+use std::sync::OnceLock;
 
 pub const ROVENT_COLLECTION_NATIVE_ORIGIN: &str = "rz-rovent-collection-native-origin/1";
 pub const ROVENT_COLLECTION_ROOT_ADMISSION: &str = "rz-rovent-collection-root-admission/1";
@@ -37,10 +39,66 @@ struct LoadedOrigin {
     mode: rz_contracts::rovent::ExecutionMode,
     input_lock: Digest,
     namespace: AdaptiveModelNamespace,
+    product_lifetime: Option<Arc<RoventNativeProductLifetime>>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     raw: Value,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     raw_sha256: String,
+}
+
+/// Current product provenance only. No JSON, public constructor or copied
+/// process/source hash can manufacture a new native-service lifetime.
+/// The actual PreparedNative issuer is a separate registration boundary.
+pub struct RoventNativeProductLifetime {
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    first_root: OnceLock<Arc<crate::rovent_root_admission::RoventRootAdmission>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    sources: std::sync::Weak<crate::rovent_bootstrap::RoventPinnedNativeSources>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    clock: rz_runtime::contracts::ContractSystemClock,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    namespace: AdaptiveModelNamespace,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    _original_verifier: rz_search::pals::coordinator::NativeAcceptanceVerifier,
+}
+impl RoventNativeProductLifetime {
+    /// Only the successful bootstrap calls this after consuming the actual
+    /// Ready event. The worker-issued verifier and ready clock are required;
+    /// snapshot metadata alone cannot create this lifetime.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn from_ready<Q: crate::pals_adaptive::NativeQuestionProjection>(
+        snapshot: &crate::rovent_bootstrap::RoventNativeStartupSnapshot,
+        sources: &Arc<crate::rovent_bootstrap::RoventPinnedNativeSources>,
+        actual_service: &crate::rovent_bootstrap::RoventNativeService<Q>,
+    ) -> Result<Arc<Self>, AdaptiveCollectionError> {
+        use rz_runtime::contracts::ContractClock;
+        let clock = actual_service
+            .ready_clock()
+            .ok_or_else(|| reject("original native service has not reached Ready"))?;
+        let verifier = actual_service
+            .native_acceptance_verifier()
+            .ok_or_else(|| reject("original native service has no worker-issued verifier"))?;
+        if clock.domain().0.0 != snapshot.process_epoch
+            || snapshot.input_lock != sources.lock_digest()
+            || snapshot.physical_workers_created != 1
+            || snapshot.neural_service_executed
+        {
+            return Err(reject("original Ready service/snapshot/source differs"));
+        }
+        let namespace = snapshot
+            .model_namespace()
+            .map_err(|error| reject(error.to_string()))?;
+        Ok(Arc::new(Self {
+            first_root: OnceLock::new(),
+            sources: Arc::downgrade(sources),
+            clock,
+            namespace,
+            _original_verifier: verifier,
+        }))
+    }
+    pub fn same_product(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
 }
 
 /// 발급은 PreparedRoventNative의 원 성공 owner에서만 가능하다.
@@ -50,6 +108,33 @@ pub struct RoventNativeCollectionOrigin {
     original: Arc<LoadedOrigin>,
 }
 impl RoventNativeCollectionOrigin {
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn from_loaded_with_lifetime(
+        snapshot: &crate::rovent_bootstrap::RoventNativeStartupSnapshot,
+        sources: Arc<crate::rovent_bootstrap::RoventPinnedNativeSources>,
+        lifetime: Arc<RoventNativeProductLifetime>,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        use rz_runtime::contracts::ContractClock;
+        if !lifetime.sources.ptr_eq(&Arc::downgrade(&sources))
+            || lifetime.clock.domain().0.0 != snapshot.process_epoch
+            || lifetime.namespace
+                != snapshot
+                    .model_namespace()
+                    .map_err(|error| reject(error.to_string()))?
+        {
+            return Err(reject(
+                "original native lifetime differs from loaded source",
+            ));
+        }
+        let mut origin = Self::from_loaded(snapshot, sources)?;
+        Arc::get_mut(&mut origin.original)
+            .expect("new original loaded owner")
+            .product_lifetime = Some(lifetime);
+        Ok(origin)
+    }
+    pub fn product_lifetime(&self) -> Option<&Arc<RoventNativeProductLifetime>> {
+        self.original.product_lifetime.as_ref()
+    }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub(crate) fn from_loaded(
         snapshot: &crate::rovent_bootstrap::RoventNativeStartupSnapshot,
@@ -123,6 +208,7 @@ impl RoventNativeCollectionOrigin {
                 mode,
                 input_lock,
                 namespace,
+                product_lifetime: None,
                 raw,
                 raw_sha256,
             }),
@@ -141,6 +227,15 @@ impl RoventNativeCollectionOrigin {
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub fn original_input_lock(&self) -> &rz_experiments::RoventInputLock {
         self.original.sources.lock()
+    }
+    /// Same retained source allocation, not matching declarations or hashes.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn matches_loaded_nnuec(
+        &self,
+        source: &crate::rovent_bootstrap::nnuec_source::LoadedRoventNnuecSource,
+    ) -> bool {
+        source.matches_sources(&self.original.sources)
+            && source.input_lock_digest() == self.original.input_lock
     }
     /// Original metadata bytes only; neither this read nor historical replay
     /// grants runtime, native, physical or training execution authority.
@@ -217,6 +312,21 @@ pub struct RoventCollectionRootAdmission {
     raw_sha256: Arc<str>,
 }
 impl RoventCollectionRootAdmission {
+    /// Absent current lifetime evidence stays unknown. This does not infer
+    /// fresh cache state from a first-looking authority or an epoch number.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn is_first_product_root(&self) -> bool {
+        self.original
+            .original
+            .product_lifetime
+            .as_ref()
+            .is_some_and(|lifetime| {
+                lifetime
+                    .first_root
+                    .get()
+                    .is_some_and(|root| Arc::ptr_eq(root, &self.root_admission))
+            })
+    }
     /// Call only immediately after the actual port's attach_rovent_frontier
     /// has checked independent Rules/Store/namespace/root-domain/ledger owners.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -342,7 +452,7 @@ impl RoventCollectionRootAdmission {
             || root_admission.root_snapshot().revision() != root_state.revision.0
             || !root_admission
                 .root_snapshot()
-                .same_state(&registration.root_rules.rules().snapshot())
+                .same_state(registration.root_rules.rules().snapshot())
             || root_admission.allowed_root_moves().as_ref()
                 != registration.root_moves.allowed().as_ref()
         {
@@ -393,6 +503,11 @@ impl RoventCollectionRootAdmission {
         }
         let raw_sha256 = rz_experiments::pals_data_v3::generation_digest(domain, &raw)
             .map_err(|error| reject(error.to_string()))?;
+        if let Some(lifetime) = &loaded.product_lifetime {
+            // Only actual successful attach can observe this root. A second
+            // root leaves the original first Arc unchanged and is not fresh.
+            let _ = lifetime.first_root.set(Arc::clone(&root_admission));
+        }
         Ok(Self {
             original: original.clone(),
             authority: registration.authority,

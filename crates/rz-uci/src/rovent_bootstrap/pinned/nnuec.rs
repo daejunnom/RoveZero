@@ -4,6 +4,10 @@
 use super::*;
 use crate::rovent_bootstrap::nnuec_source::{NNUEC_PROVENANCE_MAX_BYTES, NNUEC_WEIGHTS_MAX_BYTES};
 
+/// Original weights declaration/bytes followed by provenance declaration/bytes.
+/// This publication preserves raw source identities, not loaded model authority.
+pub(crate) type NnuecWeightsAndProvenanceBytes = (ArtifactRef, Vec<u8>, ArtifactRef, Vec<u8>);
+
 pub(super) struct PinnedNnuecArtifacts {
     weights: PinnedBlob,
     provenance: PinnedBlob,
@@ -41,7 +45,7 @@ impl PinnedNnuecArtifacts {
     pub(super) fn read(
         &self,
         pin: &rz_experiments::RoventNnuecPin,
-    ) -> Result<(ArtifactRef, Vec<u8>, ArtifactRef, Vec<u8>), BackendError> {
+    ) -> Result<NnuecWeightsAndProvenanceBytes, BackendError> {
         if self.weights.declaration != pin.weights || self.provenance.declaration != pin.provenance
         {
             return Err(fail(
@@ -67,7 +71,7 @@ impl RoventPinnedNativeSources {
     /// A named replacement cannot supply a different model or provenance.
     pub(crate) fn nnuec_artifact_bytes(
         &self,
-    ) -> Result<Option<(ArtifactRef, Vec<u8>, ArtifactRef, Vec<u8>)>, BackendError> {
+    ) -> Result<Option<NnuecWeightsAndProvenanceBytes>, BackendError> {
         match (&self.nnuec, &self.lock.manifest.engine.nnuec) {
             (None, None) => Ok(None),
             (Some(held), Some(pin)) => held.read(pin).map(Some),

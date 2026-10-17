@@ -11,6 +11,9 @@ use rz_runtime::contracts::ContractClock as _;
 
 pub const ROVENT_PCR_INITIAL_DOMAIN: &str = "rz-rovent-pcr-native-initial-stop/1";
 
+// One idle-custody slot per session retains its actual previous root receipt.
+// A larger variant does not add a queue or grant a new physical fence.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub(super) enum RoventPcrIdleCustody {
     StartupReady,

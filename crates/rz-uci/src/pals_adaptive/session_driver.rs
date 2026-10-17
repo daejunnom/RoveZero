@@ -147,6 +147,17 @@ where
                 + Sync,
         >,
     >,
+    /// Cohort physical retirement is issued only from the original trial
+    /// admission and the same actually retired researcher owner. It cannot be
+    /// supplied by relabeling a historical root-local Completed action.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub utility_trial_retired: Option<
+        Arc<
+            dyn Fn(&Arc<super::UtilityTrialPhysicalRetirement>) -> Result<(), AdaptiveManagerError>
+                + Send
+                + Sync,
+        >,
+    >,
     pub external_teacher: Option<AdaptiveExternalTeacherObserver>,
     /// Nonblocking outer-session pump. It does not run inside a native/CPU
     /// worker and cannot change the manager's original execution authority.
@@ -162,6 +173,8 @@ where
             root_admission: None,
             root_closure: None,
             utility_route_completed: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            utility_trial_retired: None,
             external_teacher: None,
             cooperative: None,
         }
@@ -769,6 +782,9 @@ where
         }
     }
 
+    // A failed fence/adoption returns the same driver and its Port/Store/archive
+    // custody intact; recovery must not depend on a new failure allocation.
+    #[allow(clippy::result_large_err)]
     fn restore_semantic_owner(
         &self,
         driver: AdaptivePortDriver<AdaptivePortModel>,

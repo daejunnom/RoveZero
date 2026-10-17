@@ -85,6 +85,9 @@ pub struct UtilityRouteClosureRejection {
     pub error: AdaptiveManagerError,
 }
 impl CompletedUtilityRouteAction {
+    // Rejection returns the original semantic outcome and whole-cost proof;
+    // preserving those owners must not require a fresh failure allocation.
+    #[allow(clippy::result_large_err)]
     pub(super) fn after_manager_shutdown(
         semantic: UtilityRouteSemanticOutcome,
         proof: UtilityRouteClosureProof,

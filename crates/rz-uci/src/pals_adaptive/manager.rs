@@ -89,12 +89,21 @@ mod admitted;
 mod cleanup;
 mod collection;
 mod cpu_semantic;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub mod utility_cohort;
 mod utility_route;
 pub use cpu_semantic::{
     AdaptiveCpuCaptureCustody, AdaptiveCpuCapturePlan, AdaptiveCpuSemanticObserver,
     AdaptiveCpuSemanticObserverBox, AdaptiveCpuSemanticRetirement,
     AdaptiveCpuSemanticRetirementParts,
 };
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use utility_cohort::{
+    UtilityCohortReadyDisposition, UtilityCohortReadyObserver, UtilityCohortReadyOffer,
+    UtilityCohortReadyRejection, UtilityCohortReadySnapshot, UtilityCohortTrialCustody,
+};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use utility_route::UtilityCohortRootClosureProof;
 pub use utility_route::{
     UtilityRouteClosureProof, UtilityRouteFinalizationRejection, UtilityRoutePendingClosure,
 };
@@ -305,6 +314,42 @@ pub struct CandidateFrame<Q> {
 /// archive I/O, an external pipe drain, or wait for a worker. Archive effects
 /// remain with the independent archive owner and finish after worker fences.
 pub trait AdaptiveSearchDriver<Q> {
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn utility_cohort_common_work(
+        &self,
+    ) -> Result<
+        Option<(
+            Option<u64>,
+            rz_search::pals::rovent_frontier::FrontierNodeWork,
+        )>,
+        AdaptiveManagerError,
+    > {
+        Ok(None)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn freeze_utility_witness_bodies(
+        &self,
+        _: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteSemanticOutcome,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityConditionalWitnessBodies,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "utility original witness bodies unsupported",
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn utility_cohort_offer_semantics(
+        &self,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::UtilityCohortOfferSemanticSource<Q>,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "utility cohort offer semantics unsupported",
+        ))
+    }
     fn prepare_utility_route(
         &mut self,
         _: &CoordinatorWork<ReviewView, Q>,
@@ -873,6 +918,9 @@ pub trait AdaptiveSearchDriver<Q> {
             "driver has no reciprocal pin retirement consumer",
         ))
     }
+    // The original work, accepted head/output, question identity, mode, budget
+    // and recipient remain independent checked provenance at this boundary.
+    #[allow(clippy::too_many_arguments)]
     fn prepare_accepted_role_reciprocal(
         &mut self,
         _: &CoordinatorWork<ReviewView, Q>,
@@ -1910,6 +1958,8 @@ where
     collection_admission: Option<RoventCollectionRootAdmission>,
     cpu_semantic: Option<cpu_semantic::CpuSemanticState<Q>>,
     utility_route: Option<utility_route::UtilityRouteState<Q>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    utility_cohort: Option<utility_cohort::UtilityCohortState<Q>>,
     utility_route_sequence: u64,
     // Failed unique prepared-job cleanup retains the same job and grant. No
     // unverified rejection can refund credit or discard its capture custody.
@@ -3038,6 +3088,10 @@ where
         self.deadline
             .accepts(self.clock.domain(), now)
             .map_err(|_| AdaptiveManagerError::Deadline)?;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self.cohort_action_expired(Instant::now()) {
+            return Err(AdaptiveManagerError::AdmissionClosed);
+        }
         Ok(now)
     }
     fn role_pending_limit(&self) -> usize {
@@ -3199,6 +3253,10 @@ where
         if self.phase == ManagerPhase::Running && self.effective_hard_expired() {
             self.begin_selected_shutdown(self.cleanup_until()?)?;
         }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self.phase == ManagerPhase::Running && self.cohort_action_expired(Instant::now()) {
+            self.begin_root_quiesce(self.cleanup_until()?)?;
+        }
         let mut changed = false;
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         match self.poll_profiled_events() {
@@ -3215,7 +3273,7 @@ where
             };
             changed = true;
             if let Err(error) = self.native_event(event) {
-                self.record_failure(error);
+                self.physical_event_error(error)?;
             }
         }
         for slot in 0..self.own.len() {
@@ -3228,7 +3286,7 @@ where
                     Ok(Some(event)) => {
                         changed = true;
                         if let Err(error) = self.own_event_observed(slot, event) {
-                            self.record_failure(error);
+                            self.physical_event_error(error)?;
                         }
                     }
                     Ok(None) => break,
@@ -3310,6 +3368,14 @@ where
                     match action(self) {
                         Ok(progress) => changed |= progress,
                         Err(error) => {
+                            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                            if matches!(error, AdaptiveManagerError::AdmissionClosed)
+                                && self.cohort_action_expired(Instant::now())
+                            {
+                                self.begin_root_quiesce(self.cleanup_until()?)?;
+                                changed = true;
+                                break;
+                            }
                             self.record_failure(error);
                             break;
                         }
@@ -3360,6 +3426,23 @@ where
             }
         }
         Ok(changed)
+    }
+    /// These event handlers return a future-admission error only after
+    /// retaining the original owner, receipt/report and deferred commit.
+    /// Their actual terminal must still drain when a cohort window expires.
+    fn physical_event_error(
+        &mut self,
+        error: AdaptiveManagerError,
+    ) -> Result<(), AdaptiveManagerError> {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if matches!(error, AdaptiveManagerError::AdmissionClosed)
+            && self.cohort_action_expired(Instant::now())
+        {
+            self.begin_root_quiesce(self.cleanup_until()?)?;
+            return Ok(());
+        }
+        self.record_failure(error);
+        Ok(())
     }
     fn schedule_root_round(&mut self) -> Result<bool, AdaptiveManagerError> {
         if !self.root_started
@@ -3969,8 +4052,8 @@ where
                         let receipt = native_receipt.ok_or(AdaptiveManagerError::Invalid(
                             "reciprocal acceptance has no actual native-owner receipt",
                         ))?;
-                        if self.phase == ManagerPhase::Running && self.check_running().is_ok() {
-                            let now = self.check_running()?;
+                        if let (ManagerPhase::Running, Ok(now)) = (self.phase, self.check_running())
+                        {
                             match self.registry.accept_reciprocal_native(
                                 receipt,
                                 self.clock.domain(),
@@ -4007,8 +4090,8 @@ where
                         let receipt = native_receipt.ok_or(AdaptiveManagerError::Invalid(
                             "P/V acceptance has no actual native-owner receipt",
                         ))?;
-                        if self.phase == ManagerPhase::Running && self.check_running().is_ok() {
-                            let now = self.check_running()?;
+                        if let (ManagerPhase::Running, Ok(now)) = (self.phase, self.check_running())
+                        {
                             if let Err(rejected) = self.registry.confirm_native_acceptance(
                                 receipt,
                                 self.clock.domain(),
@@ -4596,6 +4679,11 @@ where
             }
             if self.roles[index].queue_admitted_at.is_some() {
                 return Err(AdaptiveManagerError::Invalid("duplicate queue admission"));
+            }
+            // Preserve the original prepared ticket if a collector callback
+            // crossed its future-admission window before actual enqueue.
+            if !self.can_admit_work() {
+                break;
             }
             match self
                 .native
@@ -5891,7 +5979,11 @@ where
             None
         };
         let native_worker_limit = advice.map_or(0, |advice| usize::from(advice.workers));
-        let mut changed = peers_changed || reciprocal_changed;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let cohort_changed = self.maybe_admit_utility_cohort()?;
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        let cohort_changed = false;
+        let mut changed = peers_changed || reciprocal_changed || cohort_changed;
         if advice.is_some_and(|advice| advice.yield_selected_worker) {
             if let Some(selection) = self.advised_yield.take() {
                 // Advice and delivery refer to the same original execution;
@@ -7078,6 +7170,35 @@ where
             self.release_frontier_before_enqueue(native_frontier, rejected.proof())?;
             return Err(error);
         }
+        let final_admission_error = self
+            .check_running()
+            .err()
+            .or_else(|| (!self.can_admit_work()).then_some(AdaptiveManagerError::AdmissionClosed));
+        if let Some(admission_error) = final_admission_error {
+            let rejected = self.own[index]
+                .worker
+                .as_ref()
+                .expect("same paused CPU worker")
+                .reject_unsubmitted_resume(grant);
+            self.own[index].binding = Some(binding);
+            let rejected = match rejected {
+                Ok(rejected) => rejected,
+                Err(error) => {
+                    if let Some(reservation) = native_frontier {
+                        self.retain_frontier_unknown(reservation);
+                    }
+                    return Err(error.into());
+                }
+            };
+            self.release_frontier_before_enqueue(native_frontier, rejected.proof())?;
+            let binding = self.own[index]
+                .binding
+                .as_ref()
+                .expect("same paused custody");
+            self.driver
+                .cpu_rejected(&binding.work, &binding.envelope, rejected.proof())?;
+            return Err(admission_error);
+        }
         let submitted = match reply {
             Some(reply) => self.own[index]
                 .worker
@@ -7409,6 +7530,10 @@ where
         let until = self
             .cleanup_boundary
             .map_or(until, |boundary| boundary.cap(until));
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let until = self
+            .cohort_cleanup_ceiling()
+            .map_or(until, |cap| cap.min(until));
         if self.phase == ManagerPhase::Finished {
             return Ok(());
         }
@@ -7835,15 +7960,21 @@ where
             if self.phase == ManagerPhase::Finished {
                 return Ok(());
             }
-            if Instant::now() >= until {
-                self.begin_selected_shutdown(until)?;
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            let owner_until = self
+                .cohort_cleanup_ceiling()
+                .map_or(until, |cap| cap.min(until));
+            #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+            let owner_until = until;
+            if Instant::now() >= owner_until {
+                self.begin_selected_shutdown(owner_until)?;
                 self.tick()?;
                 return Ok(());
             }
             if !changed {
                 // The closing poll bounds the scheduling gap between final
                 // owner notify and JoinHandle::is_finished publication.
-                let wait = until
+                let wait = owner_until
                     .saturating_duration_since(Instant::now())
                     .min(Duration::from_millis(10));
                 self.counters.notification_waits += 1;

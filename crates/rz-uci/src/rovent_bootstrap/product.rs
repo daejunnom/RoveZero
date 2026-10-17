@@ -51,6 +51,9 @@ use std::{
 };
 
 type PcrDriver = AdaptiveSessionDriver<RoventNativeBackend<AdaptivePortQuestion>>;
+// A product's single Arc owns exactly one selected driver for the whole
+// session, including physical shutdown and retained-source custody.
+#[allow(clippy::large_enum_variant)]
 enum ActualProductDriver {
     Pc(RoventPcSessionDriver),
     Pcr(PcrDriver),
@@ -62,9 +65,23 @@ enum ActualProductDriver {
 pub struct RoventNativeProductDriver {
     inner: Arc<ActualProductDriver>,
     sources: Arc<RoventPinnedNativeSources>,
-    physically_closed: AtomicBool,
+    physically_closed: Arc<AtomicBool>,
     retirement_sources: Option<Arc<LaunchRetirementRegistrationCustody>>,
 }
+
+/// Read-only observation of the same product's existing finish boundary.
+/// Only finish_session's actual Confirmed result can set the private state.
+pub(crate) struct RoventProductPhysicalClose {
+    closed: Arc<AtomicBool>,
+}
+impl RoventProductPhysicalClose {
+    pub(crate) fn is_confirmed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+// One startup rejection retains the actual prepared/rejected owners and source
+// pins. Variant size must not change their existing transfer or drop boundary.
+#[allow(clippy::large_enum_variant)]
 pub enum RoventProductStartupOwners {
     Pc(PreparedRoventNative<PcPortQuestion>),
     Pcr(PreparedRoventNative<AdaptivePortQuestion>),
@@ -139,7 +156,7 @@ impl RoventNativeProductDriver {
         Ok(Self {
             inner: Arc::new(ActualProductDriver::Pcr(driver)),
             sources,
-            physically_closed: AtomicBool::new(false),
+            physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: Some(registration),
         })
     }
@@ -164,7 +181,7 @@ impl RoventNativeProductDriver {
         Ok(Self {
             inner: Arc::new(ActualProductDriver::Nnuec(driver)),
             sources,
-            physically_closed: AtomicBool::new(false),
+            physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
         })
     }
@@ -196,7 +213,7 @@ impl RoventNativeProductDriver {
         Ok(Self {
             inner: Arc::new(ActualProductDriver::Nnuec(driver)),
             sources,
-            physically_closed: AtomicBool::new(false),
+            physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
         })
     }
@@ -219,7 +236,7 @@ impl RoventNativeProductDriver {
         Ok(Self {
             inner: Arc::new(ActualProductDriver::Pc(driver)),
             sources,
-            physically_closed: AtomicBool::new(false),
+            physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
         })
     }
@@ -250,7 +267,7 @@ impl RoventNativeProductDriver {
         Ok(Self {
             inner: Arc::new(ActualProductDriver::Pc(driver)),
             sources,
-            physically_closed: AtomicBool::new(false),
+            physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
         })
     }
@@ -584,10 +601,16 @@ impl RoventNativeProductDriver {
         Ok(Self {
             inner: Arc::new(ActualProductDriver::Pcr(driver)),
             sources: pins,
-            physically_closed: AtomicBool::new(false),
+            physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
         })
     }
+    pub(crate) fn physical_close_observation(&self) -> RoventProductPhysicalClose {
+        RoventProductPhysicalClose {
+            closed: Arc::clone(&self.physically_closed),
+        }
+    }
+
     fn actual(&self) -> &dyn SearchSessionDriver {
         match self.inner.as_ref() {
             ActualProductDriver::Pc(driver) => driver,

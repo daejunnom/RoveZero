@@ -101,7 +101,13 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/pals/engine/adaptive_port/role_commit.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/utility_dependencies.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/utility_route.rs"),
+            source!(
+                "crates/rz-search/src/pals/engine/adaptive_port/utility_route/conditional_witness.rs"
+            ),
             source!("crates/rz-search/src/pals/engine/adaptive_port/validator_port.rs"),
+            source!(
+                "crates/rz-search/src/pals/engine/adaptive_port/validator_port/observation_writer.rs"
+            ),
             source!("crates/rz-search/src/pals/engine/adaptive_root.rs"),
             source!("crates/rz-search/src/pals/engine/archive_lifecycle.rs"),
             source!("crates/rz-search/src/pals/engine/cpu_lifecycle.rs"),
@@ -238,7 +244,13 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/pals/engine/adaptive_port/role_commit.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/utility_dependencies.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/utility_route.rs"),
+            source!(
+                "crates/rz-search/src/pals/engine/adaptive_port/utility_route/conditional_witness.rs"
+            ),
             source!("crates/rz-search/src/pals/engine/adaptive_port/validator_port.rs"),
+            source!(
+                "crates/rz-search/src/pals/engine/adaptive_port/validator_port/observation_writer.rs"
+            ),
             source!("crates/rz-search/src/pals/engine/archive_lifecycle.rs"),
             source!("crates/rz-search/src/pals/engine/cpu_lifecycle.rs"),
             source!("crates/rz-search/src/pals/engine/followup_execution.rs"),
@@ -299,6 +311,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_adaptive/manager/registered_ledger.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/researcher_resources.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/role_only.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/manager/utility_cohort.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/utility_route.rs"),
             source!("crates/rz-uci/src/pals_adaptive/native_accounting.rs"),
             source!("crates/rz-uci/src/pals_adaptive/projection.rs"),
@@ -312,6 +325,8 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_adaptive/session_driver/profiled_retirement.rs"),
             source!("crates/rz-uci/src/pals_adaptive/session_driver/root_admission.rs"),
             source!("crates/rz-uci/src/pals_adaptive/session_driver/rovent_external.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/utility_cohort.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/utility_cohort_historical.rs"),
             source!("crates/rz-uci/src/pals_adaptive/utility_route.rs"),
             source!("crates/rz-uci/src/pals_adaptive/validator.rs"),
             source!("crates/rz-uci/src/pals_adaptive_sources.rs"),
@@ -429,6 +444,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_adaptive/manager/registered_ledger.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/researcher_resources.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/role_only.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/manager/utility_cohort.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/utility_route.rs"),
             source!("crates/rz-uci/src/pals_adaptive/native_accounting.rs"),
             source!("crates/rz-uci/src/pals_adaptive/projection.rs"),
@@ -444,6 +460,8 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_adaptive/session_driver/root_admission.rs"),
             source!("crates/rz-uci/src/pals_adaptive/session_driver/rovent.rs"),
             source!("crates/rz-uci/src/pals_adaptive/session_driver/rovent_external.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/utility_cohort.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/utility_cohort_historical.rs"),
             source!("crates/rz-uci/src/pals_adaptive/utility_route.rs"),
             source!("crates/rz-uci/src/pals_adaptive/validator.rs"),
             source!("crates/rz-uci/src/pals_adaptive_bootstrap.rs"),

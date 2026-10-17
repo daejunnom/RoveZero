@@ -630,6 +630,54 @@ fn checked(step: AdaptivePortMaterializedStep) -> CheckedStep<AdaptivePortQuesti
     }
 }
 impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for AdaptivePortDriver<M> {
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn utility_cohort_common_work(
+        &self,
+    ) -> Result<
+        Option<(
+            Option<u64>,
+            rz_search::pals::rovent_frontier::FrontierNodeWork,
+        )>,
+        AdaptiveManagerError,
+    > {
+        Ok(self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .rovent_frontier()
+            .map(|frontier| {
+                let snapshot = frontier.snapshot();
+                (snapshot.requested_nodes, snapshot.work)
+            }))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn freeze_utility_witness_bodies(
+        &self,
+        outcome: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteSemanticOutcome,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityConditionalWitnessBodies,
+        AdaptiveManagerError,
+    > {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .freeze_utility_witness_bodies(outcome)
+            .map_err(semantic)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn utility_cohort_offer_semantics(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::UtilityCohortOfferSemanticSource,
+        AdaptiveManagerError,
+    > {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .utility_cohort_offer_semantics(work)
+            .map_err(semantic)
+    }
     fn prepare_utility_route(
         &mut self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,

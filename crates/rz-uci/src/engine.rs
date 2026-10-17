@@ -851,8 +851,10 @@ impl Owner {
         if let (Some(driver), Some(original_go)) = (&self.driver, &original_go) {
             if let Err(error) = driver.validate_go(session.snapshot().rules_position(), original_go)
             {
-                let mut rejected = SessionResult::default();
-                rejected.accepted = false;
+                let mut rejected = SessionResult {
+                    accepted: false,
+                    ..SessionResult::default()
+                };
                 rejected.diagnostics.push(Diagnostic {
                     code: "DriverGoRejected",
                     message: error.to_string(),
@@ -878,8 +880,10 @@ impl Owner {
                     driver.search_goal_capability(),
                     crate::bridge::NodeBudgetSemantics::RoventPositionVisits,
                 ) {
-                    let mut rejected = SessionResult::default();
-                    rejected.accepted = false;
+                    let mut rejected = SessionResult {
+                        accepted: false,
+                        ..SessionResult::default()
+                    };
                     rejected.diagnostics.push(Diagnostic {
                         code: "PonderClockRejected",
                         message: error.to_string(),
@@ -2528,6 +2532,9 @@ fn append_result<S>(out: &mut SessionResult<S>, next: SessionResult<S>) {
     out.accepted &= next.accepted;
 }
 
+// Preserve the exact rejected receipt on bounded retention failure without a
+// new allocation on that failure path.
+#[allow(clippy::result_large_err)]
 fn consume_pump_diagnostic(
     event: &rz_search::contracts::ContractPumpEvent,
     receipts: &Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>,
@@ -2579,6 +2586,9 @@ fn consume_pump_diagnostic(
     retained
 }
 
+// The 32-class owner returns an overflow/poisoned receipt intact; allocating a
+// replacement error must not become a prerequisite for preserving that receipt.
+#[allow(clippy::result_large_err)]
 fn retain_diagnostic(
     receipts: &Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>,
     receipt: WorkerDiagnosticReceipt,

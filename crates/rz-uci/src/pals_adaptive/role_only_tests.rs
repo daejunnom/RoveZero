@@ -259,9 +259,7 @@ fn role_only_fixture_on_clock(
     (manager, facts, until)
 }
 
-/// The actual Session issues this source's Start. The manager/native fixture
-/// uses that same process origin; no readonly handle can mint a new root.
-fn ponder_role_fixture() -> (
+type PonderRoleFixture = (
     RoleOnlyExecutionManager<u64, NativeFixture, RoleOnlyFixture>,
     Arc<NativeFacts>,
     crate::rovent_ponder::RoventPonderClockOwner,
@@ -269,7 +267,11 @@ fn ponder_role_fixture() -> (
     crate::SearchTicket,
     crate::engine::ProcessClock,
     Instant,
-) {
+);
+
+/// The actual Session issues this source's Start. The manager/native fixture
+/// uses that same process origin; no readonly handle can mint a new root.
+fn ponder_role_fixture() -> PonderRoleFixture {
     use crate::bridge::BuildSearchSettings;
     use crate::engine::{ProcessClock, driver_start_fixture};
     use crate::parser::GoLimits;

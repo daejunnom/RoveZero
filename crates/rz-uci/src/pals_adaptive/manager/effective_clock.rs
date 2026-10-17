@@ -53,6 +53,10 @@ where
     }
     pub fn can_admit_work(&self) -> bool {
         let now = Instant::now();
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self.cohort_action_expired(now) {
+            return false;
+        }
         self.effective_clock
             .as_ref()
             .is_none_or(|handle| handle.snapshot(now).can_admit(now))

@@ -46,6 +46,9 @@ impl PositionPort for FixturePositionPort {
     }
 }
 
+// One fixture invocation returns its actual Start context or Rules-only result.
+// Neither variant is queued or reconstructs the other's admission authority.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum FixtureStart {
     Started(SearchSessionContext),
     RulesOnly(SessionResult<Position>),

@@ -2,6 +2,10 @@
 //! model, Store or controller is created by these optional manager hooks.
 use super::*;
 
+// There is at most one original unsettled packet per actual worker while the
+// semantic owner is away; new Job/Resume admission is then blocked. Retaining
+// this packet does not enlarge the manager's 64/8/16 Job/command/role ceilings.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum NativeFrontierEvent {
     Settled {
         reservation: NativeReservation,

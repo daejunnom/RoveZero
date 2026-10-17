@@ -42,6 +42,10 @@ pub use collection::{
 use nnuec::PinnedNnuecArtifacts;
 
 const MAX_GRAPH_BYTES: u64 = 1 << 30;
+
+/// Original CUDA inventory metadata bytes and their declared file SHA-256.
+/// Reading these bytes does not create a runtime or physical completion proof.
+pub(crate) type CudaInventoryBytesAndSha256 = (Vec<u8>, [u8; 32]);
 const MAX_WEIGHTS_BYTES: u64 = 8 << 30;
 const MAX_PROVENANCE_BYTES: u64 = 16 << 20;
 
@@ -420,7 +424,9 @@ impl RoventPinnedNativeSources {
             .as_ref()
             .map(|blob| parse_sha256(&blob.declaration.sha256).expect("admitted inventory digest"))
     }
-    pub(crate) fn cuda_inventory_bytes(&self) -> Result<Option<(Vec<u8>, [u8; 32])>, BackendError> {
+    pub(crate) fn cuda_inventory_bytes(
+        &self,
+    ) -> Result<Option<CudaInventoryBytesAndSha256>, BackendError> {
         self.control
             .as_ref()
             .map(|blob| {

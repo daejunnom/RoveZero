@@ -248,7 +248,9 @@ impl PreparedRoventExternalLaunch {
 
     /// 실제 source state는 실패 시 이 원 launch/FD를 다음 root 또는 명시
     /// 정리까지 보존한다. low worker에는 FD 복제만 넘기며 가중치 bytes는 복사하지 않는다.
-    #[allow(clippy::too_many_arguments)]
+    // Return the same launch and original FDs on pre-spawn rejection without
+    // introducing an allocation that could itself lose that failure custody.
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     pub fn spawn_pinned_retaining(
         self,
         executable: File,

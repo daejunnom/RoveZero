@@ -8,6 +8,9 @@ use rz_search::cpu::{CpuReciprocalReply, CpuReciprocalRequest};
 use rz_search::pals::coordinator::AcceptedRoleStep;
 
 impl DriverFixture {
+    // Exercise the independent original work, accepted head/output, question
+    // identity, mode, budget and recipient checks used by the actual boundary.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn fixture_prepare_peer(
         &mut self,
         work: &CoordinatorWork<ReviewView, u64>,

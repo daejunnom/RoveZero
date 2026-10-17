@@ -6,7 +6,7 @@
 
 use super::{LaunchRetirementEvidence, RoventLaunchError};
 use crate::EngineIdentity;
-use crate::engine::{OwnerRegistry, ProcessClock};
+use crate::engine::{EngineSettings, OwnerRegistry, ProcessClock};
 use crate::pals_native::ticketed::VirtualReviewCollectionObserver;
 use crate::rovent_bootstrap::nnuec_source::LoadedRoventNnuecSource;
 use crate::rovent_bootstrap::product::{RoventNativeProductDriver, RoventProductStartupRejection};
@@ -83,6 +83,7 @@ pub fn run_collection<'a>(
             assemble: Box::new(assemble),
         }),
         None,
+        None,
     )
 }
 
@@ -106,5 +107,38 @@ pub fn run_collection_with_resource_admission<'a>(
             assemble: Box::new(assemble),
         }),
         Some(Box::new(admit_resource)),
+        None,
+    )
+}
+
+/// 같은 원 제품과 FD 수명 안에서 유한한 실제 UCI runner를 사용한다.
+/// runner는 공개 EngineProcess/event/serve 경로로 각 원 go를 발급하고
+/// actual finish_session을 완료해야 한다. 반환값으로 물리 완료를 만들지 않는다.
+pub fn run_collection_with_driver<'a>(
+    arguments: Vec<String>,
+    teacher_selections: Vec<RoventTeacherSourceSelection>,
+    observer: Box<dyn VirtualReviewCollectionObserver>,
+    admit_resource: impl FnOnce(&Arc<RoventInputLock>) -> Result<(), RoventLaunchError> + 'a,
+    assemble: impl FnOnce(
+        RoventCollectionPreparedLaunch,
+    ) -> Result<RoventNativeProductDriver, RoventProductStartupRejection>
+    + 'a,
+    run: impl FnOnce(
+        RoventNativeProductDriver,
+        ProcessClock,
+        Arc<OwnerRegistry>,
+        EngineSettings,
+    ) -> Result<(), RoventLaunchError>
+    + 'a,
+) -> Result<(), RoventLaunchError> {
+    super::run_inner(
+        arguments,
+        Some(CollectionLaunch {
+            teacher_selections,
+            observer,
+            assemble: Box::new(assemble),
+        }),
+        Some(Box::new(admit_resource)),
+        Some(Box::new(run)),
     )
 }

@@ -153,6 +153,8 @@ where
             nnuec_observations_omitted: 0,
             cpu_semantic: None,
             utility_route: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            utility_cohort: None,
             utility_route_sequence: 0,
             retained_cpu_jobs: Vec::new(),
         }

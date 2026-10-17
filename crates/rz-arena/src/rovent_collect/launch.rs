@@ -1030,6 +1030,7 @@ pub fn run_rovent_collection(
                         })),
                         external_teacher: None,
                         utility_route_completed,
+                        utility_trial_retired: None,
                         cooperative: Some(poll),
                     };
                     match native {

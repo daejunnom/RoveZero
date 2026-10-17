@@ -627,6 +627,9 @@ impl RoventNnuecSessionDriver {
         )
     }
 
+    // Keep the original native/cleanup owners, context/admission, sequence and
+    // game identity separate while applying their existing cleanup gate.
+    #[allow(clippy::too_many_arguments)]
     fn cleanup_initial(
         &self,
         native: NativeOwner,
@@ -1687,6 +1690,14 @@ impl RoventNnuecSessionDriver {
                 ));
             }
         };
+        let retirement_deadline = context.shutdown_deadline;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let retirement_deadline = utility_route
+            .as_ref()
+            .and_then(|pending| pending.cohort_cleanup_deadline())
+            .map_or(retirement_deadline, |cutoff| {
+                retirement_deadline.min(cutoff)
+            });
         let mut parts = match manager.into_nnuec_root_parts() {
             Ok(p) => p,
             Err(r) => {
@@ -1744,7 +1755,7 @@ impl RoventNnuecSessionDriver {
             }
         }
         let mut retired = loop {
-            if Instant::now() >= context.shutdown_deadline {
+            if Instant::now() >= retirement_deadline {
                 return Err(self.retain(
                     (parts.native, retirement),
                     "RoventNnuecRetirementDeadline",
@@ -1770,12 +1781,58 @@ impl RoventNnuecSessionDriver {
             }
             signal.wait_changed(
                 observed,
-                context
-                    .shutdown_deadline
+                retirement_deadline
                     .saturating_duration_since(Instant::now())
                     .min(Duration::from_millis(1)),
             );
         };
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if retired.utility_route.is_some() && retired.utility_cohort.is_some() {
+            return Err(self.retain(
+                (parts.native, retired, receipt),
+                "RoventNnuecUtilityRetirementKind",
+                "one original retirement returned both root-local and cohort outputs",
+            ));
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let Some(trial) = retired.utility_cohort.take() {
+            // This is the physical cap produced from the original cohort
+            // admission and actual RetiredResearcherOwner. A root-local
+            // Completed action never supplies this independent trial source.
+            if !collection_admitted
+                || trial.authority() != context.authority
+                || !trial.matches_root_admission(&receipt.root_admission)
+            {
+                return Err(self.retain(
+                    (parts.native, retired, trial, receipt),
+                    "RoventNnuecUtilityTrialScope",
+                    "cohort retirement differs from the original collection root admission",
+                ));
+            }
+            let Some(observer) = &self.collection_hooks.utility_trial_retired else {
+                return Err(self.retain(
+                    (parts.native, retired, trial, receipt),
+                    "RoventNnuecUtilityTrialObserverMissing",
+                    "actual cohort retirement has no final trial consumer",
+                ));
+            };
+            match catch_unwind(AssertUnwindSafe(|| observer(&trial))) {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => {
+                    let detail = error.to_string();
+                    return Err(self.retain(
+                        (parts.native, retired, trial, receipt, error),
+                        "RoventNnuecUtilityTrialPublication",
+                        &detail,
+                    ));
+                }
+                Err(payload) => return Err(self.retain(
+                    (parts.native, retired, trial, receipt, payload),
+                    "RoventNnuecUtilityTrialPublicationPanic",
+                    "cohort trial consumer panicked; original physical cap and actual owners retained",
+                )),
+            }
+        }
         if let Some(completed) = retired.utility_route.take() {
             // Cloning this historical Arc grants no execution or preparation
             // authority. Keep the original cap even if its consumer fails.

@@ -51,7 +51,7 @@ mod evidence;
 use collection::CollectionLaunch;
 pub use collection::{
     RoventCollectionPreparedLaunch, RoventCollectionPreparedNative, run_collection,
-    run_collection_with_resource_admission,
+    run_collection_with_driver, run_collection_with_resource_admission,
 };
 pub use evidence::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 
@@ -263,7 +263,7 @@ impl ExternalSelectionWire {
 /// The caller passes only process arguments. No account, token or external
 /// credential file is inspected by this native UCI entry.
 pub fn run(arguments: Vec<String>) -> Result<(), RoventLaunchError> {
-    run_inner(arguments, None, None)
+    run_inner(arguments, None, None, None)
 }
 
 /// 같은 원 lock으로 자원 admission을 한 번 수행한 뒤 native launch를 잇는다.
@@ -273,16 +273,27 @@ pub fn run_with_resource_admission<'a>(
     arguments: Vec<String>,
     admit_resource: impl FnOnce(&Arc<RoventInputLock>) -> Result<(), RoventLaunchError> + 'a,
 ) -> Result<(), RoventLaunchError> {
-    run_inner(arguments, None, Some(Box::new(admit_resource)))
+    run_inner(arguments, None, Some(Box::new(admit_resource)), None)
 }
 
 type ResourceAdmission<'a> =
     Box<dyn FnOnce(&Arc<RoventInputLock>) -> Result<(), RoventLaunchError> + 'a>;
 
+type ProductRunner<'a> = Box<
+    dyn FnOnce(
+            RoventNativeProductDriver,
+            ProcessClock,
+            Arc<OwnerRegistry>,
+            EngineSettings,
+        ) -> Result<(), RoventLaunchError>
+        + 'a,
+>;
+
 fn run_inner<'a>(
     arguments: Vec<String>,
     collection: Option<CollectionLaunch<'a>>,
     resource_admission: Option<ResourceAdmission<'a>>,
+    product_runner: Option<ProductRunner<'a>>,
 ) -> Result<(), RoventLaunchError> {
     if arguments == ["--build-capabilities-json"] {
         let sources = super::process_boundary::compiled_process_source_components()
@@ -636,14 +647,41 @@ fn run_inner<'a>(
         _ => unreachable!("paired private Collection source and assembly request"),
     }
     .map_err(|failure| reject_product(failure, cleanup_until))?;
-    let mut settings = EngineSettings::default();
-    settings.shutdown_limit = Duration::from_millis(lock.manifest.cleanup_max_ms);
+    let mut settings = EngineSettings {
+        shutdown_limit: Duration::from_millis(lock.manifest.cleanup_max_ms),
+        ..EngineSettings::default()
+    };
     settings.search.untimed_limit = Duration::from_millis(lock.manifest.wall_time_max_ms);
-    let driver: Arc<dyn SearchSessionDriver> = Arc::new(driver);
     // Keep original startup lock/selection/binary/cwd descriptors alive through
     // the same UCI whole-session physical finish, rather than a detached SSH job.
-    let result = serve_driver(driver, clock, owners, settings)
-        .map_err(|failure| error("UciSession", failure));
+    let result = match product_runner {
+        Some(run) => {
+            // The callback gets the real owner, not a forged report or root.
+            // Returning Ok without its actual physical finish is not success.
+            let completion = driver.physical_close_observation();
+            let result = run(driver, clock, owners, settings);
+            if completion.is_confirmed() {
+                result
+            } else {
+                Err(error(
+                    "PhysicalCompletionUnknown",
+                    match result {
+                        Ok(()) => {
+                            "finite product runner returned before actual physical finish".into()
+                        }
+                        Err(failure) => format!(
+                            "finite product runner failed before actual physical finish: {failure}"
+                        ),
+                    },
+                ))
+            }
+        }
+        None => {
+            let driver: Arc<dyn SearchSessionDriver> = Arc::new(driver);
+            serve_driver(driver, clock, owners, settings)
+                .map_err(|failure| error("UciSession", failure))
+        }
+    };
     drop(boundary);
     drop((
         external_selection_file,
@@ -674,6 +712,9 @@ fn prepare_launch_native<Q: NativeQuestionProjection>(
     }
 }
 
+// Assembly rejection returns the original prepared/startup owners and pins;
+// retaining them must not require a fresh allocation on the failure path.
+#[allow(clippy::result_large_err)]
 fn assemble_native_product(
     native: RoventCollectionPreparedNative,
     clock: ProcessClock,
@@ -729,8 +770,7 @@ fn read_bounded(file: &File, maximum: u64) -> Result<Vec<u8>, RoventLaunchError>
         return Err(error("BoundedInput", "not a bounded regular input"));
     }
     let mut bytes = Vec::new();
-    (&*file)
-        .take(maximum + 1)
+    file.take(maximum + 1)
         .read_to_end(&mut bytes)
         .map_err(|failure| error("BoundedInput", failure))?;
     if bytes.len() as u64 != metadata.len() {

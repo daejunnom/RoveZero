@@ -9,6 +9,11 @@ use crate::pals_adaptive::{
     AdaptiveCheckerMetadata, AdaptiveManagerError, AdaptiveNnuecRetiredOwner,
     CompletedUtilityRouteAction, UtilityRouteFinalizationRejection, UtilityRoutePendingClosure,
 };
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+use crate::pals_adaptive::{
+    UtilityCohortRootClosureProof, UtilityCohortTrialCustody, UtilityTrialPhysicalRetirement,
+    UtilityTrialRetirementRejection, UtilityUnboundTrialRetirementRejection,
+};
 use rz_contracts::Digest;
 use rz_search::cpu_value::nnuec::v2::retirement::{NnuecCacheInvalidation, NnuecCacheReleaseAck};
 use rz_search::cpu_value::nnuec::v2::review::{PreparationActor, PreparationError, Provenance};
@@ -20,6 +25,8 @@ use rz_search::cpu_worker::{
 use rz_search::pals::engine::adaptive_port::{
     AdaptivePortModel, AdaptivePortQuestion, AdaptivePreparingRootCustody, PreparingRootViewSeal,
 };
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+use rz_search::pals::engine::preparing_root::RetiredResearcherOwner;
 use rz_search::pals::engine::preparing_root::{
     ReleasedResearcherReadback, ResearcherPreparingOwner, ResearcherRetirementRejection,
 };
@@ -182,6 +189,21 @@ struct RetirementOwners {
     utility_route_pending: Option<Box<UtilityRoutePendingClosure<AdaptivePortQuestion>>>,
     utility_route: Option<Box<CompletedUtilityRouteAction>>,
     utility_route_rejection: Option<Box<UtilityRouteFinalizationRejection<AdaptivePortQuestion>>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    utility_cohort: Option<
+        Box<(
+            UtilityCohortTrialCustody<AdaptivePortQuestion>,
+            UtilityCohortRootClosureProof,
+        )>,
+    >,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    retired_researcher: Option<Box<RetiredResearcherOwner<AdaptivePortModel>>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    utility_cohort_bound_rejection:
+        Option<Box<UtilityTrialRetirementRejection<AdaptivePortQuestion>>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    utility_cohort_unbound_rejection:
+        Option<Box<UtilityUnboundTrialRetirementRejection<AdaptivePortQuestion>>>,
 }
 
 #[must_use = "a retirement failure still owns the same engine/actor custody"]
@@ -209,6 +231,8 @@ pub struct NnuecRootRetired {
     pub engine_release: NnuecEngineReleaseAck,
     pub cache_release: NnuecCacheReleaseAck,
     pub utility_route: Option<CompletedUtilityRouteAction>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub utility_cohort: Option<Arc<UtilityTrialPhysicalRetirement>>,
 }
 
 #[must_use = "pending and failure variants retain actual cleanup obligations"]
@@ -252,6 +276,14 @@ impl NnuecRootRetirement {
                 utility_route_pending: None,
                 utility_route: None,
                 utility_route_rejection: None,
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                utility_cohort: None,
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                retired_researcher: None,
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                utility_cohort_bound_rejection: None,
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                utility_cohort_unbound_rejection: None,
             }),
         }
     }
@@ -283,9 +315,17 @@ impl NnuecRootRetirement {
             ));
         }
         let owners = self.owners_mut();
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let cohort_attached = owners.utility_cohort.is_some()
+            || owners.retired_researcher.is_some()
+            || owners.utility_cohort_bound_rejection.is_some()
+            || owners.utility_cohort_unbound_rejection.is_some();
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        let cohort_attached = false;
         if owners.utility_route_pending.is_some()
             || owners.utility_route.is_some()
             || owners.utility_route_rejection.is_some()
+            || cohort_attached
         {
             return Err((
                 NnuecRootRetirementError::Invalid(
@@ -504,6 +544,25 @@ impl NnuecRootRetirement {
                         .invalid("utility finalization differs from original retirement custody");
                 }
                 if let Some(pending) = owners.utility_route_pending.take() {
+                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                    if pending.is_cohort() {
+                        match (*pending).finish_cohort_with_nnuec_release(
+                            &owners.source,
+                            std::slice::from_ref(release),
+                            cache,
+                        ) {
+                            Ok(trial_and_proof) => {
+                                owners.utility_cohort = Some(Box::new(trial_and_proof));
+                            }
+                            Err(rejection) => {
+                                let error = rejection.error.clone();
+                                owners.utility_route_rejection = Some(Box::new(rejection));
+                                return self.fail(NnuecRootRetirementError::UtilityRoute(error));
+                            }
+                        }
+                        self.phase = NnuecRootRetirementPhase::ReturnPreparingOwner;
+                        return NnuecRootRetirementStep::Pending(self);
+                    }
                     // Original handoff pins and actual Store pin zero precede
                     // this original pending owner's final cost boundary. The
                     // leaf observes that boundary; no elapsed duration or
@@ -598,6 +657,49 @@ impl NnuecRootRetirement {
                 };
                 match engine.into_preparing_owner(release, cache, readback) {
                     Ok(retired) => {
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        let utility_cohort =
+                            if let Some(trial_and_proof) = owners.utility_cohort.take() {
+                                let (trial, mut proof) = *trial_and_proof;
+                                let physical = match trial {
+                                    UtilityCohortTrialCustody::Bound(bound) => {
+                                        let materialized = proof.take_materialized();
+                                        match bound.finish_physical_retirement(
+                                            proof,
+                                            materialized,
+                                            &retired,
+                                        ) {
+                                            Ok(physical) => physical,
+                                            Err(rejection) => {
+                                                let error = rejection.error.clone();
+                                                owners.utility_cohort_bound_rejection =
+                                                    Some(Box::new(rejection));
+                                                owners.retired_researcher = Some(Box::new(retired));
+                                                return self.fail(
+                                                    NnuecRootRetirementError::UtilityRoute(error),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    UtilityCohortTrialCustody::Admitted(trial) => {
+                                        match trial.retire_unresolved(proof, &retired) {
+                                            Ok(physical) => physical,
+                                            Err(rejection) => {
+                                                let error = rejection.error.clone();
+                                                owners.utility_cohort_unbound_rejection =
+                                                    Some(Box::new(rejection));
+                                                owners.retired_researcher = Some(Box::new(retired));
+                                                return self.fail(
+                                                    NnuecRootRetirementError::UtilityRoute(error),
+                                                );
+                                            }
+                                        }
+                                    }
+                                };
+                                Some(Arc::new(physical))
+                            } else {
+                                None
+                            };
                         let mut owners = self.owners.take().unwrap();
                         let actor = owners.actor.take().unwrap();
                         return NnuecRootRetirementStep::Ready(NnuecRootRetired {
@@ -606,6 +708,8 @@ impl NnuecRootRetirement {
                             engine_release: retired.engine_release,
                             cache_release: retired.cache_release,
                             utility_route: owners.utility_route.take().map(|completed| *completed),
+                            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                            utility_cohort,
                         });
                     }
                     Err(ResearcherRetirementRejection {

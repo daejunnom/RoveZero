@@ -67,6 +67,9 @@ enum RejectedExternalSource {
     },
 }
 
+// Each session source has one process-state slot. Original launch/FD/worker
+// custody moves between these variants rather than entering an unbounded queue.
+#[allow(clippy::large_enum_variant)]
 enum ExternalProcessState {
     Dormant(DormantExternalSource),
     Running(RoventExternalOwner),
@@ -96,6 +99,9 @@ pub struct RoventExternalSessionSource {
 }
 
 impl RoventExternalSessionSource {
+    // A rejected preparation returns its original source/FD custody without
+    // allocating a replacement error owner on the failure path.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn from_pinned(
         external: RoventPinnedExternalRSource,
     ) -> Result<Self, RoventExternalSourcePreparationRejection> {
@@ -339,6 +345,9 @@ impl RoventExternalSessionSource {
         }
     }
 
+    // Failed adoption returns this same session source and actual error,
+    // preserving launch/worker/FD ownership without a fresh failure allocation.
+    #[allow(clippy::result_large_err)]
     pub(super) fn into_manager(
         mut self,
         root: Arc<RoventRootAdmission>,

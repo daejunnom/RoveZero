@@ -778,6 +778,8 @@ fn prepare_actual(
                         root_admission: Some(hooks.root_admission),
                         root_closure: Some(hooks.root_closure),
                         utility_route_completed: None,
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        utility_trial_retired: None,
                         external_teacher: Some(hooks.teacher_observer),
                         cooperative: None,
                     },

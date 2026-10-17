@@ -187,6 +187,8 @@ pub struct PreparedRoventNative<Q: NativeQuestionProjection = AdaptivePortQuesti
     snapshot: RoventNativeStartupSnapshot,
     /// Retains the exact declaration and descriptor capabilities for startup.
     sources: Arc<RoventPinnedNativeSources>,
+    /// The same successful Ready service owns one lifetime across every origin.
+    product_lifetime: Arc<crate::pals_adaptive::RoventNativeProductLifetime>,
 }
 impl<Q: NativeQuestionProjection> PreparedRoventNative<Q> {
     /// 원 성공 load와 descriptor owner를 보존한다. 실제 root 수집은 별도로
@@ -194,9 +196,10 @@ impl<Q: NativeQuestionProjection> PreparedRoventNative<Q> {
     pub fn collection_identity(
         &self,
     ) -> Result<crate::pals_adaptive::RoventNativeCollectionOrigin, BackendError> {
-        crate::pals_adaptive::RoventNativeCollectionOrigin::from_loaded(
+        crate::pals_adaptive::RoventNativeCollectionOrigin::from_loaded_with_lifetime(
             &self.snapshot,
             Arc::clone(&self.sources),
+            Arc::clone(&self.product_lifetime),
         )
         .map_err(|_| {
             fail(
@@ -371,12 +374,33 @@ fn prepare_native_with_optional_observer<Q: NativeQuestionProjection>(
     if let Err(error) = control.check() {
         return Err(rejected_native(error, native, control.cleanup_until));
     }
+    let product_lifetime = match crate::pals_adaptive::RoventNativeProductLifetime::from_ready(
+        &snapshot,
+        &sources,
+        native
+            .as_deref()
+            .expect("successful startup retains native owner"),
+    ) {
+        Ok(lifetime) => lifetime,
+        Err(error) => {
+            return Err(rejected_native(
+                fail(
+                    K::IdentityMismatch,
+                    "original Ready native lifetime was rejected",
+                )
+                .with_diagnostic("RoventNativeLifetime", &error.to_string()),
+                native,
+                control.cleanup_until,
+            ));
+        }
+    };
     Ok(PreparedRoventNative {
         service: *native
             .take()
             .expect("successful startup retains native owner"),
         snapshot,
         sources,
+        product_lifetime,
     })
 }
 
