@@ -289,10 +289,11 @@ fn raw_receipt_strings_cannot_replace_full_head_evidence() {
         go_sequence: 1,
         completed_depth: 1,
     });
-    assert!(
-        validate_generation_head_evidence(&row, &BTreeMap::from([("e".repeat(64), json!("pass"))]))
-            .is_err()
-    );
+    assert!(validate_generation_head_evidence(
+        &row,
+        &BTreeMap::from([("e".repeat(64), json!("pass"))])
+    )
+    .is_err());
 }
 
 fn teacher_evidence_codec_fixture() -> (GenerationRecordV3, BTreeMap<String, serde_json::Value>) {

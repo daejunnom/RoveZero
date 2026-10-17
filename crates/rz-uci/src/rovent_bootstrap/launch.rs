@@ -2,18 +2,22 @@
 //! fabricated weights path participates in this source-bound native assembly.
 
 use super::configuration::{ExecutionConfiguration, ResearchValueConfiguration};
+use super::external_session::RoventExternalProductStartupOwners;
 use super::nnuec_source::LoadedRoventNnuecSource;
 use super::process_boundary::verify_actual_process_boundary;
 use super::product::{
     RoventNativeProductDriver, RoventProductStartupOwners, RoventProductStartupRejection,
 };
 use super::{
-    RoventNativeAssetSelection, RoventNativeGraphAsset, RoventNativeResources, RoventNativeService,
-    RoventNativeStartupRejection, RoventPinnedNativeSources, RoventStartupControl, prepare_native,
+    PreparedRoventNative, RoventCollectionPreloadSources, RoventExternalRAssetSelection,
+    RoventExternalRSourceSelection, RoventNativeAssetSelection, RoventNativeGraphAsset,
+    RoventNativeResources, RoventNativeService, RoventNativeStartupRejection,
+    RoventPinnedExternalRSource, RoventPinnedNativeSources, RoventStartupControl, prepare_native,
+    prepare_native_with_collection_observer,
 };
 use crate::pals_adaptive::NativeQuestionProjection;
 use crate::pals_adaptive_bootstrap::protocol::serve_driver;
-use crate::pals_native::ticketed::TicketNativeEvent;
+use crate::pals_native::ticketed::{TicketNativeEvent, VirtualReviewCollectionObserver};
 use crate::rovent_root_admission::RoventRootAdmissionPolicy;
 use crate::search_driver::SearchSessionDriver;
 use crate::{
@@ -37,8 +41,15 @@ use std::{
 };
 
 const SELECTION_DOMAIN: &str = "rz-rovent-native-assets/1";
+const EXTERNAL_SELECTION_DOMAIN: &str = "rz-rovent-external-r-sources/1";
 const MAX_LOCK_BYTES: u64 = 1 << 20;
 const MAX_SELECTION_BYTES: u64 = 64 << 10;
+
+mod collection;
+use collection::CollectionLaunch;
+pub use collection::{
+    RoventCollectionPreparedLaunch, RoventCollectionPreparedNative, run_collection,
+};
 
 #[derive(Debug)]
 pub struct RoventLaunchError {
@@ -67,6 +78,7 @@ fn error(stage: &'static str, detail: impl fmt::Display) -> RoventLaunchError {
 struct Arguments {
     input_lock: String,
     native_assets: String,
+    external_r_sources: Option<String>,
     process_epoch: u64,
     startup_ms: u64,
     root_policy: RoventRootAdmissionPolicy,
@@ -75,6 +87,7 @@ impl Arguments {
     fn parse(arguments: &[String]) -> Result<Self, RoventLaunchError> {
         let mut input_lock = None;
         let mut native_assets = None;
+        let mut external_r_sources = None;
         let mut process_epoch = None;
         let mut startup_ms = None;
         let mut root_policy = None;
@@ -86,6 +99,9 @@ impl Arguments {
                 "--input-lock" if input_lock.is_none() => input_lock = Some(private_path(value)?),
                 "--native-assets" if native_assets.is_none() => {
                     native_assets = Some(private_path(value)?)
+                }
+                "--external-r-sources" if external_r_sources.is_none() => {
+                    external_r_sources = Some(private_path(value)?)
                 }
                 "--process-epoch" if process_epoch.is_none() => {
                     process_epoch = Some(number(value, u64::MAX)?)
@@ -112,6 +128,7 @@ impl Arguments {
             input_lock: input_lock.ok_or_else(|| error("Arguments", "--input-lock is required"))?,
             native_assets: native_assets
                 .ok_or_else(|| error("Arguments", "--native-assets is required"))?,
+            external_r_sources,
             process_epoch: process_epoch
                 .ok_or_else(|| error("Arguments", "--process-epoch is required"))?,
             startup_ms: startup_ms.ok_or_else(|| error("Arguments", "--startup-ms is required"))?,
@@ -189,9 +206,39 @@ impl SelectionWire {
     }
 }
 
+/// A separate source mapping leaves the original native-assets /1 codec
+/// unchanged. The mapping itself must be an original pinned provenance input.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalSelectionWire {
+    domain: String,
+    working_directory_snapshot_path: String,
+    assets: Vec<RoventExternalRAssetSelection>,
+}
+impl ExternalSelectionWire {
+    fn parse(bytes: &[u8]) -> Result<RoventExternalRSourceSelection, RoventLaunchError> {
+        let wire: Self = serde_json::from_slice(bytes)
+            .map_err(|_| error("ExternalSources", "strict external source selection JSON"))?;
+        if wire.domain != EXTERNAL_SELECTION_DOMAIN || wire.assets.len() > 32 {
+            return Err(error("ExternalSources", "source domain or asset count"));
+        }
+        Ok(RoventExternalRSourceSelection {
+            working_directory_snapshot_path: private_path(&wire.working_directory_snapshot_path)?,
+            assets: wire.assets,
+        })
+    }
+}
+
 /// The caller passes only process arguments. No account, token or external
 /// credential file is inspected by this native UCI entry.
 pub fn run(arguments: Vec<String>) -> Result<(), RoventLaunchError> {
+    run_inner(arguments, None)
+}
+
+fn run_inner(
+    arguments: Vec<String>,
+    collection: Option<CollectionLaunch<'_>>,
+) -> Result<(), RoventLaunchError> {
     if arguments == ["--build-capabilities-json"] {
         let sources = super::process_boundary::compiled_process_source_components()
             .map_err(|failure| error("CompiledSources", failure))?;
@@ -212,6 +259,14 @@ pub fn run(arguments: Vec<String>) -> Result<(), RoventLaunchError> {
         );
         return Ok(());
     }
+    let (teacher_selections, collection_observer, collection_assemble) = match collection {
+        Some(request) => (
+            Some(request.teacher_selections),
+            Some(request.observer),
+            Some(request.assemble),
+        ),
+        None => (None, None, None),
+    };
     let arguments = Arguments::parse(&arguments)?;
     let cwd = std::env::current_dir().map_err(|failure| error("Cwd", failure))?;
     let root = Dir::open_ambient_dir(&cwd, cap_std::ambient_authority())
@@ -281,30 +336,92 @@ pub fn run(arguments: Vec<String>) -> Result<(), RoventLaunchError> {
         .open_verified_at(&root, MAX_SELECTION_BYTES)
         .map_err(|failure| error("Assets", failure))?;
     let selection = SelectionWire::parse(&read_bounded(&selection_file, MAX_SELECTION_BYTES)?)?;
+    let collection_preload = teacher_selections
+        .map(|selections| {
+            RoventCollectionPreloadSources::open(
+                Arc::clone(&lock),
+                root.try_clone().map_err(|failure| error("Cwd", failure))?,
+                &cwd,
+                selections,
+                &control,
+            )
+            .map(Arc::new)
+            .map_err(|failure| error("CollectionSources", failure))
+        })
+        .transpose()?;
+    let source_root = root.try_clone().map_err(|failure| error("Cwd", failure))?;
     let sources = Arc::new(
-        RoventPinnedNativeSources::open(
-            Arc::clone(&lock),
-            root.try_clone().map_err(|failure| error("Cwd", failure))?,
-            cwd.clone(),
-            selection,
-            &control,
-        )
+        match &collection_preload {
+            Some(preload) => RoventPinnedNativeSources::open_collection(
+                Arc::clone(&lock),
+                source_root,
+                cwd.clone(),
+                selection,
+                &control,
+                Arc::clone(preload),
+            ),
+            None => RoventPinnedNativeSources::open(
+                Arc::clone(&lock),
+                source_root,
+                cwd.clone(),
+                selection,
+                &control,
+            ),
+        }
         .map_err(|failure| error("Assets", failure))?,
     );
     sources
         .configuration()
         .require_supported_native_capabilities()
         .map_err(|failure| error("Capability", failure))?;
-    match sources.configuration().fields().execution {
-        ExecutionConfiguration::RolesOnly { .. } => {}
-        ExecutionConfiguration::OwnResearcher { .. } => {}
-        ExecutionConfiguration::ExternalResearcher { .. } => {
+    let (external_source, external_selection_file) = match (
+        sources.configuration().fields().execution,
+        arguments.external_r_sources.as_deref(),
+    ) {
+        (ExecutionConfiguration::ExternalResearcher { .. }, Some(path)) => {
+            // /1 and /2 have no explicit query selection and remain unsupported.
+            sources
+                .configuration()
+                .external_question_limit()
+                .map_err(|failure| error("ExternalQuestionPolicy", failure))?
+                .ok_or_else(|| {
+                    error("ExternalQuestionPolicy", "explicit external query required")
+                })?;
+            let matching: Vec<_> = lock
+                .manifest
+                .provenance
+                .iter()
+                .filter(|artifact| artifact.path == path)
+                .collect();
+            if matching.len() != 1 {
+                return Err(error(
+                    "ExternalSources",
+                    "selection is not a unique original provenance artifact",
+                ));
+            }
+            let mapping = matching[0]
+                .open_verified_at(&root, MAX_SELECTION_BYTES)
+                .map_err(|failure| error("ExternalSources", failure))?;
+            let selected =
+                ExternalSelectionWire::parse(&read_bounded(&mapping, MAX_SELECTION_BYTES)?)?;
+            let source = RoventPinnedExternalRSource::open(&sources, &selected, &control)
+                .map_err(|failure| error("ExternalSources", failure))?;
+            (Some(source), Some(mapping))
+        }
+        (ExecutionConfiguration::ExternalResearcher { .. }, None) => {
             return Err(error(
-                "Capability",
-                "external-R product assembly is not yet admitted by this entry",
+                "ExternalSources",
+                "--external-r-sources is required for the external researcher",
             ));
         }
-    }
+        (_, Some(_)) => {
+            return Err(error(
+                "ExternalSources",
+                "external source selection requires the external researcher",
+            ));
+        }
+        (_, None) => (None, None),
+    };
     let cuda_profile = if matches!(lock.manifest.engine.pc.device, RoventDevice::Cuda { .. }) {
         let name = format!(
             "rovent-cuda-profile-{}-{}",
@@ -369,46 +486,56 @@ pub fn run(arguments: Vec<String>) -> Result<(), RoventLaunchError> {
         name: format!("Rovent {:?}", lock.manifest.engine.mode),
         author: "Rovent contributors".into(),
     };
-    let driver = if lock.manifest.engine.mode.has_native_r() {
-        let prepared = prepare_native::<AdaptivePortQuestion>(
+    let prepared_product = if lock.manifest.engine.mode.has_native_r() {
+        let prepared = prepare_launch_native::<AdaptivePortQuestion>(
             Arc::clone(&sources),
             resources,
-            clock.runtime_clock(),
+            &clock,
             control.clone(),
+            collection_observer,
         )
         .map_err(|failure| reject_factory(failure, cleanup_until))?;
-        match loaded_nnuec {
-            Some(loaded) => RoventNativeProductDriver::own_nnuec_pcr(
-                prepared,
-                loaded,
-                clock.clone(),
-                Arc::clone(&owners),
-                identity,
-                arguments.root_policy,
-            ),
-            None => RoventNativeProductDriver::own_board_pcr(
-                prepared,
-                clock.clone(),
-                Arc::clone(&owners),
-                identity,
-                arguments.root_policy,
-            ),
+        match (external_source, loaded_nnuec) {
+            (Some(external), None) => RoventCollectionPreparedNative::ExternalPcr {
+                prepared: Box::new(prepared),
+                external: Box::new(external),
+            },
+            (None, Some(loaded)) => RoventCollectionPreparedNative::OwnNnuecPcr {
+                prepared: Box::new(prepared),
+                loaded: Box::new(loaded),
+            },
+            (None, None) => RoventCollectionPreparedNative::OwnBoardPcr(Box::new(prepared)),
+            (Some(_), Some(_)) => unreachable!("exclusive own/external source configuration"),
         }
     } else {
-        let prepared = prepare_native::<PcPortQuestion>(
+        let prepared = prepare_launch_native::<PcPortQuestion>(
             Arc::clone(&sources),
             resources,
-            clock.runtime_clock(),
+            &clock,
             control.clone(),
+            collection_observer,
         )
         .map_err(|failure| reject_factory(failure, cleanup_until))?;
-        RoventNativeProductDriver::pc(
-            prepared,
+        RoventCollectionPreparedNative::Pc(Box::new(prepared))
+    };
+    let driver = match (collection_preload, collection_assemble) {
+        (Some(preload), Some(assemble)) => assemble(RoventCollectionPreparedLaunch {
+            native: prepared_product,
+            preload,
+            control: control.clone(),
+            clock: clock.clone(),
+            owners: Arc::clone(&owners),
+            identity,
+            root_policy: arguments.root_policy,
+        }),
+        (None, None) => assemble_native_product(
+            prepared_product,
             clock.clone(),
             Arc::clone(&owners),
             identity,
             arguments.root_policy,
-        )
+        ),
+        _ => unreachable!("paired private Collection source and assembly request"),
     }
     .map_err(|failure| reject_product(failure, cleanup_until))?;
     let mut settings = EngineSettings::default();
@@ -420,8 +547,77 @@ pub fn run(arguments: Vec<String>) -> Result<(), RoventLaunchError> {
     let result = serve_driver(driver, clock, owners, settings)
         .map_err(|failure| error("UciSession", failure));
     drop(boundary);
-    drop((selection_file, binary, lock_file, root));
+    drop((
+        external_selection_file,
+        selection_file,
+        binary,
+        lock_file,
+        root,
+    ));
     result
+}
+
+fn prepare_launch_native<Q: NativeQuestionProjection>(
+    sources: Arc<RoventPinnedNativeSources>,
+    resources: RoventNativeResources,
+    clock: &ProcessClock,
+    control: RoventStartupControl,
+    observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+) -> Result<PreparedRoventNative<Q>, RoventNativeStartupRejection<Q>> {
+    match observer {
+        Some(observer) => prepare_native_with_collection_observer(
+            sources,
+            resources,
+            clock.runtime_clock(),
+            control,
+            observer,
+        ),
+        None => prepare_native(sources, resources, clock.runtime_clock(), control),
+    }
+}
+
+fn assemble_native_product(
+    native: RoventCollectionPreparedNative,
+    clock: ProcessClock,
+    owners: Arc<OwnerRegistry>,
+    identity: EngineIdentity,
+    root_policy: RoventRootAdmissionPolicy,
+) -> Result<RoventNativeProductDriver, RoventProductStartupRejection> {
+    match native {
+        RoventCollectionPreparedNative::Pc(prepared) => {
+            RoventNativeProductDriver::pc(*prepared, clock, owners, identity, root_policy)
+        }
+        RoventCollectionPreparedNative::OwnBoardPcr(prepared) => {
+            RoventNativeProductDriver::own_board_pcr(
+                *prepared,
+                clock,
+                owners,
+                identity,
+                root_policy,
+            )
+        }
+        RoventCollectionPreparedNative::OwnNnuecPcr { prepared, loaded } => {
+            RoventNativeProductDriver::own_nnuec_pcr(
+                *prepared,
+                *loaded,
+                clock,
+                owners,
+                identity,
+                root_policy,
+            )
+        }
+        RoventCollectionPreparedNative::ExternalPcr { prepared, external } => {
+            RoventNativeProductDriver::external_pcr(
+                *prepared,
+                *external,
+                clock,
+                owners,
+                identity,
+                root_policy,
+                None,
+            )
+        }
+    }
 }
 
 fn read_bounded(file: &File, maximum: u64) -> Result<Vec<u8>, RoventLaunchError> {
@@ -471,6 +667,26 @@ fn reject_product(mut failure: RoventProductStartupRejection, until: Instant) ->
             driver.finish_session(until).is_ok_and(|completion| {
                 completion == Some(crate::search_driver::DriverPhysicalCompletion::Confirmed)
             })
+        }
+        RoventProductStartupOwners::ExternalRejected(rejected) => {
+            match &mut rejected.owners {
+                // These stages own only original dormant descriptors. Keep
+                // the whole rejection alive until native physical cleanup.
+                RoventExternalProductStartupOwners::Prepared { prepared, .. }
+                | RoventExternalProductStartupOwners::SourcePreparation { prepared, .. }
+                | RoventExternalProductStartupOwners::PreparedSource { prepared, .. } => {
+                    drain_native(&mut prepared.service, until)
+                }
+                RoventExternalProductStartupOwners::Session(rejection) => {
+                    drain_native(&mut rejection.sources.native, until)
+                }
+                RoventExternalProductStartupOwners::Driver(driver) => {
+                    driver.finish_session(until).is_ok_and(|completion| {
+                        completion
+                            == Some(crate::search_driver::DriverPhysicalCompletion::Confirmed)
+                    })
+                }
+            }
         }
     };
     if !confirmed {

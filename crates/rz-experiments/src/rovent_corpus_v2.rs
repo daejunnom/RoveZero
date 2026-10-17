@@ -1,12 +1,12 @@
 //! 새 submitted-input/1과 raw/3만 소비하는 명시 Rovent 자료 형식이다.
 //! 기존 manifest/index/record /1을 자동 변환하거나 재라벨하지 않는다.
-use crate::ManifestError;
 use crate::pals_data_v3::*;
 use crate::rovent_corpus::{
-    HEAD_DOMAIN, MAX_CORPUS_ROWS, ORIGIN_DOMAIN, RoventCorpusChunk, RoventCorpusManifest,
-    RoventCorpusOrigin, RoventHeadSource, RoventLineage, RoventNativeLifecycle, RoventTeacherPin,
+    RoventCorpusChunk, RoventCorpusManifest, RoventCorpusOrigin, RoventHeadSource, RoventLineage,
+    RoventNativeLifecycle, RoventTeacherPin, HEAD_DOMAIN, MAX_CORPUS_ROWS, ORIGIN_DOMAIN,
 };
 use crate::rovent_submitted_input::*;
+use crate::ManifestError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -647,8 +647,11 @@ fn validate_head_sources(
             "new WDL exact actual trajectory/Rules result evidence",
         )?;
     }
-    if let Some(target) = &row.targets.divergence {
-        validate_divergence_raw(row, target, &row.head_sources["divergence"])?;
+    if let Some(head) = row.head_sources.get("divergence") {
+        validate_divergence_roster(row, head)?;
+        if let Some(target) = &row.targets.divergence {
+            validate_divergence_raw(row, target, head)?;
+        }
     }
     Ok(())
 }
@@ -676,6 +679,155 @@ fn wdl_expectation(endpoint: &serde_json::Value) -> Result<f32, ManifestError> {
     Ok(wdl[0] - wdl[2])
 }
 
+fn validate_divergence_roster(
+    row: &RoventTrainingRecordV2,
+    head: &RoventHeadSource,
+) -> Result<(), ManifestError> {
+    let raw = &head.raw_receipt;
+    let witness = &raw["witness"];
+    let source = &witness["source"];
+    ensure(
+        exact_fields(
+            raw,
+            &[
+                "schema",
+                "kind",
+                "input_sha256",
+                "anchor",
+                "observed_sequence",
+                "witness",
+            ],
+        ) && raw["schema"] == HEAD_DOMAIN
+            && raw["kind"] == "pc_divergence"
+            && raw["input_sha256"] == row.input_sha256
+            && raw["observed_sequence"].as_u64() == Some(head.observed_sequence)
+            && head.actor_id == row.lineage.actor_id
+            && head.source == "rovent_actual_pc_divergence"
+            && head.binary_sha256.is_none()
+            && head.profile_sha256.is_none()
+            && exact_fields(
+                witness,
+                &[
+                    "schema",
+                    "native_witness_sha256",
+                    "native_hash_kind",
+                    "event_sequence",
+                    "reason",
+                    "resolution",
+                    "target_known",
+                    "source",
+                    "repair",
+                    "recheck",
+                    "repaired_endpoint",
+                    "counter_endpoint",
+                ],
+            )
+            && witness["schema"] == "rz-rovent-pc-divergence-witness/1"
+            && witness["native_witness_sha256"]
+                .as_str()
+                .is_some_and(generation_sha)
+            && matches!(
+                witness["native_hash_kind"].as_str(),
+                Some("frozen_pair" | "unresolved")
+            )
+            && witness["event_sequence"].is_u64()
+            && witness["reason"].as_str().is_some_and(|value| {
+                !value.is_empty() && value.len() <= 4096 && !value.chars().any(char::is_control)
+            })
+            && witness["target_known"].is_boolean()
+            && exact_fields(
+                source,
+                &[
+                    "native_source_sha256",
+                    "accepted",
+                    "root_budget_sha256",
+                    "counter_local_index",
+                    "counter_revision",
+                    "divergence_index",
+                    "divergence_ply",
+                    "first_move",
+                    "proposal",
+                    "counter",
+                    "perspective",
+                ],
+            )
+            && source["native_source_sha256"]
+                .as_str()
+                .is_some_and(generation_sha)
+            && source["root_budget_sha256"]
+                == row.native.raw_retirement["root_admission"]["root_budget_sha256"]
+            && source["accepted"]["ticket"] == row.native.raw_submission["ticket"]
+            && source["accepted"]["output_digest"] == row.native.output_digest,
+        "new divergence exact original raw owner roster/input/output scope",
+    )?;
+    for (key, endpoint) in [
+        ("repair", false),
+        ("recheck", false),
+        ("repaired_endpoint", true),
+        ("counter_endpoint", true),
+    ] {
+        let fact = &witness[key];
+        if !fact.is_null() {
+            ensure(
+                exact_fields(
+                    fact,
+                    if endpoint {
+                        &[
+                            "native_endpoint_sha256",
+                            "accepted",
+                            "line",
+                            "pair",
+                            "model",
+                            "perspective",
+                            "raw_wdl_bits",
+                            "root_wdl_bits",
+                            "physical",
+                        ]
+                    } else {
+                        &[
+                            "native_line_sha256",
+                            "accepted",
+                            "line_id",
+                            "observation_id",
+                            "revision",
+                            "kind",
+                            "moves",
+                        ]
+                    },
+                ),
+                "new divergence optional fact exact roster",
+            )?;
+        }
+    }
+    for fact in [
+        &source["accepted"],
+        &witness["repair"]["accepted"],
+        &witness["recheck"]["accepted"],
+        &witness["repaired_endpoint"]["accepted"],
+        &witness["counter_endpoint"]["accepted"],
+    ] {
+        if !fact.is_null() {
+            ensure(
+                exact_fields(
+                    fact,
+                    &[
+                        "frame",
+                        "ticket",
+                        "output_digest",
+                        "kind",
+                        "peer",
+                        "seal_sha256",
+                    ],
+                ),
+                "new divergence original accepted origin exact roster",
+            )?;
+        }
+    }
+    // Full native binary framing, Rules lines and frozen model joins belong to
+    // rz-arena's historical owner. This structural reader creates no authority.
+    Ok(())
+}
+
 /// 역사적 원 owner body의 의미 대조다. 이 계산은 현재 AcceptedRoleStep이나
 /// 실제 모델 실행 권한을 발급하지 않는다. 원 future native rows의 전수 join과
 /// Rules 수열 재생은 상위 historical owner가 추가로 수행한다.
@@ -685,6 +837,7 @@ pub fn validate_divergence_raw(
     head: &RoventHeadSource,
 ) -> Result<(), ManifestError> {
     target.value(&row.input)?;
+    validate_divergence_roster(row, head)?;
     let raw = &head.raw_receipt;
     let witness = &raw["witness"];
     let source = &witness["source"];
@@ -692,15 +845,24 @@ pub fn validate_divergence_raw(
     ensure(
         exact_fields(
             raw,
-            &["schema", "kind", "input_sha256", "anchor", "witness"],
+            &[
+                "schema",
+                "kind",
+                "input_sha256",
+                "anchor",
+                "observed_sequence",
+                "witness",
+            ],
         ) && raw["schema"] == HEAD_DOMAIN
             && raw["kind"] == "pc_divergence"
-            && head.source == target.source
+            && head.source == "rovent_actual_pc_divergence"
             && head.binary_sha256.is_none()
             && head.profile_sha256.is_none()
             && witness["schema"] == "rz-rovent-pc-divergence-witness/1"
             && witness["event_sequence"].as_u64().is_some_and(|v| v > 0)
-            && witness["witness_sha256"]
+            && witness["native_hash_kind"] == "frozen_pair"
+            && witness["target_known"] == true
+            && witness["native_witness_sha256"]
                 .as_str()
                 .is_some_and(generation_sha)
             && source["counter_local_index"].as_u64()
@@ -714,23 +876,14 @@ pub fn validate_divergence_raw(
         "actual divergence source counter namespace and accepted Repair",
     )?;
     let original = &row.native.raw_submission["ticket"];
-    if counter_ticket != original {
-        let attack = &witness["attack_source"];
-        ensure(
-            attack.is_object()
-                && attack["accepted"]["ticket"] == *original
-                && attack["slot"].as_u64() == Some(u64::from(target.slot))
-                && attack["attack_ply"].as_u64() == Some(u64::from(target.attack_ply))
-                && attack["cycle_sha256"] == source["cycle_sha256"]
-                && attack["cycle_sha256"].as_str().is_some_and(generation_sha),
-            "MissingOriginalAttackSource: future counter cannot be inserted into a past input",
-        )?;
-    } else {
-        ensure(
-            source["divergence_index"].as_u64() == Some(u64::from(target.slot)),
-            "original visible-counter head slot differs from target",
-        )?;
-    }
+    ensure(
+        counter_ticket == original
+            && source["divergence_index"].as_u64() == Some(u64::from(target.slot))
+            && row.input.attack_mapping[usize::from(target.slot)]
+                .selected_counter_local_index
+                .is_some(),
+        "MissingOriginalAttackSource: no capability may insert a future counter into a past input",
+    )?;
     let repair = &witness["repaired_endpoint"];
     let counter = &witness["counter_endpoint"];
     ensure(

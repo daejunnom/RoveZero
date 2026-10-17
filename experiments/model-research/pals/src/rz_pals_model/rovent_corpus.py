@@ -598,11 +598,19 @@ def _head_sources(manifest, record, labels):
                 or uint(source["observed_sequence"]) < snapshot["capture_sequence"]):
             raise ValueError("original head body/anchor/chronology/raw seal mismatch")
         label = labels[head]
+        if head == "divergence" and codec_from_manifest(manifest) is SUBMITTED_CODEC:
+            # A preserved Unknown witness still has a strict original-owner
+            # shape and causal chain. Do not skip those checks just because
+            # it intentionally supplies no optimizer target.
+            from .rovent_divergence_owner import validate_pc_divergence_head
+            validate_pc_divergence_head(record, source, label)
         if label is None:
             continue
         if (source["raw_receipt_sha256"] != label["raw_evidence_sha256"]
                 or source["observed_sequence"] != label["observed_sequence"]):
             raise ValueError("known original head target differs from source receipt")
+        if head == "divergence" and codec_from_manifest(manifest) is SUBMITTED_CODEC:
+            continue  # The exact raw /3 owner witness was joined above.
         if head == "policy":
             _teacher_head(manifest, record, source, label)
         elif head in ("wdl", "nnuec_wdl"):

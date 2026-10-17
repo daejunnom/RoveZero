@@ -18,6 +18,7 @@ fn product_arguments_require_one_explicit_closed_selection_and_policy() {
     let args = Arguments::parse(&arguments()).unwrap();
     assert_eq!(args.root_policy, RoventRootAdmissionPolicy::DynamicGo);
     assert_eq!(args.process_epoch, 23);
+    assert_eq!(args.external_r_sources, None);
     let mut exact = arguments();
     exact[4] = "--root-policy=exact-registered".into();
     assert_eq!(
@@ -49,6 +50,7 @@ fn product_arguments_reject_unregistered_paths_and_unbounded_controls() {
         "--startup-ms=3600001",
         "--startup-ms=+1",
         "--root-policy=legacy-v5",
+        "--external-r-sources=../external.json",
         "--unknown=true",
     ] {
         let mut args = arguments();
@@ -56,6 +58,34 @@ fn product_arguments_reject_unregistered_paths_and_unbounded_controls() {
         args.retain(|argument| argument.split_once('=').unwrap().0 != key);
         args.push(bad.into());
         assert!(Arguments::parse(&args).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn external_source_mapping_is_explicit_closed_and_independent_of_native_assets() {
+    let mut args = arguments();
+    args.push("--external-r-sources=inputs/external-sources.json".into());
+    assert_eq!(
+        Arguments::parse(&args)
+            .unwrap()
+            .external_r_sources
+            .as_deref(),
+        Some("inputs/external-sources.json")
+    );
+    args.push("--external-r-sources=inputs/other.json".into());
+    assert!(Arguments::parse(&args).is_err());
+
+    let wire = br#"{"domain":"rz-rovent-external-r-sources/1","working_directory_snapshot_path":"inputs/external","assets":[]}"#;
+    let selection = ExternalSelectionWire::parse(wire).unwrap();
+    assert_eq!(selection.working_directory_snapshot_path, "inputs/external");
+    assert!(selection.assets.is_empty());
+    for bad in [
+        br#"{"domain":"rz-rovent-native-assets/1","working_directory_snapshot_path":"inputs/external","assets":[]}"#.as_slice(),
+        br#"{"domain":"rz-rovent-external-r-sources/1","working_directory_snapshot_path":"../external","assets":[]}"#.as_slice(),
+        br#"{"domain":"rz-rovent-external-r-sources/1","working_directory_snapshot_path":"inputs/external","assets":[],"external_question_limit":{"kind":"depth","depth":1}}"#.as_slice(),
+        br#"{"domain":"rz-rovent-external-r-sources/1","working_directory_snapshot_path":"inputs/external"}"#.as_slice(),
+    ] {
+        assert!(ExternalSelectionWire::parse(bad).is_err());
     }
 }
 

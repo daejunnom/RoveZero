@@ -1080,6 +1080,8 @@ pub use writer_v2::{FinishedRoventCorpusV2, RoventCorpusWriterV2};
 mod historical_v2;
 mod submitted_review_historical;
 pub use historical_v2::verify_historical_submitted_record_evidence;
+mod divergence_owner;
+pub use divergence_owner::verify_historical_pc_divergence;
 mod r_readout;
 pub use r_readout::*;
 mod r_publication;

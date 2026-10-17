@@ -48,6 +48,13 @@ impl RoventInputCaptureReservationV2 {
             "model_sha256":hex(ticket.representation.model),"encoding_sha256":hex(ticket.representation.encoding),
             "input_digest":hex(ticket.representation.input),"view_digest":hex(ticket.view.view_digest),
             "input_sha256":input_sha256,"ticket":ticket_json(&ticket),"rules_replay":replay,"submitted_review":review});
+        check(
+            serde_json::to_vec(&raw)
+                .map_err(|error| invalid(error.to_string()))?
+                .len()
+                <= GENERATION_MAX_ROW_BYTES,
+            "raw3 original submission exceeds bounded row cap before native dispatch",
+        )?;
         // 이 내부 projection은 물리 owner 처리의 공통 scalar만 전달한다.
         // legacy input/record로 검증·직렬화·게시하는 경로에 전달하지 않는다.
         let common = captured.common_validation_projection();
@@ -80,6 +87,21 @@ pub struct RoventCorpusProducerV2 {
     inputs: BTreeMap<(u64, u64), rz_experiments::rovent_submitted_input::RoventSubmittedInputV1>,
 }
 impl RoventCorpusProducerV2 {
+    /// 원 C row를 보존한 caller가 실제 후속 cycle witness를 나중에 붙인다.
+    /// 수집기 순번과 manager event 순번을 합치거나 과거 입력을 수정하지 않는다.
+    pub fn attach_pc_divergence(
+        &mut self,
+        row: &mut RoventRetiredRecordV2,
+        witness: &rz_search::pals::engine::pc_port::PcDivergenceWitness,
+    ) -> Result<(), ArenaError> {
+        check(
+            row.manifest_sha256 == self.original.manifest_sha256,
+            "divergence row belongs to another original corpus owner",
+        )?;
+        self.validate_admission(&row.admission)?;
+        let observed_sequence = self.original.next()?;
+        divergence_owner::attach_actual_pc_divergence(row, witness, observed_sequence)
+    }
     #[cfg(feature = "pals-collection-onnx")]
     pub(super) fn original_teacher_producer(&self) -> &RoventCorpusProducer {
         &self.original

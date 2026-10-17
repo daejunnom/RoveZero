@@ -198,6 +198,10 @@ fn same_preparing_owner_installs_each_question_and_releases_all_view_pins() {
     };
     let model = authored_untrained_model();
     assert_eq!(model.identity().training, CpuTrainingState::Untrained);
+    let resources = AdaptiveExecutionLimits {
+        paused_bytes_per_worker_max: 128 * 1024,
+        ..AdaptiveExecutionLimits::default()
+    };
     let source = DeferredNnuecRSource::new(
         Arc::clone(&model),
         DeferredNnuecCpuPlan::new(
@@ -208,9 +212,9 @@ fn same_preparing_owner_installs_each_question_and_releases_all_view_pins() {
                 quiescence_ply: 0,
             },
             CpuOrderingPolicy::LegacyMvvLvaV1,
-            128 * 1024,
+            resources.paused_bytes_per_worker_max,
             false,
-            rz_search::cpu_worker::CPU_WORKER_COMMAND_CAPACITY,
+            resources.worker_commands_max,
             None,
         )
         .unwrap(),
@@ -309,7 +313,7 @@ fn same_preparing_owner_installs_each_question_and_releases_all_view_pins() {
     facts.child_gate.store(true, Ordering::Release);
     let owner_facts = Arc::clone(&facts);
     let owner_clock = clock.clone();
-    let native = TicketedNativeService::<ReviewView, AdaptivePortQuestion, NativeFixture>::spawn(
+    let native = TicketedNativeService::<ReviewView, AdaptivePortQuestion, NativeFixture>::spawn_with_capacity(
         move || {
             Ok(NativeFixture {
                 clock: owner_clock,
@@ -318,6 +322,8 @@ fn same_preparing_owner_installs_each_question_and_releases_all_view_pins() {
             })
         },
         TicketServiceLimits::default(),
+        resources.role_tickets_max,
+        resources.worker_commands_max,
     )
     .unwrap();
     let actor = PreparationActor::spawn_notified(Arc::clone(&model), native.signal()).unwrap();
@@ -384,7 +390,7 @@ fn same_preparing_owner_installs_each_question_and_releases_all_view_pins() {
             cpu_device_digest: Digest([125; 32]),
         },
         clock,
-        AdaptiveExecutionLimits::default(),
+        resources,
         AdaptiveRegisteredLedgerSources {
             sources: AdaptiveManagerSources {
                 native,

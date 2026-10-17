@@ -8,10 +8,6 @@ pub fn verify_historical_submitted_record_evidence(
     manifest: &RoventCorpusManifestV2,
 ) -> Result<RoventHistoricalRecordEvidence, ArenaError> {
     record.validate(manifest)?;
-    check(
-        record.targets.divergence.is_none(),
-        "MissingOriginalPcDivergenceHistoricalWitness: actual cross-record owner validation not yet connected",
-    )?;
     let common = common_scope_projection(record);
     let replay: RoventSubmittedRulesReplay =
         serde_json::from_value(record.native.raw_submission["rules_replay"].clone())
@@ -37,10 +33,12 @@ pub fn verify_historical_submitted_record_evidence(
         )?;
     }
     super::submitted_review_historical::verify_historical_submitted_review(record)?;
-    historical_scope::verify_historical_native_scope(
+    let scope = historical_scope::verify_historical_native_scope(
         &common,
         &manifest.common_registration_projection(),
-    )
+    )?;
+    divergence_owner::verify_historical_pc_divergence(record, manifest)?;
+    Ok(scope)
 }
 
 /// 이 값은 공유 계산의 임시 필드 projection뿐이다. schema와 원 raw/3를 그대로
