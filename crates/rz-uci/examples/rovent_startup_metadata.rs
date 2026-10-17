@@ -1,6 +1,7 @@
 //! Bounded, declaration-only metadata for an original Rovent startup JSON file.
 //!
 //! Usage: `rovent_startup_metadata --config=PATH.json [--backend-metadata=PATH.json]`
+//! Optional: `--position-command=position startpos moves e2e4` (one argv value).
 //! The existing startup codec owns validation, canonicalization and domain hashes.
 //! This example never opens referenced assets or creates a native/runtime owner.
 
@@ -24,6 +25,9 @@ fn main() -> std::process::ExitCode {
 mod metadata {
     use rz_eval::error::BackendError;
     use rz_experiments::RoventDevice;
+    use rz_position::contracts::{profile_digest, rules_snapshot_semantic_digest};
+    use rz_position::{BoardMove, Position, PositionError};
+    use rz_uci::parser::{self, Command, ParseError, ParserLimits, PositionBase, PositionSpec};
     use rz_uci::rovent_bootstrap::configuration::{
         LoadingProfile, ROVENT_STARTUP_CONFIGURATION_DOMAIN, StartupConfigurationDocument,
         v2::ROVENT_STARTUP_CONFIGURATION_V2_DOMAIN, v3::ROVENT_STARTUP_CONFIGURATION_V3_DOMAIN,
@@ -53,6 +57,13 @@ mod metadata {
         InputKind,
         InputBudget,
         BackendDeclaration(&'static str),
+        PositionSyntax(ParseError),
+        PositionCommand,
+        PositionRules {
+            stage: &'static str,
+            zero_based_ply: Option<usize>,
+            cause: PositionError,
+        },
         Io {
             stage: &'static str,
             cause: io::Error,
@@ -70,6 +81,9 @@ mod metadata {
                 Self::InputKind => "unsupported_input_file",
                 Self::InputBudget => "configuration_byte_budget",
                 Self::BackendDeclaration(_) => "backend_metadata_declaration_rejected",
+                Self::PositionSyntax(_) => "position_command_syntax_rejected",
+                Self::PositionCommand => "position_command_required",
+                Self::PositionRules { stage, .. } => stage,
                 Self::Io { stage, .. } => stage,
                 Self::Json(_) => "invalid_or_duplicate_json",
                 Self::Configuration(_) => "startup_configuration_rejected",
@@ -82,10 +96,17 @@ mod metadata {
     impl fmt::Display for Error {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
-                Self::Arguments => f.write_str("expected --config=PATH.json and optional --backend-metadata=PATH.json exactly once each"),
+                Self::Arguments => f.write_str("expected --config=PATH.json and optional --backend-metadata=PATH.json / --position-command=POSITION, at most once each"),
                 Self::InputKind => f.write_str("input must be a regular non-symlink JSON file"),
                 Self::InputBudget => f.write_str("each input must contain 1..=65536 bytes"),
                 Self::BackendDeclaration(detail) => f.write_str(detail),
+                Self::PositionSyntax(cause) => write!(f, "position command: {cause}"),
+                Self::PositionCommand => f.write_str("only one UCI position command is accepted"),
+                Self::PositionRules { stage, zero_based_ply, cause } => {
+                    write!(f, "{stage}")?;
+                    if let Some(ply) = zero_based_ply { write!(f, " at zero-based ply {ply}")?; }
+                    write!(f, ": {cause}")
+                }
                 Self::Io { stage, cause } => write!(f, "{stage}: {cause}"),
                 Self::Json(cause) => write!(f, "JSON syntax or duplicate key: {cause}"),
                 Self::Configuration(cause) => write!(f, "startup declaration: {cause}"),
@@ -106,6 +127,23 @@ mod metadata {
     struct Arguments {
         configuration: PathBuf,
         backend_metadata: Option<PathBuf>,
+        position_command: Option<PositionCommand>,
+    }
+    #[derive(Debug, PartialEq, Eq)]
+    struct PositionCommand {
+        raw: String,
+        position: PositionSpec,
+    }
+    fn parse_position_command(raw: &str) -> Result<PositionCommand, Error> {
+        // Use the ordinary bounded parser: 16KiB, at most 2048 moves and its
+        // existing one-line/ASCII/FEN-field syntax. This creates no UCI owner.
+        match parser::parse(raw, ParserLimits::default()).map_err(Error::PositionSyntax)? {
+            Command::Position(position) => Ok(PositionCommand {
+                raw: raw.to_owned(),
+                position,
+            }),
+            _ => Err(Error::PositionCommand),
+        }
     }
     fn json_path(text: &str) -> Result<PathBuf, Error> {
         if text.is_empty() {
@@ -120,6 +158,7 @@ mod metadata {
     fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Arguments, Error> {
         let mut configuration = None;
         let mut backend_metadata = None;
+        let mut position_command = None;
         for argument in arguments {
             let text = argument.to_str().ok_or(Error::Arguments)?;
             if let Some(path) = text.strip_prefix("--config=") {
@@ -132,6 +171,11 @@ mod metadata {
                     return Err(Error::Arguments);
                 }
                 backend_metadata = Some(json_path(path)?);
+            } else if let Some(command) = text.strip_prefix("--position-command=") {
+                if position_command.is_some() {
+                    return Err(Error::Arguments);
+                }
+                position_command = Some(parse_position_command(command)?);
             } else {
                 return Err(Error::Arguments);
             }
@@ -139,6 +183,7 @@ mod metadata {
         Ok(Arguments {
             configuration: configuration.ok_or(Error::Arguments)?,
             backend_metadata,
+            position_command,
         })
     }
 
@@ -385,6 +430,52 @@ mod metadata {
         source_file_snapshot_stability: &'static str,
     }
     #[derive(Serialize)]
+    struct RootMetadata {
+        scope: &'static str,
+        position_command: BytePin,
+        root_state_and_history_sha256: String,
+        rules_profile_sha256: String,
+        root_authority: bool,
+    }
+    fn prepare_root_metadata(command: &PositionCommand) -> Result<RootMetadata, Error> {
+        let mut position = match &command.position.base {
+            PositionBase::StartPos => Position::startpos(),
+            PositionBase::Fen(fen) => {
+                Position::from_fen(fen).map_err(|cause| Error::PositionRules {
+                    stage: "position_base_rejected",
+                    zero_based_ply: None,
+                    cause,
+                })?
+            }
+        };
+        for (ply, raw_move) in command.position.moves.iter().enumerate() {
+            let mv = BoardMove::from_uci(raw_move).map_err(|cause| Error::PositionRules {
+                stage: "position_move_syntax_rejected",
+                zero_based_ply: Some(ply),
+                cause,
+            })?;
+            position
+                .make_move(mv)
+                .map_err(|cause| Error::PositionRules {
+                    stage: "position_move_rejected",
+                    zero_based_ply: Some(ply),
+                    cause,
+                })?;
+        }
+        // from_fen retains Rules' UnknownPrefix; no missing past is invented.
+        // This is a semantic snapshot observation, not a live root/Start seal.
+        Ok(RootMetadata {
+            scope: "rules_snapshot_semantic_observation_only",
+            position_command: byte_pin(command.raw.as_bytes()),
+            root_state_and_history_sha256: hex(&rules_snapshot_semantic_digest(
+                &position.snapshot(),
+            )
+            .0),
+            rules_profile_sha256: hex(&profile_digest().0),
+            root_authority: false,
+        })
+    }
+    #[derive(Serialize)]
     struct Metadata<'a> {
         schema: &'static str,
         scope: &'static str,
@@ -400,9 +491,18 @@ mod metadata {
         actual_startup_ready: bool,
         native_authority: bool,
         training: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        root_metadata: Option<RootMetadata>,
     }
 
     fn prepare_metadata(bytes: &[u8], backend_raw: Option<&[u8]>) -> Result<Vec<u8>, Error> {
+        prepare_metadata_with_position(bytes, backend_raw, None)
+    }
+    fn prepare_metadata_with_position(
+        bytes: &[u8],
+        backend_raw: Option<&[u8]>,
+        position: Option<&PositionCommand>,
+    ) -> Result<Vec<u8>, Error> {
         check_input_budget(bytes)?;
         serde_json::from_slice::<UniqueJson>(bytes).map_err(Error::Json)?;
         let document =
@@ -417,9 +517,18 @@ mod metadata {
         } else {
             "pending_independent_runtime_metadata"
         };
+        let root_metadata = position.map(prepare_root_metadata).transpose()?;
         let output = Metadata {
-            schema: "rz-rovent-startup-metadata/1",
-            scope: "startup_configuration_declarations_only",
+            schema: if root_metadata.is_some() {
+                "rz-rovent-startup-metadata/2"
+            } else {
+                "rz-rovent-startup-metadata/1"
+            },
+            scope: if root_metadata.is_some() {
+                "startup_and_rules_metadata_only"
+            } else {
+                "startup_configuration_declarations_only"
+            },
             configuration_document_domain: match &document {
                 StartupConfigurationDocument::V1(_) => ROVENT_STARTUP_CONFIGURATION_DOMAIN,
                 StartupConfigurationDocument::V2(_) => ROVENT_STARTUP_CONFIGURATION_V2_DOMAIN,
@@ -453,6 +562,7 @@ mod metadata {
             actual_startup_ready: false,
             native_authority: false,
             training: false,
+            root_metadata,
         };
         let mut encoded = serde_json::to_vec(&output).map_err(Error::OutputEncoding)?;
         encoded.push(b'\n');
@@ -511,7 +621,12 @@ mod metadata {
             .as_deref()
             .map(read_configuration)
             .transpose()?;
-        let output = prepare_metadata(&input, backend.as_deref())?;
+        let output = match arguments.position_command.as_ref() {
+            Some(position) => {
+                prepare_metadata_with_position(&input, backend.as_deref(), Some(position))?
+            }
+            None => prepare_metadata(&input, backend.as_deref())?,
+        };
         let mut stdout = io::stdout().lock();
         stdout
             .write_all(&output)
@@ -566,7 +681,8 @@ mod metadata {
                 parse_arguments([OsString::from("--config=선언.json")]).unwrap(),
                 Arguments {
                     configuration: PathBuf::from("선언.json"),
-                    backend_metadata: None
+                    backend_metadata: None,
+                    position_command: None,
                 }
             );
             assert_eq!(
@@ -576,7 +692,8 @@ mod metadata {
                 .unwrap(),
                 Arguments {
                     configuration: PathBuf::from("a.json"),
-                    backend_metadata: Some(PathBuf::from("b.json"))
+                    backend_metadata: Some(PathBuf::from("b.json")),
+                    position_command: None,
                 }
             );
         }
@@ -694,6 +811,143 @@ mod metadata {
             assert_eq!(output.scope, "independently_supplied_declarations_only");
             assert!(!output.actual_runtime_identity_verified && !output.actual_provider_verified);
             assert!(prepare_metadata(&startup, Some(&raw)).is_ok());
+        }
+        #[test]
+        fn position_metadata_observes_actual_rules_history_and_original_command_bytes() {
+            let raw = "position startpos moves e2e4 e7e5 g1f3";
+            let command = parse_position_command(raw).unwrap();
+            let observed = prepare_root_metadata(&command).unwrap();
+            let mut expected = Position::startpos();
+            for mv in ["e2e4", "e7e5", "g1f3"] {
+                expected
+                    .make_move(BoardMove::from_uci(mv).unwrap())
+                    .unwrap();
+            }
+            assert_eq!(observed.position_command.bytes, raw.len());
+            assert_eq!(
+                observed.position_command.sha256,
+                byte_pin(raw.as_bytes()).sha256
+            );
+            assert_eq!(
+                observed.root_state_and_history_sha256,
+                hex(&rules_snapshot_semantic_digest(&expected.snapshot()).0)
+            );
+            assert_eq!(observed.rules_profile_sha256, hex(&profile_digest().0));
+            assert_eq!(observed.scope, "rules_snapshot_semantic_observation_only");
+            assert!(!observed.root_authority);
+        }
+        #[test]
+        fn fen_observation_preserves_unknown_prefix_instead_of_fabricating_start_history() {
+            let start = parse_position_command("position startpos").unwrap();
+            let fen =
+                parse_position_command(&format!("position fen {}", Position::startpos().to_fen()))
+                    .unwrap();
+            let start = prepare_root_metadata(&start).unwrap();
+            let fen = prepare_root_metadata(&fen).unwrap();
+            assert_eq!(start.rules_profile_sha256, fen.rules_profile_sha256);
+            assert_ne!(
+                start.root_state_and_history_sha256,
+                fen.root_state_and_history_sha256
+            );
+            assert!(!fen.root_authority);
+        }
+        #[test]
+        fn position_selection_rejects_other_commands_bounds_duplicate_args_and_illegal_moves() {
+            for raw in [
+                "uci",
+                "go depth 1",
+                "position startpos\nuci",
+                "position startpos moves e2e4\0",
+            ] {
+                assert!(parse_position_command(raw).is_err());
+            }
+            let over_line = format!(
+                "position startpos{}",
+                " ".repeat(ParserLimits::default().max_line_bytes)
+            );
+            assert!(matches!(
+                parse_position_command(&over_line),
+                Err(Error::PositionSyntax(ParseError::LineTooLong))
+            ));
+            let over_moves = format!(
+                "position startpos moves{}",
+                " g1f3".repeat(ParserLimits::default().max_moves + 1)
+            );
+            assert!(parse_position_command(&over_moves).is_err());
+            assert!(
+                parse_arguments(
+                    [
+                        "--config=a.json",
+                        "--position-command=position startpos",
+                        "--position-command=position startpos",
+                    ]
+                    .map(OsString::from)
+                )
+                .is_err()
+            );
+            let illegal = parse_position_command("position startpos moves e2e5").unwrap();
+            assert!(matches!(
+                prepare_root_metadata(&illegal),
+                Err(Error::PositionRules {
+                    zero_based_ply: Some(0),
+                    cause: PositionError::IllegalMove,
+                    ..
+                })
+            ));
+            let fen = parse_position_command("position fen 8/8/8/8/8/8/8/8 w - - 0 1").unwrap();
+            assert!(matches!(
+                prepare_root_metadata(&fen),
+                Err(Error::PositionRules {
+                    stage: "position_base_rejected",
+                    ..
+                })
+            ));
+        }
+        #[derive(Deserialize)]
+        struct RootObserved {
+            scope: String,
+            root_state_and_history_sha256: String,
+            rules_profile_sha256: String,
+            root_authority: bool,
+        }
+        #[derive(Deserialize)]
+        struct PositionMetadataObserved {
+            schema: String,
+            root_metadata: RootObserved,
+            actual_startup_ready: bool,
+            native_authority: bool,
+            training: bool,
+        }
+        #[test]
+        fn only_explicit_position_selects_v2_and_legacy_has_no_new_nullable_field() {
+            let startup = fixture(ROVENT_STARTUP_CONFIGURATION_DOMAIN, "");
+            let legacy = prepare_metadata(&startup, None).unwrap();
+            let legacy_text = std::str::from_utf8(&legacy).unwrap();
+            assert!(legacy_text.contains("\"schema\":\"rz-rovent-startup-metadata/1\""));
+            assert!(!legacy_text.contains("root_metadata"));
+            let command = parse_position_command("position startpos").unwrap();
+            let output = prepare_metadata_with_position(&startup, None, Some(&command)).unwrap();
+            let observed: PositionMetadataObserved = serde_json::from_slice(&output).unwrap();
+            assert_eq!(observed.schema, "rz-rovent-startup-metadata/2");
+            assert_eq!(
+                observed.root_metadata.scope,
+                "rules_snapshot_semantic_observation_only"
+            );
+            assert_eq!(
+                observed.root_metadata.root_state_and_history_sha256,
+                hex(&rules_snapshot_semantic_digest(&Position::startpos().snapshot()).0)
+            );
+            assert_eq!(
+                observed.root_metadata.rules_profile_sha256,
+                hex(&profile_digest().0)
+            );
+            assert!(
+                !observed.root_metadata.root_authority
+                    && !observed.actual_startup_ready
+                    && !observed.native_authority
+                    && !observed.training
+            );
+            assert!(output.len() <= STDOUT_MAX_BYTES);
         }
         #[test]
         fn backend_requires_explicit_absence_and_matching_profile_and_device() {
