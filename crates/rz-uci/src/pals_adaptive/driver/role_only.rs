@@ -37,6 +37,12 @@ impl<M: RoleModel> PcPortDriver<M> {
         receipt: &RoleOnlyShutdownReceipt,
     ) -> Result<PcSemanticPort<M>, (Self, AdaptiveManagerError)> {
         if !receipt.permits_semantic_closure()
+            || (self.port.requires_shared_nnuec_readout()
+                && !receipt
+                    .shared_nnuec_closure()
+                    .is_some_and(|closure| self.port.shared_nnuec_closure_matches(closure)))
+            || (!self.port.requires_shared_nnuec_readout()
+                && receipt.shared_nnuec_closure().is_some())
             || receipt.authority != self.port.authority()
             || receipt.mode != self.port.mode()
             || self.original_root_budget != Some(receipt.root_budget)
@@ -80,6 +86,77 @@ impl<M: RoleModel> RoleOnlySearchDriver<PcPortQuestion> for PcPortDriver<M> {
         &mut self,
     ) -> Result<Option<FrameInput<ReviewView, PcPortQuestion>>, AdaptiveManagerError> {
         self.port.next_role().map_err(semantic)
+    }
+    fn register_shared_nnuec_readout(
+        &mut self,
+        model: Arc<rz_search::cpu_value::nnuec::v2::Model>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .register_shared_nnuec_readout(model)
+            .map_err(|error| AdaptiveManagerError::Semantic(error.to_string()))
+    }
+    fn requires_shared_nnuec_readout(&self) -> bool {
+        self.port.requires_shared_nnuec_readout()
+    }
+    fn prepare_shared_nnuec_readout(
+        &mut self,
+        input: &FrameInput<ReviewView, PcPortQuestion>,
+        model: &Arc<rz_search::cpu_value::nnuec::v2::Model>,
+        canceled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<rz_search::pals::engine::pc_port::PcNnuecReadoutRequest, AdaptiveManagerError> {
+        self.port
+            .prepare_shared_nnuec_readout(input, model, canceled)
+            .map_err(|error| AdaptiveManagerError::Semantic(error.to_string()))
+    }
+    fn consume_shared_nnuec_readout(
+        &mut self,
+        input: &FrameInput<ReviewView, PcPortQuestion>,
+        seal: &rz_search::pals::engine::pc_port::PcNnuecReadoutSeal,
+        model: &Arc<rz_search::cpu_value::nnuec::v2::Model>,
+        completion: &rz_search::cpu_value::nnuec::v2::review::Completion,
+    ) -> Result<rz_search::pals::engine::pc_port::PcNnuecReadoutObservation, AdaptiveManagerError>
+    {
+        self.port
+            .consume_shared_nnuec_readout(input, seal, model, completion)
+            .map_err(|error| AdaptiveManagerError::Semantic(error.to_string()))
+    }
+    fn shared_nnuec_readout_consumed(
+        &self,
+        input: &FrameInput<ReviewView, PcPortQuestion>,
+    ) -> Result<bool, AdaptiveManagerError> {
+        self.port
+            .shared_nnuec_readout_consumed(input)
+            .map_err(|error| AdaptiveManagerError::Semantic(error.to_string()))
+    }
+    #[allow(clippy::type_complexity)]
+    fn close_shared_nnuec_readouts(
+        &self,
+        actor: &rz_search::cpu_value::nnuec::v2::review::PreparationActor,
+        acknowledgement: rz_search::cpu_value::nnuec::v2::retirement::NnuecCacheReleaseAck,
+        terminals: Vec<rz_search::pals::engine::pc_port::PcNnuecReadoutTerminal>,
+    ) -> Result<
+        rz_search::pals::engine::pc_port::PcSharedReadoutRootClosure,
+        (
+            AdaptiveManagerError,
+            rz_search::cpu_value::nnuec::v2::retirement::NnuecCacheReleaseAck,
+            Vec<rz_search::pals::engine::pc_port::PcNnuecReadoutTerminal>,
+        ),
+    > {
+        self.port
+            .close_shared_nnuec_readouts(actor, acknowledgement, terminals)
+            .map_err(|(error, acknowledgement, terminals)| {
+                (
+                    AdaptiveManagerError::Semantic(error.to_string()),
+                    acknowledgement,
+                    terminals,
+                )
+            })
+    }
+    fn shared_nnuec_closure_matches(
+        &self,
+        closure: &rz_search::pals::engine::pc_port::PcSharedReadoutRootClosure,
+    ) -> bool {
+        self.port.shared_nnuec_closure_matches(closure)
     }
     fn role_submitted(
         &mut self,

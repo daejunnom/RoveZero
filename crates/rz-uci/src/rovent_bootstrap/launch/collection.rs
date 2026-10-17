@@ -23,6 +23,10 @@ use std::sync::Arc;
 /// 다른 variant나 질문 타입으로 바꾸는 변환 경로는 제공하지 않는다.
 pub enum RoventCollectionPreparedNative {
     Pc(Box<PreparedRoventNative<PcPortQuestion>>),
+    PcNnuec {
+        prepared: Box<PreparedRoventNative<PcPortQuestion>>,
+        loaded: Box<LoadedRoventNnuecSource>,
+    },
     OwnBoardPcr(Box<PreparedRoventNative<AdaptivePortQuestion>>),
     OwnNnuecPcr {
         prepared: Box<PreparedRoventNative<AdaptivePortQuestion>>,

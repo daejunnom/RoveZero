@@ -186,6 +186,10 @@ fn implementation_sha256() -> String {
             include_bytes!("nnuec_v2_review.rs").as_slice(),
         ),
         (
+            "nnuec_v2_shared_readout.rs",
+            include_bytes!("nnuec_v2_shared_readout.rs").as_slice(),
+        ),
+        (
             "nnuec_v2_review_retirement.rs",
             include_bytes!("nnuec_v2_review_retirement.rs").as_slice(),
         ),

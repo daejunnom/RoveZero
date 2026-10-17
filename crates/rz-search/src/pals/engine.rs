@@ -191,6 +191,14 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
             ),
             ("pals/engine/pc_port.rs", include_str!("engine/pc_port.rs")),
             (
+                "pals/engine/pc_port/shared_nnuec.rs",
+                include_str!("engine/pc_port/shared_nnuec.rs"),
+            ),
+            (
+                "cpu_value/nnuec_v2_shared_readout.rs",
+                include_str!("../cpu_value/nnuec_v2_shared_readout.rs"),
+            ),
+            (
                 "pals/engine/pc_port/frontier_port.rs",
                 include_str!("engine/pc_port/frontier_port.rs"),
             ),

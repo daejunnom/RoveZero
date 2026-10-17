@@ -72,6 +72,13 @@ impl NnuecPreparationTerminalAck {
         Weak::ptr_eq(&self.original_model, &Arc::downgrade(model))
             && Weak::ptr_eq(&self.original_view, &Arc::downgrade(view))
     }
+    pub(crate) fn matches_original_weak(
+        &self,
+        model: &Weak<Model>,
+        view: &Weak<ReviewView>,
+    ) -> bool {
+        Weak::ptr_eq(&self.original_model, model) && Weak::ptr_eq(&self.original_view, view)
+    }
     pub fn status(&self) -> PreparationStatus {
         self.status
     }

@@ -58,6 +58,30 @@ pub use intervention::{
 pub use r_stream::{RoventRCollectionAncestor, RoventRCollectionPlan};
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
 
+/// Cohort profiles require actual own-R NNUEC authority. A PC-only source
+/// remains a distinct rejected product, with both original owners retained
+/// until the launcher's existing physical drain confirms their release.
+fn reject_pc_nnuec_cohort(
+    prepared: rz_uci::rovent_bootstrap::PreparedRoventNative<
+        rz_search::pals::engine::pc_port::PcPortQuestion,
+    >,
+    loaded: rz_uci::rovent_bootstrap::nnuec_source::LoadedRoventNnuecSource,
+) -> rz_uci::rovent_bootstrap::product::RoventProductStartupRejection {
+    let sources = Arc::clone(prepared.sources());
+    rz_uci::rovent_bootstrap::product::RoventProductStartupRejection {
+        failure: rz_uci::search_driver::SearchSessionFailure {
+            physical_completion: rz_uci::search_driver::DriverPhysicalCompletion::Unknown,
+            code: "UtilityCohortUnsupportedPcNnuec",
+            detail: "utility cohort requires the original own-R P-C-R NNUEC source; PC-only shared NNUEC is unsupported".into(),
+        },
+        owners: rz_uci::rovent_bootstrap::product::RoventProductStartupOwners::PcNnuec {
+            prepared,
+            loaded,
+        },
+        sources,
+    }
+}
+
 pub enum RoventCollectionCliParse {
     Help,
     PrepareCohortPins {
@@ -1049,7 +1073,8 @@ pub fn run_rovent_collection(
                     >
             });
             match native {
-                RoventCollectionPreparedNative::Pc(prepared) => {
+                native @ (RoventCollectionPreparedNative::Pc(_)
+                | RoventCollectionPreparedNative::PcNnuec { .. }) => {
                     let hooks = RoventPcCollectionHooks {
                         root_admission: Some(Arc::new(move |manager, cap| {
                             hook(&admission, |state| {
@@ -1069,14 +1094,34 @@ pub fn run_rovent_collection(
                         })),
                         cooperative: Some(poll),
                     };
-                    RoventNativeProductDriver::pc_with_collection_hooks(
-                        *prepared,
-                        clock,
-                        owners,
-                        identity,
-                        root_policy,
-                        hooks,
-                    )
+                    match native {
+                        RoventCollectionPreparedNative::Pc(prepared) => {
+                            RoventNativeProductDriver::pc_with_collection_hooks(
+                                *prepared,
+                                clock,
+                                owners,
+                                identity,
+                                root_policy,
+                                hooks,
+                            )
+                        }
+                        RoventCollectionPreparedNative::PcNnuec { prepared, loaded } => {
+                            RoventNativeProductDriver::pc_with_shared_nnuec_and_collection_hooks(
+                                *prepared,
+                                *loaded,
+                                clock,
+                                owners,
+                                identity,
+                                root_policy,
+                                hooks,
+                            )
+                        }
+                        RoventCollectionPreparedNative::OwnBoardPcr(_)
+                        | RoventCollectionPreparedNative::OwnNnuecPcr { .. }
+                        | RoventCollectionPreparedNative::ExternalPcr { .. } => {
+                            unreachable!("separate exact PC variants")
+                        }
+                    }
                 }
                 native => {
                     let hooks = AdaptiveSessionCollectionHooks {
@@ -1168,8 +1213,9 @@ pub fn run_rovent_collection(
                             root_policy,
                             Some(hooks),
                         ),
-                        RoventCollectionPreparedNative::Pc(_) => {
-                            unreachable!("separate exact Pc variant")
+                        RoventCollectionPreparedNative::Pc(_)
+                        | RoventCollectionPreparedNative::PcNnuec { .. } => {
+                            unreachable!("separate exact PC variants")
                         }
                     }
                 }

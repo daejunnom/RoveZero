@@ -56,6 +56,7 @@ type PcrDriver = AdaptiveSessionDriver<RoventNativeBackend<AdaptivePortQuestion>
 #[allow(clippy::large_enum_variant)]
 enum ActualProductDriver {
     Pc(RoventPcSessionDriver),
+    PcNnuec(RoventPcSessionDriver),
     Pcr(PcrDriver),
     Nnuec(RoventNnuecSessionDriver),
 }
@@ -84,6 +85,10 @@ impl RoventProductPhysicalClose {
 #[allow(clippy::large_enum_variant)]
 pub enum RoventProductStartupOwners {
     Pc(PreparedRoventNative<PcPortQuestion>),
+    PcNnuec {
+        prepared: PreparedRoventNative<PcPortQuestion>,
+        loaded: LoadedRoventNnuecSource,
+    },
     Pcr(PreparedRoventNative<AdaptivePortQuestion>),
     PcrRejected(AdaptiveSessionAdmissionRejection<RoventNativeBackend<AdaptivePortQuestion>>),
     PcrDriver(Box<PcrDriver>),
@@ -266,6 +271,78 @@ impl RoventNativeProductDriver {
         })?;
         Ok(Self {
             inner: Arc::new(ActualProductDriver::Pc(driver)),
+            sources,
+            physically_closed: Arc::new(AtomicBool::new(false)),
+            retirement_sources: None,
+        })
+    }
+
+    /// Shared readout keeps the original loaded NNUEC source in the PC-only
+    /// driver. It does not construct an R checker, CPU ledger or research TT.
+    #[allow(clippy::result_large_err)]
+    pub fn pc_with_shared_nnuec(
+        prepared: PreparedRoventNative<PcPortQuestion>,
+        loaded: LoadedRoventNnuecSource,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Self, RoventProductStartupRejection> {
+        let sources = Arc::clone(prepared.sources());
+        let driver = RoventPcSessionDriver::from_prepared_with_shared_nnuec(
+            prepared,
+            loaded,
+            clock,
+            owners,
+            identity,
+            root_policy,
+        )
+        .map_err(|rejected| RoventProductStartupRejection {
+            failure: rejected.failure,
+            owners: RoventProductStartupOwners::PcNnuec {
+                prepared: rejected.prepared,
+                loaded: rejected.loaded,
+            },
+            sources: Arc::clone(&sources),
+        })?;
+        Ok(Self {
+            inner: Arc::new(ActualProductDriver::PcNnuec(driver)),
+            sources,
+            physically_closed: Arc::new(AtomicBool::new(false)),
+            retirement_sources: None,
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn pc_with_shared_nnuec_and_collection_hooks(
+        prepared: PreparedRoventNative<PcPortQuestion>,
+        loaded: LoadedRoventNnuecSource,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        hooks: RoventPcCollectionHooks,
+    ) -> Result<Self, RoventProductStartupRejection> {
+        let sources = Arc::clone(prepared.sources());
+        let driver = RoventPcSessionDriver::from_prepared_with_shared_nnuec_and_collection_hooks(
+            prepared,
+            loaded,
+            clock,
+            owners,
+            identity,
+            root_policy,
+            hooks,
+        )
+        .map_err(|rejected| RoventProductStartupRejection {
+            failure: rejected.failure,
+            owners: RoventProductStartupOwners::PcNnuec {
+                prepared: rejected.prepared,
+                loaded: rejected.loaded,
+            },
+            sources: Arc::clone(&sources),
+        })?;
+        Ok(Self {
+            inner: Arc::new(ActualProductDriver::PcNnuec(driver)),
             sources,
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
@@ -613,7 +690,7 @@ impl RoventNativeProductDriver {
 
     fn actual(&self) -> &dyn SearchSessionDriver {
         match self.inner.as_ref() {
-            ActualProductDriver::Pc(driver) => driver,
+            ActualProductDriver::Pc(driver) | ActualProductDriver::PcNnuec(driver) => driver,
             ActualProductDriver::Pcr(driver) => driver,
             ActualProductDriver::Nnuec(driver) => driver,
         }

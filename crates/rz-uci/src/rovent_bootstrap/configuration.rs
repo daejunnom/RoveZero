@@ -521,6 +521,14 @@ pub struct PcNnuecReadoutConfiguration {
     pub context_namespace_policy: String,
     pub local_namespace_policy: String,
 }
+/// Declaration-only assembly selection. A selected variant does not establish
+/// a loaded NNUEC owner, preparation actor or a performed shared readout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeNnuecSelection {
+    Absent,
+    SharedPc,
+    OwnResearcher,
+}
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Recipient {
@@ -743,6 +751,19 @@ pub struct ConfigurationFields<'a> {
     pub execution: &'a ExecutionConfiguration,
 }
 impl ConfigurationFields<'_> {
+    pub fn nnuec_selection(&self) -> NativeNnuecSelection {
+        match self.execution {
+            ExecutionConfiguration::RolesOnly {
+                shared_nnuec_readout: Some(_),
+                ..
+            } => NativeNnuecSelection::SharedPc,
+            ExecutionConfiguration::OwnResearcher {
+                value: ResearchValueConfiguration::NnuecV2 { .. },
+                ..
+            } => NativeNnuecSelection::OwnResearcher,
+            _ => NativeNnuecSelection::Absent,
+        }
+    }
     fn validate(&self) -> Result<(), BackendError> {
         self.semantic.actual()?;
         self.review.actual()?;
@@ -987,19 +1008,9 @@ impl ConfigurationFields<'_> {
         Ok(())
     }
     fn require_supported_native_capabilities(&self) -> Result<(), BackendError> {
-        if matches!(
-            self.execution,
-            ExecutionConfiguration::RolesOnly {
-                shared_nnuec_readout: Some(_),
-                ..
-            }
-        ) {
-            return Err(fail(
-                K::UnsupportedModel,
-                "UnsupportedCapability: native P/C shared NNUEC readout consumer is not assembled",
-            ));
-        }
-        Ok(())
+        // SharedPc is assembled only by the typed loaded-owner constructor.
+        // This declaration check cannot replace that consumer or its source join.
+        self.validate()
     }
 }
 
@@ -1240,6 +1251,10 @@ mod tests {
     #[test]
     fn pc_shared_readout_is_a_separate_typed_capability_without_r_configuration() {
         let mut config = pc();
+        assert_eq!(
+            config.fields().nnuec_selection(),
+            NativeNnuecSelection::Absent
+        );
         config.execution = ExecutionConfiguration::RolesOnly {
             event_order: EventOrder::Fixed,
             role_tickets_max: 16,
@@ -1253,7 +1268,19 @@ mod tests {
         let bytes = config.canonical_bytes().unwrap();
         let decoded = RoventStartupConfiguration::from_json(&bytes).unwrap();
         assert_eq!(decoded, config);
-        let unsupported = decoded.require_supported_native_capabilities().unwrap_err();
-        assert!(unsupported.detail.starts_with("UnsupportedCapability:"));
+        assert_eq!(
+            decoded.fields().nnuec_selection(),
+            NativeNnuecSelection::SharedPc
+        );
+        assert!(decoded.require_supported_native_capabilities().is_ok());
+        let mut invalid = decoded;
+        if let ExecutionConfiguration::RolesOnly {
+            shared_nnuec_readout: Some(readout),
+            ..
+        } = &mut invalid.execution
+        {
+            readout.context_namespace_policy.clear();
+        }
+        assert!(invalid.require_supported_native_capabilities().is_err());
     }
 }

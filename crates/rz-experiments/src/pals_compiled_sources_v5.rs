@@ -62,6 +62,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
     (
         "review_view",
         &[
+            source!("crates/rz-search/src/pals/engine/pc_port/shared_nnuec.rs"),
             source!("crates/rz-search/Cargo.toml"),
             source!("crates/rz-search/src/pals/coordinator/accepted_peer.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port.rs"),
@@ -152,6 +153,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
     (
         "cpu_search",
         &[
+            source!("crates/rz-search/src/cpu_value/nnuec_v2_shared_readout.rs"),
             source!("crates/rz-search/Cargo.toml"),
             source!("crates/rz-search/src/cpu.rs"),
             source!("crates/rz-search/src/cpu/see.rs"),
@@ -200,6 +202,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
     (
         "coordinator",
         &[
+            source!("crates/rz-search/src/pals/engine/pc_port/shared_nnuec.rs"),
             source!("crates/rz-contracts/src/rovent.rs"),
             source!("crates/rz-search/Cargo.toml"),
             source!("crates/rz-search/src/pals/coordinator.rs"),

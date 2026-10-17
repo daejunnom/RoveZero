@@ -1039,6 +1039,9 @@ fn run_trial(
                         hooks,
                     )
                 }
+                RoventCollectionPreparedNative::PcNnuec { prepared, loaded } => {
+                    Err(reject_pc_nnuec_cohort(*prepared, *loaded))
+                }
                 // Pre-model source admission rejects these variants. Their
                 // ordinary constructors still retain the original prepared
                 // owner if a future configuration route violates that check.

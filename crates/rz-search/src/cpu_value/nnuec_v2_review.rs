@@ -26,6 +26,15 @@ mod retirement;
 #[path = "nnuec_v2_preparation_terminal.rs"]
 mod terminal;
 pub use terminal::NnuecPreparationTerminalAck;
+#[path = "nnuec_v2_shared_readout.rs"]
+mod shared_readout;
+pub use shared_readout::SharedNnuecReadout;
+use shared_readout::SharedReadoutTarget;
+
+#[cfg(test)]
+pub(crate) fn shared_readout_fixture_model() -> Arc<Model> {
+    Arc::new(Model::new(super::tests::checkpoint()).unwrap())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreparationError {
@@ -79,6 +88,7 @@ pub struct Request {
     store_owner: StoreReadOwner,
     utility_target: Option<u16>,
     utility_cache_prelude: Option<super::retirement::NnuecCacheReleaseAck>,
+    shared_readout: Option<SharedReadoutTarget>,
     view: Arc<ReviewView>,
     sources: Arc<[PositionSnapshot]>,
     provenance: Provenance,
@@ -143,6 +153,7 @@ impl Request {
             store_owner: stores.read_owner(),
             utility_target: None,
             utility_cache_prelude: None,
+            shared_readout: None,
             view,
             sources,
             provenance,
@@ -167,7 +178,7 @@ impl Request {
         target_record: u16,
     ) -> Result<Self, (PreparationError, Self)> {
         let checked = (|| {
-            if self.utility_target.is_some() {
+            if self.utility_target.is_some() || self.shared_readout.is_some() {
                 return Err(PreparationError::InvalidView(
                     "utility input capture already selected",
                 ));
@@ -263,6 +274,7 @@ pub struct BoundNnuecReviewContext {
     instance: BoundInstanceAuthority,
     request: RequestIdentity,
     utility_input: Option<Arc<super::utility_capture::NnuecUtilityInputCapture>>,
+    shared_readout: Option<SharedNnuecReadout>,
     context: Arc<Context>,
     numeric_context_sha256: String,
     view: Arc<ReviewView>,
@@ -564,6 +576,7 @@ impl Factory {
             context: Arc::clone(&context),
             numeric_context_sha256: numeric_context_sha256.clone(),
         });
+        let shared_readout = request.shared_readout;
         let utility_target = request.utility_target;
         let cache_prelude = request.utility_cache_prelude;
         let store_owner = request.store_owner;
@@ -571,6 +584,7 @@ impl Factory {
             instance: BoundInstanceAuthority(Arc::new(BoundInstanceState::default())),
             request: request.identity,
             utility_input: None,
+            shared_readout: None,
             root: view.anchors()[0].snapshot.position_identity(),
             context,
             numeric_context_sha256,
@@ -584,6 +598,9 @@ impl Factory {
             preparation_epoch: epoch,
             stopping: Arc::clone(&self.stopping),
         };
+        if let Some(target) = shared_readout {
+            bound.shared_readout = Some(self.shared_readout(&bound, target)?);
+        }
         if let Some(target_record) = utility_target {
             let captured = super::utility_capture::NnuecUtilityInputCapture::from_prepared(
                 UtilityInputPreparationSource {
@@ -695,6 +712,7 @@ enum Command {
 /// At most one queued/running/uncollected completion exists. The result channel
 /// is logically bounded by that gate, and terminal results are never coalesced.
 pub struct PreparationActor {
+    original_model: std::sync::Weak<Model>,
     sender: Option<SyncSender<Command>>,
     receiver: Receiver<Completion>,
     materialized: Receiver<MaterializationCompletion>,
@@ -718,6 +736,7 @@ impl PreparationActor {
         model: Arc<Model>,
         signal: CompletionSignal,
     ) -> Result<Self, PreparationError> {
+        let original_model = Arc::downgrade(&model);
         let (sender, commands) = mpsc::sync_channel::<Command>(1);
         let (results, receiver) = mpsc::channel();
         let (materializations, materialized) = mpsc::channel();
@@ -881,6 +900,7 @@ impl PreparationActor {
             })
             .map_err(|_| PreparationError::WorkerStopped)?;
         Ok(Self {
+            original_model,
             sender: Some(sender),
             receiver,
             materialized,
@@ -1817,6 +1837,148 @@ mod tests {
             assert!(Instant::now() < until, "actual prelude cache ACK timed out");
             thread::yield_now();
         }
+    }
+
+    #[test]
+    fn optional_shared_readout_keeps_plain_preparation_and_runs_exact_query_on_actor() {
+        let (stores, mut index, state, _) = setup();
+        let model = shared_readout_fixture_model();
+        let prefix: Vec<BoardMove> = "e2e4 e7e5"
+            .split_whitespace()
+            .map(|text| text.parse().unwrap())
+            .collect();
+        let mut endpoint = Position::startpos();
+        for movement in &prefix {
+            endpoint.make_move(*movement).unwrap();
+        }
+        let view = Arc::new(
+            index
+                .select(
+                    &stores,
+                    state,
+                    ReviewQuerySequences {
+                        prefix: &prefix,
+                        ..query(RoleQueryPurpose::ReplyPolicy)
+                    },
+                    ReviewSelectionPolicy::default(),
+                )
+                .unwrap(),
+        );
+        let actor = PreparationActor::spawn(Arc::clone(&model)).unwrap();
+        assert!(actor.worker_thread_id().is_some());
+        let admit = || {
+            Request::admit(
+                &model,
+                Arc::clone(&view),
+                &stores,
+                state,
+                stores.generation(),
+                Instant::now() + Duration::from_secs(10),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap()
+        };
+        let plain = admit();
+        assert!(!plain.has_shared_readout());
+        let plain_bound = actual_actor_prepare(&actor, plain).unwrap();
+        assert!(plain_bound.shared_readout().is_none());
+        assert!(plain_bound.utility_input_capture().is_none());
+        drop(plain_bound);
+        let request = admit()
+            .with_shared_readout(&endpoint.snapshot())
+            .unwrap_or_else(|_| panic!("original explicit shared target"));
+        let identity = request.identity();
+        let (error, request) = request.with_utility_input_capture(0).err().unwrap();
+        assert!(matches!(error, PreparationError::InvalidView(_)));
+        assert!(request.identity().same_request(&identity));
+        let bound = actual_actor_prepare(&actor, request).unwrap();
+        assert!(bound.utility_input_capture().is_none());
+        let readout = bound.shared_readout().unwrap();
+        assert!(readout.matches_request(&identity));
+        assert!(readout.endpoint().same_state(&endpoint.snapshot()));
+        let mut local = model.local(&Position::startpos()).unwrap();
+        for movement in prefix {
+            model.append_local(&mut local, movement).unwrap();
+        }
+        let board = model.board(&endpoint).unwrap();
+        let reference = model
+            .forward(&board, bound.context(), &local, &endpoint)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(readout.output()).unwrap(),
+            serde_json::to_vec(&reference).unwrap()
+        );
+        assert_eq!(readout.input_sha256().len(), 64);
+        drop(bound);
+        let release = actual_cache_prelude_ack(&actor);
+        assert!(actor.verifies_shared_cache_release(&model, &release));
+        actor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shared_actor_errors_keep_original_terminal_and_exact_control_class() {
+        let (stores, mut index, state, _) = setup();
+        let model = shared_readout_fixture_model();
+        let view = Arc::new(
+            index
+                .select(
+                    &stores,
+                    state,
+                    query(RoleQueryPurpose::ProposePolicy),
+                    ReviewSelectionPolicy::default(),
+                )
+                .unwrap(),
+        );
+        let actor = PreparationActor::spawn(Arc::clone(&model)).unwrap();
+        for expected in [
+            PreparationError::Cancelled,
+            PreparationError::Expired,
+            PreparationError::InvalidView("shared readout endpoint Rules mismatch"),
+        ] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let mut endpoint = Position::startpos();
+            if matches!(expected, PreparationError::InvalidView(_)) {
+                endpoint.make_move("e2e4".parse().unwrap()).unwrap();
+            }
+            let mut request = Request::admit(
+                &model,
+                Arc::clone(&view),
+                &stores,
+                state,
+                stores.generation(),
+                Instant::now() + Duration::from_secs(10),
+                Arc::clone(&cancel),
+            )
+            .unwrap()
+            .with_shared_readout(&endpoint.snapshot())
+            .unwrap_or_else(|_| panic!("original shared Request"));
+            let identity = request.identity();
+            match expected {
+                PreparationError::Cancelled => cancel.store(true, Ordering::Release),
+                PreparationError::Expired => request.deadline = Instant::now(),
+                _ => {}
+            }
+            actor
+                .try_submit(request)
+                .unwrap_or_else(|_| panic!("original actor submission"));
+            let until = Instant::now() + Duration::from_secs(10);
+            let completion = loop {
+                if let Some(completion) = actor.try_complete().unwrap() {
+                    break completion;
+                }
+                assert!(Instant::now() < until);
+                thread::yield_now();
+            };
+            assert_eq!(completion.result.err(), Some(expected));
+            assert!(completion.terminal_ack.matches_request(&identity));
+            assert!(completion.terminal_ack.matches_original(&model, &view));
+            assert!(completion.terminal_ack.allows_c_only_cleanup());
+            assert_ne!(
+                completion.terminal_ack.status(),
+                PreparationStatus::Completed
+            );
+        }
+        actor.shutdown().unwrap();
     }
     fn actual_utility_request(
         actor_model: &Model,

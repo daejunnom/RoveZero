@@ -26,6 +26,7 @@ mod peer_questions;
 mod repair_cycle;
 mod repair_report;
 mod repair_witness;
+mod shared_nnuec;
 pub use attack_source::PcAttackRankedSource;
 pub use frontier_port::PcFrontierStartup;
 use peer_questions::{PcPeerQuestion, PcPeerSource};
@@ -35,6 +36,11 @@ pub use repair_report::{PcRepairProgress, PcRepairReport};
 pub use repair_witness::{
     PcAcceptedFreshEndpoint, PcDivergenceResolution, PcDivergenceSource, PcDivergenceWitness,
     PcRepairAcceptedLine,
+};
+use shared_nnuec::SharedNnuecState;
+pub use shared_nnuec::{
+    PcNnuecReadoutError, PcNnuecReadoutObservation, PcNnuecReadoutRequest, PcNnuecReadoutSeal,
+    PcNnuecReadoutTerminal, PcSharedReadoutRootClosure,
 };
 
 const MAX_PC_PENDING: usize = 64;
@@ -497,6 +503,7 @@ pub struct PcSemanticPort<M: RoleModel> {
     retired_strategy: Option<crate::pals::rovent_frontier::FrontierMateStrategy>,
     repair_cycles: Option<PcRepairCycles>,
     post_repair_recheck: PostRepairRecheckPolicy,
+    shared_nnuec: Option<SharedNnuecState>,
 }
 
 impl<M: RoleModel> PcSemanticPort<M> {
@@ -584,6 +591,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
             retired_strategy: None,
             repair_cycles: None,
             post_repair_recheck: PostRepairRecheckPolicy::Disabled,
+            shared_nnuec: None,
             counters: PcPortCounters {
                 completed_nn_inputs: Some(0),
                 ..PcPortCounters::default()
@@ -897,6 +905,15 @@ impl<M: RoleModel> PcSemanticPort<M> {
         ticket: &RoleTicketEnvelope,
     ) -> Result<(), PalsError> {
         self.check_input(input)?;
+        if self.requires_shared_nnuec_readout()
+            && !self
+                .shared_nnuec_readout_consumed(input)
+                .map_err(|_| RoleError::InvalidOutput)?
+        {
+            return Err(
+                RoleError::Unsupported("registered shared NNUEC readout not consumed").into(),
+            );
+        }
         self.check_ticket(input, ticket)?;
         let held = self
             .pending

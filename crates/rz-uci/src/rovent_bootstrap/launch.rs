@@ -1,7 +1,7 @@
 //! Separate Rovent UCI entry. No legacy V5 DTO, command-line attestation or
 //! fabricated weights path participates in this source-bound native assembly.
 
-use super::configuration::{ExecutionConfiguration, ResearchValueConfiguration};
+use super::configuration::{ExecutionConfiguration, NativeNnuecSelection};
 use super::external_session::RoventExternalProductStartupOwners;
 use super::nnuec_source::LoadedRoventNnuecSource;
 use super::process_boundary::verify_actual_process_boundary;
@@ -578,20 +578,15 @@ fn run_inner<'a>(
     control
         .check()
         .map_err(|failure| error("StartupWindow", failure))?;
-    let loaded_nnuec = if matches!(
-        sources.configuration().fields().execution,
-        ExecutionConfiguration::OwnResearcher {
-            value: ResearchValueConfiguration::NnuecV2 { .. },
-            ..
-        }
-    ) {
-        Some(
-            LoadedRoventNnuecSource::load(Arc::clone(&sources), &control)
-                .map_err(|failure| error("NnuecSource", failure))?,
-        )
-    } else {
-        None
-    };
+    let loaded_nnuec =
+        if sources.configuration().fields().nnuec_selection() != NativeNnuecSelection::Absent {
+            Some(
+                LoadedRoventNnuecSource::load(Arc::clone(&sources), &control)
+                    .map_err(|failure| error("NnuecSource", failure))?,
+            )
+        } else {
+            None
+        };
     let owners = Arc::new(OwnerRegistry::default());
     let identity = EngineIdentity {
         name: format!("Rovent {:?}", lock.manifest.engine.mode),
@@ -630,7 +625,13 @@ fn run_inner<'a>(
             collection_observer,
         )
         .map_err(|failure| reject_factory(failure, cleanup_until))?;
-        RoventCollectionPreparedNative::Pc(Box::new(prepared))
+        match loaded_nnuec {
+            Some(loaded) => RoventCollectionPreparedNative::PcNnuec {
+                prepared: Box::new(prepared),
+                loaded: Box::new(loaded),
+            },
+            None => RoventCollectionPreparedNative::Pc(Box::new(prepared)),
+        }
     };
     let driver = match (collection_preload, collection_assemble) {
         (Some(preload), Some(assemble)) => assemble(RoventCollectionPreparedLaunch {
@@ -731,6 +732,16 @@ fn assemble_native_product(
         RoventCollectionPreparedNative::Pc(prepared) => {
             RoventNativeProductDriver::pc(*prepared, clock, owners, identity, root_policy)
         }
+        RoventCollectionPreparedNative::PcNnuec { prepared, loaded } => {
+            RoventNativeProductDriver::pc_with_shared_nnuec(
+                *prepared,
+                *loaded,
+                clock,
+                owners,
+                identity,
+                root_policy,
+            )
+        }
         RoventCollectionPreparedNative::OwnBoardPcr(prepared) => {
             RoventNativeProductDriver::own_board_pcr(
                 *prepared,
@@ -802,6 +813,11 @@ fn reject_product(mut failure: RoventProductStartupRejection, until: Instant) ->
     let detail = error("ProductAssembly", &failure.failure);
     let confirmed = match &mut failure.owners {
         RoventProductStartupOwners::Pc(prepared) => drain_native(&mut prepared.service, until),
+        RoventProductStartupOwners::PcNnuec { prepared, .. } => {
+            // The loaded source remains in this same rejection while native
+            // cleanup runs. No actor exists before the shared root is admitted.
+            drain_native(&mut prepared.service, until)
+        }
         RoventProductStartupOwners::Pcr(prepared) => drain_native(&mut prepared.service, until),
         RoventProductStartupOwners::NnuecRejected(rejected) => {
             drain_native(&mut rejected.prepared.service, until)

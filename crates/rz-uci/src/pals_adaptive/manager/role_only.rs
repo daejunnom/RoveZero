@@ -3,8 +3,18 @@
 //! Encoding and inference stay on the existing single native service worker.
 use super::collection::{AdaptiveCollectionObserver, RoventCollectionRootAdmission};
 use super::*;
+use rz_search::cpu_value::nnuec::v2::Model as SharedNnuecModel;
+use rz_search::cpu_value::nnuec::v2::retirement::{NnuecCacheInvalidation, NnuecCacheReleaseAck};
+use rz_search::cpu_value::nnuec::v2::review::{
+    Completion as SharedNnuecCompletion, PreparationActor, PreparationError,
+    Request as SharedNnuecRequest,
+};
 use rz_search::pals::coordinator::AcceptedRoleStep;
 use rz_search::pals::engine::NoResearcher;
+use rz_search::pals::engine::pc_port::{
+    PcNnuecReadoutObservation, PcNnuecReadoutRequest, PcNnuecReadoutSeal, PcNnuecReadoutTerminal,
+    PcSharedReadoutRootClosure,
+};
 
 pub trait RoleOnlySearchDriver<Q> {
     fn researcher(&self) -> &NoResearcher;
@@ -16,6 +26,67 @@ pub trait RoleOnlySearchDriver<Q> {
         root_budget: Digest,
     ) -> Result<(), AdaptiveManagerError>;
     fn next_role(&mut self) -> Result<Option<FrameInput<ReviewView, Q>>, AdaptiveManagerError>;
+    fn register_shared_nnuec_readout(
+        &mut self,
+        _: Arc<SharedNnuecModel>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no shared P/C NNUEC readout",
+        ))
+    }
+    fn requires_shared_nnuec_readout(&self) -> bool {
+        false
+    }
+    fn prepare_shared_nnuec_readout(
+        &mut self,
+        _: &FrameInput<ReviewView, Q>,
+        _: &Arc<SharedNnuecModel>,
+        _: Arc<AtomicBool>,
+    ) -> Result<PcNnuecReadoutRequest, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no same-input P/C NNUEC preparation",
+        ))
+    }
+    fn consume_shared_nnuec_readout(
+        &mut self,
+        _: &FrameInput<ReviewView, Q>,
+        _: &PcNnuecReadoutSeal,
+        _: &Arc<SharedNnuecModel>,
+        _: &SharedNnuecCompletion,
+    ) -> Result<PcNnuecReadoutObservation, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no same-input P/C NNUEC consumption",
+        ))
+    }
+    fn shared_nnuec_readout_consumed(
+        &self,
+        _: &FrameInput<ReviewView, Q>,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    #[allow(clippy::type_complexity)]
+    fn close_shared_nnuec_readouts(
+        &self,
+        _: &PreparationActor,
+        acknowledgement: NnuecCacheReleaseAck,
+        terminals: Vec<PcNnuecReadoutTerminal>,
+    ) -> Result<
+        PcSharedReadoutRootClosure,
+        (
+            AdaptiveManagerError,
+            NnuecCacheReleaseAck,
+            Vec<PcNnuecReadoutTerminal>,
+        ),
+    > {
+        Err((
+            AdaptiveManagerError::Invalid("driver has no shared P/C NNUEC closure"),
+            acknowledgement,
+            terminals,
+        ))
+    }
+    fn shared_nnuec_closure_matches(&self, _: &PcSharedReadoutRootClosure) -> bool {
+        false
+    }
     fn role_submitted(
         &mut self,
         input: &FrameInput<ReviewView, Q>,
@@ -136,6 +207,8 @@ pub struct RoleOnlyShutdownReceipt {
     pub review_leases: RoventReviewLeaseObservation,
     native_root_fence: Option<NativeRootFence>,
     close_mode: AdaptiveCloseMode,
+    shared_nnuec_required: bool,
+    shared_nnuec_closure: Option<Arc<PcSharedReadoutRootClosure>>,
 }
 impl RoleOnlyShutdownReceipt {
     pub fn permits_semantic_closure(&self) -> bool {
@@ -143,6 +216,7 @@ impl RoleOnlyShutdownReceipt {
             && !self.quarantined
             && self.pending_tickets == 0
             && self.retained_outputs == 0
+            && (!self.shared_nnuec_required || self.shared_nnuec_closure.is_some())
             && match self.close_mode {
                 AdaptiveCloseMode::ProcessShutdown => {
                     self.native_process_joined && self.native_physical_shutdown_confirmed
@@ -155,6 +229,33 @@ impl RoleOnlyShutdownReceipt {
     pub fn root_fence(&self) -> Option<NativeRootFence> {
         self.native_root_fence
     }
+    /// Observation of the original actor/root closure, not a replacement for
+    /// the native physical fence or a new evaluator/NN completion authority.
+    pub fn shared_nnuec_closure(&self) -> Option<&Arc<PcSharedReadoutRootClosure>> {
+        self.shared_nnuec_closure.as_ref()
+    }
+}
+
+struct PendingSharedReadout<Q> {
+    input: FrameInput<ReviewView, Q>,
+    request: Option<SharedNnuecRequest>,
+    seal: Option<PcNnuecReadoutSeal>,
+    completion: Option<SharedNnuecCompletion>,
+    submitted: bool,
+}
+
+/// This is immutable-question/terminal custody only. The Session owns the one
+/// existing preparation actor; no R frame, CpuJob, evaluator or worker exists
+/// here. Numeric readouts never change P/C WDL, mate proofs or node counters.
+struct SharedReadoutPreparation<Q> {
+    model: Arc<SharedNnuecModel>,
+    canceled: Arc<AtomicBool>,
+    pending: Option<PendingSharedReadout<Q>>,
+    terminals: Vec<PcNnuecReadoutTerminal>,
+    invalidation: Option<NnuecCacheInvalidation>,
+    cache_release: Option<NnuecCacheReleaseAck>,
+    closure: Option<Arc<PcSharedReadoutRootClosure>>,
+    unknown: bool,
 }
 
 pub struct RoleOnlyExecutionManager<Q, B, D>
@@ -171,6 +272,7 @@ where
     acks: VecDeque<NativeAck>,
     pending_input: Option<FrameInput<ReviewView, Q>>,
     pending_preparation: Option<TicketPreparation<ReviewView, Q>>,
+    shared_nnuec: Option<SharedReadoutPreparation<Q>>,
     phase: ManagerPhase,
     native_ready: bool,
     verifier_registered: bool,
@@ -272,6 +374,7 @@ where
             acks: VecDeque::with_capacity(registration.role_tickets_max),
             pending_input: None,
             pending_preparation: None,
+            shared_nnuec: None,
             phase: ManagerPhase::Running,
             native_ready,
             verifier_registered,
@@ -302,6 +405,267 @@ where
     }
     pub fn driver_mut(&mut self) -> &mut D {
         &mut self.driver
+    }
+    /// Register the original model before the first question. Explicit None
+    /// baselines do not call this endpoint; declared shared readout cannot
+    /// silently fall back to the old unprepared P/C path.
+    pub fn enable_shared_nnuec_preparation(
+        &mut self,
+        model: Arc<SharedNnuecModel>,
+    ) -> Result<(), AdaptiveManagerError> {
+        if self.phase != ManagerPhase::Running
+            || self.shutdown_until.is_some()
+            || self.shared_nnuec.is_some()
+            || self.pending_input.is_some()
+            || self.pending_preparation.is_some()
+            || !self.bindings.is_empty()
+            || self.counters.native_preparations != 0
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C shared NNUEC registration must precede the first question",
+            ));
+        }
+        self.driver
+            .register_shared_nnuec_readout(Arc::clone(&model))?;
+        if !self.driver.requires_shared_nnuec_readout() {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C driver did not retain shared NNUEC registration",
+            ));
+        }
+        self.shared_nnuec = Some(SharedReadoutPreparation {
+            model,
+            canceled: Arc::new(AtomicBool::new(false)),
+            pending: None,
+            terminals: Vec::new(),
+            invalidation: None,
+            cache_release: None,
+            closure: None,
+            unknown: false,
+        });
+        Ok(())
+    }
+
+    /// The Session lends its existing actor before/after tick, including while
+    /// draining. Completion and cache release remain nonblocking, same-owner
+    /// operations and do not create a CPU search worker or native node credit.
+    pub fn pump_shared_nnuec_preparation(
+        &mut self,
+        actor: &PreparationActor,
+    ) -> Result<bool, AdaptiveManagerError> {
+        if self.phase == ManagerPhase::Finished {
+            return Ok(false);
+        }
+        if self.phase == ManagerPhase::Running
+            && (self.effective_hard_expired() || self.now().is_err())
+        {
+            self.begin_root_quiesce(self.cleanup_until()?)?;
+        }
+        let Some(mut preparation) = self.shared_nnuec.take() else {
+            return if self.driver.requires_shared_nnuec_readout() {
+                Err(AdaptiveManagerError::Invalid(
+                    "required P/C shared NNUEC preparation is absent",
+                ))
+            } else {
+                Ok(false)
+            };
+        };
+        let result = self.pump_shared_readout(actor, &mut preparation);
+        self.shared_nnuec = Some(preparation);
+        if let Err(error) = &result {
+            self.record_failure(error.clone());
+        }
+        result
+    }
+
+    fn pump_shared_readout(
+        &mut self,
+        actor: &PreparationActor,
+        preparation: &mut SharedReadoutPreparation<Q>,
+    ) -> Result<bool, AdaptiveManagerError> {
+        if preparation.unknown || preparation.closure.is_some() {
+            return Ok(false);
+        }
+        let closing = self.phase != ManagerPhase::Running;
+        if closing {
+            preparation.canceled.store(true, Ordering::Release);
+        }
+        let may_submit = !closing && self.can_admit_work();
+        let mut changed = false;
+        if preparation.pending.is_none()
+            && may_submit
+            && let Some(input) = self.pending_input.as_ref()
+            && !self.driver.shared_nnuec_readout_consumed(input)?
+        {
+            let request = self.driver.prepare_shared_nnuec_readout(
+                input,
+                &preparation.model,
+                Arc::clone(&preparation.canceled),
+            )?;
+            let (request, seal) = request.into_parts();
+            preparation.pending = Some(PendingSharedReadout {
+                input: input.clone(),
+                request: Some(request),
+                seal: Some(seal),
+                completion: None,
+                submitted: false,
+            });
+            changed = true;
+        }
+        if let Some(pending) = preparation.pending.as_mut()
+            && !pending.submitted
+            && closing
+        {
+            if pending.request.is_none() || pending.seal.is_none() {
+                preparation.unknown = true;
+                return Err(AdaptiveManagerError::Invalid(
+                    "unsubmitted P/C NNUEC original request/seal custody is absent",
+                ));
+            }
+            let request = pending
+                .request
+                .take()
+                .expect("original unsubmitted request");
+            let seal = pending.seal.take().expect("original unsubmitted seal");
+            match seal.retire_unsubmitted(request) {
+                Ok(terminal) => preparation.terminals.push(terminal),
+                Err((error, seal, request)) => {
+                    pending.seal = Some(seal);
+                    pending.request = Some(request);
+                    preparation.unknown = true;
+                    return Err(AdaptiveManagerError::Semantic(error.to_string()));
+                }
+            }
+            preparation.pending = None;
+            changed = true;
+        }
+        if let Some(pending) = preparation.pending.as_mut() {
+            if !pending.submitted && may_submit {
+                let request = pending.request.take().ok_or(AdaptiveManagerError::Invalid(
+                    "P/C NNUEC original request custody is absent",
+                ))?;
+                match actor.try_submit(request) {
+                    Ok(()) => {
+                        pending.submitted = true;
+                        changed = true;
+                    }
+                    Err((PreparationError::Busy, original)) => pending.request = Some(original),
+                    Err((error, original)) => {
+                        pending.request = Some(original);
+                        return Err(AdaptiveManagerError::NnuecPreparation(
+                            NnuecWorkError::Preparation(error),
+                        ));
+                    }
+                }
+            }
+            if pending.submitted && pending.completion.is_none() {
+                match actor.try_complete() {
+                    Ok(Some(completion)) => {
+                        pending.completion = Some(completion);
+                        changed = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        preparation.unknown = true;
+                        return Err(AdaptiveManagerError::NnuecPreparation(
+                            NnuecWorkError::Preparation(error),
+                        ));
+                    }
+                }
+            }
+            // A suspended execution clock does not consume or discard a
+            // completed question. Keep its exact owners until admission or
+            // original root closure permits the next action.
+            if (may_submit || closing) && pending.completion.is_some() {
+                if pending.seal.is_none() {
+                    preparation.unknown = true;
+                    return Err(AdaptiveManagerError::Invalid(
+                        "P/C NNUEC original completion seal is absent",
+                    ));
+                }
+                let completion = pending.completion.take().expect("original completion");
+                let seal = pending.seal.take().expect("original completion seal");
+                let consumed = if closing {
+                    Ok(())
+                } else {
+                    self.driver
+                        .consume_shared_nnuec_readout(
+                            &pending.input,
+                            &seal,
+                            &preparation.model,
+                            &completion,
+                        )
+                        .map(|_| ())
+                };
+                match seal.retire(completion) {
+                    Ok(terminal) => preparation.terminals.push(terminal),
+                    Err((error, seal, completion)) => {
+                        pending.seal = Some(seal);
+                        pending.completion = Some(completion);
+                        preparation.unknown = true;
+                        return Err(AdaptiveManagerError::Semantic(error.to_string()));
+                    }
+                }
+                preparation.pending = None;
+                changed = true;
+                consumed?;
+            }
+        }
+        if closing && preparation.pending.is_none() {
+            if preparation.invalidation.is_none() {
+                preparation.invalidation =
+                    Some(actor.invalidate_context_cache().map_err(|error| {
+                        AdaptiveManagerError::NnuecPreparation(NnuecWorkError::Preparation(error))
+                    })?);
+                changed = true;
+            }
+            if preparation.cache_release.is_none() {
+                preparation.cache_release = actor
+                    .try_context_cache_release(
+                        preparation
+                            .invalidation
+                            .as_ref()
+                            .expect("original invalidation"),
+                    )
+                    .map_err(|error| {
+                        AdaptiveManagerError::NnuecPreparation(NnuecWorkError::Preparation(error))
+                    })?;
+            }
+            if let Some(acknowledgement) = preparation.cache_release.take() {
+                let terminals = std::mem::take(&mut preparation.terminals);
+                match self
+                    .driver
+                    .close_shared_nnuec_readouts(actor, acknowledgement, terminals)
+                {
+                    Ok(closure) => {
+                        let matches = self.driver.shared_nnuec_closure_matches(&closure);
+                        preparation.closure = Some(Arc::new(closure));
+                        if !matches {
+                            preparation.unknown = true;
+                            return Err(AdaptiveManagerError::PhysicalUnknown);
+                        }
+                        changed = true;
+                    }
+                    Err((error, acknowledgement, terminals)) => {
+                        preparation.cache_release = Some(acknowledgement);
+                        preparation.terminals = terminals;
+                        preparation.unknown = true;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    fn shared_readout_cleanup_settled(&self) -> bool {
+        self.shared_nnuec.as_ref().map_or(
+            !self.driver.requires_shared_nnuec_readout(),
+            |preparation| {
+                !preparation.unknown
+                    && preparation.pending.is_none()
+                    && preparation.closure.is_some()
+            },
+        )
     }
     pub fn register_cleanup_deadline(
         &mut self,
@@ -487,6 +851,11 @@ where
         if !self.can_admit_work() {
             return Ok(false);
         }
+        if self.driver.requires_shared_nnuec_readout() && self.shared_nnuec.is_none() {
+            return Err(AdaptiveManagerError::Invalid(
+                "required P/C NNUEC readout was not enabled",
+            ));
+        }
         let mut changed = false;
         while self.phase == ManagerPhase::Running && self.bindings.len() < self.pending_limit()? {
             let reserved = self
@@ -530,6 +899,11 @@ where
             self.deadline
                 .accepts(self.clock.domain(), now)
                 .map_err(|_| AdaptiveManagerError::Deadline)?;
+            if self.shared_nnuec.is_some() && !self.driver.shared_nnuec_readout_consumed(input)? {
+                // The same original FrameInput stays pinned here. Only the
+                // Session's nonblocking actor pump can make this gate ready.
+                break;
+            }
             if self.pending_preparation.is_none() {
                 self.pending_preparation = Some(TicketPreparation {
                     question: input.question_digest,
@@ -1269,6 +1643,9 @@ where
         };
         self.close_mode = mode;
         self.shutdown_until = Some(until);
+        if let Some(preparation) = &self.shared_nnuec {
+            preparation.canceled.store(true, Ordering::Release);
+        }
         if self.phase != ManagerPhase::Quarantined {
             self.phase = ManagerPhase::Draining;
         }
@@ -1372,7 +1749,10 @@ where
                     self.native_joined && self.native_finished == Some(true)
                 }
             };
-            if fenced && self.phase != ManagerPhase::Quarantined {
+            if fenced
+                && self.shared_readout_cleanup_settled()
+                && self.phase != ManagerPhase::Quarantined
+            {
                 if !self.collection_settled {
                     if let Some(observer) = &mut self.collection {
                         let remaining: Vec<_> = self
@@ -1431,8 +1811,14 @@ where
             retained_outputs: self.bindings.len()
                 + self.retained_completions.len()
                 + usize::from(self.pending_input.is_some())
-                + usize::from(self.pending_preparation.is_some()),
-            quarantined: self.phase == ManagerPhase::Quarantined || self.native.is_quarantined(),
+                + usize::from(self.pending_preparation.is_some())
+                + usize::from(!self.shared_readout_cleanup_settled()),
+            quarantined: self.phase == ManagerPhase::Quarantined
+                || self.native.is_quarantined()
+                || self
+                    .shared_nnuec
+                    .as_ref()
+                    .is_some_and(|preparation| preparation.unknown),
             request_sequence_high_water: self.registry.next_request_sequence().saturating_sub(1),
             counters: self.counters,
             canceled_acceptance_acks: self.canceled_acceptance_acks,
@@ -1440,6 +1826,11 @@ where
             review_leases: leases,
             native_root_fence: self.native_root_fence,
             close_mode: self.close_mode,
+            shared_nnuec_required: self.driver.requires_shared_nnuec_readout(),
+            shared_nnuec_closure: self
+                .shared_nnuec
+                .as_ref()
+                .and_then(|preparation| preparation.closure.clone()),
         })
     }
     pub fn run_root_until(
