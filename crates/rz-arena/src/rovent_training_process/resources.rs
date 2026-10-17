@@ -8,9 +8,9 @@
 use crate::ArenaError;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::{ambient_authority, fs::Dir};
-use nix::sched::{CpuSet, sched_getaffinity};
-use nix::sys::stat::{Mode, mkdirat};
-use nix::sys::statfs::{CGROUP2_SUPER_MAGIC, PROC_SUPER_MAGIC, fstatfs};
+use nix::sched::{sched_getaffinity, CpuSet};
+use nix::sys::stat::{mkdirat, Mode};
+use nix::sys::statfs::{fstatfs, CGROUP2_SUPER_MAGIC, PROC_SUPER_MAGIC};
 use nix::unistd::{Pid, Uid};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,6 +25,11 @@ const MAX_PROC_TEXT: usize = 16 * 1024;
 const MAX_MOUNTINFO: usize = 256 * 1024;
 const MAX_CGROUP_PROCS: usize = 64 * 1024;
 const CPU_PERIOD_US: u64 = 1_000_000;
+
+mod native_tree;
+pub use native_tree::{
+    RoventNativeProcessEntry, RoventNativeProcessSnapshot, RoventNativeTreeObservation,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -721,7 +726,11 @@ fn io(stage: &str) -> ArenaError {
     ArenaError::Io(format!("rovent_training_resources.{stage}"))
 }
 fn check(ok: bool, detail: &str) -> Result<(), ArenaError> {
-    if ok { Ok(()) } else { Err(invalid(detail)) }
+    if ok {
+        Ok(())
+    } else {
+        Err(invalid(detail))
+    }
 }
 fn valid_leaf(name: &str) -> bool {
     name.starts_with("rovent-")
@@ -846,6 +855,12 @@ fn write_kernel(directory: &Dir, name: &str, value: &str) -> Result<(), ArenaErr
         .contains(&name),
         "only fresh leaf limit files may be written",
     )?;
+    write_cgroup_value(directory, name, value)
+}
+// The limit-file whitelist above remains unchanged. The native child module
+// may additionally write only its own actual PID to the retained fresh leaf's
+// cgroup.procs; both paths use this same bounded no-follow cgroup2 write.
+fn write_cgroup_value(directory: &Dir, name: &str, value: &str) -> Result<(), ArenaError> {
     let mut options = cap_std::fs::OpenOptions::new();
     options.write(true).follow(FollowSymlinks::No);
     let mut file = directory
@@ -1056,22 +1071,18 @@ mod tests {
         let p = policy();
         let raw = serde_json::to_string(&p).unwrap();
         assert_eq!(RoventTrainingResourcePolicy::from_json(&raw).unwrap(), p);
-        assert!(
-            RoventTrainingResourcePolicy::from_json(&raw.replacen(
-                "\"pids_max\":",
-                "\"extra\":0,\"pids_max\":",
-                1
-            ))
-            .is_err()
-        );
-        assert!(
-            RoventTrainingResourcePolicy::from_json(&raw.replacen(
-                "\"pids_max\":",
-                "\"pids_max\":1,\"pids_max\":",
-                1
-            ))
-            .is_err()
-        );
+        assert!(RoventTrainingResourcePolicy::from_json(&raw.replacen(
+            "\"pids_max\":",
+            "\"extra\":0,\"pids_max\":",
+            1
+        ))
+        .is_err());
+        assert!(RoventTrainingResourcePolicy::from_json(&raw.replacen(
+            "\"pids_max\":",
+            "\"pids_max\":1,\"pids_max\":",
+            1
+        ))
+        .is_err());
         for device in ["cuda", "cuda:-1", "cuda:00", "cuda:64", "gpu", " cpu"] {
             let mut wrong = p.clone();
             wrong.device = device.into();

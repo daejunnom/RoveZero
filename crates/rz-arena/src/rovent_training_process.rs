@@ -35,6 +35,7 @@ mod resources;
 pub use linux::compiled_rovent_trainer_source_sha256;
 #[cfg(target_os = "linux")]
 pub use resources::{
+    RoventNativeProcessEntry, RoventNativeProcessSnapshot, RoventNativeTreeObservation,
     RoventTrainingResourceFailure, RoventTrainingResourcePolicy, RoventTrainingResources,
     RoventTrainingTotalParentScopeObservation,
 };
