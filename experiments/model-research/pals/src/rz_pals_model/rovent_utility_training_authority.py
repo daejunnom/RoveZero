@@ -322,8 +322,11 @@ class ParentSocketUtilityTrainerAuthority:
 
     def checkpoint_published(self, lease, checkpoint, owner):
         require_original_utility_authority(self, lease=lease, owner=owner)
+        from .rovent_training_bootstrap import _pin as file_pin
+        projection = file_pin(checkpoint["tensor_projection"], 16 * 1024**2)
         self._rpc("checkpoint_published", {"schema": "rz-rovent-utility-trainer-checkpoint/1",
             "checkpoint": {name: checkpoint[name] for name in ("path", "sha256", "bytes")},
+            "tensor_projection": copy.deepcopy(projection),
             "completed_updates": owner.completed_updates, "ancestor_updates": owner.ancestor_updates,
             **self._state(owner), "snapshot_cost": copy.deepcopy(checkpoint["snapshot_cost"]),
             "post_snapshot_cost": copy.deepcopy(checkpoint["post_snapshot_cost"]), "pending_microbatches": owner.pending_microbatches,

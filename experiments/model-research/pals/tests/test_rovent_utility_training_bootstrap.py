@@ -35,7 +35,8 @@ def fixture():
         "trainer_python_executable": pin("/opt/python/bin/python3", "33"), "trainer_python_version": "3.12.7",
         "dependency_directories": ["/opt/python/site-packages"], "runtime_endpoints": endpoints,
         "trainer_dependency_set_sha256": hashlib.sha256(dependency_raw).hexdigest(),
-        "current_dataset": {"root": "/data/cohort", "publication": pin("/data/cohort/publication.json", "34")},
+        "current_dataset": {"root": "/data/cohort", "publication": pin("/data/cohort/publication.json", "34"),
+            "durable_ack": pin("/data/cohort/durable-ack.json", "39")},
         "ancestor_datasets": [], "initialization_source": {"mode": "initialize", "utility": pin("/data/utility.json", "35")},
         "frozen_nnuec_base": pin("/data/base.json", "36"),
         "frozen_pc_sources": [{"role": role, "artifact": pin("/data/" + role + ".pt", marker),
@@ -113,6 +114,15 @@ class UtilityBootstrapTests(unittest.TestCase):
         value["registration"]["initialization_source"] = {"mode": "resume",
             "checkpoint": {"root": "/data/old-utility", "publication": pin("/data/old-utility/publication.json", "62")}}
         self.assertEqual(validate(value)["registration"]["action"], "export")
+
+    def test_dataset_durable_ack_is_required_without_changing_the_checkpoint_reference(self):
+        value = fixture(); value["registration"]["current_dataset"].pop("durable_ack")
+        with self.assertRaises(ValueError): validate(value)
+        value = fixture(); value["registration"]["initialization_source"] = {"mode": "resume",
+            "checkpoint": {"root": "/data/old-utility", "publication": pin("/data/old-utility/publication.json", "62")}}
+        self.assertEqual(validate(value)["registration"]["initialization_source"]["mode"], "resume")
+        value["registration"]["initialization_source"]["checkpoint"]["durable_ack"] = pin("/data/old-utility/durable-ack.json", "63")
+        with self.assertRaises(ValueError): validate(value)
 
 
 if __name__ == "__main__":

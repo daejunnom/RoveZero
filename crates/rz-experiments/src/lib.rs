@@ -24,6 +24,7 @@ pub mod rovent_r_readout;
 mod rovent_root_allocation;
 mod rovent_root_descriptor;
 pub mod rovent_submitted_input;
+pub mod rovent_utility_cohort;
 mod validation;
 
 pub use manifest::*;

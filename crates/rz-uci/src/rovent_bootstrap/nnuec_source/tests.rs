@@ -6,7 +6,6 @@ use rz_search::cpu_value::nnuec::{
     v2::{self, Checkpoint, RelationParameters},
 };
 use serde_json::Value;
-use sha2::Digest as _;
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},

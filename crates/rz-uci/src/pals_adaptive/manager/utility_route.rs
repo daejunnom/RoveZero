@@ -6,7 +6,6 @@ use rz_search::cpu_value::nnuec::v2::review::{
     BoundNnuecReviewContext, Completion, NnuecPreparationTerminalAck, PreparationActor,
     PreparationError, PreparationObservation, Provenance, Request,
 };
-use rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture;
 use rz_search::pals::coordinator::AcceptedRoleStep;
 use rz_search::pals::engine::adaptive_port::utility_route::{
     UtilityRouteAction, UtilityRouteActionId, UtilityRouteCommitGuard, UtilityRoutePreparation,

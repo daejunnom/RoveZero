@@ -3,8 +3,6 @@
 use super::*;
 use rz_contracts::{Deadline, Digest};
 use rz_position::contracts::ContractState;
-#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-use rz_runtime::contracts::ContractClock as _;
 use rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace;
 use rz_search::pals::rovent_engine::RootMoveDomain;
 use rz_search::pals::rovent_frontier::RoventFrontier;

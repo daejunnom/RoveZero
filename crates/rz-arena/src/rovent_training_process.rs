@@ -34,6 +34,8 @@ pub mod recovery;
 #[cfg(target_os = "linux")]
 mod resources;
 #[cfg(target_os = "linux")]
+pub mod utility;
+#[cfg(target_os = "linux")]
 pub use linux::compiled_rovent_trainer_source_sha256;
 #[cfg(target_os = "linux")]
 pub use resources::{

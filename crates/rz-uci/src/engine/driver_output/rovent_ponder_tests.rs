@@ -10,7 +10,6 @@ use super::super::{
     Owner, ProcessClock, RulesSearchPosition, RulesUciPort, append_result, event_channel,
 };
 use crate::bridge::NodeBudgetSemantics;
-use crate::contracts::SessionScope;
 use crate::rovent_root_admission::{RoventRootAdmission, RoventRootAdmissionPolicy};
 use crate::search_driver::{
     DriverPhysicalCompletion, SearchKind, SearchSessionContext, SearchSessionDriver,

@@ -185,7 +185,7 @@ pub(super) struct IoVerifiedArtifact<S> {
     summary: S,
 }
 impl<S> IoVerifiedArtifact<S> {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn file(&self) -> &File {
         &self._retained_file
     }
@@ -209,7 +209,7 @@ impl<S> IoVerifiedArtifact<S> {
 
     /// Identity/type/extent check on the original retained FD, not a pathname
     /// or caller-supplied bool. Content revalidation remains bounded below.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn revalidate(&self) -> Result<(), IoError> {
         self._retained_capability.verify_named_root()?;
         let state = FileState::observe(&self._retained_file)?;

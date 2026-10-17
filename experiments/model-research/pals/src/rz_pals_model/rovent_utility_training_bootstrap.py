@@ -35,11 +35,20 @@ STARTUP_FIELDS = ("schema", "execution_id", "window_id", "registration_sha256", 
     "dependency_directories", "runtime_module_pins", "python_runtime", "resources", "artifact_watch_profile", "child_read_credit")
 
 
-def _publication(value):
+def _checkpoint_reference(value):
     _fields(value, ("root", "publication"), "utility original publication source")
     _absolute(value["root"])
     _pin(value["publication"])
     _child_path(value["root"], value["publication"]["path"], "utility publication")
+    return value
+
+
+def _dataset_reference(value):
+    _fields(value, ("root", "publication", "durable_ack"), "utility original cohort dataset source")
+    _absolute(value["root"])
+    for name in ("publication", "durable_ack"):
+        _pin(value[name])
+        _child_path(value["root"], value[name]["path"], "utility cohort " + name)
     return value
 
 
@@ -64,12 +73,12 @@ def validate_registration(value):
         raise ValueError("duplicate utility dependency directory")
     if _sha(value["trainer_dependency_set_sha256"]) != recovered_dependency_set_digest(value["runtime_endpoints"]):
         raise ValueError("utility runtime endpoint declaration differs from its pure dependency seal")
-    _publication(value["current_dataset"])
+    _dataset_reference(value["current_dataset"])
     if type(value["ancestor_datasets"]) is not list or len(value["ancestor_datasets"]) > 256:
         raise ValueError("bounded original utility dataset ancestry required")
     seen = {value["current_dataset"]["publication"]["sha256"]}
     for ancestor in value["ancestor_datasets"]:
-        _publication(ancestor)
+        _dataset_reference(ancestor)
         identity = ancestor["publication"]["sha256"]
         if identity in seen:
             raise ValueError("duplicate or current utility ancestor publication")
@@ -96,7 +105,7 @@ def validate_registration(value):
         _pin(source["utility"], MAX_RUNTIME_MODULE_BYTES)
     elif mode in ("resume", "fork"):
         _fields(source, ("mode", "checkpoint"), "historical utility checkpoint source")
-        _publication(source["checkpoint"])
+        _checkpoint_reference(source["checkpoint"])
     else:
         raise ValueError("registered initialize/resume/fork utility source required")
     if value["action"] == "train":

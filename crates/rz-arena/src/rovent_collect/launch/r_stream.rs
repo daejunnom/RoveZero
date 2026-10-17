@@ -105,7 +105,7 @@ impl RStream {
             plan.every_nth_score,
             plan.maximum_input_bytes as usize,
         )
-        .map_err(|error| invalid(error.to_string()))?;
+        .map_err(|error| invalid(format!("{error:?}")))?;
         let limits = RoventRObserverLimits::new(
             plan.maximum_captures.into(),
             plan.maximum_witnesses.into(),
