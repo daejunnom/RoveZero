@@ -694,3 +694,35 @@ reader를 연결했다. 신경망 import를 차단한 자료 검사 44개가 통
 join, 같은 고정 소스의 컴파일·실행·source inventory, 네 모드 및 외부 교사의 실제 인수다.
 서로 다른 trial의 원 cost epoch·authority·clock을 유지하며 공통 비교 맥락으로 위장하지
 않는다. 준비 명세는 계속 실행 권한 `false`, optimizer update `0`인 수동 자료다.
+
+### N05 후속 통합 계약
+
+실제 producer는 길이 한도 또는 Rules 종료에 도달한 Proposal을 게시한다. 따라서
+그 full target을 단순 연장하는 최초 P arm 정의는 정상 자료에서 항상 unsupported가
+될 수 있다. `/2`의 P는 같은 original first에서 제한된 재제안으로 구체화한다.
+중립 full Proposal·record·reference bytes는 그대로 보존하고, P의 실제 query prefix만
+원 Rules root에서 재생한 `[original first]`로 둔다. query proposal은 원 full target을
+유지한다. C prefix는 빈 수열, R prefix는 원 full target이다. 실제 first endpoint의
+종료·합법수·기존 길이/credit/deadline 검사를 유지하고, target을 잘라 넣지 않는다.
+기본 탐색 정책은 이 실험 정책을 선택하지 않으면 바뀌지 않는다.
+
+비교의 공통 조건에는 실제 source FrameBudget의 role·CPU·Store 세 축과, 원 witness
+의미 식별 집합도 포함한다. 이 witness 식별은 정확한 Rules root·Counter/Repair 종류·
+Move16 라인을 사용하며 owner·frame·request·절대 시각을 공통 의미로 비교하지 않는다.
+실제 arm 발주 전과 pair 인수에서 두 조건을 모두 대조한다.
+
+새 `/2` dataset을 실제 학습 소비자로 연결하기 위해 별도 `intervention_v2` source family를
+구현한다. 기존 recipe·parameter·NNUEC 수학은 유지하고, 원 exact9 준비 본문을 기존
+PREP1/PREP2 외피로 재생성하지 않는다. dataset·context·pool은 각각 기존 도메인의 `/2`,
+training-registration과 train-window는 `/3`, startup/RPC/ACK/result 및 checkpoint·
+retirement·projection·closure·completion·export wrapper는 별도 `/2`다. 구체적인
+문자열은 각 기존 도메인의 실제 이름을 사용한다. registration은 기존 29필드에
+`data_family`를 더한 30필드, window는 새 schema의 기존 23필드, child startup은
+기존 18필드에 같은 family를 더한 19필드로 닫는다. 기존 parser의 허용 범위는 넓히지 않는다.
+
+`ValidatedUtilityNumericalParts`와 private typed family를 통해 검증된 수학 부분과
+감독·FD·resource·socket·ACK·atomic 저장 기계만 공유한다. 새 원 dataset/authority가
+현재 peer·lease·읽기 예산·원 update journal·completion을 별도로 보유해야 한다。
+준비 metadata나 저장된 역사 자료만으로 실제 update·checkpoint·export 성공을
+만들지 않는다. 기존 diagnostic 자산은 승격하지 않는다. 이 연결은 소스 구현과
+비학습 검사의 범위이며 실제 optimizer update·학습을 실행하는 승인은 아니다.
