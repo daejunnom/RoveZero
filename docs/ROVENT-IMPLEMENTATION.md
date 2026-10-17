@@ -516,3 +516,39 @@ fixture가 원 질문 revision을 봉인하도록 수정했으며 제품 수락 
 
 실제 optimizer update·본학습·원격 비교·PR 병합은 이번 목표의 완료 조건에 추가하지
 않는다. 소스 준비·CPU 통과·실제 모델/GPU 인수를 분리하고 목표는 계속 진행한다.
+
+## 열 번째 통합 체크포인트
+
+`639eb32`의 후속 CPU 실행에서 UCI 706개가 모두 통과했다. 명시적 미학습 NNUEC
+자산을 이용한 독립 산술 대조도 20개 입력에서 통과했다. Rust가 생성한 실제 입력을
+별도 stdlib reference로 계산한 결과이며, Rules 인코더의 독립 구현·기력·GPU·학습
+증거는 아니다. 최초 비교기 오류와 수정 후 영수증은 각각 보존한다.
+
+`1db90f1`의 원 utility action은 질문·view·실제 descendant·새 witness를 연결하고,
+같은 actor의 해제와 cache ACK 및 PinZero 이후에 비용을 닫도록 구현했다.
+validation030은 utility 입력 준비의 오류 변환 두 곳과 root 후보 반복 한 곳에서
+컴파일에 실패했다. `1d9256e`에서 이 세 곳과 collection origin의 포맷을 수정했다.
+해당 고정 소스의 순수 소비자·utility 명세 검사는 신경망 import·optimizer를 차단한
+Windows·WSL에서 각각 369개 통과했다. 최신 Rust 전체 검사는 진행 중이며, 새
+CaptureError 표시 변환 오류가 발견돼 전체 통과로 표시하지 않는다.
+
+사용자가 승인한 N05 후속 범위는 선택형 cohort 비교 실행기다. 단일 root의 서로
+다른 시각에 얻은 결과를 사후에 같은 비교 쌍으로 바꾸지 않는다.
+
+- 입력·가중치·정확 Rules 이력·후보·예산·자원·준비 절차를 결과 전에 등록한다.
+  실제 Ready 상태에서 봉인한 문맥으로 독립 root의 P/C/R trial을 최대 세 개 실행한다.
+- trial의 원 authority·시계·hard deadline·완료·미해결·물리 종료를 따로 보존한다.
+  원 cache 준비와 실제 관측 근거가 부족하면 known pair를 만들지 않는다.
+- cohort 비용은 실제 route·제한된 역사 자료 materialization·같은 actor의 물리 drain과
+  PinZero를 포함한다. durable dataset I/O는 별도 수집 비용으로 기록하며, 원 root-local
+  비용에서 사후에 시간을 빼지 않는다.
+- 새 비용 domain은 `rz-rovent-utility-cohort-cost/1`, 명세는
+  `rz-rovent-utility-training-preparation/2`다. 기존 preparation `/1`과 root-local
+  source·bytes·unknown 상태를 유지한다.
+- 첫 자료 단위는 원 cohort publication 하나와 별도 durable ACK다. 다context 집계는
+  이 자료를 암묵적으로 확장하지 않으며, 과거 dataset은 학습 계보 검증과 구분한다.
+
+병렬 잔여는 CPU·Manager·E의 실제 cohort 발급·실행·게시, MF·F의 원 FD 소비와
+utility checkpoint/export 연결, 총괄의 최신 Rust·형식·CI 및 최종 source literal
+검사다. optimizer를 호출하지 않는 tensor 검사와 실제 모델·로컬 GPU 수명 인수는
+순수 검사의 통과 수와 별도로 관리한다. 실제 학습·원격 비교·PR 병합은 실행하지 않는다.
