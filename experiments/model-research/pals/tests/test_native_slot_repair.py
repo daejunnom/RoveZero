@@ -135,7 +135,21 @@ class SlotFixture(RepairFixture):
     """
     def __init__(self, directory):
         self.ready = False
-        super().__init__(directory)
+        original_bytes = fixtures.frozen_fixture_bytes
+
+        def with_synthetic_compiled_fact(value):
+            # Bind this declaration before the seed source's FIRST raw bytes,
+            # producer registration and receipt are created. Mutating only
+            # self.source later would leave the retained checked-source wire
+            # without the fact used by the real divergence/slot factories.
+            if (type(value) is list and len(value) == 2
+                    and value[0] == training.CHECKED_SOURCE_DOMAIN
+                    and type(value[1]) is dict and type(value[1].get("native")) is dict):
+                value[1]["native"]["search_implementation_sha256"] = SYNTHETIC_COMPILED_FACT
+            return original_bytes(value)
+
+        with patch.object(fixtures, "frozen_fixture_bytes", side_effect=with_synthetic_compiled_fact):
+            super().__init__(directory)
         seed_dir = self.root / "synthetic-slot-auxiliary"
         seed_dir.mkdir()
         seed = NativeDivergenceFixture(seed_dir)
@@ -187,7 +201,6 @@ class SlotFixture(RepairFixture):
         repo = Path(__file__).resolve().parents[4]
         source_raws = read_reviewed_fixture_sources(repo)
         self.engine_raw, self.native_raw = (source_raws[path] for path in slot_witness._SOURCE_PATHS)
-        self.source["native"]["search_implementation_sha256"] = SYNTHETIC_COMPILED_FACT
         self.manifest = fixture_manifest()
         self.build = {"schema": slot_witness.BUILD_SCHEMA, "source_commit": REVIEWED_SOURCE_COMMIT,
             "actual_build_exit_code": 0, "source_verified_before_and_after_build": True,
@@ -532,6 +545,9 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.fixture = SlotFixture(self.temp.name)
 
     def test_known_unique_chain_is_factual_conditional_and_all_targets_false(self):
+        original_source = json.loads(self.fixture.source_raw)[1]
+        self.assertEqual(original_source["native"]["search_implementation_sha256"], SYNTHETIC_COMPILED_FACT)
+        self.assertEqual(original_source, self.fixture.source)
         checked = self.fixture.admit_slot()
         self.assertEqual(checked.status, "known")
         self.assertIs(checked.require_witness(), checked)
