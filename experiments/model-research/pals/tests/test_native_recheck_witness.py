@@ -27,7 +27,8 @@ from test_repair_context import RepairFixture
 from test_semantic_verifier import SemanticFixture, tokens
 import test_training as fixtures
 from native_source_review_fixture import (
-    REVIEWED_SOURCE_COMMIT, REVIEWED_TRANSITION_PINS, SYNTHETIC_COMPILED_FACT,
+    REVIEWED_SOURCE_COMMIT, REVIEWED_TRANSITION_PINS, REVIEWED_COMPONENT_PINS,
+    REVIEWED_CLOSURE_SHA256, SYNTHETIC_COMPILED_FACT,
     fixture_manifest, fixture_review_scope, read_reviewed_fixture_sources,
 )
 
@@ -1425,7 +1426,14 @@ class NativeRecheckPublicWholeTests(unittest.TestCase):
             original = json.loads(fixture.seed.artifacts["receipt.json"])
             self.assertEqual(original["artifacts"][witness.TRACE_ARTIFACT], byte_pin(fixture.trace_raw))
             self.assertEqual(set(original["artifacts"]), set(fixture.assets) - {"receipt.json"})
-            self.assertEqual(fixture.anchor.admission()["source_observation"]["reviewed_transition_sources"], REVIEWED_TRANSITION_PINS)
+            source_review = fixture.anchor.admission()["source_observation"]
+            self.assertEqual(source_review["reviewed_transition_sources"], REVIEWED_TRANSITION_PINS)
+            closure = source_review["reviewed_transition_closure"]
+            self.assertEqual(closure["component_pins"], REVIEWED_COMPONENT_PINS)
+            self.assertEqual(closure["closure_sha256"], REVIEWED_CLOSURE_SHA256)
+            self.assertEqual(closure["compiled_search_implementation_sha256"], SYNTHETIC_COMPILED_FACT)
+            self.assertIs(closure["historical_metadata_only"], True)
+            self.assertIs(closure["execution_authorized"], False)
             self.assertEqual(fixture.repaired_check.rules_receipt()["claimed_line"]["claim_truth"], "unknown")
             self.assertEqual(fixture.reply_check.rules_receipt()["claimed_line"]["claim_truth"], "unknown")
             # Capabilities are immutable and their returned views are detached.

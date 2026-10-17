@@ -224,7 +224,10 @@ fn revoked_reciprocal_permit_check_never_grants_acceptance_or_releases_credit() 
     let mut registry = RoleTicketRegistry::<u64, RoleOutput>::new(
         authority(),
         512,
-        rz_runtime::adaptive::CoordinatorPolicy::Fixed,
+        // This custody test needs two original delivered permits at once to
+        // reject a cross-ticket substitution. Fixed order intentionally waits
+        // for the first ticket's retirement before delivering the second.
+        rz_runtime::adaptive::CoordinatorPolicy::Adaptive,
         1,
     )
     .unwrap();
