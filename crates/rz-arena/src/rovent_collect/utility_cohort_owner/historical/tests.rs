@@ -119,8 +119,13 @@ fn snapshot(position: &Position) -> String {
 }
 fn endpoint(root: &Position, line: &[rz_position::BoardMove], value: i32) -> String {
     let mut position = root.clone();
-    for movement in line {
-        position.make_move(*movement).unwrap();
+    for (ply, movement) in line.iter().enumerate() {
+        position.make_move(*movement).unwrap_or_else(|error| {
+            panic!(
+                "original Rules fixture ply {} ({movement}) rejected: {error:?}",
+                ply + 1
+            )
+        });
     }
     assert!(matches!(
         position.classify_position().unwrap().play_status,
@@ -295,9 +300,12 @@ fn known_rules_case() -> (
     let root = Position::from_fen("8/7k/5K2/8/8/8/8/Q7 w - - 0 1").unwrap();
     let original = super::tests::root(&root);
     let model = model();
-    let proposal = moves("a1a6 h7g8 f6e7 g8h8 e7f7 h8h7 a6a7 h7h8 a7g7");
-    let counter = moves("a1a6 h7h8 a6g6");
-    let repair = moves("a1a6 h7h8 a6e6 h8h7 f6f7 h7h8 e6h6");
+    // Qb1 checks h7 while leaving both Kg8 and Kh8 legal. The counter
+    // reaches a real stalemate; the different continuation repairs it into
+    // a real mate. No queen line passes through its own king on f6.
+    let proposal = moves("a1b1 h7g8 b1b6 g8h7 b6b7 h7h8 b7g7");
+    let counter = moves("a1b1 h7h8 b1g6");
+    let repair = moves("a1b1 h7h8 b1e1 h8h7 f6f7 h7h8 e1h1");
     let old = summary(&root, 11, &proposal, false, 0.0, None);
     let prior = recipe(
         &root,
@@ -600,4 +608,57 @@ fn submitted_input_keeps_the_original_selected_view_and_root_provenance() {
             "accepted replaced original provenance {key}"
         );
     }
+}
+
+#[test]
+fn submission_seal_keeps_original_revision_state_and_u16_rebase_framing() {
+    // Historical framing operands only; this creates no live ReviewView or
+    // native acceptance. Spell the producer bytes independently below.
+    let mut metadata = vec![
+        RecordMetadata {
+            anchor: 0,
+            parent: None,
+            supersedes: None,
+            source_state: 11,
+            source_revision: 41,
+            source_line_offset: 0,
+            original_first_move: None,
+        },
+        RecordMetadata {
+            anchor: 0,
+            parent: Some(0),
+            supersedes: None,
+            source_state: 11,
+            source_revision: 43,
+            source_line_offset: 2,
+            original_first_move: None,
+        },
+    ];
+    let mut raw = b"rz-pals-review-view-seal/1\0".to_vec();
+    raw.extend_from_slice(&[19_u8; 32]);
+    for number in [7_u64, 1, 1] {
+        raw.extend_from_slice(&number.to_le_bytes());
+    }
+    for (revision, state, offset) in [(41_u64, 11_u64, 0_u16), (43, 11, 2)] {
+        raw.extend_from_slice(&revision.to_le_bytes());
+        raw.extend_from_slice(&state.to_le_bytes());
+        raw.extend_from_slice(&offset.to_le_bytes());
+    }
+    let provenance = json!({"full_view_sha256": h(19), "view_seal_sha256": sha(&raw),
+        "sequence": 7, "generation": 1, "root_state": 1});
+    verify_input_submission_seal(&provenance, &metadata).unwrap();
+    metadata[1].source_revision = 44;
+    assert!(verify_input_submission_seal(&provenance, &metadata).is_err());
+    metadata[1].source_revision = 43;
+    metadata[1].source_state = 12;
+    assert!(verify_input_submission_seal(&provenance, &metadata).is_err());
+    metadata[1].source_state = 11;
+    metadata[1].source_line_offset = 3;
+    assert!(verify_input_submission_seal(&provenance, &metadata).is_err());
+    assert!(
+        serde_json::from_value::<RecordMetadata>(json!({"anchor": 0, "parent": null,
+        "supersedes": null, "source_state": 11, "source_revision": 43,
+        "source_line_offset": 65536, "original_first_move": null}))
+        .is_err()
+    );
 }

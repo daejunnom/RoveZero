@@ -14,7 +14,7 @@ use rz_search::cpu_value::nnuec::{rules, v2};
 use rz_uci::pals_adaptive::{UtilityCohortFrozenDecision, UtilityCohortSourcePins};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 use std::collections::{BTreeMap, BTreeSet};
 
 const SOURCE_DOMAIN: &str = "rz-rovent-utility-cohort-collection-source/1";
@@ -90,7 +90,7 @@ fn same<A: serde::Serialize, B: serde::Serialize>(a: &A, b: &B) -> Result<bool, 
 }
 fn unhex(value: &str) -> Result<Vec<u8>, ArenaError> {
     ensure(
-        value.len() % 2 == 0
+        value.len().is_multiple_of(2)
             && value
                 .bytes()
                 .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v)),
@@ -218,7 +218,7 @@ struct RecordMetadata {
     supersedes: Option<u16>,
     source_state: u64,
     source_revision: u64,
-    source_line_offset: u32,
+    source_line_offset: u16,
     original_first_move: Option<u16>,
 }
 
@@ -1376,8 +1376,7 @@ fn verify_reference_input(
         let first = metadata.original_first_move.map(packed).transpose()?;
         let expected_first = first
             .map(|movement| {
-                rules::reference_line_from_rules(&source, &[movement])
-                    .map(|line| line.moves[0].clone())
+                rules::reference_line_from_rules(&source, &[movement]).map(|line| line.moves[0])
             })
             .transpose()
             .map_err(error)?;
@@ -1494,6 +1493,7 @@ fn verify_reference_input(
         same(&provenance["model"], model.identity())?,
         "original context provenance model",
     )?;
+    verify_input_submission_seal(provenance, &metadata)?;
     let mut h = Sha256::new();
     h.update(v2::utility_capture::SUBMISSION_TARGET_CAPTURE_DOMAIN.as_bytes());
     h.update([0]);
@@ -1520,6 +1520,30 @@ fn verify_reference_input(
         submission_target_sha256,
         context_sha256,
     })
+}
+
+/// Preserve the producer's existing `view_seal_digest` framing. Source
+/// revisions and rebasing offsets are historical metadata, not numerical NN
+/// features, but they still distinguish the original immutable submission.
+fn verify_input_submission_seal(
+    provenance: &Value,
+    metadata: &[RecordMetadata],
+) -> Result<(), ArenaError> {
+    let mut seal = Sha256::new();
+    seal.update(b"rz-pals-review-view-seal/1\0");
+    seal.update(unhex(hash_field(provenance, "full_view_sha256")?)?);
+    for key in ["sequence", "generation", "root_state"] {
+        seal.update(number(provenance, key)?.to_le_bytes());
+    }
+    for record in metadata {
+        seal.update(record.source_revision.to_le_bytes());
+        seal.update(record.source_state.to_le_bytes());
+        seal.update(record.source_line_offset.to_le_bytes());
+    }
+    ensure(
+        format!("{:x}", seal.finalize()) == hash_field(provenance, "view_seal_sha256")?,
+        "original submitted view seal/source revision framing",
+    )
 }
 
 /// Same submitted Request that bound the actual selected work. Numerical
@@ -2872,7 +2896,6 @@ fn join_basis_recipe(
 }
 
 struct CheckedTrial {
-    wire: Value,
     cost: rz_uci::pals_adaptive::UtilityCohortCostWire,
     digest: String,
     recipient: u8,
@@ -2885,6 +2908,9 @@ struct CheckedTrial {
     authority: Value,
 }
 
+// Each independent original operand remains explicit at this historical
+// boundary; combining them must not replace their separate pin/Rules joins.
+#[allow(clippy::too_many_arguments)]
 fn verify_trial(
     ordinal: usize,
     publication: &RoventUtilityCohortPublication,
@@ -3205,7 +3231,6 @@ fn verify_trial(
         }
     }
     Ok(CheckedTrial {
-        wire,
         cost,
         digest: digest_bytes(TRIAL_DOMAIN, raw),
         recipient,
@@ -3531,12 +3556,11 @@ pub(super) fn verify_historical_utility_cohort(
     let (known_pairs, known_pair_sha256, all_pair_sha256) =
         verify_pairs(publication, files, &trials)?;
     let metadata = &source.collection_metadata;
-    let split = source
+    let split = *source
         .collection_manifest
         .opening_splits
         .get(&metadata.opening_id)
-        .ok_or_else(|| error("original opening split"))?
-        .clone();
+        .ok_or_else(|| error("original opening split"))?;
     let mut ancestors = source
         .ancestor_datasets
         .iter()
