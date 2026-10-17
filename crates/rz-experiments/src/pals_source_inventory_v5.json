@@ -73,7 +73,8 @@
       "crates/rz-search/src/pals/engine/researcher_profile.rs",
       "crates/rz-search/src/pals/engine/review_lifecycle.rs",
       "crates/rz-search/src/pals/engine/semantic_state.rs",
-      "crates/rz-search/src/pals/review_context.rs"
+      "crates/rz-search/src/pals/review_context.rs",
+      "crates/rz-search/src/pals/review_context/historical.rs"
     ],
     "cpu_search": [
       "crates/rz-search/Cargo.toml",
@@ -83,11 +84,14 @@
       "crates/rz-search/src/cpu_checker.rs",
       "crates/rz-search/src/cpu_value.rs",
       "crates/rz-search/src/cpu_value/nnuec.rs",
+      "crates/rz-search/src/cpu_value/nnuec_rules.rs",
       "crates/rz-search/src/cpu_value/nnuec_v2.rs",
       "crates/rz-search/src/cpu_value/nnuec_v2_capture.rs",
       "crates/rz-search/src/cpu_value/nnuec_v2_cpu.rs",
       "crates/rz-search/src/cpu_value/nnuec_v2_registration.rs",
+      "crates/rz-search/src/cpu_value/nnuec_v2_retirement.rs",
       "crates/rz-search/src/cpu_value/nnuec_v2_review.rs",
+      "crates/rz-search/src/cpu_value/nnuec_v2_review_retirement.rs",
       "crates/rz-search/src/cpu_value/nnuec_v2_utility.rs"
     ],
     "cpu_worker": [
@@ -96,7 +100,8 @@
       "crates/rz-search/src/cpu_worker.rs",
       "crates/rz-search/src/cpu_worker/deferred_value.rs",
       "crates/rz-search/src/cpu_worker/ledger_registration.rs",
-      "crates/rz-search/src/cpu_worker/prepared_value.rs"
+      "crates/rz-search/src/cpu_worker/prepared_value.rs",
+      "crates/rz-search/src/cpu_worker/retired_value.rs"
     ],
     "cpu_credit": [
       "crates/rz-contracts/Cargo.toml",
@@ -397,7 +402,8 @@
       "crates/rz-uci/src/pals_native/virtual_encoding.rs",
       "crates/rz-uci/src/pals_native/virtual_selected_input.rs",
       "crates/rz-uci/src/rovent_bootstrap.rs",
-      "crates/rz-uci/src/rovent_bootstrap/pinned.rs"
+      "crates/rz-uci/src/rovent_bootstrap/pinned.rs",
+      "experiments/model-research/pals/src/rz_pals_model/rovent_root_descriptor.py"
     ],
     "model_encoding": [
       "crates/rz-eval/Cargo.toml",
@@ -542,6 +548,7 @@
       "crates/rz-search/src/cpu_checker.rs",
       "crates/rz-search/src/external_cpu.rs",
       "crates/rz-search/src/external_cpu/adaptive.rs",
+      "crates/rz-search/src/external_cpu/collection_teacher.rs",
       "crates/rz-search/src/external_cpu/profiled_worker.rs",
       "crates/rz-search/src/external_cpu/profiles.rs",
       "crates/rz-search/src/external_cpu/worker.rs",
@@ -595,9 +602,11 @@
       "crates/rz-uci/src/pals_adaptive/manager/collection/origin.rs",
       "crates/rz-uci/src/pals_adaptive/validator.rs",
       "crates/rz-uci/src/pals_native/ticketed/virtual_bridge.rs",
+      "experiments/model-research/pals/src/rz_pals_model/rovent_collection_teacher.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_corpus.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_historical_corpus.py",
-      "experiments/model-research/pals/src/rz_pals_model/rovent_native_v2.py"
+      "experiments/model-research/pals/src/rz_pals_model/rovent_native_v2.py",
+      "experiments/model-research/pals/src/rz_pals_model/rovent_root_descriptor.py"
     ],
     "data_v3": [
       "crates/rz-arena/Cargo.toml",
@@ -636,9 +645,11 @@
       "crates/rz-experiments/src/rovent_corpus.rs",
       "experiments/model-research/pals/src/rz_pals_model/generation_chunks.py",
       "experiments/model-research/pals/src/rz_pals_model/generation_data.py",
+      "experiments/model-research/pals/src/rz_pals_model/rovent_collection_teacher.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_corpus.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_historical_corpus.py",
-      "experiments/model-research/pals/src/rz_pals_model/rovent_native_v2.py"
+      "experiments/model-research/pals/src/rz_pals_model/rovent_native_v2.py",
+      "experiments/model-research/pals/src/rz_pals_model/rovent_root_descriptor.py"
     ],
     "trainer": [
       "crates/rz-arena/src/bin/rovent-trainer.rs",
@@ -666,6 +677,7 @@
       "experiments/model-research/pals/src/rz_pals_model/generation_training_cli.py",
       "experiments/model-research/pals/src/rz_pals_model/model.py",
       "experiments/model-research/pals/src/rz_pals_model/nnuec_trainable.py",
+      "experiments/model-research/pals/src/rz_pals_model/rovent_collection_teacher.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_historical_checkpoint.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_historical_corpus.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_native_v2.py",
@@ -673,6 +685,7 @@
       "experiments/model-research/pals/src/rz_pals_model/rovent_recovered_training_authority.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_recovered_training_child.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_recovered_training_window.py",
+      "experiments/model-research/pals/src/rz_pals_model/rovent_root_descriptor.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_tensor_training.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_training_authority.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_training_bootstrap.py",

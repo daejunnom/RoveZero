@@ -407,6 +407,9 @@ def _teacher_question(record, binding):
 
 
 def _teacher_head(manifest, record, source, label):
+    from .rovent_collection_teacher import COLLECTION_BINDING_DOMAIN
+    from .rovent_collection_teacher import validate_collection_teacher_binding, validate_legacy_teacher_root
+
     raw = fields(source["raw_receipt"], ("schema", "kind", "actor_id", "input_sha256", "anchor", "teacher_pin",
                                         "binding", "completion"), "original teacher policy owner body")
     actor = source["actor_id"]
@@ -419,19 +422,31 @@ def _teacher_head(manifest, record, source, label):
             or label["teacher_profile_sha256"] != pin["profile_sha256"]):
         raise ValueError("original teacher actor/source/binary/profile attribution mismatch")
     _teacher_pin(pin)
-    binding = fields(raw["binding"], ("question_sequence", "question_digest", "root_budget", "root_restriction",
-        "execution_epoch", "execution_sequence", "owner", "process", "requested", "question", "position_anchor", "root_moves",
-        "mode", "soft_quantum_ns", "context_token_budget"), "original teacher dispatch binding")
-    for key in ("question_sequence", "execution_epoch", "execution_sequence", "owner"):
-        uint(binding[key])
-    for key in ("question_digest", "root_budget", "root_restriction"):
-        sha(binding[key])
+    binding = raw["binding"]
+    collection = type(binding) is dict and binding.get("schema") == COLLECTION_BINDING_DOMAIN
+    if collection:
+        validate_collection_teacher_binding(manifest, record, actor, pin, binding)
+    else:
+        # Preserve the historical exact body and its digest. Descriptor-bearing
+        # legacy dispatches are a second explicit variant, never loose extras.
+        descriptor = type(binding) is dict and bool({"root_descriptor", "root_descriptor_sha256"} & set(binding))
+        extra = ("root_descriptor", "root_descriptor_sha256") if descriptor else ()
+        fields(binding, ("question_sequence", "question_digest", "root_budget", "root_restriction",
+            "execution_epoch", "execution_sequence", "owner", "process", "requested", "question", "position_anchor", "root_moves",
+            "mode", "soft_quantum_ns", "context_token_budget", *extra), "original teacher dispatch binding")
+        for key in ("question_sequence", "execution_epoch", "execution_sequence", "owner"):
+            uint(binding[key])
+        for key in ("question_digest", "root_budget", "root_restriction"):
+            sha(binding[key])
     process = fields(binding["process"], ("pid", "process_group", "proc_start_ticks"), "original teacher process")
     for key in process:
         if uint(process[key], 2**32 - 1 if key != "proc_start_ticks" else 2**64 - 1) == 0:
             raise ValueError("known original teacher physical process required")
     _constraint(binding["requested"])
-    _teacher_question(record, binding)
+    if not collection:
+        _teacher_question(record, binding)
+        if descriptor:
+            validate_legacy_teacher_root(manifest, record, binding)
     completed = fields(raw["completion"], ("profile", "purpose", "issued_go", "requested", "issued",
         "readiness_barrier_completed", "go_issued", "raw", "opinions", "requested_multipv",
         "conditional_policy_target_known", "option_application_observed", "model_loading_observed", "attempt", "stop_control", "timing"),
@@ -441,7 +456,7 @@ def _teacher_head(manifest, record, source, label):
             or completed["requested"] != binding["requested"] or completed["go_issued"] is not True
             or completed["readiness_barrier_completed"] is not True
             or completed["conditional_policy_target_known"] is not True
-            or binding["execution_epoch"] != record["native"]["process_epoch"]):
+            or not collection and binding["execution_epoch"] != record["native"]["process_epoch"]):
         raise ValueError("original teacher request/go/readiness/profile completion was not joined")
     _constraint(completed["issued"])
     if (type(completed["issued_go"]) is not str or not completed["issued_go"].startswith("go ")

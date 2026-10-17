@@ -89,10 +89,13 @@ def _submission(record, value):
 
 
 def _root_admission(manifest, record, retired):
-    root = fields(retired["root_admission"], ("schema", "native_origin", "native_origin_sha256",
+    root = retired["root_admission"]
+    descriptor = type(root) is dict and bool({"root_descriptor", "root_descriptor_sha256"} & set(root))
+    extra = ("root_descriptor", "root_descriptor_sha256") if descriptor else ()
+    root = fields(root, ("schema", "native_origin", "native_origin_sha256",
         "process_epoch", "game_generation", "root_generation", "implementation_sha256", "deadline_clock",
         "deadline_tick", "root_budget_sha256", "selective_policy_sha256", "root_state", "store_root_state",
-        "root_moves", "depth_plies", "mate_moves", "requested_nodes"), "native /2 original root admission")
+        "root_moves", "depth_plies", "mate_moves", "requested_nodes", *extra), "native /2 original root admission")
     native, ticket = record["native"], record["native"]["raw_submission"]["ticket"]
     if root["schema"] != ROOT_DOMAIN or digest(ROOT_DOMAIN, root) != sha(retired["root_admission_sha256"]):
         raise ValueError("native /2 original root admission seal mismatch")
@@ -105,8 +108,12 @@ def _root_admission(manifest, record, retired):
         sha(root[key])
     uint(root["store_root_state"])
     for key in ("depth_plies", "mate_moves", "requested_nodes"):
-        if root[key] is not None and uint(root[key], 2**64 - 1 if key == "requested_nodes" else 65535) == 0:
-            raise ValueError("native /2 explicit positive root search limit required")
+        if root[key] is not None:
+            parsed = uint(root[key], 2**64 - 1 if key == "requested_nodes" else 65535)
+            # Current RootDescriptor carries Option<u64>, including zero, for
+            # nodes. Preserve the historical no-descriptor admission rule.
+            if parsed == 0 and (key != "requested_nodes" or not descriptor):
+                raise ValueError("native /2 explicit positive root search limit required")
     moves = root["root_moves"]
     if (type(moves) is not list or not 1 <= len(moves) <= 218
             or any(type(move) is not str for move in moves) or len(set(moves)) != len(moves)):
@@ -167,6 +174,11 @@ def _root_admission(manifest, record, retired):
                    and profile["binary"]["bytes"] == pin["binary_bytes"]
                    and profile["source_commit"] == pin["source_commit"] for profile in profiles):
             raise ValueError("native /2 original loaded lock lacks frozen corpus teacher")
+    if descriptor:
+        # Explicit current variant only. Historical no-descriptor bytes and
+        # digest remain unchanged; neither variant reconstructs a live lock.
+        from .rovent_root_descriptor import validate_root_admission_descriptor
+        validate_root_admission_descriptor(root)
 
 
 def validate_native_v2(manifest, record):
