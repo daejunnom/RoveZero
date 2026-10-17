@@ -184,6 +184,11 @@ impl NnuecCaptureReservation {
     pub fn matches_lineage(&self, lineage: &NnuecCaptureLineage) -> bool {
         self.submission.lineage.same_authority(lineage)
     }
+    /// Original loaded-model instance readback, including before a Job exists.
+    /// This grants no submission, worker activation, terminal or target right.
+    pub fn matches_model(&self, model: &Arc<Model>) -> bool {
+        Arc::ptr_eq(&self.submission.model, model)
+    }
 
     /// Attach only to a prepared immutable Job. This reserves no native nodes
     /// and does not claim that the Job entered a worker or produced a value.
@@ -423,6 +428,8 @@ impl NnuecActiveCapture {
             }
         }
     }
+    // Keep the original model, Bound, input and observation identities explicit.
+    #[allow(clippy::too_many_arguments)]
     fn capture_one(
         &self,
         model: &Arc<Model>,

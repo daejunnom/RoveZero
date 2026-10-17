@@ -66,6 +66,9 @@ pub(crate) struct AdaptiveRetirementFrontierSource<'a> {
 }
 
 impl FrontierQuestionSource {
+    // Retain the original authority, deadlines, Rules, view and lineage as
+    // distinct sources instead of replacing them with an unchecked context.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         authority: SearchAuthority,
         original_deadline: Deadline,
@@ -1014,7 +1017,7 @@ mod tests {
         let strategy = snapshot.mate_strategy.as_ref().unwrap();
         assert_eq!(strategy.best_move(), BoardMove::from_uci("g6g7").unwrap());
         assert!(strategy.validates_root(
-            &port.rules.rules().snapshot(),
+            port.rules.rules().snapshot(),
             frontier.root_moves().allowed(),
         ));
         assert_eq!(strategy.conclusion().exact_uci_mate(), Some(1));

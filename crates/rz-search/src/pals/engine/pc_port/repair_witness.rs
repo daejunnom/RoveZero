@@ -444,7 +444,7 @@ impl PcAcceptedFreshEndpoint {
             || accepted.ticket().role != Role::Proposer
             || physical.physical_fresh != Some(true)
             || !physical.measurement_complete
-            || !physical.completed_nn_inputs.is_some_and(|count| count > 0)
+            || physical.completed_nn_inputs.is_none_or(|count| count == 0)
             || execution.epoch != accepted.ticket().authority.epoch
             || input.view.query().prefix.is_empty()
             || input.view.query().prefix.len() > MAX_WITNESS_PLIES

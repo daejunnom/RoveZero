@@ -22,117 +22,6 @@ pub(in crate::pals::engine) struct CpuEvidenceContextSeal {
     profile: CpuWorkerProfile,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::super::conditional_evidence::tests::{accepted_raw, port as contract_port};
-    use super::*;
-    use rz_contracts::pals_adaptive::CpuJobId;
-
-    // Reuse the Store semantic fixture, which makes no physical search claim.
-    // Actual Bound/worker minting is exercised by the UCI owner integration.
-    fn consumed_context(
-        port: &AdaptiveEnginePort<LegalOrderRoleMock>,
-        node: usize,
-    ) -> CpuEvidenceContextSeal {
-        let evidence = port.engine.semantic.nodes[node].evidence.as_ref().unwrap();
-        let (observation, execution) = evidence.provenance.unwrap();
-        let task = port.engine.semantic.stores.tasks.get(execution).unwrap();
-        assert!(matches!(task.status, TaskStatus::Completed(id) if id == observation));
-        let profile = CpuWorkerProfile {
-            owner: CpuWorkerId(1),
-            max_depth: 8,
-            evaluation_namespace: ContractDigest([31; 32]),
-            search_conditions: ContractDigest([32; 32]),
-        };
-        let question = ContractDigest([33; 32]);
-        CpuEvidenceContextSeal {
-            store: port.engine.semantic.stores.read_owner(),
-            generation: port.engine.semantic.stores.generation(),
-            root: port.root_state_id(),
-            authority: port.authority,
-            frame: FrameId {
-                authority: port.authority,
-                sequence: 1,
-            },
-            question,
-            task: task.key.clone(),
-            execution,
-            observation,
-            job: CpuJobEnvelope {
-                id: CpuJobId {
-                    authority: port.authority,
-                    sequence: 1,
-                },
-                state_identity: port
-                    .issue_rules_position(port.engine.semantic.nodes[node].position.clone())
-                    .unwrap()
-                    .export()
-                    .unwrap()
-                    .snapshot()
-                    .identity(),
-                question,
-                root_restriction: ContractDigest([0; 32]),
-                evaluation_namespace: profile.evaluation_namespace,
-                search_conditions: profile.search_conditions,
-                total_native_node_credit: task.key.node_budget,
-                hard_deadline: port.deadline,
-            },
-            owner: profile.owner,
-            profile,
-        }
-    }
-
-    #[test]
-    fn retained_consumed_context_does_not_depend_on_active_admission() {
-        let mut port = contract_port(Position::startpos());
-        let movement = BoardMove::from_uci("e2e4").unwrap();
-        accepted_raw(&mut port, &[movement], 14, 2);
-        let node = port.replay_node(&[movement]).unwrap();
-        let seal = consumed_context(&port, node);
-        let task = seal.task.clone();
-        let execution = seal.execution;
-        let observation = seal.observation;
-        port.engine.semantic.nodes[node]
-            .evidence
-            .as_mut()
-            .unwrap()
-            .context = Some(Arc::new(seal));
-        port.cpu_admissions.clear();
-        let evidence = port.engine.semantic.nodes[node].evidence.as_ref().unwrap();
-        assert!(port.conditional_cpu_task_condition_matches(
-            evidence,
-            &task,
-            execution,
-            observation
-        ));
-        let foreign = contract_port(Position::startpos());
-        assert!(!foreign.conditional_cpu_task_condition_matches(
-            evidence,
-            &task,
-            execution,
-            observation
-        ));
-        assert!(!port.conditional_cpu_task_condition_matches(
-            evidence,
-            &task,
-            execution,
-            ObservationId(observation.0 + 1)
-        ));
-        let mut other_task = task;
-        other_task
-            .cpu_condition
-            .as_mut()
-            .unwrap()
-            .push_str(";nnuec-context-binding=another-view");
-        assert!(!port.conditional_cpu_task_condition_matches(
-            evidence,
-            &other_task,
-            execution,
-            observation
-        ));
-    }
-}
-
 /// Live installation admission is checked before the Store consumes anything.
 /// Finalizing that already consumed fact never reopens a canceled authority.
 pub(super) struct PreparedCpuEvidenceContext {
@@ -257,5 +146,116 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             && context.profile.owner == context.owner
             && accepted.provenance == Some((observation, execution))
             && task.value_identity.as_ref() == Some(&accepted.value_identity)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::conditional_evidence::tests::{accepted_raw, port as contract_port};
+    use super::*;
+    use rz_contracts::pals_adaptive::CpuJobId;
+
+    // Reuse the Store semantic fixture, which makes no physical search claim.
+    // Actual Bound/worker minting is exercised by the UCI owner integration.
+    fn consumed_context(
+        port: &AdaptiveEnginePort<LegalOrderRoleMock>,
+        node: usize,
+    ) -> CpuEvidenceContextSeal {
+        let evidence = port.engine.semantic.nodes[node].evidence.as_ref().unwrap();
+        let (observation, execution) = evidence.provenance.unwrap();
+        let task = port.engine.semantic.stores.tasks.get(execution).unwrap();
+        assert!(matches!(task.status, TaskStatus::Completed(id) if id == observation));
+        let profile = CpuWorkerProfile {
+            owner: CpuWorkerId(1),
+            max_depth: 8,
+            evaluation_namespace: ContractDigest([31; 32]),
+            search_conditions: ContractDigest([32; 32]),
+        };
+        let question = ContractDigest([33; 32]);
+        CpuEvidenceContextSeal {
+            store: port.engine.semantic.stores.read_owner(),
+            generation: port.engine.semantic.stores.generation(),
+            root: port.root_state_id(),
+            authority: port.authority,
+            frame: FrameId {
+                authority: port.authority,
+                sequence: 1,
+            },
+            question,
+            task: task.key.clone(),
+            execution,
+            observation,
+            job: CpuJobEnvelope {
+                id: CpuJobId {
+                    authority: port.authority,
+                    sequence: 1,
+                },
+                state_identity: port
+                    .issue_rules_position(port.engine.semantic.nodes[node].position.clone())
+                    .unwrap()
+                    .export()
+                    .unwrap()
+                    .snapshot()
+                    .identity(),
+                question,
+                root_restriction: ContractDigest([0; 32]),
+                evaluation_namespace: profile.evaluation_namespace,
+                search_conditions: profile.search_conditions,
+                total_native_node_credit: task.key.node_budget,
+                hard_deadline: port.deadline,
+            },
+            owner: profile.owner,
+            profile,
+        }
+    }
+
+    #[test]
+    fn retained_consumed_context_does_not_depend_on_active_admission() {
+        let mut port = contract_port(Position::startpos());
+        let movement = BoardMove::from_uci("e2e4").unwrap();
+        accepted_raw(&mut port, &[movement], 14, 2);
+        let node = port.replay_node(&[movement]).unwrap();
+        let seal = consumed_context(&port, node);
+        let task = seal.task.clone();
+        let execution = seal.execution;
+        let observation = seal.observation;
+        port.engine.semantic.nodes[node]
+            .evidence
+            .as_mut()
+            .unwrap()
+            .context = Some(Arc::new(seal));
+        port.cpu_admissions.clear();
+        let evidence = port.engine.semantic.nodes[node].evidence.as_ref().unwrap();
+        assert!(port.conditional_cpu_task_condition_matches(
+            evidence,
+            &task,
+            execution,
+            observation
+        ));
+        let foreign = contract_port(Position::startpos());
+        assert!(!foreign.conditional_cpu_task_condition_matches(
+            evidence,
+            &task,
+            execution,
+            observation
+        ));
+        assert!(!port.conditional_cpu_task_condition_matches(
+            evidence,
+            &task,
+            execution,
+            ObservationId(observation.0 + 1)
+        ));
+        let mut other_task = task;
+        other_task
+            .cpu_condition
+            .as_mut()
+            .unwrap()
+            .push_str(";nnuec-context-binding=another-view");
+        assert!(!port.conditional_cpu_task_condition_matches(
+            evidence,
+            &other_task,
+            execution,
+            observation
+        ));
     }
 }

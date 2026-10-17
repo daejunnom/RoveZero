@@ -319,6 +319,7 @@ impl<M: RoleModel> PalsEngine<M> {
     pub(super) fn reset_review_context(&mut self) {
         self.semantic.reset_review_context();
     }
+    #[cfg(test)]
     pub(super) fn publish_review_record(
         &mut self,
         record: &RoleRecord,
@@ -332,19 +333,7 @@ impl<M: RoleModel> PalsEngine<M> {
         let config = self.semantic_sequence_config();
         self.semantic.restore_review_context_after_load(&config);
     }
-    fn review_root_for_question(
-        &self,
-        node: usize,
-        question: RoleQuestion<'_>,
-        legal: &[BoardMove],
-    ) -> Result<StateId, PalsError> {
-        self.semantic.review_root_for_question(
-            &self.semantic_sequence_config(),
-            node,
-            question,
-            legal,
-        )
-    }
+    #[cfg(test)]
     fn review_policy_for_question(
         &self,
         root: StateId,

@@ -147,7 +147,7 @@ impl super::repair_report::PcRepairProgress {
             phase: step.phase,
             first: step.origin.first,
             model: step.origin.model.clone(),
-            root_source: step.origin.initial_source.clone(),
+            root_source: step.origin.initial_source,
             prefix: step.prefix.clone(),
             proposal: step.proposal.clone(),
             counter: step.counter.clone(),
@@ -317,6 +317,9 @@ impl<M: RoleModel> PcSemanticPort<M> {
             .flat_map(|cycles| cycles.witnesses.iter())
     }
 
+    // The original input, accepted head/output, Rules child and responsibility
+    // lineage remain separate checked sources at Repair admission.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn enqueue_actual_repair_cycle(
         &mut self,
         input: &FrameInput<ReviewView, PcPortQuestion>,

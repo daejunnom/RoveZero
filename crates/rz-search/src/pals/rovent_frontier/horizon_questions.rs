@@ -525,19 +525,6 @@ impl RoventFrontier {
         Ok(FrontierHorizonAcceptance::Closed)
     }
 
-    pub(crate) fn accept_goal_horizon_rules(
-        &mut self,
-        input: &GoalLocalInput,
-        stores: &PalsStores,
-        endpoint: FrontierPath,
-        clock: ClockDomain,
-        now: MonotonicTick,
-    ) -> Result<FrontierHorizonAcceptance, FrontierError> {
-        let question = VerifiedHorizonEndpoint::from_adaptive(input, stores, endpoint)?;
-        self.check_goal_horizon_input(&question, stores)?;
-        self.close_goal_horizon_rules_origin(question.source, stores, endpoint, clock, now)
-    }
-
     pub(crate) fn accept_pc_goal_horizon_rules(
         &mut self,
         input: &FrameInput<ReviewView, PcPortQuestion>,

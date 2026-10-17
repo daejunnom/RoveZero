@@ -843,6 +843,8 @@ impl PreparationActor {
         })
     }
     /// Failure returns ownership of the request and its pin to the caller.
+    // Full/closed queues return that original owner without a new allocation.
+    #[allow(clippy::result_large_err)]
     pub fn try_submit(&self, request: Request) -> Result<(), (PreparationError, Request)> {
         if self.stopping.load(Ordering::Acquire) {
             return Err((PreparationError::WorkerStopped, request));

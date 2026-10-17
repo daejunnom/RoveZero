@@ -693,25 +693,6 @@ impl<M: RoleModel> PcSemanticOwner<M> {
         self.semantic
             .prepare_review_view(&self.profile.sequence_config(), node, question, legal)
     }
-    pub(super) fn prepare_frozen_review_views(
-        &mut self,
-        first_node: usize,
-        first_question: RoleQuestion<'_>,
-        first_legal: &[BoardMove],
-        second_node: usize,
-        second_question: RoleQuestion<'_>,
-        second_legal: &[BoardMove],
-    ) -> Result<Option<review_lifecycle::FrozenReviewViews>, PalsError> {
-        self.semantic.prepare_frozen_review_views(
-            &self.profile.sequence_config(),
-            first_node,
-            first_question,
-            first_legal,
-            second_node,
-            second_question,
-            second_legal,
-        )
-    }
     pub(super) fn publish_record(
         &mut self,
         record: RoleRecord,

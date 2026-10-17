@@ -1093,9 +1093,10 @@ mod tests {
                 .with_edge(&context, edge(0, 1, EdgeKind::Parent))
                 .is_err()
         );
-        let original = Some("e2e4".parse().unwrap());
+        let original_move = "e2e4".parse().unwrap();
+        let original = Some(original_move);
         let mut child = Position::startpos();
-        child.make_move(original.unwrap()).unwrap();
+        child.make_move(original_move).unwrap();
         let proposal = model
             .encode_review_line(&child, &[], LineKind::Proposal, original)
             .unwrap();

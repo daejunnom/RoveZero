@@ -762,10 +762,11 @@ fn cancelled_original_control_cannot_hide_a_foreign_engine_readback() {
     // input. It is never accepted as NNUEC or used as a fallback searcher.
     materialized.engine = CpuEngine::new(config()).unwrap();
     fixture.cancel.store(true, Ordering::Release);
-    let (returned, error) = source
-        .try_spawn_worker(materialized, CpuWorkerId(0), CompletionSignal::default())
-        .err()
-        .expect("foreign engine must remain rejected");
+    let (returned, error) =
+        match source.try_spawn_worker(materialized, CpuWorkerId(0), CompletionSignal::default()) {
+            Err(rejected) => rejected,
+            Ok(_) => panic!("foreign engine must remain rejected"),
+        };
     assert_eq!(
         error,
         CpuWorkerError::Invalid("deferred NNUEC source/binding revoked")
@@ -783,10 +784,10 @@ fn native_constructor_configuration_failure_remains_a_typed_failure() {
         .config
         .max_depth = 0;
     let original = request(&source, &fixture);
-    let (returned, error) = original
-        .materialize()
-        .err()
-        .expect("invalid native declaration");
+    let (returned, error) = match original.materialize() {
+        Err(rejected) => rejected,
+        Ok(_) => panic!("invalid native declaration"),
+    };
     assert_eq!(
         error,
         CpuWorkerError::Cpu(CpuError::InvalidConfig("depth must be in 1..=64"))

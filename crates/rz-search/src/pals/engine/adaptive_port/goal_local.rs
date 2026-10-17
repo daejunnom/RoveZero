@@ -474,9 +474,6 @@ impl Default for GoalLocalPortState {
 }
 
 impl GoalLocalPortState {
-    pub(super) fn owner(&self) -> &Arc<()> {
-        &self.owner
-    }
     fn has_retained_state(&self) -> bool {
         self.prepared.is_some()
             || self.selection.is_some()

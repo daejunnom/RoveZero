@@ -370,9 +370,8 @@ impl CpuJob {
         match &self.nnuec_capture {
             Some(capture) => capture
                 .retire(self.envelope, owner, ending)
-                .map_err(|error| {
+                .inspect_err(|error| {
                     capture.record_error(error.clone());
-                    error
                 }),
             None => Ok(()),
         }

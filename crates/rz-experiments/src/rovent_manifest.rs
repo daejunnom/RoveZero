@@ -420,7 +420,7 @@ impl RoventResourcePlan {
         require(
             actors.contains(&RoventActor::OwnR) == own_r
                 && actors.contains(&RoventActor::ExternalR) == external_r
-                && actors.contains(&RoventActor::Teacher) == !engine.teachers.is_empty()
+                && actors.contains(&RoventActor::Teacher) != engine.teachers.is_empty()
                 && self.gpu_devices
                     == u32::from(engine.pc.device.compute() == PcCompute::Accelerator),
             "resource actors/devices do not match the selected roles",

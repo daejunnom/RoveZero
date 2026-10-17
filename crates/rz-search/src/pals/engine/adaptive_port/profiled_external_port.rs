@@ -49,6 +49,9 @@ pub enum ProfiledExternalUnsupported {
     ReciprocalResume,
 }
 
+// Transfer the exact admitted Job without a new allocation in the admission
+// path. Any future indirection must retain the same failure/owner contract.
+#[allow(clippy::large_enum_variant)]
 pub enum AdaptiveProfiledExternalPreparation {
     Ready(ProfiledExternalJob),
     Unsupported(ProfiledExternalUnsupported),

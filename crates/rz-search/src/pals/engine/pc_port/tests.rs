@@ -312,7 +312,7 @@ fn store_publication_failure_preserves_actual_head_consumption_once() {
             .unwrap()
     );
     assert_eq!(port.completion, PcPortCompletion::Failed);
-    assert!(port.owner.semantic.nodes[port.root].edges.len() > 0);
+    assert!(!port.owner.semantic.nodes[port.root].edges.is_empty());
     assert!(port.pending[&root.question_digest].failure.is_some());
     let before = port.counters;
     assert!(port.consume_accepted(&root, &proof, &output, None).is_err());

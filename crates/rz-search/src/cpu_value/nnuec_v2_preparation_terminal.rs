@@ -32,6 +32,8 @@ impl std::fmt::Debug for NnuecPreparationTerminalAck {
     }
 }
 impl NnuecPreparationTerminalAck {
+    // Independent request, model, view and actor authorities form this terminal proof.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         provenance: Provenance,
         request: RequestIdentity,

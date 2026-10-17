@@ -41,6 +41,8 @@ impl std::fmt::Debug for NnuecCaptureLineage {
     }
 }
 impl NnuecCaptureLineage {
+    // Each original identity and lease is checked independently at this authority boundary.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         bound: BoundInstanceAuthority,
         request: RequestIdentity,
@@ -78,6 +80,11 @@ impl NnuecCaptureLineage {
     }
     pub fn original_deadline(&self) -> Deadline {
         self.original_deadline
+    }
+    /// Historical worker activation only, not an enqueue/terminal/usage
+    /// proof. Absence alone cannot attest a manager's unsubmitted capture.
+    pub fn activation_observed(&self) -> bool {
+        self.authority.original_job.get().is_some()
     }
     pub fn binding_digest(&self) -> Digest {
         self.binding

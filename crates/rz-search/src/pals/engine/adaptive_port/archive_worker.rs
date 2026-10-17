@@ -459,10 +459,10 @@ impl<M: RoleModel> ArchiveCompletion<M> {
     > {
         if self.result.is_ok()
             && (self.receipt.operation != ArchiveOperationKind::PersistProfiledRetirement
-                || !self
+                || self
                     .profiled_retirement
                     .as_ref()
-                    .is_some_and(|payload| payload.commit.is_some()))
+                    .is_none_or(|payload| payload.commit.is_none()))
         {
             self.result = Err(ArchiveQuarantineReason::InvalidReturn(
                 "profiled retirement commit missing",
@@ -479,6 +479,8 @@ impl<M: RoleModel> ArchiveCompletion<M> {
     }
     // All install paths share this allocation-free owner rejection.
     #[allow(clippy::result_large_err)]
+    // Return each original owner/permit without a box or unchecked wrapper.
+    #[allow(clippy::type_complexity)]
     fn install_checked(
         self,
         expected_authority: SearchAuthority,

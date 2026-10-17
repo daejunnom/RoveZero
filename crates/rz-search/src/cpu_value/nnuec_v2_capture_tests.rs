@@ -398,6 +398,7 @@ fn lineage_requires_actual_begin_and_rejects_an_equal_metadata_reservation() {
     );
     assert_eq!(lineage.original_deadline(), envelope.hard_deadline);
     assert!(!lineage.matches_activated_job(envelope, CpuWorkerId(0)));
+    assert!(!lineage.activation_observed());
     original
         .enable_nnuec_capture(capture.clone())
         .unwrap_or_else(|_| panic!("attach"));
@@ -409,6 +410,7 @@ fn lineage_requires_actual_begin_and_rejects_an_equal_metadata_reservation() {
     worker.begin(original, first).unwrap();
     assert!(report(&worker).terminal);
     assert!(lineage.matches_activated_job(envelope, CpuWorkerId(0)));
+    assert!(lineage.activation_observed());
     assert!(!lineage.matches_activated_job(envelope, CpuWorkerId(1)));
     let mut other = envelope;
     other.id.sequence += 1;
@@ -768,6 +770,7 @@ fn definite_unqueued_rejection_retires_original_without_claiming_cpu_execution()
     assert!(!equal_metadata.matches_retirement(retirement));
     assert!(!retirement.matches_lineage(&lineage));
     assert!(!lineage.matches_activated_job(retirement.job(), retirement.owner()));
+    assert!(!lineage.activation_observed());
     assert_eq!(retirement.attempted(), 0);
     assert!(retirement.readouts().is_empty());
     let stopped = worker.shutdown().unwrap();
@@ -792,10 +795,10 @@ fn prepared_rejection_retains_the_same_job_until_actual_fence_attests_not_starte
     let valid = grant(&original, 1, 1);
     let mut foreign = valid;
     foreign.owner = CpuWorkerId(1);
-    let (error, original) = worker
-        .reject_prepared_retaining(original, foreign)
-        .err()
-        .expect("foreign scope rejection");
+    let (error, original) = match worker.reject_prepared_retaining(original, foreign) {
+        Err(rejected) => rejected,
+        Ok(_) => panic!("foreign scope rejection"),
+    };
     assert_eq!(
         error,
         CpuWorkerError::Invalid("CPU prepared rejection scope mismatch")
@@ -804,10 +807,10 @@ fn prepared_rejection_retains_the_same_job_until_actual_fence_attests_not_starte
     assert!(capture.retirement().is_none());
     let mut invalid = valid;
     invalid.node_credit = 0;
-    let (error, original) = worker
-        .reject_prepared_retaining(original, invalid)
-        .err()
-        .expect("invalid grant rejection");
+    let (error, original) = match worker.reject_prepared_retaining(original, invalid) {
+        Err(rejected) => rejected,
+        Ok(_) => panic!("invalid grant rejection"),
+    };
     assert_eq!(
         error,
         CpuWorkerError::Invalid("CPU submission owner or grant mismatch")
@@ -826,10 +829,10 @@ fn prepared_rejection_retains_the_same_job_until_actual_fence_attests_not_starte
     let (_, _, original) = rejected.into_parts();
     let original = original.expect("same rejected Job");
     assert!(Arc::ptr_eq(&mailbox, &original.mailbox));
-    let (error, original) = worker
-        .reject_prepared_retaining(original, valid)
-        .err()
-        .expect("same execution cannot issue another proof");
+    let (error, original) = match worker.reject_prepared_retaining(original, valid) {
+        Err(rejected) => rejected,
+        Ok(_) => panic!("same execution cannot issue another proof"),
+    };
     assert_eq!(error, CpuWorkerError::Duplicate);
     assert!(Arc::ptr_eq(&mailbox, &original.mailbox));
     assert!(capture.error().unwrap().is_none());
@@ -856,10 +859,10 @@ fn an_enqueued_execution_cannot_attest_not_started_for_another_prepared_capture(
         .unwrap_or_else(|_| panic!("capture attach"));
     let mailbox = Arc::clone(&original.mailbox);
     let repeated_execution = grant(&original, first_grant.execution.sequence, 1);
-    let (error, original) = worker
-        .reject_prepared_retaining(original, repeated_execution)
-        .err()
-        .expect("actual queue already owns execution");
+    let (error, original) = match worker.reject_prepared_retaining(original, repeated_execution) {
+        Err(rejected) => rejected,
+        Ok(_) => panic!("actual queue already owns execution"),
+    };
     assert_eq!(error, CpuWorkerError::Duplicate);
     assert!(Arc::ptr_eq(&mailbox, &original.mailbox));
     assert!(capture.retirement().is_none());

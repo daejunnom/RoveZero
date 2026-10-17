@@ -75,28 +75,6 @@ impl<'a> VerifiedFrontierQuestion<'a> {
         })
     }
 
-    pub(crate) fn from_pc(
-        work: &'a CoordinatorWork<ReviewView, PcPortQuestion>,
-        stores: &PalsStores,
-    ) -> Result<Self, FrontierError> {
-        PcPortQuestion::validate_frontier_source(work, stores)
-            .map_err(|_| FrontierError::Invalid("actual R-free port question/view"))?;
-        Ok(Self {
-            frame: work.frame,
-            original_first_move: work.original_first_move,
-            original_deadline: work.original_deadline,
-            stage: work.input.stage,
-            question_digest: work.input.question_digest,
-            view_seal: work.input.view_seal,
-            public_context: work.input.public_context,
-            view: &work.input.view,
-            position: work.input.question.position(),
-            context: work.input.question.context(),
-            pc_question: Some(&work.input.question),
-            owner: QuestionOwner::Pc(&work.input.question),
-        })
-    }
-
     /// The role-only owner has no CPU frame budget or RefinementMachine.
     /// Borrow its actual immutable input directly, after its private producer
     /// validation, without manufacturing a CoordinatorWork or new allowance.

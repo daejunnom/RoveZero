@@ -147,6 +147,7 @@ impl UtilityModel {
 
     /// Only named boundaries may request a shadow observation. No per-node
     /// policy integration or hidden selected-line replacement is performed.
+    #[allow(clippy::too_many_arguments)] // Preserve the independently checked original input authorities.
     pub fn observe(
         &self,
         bound: &BoundNnuecReviewContext,

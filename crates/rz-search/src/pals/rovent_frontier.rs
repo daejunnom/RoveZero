@@ -318,6 +318,9 @@ impl CompletionScope {
             && self.endpoint == endpoint
     }
 }
+// This bounded completion seal retains the exact ticket and physical evidence
+// inline; sealing completion cannot introduce an unbudgeted heap allocation.
+#[allow(clippy::large_enum_variant)]
 enum FrontierCompletionSeal {
     Rules {
         scope: CompletionScope,
@@ -1438,6 +1441,9 @@ impl RoventFrontier {
         Ok(())
     }
 
+    // Check the actual admitted question, Store owner, endpoint and original
+    // clock separately before consuming their Rules completion evidence.
+    #[allow(clippy::too_many_arguments)]
     pub fn accept_rules_endpoint(
         &mut self,
         obligation: FrontierObligation,

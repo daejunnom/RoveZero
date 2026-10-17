@@ -143,6 +143,9 @@ impl AcceptedRoleStep {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// A bounded value seal preserves the public Copy origin contract. Heap-backed
+// ownership would change that contract; this is not a measured memory claim.
+#[allow(clippy::large_enum_variant)]
 pub enum AcceptedRoleOriginKind {
     LocalAccepted,
     PeerQuestion(rz_contracts::rovent::QuestionEnvelope),

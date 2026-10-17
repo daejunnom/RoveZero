@@ -86,7 +86,7 @@ impl<M: RoleModel> ResearcherPreparingRoot<M> {
             || !view.query().proposal.is_empty()
             || view.query().counterexample.is_some()
         {
-            return Err(PalsError::from(StoreError::StaleConsumer).into());
+            return Err(PalsError::from(StoreError::StaleConsumer));
         }
         Ok(PreparingRootReviewSource {
             identity: &self.identity,

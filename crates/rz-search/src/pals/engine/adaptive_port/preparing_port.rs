@@ -21,6 +21,9 @@ impl<M: RoleModel> AdaptivePreparingRootAdmission<M> {
 /// The session moves the SAME ledger into its manager and retains the actor,
 /// cancellation and first-Bound pins through real replacement or shutdown.
 /// External code cannot construct this transport from metadata.
+// The private unit seal restricts issuance to this module; it is an ownership
+// boundary, not an API promise about future public fields.
+#[allow(clippy::manual_non_exhaustive)]
 pub struct AdaptivePreparingRootCustody {
     pub ledger: CpuCreditLedger,
     pub root_moves: Arc<RootMoveDomain>,
