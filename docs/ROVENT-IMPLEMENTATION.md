@@ -408,3 +408,57 @@ search 실패 자료는 보존한다. 잘못된 fixture의 미청구 Rules 경�
 Repair/teacher/R 출처 검증, 비학습 tensor·checkpoint·export 및 로컬 4050 정확성이다.
 최종 source closure·고정 source pin·동일 SHA CI도 확인해야 한다. 실제 학습은
 이번 목표에서 제외하며, 로컬 검증 결과를 원격 성능·기력 비교로 보고하지 않는다.
+
+## 여덟 번째 통합 체크포인트
+
+P-C/P-C-R의 깊이는 사용자 제공 depth·mate 설계에 따라 root 상대의 선택적 체스
+ply로 유지한다. 생성 chunk, 지역 CPU depth, 문맥 길이, 왕복 횟수를 UCI depth로
+바꾸지 않는다. 메이트 후보 한 줄과 강제 메이트 증명도 구분한다. Rules의 OR/AND
+근거로 필요한 전체 방어가 닫힌 강제 승패는 조기 종료할 수 있으며, 정확한 최단
+거리를 확인하기 전에는 `score mate`의 정확 거리로 표시하지 않는다.
+
+다음은 별도 고정 worktree에서 실제 실행한 검사다. 소스 등록과 미실행 후속은
+이 표의 성공으로 확대하지 않는다. suite 사이에 겹치는 검사가 있으므로 합산하지 않는다.
+
+| 고정 소스·검사 | 실제 결과 |
+|---|---|
+| `f39f828`, Linux 네 crate 전체 타깃 타입 검사·공통 계약 | 통과·15개 통과 |
+| 같은 소스, search | 925개 통과·기존 선택 실행 2개 미실행 |
+| 같은 소스, UCI | 실제 검사 중 NNUEC owner fixture에서 Windows stack overflow로 비정상 종료. 전체 UCI 성공·experiments 신규 성공은 아님 |
+| `40b926b`, 준비 owner의 타입 크기 관측 | layout 검사 통과. 준비 transport가 약 37KiB임을 확인했으나 RSS·peak·성능 개선의 측정은 아님 |
+| 같은 소스, Ponder | 세 사례 모두 대기 timeout으로 실패 |
+| `8c7c291`, 기본 Windows stack의 준비 transport·Ponder | layout 1개와 Ponder 3개 통과. 실제 첫 Ready까지 도달한 뒤 원 native/manager 자원 한도 불일치로 owner 검사 1개 실패 |
+| `8371962`, Linux 전체 타깃 타입 검사 | 새 profiled 접점의 API·fixture 접근·금지된 unsafe 사용으로 실패. 실제 ELF fixture 실행 전임 |
+| `6c6bf61`, Linux 전체 타깃 타입 검사 | 첫 실패의 private 접근·unsafe 경계는 수정됨. 초기 AttackRanking fixture 의존 선언 누락과 cleanup 진단 타입 오류로 실패 |
+| `ec0f740`, 제출 입력·corpus·teacher·divergence·R ancestry 순수 검사 | Windows·WSL 각각 243개 통과. neural import·forward·optimizer 실행 차단 |
+
+stack overflow 보완은 테스트 stack 크기를 올리지 않고 원 준비 소유자 묶음을 같은
+힙 할당에 유지하는 방식이다. 이후 자원 fixture는 같은 명시 한도를 native service,
+Deferred CPU plan, manager에 전달하도록 수정했다. 실제 오류 자료와 원 guard는
+보존하며, 이 자원 수정 이후의 종단 통과 여부는 다음 고정 소스 검사에서 확인한다.
+
+외부 R의 실제 source·requested/issued constraint·Dispatch·동일 terminal·Store 게시·
+P/C continuation·종료 증거를 연결했다. 기존 설정 `/1`·`/2`의 bytes는 유지하고
+새 설정 `/3`에서 독립 외부 질문 한도를 명시한다. 프로세스 직접 종료의 증거는
+semantic close 전용이며, 과거 ready fence나 실제 join을 다음 root 권한으로 바꾸지
+않는다. 디스크 회수 전 원 packet·View·Store pin을 유지하는 durable sink와 실제
+제품 입구 연결은 아직 별도 인수 대상이다.
+
+새 raw3·corpus2의 producer·writer·publication·historical reader와 공유 Collection
+launch를 등록했다. 초기 `counter=None`의 실제 AttackRanking과 나중 visible-counter
+입력은 서로 다른 원 source로 보존한다. 후발 witness를 같은 원 retired C row에
+연결하되 이미 게시한 입력을 다시 쓰거나 미래 반례를 과거 tensor에 넣지 않는다.
+원 source 해시만 같다는 이유로 새 helper closure를 자동 허용하지 않는다.
+
+남은 작업은 다음과 같이 계속 병렬 진행한다.
+
+- 외부 R의 durable retirement와 정상 다음 root·newgame·process close를 실제 인수한다.
+- 실제 Collection 상위 실행기, 게시 전 유한 C row 보관, 원 Repair·teacher·R 출처와
+  FD publication·재개·검증 소비자를 종단 연결한다.
+- native R의 실제 capture·semantic witness와 optional peer→외부 R 후속을 연결한다.
+- 네 모드의 depth·mate·searchmoves·Ponder와 NNUEC 원 owner 회수를 같은 소스에서 검사한다.
+- 기존 source review의 helper closure를 엄격하게 등록하고, 최종 형식·CI를 확인한다.
+- optimizer를 실행하지 않는 tensor·checkpoint·export와 로컬 RTX 4050의 수치·물리
+  수명을 확인한다. 이 로컬 실행은 성능·기력 자료로 사용하지 않는다.
+
+실제 학습·원격 성능 및 기력 비교·PR 병합은 이번 체크포인트에서 실행하지 않는다.
