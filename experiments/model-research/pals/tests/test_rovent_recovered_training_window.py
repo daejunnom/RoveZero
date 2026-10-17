@@ -37,6 +37,44 @@ class RecoveredLearnerConsumerTests(unittest.TestCase):
     def tearDown(self):
         sys.meta_path.remove(self.guard)
 
+    def test_publication_actual_fields_include_and_join_separate_training_epoch(self):
+        # Independent Rust DTO field roster: do not manufacture this fixture
+        # from the decoder's own _PUBLICATION_FIELDS constant.
+        names = ("schema", "execution_id", "window_id", "collection_source_sha256",
+            "collection_runtime_library_sha256", "trainer_source_sha256", "trainer_python_executable_sha256",
+            "trainer_dependency_set_sha256", "training_model_semantics_sha256", "initialization_source",
+            "collection_model_epoch", "collection_context_epoch", "training_model_epoch", "recipe_sha256", "stage_id",
+            "training_profile_sha256", "membership_sha256", "current_dataset_publication_sha256",
+            "ancestor_dataset_publication_sha256", "tensor", "checkpoint_retirement", "update_receipts", "terminal_receipt",
+            "original_recipe", "original_membership", "original_window_spec", "parent_publication", "boundary",
+            "recorded_tail_cost", "recorded_closure")
+        publication = dict.fromkeys(names)
+        for name in ("collection_source_sha256", "collection_runtime_library_sha256", "collection_model_epoch",
+                     "collection_context_epoch", "training_model_epoch", "trainer_source_sha256",
+                     "trainer_python_executable_sha256", "trainer_dependency_set_sha256", "training_model_semantics_sha256",
+                     "window_id", "stage_id", "recipe_sha256"):
+            publication[name] = self.spec[name]
+        publication.update(schema=recovered.PUBLICATION_DOMAIN,
+            training_profile_sha256=recovered.training_profile_digest(self.spec))
+        before = copy.deepcopy(publication)
+        self.assertIs(recovered.validate_checkpoint_publication_metadata(publication, original_window=self.spec), publication)
+        self.assertEqual(publication, before)
+        missing = {name: value for name, value in publication.items() if name != "training_model_epoch"}
+        with self.assertRaisesRegex(ValueError, "fields mismatch"):
+            recovered.validate_checkpoint_publication_metadata(missing)
+        for epoch in (0, self.spec["collection_model_epoch"]):
+            with self.subTest(epoch=epoch), self.assertRaises(ValueError):
+                recovered.validate_checkpoint_publication_metadata({**publication, "training_model_epoch": epoch},
+                    original_window=self.spec)
+        with self.assertRaisesRegex(ValueError, "identity or epoch"):
+            recovered.validate_checkpoint_publication_metadata({**publication,
+                "trainer_python_executable_sha256": self.spec["collection_runtime_library_sha256"]}, original_window=self.spec)
+        zero = {**self.spec, "training_model_epoch": 0}
+        zero_publication = {**publication, "training_model_epoch": 0,
+            "training_profile_sha256": recovered.training_profile_digest(zero)}
+        self.assertEqual(recovered.validate_checkpoint_publication_metadata(zero_publication,
+            original_window=zero)["training_model_epoch"], 0)
+
     def owner(self, spec=None):
         spec = self.spec if spec is None else spec
         admission = {"corpus_sha256": "a" * 64}

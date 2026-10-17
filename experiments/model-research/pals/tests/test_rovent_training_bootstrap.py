@@ -110,6 +110,7 @@ def recovered_fixture():
         "action": "train", "export_request": None, "recipe": old["recipe"], "membership": old["membership"], "window_spec": old["window_spec"],
         "trainer_source_sha256": bootstrap._digest(bootstrap.RECOVERED_SOURCE_DOMAIN, source_inventory), "trainer_python_version": "3.12.3",
         "trainer_python_executable": pin("/tmp/rovent-fixture-python", b"actual new trainer Python image"),
+        "dependency_directories": [entry["path"] for entry in value["dependency_directories"]],
         "trainer_dependency_set_sha256": bootstrap.recovered_dependency_set_digest(endpoints), "runtime_endpoints": endpoints,
         "current_dataset": dataset, "ancestor_datasets": [], "initialization_source": {"kind": "initialize",
             "pc_checkpoint": pin("/tmp/rovent-fixture-input/initial-pc.pt", b"initial P C tensors"),
@@ -170,6 +171,44 @@ class RoventRecoveredBootstrapProjectionTests(unittest.TestCase):
 
     def tearDown(self):
         sys.meta_path.remove(self.guard)
+
+    def test_registration_fixture_matches_the_independently_listed_rust_dto_fields(self):
+        # Deliberately independent of the Python validator's expected tuple.
+        # Keep this list aligned to RoventRecoveredTrainingRegistration so a
+        # newly required wire field cannot disappear from both local fixtures
+        # and parsing tests unnoticed.
+        expected = {"schema", "execution_id", "action", "export_request", "recipe", "membership", "window_spec",
+            "trainer_source_sha256", "trainer_python_executable", "trainer_python_version", "dependency_directories",
+            "trainer_dependency_set_sha256", "runtime_endpoints", "current_dataset", "ancestor_datasets", "initialization_source",
+            "rules_profile", "expected_initial_completed", "expected_ancestor_completed", "resources_policy", "require_total_quota",
+            "output_root", "control_root", "checkpoint_directory", "receipt_path", "max_rpc_messages", "max_rpc_bytes",
+            "max_read_bytes", "max_child_read_bytes", "max_output_bytes", "max_artifact_files"}
+        value = recovered_fixture()
+        self.assertEqual(set(value["registration"]), expected)
+        self.assertEqual(validate_recovered(value), value)
+
+    def test_registered_dependency_paths_are_bounded_unique_and_join_the_pinned_startup_roster(self):
+        for paths in ([], ["relative"], ["/tmp/dependency-one"] * 2,
+                ["/tmp/dependency-" + str(index) for index in range(9)]):
+            value = recovered_fixture()
+            value["registration"]["dependency_directories"] = paths
+            with self.subTest(paths=paths), self.assertRaises(ValueError):
+                validate_recovered(value)
+        missing = recovered_fixture()
+        missing["registration"].pop("dependency_directories")
+        with self.assertRaisesRegex(ValueError, "fields mismatch"):
+            validate_recovered(missing)
+        value = recovered_fixture()
+        value["dependency_directories"][0]["path"] = "/tmp/foreign-fixture-dependencies"
+        with self.assertRaisesRegex(ValueError, "identity roster"):
+            validate_recovered(value)
+        value = recovered_fixture()
+        value["registration"]["dependency_directories"].append("/tmp/second-fixture-dependencies")
+        value["dependency_directories"].append({"path": "/tmp/second-fixture-dependencies", "device": 1, "inode": 4})
+        self.assertEqual(validate_recovered(value), value)
+        value["dependency_directories"].reverse()
+        with self.assertRaisesRegex(ValueError, "identity roster"):
+            validate_recovered(value)
 
     def test_new_projection_has_distinct_data_python_dependency_and_source_namespaces(self):
         value = recovered_fixture()

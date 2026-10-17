@@ -1,5 +1,6 @@
 """Tiny parameter/state inventories; never model weights or training proof."""
 import copy
+import ast
 import importlib.abc
 import math
 from pathlib import Path
@@ -49,12 +50,13 @@ def recipe_fixture(membership):
     return SeriesRecipe(value)
 
 
-def membership_v2_fixture(*, validator=True):
+def membership_v2_fixture(*, validator=True, semantics=None):
+    semantics = training.NNUEC_V2_SEMANTICS if semantics is None else semantics
     original = membership_fixture(validator=validator)
     return {**original, "schema": training.MEMBERSHIP_V2_DOMAIN,
-        "nnuec_schema": training.NNUEC_V2_SCHEMA, "nnuec_semantics": training.NNUEC_V2_SEMANTICS,
+        "nnuec_schema": training.NNUEC_V2_SCHEMA, "nnuec_semantics": semantics,
         "parameters": [item for item in original["parameters"] if not item["name"].startswith("nnuec.")]
-            + training.nnuec_v2_parameter_descriptors(original["nnuec_config"])}
+            + training.nnuec_v2_parameter_descriptors(original["nnuec_config"], semantics=semantics)}
 
 
 def checkpoint(recipe):
@@ -100,6 +102,48 @@ class RoventTrainingPreparationTests(unittest.TestCase):
 
     def tearDown(self):
         sys.meta_path.remove(self.guard)
+
+    def test_prototype_v2_metadata_keeps_its_literal_and_digest_but_cannot_train_current_model(self):
+        old_literal = "board800-exactb192-causal-line-kind4-directedpair-exactc256-fp32-v2"
+        prototype = membership_v2_fixture(semantics=old_literal)
+        before = copy.deepcopy(prototype)
+        expected = digest("rz-rovent-trainable-parameter-membership/2", before)
+        self.assertEqual(training.membership_digest(prototype), expected)
+        self.assertEqual(training.nnuec_membership(prototype)[1], old_literal)
+        with self.assertRaisesRegex(ValueError, "prototype membership.*originfirst"):
+            training.validate_training_membership(prototype)
+        self.assertEqual(prototype, before)
+        current = membership_v2_fixture()
+        training.validate_training_membership(current)
+        self.assertNotEqual(training.membership_digest(current), expected)
+        self.assertEqual(training.membership_digest(prototype), expected)
+
+    def test_current_guard_uses_independent_reference_metadata_and_exact_parameter_spec(self):
+        # Read only the independent reference's literal; no model module is
+        # imported or initialized in this preparation suite.
+        source = Path(training.__file__).with_name("nnuec_v2_reference.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        semantics = next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "SEMANTICS" for target in node.targets))
+        current = membership_v2_fixture()
+        self.assertEqual(current["nnuec_semantics"], semantics)
+        metadata = {"schema": "rz-nnuec-torch-metadata/1", "model_schema": "rz-nnuec-fp32-v2",
+            "model_semantics": semantics, "config": copy.deepcopy(current["nnuec_config"]),
+            "output_scale": 1.0, "training": {"kind": "untrained"}}
+        spec = {item["wire_name"]: {"shape": tuple(item["shape"]), "dtype": "float32"}
+            for item in current["parameters"] if item["name"].startswith("nnuec.")}
+        self.assertEqual(spec["base.board_weights"]["shape"], (800, 2))
+        self.assertEqual(spec["kind_embeddings"]["shape"], (4, 3))
+        self.assertEqual(spec["pair_projection"]["shape"], (4, 3))
+        training.validate_training_membership(current, nnuec_metadata=metadata, nnuec_parameter_spec=spec)
+        for field, value in (("model_semantics", "board800-exactb192-causal-line-kind4-directedpair-exactc256-fp32-v2"),
+                              ("model_schema", "rz-nnuec-fp32-v1"), ("config", {**metadata["config"], "line_width": 4})):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "model metadata differs"):
+                training.validate_training_membership(current, nnuec_metadata={**metadata, field: value}, nnuec_parameter_spec=spec)
+        altered = copy.deepcopy(spec)
+        altered["pair_projection"]["shape"] = (3, 4)
+        with self.assertRaisesRegex(ValueError, "parameter spec differs"):
+            training.validate_training_membership(current, nnuec_metadata=metadata, nnuec_parameter_spec=altered)
 
     def test_v2_membership_is_explicit_base19_plus_relation5_without_v1_or_utility_conversion(self):
         original = membership_fixture()

@@ -43,7 +43,7 @@ def _read_startup(stream, count):
 def _metadata_inputs(startup, reads):
     from .generation_data import fields
     from .rovent_generation import SeriesRecipe
-    from .rovent_training import validate_membership, nnuec_membership
+    from .rovent_training import validate_training_membership, nnuec_membership
     from .rovent_training_window_v2 import validate_window_spec
     from .rovent_training_bootstrap import validate_recovered_window_binding
     from .artifacts import validate_rules_declaration
@@ -51,7 +51,7 @@ def _metadata_inputs(startup, reads):
     registration = startup["registration"]
     recipe = SeriesRecipe(reads.json(registration["recipe"], maximum=1024**2))
     membership = reads.json(registration["membership"], maximum=16 * 1024**2)
-    validate_membership(membership)
+    validate_training_membership(membership)
     spec = reads.json(registration["window_spec"], maximum=1024**2)
     # The explicit /2 parser precedes all runtime/model access. Do not project
     # its fields into an old window just to make the old child accept them.

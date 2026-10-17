@@ -19,7 +19,7 @@ from .generation_data import digest, fields, sha, uint
 from .generation_export import COST_FIELDS, _hash_file
 from .generation_training import OPTIMIZER, _typed_equal, atomic_checkpoint
 from .rovent_generation import SeriesRecipe
-from .rovent_training import membership_digest, optimizer_ownership, prepare_training_stage
+from .rovent_training import membership_digest, optimizer_ownership, prepare_training_stage, validate_training_membership
 from .rovent_nnuec_training_state import (derive_nnuec_tensor_training_state,
     fork_nnuec_ancestor, nnuec_is_unmodified)
 
@@ -31,9 +31,13 @@ BUCKETS = (8, 16, 32, 64, 128, 256)
 _RNG_LOCK = threading.RLock()
 
 
-def _runtime(execute):
+def _require_execution(execute):
     if execute is not True:
         raise ValueError("explicit tensor lifecycle execution required; no implicit model/optimizer import")
+
+
+def _runtime(execute):
+    _require_execution(execute)
     import torch
     from .training import _clone_state, _validate_rng, capture_rng, restore_rng
     from .nonzero_training import _state_digest, state_equal
@@ -75,6 +79,11 @@ def _validate_json_state(value, *, depth=0, allowance=None):
 
 
 def _live_parameters(model, membership, torch):
+    module = getattr(model, "nnuec", None)
+    if not callable(getattr(module, "parameter_spec", None)):
+        raise ValueError("actual NNUEC trainable parameter spec required")
+    validate_training_membership(membership, nnuec_metadata=_nnuec_metadata(model),
+        nnuec_parameter_spec=module.parameter_spec())
     expected = {item["name"]: item for item in membership["parameters"]}
     parameters = dict(model.named_parameters())
     if set(parameters) != set(expected):
@@ -219,6 +228,8 @@ def validate_nnuec_tensor_checkpoint_state(payload):
 def create_tensor_owner(model, recipe, membership, *, stage_id, samplers, bucket, sampler_validator,
                         cuda_devices=(), execute=False):
     """Clone a caller model and create unused AdamW owners; caller stays intact."""
+    _require_execution(execute)
+    validate_training_membership(membership)
     runtime = _runtime(execute)
     torch, _, validate_rng, capture_rng, restore_rng, _, _ = runtime
     prepare_training_stage(recipe, membership, stage_id=stage_id, mode="initialize")
@@ -346,6 +357,8 @@ def _scheduler_snapshot(owner, clone, equal):
 
 
 def tensor_payload(owner, *, sampler_validator, execute=False):
+    _require_execution(execute)
+    validate_training_membership(owner.membership)
     torch, clone, validate_rng, _, _, _, equal = _runtime(execute)
     if type(owner) is not OwnedTensorState or owner.quarantined:
         raise ValueError("live nonquarantined original tensor owner required")
@@ -443,6 +456,7 @@ def _load_pinned_tensor_file(path, expected_sha256, maximum, torch, *, read_acco
 
 
 def _restore_scratch(payload, template, recipe, membership, *, sampler_validator, runtime):
+    validate_training_membership(membership)
     torch, clone, validate_rng, capture_rng, restore_rng, _, equal = runtime
     fields(payload, ("schema", "eligibility", "recipe", "recipe_sha256", "membership", "membership_sha256", "stage_id",
         "nnuec_metadata", "nnuec_tensor_training_state", "model_metadata",
@@ -463,7 +477,13 @@ def _restore_scratch(payload, template, recipe, membership, *, sampler_validator
     validate_rng(payload["rng"], tuple(devices))
     _validate_json_state(payload["nnuec_metadata"])
     nnuec_tensor_state = validate_nnuec_tensor_checkpoint_state(payload)
-    _nnuec_metadata(template)
+    module = getattr(template, "nnuec", None)
+    if not callable(getattr(module, "parameter_spec", None)):
+        raise ValueError("actual NNUEC restore parameter spec required")
+    validate_training_membership(membership, nnuec_metadata=_nnuec_metadata(template),
+        nnuec_parameter_spec=module.parameter_spec())
+    validate_training_membership(membership, nnuec_metadata=payload["nnuec_metadata"],
+        nnuec_parameter_spec=module.parameter_spec())
     template.nnuec.validate_metadata_state(copy.deepcopy(payload["nnuec_metadata"]))
     if not _typed_equal(_model_metadata(template), payload["model_metadata"]):
         raise ValueError("source model immutable configuration differs from caller template")
@@ -542,6 +562,8 @@ def _restore_scratch(payload, template, recipe, membership, *, sampler_validator
 def stage_tensor_resume(path, expected_sha256, template, recipe, membership, *, sampler_validator,
                         max_file_bytes, expected_stage_id, execute=False, read_accounting=None, snapshot_directory=None):
     """Return a fully checked new owner. Original model/global RNG are intact."""
+    _require_execution(execute)
+    validate_training_membership(membership)
     runtime = _runtime(execute)
     maximum = uint(max_file_bytes, MAX_BYTES)
     if not maximum:
@@ -568,6 +590,8 @@ def stage_tensor_fork(path, expected_sha256, template, recipe, membership, *, so
     cost and update history remain in separate ancestry counters; resetting the
     child's stage counters does not erase the cost or relabel its learned origin.
     """
+    _require_execution(execute)
+    validate_training_membership(membership)
     runtime = _runtime(execute)
     torch, _, _, capture_rng, restore_rng, _, _ = runtime
     target = recipe.stage(target_stage_id)
@@ -657,6 +681,8 @@ def export_tensor_owner(owner, directory, *, kind, rules_profile_json, initializ
     trainer and diagnostic eligibility flags do not grant that admission.
     No optimizer update, model forward or numerical inference is dispatched.
     """
+    _require_execution(execute)
+    validate_training_membership(owner.membership)
     runtime = _runtime(execute)
     if kind not in ("collection", "deployment"):
         raise ValueError("explicit collection/deployment export kind required")

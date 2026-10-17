@@ -433,7 +433,7 @@ def recovered_dependency_set_digest(endpoints):
 def validate_recovered_registration(value):
     """Validate the distinct recovered DTO without converting an original /1."""
     _fields(value, ("schema", "execution_id", "action", "export_request", "recipe", "membership", "window_spec",
-        "trainer_source_sha256", "trainer_python_version", "trainer_python_executable", "trainer_dependency_set_sha256",
+        "trainer_source_sha256", "trainer_python_version", "trainer_python_executable", "dependency_directories", "trainer_dependency_set_sha256",
         "runtime_endpoints", "current_dataset", "ancestor_datasets", "initialization_source", "rules_profile",
         "expected_initial_completed", "expected_ancestor_completed", "resources_policy", "require_total_quota",
         "output_root", "control_root", "checkpoint_directory", "receipt_path", "max_rpc_messages", "max_rpc_bytes",
@@ -449,6 +449,12 @@ def validate_recovered_registration(value):
             or re.fullmatch(r"3\.[0-9]{1,2}\.[0-9]{1,3}", value["trainer_python_version"]) is None
             or any(str(int(part)) != part for part in value["trainer_python_version"].split("."))):
         raise ValueError("explicit recovered Python version required")
+    directories = value["dependency_directories"]
+    if type(directories) is not list or not 1 <= len(directories) <= 8:
+        raise ValueError("one to eight explicitly registered recovered dependency directories required")
+    registered_paths = [str(_absolute(path)) for path in directories]
+    if len(set(registered_paths)) != len(registered_paths):
+        raise ValueError("duplicate recovered registered dependency directory")
     if _sha(value["trainer_dependency_set_sha256"]) != recovered_dependency_set_digest(value["runtime_endpoints"]):
         raise ValueError("recovered declared dependency endpoint digest differs")
     _historical_dataset_request(value["current_dataset"])
@@ -673,6 +679,8 @@ def validate_recovered_startup(raw, *, expected_sha256, expected_bytes, executio
             raise ValueError("duplicate/aliased recovered dependency directory")
         paths.add(str(path))
         identities.add(identity)
+    if [dependency["path"] for dependency in dependencies] != registration["dependency_directories"]:
+        raise ValueError("recovered startup dependency identity roster differs from the registered paths or order")
     runtime = _fields(value["python_runtime"], ("version", "executable"), "recovered actual Python runtime")
     if runtime["version"] != registration["trainer_python_version"] or runtime["executable"] != registration["trainer_python_executable"]:
         raise ValueError("recovered runtime must use the registered trainer Python image, not collection ORT")

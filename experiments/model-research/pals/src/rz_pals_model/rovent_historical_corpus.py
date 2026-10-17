@@ -10,11 +10,13 @@ or legacy format conversion and no neural framework import.
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
 from pathlib import Path
 
 from .generation_data import digest, fields, identifier, sha, uint
 from . import rovent_corpus as original
+from .rovent_training_bootstrap import MAX_READ_BYTES as _MAX_SHARED_READ_BYTES
 
 PUBLICATION_DOMAIN = "rz-rovent-corpus-publication/1"
 OBSERVATION_DOMAIN = "rz-rovent-historical-corpus-observation/1"
@@ -24,7 +26,6 @@ ORIGIN_DOMAIN = "rz-rovent-collection-native-origin/1"
 _ROLES = ("proposer", "critic", "validator")
 _MAX_METADATA_BYTES = 16 * 1024 * 1024
 _MAX_CHUNK_BYTES = 32 * 1024 * 1024
-_MAX_SHARED_READ_BYTES = 2**40
 
 
 class HistoricalReadBudget:
@@ -183,9 +184,9 @@ def _publication(value, limits):
     entries = value["admissions"]
     if type(entries) is not list or len(entries) != len(admissions):
         raise ValueError("historical publication requires every original input lock pin")
-    locks, canonical_paths, path_canonicals, seen_admissions = {}, {}, {}, []
+    locks, bundles, canonical_paths, path_canonicals, seen_admissions = {}, {}, {}, {}, []
     for entry in entries:
-        fields(entry, ("native_admission_sha256", "input_lock", "canonical_input_lock_sha256"),
+        fields(entry, ("native_admission_sha256", "input_lock", "canonical_input_lock_sha256", "runtime_bundle_manifest"),
                "historical publication admission lock pin")
         seen_admissions.append(sha(entry["native_admission_sha256"]))
         canonical = sha(entry["canonical_input_lock_sha256"])
@@ -206,6 +207,23 @@ def _publication(value, limits):
             total += pin["bytes"]
         canonical_paths[canonical] = identity
         path_canonicals[identity] = canonical
+        bundle = entry["runtime_bundle_manifest"]
+        if bundle is not None:
+            _relative_pin(bundle, maximum=min(64 * 1024, limits.max_file_bytes),
+                description="historical original CUDA bundle metadata pin")
+            bundle_path = bundle["path"].casefold() if os.name == "nt" else bundle["path"]
+            if (not bundle["path"].startswith("runtime-bundles/") or not bundle["path"].endswith(".json")
+                    or bundle_path in paths or bundle_path in locks):
+                raise ValueError("historical runtime bundle overlaps corpus/lock payload")
+            identity = bundle["sha256"]
+            if identity in bundles:
+                if bundles[identity] != bundle:
+                    raise ValueError("historical runtime bundle raw SHA names conflicting file pins")
+            else:
+                if bundle_path in {item["path"].casefold() if os.name == "nt" else item["path"] for item in bundles.values()}:
+                    raise ValueError("historical runtime bundle path has conflicting raw SHA")
+                bundles[identity] = bundle
+                total += bundle["bytes"]
     if seen_admissions != admissions:
         raise ValueError("historical publication admission entries differ from exact sorted set")
     if uint(value["total_payload_bytes"], limits.max_total_bytes) != total:
@@ -277,7 +295,66 @@ def _input_lock(value, expected_canonical):
     return value
 
 
-def _join_record(registration, record, admissions):
+def _runtime_bundle_digest(value):
+    """Independent metadata codec; no library is opened or dlopened here."""
+    if type(value) is not dict:
+        raise ValueError("historical original CUDA bundle object required")
+    fields(value, ("schema_version", "files") + (("loader_aliases",) if "loader_aliases" in value else ()),
+        "historical original CUDA bundle")
+    schema = value["schema_version"]
+    if type(schema) is not int or schema not in (1, 2):
+        raise ValueError("historical explicit CUDA bundle schema 1/2 required")
+    nvidia = ("libcudart.so.12", "libcublas.so.12", "libcublasLt.so.12", "libcufft.so.11", "libcurand.so.10",
+        "libnvrtc.so.12", "libnvrtc-builtins.so.12.8", "libnvJitLink.so.12", "libcudnn.so.9", "libcudnn_adv.so.9",
+        "libcudnn_cnn.so.9", "libcudnn_ops.so.9", "libcudnn_engines_precompiled.so.9",
+        "libcudnn_engines_runtime_compiled.so.9", "libcudnn_graph.so.9", "libcudnn_heuristic.so.9")
+    names = {"libonnxruntime.so.1.22.0": ("core", 1), "libonnxruntime_providers_shared.so": ("providers_shared", 2),
+        "libonnxruntime_providers_cuda.so": ("providers_cuda", 3), **{name: ("nvidia_dependency", 4) for name in nvidia}}
+    files = value["files"]
+    if type(files) is not list or len(files) != len(names):
+        raise ValueError("historical CUDA bundle requires the closed 19-file profile")
+    seen, total = set(), 0
+    framed = bytearray(b"RoveZero/native-cuda-bundle\0" +
+        (b"binary-codec-v1\0" if schema == 1 else b"binary-codec-v2-aliases\0"))
+    framed.extend(schema.to_bytes(4, "big") + len(files).to_bytes(4, "big"))
+    for item in files:
+        fields(item, ("role", "filename", "bytes", "sha256"), "historical CUDA library metadata")
+        name = item["filename"]
+        if type(name) is not str or name not in names or name in seen or item["role"] != names[name][0]:
+            raise ValueError("historical CUDA library role/name/duplicate mismatch")
+        seen.add(name)
+        total += uint(item["bytes"], 1024**3)
+        if not item["bytes"] or total > 4 * 1024**3:
+            raise ValueError("historical CUDA library declared byte capacity exceeded")
+        sha(item["sha256"])
+    for item in sorted(files, key=lambda row: row["filename"]):
+        name = item["filename"].encode("ascii")
+        framed.extend(len(name).to_bytes(4, "big") + name + bytes([names[item["filename"]][1]]))
+        framed.extend(item["bytes"].to_bytes(8, "big") + bytes.fromhex(item["sha256"]))
+    aliases = value.get("loader_aliases")
+    if schema == 1:
+        if aliases is not None:
+            raise ValueError("historical CUDA V1 cannot declare loader aliases")
+    else:
+        allowed = {name + ".8.0": name for name in nvidia if name.startswith("libcudnn")}
+        if type(aliases) is not list or not 1 <= len(aliases) <= len(allowed):
+            raise ValueError("historical CUDA V2 requires explicit closed loader aliases")
+        seen = set()
+        for item in aliases:
+            fields(item, ("filename", "target"), "historical CUDA loader alias")
+            name = item["filename"]
+            if type(name) is not str or name in seen or allowed.get(name) != item["target"]:
+                raise ValueError("historical CUDA loader alias changed closed profile")
+            seen.add(name)
+        framed.extend(len(aliases).to_bytes(4, "big"))
+        for item in sorted(aliases, key=lambda row: row["filename"]):
+            for name in (item["filename"], item["target"]):
+                raw = name.encode("ascii")
+                framed.extend(len(raw).to_bytes(4, "big") + raw)
+    return hashlib.sha256(framed).hexdigest()
+
+
+def _join_record(registration, record, admissions, runtime_bundles=None):
     native = record["native"]
     for name in ("raw_submission", "raw_completion", "raw_retirement"):
         if native[name].get("schema") != NATIVE_DOMAIN:
@@ -296,6 +373,23 @@ def _join_record(registration, record, admissions):
     if lock is None or origin.get("input_lock_sha256") != lock["canonical_sha256"]:
         raise ValueError("historical root admission lacks its published original input lock")
     engine = lock["manifest"]["engine"]
+    if type(engine) is not dict:
+        raise ValueError("historical original lock engine object required")
+    bundle = None if runtime_bundles is None else runtime_bundles.get(admission_sha)
+    if origin.get("runtime_bundle_sha256") is None:
+        if bundle is not None:
+            raise ValueError("historical CPU origin cannot acquire a CUDA bundle")
+    else:
+        if bundle is None or _runtime_bundle_digest(bundle["body"]) != origin["runtime_bundle_sha256"]:
+            raise ValueError("historical runtime bundle semantic digest differs from its raw metadata file")
+        pc = engine.get("pc")
+        artifacts = pc.get("runtime_artifacts") if type(pc) is dict else None
+        if (type(artifacts) is not list or not any(type(item) is dict and item.get("sha256") == bundle["pin"]["sha256"]
+                and item.get("bytes") == bundle["pin"]["bytes"] for item in artifacts)):
+            raise ValueError("historical runtime bundle raw file pin absent from the original lock")
+        core = next(row for row in bundle["body"]["files"] if row["role"] == "core")
+        if core["sha256"] != origin.get("runtime_library_sha256"):
+            raise ValueError("historical CUDA bundle core is not the registered collection runtime library")
     if (type(engine) is not dict or engine.get("source_commit") != registration["collection_source_commit"]
             or engine.get("source_components") != origin.get("source_components")
             or _source_aggregate(registration["collection_source_commit"], engine["source_components"])
@@ -351,7 +445,7 @@ class HistoricalRoventCorpus:
         _join_metadata(registration, publication, manifest, index)
         for pin in publication["chunks"]:
             _read_file(root, pin, read_budget)
-        locks_by_path, admissions = {}, {}
+        locks_by_path, admissions, bundles_by_sha, runtime_bundles = {}, {}, {}, {}
         for entry in publication["admissions"]:
             pin = entry["input_lock"]
             path = pin["path"]
@@ -362,6 +456,13 @@ class HistoricalRoventCorpus:
             if lock["canonical_sha256"] != entry["canonical_input_lock_sha256"]:
                 raise ValueError("historical shared original input lock canonical seal changed")
             admissions[entry["native_admission_sha256"]] = lock
+            pin = entry["runtime_bundle_manifest"]
+            if pin is not None:
+                if pin["sha256"] not in bundles_by_sha:
+                    body = _read_file(root, pin, read_budget, json_metadata=True)
+                    _runtime_bundle_digest(body)
+                    bundles_by_sha[pin["sha256"]] = {"body": body, "pin": pin}
+                runtime_bundles[entry["native_admission_sha256"]] = bundles_by_sha[pin["sha256"]]
         declared_ancestors = tuple(manifest["ancestor_index_sha256"])
         # The final reader owns the decoded manifest/index. Drop the first-pass
         # copies before that reader allocates its bounded row/index storage.
@@ -376,7 +477,7 @@ class HistoricalRoventCorpus:
         if (corpus.manifest_semantic_sha256 != publication["canonical_manifest_sha256"]
                 or corpus.index_semantic_sha256 != publication["canonical_index_sha256"]):
             raise ValueError("historical original reader changed publication canonical seals")
-        actual_admissions = sorted({_join_record(registration, record, admissions) for record in corpus._records})
+        actual_admissions = sorted({_join_record(registration, record, admissions, runtime_bundles) for record in corpus._records})
         if actual_admissions != publication["native_admission_sha256"]:
             raise ValueError("historical publication full native admission set mismatch")
         expected_ancestors = sorted(owner.corpus.index_semantic_sha256 for owner in ancestors)

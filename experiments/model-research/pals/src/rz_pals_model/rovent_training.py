@@ -24,7 +24,8 @@ EXPORT_DOMAIN = "rz-rovent-export-preparation/1"
 NNUEC_SCHEMA = "rz-nnuec-fp32-v1"
 NNUEC_SEMANTICS = "board800-exactb192-causal-line-exactc256-fp32-v1"
 NNUEC_V2_SCHEMA = "rz-nnuec-fp32-v2"
-NNUEC_V2_SEMANTICS = "board800-exactb192-causal-line-kind4-directedpair-exactc256-fp32-v2"
+NNUEC_V2_PROTOTYPE_SEMANTICS = "board800-exactb192-causal-line-kind4-directedpair-exactc256-fp32-v2"
+NNUEC_V2_SEMANTICS = "board800-exactb192-causal-line-kind4-directedpair-originfirst-exactc256-fp32-v2"
 CONFIG_FIELDS = ("board_width", "line_width", "context_width", "local_width", "hidden_width",
                  "causal_window", "max_lines", "max_plies")
 COMPONENTS = ("pc_shared", "p_private", "c_private", "v_private", "nnuec")
@@ -65,16 +66,18 @@ def nnuec_parameter_descriptors(config):
             for name, shape in shapes.items()]
 
 
-def nnuec_v2_parameter_descriptors(config):
+def nnuec_v2_parameter_descriptors(config, *, semantics=NNUEC_V2_SEMANTICS):
     """Explicit base19+relation5 domain; V1 is never silently upgraded."""
+    if semantics not in (NNUEC_V2_PROTOTYPE_SEMANTICS, NNUEC_V2_SEMANTICS):
+        raise ValueError("explicit recognized NNUEC V2 membership semantics required")
     parameters = [{**item, "name": "nnuec.base." + item["wire_name"],
-        "wire_name": "base." + item["wire_name"], "semantics": NNUEC_V2_SEMANTICS}
+        "wire_name": "base." + item["wire_name"], "semantics": semantics}
         for item in nnuec_parameter_descriptors(config)]
     e, c = config["line_width"], config["context_width"]
     for name, shape in (("kind_embeddings", [4, e]), ("pair_parent", [2, e]), ("pair_child", [2, e]),
                          ("pair_bias", [2, e]), ("pair_projection", [c, e])):
         parameters.append({"name": "nnuec." + name, "wire_name": name, "shape": shape, "dtype": "float32",
-            "semantics": NNUEC_V2_SEMANTICS, "layout": "output_rows" if name == "pair_projection" else "feature_rows", "trainable": True})
+            "semantics": semantics, "layout": "output_rows" if name == "pair_projection" else "feature_rows", "trainable": True})
     return parameters
 
 
@@ -82,7 +85,8 @@ def nnuec_membership(membership):
     if membership["schema"] == MEMBERSHIP_DOMAIN:
         return NNUEC_SCHEMA, NNUEC_SEMANTICS, nnuec_parameter_descriptors(membership["nnuec_config"])
     if membership["schema"] == MEMBERSHIP_V2_DOMAIN:
-        return NNUEC_V2_SCHEMA, NNUEC_V2_SEMANTICS, nnuec_v2_parameter_descriptors(membership["nnuec_config"])
+        semantics = membership["nnuec_semantics"]
+        return NNUEC_V2_SCHEMA, semantics, nnuec_v2_parameter_descriptors(membership["nnuec_config"], semantics=semantics)
     raise ValueError("unsupported NNUEC trainable membership domain")
 
 
@@ -101,7 +105,8 @@ def validate_membership(value):
         + (("nnuec_schema", "nnuec_semantics") if domain == MEMBERSHIP_V2_DOMAIN else ()), "Rovent trainable membership")
     if domain not in (MEMBERSHIP_DOMAIN, MEMBERSHIP_V2_DOMAIN) or type(value["validator_present"]) is not bool:
         raise ValueError("new explicit Rovent membership domain required")
-    if domain == MEMBERSHIP_V2_DOMAIN and (value["nnuec_schema"] != NNUEC_V2_SCHEMA or value["nnuec_semantics"] != NNUEC_V2_SEMANTICS):
+    if domain == MEMBERSHIP_V2_DOMAIN and (value["nnuec_schema"] != NNUEC_V2_SCHEMA
+            or value["nnuec_semantics"] not in (NNUEC_V2_PROTOTYPE_SEMANTICS, NNUEC_V2_SEMANTICS)):
         raise ValueError("explicit V2 NNUEC schema/semantics required")
     sha(value["model_semantics_sha256"])
     expected_nnuec = {item["name"]: item for item in nnuec_membership(value)[2]}
@@ -133,6 +138,38 @@ def validate_membership(value):
     if components != required or not set(expected_nnuec) <= seen:
         raise ValueError("incomplete shared/private/NNUEC parameter membership")
     return value
+
+
+def validate_training_membership(value, *, nnuec_metadata=None, nnuec_parameter_spec=None):
+    """Admit current model meaning, separately from historical metadata reads.
+
+    The prototype /2 literal remains readable and keeps its exact canonical
+    SHA. It cannot load into the current origin-first model by an alias. The
+    caller repeats this guard against the live model's metadata and actual
+    parameter spec before constructing moments or applying restored state.
+    """
+    checked = validate_membership(value)
+    schema, semantics, descriptors = nnuec_membership(checked)
+    if schema == NNUEC_V2_SCHEMA and semantics != NNUEC_V2_SEMANTICS:
+        raise ValueError("historical NNUEC V2 prototype membership is not current originfirst training semantics")
+    if (nnuec_metadata is None) != (nnuec_parameter_spec is None):
+        raise ValueError("actual NNUEC metadata and parameter spec must be checked together")
+    if nnuec_metadata is not None:
+        fields(nnuec_metadata, ("schema", "model_schema", "model_semantics", "config", "output_scale", "training"),
+            "actual trainable NNUEC metadata")
+        if (nnuec_metadata["schema"] != "rz-nnuec-torch-metadata/1"
+                or nnuec_metadata["model_schema"] != schema or nnuec_metadata["model_semantics"] != semantics
+                or not _typed_equal(nnuec_metadata["config"], checked["nnuec_config"])):
+            raise ValueError("actual NNUEC model metadata differs from exact registered schema/semantics/config")
+        expected = {item["wire_name"]: item for item in descriptors}
+        fields(nnuec_parameter_spec, expected, "actual trainable NNUEC parameter spec")
+        for name, item in nnuec_parameter_spec.items():
+            fields(item, ("shape", "dtype"), "actual NNUEC parameter shape/dtype")
+            shape = item["shape"]
+            if (type(shape) not in (tuple, list) or any(type(size) is not int for size in shape)
+                    or list(shape) != expected[name]["shape"] or item["dtype"] != "float32"):
+                raise ValueError("actual NNUEC parameter spec differs from registered wire shape/dtype")
+    return checked
 
 
 def membership_digest(value):

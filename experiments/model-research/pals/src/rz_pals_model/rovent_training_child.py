@@ -45,14 +45,14 @@ def _metadata_inputs(startup, reads):
     # consumes an explicitly registered original pin.
     from .generation_data import fields
     from .rovent_generation import SeriesRecipe
-    from .rovent_training import validate_membership, nnuec_membership
+    from .rovent_training import validate_training_membership, nnuec_membership
     from .rovent_training_window import validate_window_spec
     from .artifacts import validate_rules_declaration
     from .config import ModelConfig
     registration = startup["registration"]
     recipe = SeriesRecipe(reads.json(registration["recipe"], maximum=1024**2))
     membership = reads.json(registration["membership"], maximum=16 * 1024**2)
-    validate_membership(membership)
+    validate_training_membership(membership)
     window = reads.json(registration["window_spec"], maximum=1024**2)
     validate_window_spec(recipe, window)
     rules = reads.json(registration["rules_profile"], maximum=65536)

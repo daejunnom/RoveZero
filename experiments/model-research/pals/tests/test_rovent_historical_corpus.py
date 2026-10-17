@@ -90,7 +90,7 @@ def synthetic_v2():
         "source_commit": manifest["source_commit"], "source_components": components, "source_sha256": source_sha,
         "weights_sha256": native["model_sha256"], "export_manifest_sha256": h("collection export manifest"),
         "backend_sha256": h("collection backend"), "runtime_library_sha256": manifest["runtime_sha256"],
-        "runtime_bundle_sha256": h("runtime bundle differs from library"),
+        "runtime_bundle_sha256": None,
         "native_configuration_sha256": h("collection native configuration"),
         "model_semantics": "synthetic-semantics", "model_semantics_sha256": manifest["model_semantics_sha256"],
         "encoding": "synthetic-encoding", "encoding_sha256": native["encoding_sha256"],
@@ -131,7 +131,7 @@ def reseal_native(manifest, record):
     seal_record(manifest, record)
 
 
-def write_publication(root, *, source=None):
+def write_publication(root, *, source=None, runtime_bundle=None):
     recipe, manifest, record, lock, binding = synthetic_v2() if source is None else source
     root.mkdir(parents=True, exist_ok=True)
     origin = {key: record[key] for key in ("record_sha256", "input_sha256", "origin_sha256", "split")}
@@ -140,6 +140,10 @@ def write_publication(root, *, source=None):
     origin.update(copy.deepcopy(record["lineage"]))
     payloads = {"corpus-manifest.json": raw(manifest), "chunks/000000.jsonl": raw(record),
                 "input-locks/original.json": raw(lock)}
+    bundle_pin = None
+    if runtime_bundle is not None:
+        payloads["runtime-bundles/original.json"] = raw(runtime_bundle)
+        bundle_pin = file_pin("runtime-bundles/original.json", payloads["runtime-bundles/original.json"])
     chunk = file_pin("chunks/000000.jsonl", payloads["chunks/000000.jsonl"])
     index = {"schema": original.INDEX_DOMAIN, "manifest_sha256": data.digest(original.MANIFEST_DOMAIN, manifest),
              "record_count": 1, "chunks": [{**chunk, "records": 1}], "origins": [origin]}
@@ -156,7 +160,7 @@ def write_publication(root, *, source=None):
         "native_admission_sha256": [admission_sha],
         "admissions": [{"native_admission_sha256": admission_sha,
                         "input_lock": file_pin("input-locks/original.json", payloads["input-locks/original.json"]),
-                        "canonical_input_lock_sha256": lock["canonical_sha256"]}]}
+                        "canonical_input_lock_sha256": lock["canonical_sha256"], "runtime_bundle_manifest": bundle_pin}]}
     payloads["publication.json"] = raw(publication)
     for name, payload in payloads.items():
         path = root.joinpath(*name.split("/"))
@@ -171,6 +175,74 @@ def write_publication(root, *, source=None):
 
 
 class HistoricalCorpusTests(unittest.TestCase):
+    def test_cpu_publication_requires_explicit_null_bundle_without_inventing_cuda(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registration, publication, _, _, _, _ = write_publication(Path(directory))
+            self.assertIsNone(publication["admissions"][0]["runtime_bundle_manifest"])
+            before = copy.deepcopy(publication)
+            self.assertIs(historical._publication(publication, original.CorpusLimits()), publication)
+            self.assertEqual(publication, before)
+            missing = copy.deepcopy(publication)
+            del missing["admissions"][0]["runtime_bundle_manifest"]
+            with self.assertRaisesRegex(ValueError, "fields mismatch"):
+                historical._publication(missing, original.CorpusLimits())
+
+    def test_cuda_raw_metadata_file_and_binary_semantic_digest_are_separate_and_budgeted(self):
+        filenames = ("libcudart.so.12", "libcublas.so.12", "libcublasLt.so.12", "libcufft.so.11", "libcurand.so.10",
+            "libnvrtc.so.12", "libnvrtc-builtins.so.12.8", "libnvJitLink.so.12", "libcudnn.so.9", "libcudnn_adv.so.9",
+            "libcudnn_cnn.so.9", "libcudnn_ops.so.9", "libcudnn_engines_precompiled.so.9",
+            "libcudnn_engines_runtime_compiled.so.9", "libcudnn_graph.so.9", "libcudnn_heuristic.so.9")
+        files = [{"role": role, "filename": name, "bytes": 4, "sha256": h(name)} for role, name in (
+            ("core", "libonnxruntime.so.1.22.0"), ("providers_shared", "libonnxruntime_providers_shared.so"),
+            ("providers_cuda", "libonnxruntime_providers_cuda.so"))]
+        files.extend({"role": "nvidia_dependency", "filename": name, "bytes": 4, "sha256": h(name)} for name in filenames)
+        bundle = {"schema_version": 2, "files": files,
+            "loader_aliases": [{"filename": "libcudnn.so.9.8.0", "target": "libcudnn.so.9"}]}
+        source = synthetic_v2()
+        recipe, manifest, record, lock, _binding = source
+        files[0]["sha256"] = manifest["runtime_sha256"]
+        bundle_bytes = raw(bundle)
+        raw_sha = hashlib.sha256(bundle_bytes).hexdigest()
+        semantic_sha = historical._runtime_bundle_digest(bundle)
+        self.assertNotEqual(raw_sha, semantic_sha)
+        lock["manifest"]["engine"]["pc"] = {"runtime_artifacts": [artifact("runtime.json", raw_sha, len(bundle_bytes))]}
+        lock["canonical_sha256"] = data.digest("rz-rovent-execution-canonical/1", lock["manifest"])
+        admission = record["native"]["raw_retirement"]["root_admission"]
+        admission["native_origin"].update(input_lock_sha256=lock["canonical_sha256"], runtime_bundle_sha256=semantic_sha)
+        admission["native_origin_sha256"] = data.digest(native_v2.ORIGIN_DOMAIN, admission["native_origin"])
+        record["native"]["raw_retirement"]["root_admission_sha256"] = data.digest(native_v2.ROOT_DOMAIN, admission)
+        reseal_native(manifest, record)
+        with tempfile.TemporaryDirectory() as directory:
+            registration, publication, _, _, _, _ = write_publication(Path(directory), source=source, runtime_bundle=bundle)
+            budget = historical.HistoricalReadBudget(8 * 1024**2)
+            owner = historical.HistoricalRoventCorpus.from_registration(registration, read_budget=budget)
+            self.assertFalse(owner.observation()["execution_authorized"])
+            self.assertGreaterEqual(budget.observation()["charged_bytes"], len(bundle_bytes))
+            self.assertFalse(budget.observation()["unknown"])
+            duplicate = copy.deepcopy(publication["admissions"][0])
+            duplicate["native_admission_sha256"] = h("second root sharing one bundle")
+            publication["admissions"].append(duplicate)
+            publication["admissions"].sort(key=lambda item: item["native_admission_sha256"])
+            publication["native_admission_sha256"] = [item["native_admission_sha256"] for item in publication["admissions"]]
+            historical._publication(publication, original.CorpusLimits())
+            duplicate["runtime_bundle_manifest"]["bytes"] += 1
+            with self.assertRaisesRegex(ValueError, "conflicting file pins"):
+                historical._publication(publication, original.CorpusLimits())
+
+    def test_cuda_binary_codec_rejects_alias_escape_nonprofile_and_file_mismatch(self):
+        for value in ({"schema_version": 1, "files": []}, {"schema_version": 2, "files": [], "loader_aliases": []},
+                      {"schema_version": 3, "files": []}):
+            with self.subTest(schema=value["schema_version"]), self.assertRaises(ValueError):
+                historical._runtime_bundle_digest(value)
+
+    def test_shared_read_budget_reuses_the_original_bootstrap_ceiling(self):
+        from rz_pals_model.rovent_training_bootstrap import MAX_READ_BYTES
+        self.assertEqual(historical._MAX_SHARED_READ_BYTES, MAX_READ_BYTES)
+        budget = historical.HistoricalReadBudget(MAX_READ_BYTES)
+        self.assertEqual(budget.observation()["maximum_bytes"], MAX_READ_BYTES)
+        with self.assertRaises(ValueError):
+            historical.HistoricalReadBudget(MAX_READ_BYTES + 1)
+
     def setUp(self):
         self.guard = NeuralImportsForbidden()
         sys.meta_path.insert(0, self.guard)

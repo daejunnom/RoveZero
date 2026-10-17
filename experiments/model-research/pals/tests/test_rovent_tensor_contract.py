@@ -3,7 +3,7 @@ import importlib.abc
 import sys
 import unittest
 
-from test_rovent_training import NeuralImportsForbidden, membership_fixture, recipe_fixture
+from test_rovent_training import NeuralImportsForbidden, membership_fixture, membership_v2_fixture, recipe_fixture
 
 
 _guard = NeuralImportsForbidden()
@@ -51,6 +51,27 @@ class RoventTensorAdmissionTests(unittest.TestCase):
             nested = [nested]
         with self.assertRaisesRegex(ValueError, "bounded plain checkpoint sidecar"):
             tensors._validate_json_state(nested)
+
+    def test_prototype_membership_is_rejected_before_any_runtime_import_or_caller_mutation(self):
+        from types import SimpleNamespace
+        membership = membership_v2_fixture(
+            semantics="board800-exactb192-causal-line-kind4-directedpair-exactc256-fp32-v2")
+        owner = SimpleNamespace(membership=membership)
+        calls = (
+            lambda: tensors.create_tensor_owner(None, None, membership, stage_id=None, samplers=None,
+                bucket=None, sampler_validator=None, execute=True),
+            lambda: tensors.tensor_payload(owner, sampler_validator=None, execute=True),
+            lambda: tensors.stage_tensor_resume(None, None, None, None, membership, sampler_validator=None,
+                max_file_bytes=0, expected_stage_id=None, execute=True),
+            lambda: tensors.stage_tensor_fork(None, None, None, None, membership, source_sampler_validator=None,
+                target_sampler_validator=None, target_stage_id=None, reset_seed=None, reset_samplers=None,
+                reset_bucket=None, max_file_bytes=0, execute=True),
+            lambda: tensors.export_tensor_owner(owner, None, kind=None, rules_profile_json=None,
+                sampler_validator=None, max_output_bytes=0, execute=True),
+        )
+        for call in calls:
+            with self.subTest(call=call), self.assertRaisesRegex(ValueError, "prototype membership.*originfirst"):
+                call()
 
     def test_ledger_preserves_ancestral_cost_and_rejects_uncertain_accumulation_or_early_v(self):
         membership = membership_fixture()

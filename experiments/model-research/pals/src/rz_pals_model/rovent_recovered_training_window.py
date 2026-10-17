@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 from .generation_data import digest, fields, sha, uint
 from .generation_training import _typed_equal
-from .rovent_training import membership_digest
+from .rovent_training import membership_digest, validate_training_membership
 from .rovent_training_window_v2 import validate_window_spec, training_profile_digest
 from .rovent_training_recovery import artifact_reference, initial_recovered_cost, recorded_tail_cost
 from . import rovent_training_window as core
@@ -27,7 +27,7 @@ PUBLICATION_DOMAIN = "rz-rovent-training-checkpoint-publication/1"
 _PUBLICATION_FIELDS = ("schema", "execution_id", "window_id", "collection_source_sha256",
     "collection_runtime_library_sha256", "trainer_source_sha256", "trainer_python_executable_sha256",
     "trainer_dependency_set_sha256", "training_model_semantics_sha256", "initialization_source",
-    "collection_model_epoch", "collection_context_epoch", "recipe_sha256", "stage_id", "training_profile_sha256",
+    "collection_model_epoch", "collection_context_epoch", "training_model_epoch", "recipe_sha256", "stage_id", "training_profile_sha256",
     "membership_sha256", "current_dataset_publication_sha256", "ancestor_dataset_publication_sha256", "tensor",
     "checkpoint_retirement", "update_receipts", "terminal_receipt", "original_recipe", "original_membership",
     "original_window_spec", "parent_publication", "boundary", "recorded_tail_cost", "recorded_closure")
@@ -57,6 +57,38 @@ class HistoricalCheckpointInput:
     snapshot_directory: str
 
 
+def validate_checkpoint_publication_metadata(value, *, original_window=None):
+    """Check the actual publication DTO without IO, tensor loads or a lease."""
+    fields(value, _PUBLICATION_FIELDS, "historical checkpoint publication")
+    if value["schema"] != PUBLICATION_DOMAIN:
+        raise ValueError("explicit historical checkpoint publication domain required")
+    for name in ("collection_model_epoch", "collection_context_epoch", "training_model_epoch"):
+        uint(value[name])
+    if original_window is not None:
+        if type(original_window) is not dict:
+            raise ValueError("original pinned training window metadata required")
+        domain = original_window.get("schema")
+        if domain == "rz-rovent-train-window/2":
+            names = ("collection_source_sha256", "collection_runtime_library_sha256", "collection_model_epoch",
+                "collection_context_epoch", "training_model_epoch", "trainer_source_sha256",
+                "trainer_python_executable_sha256", "trainer_dependency_set_sha256", "training_model_semantics_sha256")
+            if any(name not in original_window or not _typed_equal(original_window[name], value[name]) for name in names):
+                raise ValueError("historical publication changed original separate collection/training identity or epoch")
+        elif domain == "rz-rovent-train-window/1":
+            # The old unseparated fields are retained as old evidence. They
+            # cannot identify separate Python and collection runtimes by alias.
+            if original_window.get("model_semantics_sha256") != value["training_model_semantics_sha256"]:
+                raise ValueError("legacy historical model semantics changed")
+        else:
+            raise ValueError("historical original window domain unsupported")
+        if (original_window.get("window_id") != value["window_id"]
+                or original_window.get("stage_id") != value["stage_id"]
+                or original_window.get("recipe_sha256") != value["recipe_sha256"]
+                or core.training_profile_digest(original_window) != value["training_profile_sha256"]):
+            raise ValueError("historical original window/profile/stage publication mismatch")
+    return value
+
+
 def _relative_pin(root, value):
     pin = artifact_reference(value)
     root = Path(root)
@@ -74,9 +106,7 @@ def read_historical_checkpoint_source(startup, reads, *, corpus_by_publication):
         raise ValueError("historical checkpoint input requires explicit resume or fork")
     source = initialization["checkpoint"]
     publication = reads.json(source["publication"], maximum=16 << 20)
-    fields(publication, _PUBLICATION_FIELDS, "historical checkpoint publication")
-    if publication["schema"] != PUBLICATION_DOMAIN:
-        raise ValueError("explicit historical checkpoint publication domain required")
+    validate_checkpoint_publication_metadata(publication)
     observation = startup["checkpoint_admission"]
     if (publication["tensor"]["sha256"] != observation["tensor_sha256"]
             or source["publication"]["sha256"] != observation["publication_sha256"]):
@@ -95,6 +125,7 @@ def read_historical_checkpoint_source(startup, reads, *, corpus_by_publication):
             or membership_digest(original_membership) != publication["membership_sha256"]):
         raise ValueError("historical recipe/membership exact bytes changed canonical identity")
     core.validate_window_spec(original, original_window)
+    validate_checkpoint_publication_metadata(publication, original_window=original_window)
     if (core.training_profile_digest(original_window) != publication["training_profile_sha256"]
             or original_window["stage_id"] != publication["stage_id"]):
         raise ValueError("historical window changed its original profile/stage")
@@ -210,6 +241,7 @@ def _sampler_validator(owner, intake, spec):
 
 
 def _raw_scratch(path, expected_sha256, template, recipe, membership, authority, maximum):
+    validate_training_membership(membership)
     source = _source(authority)
     if str(Path(path)) != source.tensor_pin["path"] or expected_sha256 != source.tensor_pin["sha256"]:
         raise ValueError("only the exact registered recovered tensor input may be loaded")
