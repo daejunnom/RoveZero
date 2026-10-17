@@ -294,6 +294,7 @@ fn source_bundle() -> Result<BTreeMap<&'static str, &'static [u8]>, ArenaError> 
         source!("rovent_submitted_input.py"),
         source!("rovent_corpus_codec.py"),
         source!("rovent_native_v3.py"),
+        source!("rovent_external_root.py"),
         source!("rovent_divergence.py"),
     ] {
         files.insert(path, bytes);

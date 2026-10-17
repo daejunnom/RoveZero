@@ -25,6 +25,8 @@ const MAX_PROVENANCE_ARTIFACTS: usize = 32;
 /// Construction is closed over the original retained bytes, actual loaded
 /// model, compiled registration and exact startup lock. Keeping the source Arc
 /// also keeps its original directory and file descriptors alive.
+/// Clone은 같은 source/model Arc를 공유하며 재로딩이나 새 권한을 발급하지 않는다.
+#[derive(Clone)]
 pub struct LoadedRoventNnuecSource {
     sources: Arc<RoventPinnedNativeSources>,
     model: Arc<Model>,

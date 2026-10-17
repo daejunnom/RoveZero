@@ -632,6 +632,11 @@ pub struct NnuecCaptureRetirement {
     error: Option<CaptureError>,
 }
 impl NnuecCaptureRetirement {
+    /// Historical original-capture identity only. In particular, NotStarted
+    /// keeps an unactivated lineage and cannot issue a semantic witness.
+    pub fn lineage(&self) -> NnuecCaptureLineage {
+        self.submission.lineage.clone()
+    }
     /// Exact original activation, never public metadata equality. A known
     /// unstarted terminal supplies no actual worker/readout semantic witness.
     pub fn matches_lineage(&self, lineage: &NnuecCaptureLineage) -> bool {

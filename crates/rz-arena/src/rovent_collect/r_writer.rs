@@ -355,21 +355,26 @@ impl RoventRCorpusWriter {
         Ok(())
     }
     pub fn finish(
-        mut self,
+        self,
         mut sink: impl FnMut(RoventRPublicationPacket) -> Result<(), ArenaError>,
     ) -> Result<FinishedRoventRCorpus, ArenaError> {
-        check(
-            !self.poisoned && !self.retirements.is_empty(),
-            "R finish requires complete actual retirements",
-        )?;
-        self.poisoned = true;
-        self.flush(&mut sink)?;
-        self.index.validate()?;
-        let admissions = self
-            .admissions
-            .iter()
-            .map(|(sha, pins)| pins.admission(sha.clone()))
-            .collect::<Result<Vec<_>, _>>()?;
+        self.finish_retaining(&mut sink)
+            .map_err(|rejected| rejected.error)
+    }
+    /// 실패한 flush/metadata 검증에서도 같은 writer와 원 source pin을 반환한다.
+    pub fn finish_retaining(
+        mut self,
+        mut sink: impl FnMut(RoventRPublicationPacket) -> Result<(), ArenaError>,
+    ) -> Result<FinishedRoventRCorpus, Box<RoventRWriterFinishRejected>> {
+        let admissions = match self.prepare_finish(&mut sink) {
+            Ok(admissions) => admissions,
+            Err(error) => {
+                return Err(Box::new(RoventRWriterFinishRejected {
+                    error,
+                    writer: self,
+                }));
+            }
+        };
         Ok(FinishedRoventRCorpus {
             manifest: self.manifest,
             index: self.index,
@@ -379,6 +384,26 @@ impl RoventRCorpusWriter {
             allocations: self.allocations,
         })
     }
+    fn prepare_finish(
+        &mut self,
+        sink: &mut Sink<'_>,
+    ) -> Result<Vec<RoventRPublicationAdmission>, ArenaError> {
+        check(
+            !self.poisoned && !self.retirements.is_empty(),
+            "R finish requires complete actual retirements",
+        )?;
+        self.poisoned = true;
+        self.flush(sink)?;
+        self.index.validate()?;
+        self.admissions
+            .iter()
+            .map(|(sha, pins)| pins.admission(sha.clone()))
+            .collect::<Result<Vec<_>, _>>()
+    }
+}
+pub struct RoventRWriterFinishRejected {
+    pub error: ArenaError,
+    pub writer: RoventRCorpusWriter,
 }
 pub struct FinishedRoventRCorpus {
     manifest: RoventRReadoutManifest,

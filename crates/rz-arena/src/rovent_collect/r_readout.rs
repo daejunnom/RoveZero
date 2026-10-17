@@ -5,7 +5,8 @@ use super::*;
 use rz_contracts::pals_adaptive::CpuJobEnvelope;
 use rz_experiments::rovent_r_readout::*;
 use rz_search::cpu_value::nnuec::v2::capture::{
-    NnuecCaptureEnding, NnuecCaptureRetirement, NnuecCapturedReadout,
+    NnuecCaptureEnding, NnuecCaptureLineage, NnuecCaptureReservation, NnuecCaptureRetirement,
+    NnuecCapturedReadout,
 };
 use rz_uci::rovent_bootstrap::nnuec_source::LoadedRoventNnuecSource;
 use std::sync::Arc;
@@ -44,6 +45,7 @@ impl PublishedRoventRReadout {
 /// Empty/error/overflow terminal observations are retained separately; they
 /// are never manufactured into a zero-input training row.
 pub struct CapturedRoventRRetirement {
+    lineage: NnuecCaptureLineage,
     manifest_sha256: String,
     retirement: RoventRCaptureRetirement,
     retirement_sha256: String,
@@ -52,6 +54,10 @@ pub struct CapturedRoventRRetirement {
     source: Arc<LoadedRoventNnuecSource>,
 }
 impl CapturedRoventRRetirement {
+    /// 원 worker가 활성화한 같은 예약의 작은 lineage만 대조한다.
+    pub fn matches_reservation(&self, reservation: &NnuecCaptureReservation) -> bool {
+        self.lineage.matches_reservation(reservation)
+    }
     pub fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
     }
@@ -164,9 +170,11 @@ impl RoventRReadoutCollector {
         // Record original empty/failed terminal occurrence too. There is no
         // fabricated zero-input row and no target/optimizer count for it.
         self.consumed.insert(occurrence);
+        let lineage = retirement.lineage();
         let retirement = retirement_wire(retirement)?;
         let retirement_sha256 = generation_digest(R_READOUT_RETIREMENT_DOMAIN, &retirement)?;
         Ok(CapturedRoventRRetirement {
+            lineage,
             manifest_sha256: self.manifest.sha256()?,
             retirement,
             retirement_sha256,

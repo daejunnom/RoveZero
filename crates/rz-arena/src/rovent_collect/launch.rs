@@ -36,7 +36,9 @@ use std::{
 };
 
 pub const ROVENT_COLLECTION_LAUNCH_PLAN: &str = "rz-rovent-collection-launch/1";
+mod r_stream;
 mod resources;
+pub use r_stream::{RoventRCollectionAncestor, RoventRCollectionPlan};
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
 
 pub enum RoventCollectionCliParse {
@@ -152,6 +154,8 @@ pub struct RoventCollectionLaunchPlan {
     pub manifest: RoventPublicationFile,
     /// 원 input lock provenance로 봉인한 OS 자원 계획이다.
     pub resource_plan: RoventPublicationFile,
+    /// own NNUEC에만 선택하는 별도 role-less 원 R 자료 경로다.
+    pub r_readout: Option<RoventRCollectionPlan>,
     pub metadata: RoventCollectionMetadata,
     pub teacher_sources: Vec<RoventTeacherSourceSelection>,
     pub teacher_slots: Vec<RoventCollectionTeacherSlot>,
@@ -347,6 +351,12 @@ struct RootCaller {
 struct CollectionCaller {
     plan: RoventCollectionLaunchPlan,
     resource: resources::CollectionResourceCustody,
+    r: Option<r_stream::RStream>,
+    unmatched_r_retirement: Option<
+        rz_uci::pals_adaptive::AdaptiveCpuSemanticRetirement<
+            rz_search::pals::engine::adaptive_port::AdaptivePortQuestion,
+        >,
+    >,
     manifest: RoventCorpusManifestV2,
     owner: RoventCollectionOwnerV2,
     writer: Option<RoventCorpusWriterV2>,
@@ -705,6 +715,8 @@ pub struct RoventCollectionLaunchReceipt {
     pub records: u64,
     pub teacher_failure_count: usize,
     pub historical_dataset: Arc<VerifiedRoventDataset>,
+    pub r_datasets:
+        Vec<Arc<crate::rovent_training_process::recovery::VerifiedRoventRAuxiliaryDataset>>,
     original: Arc<Mutex<CollectionCaller>>,
 }
 impl RoventCollectionLaunchReceipt {
@@ -779,6 +791,9 @@ pub fn run_rovent_collection(
         original_parent.create_dir(leaf).map_err(io)?;
         let directory = original_parent.open_dir_nofollow(leaf).map_err(io)?;
         directory.create_dir("chunks").map_err(io)?;
+        if plan.r_readout.is_some() {
+            directory.create_dir("r-roots").map_err(io)?;
+        }
         let (owner, observer) =
             RoventCollectionOwnerV2::new(manifest.clone(), plan.metadata.clone())?;
         let writer = RoventCorpusWriterV2::new(&manifest)?;
@@ -793,8 +808,21 @@ pub fn run_rovent_collection(
         detail: error.to_string(),
         original: None,
     })?;
+    let r = plan
+        .r_readout
+        .clone()
+        .map(|request| {
+            r_stream::RStream::prepare(input_directory, request, &plan, ancestors.clone())
+        })
+        .transpose()
+        .map_err(|error| RoventCollectionLaunchFailure {
+            detail: error.to_string(),
+            original: None,
+        })?;
     let shared = Arc::new(Mutex::new(CollectionCaller {
         plan: plan.clone(),
+        r,
+        unmatched_r_retirement: None,
         resource: resources::CollectionResourceCustody::prepare(
             input_directory,
             &plan.resource_plan,
@@ -838,7 +866,21 @@ pub fn run_rovent_collection(
                 .map_err(|error| RoventLaunchError {
                     stage: "resource_admission",
                     detail: error.to_string(),
-                })
+                })?;
+            if state.r.is_some()
+                && (lock.manifest.engine.nnuec.is_none()
+                    || !lock.manifest.engine.mode.has_native_r()
+                    || !matches!(
+                        &lock.manifest.engine.researcher,
+                        Some(rz_experiments::RoventResearcher::Own { .. })
+                    ))
+            {
+                return Err(RoventLaunchError {
+                    stage: "r_capture_source",
+                    detail: "R capture requires the original own NNUEC source".into(),
+                });
+            }
+            Ok(())
         },
         move |prepared| {
             let RoventCollectionPreparedLaunch {
@@ -860,6 +902,12 @@ pub fn run_rovent_collection(
             let cooperative = Arc::clone(&original);
             let poll: Arc<dyn Fn() -> Result<(), AdaptiveManagerError> + Send + Sync> =
                 Arc::new(move || hook(&cooperative, |state| state.poll()));
+            let r_source = match &native {
+                RoventCollectionPreparedNative::OwnNnuecPcr { loaded, .. } => {
+                    Some(Arc::new((**loaded).clone()))
+                }
+                _ => None,
+            };
             match native {
                 RoventCollectionPreparedNative::Pc(prepared) => {
                     let hooks = RoventPcCollectionHooks {
@@ -901,11 +949,42 @@ pub fn run_rovent_collection(
                                     .owner
                                     .current_admission()?
                                     .ok_or_else(|| invalid("Collection actual cap missing"))?;
+                                if let Some(stream) = &mut state.r {
+                                    let source = r_source.as_ref().ok_or_else(|| {
+                                        invalid("original NNUEC R source missing")
+                                    })?;
+                                    let observer = stream.admit(
+                                        cap.clone(),
+                                        Arc::clone(source),
+                                        &state.plan,
+                                        &state.directory,
+                                    )?;
+                                    manager
+                                        .set_cpu_semantic_observer(observer)
+                                        .map_err(|error| invalid(format!("{error:?}")))?;
+                                }
                                 state.admit(cap)
                             })
                         })),
-                        root_closure: Some(Arc::new(move |_manager, _completion| {
-                            hook(&closure, |state| state.close_root(std::iter::empty()))
+                        root_closure: Some(Arc::new(move |manager, _completion| {
+                            hook(&closure, |state| {
+                                let retirement = manager
+                                    .take_cpu_semantic_retirement()
+                                    .map_err(|error| invalid(format!("{error:?}")))?;
+                                let teacher = state.close_root(std::iter::empty());
+                                let r = match retirement {
+                                    Some(retirement) => match &mut state.r {
+                                        Some(stream) => stream.close(retirement, &state.plan),
+                                        None => {
+                                            state.unmatched_r_retirement = Some(retirement);
+                                            Err(invalid("unmatched actual R retirement retained"))
+                                        }
+                                    },
+                                    None => Ok(()),
+                                };
+                                teacher?;
+                                r
+                            })
                         })),
                         external_teacher: None,
                         cooperative: Some(poll),
@@ -972,6 +1051,8 @@ pub fn run_rovent_collection(
                 && state.publishing.is_none()
                 && state.retiring.is_none()
                 && state.teacher_failures.is_empty()
+                && state.unmatched_r_retirement.is_none()
+                && state.r.as_ref().is_none_or(|stream| stream.fully_closed())
                 && state.owner.pending_retired_count()? == 0
                 && state.records > 0
                 && state.roots as usize == state.closed.len(),
@@ -1033,6 +1114,12 @@ pub fn run_rovent_collection(
             ancestors,
             &budget,
         )?);
+        let r_datasets = state
+            .r
+            .as_ref()
+            .map(|stream| stream.for_current_pc(Arc::clone(&historical_dataset), &state.plan))
+            .transpose()?
+            .unwrap_or_default();
         // 종료 후 엄격 비교 HOLD도 이미 퇴역한 원 자료의 내구 게시와 전체
         // FD 검증을 건너뛰지 않는다. 같은 scope의 원 오류는 caller에 남는다.
         resource_result?;
@@ -1044,6 +1131,7 @@ pub fn run_rovent_collection(
             records: state.records,
             teacher_failure_count: state.teacher_failures.len(),
             historical_dataset,
+            r_datasets,
             original: Arc::clone(&shared),
         })
     };

@@ -5,7 +5,7 @@
 use super::*;
 use crate::cpu::{CpuConfig, CpuOrderingPolicy, CpuProfile, CpuResumePolicy};
 use crate::cpu_value::nnuec::v2::cpu::V2CpuValue;
-use crate::cpu_value::nnuec::v2::review::{PreparationActor, Request};
+use crate::cpu_value::nnuec::v2::review::{NnuecPreparationTerminalAck, PreparationActor, Request};
 use crate::cpu_worker::{
     CpuJob, CpuSliceReport, CpuWorker, CpuWorkerError, CpuWorkerEvent, cpu_root_restriction_digest,
 };
@@ -30,6 +30,7 @@ struct Fixture {
     stores: PalsStores,
     clock: InstantClock,
     cancel: Arc<AtomicBool>,
+    terminal: NnuecPreparationTerminalAck,
     _actor: PreparationActor,
 }
 
@@ -107,9 +108,12 @@ fn fixture_with_utility_target(capture_utility: bool) -> Fixture {
     actor
         .try_submit(request)
         .unwrap_or_else(|_| panic!("prepare admission"));
-    let bound = loop {
+    let (bound, terminal) = loop {
         if let Some(completion) = actor.try_complete().unwrap() {
-            break Arc::new(completion.result.unwrap());
+            break (
+                Arc::new(completion.result.unwrap()),
+                completion.terminal_ack,
+            );
         }
         assert!(Instant::now() < clock.origin() + WINDOW);
         std::thread::yield_now();
@@ -120,6 +124,7 @@ fn fixture_with_utility_target(capture_utility: bool) -> Fixture {
         stores,
         clock,
         cancel,
+        terminal,
         _actor: actor,
     }
 }
@@ -315,6 +320,45 @@ fn utility_source_matches_only_the_same_original_bound_and_request_r_lineage() {
         "historical matching never revives action authority"
     );
     worker.shutdown().unwrap();
+}
+
+#[test]
+fn utility_c_only_closure_matchers_require_the_exact_request_and_actual_actor_cache_ack() {
+    let original = fixture_with_utility_target(true);
+    let foreign = fixture_with_utility_target(true);
+    let cap = original.bound.utility_input_capture().unwrap();
+    assert!(cap.matches_preparation_terminal(&original.terminal));
+    assert!(!cap.matches_preparation_terminal(&foreign.terminal));
+    assert!(original.terminal.allows_c_only_cleanup());
+    let own_ticket = original._actor.invalidate_context_cache().unwrap();
+    let own_ack = loop {
+        if let Some(ack) = original
+            ._actor
+            .try_context_cache_release(&own_ticket)
+            .unwrap()
+        {
+            break ack;
+        }
+        assert!(Instant::now() < original.clock.origin() + WINDOW);
+        std::thread::yield_now();
+    };
+    let foreign_ticket = foreign._actor.invalidate_context_cache().unwrap();
+    let foreign_ack = loop {
+        if let Some(ack) = foreign
+            ._actor
+            .try_context_cache_release(&foreign_ticket)
+            .unwrap()
+        {
+            break ack;
+        }
+        assert!(Instant::now() < foreign.clock.origin() + WINDOW);
+        std::thread::yield_now();
+    };
+    assert!(cap.matches_context_cache_release(&own_ack));
+    assert!(!cap.matches_context_cache_release(&foreign_ack));
+    assert!(original.terminal.matches_cache_release(&own_ack));
+    assert!(!original.bound.authority_is_live());
+    assert!(cap.reference().base_input.local_line.moves.is_empty());
 }
 
 #[test]

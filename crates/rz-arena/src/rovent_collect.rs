@@ -1055,9 +1055,11 @@ mod observer;
 pub use observer::*;
 mod rules_replay;
 pub use rules_replay::*;
-mod historical_scope;
 mod external_scope;
-pub use external_scope::{RoventHistoricalExternalSource, verify_historical_external_source_input_lock};
+mod historical_scope;
+pub use external_scope::{
+    RoventHistoricalExternalSource, verify_historical_external_source_input_lock,
+};
 pub use historical_scope::{RoventHistoricalRecordEvidence, verify_historical_record_evidence};
 pub(crate) use historical_scope::{RoventNativeOriginEvidence, RoventRootAdmissionEvidence};
 mod publication;
@@ -1086,6 +1088,14 @@ mod divergence_owner;
 pub use divergence_owner::verify_historical_pc_divergence;
 mod r_readout;
 pub use r_readout::*;
+#[cfg(feature = "pals-collection-onnx")]
+mod r_observer;
+#[cfg(feature = "pals-collection-onnx")]
+pub use r_observer::*;
+#[cfg(feature = "pals-collection-onnx")]
+mod r_semantic;
+#[cfg(feature = "pals-collection-onnx")]
+pub use r_semantic::*;
 mod r_publication;
 pub use r_publication::*;
 mod r_writer;

@@ -406,6 +406,7 @@ pub(super) fn source_bundle() -> Result<BTreeMap<&'static str, &'static [u8]>, A
         source!("rovent_generation.py"),
         source!("rovent_training.py"),
         source!("rovent_corpus.py"),
+        source!("rovent_external_root.py"),
         source!("rovent_tensor_training.py"),
         source!("rovent_training_window.py"),
         source!("rovent_training_authority.py"),

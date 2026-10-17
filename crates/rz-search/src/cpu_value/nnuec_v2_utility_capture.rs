@@ -270,6 +270,27 @@ impl NnuecUtilityInputCapture {
     pub fn matches_capture_lineage(&self, lineage: &super::capture::NnuecCaptureLineage) -> bool {
         lineage.matches_original_bound(&self.instance, &self.request)
     }
+    /// Physical cache release by this same actor after the original input's
+    /// preparation epoch. This does not prove an engine/worker was released;
+    /// the action owner must join its actual final installed-owner ACK too.
+    pub fn matches_context_cache_release(
+        &self,
+        release: &super::retirement::NnuecCacheReleaseAck,
+    ) -> bool {
+        release.clears(&self.invalidations, self.epoch)
+    }
+    /// Exact original C terminal, not another Request with equal view hashes.
+    /// C-only closure must additionally consume allows_c_only_cleanup() and
+    /// the same actor's cache release; this matcher alone grants no closure.
+    pub fn matches_preparation_terminal(
+        &self,
+        terminal: &super::review::NnuecPreparationTerminalAck,
+    ) -> bool {
+        terminal.matches_request(&self.request)
+            && terminal.model_identity() == &self.identity
+            && terminal.provenance() == &self.provenance
+            && terminal.preparation_epoch() == self.epoch
+    }
     /// Live source validation only. Historical getters deliberately remain
     /// readable after retirement; neither path grants action/worker rights.
     pub fn validates(
