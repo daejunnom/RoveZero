@@ -9,8 +9,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+#[path = "cli/numerical_scope.rs"]
+mod numerical_scope_cli;
+
 const MAX_JSON_BYTES: u64 = MAX_MANIFEST_BYTES as u64;
-const USAGE: &str = "Usage:\n  rz-experiments validate MANIFEST\n  rz-experiments lock MANIFEST OUTPUT\n  rz-experiments verify LOCKED [--artifact-root ROOT --max-artifact-bytes N]\n  rz-experiments rovent-validate MANIFEST\n  rz-experiments rovent-lock MANIFEST OUTPUT\n  rz-experiments rovent-verify-receipt LOCKED RECEIPT\n\nOnly input validation and locking are implemented. All successful results retain execution_ready=false. Rovent receipt validation checks saved structure and lock binding, not the truth of owner observations.";
+const USAGE: &str = "Usage:\n  rz-experiments validate MANIFEST\n  rz-experiments lock MANIFEST OUTPUT\n  rz-experiments verify LOCKED [--artifact-root ROOT --max-artifact-bytes N]\n  rz-experiments rovent-validate MANIFEST\n  rz-experiments rovent-lock MANIFEST OUTPUT\n  rz-experiments rovent-verify-receipt LOCKED RECEIPT\n  rz-experiments pals-verify-numerical-scope SCOPE --scope-sha256 SHA256 --artifact-root ROOT --max-artifact-bytes N --timeout-ms N\n\nAll successful results retain execution_ready=false. Rovent receipt validation checks saved structure and lock binding, not the truth of owner observations. Numerical-scope verification requires pals-content-admission and only rechecks saved evidence through retained read-only descriptors; it does not execute a model or issue current process/device authority. Its explicit wall-clock guard checks read boundaries and validator entry/return, not hard preemption of an existing hashing/validation call.";
 
 enum Command {
     Help,
@@ -32,6 +35,7 @@ enum Command {
         input_lock: PathBuf,
         receipt: PathBuf,
     },
+    PalsVerifyNumericalScope(numerical_scope_cli::Request),
 }
 
 fn main() -> ExitCode {
@@ -68,6 +72,9 @@ fn parse_command(args: Vec<OsString>) -> Result<Command, String> {
             input_lock: PathBuf::from(&args[1]),
             receipt: PathBuf::from(&args[2]),
         }),
+        Some("pals-verify-numerical-scope") => {
+            numerical_scope_cli::parse(&args).map(Command::PalsVerifyNumericalScope)
+        }
         _ => Err(format!("invalid or missing command arguments\n{USAGE}")),
     }
 }
@@ -173,6 +180,7 @@ fn execute(command: Command) -> Result<String, String> {
                 .map_err(|e| e.to_string())?;
             Ok("Rovent receipt structure and lock binding valid; execution_ready=false; execution_attested=false".into())
         }
+        Command::PalsVerifyNumericalScope(request) => numerical_scope_cli::execute(request),
     }
 }
 

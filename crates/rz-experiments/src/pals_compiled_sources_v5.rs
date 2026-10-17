@@ -570,7 +570,9 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
         &[
             source!("crates/rz-experiments/Cargo.toml"),
             source!("crates/rz-experiments/src/artifact.rs"),
+            source!("crates/rz-experiments/src/cli/numerical_scope.rs"),
             source!("crates/rz-experiments/src/lib.rs"),
+            source!("crates/rz-experiments/src/main.rs"),
             source!("crates/rz-experiments/src/pals_compiled_sources_v5.rs"),
             source!("crates/rz-experiments/src/pals_manifest_v5.rs"),
             source!("crates/rz-experiments/src/pals_manifest_v5/resource_readback.rs"),

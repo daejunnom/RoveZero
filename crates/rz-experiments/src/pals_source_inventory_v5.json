@@ -472,7 +472,9 @@
     "manifest_v5": [
       "crates/rz-experiments/Cargo.toml",
       "crates/rz-experiments/src/artifact.rs",
+      "crates/rz-experiments/src/cli/numerical_scope.rs",
       "crates/rz-experiments/src/lib.rs",
+      "crates/rz-experiments/src/main.rs",
       "crates/rz-experiments/src/pals_compiled_sources_v5.rs",
       "crates/rz-experiments/src/pals_manifest_v5.rs",
       "crates/rz-experiments/src/pals_manifest_v5/resource_readback.rs",
