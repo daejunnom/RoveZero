@@ -375,6 +375,10 @@ struct Broker {
     registration_file: Arc<File>,
     registration_pin: RoventTrainingFilePin,
     archives: Arc<Mutex<Vec<PublishedUtilityCheckpointArchive>>>,
+    // The publisher returns the original boxed partial-I/O owner. Preserve
+    // that allocation when the retention registry grows instead of moving its
+    // descriptor family out of the failure during quarantine.
+    #[allow(clippy::vec_box)]
     archive_failures: Arc<Mutex<Vec<Box<UtilityCheckpointArchiveFailure>>>>,
 }
 #[derive(Clone)]
@@ -1096,6 +1100,9 @@ struct Custody {
     checkpoint: Option<Arc<VerifiedUtilityCheckpointSource>>,
     registration: Option<(RoventTrainingFilePin, Arc<File>)>,
     archives: Arc<Mutex<Vec<PublishedUtilityCheckpointArchive>>>,
+    // Shared with Broker: retain each publisher-returned partial-I/O allocation
+    // intact through failure custody, including registry growth and shutdown.
+    #[allow(clippy::vec_box)]
     archive_failures: Arc<Mutex<Vec<Box<UtilityCheckpointArchiveFailure>>>>,
     admission_files: Vec<linux::HeldFile>,
     old_run_reclamation: Option<VerifiedUtilityOldRunReclamation>,
@@ -1523,6 +1530,9 @@ pub fn run_rovent_utility_from_cli(
                 let observation = failure.observation();
                 // Failure owns its original partially created cgroup; do not
                 // discard it as an alleged clean unexecuted metadata error.
+                // Retain the producer-returned allocation intact rather than
+                // unboxing and moving that partial resource owner on growth.
+                #[allow(clippy::vec_box)]
                 static RESOURCE_FAILURES: LazyLock<
                     Mutex<Vec<Box<crate::rovent_training_process::RoventTrainingResourceFailure>>>,
                 > = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -2110,32 +2120,31 @@ pub fn run_rovent_utility_from_cli(
             // Preserve a bounded actual failure report when this same owner
             // still has time and control credit; inability to preserve it is
             // itself recorded rather than manufacturing a successful receipt.
-            if Instant::now() < request.whole_deadline() {
-                if let Ok(mut slot) = custody.held.try_lock() {
-                    if let Some(held) = slot.as_mut() {
-                        if let Some(process) = custody.process.as_ref() {
-                            if preserve_transport(process, held).is_err() {
-                                observation["transport_preservation"] =
-                                    json!({"status":"unknown","partial_files_retained":true});
-                            }
-                        }
-                        match encode(&observation).and_then(|raw| {
-                            linux::write_new(
-                                &held.control_path.join("utility-parent-failure.json"),
-                                &raw,
-                                held,
-                                true,
-                            )
-                        }) {
-                            Ok(file) => {
-                                observation["parent_failure_receipt"] = json!(file.pin);
-                                held.journals.push(file);
-                            }
-                            Err(_) => {
-                                observation["parent_failure_receipt"] =
-                                    json!({"status":"unknown","partial_files_retained":true})
-                            }
-                        }
+            if Instant::now() < request.whole_deadline()
+                && let Ok(mut slot) = custody.held.try_lock()
+                && let Some(held) = slot.as_mut()
+            {
+                if let Some(process) = custody.process.as_ref()
+                    && preserve_transport(process, held).is_err()
+                {
+                    observation["transport_preservation"] =
+                        json!({"status":"unknown","partial_files_retained":true});
+                }
+                match encode(&observation).and_then(|raw| {
+                    linux::write_new(
+                        &held.control_path.join("utility-parent-failure.json"),
+                        &raw,
+                        held,
+                        true,
+                    )
+                }) {
+                    Ok(file) => {
+                        observation["parent_failure_receipt"] = json!(file.pin);
+                        held.journals.push(file);
+                    }
+                    Err(_) => {
+                        observation["parent_failure_receipt"] =
+                            json!({"status":"unknown","partial_files_retained":true})
                     }
                 }
             }

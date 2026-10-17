@@ -291,10 +291,10 @@ pub fn run_native_with_resources(
     let prepare = || -> Result<NativeResourceCustody, ArenaError> {
         pin.validate()?;
         let root = Dir::open_ambient_dir(
-            std::env::current_dir().map_err(|error| invalid(error))?,
+            std::env::current_dir().map_err(invalid)?,
             cap_std::ambient_authority(),
         )
-        .map_err(|error| invalid(error))?;
+        .map_err(invalid)?;
         prepare_resource_custody(&root, pin)
     };
     let state = prepare().map_err(|error| RoventNativeResourceRunFailure {
@@ -365,10 +365,10 @@ pub(crate) fn prepare_resource_custody(
     options.read(true).follow(FollowSymlinks::No);
     let mut plan_file = parent
         .open_with(leaf, &options)
-        .map_err(|error| invalid(error))?;
+        .map_err(invalid)?;
     if !plan_file
         .metadata()
-        .map_err(|error| invalid(error))?
+        .map_err(invalid)?
         .is_file()
     {
         return Err(invalid("resource plan must be a regular held file"));
@@ -377,12 +377,12 @@ pub(crate) fn prepare_resource_custody(
     (&mut plan_file)
         .take(pin.bytes + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| invalid(error))?;
+        .map_err(invalid)?;
     if bytes.len() as u64 != pin.bytes || format!("{:x}", Sha256::digest(&bytes)) != pin.sha256 {
         return Err(invalid("original resource plan bytes differ"));
     }
     let plan: RoventNativeResourceLaunchPlan =
-        crate::decode_json(std::str::from_utf8(&bytes).map_err(|error| invalid(error))?)?;
+        crate::decode_json(std::str::from_utf8(&bytes).map_err(invalid)?)?;
     plan.validate()?;
     let (delegated, directory) = prepare_native_resource_paths(&plan, root)?;
     Ok(NativeResourceCustody {
@@ -411,10 +411,10 @@ pub(crate) fn prepare_native_resource_paths(
     plan.validate()?;
     let delegated = RoventTrainingResources::open_native_delegation(&plan.delegated_cgroup_path)?;
     let (parent, leaf) = parent_and_leaf(original_private_root, &plan.evidence_directory)?;
-    parent.create_dir(leaf).map_err(|error| invalid(error))?;
+    parent.create_dir(leaf).map_err(invalid)?;
     let directory = parent
         .open_dir_nofollow(leaf)
-        .map_err(|error| invalid(error))?;
+        .map_err(invalid)?;
     Ok((delegated, directory))
 }
 
@@ -432,7 +432,7 @@ fn parent_and_leaf<'a>(
     if !relative(path) {
         return Err(invalid("bounded relative original path required"));
     }
-    let mut parent = root.try_clone().map_err(|error| invalid(error))?;
+    let mut parent = root.try_clone().map_err(invalid)?;
     let mut parts = path.components().peekable();
     while let Some(Component::Normal(part)) = parts.next() {
         if parts.peek().is_none() {
@@ -440,7 +440,7 @@ fn parent_and_leaf<'a>(
         }
         parent = parent
             .open_dir_nofollow(part)
-            .map_err(|error| invalid(error))?;
+            .map_err(invalid)?;
     }
     Err(invalid("original basename missing"))
 }

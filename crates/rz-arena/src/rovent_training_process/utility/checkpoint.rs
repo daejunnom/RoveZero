@@ -1725,15 +1725,15 @@ fn inherited_tails(
     let mut expected = parent.map_or_else(Vec::new, |parent| {
         parent.cost.inherited_unknown_tails.clone()
     });
-    if let Some(parent) = parent {
-        if parent.cost.closure_tail.is_unknown() {
-            expected.push(RoventUtilityInheritedUnknownTail {
-                checkpoint_publication_sha256: parent.publication_pin.sha256.clone(),
-                execution_id: parent.publication.execution_id.clone(),
-                window_id: parent.publication.window_id.clone(),
-                tail: parent.cost.closure_tail.clone(),
-            });
-        }
+    if let Some(parent) = parent
+        && parent.cost.closure_tail.is_unknown()
+    {
+        expected.push(RoventUtilityInheritedUnknownTail {
+            checkpoint_publication_sha256: parent.publication_pin.sha256.clone(),
+            execution_id: parent.publication.execution_id.clone(),
+            window_id: parent.publication.window_id.clone(),
+            tail: parent.cost.closure_tail.clone(),
+        });
     }
     expected.sort_by(|a, b| {
         (

@@ -199,6 +199,10 @@ fn deserialize_r_registration<'de, D: Deserializer<'de>>(
 /// original cohort preparation; neither is reconstructed from the new window.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+// One registration owns at most 256 ancestor declarations. Keep each complete
+// typed declaration inline instead of adding a separate allocation per R
+// ancestor; this is metadata, never a worker message or live execution owner.
+#[allow(clippy::large_enum_variant)]
 pub enum RoventUtilityAncestorDatasetRegistration {
     PcLegacy {
         registration: RoventHistoricalDatasetRegistration,
@@ -219,6 +223,9 @@ impl<'de> Deserialize<'de> for RoventUtilityAncestorDatasetRegistration {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        // Match the public, bounded declaration layout during strict decoding;
+        // the temporary is consumed directly into that same historical type.
+        #[allow(clippy::large_enum_variant)]
         enum Fields {
             PcLegacy {
                 #[serde(deserialize_with = "deserialize_pc_registration")]
