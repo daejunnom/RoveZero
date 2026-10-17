@@ -21,6 +21,14 @@ pub(super) fn setup_with_resolver(
     line_plies: usize,
     resolver: ResolverPolicy,
 ) -> Port {
+    setup_with_model(position, line_plies, resolver, LegalOrderRoleMock)
+}
+pub(super) fn setup_with_model<M: RoleModel>(
+    position: Position,
+    line_plies: usize,
+    resolver: ResolverPolicy,
+    model: M,
+) -> AdaptiveEnginePort<M> {
     let cpu = CpuEngine::new(crate::cpu::CpuConfig {
         tt_entries: 16,
         max_depth: 8,
@@ -33,10 +41,10 @@ pub(super) fn setup_with_resolver(
     };
     let engine = match resolver {
         // Keep the original fixture's legacy followup-lane/default identity.
-        ResolverPolicy::OwnRawRestricted => PalsEngine::new(config, LegalOrderRoleMock, cpu),
+        ResolverPolicy::OwnRawRestricted => PalsEngine::new(config, model, cpu),
         ResolverPolicy::ModelWdlRestricted => PalsEngine::new_with_boxed_checker_and_policies(
             config,
-            LegalOrderRoleMock,
+            model,
             Box::new(OwnedCpuChecker::new(Box::new(cpu)).unwrap()),
             resolver,
             PostRepairRecheckPolicy::Disabled,
@@ -57,7 +65,7 @@ pub(super) fn setup_with_resolver(
     let next = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let issuer: AdaptiveRulesOwnerIssuer =
         Arc::new(move || Ok(OwnerId(next.fetch_add(1, Ordering::Relaxed))));
-    Port::new(
+    AdaptiveEnginePort::new(
         engine,
         position,
         authority,

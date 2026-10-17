@@ -46,7 +46,7 @@ pub use reciprocal_port::{
     AdaptiveAcceptedReciprocalAnswer, AdaptiveCpuReciprocalQuestion, AdaptivePeerQuestion,
     AdaptiveSourceOpinion,
 };
-pub use utility_dependencies::UtilityContinuationSource;
+pub use utility_dependencies::{UtilityCohortOfferSemanticSource, UtilityContinuationSource};
 pub mod utility_route;
 pub mod validator_port;
 pub use branch_queue::{AdaptiveDeferredRepair, AdaptiveQueuedRecheck};

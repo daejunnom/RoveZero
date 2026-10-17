@@ -8,6 +8,85 @@ use rz_contracts::rovent::QuestionEnvelope;
 use std::sync::Weak;
 
 const MAX_UTILITY_CONTINUATIONS: usize = crate::pals::coordinator::MAX_COORDINATOR_FRAMES;
+const COHORT_LINE_DOMAIN: &[u8] = b"rz-rovent-utility-cohort-ordered-line/1";
+
+/// A comparison-only source minted from this port's checked immutable input.
+/// The manager separately attests that this exact source is currently Ready.
+/// Matching content cannot admit a child, refill a budget or revive an offer.
+/// Weak input references add no selected-view pin or model/CPU owner lifetime.
+pub struct UtilityCohortOfferSemanticSource<Q = AdaptivePortQuestion> {
+    semantic: ContractDigest,
+    owner: StoreReadOwner,
+    generation: u64,
+    root: StateId,
+    frame: FrameId,
+    first: rz_contracts::pals::Move16,
+    deadline: Deadline,
+    budget: FrameBudget,
+    stage: RefinementStage,
+    question: ContractDigest,
+    view: ReviewViewSeal,
+    full_view: ContractDigest,
+    public_context: ContractDigest,
+    query: Weak<Q>,
+    selected: Weak<ReviewView>,
+}
+impl<Q> Clone for UtilityCohortOfferSemanticSource<Q> {
+    fn clone(&self) -> Self {
+        Self {
+            semantic: self.semantic,
+            owner: self.owner.clone(),
+            generation: self.generation,
+            root: self.root,
+            frame: self.frame,
+            first: self.first,
+            deadline: self.deadline,
+            budget: self.budget,
+            stage: self.stage,
+            question: self.question,
+            view: self.view,
+            full_view: self.full_view,
+            public_context: self.public_context,
+            query: self.query.clone(),
+            selected: self.selected.clone(),
+        }
+    }
+}
+impl<Q> UtilityCohortOfferSemanticSource<Q> {
+    pub fn digest(&self) -> ContractDigest {
+        self.semantic
+    }
+
+    /// Original identity only; current scheduling/admission is still checked
+    /// by the owner. A cloned equal Q or a rewritten budget is not this offer.
+    pub fn matches_work(&self, work: &CoordinatorWork<ReviewView, Q>) -> bool {
+        self.frame == work.frame
+            && self.first == work.original_first_move
+            && self.deadline == work.original_deadline
+            && self.budget == work.budget
+            && self.stage == work.input.stage
+            && self.question == work.input.question_digest
+            && self.view == work.input.view_seal
+            && self.full_view == ContractDigest(work.input.view.digest())
+            && self.public_context == work.input.public_context
+            && self.query.ptr_eq(&Arc::downgrade(&work.input.question))
+            && self.selected.ptr_eq(&Arc::downgrade(&work.input.view))
+    }
+
+    /// Cleanup identity check, including after deadline/cancel. This neither
+    /// claims pin-zero/physical retirement nor reopens logical authority.
+    pub fn matches_store(&self, stores: &PalsStores) -> bool {
+        self.owner.matches(stores)
+            && self.generation == stores.generation()
+            && self.generation == self.frame.authority.root.0
+            && stores.root().is_some_and(|root| {
+                stores
+                    .situations
+                    .get(root)
+                    .is_ok_and(|situation| situation.state == self.root)
+            })
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum UtilityContinuationCause {
@@ -133,6 +212,249 @@ impl UtilityContinuationRegistry {
 }
 
 impl<M: RoleModel> AdaptiveEnginePort<M> {
+    /// Freeze comparison semantics only after validating this owner's actual
+    /// immutable submission. Ready/idle membership and the complete offer set
+    /// are attested separately by the manager; no raw digest can mint this cap.
+    pub fn utility_cohort_offer_semantics(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<UtilityCohortOfferSemanticSource, PalsError> {
+        self.check_work(work)?;
+        AdaptivePortQuestion::validate_frontier_source(work, &self.engine.semantic.stores)?;
+        if work.input.stage.role() == Some(Role::Validator) {
+            return Err(RoleError::Unsupported("utility cohort has no validator offer").into());
+        }
+        let frontier = self.rovent_frontier().ok_or(RoleError::Unavailable)?;
+        let registration = frontier.registration();
+        let namespace = self.model_namespace()?;
+        frontier.validate_attachment(
+            crate::pals::rovent_frontier::FrontierAttachment {
+                authority: self.authority,
+                mode: registration.mode,
+                original_deadline: self.deadline,
+                root_budget: registration.root_budget,
+                root_rules: &self.rules,
+                root_moves: frontier.root_moves(),
+                root_state: self.root_state_id(),
+                model_namespace: namespace,
+                native_ledger: registration.native_ledger.as_ref(),
+            },
+            &self.engine.semantic.stores,
+        )?;
+        if registration.native_ledger.is_none() {
+            return Err(RoleError::Unsupported(
+                "utility cohort requires the original native ledger",
+            )
+            .into());
+        }
+        let q = &work.input.question;
+        let mut hash = Sha256::new();
+        hash.update(b"rz-rovent-utility-cohort-ready-offer/1\0");
+        hash.update(self.rules.snapshot().identity().semantic.0);
+        hash.update(
+            rz_position::contracts::rules_snapshot_semantic_digest(&q.position.snapshot()).0,
+        );
+        hash.update([work.input.stage as u8, q.context.purpose as u8]);
+        hash.update(work.original_first_move.bits().to_le_bytes());
+        hash.update(work.budget.role_submissions_remaining.to_le_bytes());
+        hash.update(work.budget.original_cpu_credit.to_le_bytes());
+        hash.update(work.budget.original_store_byte_limit.to_le_bytes());
+        // Input digest excludes view issuance. The existing V2 canonical
+        // input conservatively retains its record metadata; no old bytes or
+        // model feature semantics are normalized by this comparison path.
+        self.utility_cohort_write_view(&mut hash, &work.input.view)?;
+        for line in [&q.context.prefix, &q.proposal] {
+            hash.update(role_line_sha256(COHORT_LINE_DOMAIN, line)?);
+        }
+        for line in [&q.counter, &q.repaired, &q.validator_root_moves] {
+            hash.update([u8::from(line.is_some())]);
+            if let Some(line) = line {
+                hash.update(role_line_sha256(COHORT_LINE_DOMAIN, line)?);
+            }
+        }
+        hash.update([
+            u8::from(q.attack_ply.is_some()),
+            u8::from(q.discovery_restricted),
+            u8::from(q.recheck),
+        ]);
+        if let Some(ply) = q.attack_ply {
+            hash.update((ply as u64).to_le_bytes());
+        }
+        for observation in [q.counter_source, q.paired_repaired] {
+            hash.update([u8::from(observation.is_some())]);
+            if let Some(observation) = observation {
+                self.validator_write_observation(&mut hash, observation, 0)?;
+            }
+        }
+        hash.update([u8::from(q.frozen_counter.is_some())]);
+        if let Some(view) = &q.frozen_counter {
+            self.utility_cohort_write_view(&mut hash, view)?;
+        }
+        hash.update([u8::from(q.paired_fresh_seal.is_some())]);
+        if let Some(pair) = &q.paired_fresh_seal {
+            hash.update(pair.public_context.0);
+            hash.update(pair.root_state.semantic.0);
+            hash.update(pair.context_policy.0);
+            hash.update(pair.selected_records.to_le_bytes());
+            hash.update([
+                pair.anchors,
+                pair.role as u8,
+                u8::from(pair.perspective == Color::Black),
+            ]);
+            hash.update(pair.model.0);
+            hash.update(pair.encoding.0);
+            utility_cohort_precision(&mut hash, pair.precision);
+            hash.update(pair.frozen_epoch.to_le_bytes());
+            hash.update(pair.record_revision.to_le_bytes());
+        }
+        hash.update([u8::from(q.legacy_full_records.is_some())]);
+        if let Some(records) = &q.legacy_full_records {
+            hash.update(records.root_state());
+            hash.update((records.records().len() as u64).to_le_bytes());
+            for record in records.records() {
+                hash.update(
+                    rz_position::contracts::rules_snapshot_semantic_digest(
+                        self.engine
+                            .semantic
+                            .stores
+                            .states
+                            .get(record.origin_state)?,
+                    )
+                    .0,
+                );
+                for relation in [record.parent_revision, record.supersedes_revision] {
+                    hash.update([u8::from(relation.is_some())]);
+                    if let Some(revision) = relation {
+                        let local = records
+                            .records()
+                            .iter()
+                            .position(|candidate| candidate.revision == revision)
+                            .ok_or(RoleError::InvalidOutput)?;
+                        hash.update((local as u64).to_le_bytes());
+                    }
+                }
+                self.utility_cohort_write_record(&mut hash, record)?;
+            }
+        }
+        hash.update(namespace.utility_cohort_digest().0);
+        hash.update([registration.mode as u8]);
+        hash.update(registration.selective_policy.0);
+        for goal in [registration.goal.depth_plies, registration.goal.mate_moves] {
+            hash.update([u8::from(goal.is_some())]);
+            if let Some(goal) = goal {
+                hash.update(goal.get().to_le_bytes());
+            }
+        }
+        hash.update([u8::from(registration.nodes.is_some())]);
+        if let Some(nodes) = registration.nodes {
+            hash.update(nodes.to_le_bytes());
+        }
+        hash.update(role_line_sha256(
+            COHORT_LINE_DOMAIN,
+            frontier.root_moves().allowed(),
+        )?);
+        let config = self.engine.semantic_sequence_config();
+        for value in [
+            self.engine.config.line_plies,
+            config.line_plies,
+            config.beam_width,
+            config.max_nodes,
+            config.max_records,
+        ] {
+            hash.update((value as u64).to_le_bytes());
+        }
+        hash.update(config.max_role_calls.to_le_bytes());
+        hash.update(self.engine.config.cpu_nodes_per_task.to_le_bytes());
+        hash.update(self.limits.max_rounds.to_le_bytes());
+        hash.update(self.limits.max_cpu_nodes.to_le_bytes());
+        hash.update(self.limits.cpu_depth.to_le_bytes());
+        for text in [
+            self.engine.resolver.version(),
+            self.engine.post_repair_recheck.search_identity(),
+            self.engine.semantic.model.identity(),
+            self.engine.researcher.cpu_registered_condition.as_str(),
+        ] {
+            hash.update((text.len() as u64).to_le_bytes());
+            hash.update(text.as_bytes());
+        }
+        self.check_live()?;
+        Ok(UtilityCohortOfferSemanticSource {
+            semantic: ContractDigest(hash.finalize().into()),
+            owner: self.engine.semantic.stores.read_owner(),
+            generation: self.engine.semantic.stores.generation(),
+            root: self.root_state_id(),
+            frame: work.frame,
+            first: work.original_first_move,
+            deadline: work.original_deadline,
+            budget: work.budget,
+            stage: work.input.stage,
+            question: work.input.question_digest,
+            view: work.input.view_seal,
+            full_view: ContractDigest(work.input.view.digest()),
+            public_context: work.input.public_context,
+            query: Arc::downgrade(&work.input.question),
+            selected: Arc::downgrade(&work.input.view),
+        })
+    }
+
+    fn utility_cohort_write_view(
+        &self,
+        hash: &mut Sha256,
+        view: &ReviewView,
+    ) -> Result<(), PalsError> {
+        if !view.validates(&self.engine.semantic.stores)
+            || view.records().len() != view.records_metadata().len()
+            || view.records().len() != view.source_snapshots().len()
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        hash.update(view.digest());
+        for ((record, metadata), source) in view
+            .records()
+            .iter()
+            .zip(view.records_metadata())
+            .zip(view.source_snapshots().iter())
+        {
+            self.utility_cohort_write_record(hash, record)?;
+            hash.update(rz_position::contracts::rules_snapshot_semantic_digest(source).0);
+            hash.update(metadata.source_line_offset.to_le_bytes());
+            hash.update([u8::from(metadata.original_first_move.is_some())]);
+            if let Some(first) = metadata.original_first_move {
+                hash.update(Move16::pack(first)?.bits().to_le_bytes());
+            }
+        }
+        Ok(())
+    }
+
+    fn utility_cohort_write_record(
+        &self,
+        hash: &mut Sha256,
+        record: &RoleRecord,
+    ) -> Result<(), PalsError> {
+        hash.update([
+            record.kind as u8,
+            u8::from(record.perspective == Color::Black),
+            u8::from(record.critical),
+            u8::from(record.value.is_some()),
+        ]);
+        if let Some(value) = record.value {
+            hash.update(value.to_le_bytes());
+        }
+        hash.update(record.completed_depth.to_le_bytes());
+        hash.update([match record.score_scope {
+            None => 0,
+            Some(CpuScoreScope::FrontierOnly) => 1,
+            Some(CpuScoreScope::CompletedIteration) => 2,
+            Some(CpuScoreScope::RulesTerminal) => 3,
+        }]);
+        hash.update(role_line_sha256(COHORT_LINE_DOMAIN, &record.line)?);
+        hash.update([u8::from(record.cpu_observation.is_some())]);
+        if let Some(observation) = record.cpu_observation {
+            self.validator_write_observation(hash, observation, 0)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn validated_utility_await(
         &self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
@@ -312,10 +634,211 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     }
 }
 
+fn utility_cohort_precision(hash: &mut Sha256, precision: rz_contracts::PrecisionProfile) {
+    match precision {
+        rz_contracts::PrecisionProfile::Fp32 => hash.update([0]),
+        rz_contracts::PrecisionProfile::Fp16 => hash.update([1]),
+        rz_contracts::PrecisionProfile::Bf16 => hash.update([2]),
+        rz_contracts::PrecisionProfile::Quantized(key) => {
+            hash.update([3]);
+            hash.update(key.0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::port_tests::{output, setup, work};
     use super::*;
+
+    fn cohort_port() -> AdaptiveEnginePort<AdaptivePortModel> {
+        use crate::contract_time::InstantClock;
+        use crate::cpu_worker::CpuCreditLedger;
+        use crate::pals::rovent_engine::RootMoveDomain;
+        use crate::pals::rovent_frontier::{FrontierLimits, FrontierRegistration};
+        use rz_contracts::MonotonicTick;
+        use rz_contracts::rovent::{ExecutionMode, SearchGoal};
+        use std::num::NonZeroU16;
+
+        // Reuse the existing semantic fixture, with the product metadata
+        // mirror and actual namespace admission. This runs no role backend.
+        let value = LegalOrderRoleMock.value_identity().unwrap().clone();
+        let namespace = AdaptiveModelNamespace::new(
+            value.clone(),
+            ContractDigest([5; 32]),
+            ContractDigest([6; 32]),
+            rz_contracts::PrecisionProfile::Fp32,
+            1,
+        )
+        .unwrap();
+        let model = AdaptivePortModel::new_with_namespace(
+            value.model.clone(),
+            Some(value),
+            namespace.clone(),
+        )
+        .unwrap();
+        let mut port = super::super::port_tests::setup_with_model(
+            Position::startpos(),
+            3,
+            ResolverPolicy::ModelWdlRestricted,
+            model,
+        );
+        let allowed = [
+            BoardMove::from_uci("e2e4").unwrap(),
+            BoardMove::from_uci("d2d4").unwrap(),
+        ];
+        let domain = Arc::new(RootMoveDomain::new(&port.rules, Some(&allowed)).unwrap());
+        let ledger = CpuCreditLedger::new(
+            port.authority,
+            2000,
+            InstantClock::new(port.deadline.clock, Instant::now()),
+        )
+        .unwrap();
+        let identity = ledger.identity();
+        let registration = FrontierRegistration {
+            authority: port.authority,
+            mode: ExecutionMode::CpuPcr,
+            original_deadline: port.deadline,
+            root_budget: ContractDigest([88; 32]),
+            goal: SearchGoal {
+                depth_plies: NonZeroU16::new(3),
+                mate_moves: None,
+            },
+            nodes: Some(2000),
+            selective_policy: ContractDigest([89; 32]),
+            root_rules: Arc::clone(&port.rules),
+            root_moves: Arc::clone(&domain),
+            root_state: port.root_state_id(),
+            model_namespace: Arc::new(namespace),
+            native_ledger: Some(identity.clone()),
+        };
+        port.attach_rovent_frontier(
+            registration,
+            FrontierLimits {
+                maximum_goal_plies: NonZeroU16::new(16).unwrap(),
+                maximum_frames: 16,
+                maximum_paths: 64,
+                maximum_mate_nodes: 64,
+                maximum_native_receipts: 16,
+            },
+            AdaptiveFrontierStartup {
+                mode: ExecutionMode::CpuPcr,
+                root_budget: ContractDigest([88; 32]),
+                root_moves: &domain,
+                native_ledger: Some(&identity),
+            },
+            port.deadline.clock,
+            MonotonicTick(0),
+        )
+        .unwrap();
+        port.prepare_rovent_root_rules(port.deadline.clock, MonotonicTick(0))
+            .unwrap();
+        port
+    }
+
+    fn cohort_work(
+        port: &mut AdaptiveEnginePort<AdaptivePortModel>,
+        first: &str,
+        sequence: u64,
+    ) -> CoordinatorWork<ReviewView, AdaptivePortQuestion> {
+        let first = BoardMove::from_uci(first).unwrap();
+        let node = port.replay_node(&[first]).unwrap();
+        let input = port
+            .input(
+                node,
+                RefinementStage::ProposalContinuation,
+                Some(first),
+                vec![first],
+                vec![first],
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        CoordinatorWork {
+            frame: FrameId {
+                authority: port.authority,
+                sequence,
+            },
+            original_first_move: rz_contracts::pals::Move16::encode(
+                rz_contracts::Move::try_from(first).unwrap(),
+            ),
+            original_deadline: port.deadline,
+            budget: FrameBudget {
+                role_submissions_remaining: port.engine.config.max_role_calls,
+                original_cpu_credit: port.limits.max_cpu_nodes,
+                original_store_byte_limit: 8 * 1024 * 1024,
+            },
+            input,
+        }
+    }
+
+    #[test]
+    fn cohort_content_can_match_reissuance_without_transferring_the_actual_offer() {
+        let mut port = cohort_port();
+        let first = cohort_work(&mut port, "e2e4", 1);
+        let lease_count = port.engine.semantic.stores.review_pin_count().unwrap();
+        let strong_query = Arc::strong_count(&first.input.question);
+        let strong_view = Arc::strong_count(&first.input.view);
+        let source = port.utility_cohort_offer_semantics(&first).unwrap();
+        assert!(source.matches_work(&first));
+        assert!(source.matches_store(&port.engine.semantic.stores));
+        assert_eq!(Arc::strong_count(&first.input.question), strong_query);
+        assert_eq!(Arc::strong_count(&first.input.view), strong_view);
+        assert_eq!(
+            port.engine.semantic.stores.review_pin_count().unwrap(),
+            lease_count
+        );
+
+        let second = cohort_work(&mut port, "e2e4", 2);
+        assert_ne!(first.input.question_digest, second.input.question_digest);
+        assert_ne!(first.input.view.sequence(), second.input.view.sequence());
+        let reissued = port.utility_cohort_offer_semantics(&second).unwrap();
+        assert_eq!(source.digest(), reissued.digest());
+        assert!(!source.matches_work(&second));
+        assert!(reissued.matches_work(&second));
+
+        let mut copied = first.clone();
+        copied.input.question = Arc::new(first.input.question.as_ref().clone());
+        assert!(!source.matches_work(&copied));
+        let mut changed_budget = first.clone();
+        changed_budget.budget.role_submissions_remaining -= 1;
+        assert!(!source.matches_work(&changed_budget));
+        let mut changed_deadline = first.clone();
+        changed_deadline.original_deadline.at.0 += 1;
+        assert!(!source.matches_work(&changed_deadline));
+        assert!(
+            port.utility_cohort_offer_semantics(&changed_deadline)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cohort_cap_keeps_store_identity_separate_from_contents_and_query_choice() {
+        let mut first_port = cohort_port();
+        let first_work = cohort_work(&mut first_port, "e2e4", 1);
+        let source = first_port
+            .utility_cohort_offer_semantics(&first_work)
+            .unwrap();
+        let mut second_port = cohort_port();
+        let second_work = cohort_work(&mut second_port, "e2e4", 9);
+        let same_contents = second_port
+            .utility_cohort_offer_semantics(&second_work)
+            .unwrap();
+        assert_eq!(source.digest(), same_contents.digest());
+        assert!(!source.matches_store(&second_port.engine.semantic.stores));
+        assert!(!same_contents.matches_store(&first_port.engine.semantic.stores));
+        assert!(!source.matches_work(&second_work));
+        let other_first = cohort_work(&mut first_port, "d2d4", 2);
+        let different = first_port
+            .utility_cohort_offer_semantics(&other_first)
+            .unwrap();
+        assert_ne!(source.digest(), different.digest());
+        assert!(source.matches_store(&first_port.engine.semantic.stores));
+    }
 
     #[test]
     fn ordinary_utility_cause_requires_consumed_source_and_exact_materialized_target() {
