@@ -22,6 +22,11 @@ path = "src/bin/fixture-engine.rs"
 required-features = ["test-fixtures"]
 
 [[bin]]
+name = "rz-rovent-trainer"
+path = "src/bin/rovent-trainer.rs"
+required-features = ["pals-collection-onnx"]
+
+[[bin]]
 name = "rz-pals-generation-game-worker"
 path = "src/bin/pals-generation-game-worker.rs"
 required-features = ["pals-collection-onnx"]

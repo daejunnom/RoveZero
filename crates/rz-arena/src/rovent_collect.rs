@@ -849,6 +849,13 @@ pub struct RoventCorpusWriter {
     buffer_rows: u64,
     total_bytes: u64,
     record_seals: BTreeSet<String>,
+    // Only metadata snapshots survive publication; old root Rules/model pins
+    // are not kept alive by the corpus writer.
+    admissions: BTreeMap<String, std::sync::Arc<publication::RoventPublicationSourceSnapshot>>,
+    publication_sources:
+        BTreeMap<String, std::sync::Arc<publication::RoventPublicationSourceSnapshot>>,
+    publication_payloads:
+        BTreeMap<String, std::sync::Arc<publication::RoventPublicationSourceSnapshot>>,
 }
 impl RoventCorpusWriter {
     pub fn new(manifest: &RoventCorpusManifest) -> Result<Self, ArenaError> {
@@ -869,6 +876,9 @@ impl RoventCorpusWriter {
             // Conservative reserve for changing index counters/framing.
             total_bytes: manifest_bytes + 4096,
             record_seals: BTreeSet::new(),
+            admissions: BTreeMap::new(),
+            publication_sources: BTreeMap::new(),
+            publication_payloads: BTreeMap::new(),
         })
     }
     pub fn append(&mut self, row: PublishedRoventRecord) -> Result<(), ArenaError> {
@@ -877,6 +887,40 @@ impl RoventCorpusWriter {
             "published row belongs to another corpus writer",
         )?;
         row.record.validate_rules_replay_v2(&self.manifest)?;
+        check(
+            row.record.native.raw_retirement["root_admission_sha256"] == row.admission.raw_sha256()
+                && row.record.native.raw_retirement["root_admission"]
+                    == *row.admission.raw_receipt(),
+            "writer requires the original published root admission",
+        )?;
+        let admission_sha = row.admission.raw_sha256().to_owned();
+        let source_sha = row.admission.native_origin().raw_sha256().to_owned();
+        // Read/serialize original source metadata once per native origin, then
+        // share equal source payloads across process/root occurrences.
+        let (source, new_payload) = match self.publication_sources.get(&source_sha) {
+            Some(source) => (std::sync::Arc::clone(source), None),
+            None => {
+                let snapshot =
+                    publication::RoventPublicationSourceSnapshot::capture(&row.admission)?;
+                let key = snapshot.payload_key();
+                match self.publication_payloads.get(&key) {
+                    Some(original) => {
+                        check(
+                            original.same_source(&snapshot),
+                            "conflicting original publication source",
+                        )?;
+                        (std::sync::Arc::clone(original), None)
+                    }
+                    None => (std::sync::Arc::new(snapshot), Some(key)),
+                }
+            }
+        };
+        if let Some(original) = self.admissions.get(&admission_sha) {
+            check(
+                std::sync::Arc::ptr_eq(original, &source),
+                "root admission changed its original source",
+            )?;
+        }
         let mut bytes = serde_json::to_vec(&row.record).map_err(|e| invalid(e.to_string()))?;
         bytes.push(b'\n');
         let origin = RoventCorpusOrigin::from_record(&row.record);
@@ -884,8 +928,20 @@ impl RoventCorpusWriter {
             .map_err(|e| invalid(e.to_string()))?
             .len() as u64
             + 1;
+        let source_bytes = if new_payload.is_some() {
+            source.payload_bytes()?
+        } else {
+            0
+        };
+        let admission_bytes = if self.admissions.contains_key(&admission_sha) {
+            0
+        } else {
+            512
+        };
         let added = (bytes.len() as u64)
             .checked_add(origin_bytes)
+            .and_then(|n| n.checked_add(source_bytes))
+            .and_then(|n| n.checked_add(admission_bytes))
             .ok_or_else(|| invalid("corpus byte count overflow"))?;
         check(
             self.index.origins.len() < MAX_CORPUS_ROWS
@@ -903,6 +959,14 @@ impl RoventCorpusWriter {
             "corpus output cap/duplicate; flush full chunk explicitly",
         )?;
         self.record_seals.insert(row.record.record_sha256.clone());
+        if let Some(key) = new_payload {
+            self.publication_payloads
+                .insert(key, std::sync::Arc::clone(&source));
+        }
+        self.publication_sources
+            .entry(source_sha)
+            .or_insert_with(|| std::sync::Arc::clone(&source));
+        self.admissions.entry(admission_sha).or_insert(source);
         self.index.origins.push(origin);
         self.index.record_count += 1;
         self.buffer_rows += 1;
@@ -942,6 +1006,11 @@ impl RoventCorpusWriter {
         self.index.validate()?;
         Ok(self.index)
     }
+    /// Consumes only this writer's original opaque published records. The
+    /// returned owner can commit durable data, never restore native authority.
+    pub fn finish_publication(self) -> Result<FinishedRoventCorpus, ArenaError> {
+        FinishedRoventCorpus::from_writer(self)
+    }
 }
 
 #[cfg(feature = "pals-collection-onnx")]
@@ -958,6 +1027,14 @@ mod observer;
 pub use observer::*;
 mod rules_replay;
 pub use rules_replay::*;
+mod historical_scope;
+pub use historical_scope::{RoventHistoricalRecordEvidence, verify_historical_record_evidence};
+mod publication;
+pub use publication::{
+    FinishedRoventCorpus, ROVENT_CORPUS_PUBLICATION, ROVENT_PUBLICATION_FILE,
+    ROVENT_PUBLICATION_INDEX, ROVENT_PUBLICATION_MANIFEST, RoventCorpusPublication,
+    RoventPublicationAdmission, RoventPublicationFile,
+};
 
 #[cfg(test)]
 mod tests {

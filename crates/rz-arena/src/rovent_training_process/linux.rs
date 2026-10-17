@@ -29,19 +29,19 @@ use std::{
 const MAX_JSON: u64 = 16 << 20;
 const MAX_CHECKPOINT: u64 = 2 << 30;
 const MAX_SOURCE: u64 = 4 << 20;
-const PACKAGE: &str = "experiments/model-research/pals/src";
-const BOOTSTRAP: &str = "import sys,runpy; package=sys.argv.pop(1); module=sys.argv.pop(1); sys.path.insert(0,package); sys.argv[0]=module; runpy.run_module(module,run_name='__main__',alter_sys=True)";
+pub(super) const PACKAGE: &str = "experiments/model-research/pals/src";
+pub(super) const BOOTSTRAP: &str = "import sys,runpy; package=sys.argv.pop(1); module=sys.argv.pop(1); sys.path.insert(0,package); sys.argv[0]=module; runpy.run_module(module,run_name='__main__',alter_sys=True)";
 static NEXT_CONTROL: AtomicU64 = AtomicU64::new(1);
 static DEVICE_ADMISSIONS: std::sync::LazyLock<Mutex<BTreeSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(BTreeSet::new()));
 /// A process-local logical device admission, not a host-wide GPU lock. Unknown
 /// closure deliberately keeps its slot reserved even if its receipt is dropped.
-struct ProcessDeviceAdmission {
+pub(super) struct ProcessDeviceAdmission {
     device: String,
     released: bool,
 }
 impl ProcessDeviceAdmission {
-    fn acquire(device: &str) -> Result<Option<Self>, ArenaError> {
+    pub(super) fn acquire(device: &str) -> Result<Option<Self>, ArenaError> {
         if device == "cpu" {
             return Ok(None);
         }
@@ -57,7 +57,7 @@ impl ProcessDeviceAdmission {
             released: false,
         }))
     }
-    fn release_confirmed(&mut self) -> Result<(), ArenaError> {
+    pub(super) fn release_confirmed(&mut self) -> Result<(), ArenaError> {
         check(!self.released, "device admission already released")?;
         let mut admitted = DEVICE_ADMISSIONS
             .try_lock()
@@ -72,26 +72,26 @@ impl ProcessDeviceAdmission {
 }
 
 pub(super) struct HeldFile {
-    file: File,
-    pin: RoventTrainingFilePin,
-    identity: FileIdentity,
+    pub(super) file: File,
+    pub(super) pin: RoventTrainingFilePin,
+    pub(super) identity: FileIdentity,
 }
 pub(super) struct LinuxHeld {
-    output: File,
-    control: File,
-    output_path: PathBuf,
-    control_path: PathBuf,
-    source: PathBuf,
-    inputs: Vec<HeldFile>,
-    sources: Vec<HeldFile>,
-    checkpoints: Vec<HeldFile>,
-    journals: Vec<HeldFile>,
-    artifacts: Vec<HeldFile>,
-    partial_outputs: Vec<File>,
-    dependency_directories: Vec<(File, PathBuf, u64, u64)>,
-    control_written: u64,
-    control_limit: u64,
-    device_admission: Option<ProcessDeviceAdmission>,
+    pub(super) output: File,
+    pub(super) control: File,
+    pub(super) output_path: PathBuf,
+    pub(super) control_path: PathBuf,
+    pub(super) source: PathBuf,
+    pub(super) inputs: Vec<HeldFile>,
+    pub(super) sources: Vec<HeldFile>,
+    pub(super) checkpoints: Vec<HeldFile>,
+    pub(super) journals: Vec<HeldFile>,
+    pub(super) artifacts: Vec<HeldFile>,
+    pub(super) partial_outputs: Vec<File>,
+    pub(super) dependency_directories: Vec<(File, PathBuf, u64, u64)>,
+    pub(super) control_written: u64,
+    pub(super) control_limit: u64,
+    pub(super) device_admission: Option<ProcessDeviceAdmission>,
 }
 impl LinuxHeld {
     pub(super) fn checkpoint_files(&self) -> impl Iterator<Item = (&RoventTrainingFilePin, &File)> {
@@ -199,7 +199,7 @@ fn parse<T: serde::de::DeserializeOwned>(raw: &[u8]) -> Result<T, ArenaError> {
     // Persisted registrations use the same duplicate-key rejecting parser.
     rz_experiments::decode_json(text).map_err(|e| invalid(e.to_string()))
 }
-fn path_ok(path: &Path) -> bool {
+pub(super) fn path_ok(path: &Path) -> bool {
     path.is_absolute()
         && path.components().all(|p| match p {
             Component::RootDir => true,
@@ -215,7 +215,7 @@ fn path_ok(path: &Path) -> bool {
             _ => false,
         })
 }
-fn empty_owned_directory(path: &Path) -> Result<File, ArenaError> {
+pub(super) fn empty_owned_directory(path: &Path) -> Result<File, ArenaError> {
     check(
         path_ok(path),
         "owned directory must be a nonsecret normalized absolute path",
@@ -235,7 +235,7 @@ fn empty_owned_directory(path: &Path) -> Result<File, ArenaError> {
     )?;
     Ok(file)
 }
-fn ensure_child_directory(root: &Path, path: &Path) -> Result<(), ArenaError> {
+pub(super) fn ensure_child_directory(root: &Path, path: &Path) -> Result<(), ArenaError> {
     check(
         path_ok(path) && path != root && path.starts_with(root),
         "output child escapes owned root",
@@ -261,7 +261,7 @@ fn ensure_child_directory(root: &Path, path: &Path) -> Result<(), ArenaError> {
     }
     Ok(())
 }
-fn write_new(
+pub(super) fn write_new(
     path: &Path,
     raw: &[u8],
     owner: &mut LinuxHeld,
@@ -393,7 +393,7 @@ macro_rules! source {
         )
     };
 }
-fn source_bundle() -> Result<BTreeMap<&'static str, &'static [u8]>, ArenaError> {
+pub(super) fn source_bundle() -> Result<BTreeMap<&'static str, &'static [u8]>, ArenaError> {
     let mut files = BTreeMap::new();
     for (_, component) in rz_experiments::SOURCE_COMPONENT_FILES_V5 {
         for (path, bytes) in *component {
@@ -460,7 +460,7 @@ fn install_sources(
     }
     Ok(json!(inventory))
 }
-fn proc_start(pid: u32) -> Result<u64, ArenaError> {
+pub(super) fn proc_start(pid: u32) -> Result<u64, ArenaError> {
     let text = fs::read_to_string(format!("/proc/{pid}/stat"))
         .map_err(|_| invalid("original process stat"))?;
     let tail = text
@@ -472,7 +472,7 @@ fn proc_start(pid: u32) -> Result<u64, ArenaError> {
         .and_then(|v| v.parse().ok())
         .ok_or_else(|| invalid("process start tick"))
 }
-fn original_ticks(
+pub(super) fn original_ticks(
     started: Instant,
     execution: Instant,
     whole: Instant,
@@ -995,7 +995,7 @@ fn seal_set(kind: &str, values: &BTreeSet<String>) -> Result<Value, ArenaError> 
     }
     Ok(json!({"sha256":format!("{:x}",hash.finalize()),"count":values.len()}))
 }
-fn lineage_teachers(recipe: &Value, stage: &Value) -> Result<Vec<String>, ArenaError> {
+pub(super) fn lineage_teachers(recipe: &Value, stage: &Value) -> Result<Vec<String>, ArenaError> {
     let stages = recipe["stages"]
         .as_array()
         .filter(|s| s.len() <= 64)

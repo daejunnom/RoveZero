@@ -25,6 +25,8 @@ use std::{
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+pub mod recovery;
+#[cfg(target_os = "linux")]
 mod resources;
 #[cfg(target_os = "linux")]
 pub use linux::compiled_rovent_trainer_source_sha256;
@@ -149,9 +151,28 @@ impl OriginalRoventCorpusCustody {
         })
     }
     pub fn retain_published(&mut self, original: &PublishedRoventRecord) -> Result<(), ArenaError> {
+        self.retain_published_explicit(original, false)
+    }
+    /// New exact Rules-replay format is selected explicitly. The original
+    /// /1 intake above is preserved and never automatically retags old rows.
+    pub fn retain_published_rules_replay_v2(
+        &mut self,
+        original: &PublishedRoventRecord,
+    ) -> Result<(), ArenaError> {
+        self.retain_published_explicit(original, true)
+    }
+    fn retain_published_explicit(
+        &mut self,
+        original: &PublishedRoventRecord,
+        rules_replay_v2: bool,
+    ) -> Result<(), ArenaError> {
         let row = original.record();
-        row.validate(&self.manifest)
-            .map_err(|e| invalid(e.to_string()))?;
+        (if rules_replay_v2 {
+            row.validate_rules_replay_v2(&self.manifest)
+        } else {
+            row.validate(&self.manifest)
+        })
+        .map_err(|e| invalid(e.to_string()))?;
         check(
             original.manifest_sha256() == self.manifest_sha256
                 && self.rows.len() < MAX_TRAINER_ROWS
@@ -530,6 +551,9 @@ impl TrainerLedger {
         Ok(json!({}))
     }
     fn consume(&mut self, p: &Value) -> Result<Value, ArenaError> {
+        self.consume_with_schema(p, "rz-rovent-trainer-consume/1")
+    }
+    fn consume_with_schema(&mut self, p: &Value, schema: &str) -> Result<Value, ArenaError> {
         fields(
             p,
             &[
@@ -544,10 +568,7 @@ impl TrainerLedger {
             ],
         )?;
         check(
-            self.begun
-                && !self.ended
-                && p["schema"] == "rz-rovent-trainer-consume/1"
-                && self.pending.len() < 8,
+            self.begun && !self.ended && p["schema"] == schema && self.pending.len() < 8,
             "closed or overfull original sample admission",
         )?;
         let origin = sha(&p["origin_sha256"])?;
@@ -596,6 +617,18 @@ impl TrainerLedger {
         Ok(json!({}))
     }
     fn update(&mut self, p: &Value) -> Result<Value, ArenaError> {
+        self.update_with_schema(
+            p,
+            "rz-rovent-trainer-update/1",
+            "rz-rovent-original-learner-update/1",
+        )
+    }
+    fn update_with_schema(
+        &mut self,
+        p: &Value,
+        schema: &str,
+        event_schema: &str,
+    ) -> Result<Value, ArenaError> {
         fields(
             p,
             &[
@@ -632,9 +665,9 @@ impl TrainerLedger {
             self.begun
                 && !self.ended
                 && self.pending.len() == 8
-                && p["schema"] == "rz-rovent-trainer-update/1"
+                && p["schema"] == schema
                 && p["pending_microbatches"] == 0
-                && event["schema"] == "rz-rovent-original-learner-update/1"
+                && event["schema"] == event_schema
                 && event["window_id"] == self.window["window_id"]
                 && event["stage_id"] == self.window["stage_id"]
                 && event["phase"] == self.window["phase"]

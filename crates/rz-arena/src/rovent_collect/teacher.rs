@@ -95,6 +95,7 @@ pub struct RoventTeacherBinding {
     constraint: rz_search::external_cpu::ExternalGoConstraint,
     root_restriction: Digest,
     process: ExternalProcessIdentity,
+    root_admission: std::sync::Arc<rz_uci::rovent_root_admission::RoventRootAdmission>,
     raw: Value,
 }
 impl RoventCorpusProducer {
@@ -120,6 +121,9 @@ impl RoventCorpusProducer {
             .verified_startup()
             .map_err(|e| invalid(e.to_string()))?
             .ok_or_else(|| invalid("teacher actual startup missing"))?;
+        let root_admission = owner
+            .actual_root_admission()
+            .ok_or_else(|| invalid("teacher requires the original actual-go root admission"))?;
         let anchor = exact_rules_anchor(&job.position)?;
         let root_restriction = rz_search::external_cpu::worker::external_root_restriction_digest(
             job.root_moves.as_deref(),
@@ -131,6 +135,12 @@ impl RoventCorpusProducer {
                 && self.manifest.teachers.get(&registered.actor_id) == Some(&registered.pin)
                 && anchor == input.anchor
                 && job.question.id.authority == input.ticket.authority
+                && root_admission.authority() == input.ticket.authority
+                && hex(root_admission.startup_lock_digest()) == startup.input_lock_sha256()
+                && root_admission.hard_deadline() == input.ticket.original_deadline
+                && job.question.root_budget == root_admission.root_budget_digest()
+                && job.question.original_deadline.clock == root_admission.hard_deadline().clock
+                && job.question.original_deadline.at <= root_admission.hard_deadline().at
                 && job.question.anchor.semantic
                     == rz_position::contracts::rules_snapshot_semantic_digest(
                         &job.position.snapshot(),
@@ -146,7 +156,8 @@ impl RoventCorpusProducer {
             "execution_epoch":job.execution.epoch.0,"execution_sequence":job.execution.sequence,
             "owner":job.owner.0,"process":process_json(process),"requested":job.constraint,"question":question_json(job.question),
             "position_anchor":anchor,"root_moves":job.root_moves.as_ref().map(|m|packed(m)).transpose()?,"mode":format!("{:?}",job.mode),
-            "soft_quantum_ns":job.soft_quantum.as_nanos().min(u128::from(u64::MAX)) as u64,"context_token_budget":job.context_token_budget});
+            "soft_quantum_ns":job.soft_quantum.as_nanos().min(u128::from(u64::MAX)) as u64,"context_token_budget":job.context_token_budget,
+            "root_descriptor":root_admission.descriptor(),"root_descriptor_sha256":hex(root_admission.digest())});
         Ok(RoventTeacherBinding {
             input_sha256: input.input_sha256.clone(),
             anchor,
@@ -157,6 +168,7 @@ impl RoventCorpusProducer {
             constraint: job.constraint,
             root_restriction,
             process,
+            root_admission: std::sync::Arc::clone(root_admission),
             raw,
         })
     }
@@ -169,12 +181,13 @@ impl RoventCorpusProducer {
         completion: &ProfiledExternalCompletion,
     ) -> Result<(), ArenaError> {
         owner
-            .validate_completion(completion, dispatch)
+            .validate_actual_completion(completion, dispatch)
             .map_err(|e| invalid(e.to_string()))?;
         check(
             row.record.targets.policy.is_none()
                 && binding.input_sha256 == row.record.input_sha256
                 && binding.anchor == row.record.input.rules_anchor
+                && std::sync::Arc::ptr_eq(&binding.root_admission, row.admission.root_admission())
                 && dispatch.scope() == binding.scope
                 && dispatch.question() == binding.question
                 && dispatch.constraint() == binding.constraint
