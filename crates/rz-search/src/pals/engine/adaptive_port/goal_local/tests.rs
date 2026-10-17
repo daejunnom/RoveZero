@@ -562,11 +562,12 @@ fn actual_goal_local_chunks_reach_original_depth_without_new_frames_or_r_work() 
     assert_eq!(snapshot.work.native_nodes, 0);
     assert_eq!(port.counters.cpu_tasks_requested, 0);
     assert_eq!(port.counters.external_checker_tasks, 0);
-    assert!(port
-        .rovent_frontier()
-        .unwrap()
-        .validate_unmet_horizon_question(&old_source)
-        .is_err());
+    assert!(
+        port.rovent_frontier()
+            .unwrap()
+            .validate_unmet_horizon_question(&old_source)
+            .is_err()
+    );
     assert!(matches!(
         port.next_rovent_goal_input(port.deadline.clock, MonotonicTick(0))
             .unwrap(),
@@ -763,8 +764,8 @@ fn original_registry_head_advances_once_and_rejects_changed_output_or_physical_s
     }
     assert!(proof.validates_output(&output));
     assert!(!proof.validates_output(&altered));
-    assert!(port
-        .consume_rovent_goal_input(
+    assert!(
+        port.consume_rovent_goal_input(
             &original,
             &proof,
             &altered,
@@ -772,13 +773,14 @@ fn original_registry_head_advances_once_and_rejects_changed_output_or_physical_s
             port.deadline.clock,
             MonotonicTick(0)
         )
-        .is_err());
+        .is_err()
+    );
     let changed = AdaptivePortRoleEvidence {
         completed_nn_inputs: Some(2),
         ..evidence
     };
-    assert!(port
-        .consume_rovent_goal_input(
+    assert!(
+        port.consume_rovent_goal_input(
             &original,
             &proof,
             &output,
@@ -786,7 +788,8 @@ fn original_registry_head_advances_once_and_rejects_changed_output_or_physical_s
             port.deadline.clock,
             MonotonicTick(0)
         )
-        .is_err());
+        .is_err()
+    );
     assert!(port.engine.semantic.records.is_empty());
     assert_eq!(port.counters.cpu_tasks_requested, 0);
     assert_eq!(port.counters.cpu_nodes, 0);
@@ -827,9 +830,10 @@ fn one_original_goal_reaches_actual_fresh_leaf_without_promoting_it_to_mate_proo
                 assert!(fresh);
                 assert_eq!(leaf.kind(), GoalLocalLeafKind::FreshBoundary);
                 assert_eq!(Some(leaf.source_key()), source);
-                assert!(leaf
-                    .snapshot()
-                    .same_state(&original.input().question.position.snapshot()));
+                assert!(
+                    leaf.snapshot()
+                        .same_state(&original.input().question.position.snapshot())
+                );
                 assert!(!port.rovent_goal_has_pending());
                 leaf_seen = true;
                 break;
@@ -843,12 +847,13 @@ fn one_original_goal_reaches_actual_fresh_leaf_without_promoting_it_to_mate_proo
     assert_eq!(port.counters.accepted_value_outputs, 1);
     assert_eq!(port.counters.cpu_tasks_requested, 0);
     assert!(port.engine.semantic.records.is_empty());
-    assert!(port
-        .rovent_frontier()
-        .unwrap()
-        .snapshot()
-        .mate_strategy
-        .is_none());
+    assert!(
+        port.rovent_frontier()
+            .unwrap()
+            .snapshot()
+            .mate_strategy
+            .is_none()
+    );
 }
 
 #[test]
