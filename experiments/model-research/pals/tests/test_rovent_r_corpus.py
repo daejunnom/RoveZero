@@ -148,7 +148,7 @@ def fixture():
         "context_query": {"purpose": "ProposePolicy", "prefix": [], "proposal": [], "counterexample": None, "legal": [], "divergences": []},
         "selection_policy": {"mode": "current_root_only", "token_budget": 512, "max_records": 64, "max_anchors": 1, "required_bundle": None},
         "actual_tokens": 0, "token_budget": 512, "length_bucket": 8,
-        "context_records": [], "context_anchors": [evidence], "context_anchor_states": [1],
+        "context_records": [], "context_anchors": [evidence], "context_source_anchors": [], "context_anchor_states": [1],
         "local_anchor": evidence, "local_encoded_perspective": "white", "current_rules": evidence}
     bound["view_seal_sha256"] = hashlib.sha256(b"rz-pals-review-view-seal/1\0" + bytes.fromhex(bound["full_view_sha256"])
         + (1).to_bytes(8, "little") * 3).hexdigest()
@@ -257,6 +257,7 @@ def add_context(row):
         "record_perspective": "black", "encoded_perspective": "white", "completed_depth": 2,
         "score_scope": "CompletedIteration", "value": 7, "cpu_observation": None, "critical": True} for index in range(2)]
     bound["actual_tokens"] = 2
+    bound["context_source_anchors"] = [copy.deepcopy(bound["context_anchors"][0]) for _ in range(2)]
     value = json.loads(row["input"]["reference_input_json"])
     value["context_lines"] = [{"id": record["local_id"], "kind": record["kind"], "original_first_move": corpus._move(move),
         "anchor_features": [768, 774, 783], "perspective": "white", "moves": [corpus._move(move)]} for record in bound["context_records"]]
@@ -580,6 +581,15 @@ class RCorpusTests(unittest.TestCase):
             self.assertNotEqual(pool["pool_sha256"], all_rows["pool_sha256"])
             self.assertEqual(pool["pool_sha256"], data.digest(corpus.POOL_DOMAIN,
                 {"index_sha256": owner.index_semantic_sha256, "occurrences": pool["occurrences"]}))
+
+    def test_source_anchors_cannot_be_omitted_or_replaced_by_selected_anchor_count(self):
+        source = fixture()
+        add_context(source[2])
+        source[2]["bound"]["context_source_anchors"].pop()
+        seal(source[2])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "source anchors must match selected record order/count"):
+                open_owner(Path(directory), source=source)
 
 
 if __name__ == "__main__":

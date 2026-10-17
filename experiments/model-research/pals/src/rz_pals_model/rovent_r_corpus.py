@@ -262,7 +262,7 @@ def _bound(value):
     fields(value, ("model_semantics", "parameter_sha256", "training_state", "weights_file_sha256", "collection_model_epoch", "collection_context_epoch",
         "root_state", "generation", "sequence", "full_view_sha256", "view_seal_sha256", "record_scope_sha256",
         "policy_sha256", "context_sha256", "context_query", "selection_policy", "actual_tokens", "token_budget", "length_bucket", "context_records",
-        "context_anchors", "context_anchor_states", "local_anchor", "local_encoded_perspective", "current_rules"), "R Bound")
+        "context_anchors", "context_source_anchors", "context_anchor_states", "local_anchor", "local_encoded_perspective", "current_rules"), "R Bound")
     from .nnuec_reference import _training
     _training(value["training_state"])
     identifier(value["model_semantics"])
@@ -278,6 +278,9 @@ def _bound(value):
     records, anchors = value["context_records"], value["context_anchors"]
     if type(records) is not list or len(records) > 64 or type(anchors) is not list or not 1 <= len(anchors) <= 4:
         raise ValueError("bounded exact R selected records/anchors required")
+    source_anchors = value["context_source_anchors"]
+    if type(source_anchors) is not list or len(source_anchors) != len(records):
+        raise ValueError("R original source anchors must match selected record order/count")
     states = value["context_anchor_states"]
     if type(states) is not list or len(states) != len(anchors):
         raise ValueError("R original selected anchor state/order differs")
@@ -294,7 +297,7 @@ def _bound(value):
         raise ValueError("R original selection policy budget/capacity differs")
     if policy["required_bundle"] is not None:
         uint(policy["required_bundle"])
-    for anchor in (*anchors, value["local_anchor"], value["current_rules"]):
+    for anchor in (*anchors, *source_anchors, value["local_anchor"], value["current_rules"]):
         _rules(anchor)
     for index, record in enumerate(records):
         fields(record, ("local_id", "record_id", "record_revision", "parent_revision", "supersedes_revision", "origin_state",
