@@ -735,7 +735,6 @@ fn seal_owner<M: RoleModel>(
         }
     }
     if let ArchiveOwner::Port(port) = owner {
-        merge_pins(&mut active_cpu_pins, &port.goal_local_protected_pins()?);
         if port.authority != authority || work.deadline > port.limits.deadline {
             return Err(StoreError::StaleConsumer.into());
         }
@@ -799,6 +798,7 @@ fn seal_owner<M: RoleModel>(
     }
     let mut active_cpu_pins = StorePins::default();
     if let ArchiveOwner::Port(port) = owner {
+        merge_pins(&mut active_cpu_pins, &port.goal_local_protected_pins()?);
         for admission in port.cpu_admissions.values() {
             active_cpu_pins.executions.extend(admission.execution);
             if let Some(execution) = admission.execution {

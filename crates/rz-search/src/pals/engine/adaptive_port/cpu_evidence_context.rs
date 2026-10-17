@@ -63,8 +63,9 @@ mod tests {
                     authority: port.authority,
                     sequence: 1,
                 },
-                state_identity: port.engine.semantic.nodes[node]
-                    .position
+                state_identity: port
+                    .issue_rules_position(port.engine.semantic.nodes[node].position.clone())
+                    .unwrap()
                     .export()
                     .unwrap()
                     .snapshot()

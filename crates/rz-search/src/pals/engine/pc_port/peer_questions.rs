@@ -90,6 +90,7 @@ impl PcPeerQuestion {
             || envelope.anchor != self.anchor.snapshot().identity()
             || !self
                 .anchor
+                .rules()
                 .snapshot()
                 .same_state(&query.position.snapshot())
             || envelope.anchor_root_ply.0 as usize != query.context.prefix.len()
