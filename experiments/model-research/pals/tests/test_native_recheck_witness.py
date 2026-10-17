@@ -4,9 +4,10 @@ The whole positive fixture reads the independently pinned reviewed Rust sources,
 then uses the public strict-loader, Repair, Rules, anchor and whole factories.
 Its build/process/Rules/CPU records are synthetic caller observations, never
 evidence that a compiler, child, model, loss, optimizer or chess replay executed.
-Production gates and historical literal profiles are never patched here. The
-new closure-consumer tests patch only the separate private registry with static
-synthetic source text inside each test; they never enroll current file hashes.
+Production gates and historical literal profiles are never patched here. New
+banks use the separate private registry only in a scoped test context, with
+fourteen literal reviewed pins and a synthetic compiled fact. They never enroll
+current file hashes or claim an actual compiler artifact.
 """
 import copy
 import json
@@ -25,6 +26,10 @@ from rz_pals_model.semantic_verifier import byte_pin, canonical
 from test_repair_context import RepairFixture
 from test_semantic_verifier import SemanticFixture, tokens
 import test_training as fixtures
+from native_source_review_fixture import (
+    REVIEWED_SOURCE_COMMIT, REVIEWED_TRANSITION_PINS, SYNTHETIC_COMPILED_FACT,
+    fixture_manifest, fixture_review_scope, read_reviewed_fixture_sources,
+)
 
 
 def jsonl(values):
@@ -1041,6 +1046,7 @@ class SyntheticWholeRecheckFixture:
         cpu_sha = byte_pin(canonical(cpu_config))["sha256"]
         self.source["cpu_profile_sha256"] = cpu_sha
         native_source = self.source["native"]
+        native_source["search_implementation_sha256"] = SYNTHETIC_COMPILED_FACT
         native_source["cpu_task_source"] = {"configuration": cpu_config,
             "implementation_sha256": self.source["implementation_sha256"], "cpu_profile_sha256": cpu_sha}
         registry = native_source["independent_registry"]
@@ -1063,23 +1069,18 @@ class SyntheticWholeRecheckFixture:
         self.roster = frozen.seal_roster({"version": frozen.ROSTER_DOMAIN, "game_producers": [producer]})
         self.producer = producer
         repo = Path(__file__).resolve().parents[4]
-        self.source_raws = {}
-        for path, name in zip(REVIEWED_CURRENT_WHOLE_SOURCE_PINS, ("engine_source", "native_source")):
-            expected = REVIEWED_CURRENT_WHOLE_SOURCE_PINS[path]
-            with (repo / path).open("rb") as stream:
-                actual = stream.read(expected["bytes"] + 1)
-            if byte_pin(actual) != expected:
-                raise AssertionError("reviewed Rust fixture source pin changed: " + path)
-            self.source_raws[name] = actual
-        manifest = {"source_commit": "a" * 40,
-                    "files": [{"path": path, **copy.deepcopy(pin)} for path, pin in REVIEWED_CURRENT_WHOLE_SOURCE_PINS.items()]}
+        reviewed_sources = read_reviewed_fixture_sources(repo)
+        self.source_raws = {name: reviewed_sources[path] for path, name in
+            zip(REVIEWED_TRANSITION_PINS, ("engine_source", "native_source"))}
+        manifest = fixture_manifest()
         self.source_raws["source_manifest"] = canonical(manifest)
-        build = {"schema": witness.BUILD_SCHEMA, "source_commit": "a" * 40,
+        build = {"schema": witness.BUILD_SCHEMA, "source_commit": REVIEWED_SOURCE_COMMIT,
                  "actual_build_exit_code": 0, "source_verified_before_and_after_build": True,
                  "binary": {"bytes": 17, "sha256": self.source["implementation_sha256"]},
                  "source_manifest": byte_pin(self.source_raws["source_manifest"]),
                  "compiler_artifact": {"reason": "compiler-artifact", "target": {"name": "pals_collect"},
-                                       "features": ["pals-collection-onnx"], "fresh": False}}
+                                       "features": ["pals-collection-onnx"], "fresh": False},
+                 "assurance": "synthetic caller compiler/binary observations; no actual build or process execution"}
         self.source_raws["build_registration"] = canonical(build)
 
     def _extend_rows(self):
@@ -1394,6 +1395,9 @@ class SyntheticWholeRecheckFixture:
 class NativeRecheckPublicWholeTests(unittest.TestCase):
     """Public-factory synthetic wiring; execution/effectiveness remain untested."""
 
+    def setUp(self):
+        self.enterContext(fixture_review_scope("legacy_single_reply"))
+
     def assert_denied_authorities(self, observation):
         for name in witness._DENIED_AUTHORITIES:
             self.assertIs(observation[name], False, name)
@@ -1421,7 +1425,7 @@ class NativeRecheckPublicWholeTests(unittest.TestCase):
             original = json.loads(fixture.seed.artifacts["receipt.json"])
             self.assertEqual(original["artifacts"][witness.TRACE_ARTIFACT], byte_pin(fixture.trace_raw))
             self.assertEqual(set(original["artifacts"]), set(fixture.assets) - {"receipt.json"})
-            self.assertEqual(fixture.anchor.admission()["source_observation"]["reviewed_transition_sources"], REVIEWED_CURRENT_WHOLE_SOURCE_PINS)
+            self.assertEqual(fixture.anchor.admission()["source_observation"]["reviewed_transition_sources"], REVIEWED_TRANSITION_PINS)
             self.assertEqual(fixture.repaired_check.rules_receipt()["claimed_line"]["claim_truth"], "unknown")
             self.assertEqual(fixture.reply_check.rules_receipt()["claimed_line"]["claim_truth"], "unknown")
             # Capabilities are immutable and their returned views are detached.

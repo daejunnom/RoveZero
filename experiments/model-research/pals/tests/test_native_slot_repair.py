@@ -2,8 +2,9 @@
 
 The real strict parent/D/Repair/semantic factories are used. Build, launch,
 physical heads and Rules descriptors are explicitly synthetic caller facts.
-The two tracked Rust sources are read only to exercise the closed static
-review profile; no compiler, process, Rules replay, model or training runs.
+The fourteen literal reviewed Rust sources are read only to exercise a new
+scoped synthetic review profile; no compiler, process, Rules replay, model or
+training runs. Historical two-file allow-lists remain unchanged.
 Known is conditional fixture coverage only. The usual engine path observes
 publication at the next D, which stays not_examined. These bytes do not prove
 execution of the narrow ordinary branch/role-limit path that can be known.
@@ -28,6 +29,10 @@ from test_native_divergence import NativeDivergenceFixture
 from test_repair_context import RepairFixture
 from test_semantic_verifier import SemanticFixture, tokens
 import test_training as fixtures
+from native_source_review_fixture import (
+    REVIEWED_SOURCE_COMMIT, REVIEWED_TRANSITION_PINS, SYNTHETIC_COMPILED_FACT,
+    fixture_manifest, fixture_review_scope, read_reviewed_fixture_sources,
+)
 
 
 # Independent live-fixture pins, deliberately separate from historical table
@@ -180,18 +185,11 @@ class SlotFixture(RepairFixture):
             "line": self.lineages[1]["counterexample"], "value": None, "completed_depth": 0, "scope": "Unknown",
             "white_score_perspective": True, "critical": False, "source_cpu_profile_sha256": self.source["cpu_profile_sha256"]}
         repo = Path(__file__).resolve().parents[4]
-        source_raws = []
-        for path in slot_witness._SOURCE_PATHS:
-            expected = REVIEWED_CURRENT_SOURCE_PINS[path]
-            with (repo / path).open("rb") as stream:
-                actual = stream.read(expected["bytes"] + 1)
-            if semantic.byte_pin(actual) != expected:
-                raise AssertionError("reviewed Rust fixture source pin changed: " + path)
-            source_raws.append(actual)
-        self.engine_raw, self.native_raw = source_raws
-        self.manifest = {"source_commit": "a" * 40, "files": [{"path": path, **semantic.byte_pin(value)}
-            for path, value in zip(slot_witness._SOURCE_PATHS, (self.engine_raw, self.native_raw))]}
-        self.build = {"schema": slot_witness.BUILD_SCHEMA, "source_commit": "a" * 40,
+        source_raws = read_reviewed_fixture_sources(repo)
+        self.engine_raw, self.native_raw = (source_raws[path] for path in slot_witness._SOURCE_PATHS)
+        self.source["native"]["search_implementation_sha256"] = SYNTHETIC_COMPILED_FACT
+        self.manifest = fixture_manifest()
+        self.build = {"schema": slot_witness.BUILD_SCHEMA, "source_commit": REVIEWED_SOURCE_COMMIT,
             "actual_build_exit_code": 0, "source_verified_before_and_after_build": True,
             "binary": {"bytes": 32, "sha256": self.source["implementation_sha256"]},
             "compiler_artifact": {"reason": "compiler-artifact", "target": {"name": "pals_collect"},
@@ -528,6 +526,7 @@ class NativeSlotClosureConsumerTests(unittest.TestCase):
 
 class NativeSlotRepairTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(fixture_review_scope("default_disabled"))
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.fixture = SlotFixture(self.temp.name)
@@ -543,7 +542,7 @@ class NativeSlotRepairTests(unittest.TestCase):
         self.assertEqual(body["initial_repair_native_request"], [1, 4])
         self.assertEqual(body["publication_native_request"], [1, 5])
         self.assertEqual(body["captured_input_revision"], 2)
-        self.assertEqual(body["transition_profile"]["reviewed_transition_sources"], REVIEWED_CURRENT_SOURCE_PINS)
+        self.assertEqual(body["transition_profile"]["reviewed_transition_sources"], REVIEWED_TRANSITION_PINS)
         self.assertEqual(admission["scope"], "conditional_unique_prepared_lineage")
         self.assertFalse(body["direct_causal_ids_present"])
         self.assertFalse(body["before_dispatch_witness_claimed"])
@@ -676,8 +675,21 @@ class NativeSlotRepairTests(unittest.TestCase):
     def test_current_review_is_one_literal_pair_and_rejects_historical_hybrids(self):
         observed = {path: semantic.byte_pin(value) for path, value in zip(slot_witness._SOURCE_PATHS,
             (self.fixture.engine_raw, self.fixture.native_raw))}
-        self.assertEqual(observed, REVIEWED_CURRENT_SOURCE_PINS)
-        self.assertEqual(slot_witness._reviewed_source_pair(observed), observed)
+        self.assertEqual(observed, REVIEWED_TRANSITION_PINS)
+        # This new synthetic bank does not extend the product's historical
+        # two-file allow-list. Its complete helper profile is scoped to this
+        # test and remains necessary on every verify() call.
+        with self.assertRaises(slot_witness._Unsupported):
+            slot_witness._reviewed_source_pair(observed)
+        from rz_pals_model import native_source_review as reviewed
+        with patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", ()):
+            with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
+                slot_witness._source_review(source_review_raws(self.fixture), self.fixture.source)
+        proof = slot_witness._source_review(source_review_raws(self.fixture), self.fixture.source)["reviewed_transition_closure"]
+        self.assertEqual(len(proof["component_pins"]), 14)
+        self.assertEqual(proof["compiled_search_implementation_sha256"], SYNTHETIC_COMPILED_FACT)
+        self.assertIs(proof["execution_authorized"], False)
+        self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_CURRENT_SOURCE_PINS), REVIEWED_CURRENT_SOURCE_PINS)
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_PRE_LINT_SOURCE_PINS), REVIEWED_PRE_LINT_SOURCE_PINS)
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_LINT_SOURCE_PINS), REVIEWED_LINT_SOURCE_PINS)
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_CONTROLLED_SOURCE_PINS), REVIEWED_CONTROLLED_SOURCE_PINS)
