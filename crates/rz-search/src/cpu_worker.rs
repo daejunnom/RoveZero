@@ -124,6 +124,12 @@ impl CpuSubmissionRejected {
             CpuCommand::Begin(job, grant) => (grant, Some(job)),
             CpuCommand::Resume(grant) | CpuCommand::ResumeWithReply(grant, _) => (grant, None),
         };
+        // Only this owner's definite pre-enqueue rejection proves that the
+        // prepared original never executed. Duplicates/foreign/unknown
+        // submissions must leave any primary capture custody untouched.
+        if verified_unqueued && let Some(job) = &job {
+            let _ = job.retire_nnuec_capture(grant.owner, NnuecCaptureEnding::NotStarted);
+        }
         Self {
             reason,
             proof: Box::new(CpuAdmissionRejection {

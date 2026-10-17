@@ -78,6 +78,7 @@ impl<M: RoleModel> PalsEngine<M> {
             cpu_interleave: CpuInterleavePolicy::ReplaceOnFresh,
             held_cpu_task: None,
             rovent_root_prefix_plies,
+            deferred_researcher_source: None,
             researcher,
             semantic,
             last_cpu_checkpoint_cleanup_error: None,
@@ -89,6 +90,12 @@ impl<M: RoleModel> PalsEngine<M> {
         self.rovent_root_prefix_plies
             .map(usize::from)
             .unwrap_or(self.config.line_plies)
+    }
+
+    /// Only an actual Ready handoff can install this declaration. It holds
+    /// neither a Bound nor a view pin and supplies no worker/cleanup authority.
+    pub fn deferred_researcher_source(&self) -> Option<&crate::cpu_worker::DeferredNnuecRSource> {
+        self.deferred_researcher_source.as_ref()
     }
 
     pub fn rovent_semantic_profile(&self) -> Option<RoventSemanticProfile> {
@@ -106,3 +113,7 @@ impl<M: RoleModel> PalsEngine<M> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "researcher_profile_tests.rs"]
+mod tests;

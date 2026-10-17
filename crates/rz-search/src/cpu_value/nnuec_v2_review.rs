@@ -136,6 +136,7 @@ impl Request {
 
 pub struct BoundNnuecReviewContext {
     context: Arc<Context>,
+    numeric_context_sha256: String,
     view: Arc<ReviewView>,
     root: PositionIdentity,
     provenance: Provenance,
@@ -149,6 +150,11 @@ pub struct BoundNnuecReviewContext {
 impl BoundNnuecReviewContext {
     pub fn context(&self) -> &Arc<Context> {
         &self.context
+    }
+    /// Computed by the preparation actor, never by the manager's dispatch
+    /// path. This numerical seal is separate from full Rules/view provenance.
+    pub fn numeric_context_sha256(&self) -> &str {
+        &self.numeric_context_sha256
     }
     pub fn view(&self) -> &Arc<ReviewView> {
         &self.view
@@ -192,6 +198,7 @@ struct CachedScope {
     view: Arc<ReviewView>,
     digest: [u8; 32],
     context: Arc<Context>,
+    numeric_context_sha256: String,
 }
 /// Owned exclusively by the actor below, with one bounded cached scope.
 struct Factory {
@@ -344,15 +351,22 @@ impl Factory {
             }
             context
         };
+        let numeric_context_sha256 = if let Some(cached) = cached {
+            cached.numeric_context_sha256.clone()
+        } else {
+            context.sha256()?
+        };
         self.control(&request)?;
         self.cached = Some(CachedScope {
             view: Arc::clone(view),
             digest: request.provenance.record_scope_digest,
             context: Arc::clone(&context),
+            numeric_context_sha256: numeric_context_sha256.clone(),
         });
         Ok(BoundNnuecReviewContext {
             root: view.anchors()[0].snapshot.position_identity(),
             context,
+            numeric_context_sha256,
             view: request.view,
             provenance: request.provenance,
             reused_record_scope,
@@ -813,6 +827,14 @@ mod tests {
         assert!(!prepared_a.reused_record_scope());
         assert!(prepared_b.reused_record_scope());
         assert!(Arc::ptr_eq(prepared_a.context(), prepared_b.context()));
+        assert_eq!(
+            prepared_a.numeric_context_sha256(),
+            prepared_b.numeric_context_sha256()
+        );
+        assert_eq!(
+            prepared_a.numeric_context_sha256(),
+            prepared_a.context().sha256().unwrap()
+        );
         assert_ne!(
             prepared_a.provenance().full_view_digest,
             prepared_b.provenance().full_view_digest

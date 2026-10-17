@@ -1170,4 +1170,6 @@ mod tests {
         assert_eq!(snapshot.horizon.completed_depth.unwrap().0, 1);
         assert_eq!(port.counters.role_calls, 0);
     }
+
+    include!("checked_replay_tests.rs");
 }

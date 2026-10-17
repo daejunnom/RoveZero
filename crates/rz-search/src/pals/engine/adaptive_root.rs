@@ -11,6 +11,8 @@ use std::sync::{Arc, Weak};
 
 #[path = "no_researcher_lifecycle.rs"]
 mod no_researcher_lifecycle;
+#[path = "preparing_root/registration.rs"]
+mod preparing_registration;
 
 #[derive(Default)]
 pub struct AdaptiveRootRegistry {

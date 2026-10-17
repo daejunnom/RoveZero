@@ -1,5 +1,6 @@
 //! Pure checked role consumption and continuation construction. The physical
 //! owner must acknowledge the ORIGINAL ticket before calling commit_role.
+use super::checked_replay::PreparedRoleChoice;
 use super::*;
 
 impl<M: RoleModel> AdaptiveEnginePort<M> {
@@ -161,11 +162,17 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         } else {
             None
         };
-        if !self.attempted_role_commits.insert(ticket.id) {
+        if self.attempted_role_commits.contains(&ticket.id) {
             return Err(
                 StoreError::InvalidEvidence("role semantic commit was already attempted").into(),
             );
         }
+        let choice = self.prepare_role_choice(work, output)?;
+        // Keep the original head and graph choice intact while an actual
+        // native reservation blocks the next Rules edge. No Store publication
+        // or semantic-attempt marker has occurred when this returns Reserved.
+        self.preflight_role_choice(work, choice)?;
+        self.attempted_role_commits.insert(ticket.id);
         let evidence = role_output_digest(ticket, output);
         let mut fresh_pair = None;
         let rules_pair = None;
@@ -173,11 +180,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             RefinementStage::ProposalContinuation
             | RefinementStage::CounterContinuation
             | RefinementStage::Repair => {
-                let ranked = rank_moves(work.input.view.query().legal.as_slice(), output)?;
-                let movement = *ranked.first().ok_or(RoleError::InvalidOutput)?;
-                let node = self.connect_hot(query.node, movement)?;
+                let PreparedRoleChoice::Continuation(movement) = choice else {
+                    return Err(RoleError::InvalidOutput.into());
+                };
                 let mut prefix = query.context.prefix.clone();
                 prefix.push(movement);
+                let node = self.replay_node(&prefix)?;
                 let done = prefix.len() >= self.engine.config.line_plies
                     || self.engine.semantic.nodes[node].terminal.is_some();
                 let next = if done {
@@ -244,30 +252,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 AdaptivePortTransition::Continue(next)
             }
             RefinementStage::CriticDivergence => {
-                let RolePayload::Counterexample {
-                    divergence_logits, ..
-                } = &output.payload
-                else {
+                let PreparedRoleChoice::Divergence(ply) = choice else {
                     return Err(RoleError::InvalidOutput.into());
                 };
-                let sites = &work.input.view.query().divergences;
-                let mut ranked: Vec<_> = (0..sites.len()).collect();
-                ranked.sort_by(|a, b| {
-                    divergence_logits[*b]
-                        .total_cmp(&divergence_logits[*a])
-                        .then(a.cmp(b))
-                });
-                let best = if ranked.is_empty() {
-                    None
-                } else {
-                    Some(
-                        ranked[usize::try_from(self.root_round)
-                            .map_err(|_| PalsError::InvalidLimits)?
-                            % ranked.len()],
-                    )
-                };
-                if let Some(best) = best {
-                    let ply = sites[best];
+                if let Some(ply) = ply {
                     let prefix = query.proposal[..ply].to_vec();
                     let node = self.replay_node(&prefix)?;
                     AdaptivePortTransition::Continue(self.blueprint(
@@ -291,28 +279,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             }
             RefinementStage::CriticReply => {
                 let ply = query.attack_ply.ok_or(RoleError::InvalidOutput)?;
-                let original = *query.proposal.get(ply).ok_or(RoleError::InvalidOutput)?;
                 let cpu_response = query
                     .counter
                     .as_ref()
                     .and_then(|line| line.get(ply))
                     .copied();
-                let ranked = rank_moves(&work.input.view.query().legal, output)?;
-                let examined = &self.engine.semantic.nodes[query.node].edges;
-                let movement = ranked
-                    .iter()
-                    .copied()
-                    .find(|mv| {
-                        *mv != original
-                            && Some(*mv) != cpu_response
-                            && !examined.iter().any(|edge| edge.movement == *mv)
-                    })
-                    .or_else(|| {
-                        ranked
-                            .iter()
-                            .copied()
-                            .find(|mv| *mv != original && Some(*mv) != cpu_response)
-                    });
+                let PreparedRoleChoice::CriticReply(movement) = choice else {
+                    return Err(RoleError::InvalidOutput.into());
+                };
                 let critic = if let Some(movement) = movement {
                     let mut prefix = query.context.prefix.clone();
                     prefix.push(movement);
@@ -349,23 +323,13 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             }
             RefinementStage::CriticRecheck => {
                 let repaired = query.repaired.as_ref().ok_or(RoleError::InvalidOutput)?;
-                let ranked = rank_moves(&work.input.view.query().legal, output)?;
-                let prefix_len = query.context.prefix.len();
-                let movement = if query.recheck {
-                    ranked.first().copied()
-                } else {
-                    let old = *repaired.get(prefix_len).ok_or(RoleError::InvalidOutput)?;
-                    let examined = &self.engine.semantic.nodes[query.node].edges;
-                    ranked
-                        .iter()
-                        .copied()
-                        .find(|mv| *mv != old && !examined.iter().any(|edge| edge.movement == *mv))
-                        .or_else(|| ranked.iter().copied().find(|mv| *mv != old))
+                let PreparedRoleChoice::CriticRecheck(movement) = choice else {
+                    return Err(RoleError::InvalidOutput.into());
                 };
                 if let Some(movement) = movement {
-                    let node = self.connect_hot(query.node, movement)?;
                     let mut counterline = query.context.prefix.clone();
                     counterline.push(movement);
+                    let node = self.replay_node(&counterline)?;
                     if self.engine.semantic.nodes[node].terminal.is_some()
                         || counterline.len() >= repaired.len()
                     {
@@ -879,6 +843,15 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let root_color = self.engine.semantic.nodes[self.root]
             .position
             .side_to_move();
+        let checked = if self.rovent_frontier().is_some() {
+            Some(self.existing_checked_frontier_line(repaired)?.ok_or(
+                crate::pals::rovent_frontier::FrontierError::Invalid(
+                    "repaired source has no original charged Rules path",
+                ),
+            )?)
+        } else {
+            None
+        };
         let mut position = self.engine.semantic.nodes[self.root].position.clone();
         let mut changed = None;
         let mut anchor = None;
@@ -900,7 +873,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 anchor = Some(ply);
                 break;
             }
-            position.make_move(*movement)?;
+            if let Some(checked) = &checked {
+                position =
+                    Position::from_snapshot(checked.steps()[ply].snapshot(), Default::default())?;
+            } else {
+                position.make_move(*movement)?;
+            }
         }
         if let Some(anchor) = anchor {
             let prefix = repaired[..anchor].to_vec();
@@ -1009,9 +987,13 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     }
             })
             .map(|record| record.revision);
-        let mut replay = self.engine.semantic.nodes[self.root].position.clone();
-        for movement in line {
-            replay.make_move(*movement)?;
+        if self.rovent_frontier().is_some() {
+            self.replay_node(line)?;
+        } else {
+            let mut replay = self.engine.semantic.nodes[self.root].position.clone();
+            for movement in line {
+                replay.make_move(*movement)?;
+            }
         }
         let record = RoleRecord {
             revision,

@@ -43,6 +43,7 @@ mod cpu_lifecycle;
 mod followup_execution;
 mod frozen_recheck;
 pub mod pc_port;
+pub mod preparing_root;
 mod researcher_admission;
 mod researcher_profile;
 mod review_lifecycle;
@@ -143,6 +144,34 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
             (
                 "pals/engine/researcher_profile.rs",
                 include_str!("engine/researcher_profile.rs"),
+            ),
+            (
+                "pals/engine/preparing_root.rs",
+                include_str!("engine/preparing_root.rs"),
+            ),
+            (
+                "pals/engine/preparing_root/controls.rs",
+                include_str!("engine/preparing_root/controls.rs"),
+            ),
+            (
+                "pals/engine/preparing_root/handoff.rs",
+                include_str!("engine/preparing_root/handoff.rs"),
+            ),
+            (
+                "pals/engine/preparing_root/lifecycle.rs",
+                include_str!("engine/preparing_root/lifecycle.rs"),
+            ),
+            (
+                "pals/engine/preparing_root/registration.rs",
+                include_str!("engine/preparing_root/registration.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/preparing_nnuec.rs",
+                include_str!("engine/adaptive_port/preparing_nnuec.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/preparing_port.rs",
+                include_str!("engine/adaptive_port/preparing_port.rs"),
             ),
             (
                 "pals/engine/no_researcher_lifecycle.rs",
@@ -1354,6 +1383,7 @@ pub struct PalsEngine<M: RoleModel> {
     cpu_interleave: CpuInterleavePolicy,
     held_cpu_task: Option<HeldCpuTask>,
     rovent_root_prefix_plies: Option<u16>,
+    deferred_researcher_source: Option<crate::cpu_worker::DeferredNnuecRSource>,
     // Explicit shutdown still supplies completion evidence. On ordinary Rust
     // destruction, release the actual researcher before its Store/context owner.
     researcher: RegisteredResearcher,

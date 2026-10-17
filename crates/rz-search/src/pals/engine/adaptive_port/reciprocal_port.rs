@@ -1013,6 +1013,57 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         output: &RoleOutput,
         physical: Option<AdaptivePortRoleEvidence>,
     ) -> Result<ContractDigest, PalsError> {
+        // The first accepted head must keep its original custody if native
+        // reservations currently prevent checking its chosen child. Nothing
+        // has been consumed or cached as a failed publication at this point.
+        if !self
+            .reciprocal
+            .answers
+            .iter()
+            .any(|answer| answer.ticket == *accepted.ticket())
+        {
+            self.validate_role(work, accepted.ticket(), output)?;
+            if !accepted.validates_output(output) {
+                return Err(RoleError::InvalidOutput.into());
+            }
+            let pending = self
+                .reciprocal
+                .pending
+                .values()
+                .find(|pending| {
+                    pending.envelope.question_digest == work.input.question_digest
+                        && pending.input.view_seal == work.input.view_seal
+                        && pending.origin.is_some()
+                })
+                .ok_or(RoleError::InvalidOutput)?;
+            if pending.request.is_some()
+                || !matches!(
+                    work.input.question.context.purpose,
+                    RoleQueryPurpose::ProposePolicy
+                        | RoleQueryPurpose::ReplyPolicy
+                        | RoleQueryPurpose::RepairPolicy
+                )
+            {
+                return Err(RoleError::InvalidOutput.into());
+            }
+            if !self.reciprocal_source_consumed(work, accepted.ticket(), output)
+                && self.counters.role_calls >= self.engine.config.max_role_calls
+            {
+                return Err(PalsError::RoleCallLimit);
+            }
+            if self.reciprocal.peer_publications.len() >= MAX_RECIPROCAL_QUESTION_HISTORY {
+                return Err(PalsError::Capacity);
+            }
+            let movement = role_commit::rank_moves(&work.input.view.query().legal, output)?
+                .first()
+                .copied()
+                .ok_or(RoleError::InvalidOutput)?;
+            if self.rovent_frontier().is_some() {
+                let mut line = work.input.question.context.prefix.clone();
+                line.push(movement);
+                self.checked_frontier_line(&line)?;
+            }
+        }
         let answer = self.consume_cpu_reciprocal(work, accepted, output, physical)?;
         if let Some(original) = self.reciprocal.peer_publications.get(&accepted.ticket().id) {
             return original.clone();
@@ -1266,12 +1317,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if prefix.len() > 256 {
             return Err(PalsError::Capacity);
         }
-        let mut replay = parent.input.question.position.clone();
-        for movement in request.relative_prefix() {
-            replay.make_move(*movement)?;
-        }
-        if !replay.snapshot().same_state(&request.position().snapshot()) {
-            return Err(ReviewError::AnchorMismatch.into());
+        if self.rovent_frontier().is_none() {
+            let mut replay = parent.input.question.position.clone();
+            for movement in request.relative_prefix() {
+                replay.make_move(*movement)?;
+            }
+            if !replay.snapshot().same_state(&request.position().snapshot()) {
+                return Err(ReviewError::AnchorMismatch.into());
+            }
         }
         let node = self.replay_node(&prefix)?;
         if !self.engine.semantic.nodes[node]

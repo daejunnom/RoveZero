@@ -456,9 +456,21 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        let mut checked = self.engine.semantic.nodes[self.root].position.clone();
-        for movement in &pending.counter {
-            checked.make_move(*movement)?;
+        if self.rovent_frontier().is_some() {
+            // A queued alternative has not been selected for examination yet.
+            // Reserve/check its Rules path without publishing hot graph edges;
+            // begin_counter adopts those snapshots at the actual selection.
+            if self
+                .existing_checked_frontier_line(&pending.counter)?
+                .is_none()
+            {
+                self.checked_frontier_line(&pending.counter)?;
+            }
+        } else {
+            let mut checked = self.engine.semantic.nodes[self.root].position.clone();
+            for movement in &pending.counter {
+                checked.make_move(*movement)?;
+            }
         }
         let mut hash = Sha256::new();
         hash.update(b"rz-pals-pending-counter/1\0");
@@ -662,10 +674,16 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .zip(&counter)
             .position(|(a, b)| a != b)
             .ok_or(RoleError::InvalidOutput)?;
-        let mut position = self.engine.semantic.nodes[self.root].position.clone();
-        for movement in &proposal[..attack] {
-            position.make_move(*movement)?;
-        }
+        let position = if self.rovent_frontier().is_some() {
+            let node = self.replay_node(&proposal[..attack])?;
+            self.engine.semantic.nodes[node].position.clone()
+        } else {
+            let mut position = self.engine.semantic.nodes[self.root].position.clone();
+            for movement in &proposal[..attack] {
+                position.make_move(*movement)?;
+            }
+            position
+        };
         if position.side_to_move()
             == self.engine.semantic.nodes[self.root]
                 .position

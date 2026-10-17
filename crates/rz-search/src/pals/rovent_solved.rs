@@ -5,6 +5,7 @@
 //! input. Missing defenses remain work for the existing P/C/R question queue;
 //! this reducer executes no alpha-beta, NNUE, model, external process or worker.
 
+use super::rovent_frontier::CheckedFrontierLine;
 use super::store::{LineId, PalsStores};
 use rz_contracts::rovent::ChessPly;
 use rz_position::{
@@ -72,6 +73,43 @@ pub struct RootMateConclusion {
     pub root_side_to_move: Color,
     pub conclusion: MateConclusion,
     pub scope: MateScope,
+}
+
+/// An actual checked root strategy, issued only by this Rules coverage owner.
+/// Keeping the selected edge and its exact root domain with the conclusion
+/// prevents a caller from attaching this score to an unrelated model choice.
+#[derive(Clone, Debug)]
+pub struct RootMateStrategy {
+    root: PositionSnapshot,
+    allowed_root_moves: Vec<BoardMove>,
+    root_restricted: bool,
+    movement: BoardMove,
+    child: PositionSnapshot,
+    conclusion: RootMateConclusion,
+}
+
+impl RootMateStrategy {
+    pub fn best_move(&self) -> BoardMove {
+        self.movement
+    }
+
+    pub fn conclusion(&self) -> RootMateConclusion {
+        self.conclusion
+    }
+
+    /// Whether the original root domain was restricted, even when a winning
+    /// allowed move also certifies existence for the unrestricted root.
+    pub fn root_restricted(&self) -> bool {
+        self.root_restricted
+    }
+
+    pub fn validates_root(&self, root: &PositionSnapshot, allowed: &[BoardMove]) -> bool {
+        self.root.same_state(root) && self.allowed_root_moves == allowed
+    }
+
+    pub fn checked_child_snapshot(&self) -> &PositionSnapshot {
+        &self.child
+    }
 }
 
 impl RootMateConclusion {
@@ -231,6 +269,26 @@ impl MateProofStore {
         }
     }
 
+    /// Read only already closed Rules coverage. At an attacking root this is
+    /// a proven winning move; at a defending root every allowed move is proved
+    /// lost and the chosen move maximizes the observed forced distance. No
+    /// missing branch is searched or inferred by this accessor.
+    pub fn root_strategy(&self) -> Option<RootMateStrategy> {
+        let conclusion = self.root_conclusion();
+        if !conclusion.goal_satisfied() {
+            return None;
+        }
+        let (movement, child) = self.strategy_child(0)?;
+        Some(RootMateStrategy {
+            root: self.nodes[0].snapshot.clone(),
+            allowed_root_moves: self.nodes[0].legal.clone(),
+            root_restricted: self.root_restricted,
+            movement,
+            child: self.nodes[child.slot].snapshot.clone(),
+            conclusion,
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -350,6 +408,69 @@ impl MateProofStore {
         position
             .make_move(movement)
             .map_err(|_| MateProofError::IllegalMove)?;
+        self.link_checked_position(parent_slot, move_slot, remaining, &position)
+    }
+
+    /// Project one already charged controller edge into passive coverage.
+    /// The immutable line is issued only after that owner's actual Rules
+    /// transition. A snapshot declaration, raw score or unchecked move cannot
+    /// enter this path, and no additional Rules mutation is performed here.
+    pub(crate) fn observe_checked_child(
+        &mut self,
+        parent: MateNodeId,
+        line: &CheckedFrontierLine,
+        step_index: usize,
+    ) -> Result<MateNodeId, MateProofError> {
+        let parent_slot = self.check(parent)?;
+        let step = line
+            .steps()
+            .get(step_index)
+            .ok_or(MateProofError::ForeignHandle)?;
+        let parent_snapshot = if step_index == 0 {
+            line.root_snapshot()
+        } else {
+            line.steps()[step_index - 1].snapshot()
+        };
+        let root_offset =
+            u16::try_from(step_index).map_err(|_| MateProofError::HorizonExhausted)?;
+        let node = &self.nodes[parent_slot];
+        if !self.nodes[0].snapshot.same_state(line.root_snapshot())
+            || !node.snapshot.same_state(parent_snapshot)
+            || self.nodes[0].remaining.0.checked_sub(root_offset) != Some(node.remaining.0)
+        {
+            return Err(MateProofError::ForeignHandle);
+        }
+        let move_slot = node
+            .legal
+            .iter()
+            .position(|held| *held == step.movement())
+            .ok_or(MateProofError::IllegalMove)?;
+        if let Some(child) = node.children[move_slot] {
+            return if self.nodes[child.slot].snapshot.same_state(step.snapshot()) {
+                Ok(child)
+            } else {
+                Err(MateProofError::ForeignHandle)
+            };
+        }
+        if node.terminal.is_some() {
+            return Err(MateProofError::AlreadyClosed);
+        }
+        if node.remaining.0 == 0 {
+            return Err(MateProofError::HorizonExhausted);
+        }
+        let remaining = ChessPly(node.remaining.0 - 1);
+        let position = Position::from_snapshot(step.snapshot(), Default::default())
+            .map_err(|_| MateProofError::Rules)?;
+        self.link_checked_position(parent_slot, move_slot, remaining, &position)
+    }
+
+    fn link_checked_position(
+        &mut self,
+        parent_slot: usize,
+        move_slot: usize,
+        remaining: ChessPly,
+        position: &Position,
+    ) -> Result<MateNodeId, MateProofError> {
         let snapshot = position.snapshot();
         let existing = self
             .index
@@ -367,7 +488,7 @@ impl MateProofStore {
             }
         } else {
             let legal = position.ordered_legal_moves().moves().to_vec();
-            let child = self.make_node(&position, remaining, legal)?;
+            let child = self.make_node(position, remaining, legal)?;
             self.push_node(child)?
         };
         self.nodes[child.slot]
@@ -408,29 +529,35 @@ impl MateProofStore {
     /// selection; its entire printed PV must still be replayed by Rules. A
     /// failed or missing child is never fabricated to match the distance bound.
     pub fn strategy_move(&self, node: MateNodeId) -> Result<Option<BoardMove>, MateProofError> {
-        let node = &self.nodes[self.check(node)?];
+        Ok(self
+            .strategy_child(self.check(node)?)
+            .map(|(movement, _)| movement))
+    }
+
+    fn strategy_child(&self, slot: usize) -> Option<(BoardMove, MateNodeId)> {
+        let node = &self.nodes[slot];
         if !matches!(node.conclusion, MateConclusion::ForcedMate(_)) {
-            return Ok(None);
+            return None;
         }
         let attack_turn = node.snapshot.side_to_move() == self.attacker;
-        let mut best: Option<(BoardMove, u16)> = None;
+        let mut best: Option<(BoardMove, MateNodeId, u16)> = None;
         for (movement, child) in node.legal.iter().zip(&node.children) {
             let Some(child) = child else { continue };
             let MateConclusion::ForcedMate(distance) = self.nodes[child.slot].conclusion else {
                 continue;
             };
             let distance = distance.plies().0;
-            if best.is_none_or(|(_, held)| {
+            if best.is_none_or(|(_, _, held)| {
                 if attack_turn {
                     distance < held
                 } else {
                     distance > held
                 }
             }) {
-                best = Some((*movement, distance));
+                best = Some((*movement, *child, distance));
             }
         }
-        Ok(best.map(|(movement, _)| movement))
+        best.map(|(movement, child, _)| (movement, child))
     }
 
     fn make_node(
@@ -647,6 +774,19 @@ mod tests {
             );
             assert_eq!(proof.root_conclusion().exact_uci_mate(), Some(1));
             assert!(proof.root_conclusion().goal_satisfied());
+            let strategy = proof.root_strategy().unwrap();
+            assert_eq!(strategy.best_move(), mv(movement));
+            assert_eq!(strategy.conclusion(), proof.root_conclusion());
+            assert!(
+                strategy
+                    .validates_root(&position.snapshot(), position.ordered_legal_moves().moves())
+            );
+            assert!(
+                strategy
+                    .checked_child_snapshot()
+                    .same_state(proof.snapshot(child).unwrap())
+            );
+            assert!(!strategy.validates_root(&position.snapshot(), &[mv(movement)]));
             let count = proof.len();
             assert_eq!(proof.open_child(root, mv(movement)).unwrap(), child);
             assert_eq!(proof.len(), count);
@@ -775,12 +915,16 @@ mod tests {
         );
         assert!(proof.root_conclusion().goal_satisfied());
         assert_eq!(proof.root_conclusion().exact_uci_mate(), None);
+        let strategy = proof.root_strategy().unwrap();
+        assert_eq!(strategy.best_move(), mv("f7f6"));
+        assert_eq!(strategy.conclusion().exact_uci_mate(), None);
         proof.open_child(root, mv("f7g7")).unwrap();
         assert_eq!(
             proof.root_conclusion().conclusion,
             MateConclusion::ForcedMate(MateDistance::Exact(ChessPly(1)))
         );
         assert_eq!(proof.strategy_move(root).unwrap(), Some(mv("f7g7")));
+        assert_eq!(proof.root_strategy().unwrap().best_move(), mv("f7g7"));
     }
 
     #[test]
@@ -804,6 +948,47 @@ mod tests {
             MateConclusion::ForcedMate(MateDistance::Within(ChessPly(3)))
         );
         assert_eq!(proof.root_conclusion().exact_uci_mate(), None);
+        let strategy = proof.root_strategy().unwrap();
+        assert!(strategy.root_restricted());
+        assert_eq!(strategy.best_move(), roots[0]);
+        assert!(strategy.validates_root(&position.snapshot(), &roots));
+        assert!(!strategy.validates_root(
+            &Position::from_fen(&position.to_fen()).unwrap().snapshot(),
+            &roots,
+        ));
+    }
+
+    #[test]
+    fn root_loss_strategy_delays_within_the_original_proved_move_domain() {
+        let mut position = Position::from_fen("6k1/p7/5K2/8/8/8/P7/5Q2 w - - 0 1").unwrap();
+        for movement in ["a2a3", "a7a6", "f1g1"] {
+            position.make_uci(movement).unwrap();
+        }
+        let allowed = [mv("g8h8"), mv("g8f8"), mv("g8h7")];
+        let mut proof =
+            MateProofStore::new(&position, Color::White, ChessPly(4), Some(&allowed), 32).unwrap();
+        let root = proof.root();
+        assert!(proof.root_strategy().is_none());
+        for branch in [
+            &["g8h8", "g1g7"][..],
+            &["g8h7", "g1g7"][..],
+            &["g8f8", "g1g7", "f8e8", "g7e7"][..],
+        ] {
+            let mut parent = root;
+            for movement in branch {
+                parent = proof.open_child(parent, mv(movement)).unwrap();
+            }
+        }
+        let strategy = proof.root_strategy().unwrap();
+        assert_eq!(strategy.best_move(), mv("g8f8"));
+        assert!(strategy.root_restricted());
+        assert_eq!(strategy.conclusion().scope, MateScope::RestrictedRoot);
+        assert_eq!(
+            strategy.conclusion().conclusion,
+            MateConclusion::ForcedMate(MateDistance::Within(ChessPly(4)))
+        );
+        assert!(strategy.validates_root(&position.snapshot(), &allowed));
+        assert_eq!(strategy.conclusion().exact_uci_mate(), None);
     }
 
     #[test]

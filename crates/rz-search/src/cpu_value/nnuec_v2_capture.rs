@@ -29,6 +29,7 @@ pub enum CaptureError {
     Invalid(&'static str),
     Stale,
     Duplicate,
+    Busy,
     Capacity,
     Poisoned,
     Rules,
@@ -37,13 +38,23 @@ pub enum CaptureError {
 }
 
 /// Required collection settings. No collection runs in the default CPU path.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NnuecCaptureLimits {
     maximum_readouts: u16,
     every_nth_score: u32,
     maximum_input_bytes: usize,
 }
 impl NnuecCaptureLimits {
+    pub fn maximum_readouts(&self) -> u16 {
+        self.maximum_readouts
+    }
+    pub fn every_nth_score(&self) -> u32 {
+        self.every_nth_score
+    }
+    /// Retained serialized numeric input bytes, not total/peak heap memory.
+    pub fn maximum_input_bytes(&self) -> usize {
+        self.maximum_input_bytes
+    }
     pub fn new(
         maximum_readouts: u16,
         every_nth_score: u32,
@@ -132,7 +143,7 @@ impl NnuecCaptureReservation {
         }
         let binding = super::cpu::binding_digest(model.identity(), provenance)
             .map_err(|_| CaptureError::Input)?;
-        let context_sha256 = bound.context().sha256().map_err(|_| CaptureError::Input)?;
+        let context_sha256 = bound.numeric_context_sha256().to_owned();
         Ok(Self {
             submission: Arc::new(Submission {
                 model,
@@ -218,7 +229,10 @@ impl NnuecCaptureReservation {
     ) -> Result<NnuecActiveCapture, CaptureError> {
         self.check_job(job, anchor, clock, actual_value_binding)?;
         let mut state = self.state.lock().map_err(|_| CaptureError::Poisoned)?;
-        if state.retired || state.prepared_job != Some((job, owner)) {
+        if state.retired
+            || state.prepared_job != Some((job, owner))
+            || state.clock_origin != Some(clock.origin())
+        {
             return Err(CaptureError::Stale);
         }
         match state.job {
@@ -244,15 +258,18 @@ impl NnuecCaptureReservation {
         self.retirement.get()
     }
     pub fn error(&self) -> Result<Option<CaptureError>, CaptureError> {
-        Ok(self
-            .state
-            .lock()
-            .map_err(|_| CaptureError::Poisoned)?
-            .error
-            .clone())
+        self.state
+            .try_lock()
+            .map(|state| state.error.clone())
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => CaptureError::Busy,
+                std::sync::TryLockError::Poisoned(_) => CaptureError::Poisoned,
+            })
     }
     pub(crate) fn record_error(&self, error: CaptureError) {
-        if let Ok(mut state) = self.state.lock() {
+        if let Ok(mut state) = self.state.lock()
+            && !state.retired
+        {
             state.error.get_or_insert(error);
         }
     }
@@ -363,7 +380,12 @@ impl NnuecActiveCapture {
                     state.readouts.push(readout);
                 }
             }
-            Err(error) => state.error = Some(error),
+            Err(error) => {
+                if error == CaptureError::Capacity {
+                    state.overflow = state.overflow.saturating_add(1);
+                }
+                state.error = Some(error);
+            }
         }
     }
     fn capture_one(
@@ -537,6 +559,12 @@ impl NnuecCapturedReadout {
     pub fn context_sha256(&self) -> &str {
         &self.submission.context_sha256
     }
+    /// The original immutable selected view, including local record IDs,
+    /// relation metadata, anchors and checked rebase offsets. No new Store
+    /// lookup or eligible-view consumption is performed here.
+    pub fn context_view(&self) -> &Arc<ReviewView> {
+        self.submission.bound.view()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -563,6 +591,24 @@ pub struct NnuecCaptureRetirement {
     error: Option<CaptureError>,
 }
 impl NnuecCaptureRetirement {
+    pub fn model_identity(&self) -> &crate::cpu_value::CpuValueIdentity {
+        self.submission.model.identity()
+    }
+    pub fn provenance(&self) -> &super::review::Provenance {
+        self.submission.bound.provenance()
+    }
+    pub fn context_sha256(&self) -> &str {
+        &self.submission.context_sha256
+    }
+    pub fn context_view(&self) -> &Arc<ReviewView> {
+        self.submission.bound.view()
+    }
+    pub fn limits(&self) -> NnuecCaptureLimits {
+        self.submission.limits
+    }
+    pub fn original_deadline(&self) -> Deadline {
+        self.submission.original_deadline
+    }
     pub fn job(&self) -> CpuJobEnvelope {
         self.job
     }
@@ -596,6 +642,8 @@ impl NnuecCaptureRetirement {
     pub fn input_bytes(&self) -> usize {
         self.input_bytes
     }
+    /// Only sampled input/Rules preparation, not the complete collection
+    /// overhead. input_bytes counts retained serialized inputs, not peak heap.
     pub fn preparation_time(&self) -> Duration {
         self.preparation_time
     }
@@ -603,3 +651,7 @@ impl NnuecCaptureRetirement {
         self.error.as_ref()
     }
 }
+
+#[cfg(test)]
+#[path = "nnuec_v2_capture_tests.rs"]
+mod tests;

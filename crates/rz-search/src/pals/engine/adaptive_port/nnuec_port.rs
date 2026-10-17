@@ -64,6 +64,9 @@ pub struct AdaptiveNnuecReviewSeal {
     model: CpuValueIdentity,
 }
 impl AdaptiveNnuecReviewSeal {
+    pub fn view(&self) -> &Arc<ReviewView> {
+        &self.work.input.view
+    }
     pub fn view_seal(&self) -> ReviewViewSeal {
         self.work.input.view_seal
     }
@@ -112,6 +115,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if work.input.stage.role().is_some()
             || work.input.view.root_state() != self.root_state_id()
             || work.frame.authority != self.authority
+            || self.engine.researcher.cpu_registered_value.as_ref() != Some(model.identity())
         {
             return Err(AdaptiveNnuecPreparationError::StateMismatch);
         }
@@ -207,6 +211,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let provenance = bound.provenance();
         if work.input.stage.role().is_some()
             || model.identity() != &original.model
+            || self.engine.researcher.cpu_registered_value.as_ref() != Some(model.identity())
             || provenance.model != original.model
             || provenance.root != self.root_state_id()
             || provenance.generation != self.authority.root.0

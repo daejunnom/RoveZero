@@ -148,6 +148,7 @@ pub struct RoventResult {
     pub terminal: Option<TerminalReason>,
     pub horizon: HorizonSnapshot,
     pub mate: Option<RootMateConclusion>,
+    pub mate_strategy: Option<super::rovent_solved::RootMateStrategy>,
     pub candidates: Vec<RoventCandidate>,
     pub work: RoventWork,
     pub mode: ExecutionMode,
@@ -731,6 +732,7 @@ impl<M: RoleModel> RoventEngine<M> {
                 terminal: Some(reason),
                 horizon: horizon.snapshot(),
                 mate: None,
+                mate_strategy: None,
                 candidates: Vec::new(),
                 work: state.work,
                 mode: self.config.mode,
@@ -744,6 +746,7 @@ impl<M: RoleModel> RoventEngine<M> {
             terminal: None,
             horizon: horizon.snapshot(),
             mate: None,
+            mate_strategy: None,
             candidates: Vec::new(),
             work: state.work,
             mode: self.config.mode,
@@ -892,7 +895,11 @@ impl<M: RoleModel> RoventEngine<M> {
                     state.control()?;
                     let conclusion = proof.root_conclusion();
                     if conclusion.goal_satisfied() {
-                        result.best_move = proof.strategy_move(proof_root)?.or(result.best_move);
+                        let strategy = proof.root_strategy();
+                        if let Some(strategy) = &strategy {
+                            result.best_move = Some(strategy.best_move());
+                        }
+                        result.mate_strategy = strategy;
                         result.mate = Some(conclusion);
                         result.completion = RoventCompletion::MateGoal;
                         break;

@@ -41,6 +41,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 mod question;
+pub use super::rovent_solved::RootMateStrategy as FrontierMateStrategy;
 pub(crate) use question::VerifiedFrontierQuestion;
 use question::WeakQuestionOwner;
 
@@ -381,6 +382,7 @@ pub struct FrontierSnapshot {
     pub work: FrontierNodeWork,
     pub horizon: HorizonSnapshot,
     pub mate: [Option<RootMateConclusion>; 2],
+    pub mate_strategy: Option<FrontierMateStrategy>,
     pub goal: FrontierGoalStatus,
     pub registered_frames: usize,
     pub completed_frames: usize,
@@ -544,7 +546,20 @@ impl RoventFrontier {
             .into_iter()
             .enumerate()
         {
-            if let Some(remaining) = registration.goal.mate_horizon(lane == 0)? {
+            // Passive coverage never reaches a synthetic horizon boundary:
+            // every admitted Rules path is shorter than this sentinel. Only
+            // actual Rules terminals/covered choices can close a passive node.
+            let remaining = registration
+                .goal
+                .mate_horizon(lane == 0)?
+                .unwrap_or(ChessPly(
+                    limits
+                        .maximum_goal_plies
+                        .get()
+                        .checked_add(1)
+                        .ok_or(FrontierError::DepthHorizon)?,
+                ));
+            {
                 let root_moves = if registration.root_moves.allowed().is_empty() {
                     None
                 } else {
@@ -911,6 +926,38 @@ impl RoventFrontier {
             return Err(FrontierError::StoreUnavailable);
         }
         self.seal_checked_line(path)
+    }
+
+    /// Inspect only edges this exact owner already checked and charged.
+    /// Absence grants no validity and performs no Rules replay or admission.
+    pub(crate) fn existing_rules_prefix(
+        &self,
+        prefix: &[BoardMove],
+        stores: &PalsStores,
+    ) -> Result<Option<CheckedFrontierLine>, FrontierError> {
+        if !self.pin.validates(stores) || !self.store_owner.matches(stores) {
+            return Err(FrontierError::StoreUnavailable);
+        }
+        self.existing_path(prefix)?
+            .map(|path| self.seal_checked_line(path))
+            .transpose()
+    }
+
+    fn existing_path(&self, prefix: &[BoardMove]) -> Result<Option<FrontierPath>, FrontierError> {
+        if prefix.len() > usize::from(self.limits.maximum_goal_plies.get()) {
+            return Err(FrontierError::DepthHorizon);
+        }
+        let mut path = self.root_path();
+        for movement in prefix {
+            let Some(slot) = self.path_index.get(&(path.slot, *movement)) else {
+                return Ok(None);
+            };
+            path = FrontierPath {
+                owner: self.owner,
+                slot: *slot,
+            };
+        }
+        Ok(Some(path))
     }
 
     fn seal_checked_line(&self, path: FrontierPath) -> Result<CheckedFrontierLine, FrontierError> {
@@ -1698,7 +1745,7 @@ impl RoventFrontier {
             return Err(FrontierError::Capacity("missing-question result bound"));
         }
         let mut questions = Vec::with_capacity(maximum);
-        if maximum == 0 {
+        if maximum == 0 || self.registration.goal.mate_moves.is_none() {
             return Ok(questions);
         }
         for (lane_index, lane) in self.mate.iter().enumerate() {
@@ -1837,6 +1884,17 @@ impl RoventFrontier {
         self.interrupt(FrontierStop::Canceled);
     }
 
+    /// A typed observation, not an output/fence authority. The real consumer
+    /// must still join its original root/domain and physical result custody.
+    /// A proved own win is preferred; otherwise the opponent lane supplies
+    /// its proved longest-delay defense within the original root domain.
+    pub fn mate_strategy(&self) -> Option<FrontierMateStrategy> {
+        self.mate
+            .iter()
+            .flatten()
+            .find_map(|lane| lane.proof.root_strategy())
+    }
+
     pub fn snapshot(&self) -> FrontierSnapshot {
         let horizon = self.horizon.snapshot();
         let mate = std::array::from_fn(|lane| {
@@ -1876,6 +1934,7 @@ impl RoventFrontier {
             work: self.work,
             horizon,
             mate,
+            mate_strategy: self.mate_strategy(),
             goal,
             registered_frames: self.frames.len(),
             completed_frames,
@@ -2069,11 +2128,12 @@ impl RoventFrontier {
             ));
         }
         let old_anchor = self.path(parent)?.anchor.clone();
-        if self
-            .registration
-            .goal
-            .depth_plies
-            .is_some_and(|depth| old_anchor.ply().0 >= depth.get())
+        if old_anchor.ply().0 >= self.limits.maximum_goal_plies.get()
+            || self
+                .registration
+                .goal
+                .depth_plies
+                .is_some_and(|depth| old_anchor.ply().0 >= depth.get())
         {
             return Err(FrontierError::DepthHorizon);
         }
@@ -2122,11 +2182,28 @@ impl RoventFrontier {
         let Some(lane) = self.mate[lane_index].as_ref() else {
             return Ok(());
         };
+        let passive = self.registration.goal.mate_moves.is_none();
+        let checked = if passive {
+            if clock != self.registration.original_deadline.clock {
+                return Err(FrontierError::ForeignRoot);
+            }
+            let endpoint = self.existing_path(prefix)?.ok_or(FrontierError::Invalid(
+                "passive mate coverage lacks prior checked Rules path",
+            ))?;
+            Some(self.seal_checked_line(endpoint)?)
+        } else {
+            None
+        };
         let mut node = lane.proof.root();
         let mut path = self.root_path();
-        for movement in prefix {
+        for (step_index, movement) in prefix.iter().enumerate() {
             let tick = self.original_tick_after_elapsed(clock, now, started.elapsed())?;
-            self.check_control(clock, tick)?;
+            // Passive reduction consumes immutable evidence already admitted
+            // under this root. It creates no new work/admission and may finish
+            // projecting the paid final edge when that edge filled the quota.
+            if !passive {
+                self.check_control(clock, tick)?;
+            }
             let lane = self.mate[lane_index].as_ref().expect("registered lane");
             if lane.proof.remaining(node)?.0 == 0
                 || lane.proof.conclusion(node)? != MateConclusion::Unknown
@@ -2147,6 +2224,15 @@ impl RoventFrontier {
             };
             node = match existing {
                 Some(child) => child,
+                None if passive => self.mate[lane_index]
+                    .as_mut()
+                    .expect("registered lane")
+                    .proof
+                    .observe_checked_child(
+                        node,
+                        checked.as_ref().expect("passive checked source"),
+                        step_index,
+                    )?,
                 None => {
                     self.spend_transition()?;
                     self.mate[lane_index]

@@ -26,6 +26,16 @@ struct Fixture {
 
 impl Fixture {
     fn new(position: Position, goal: SearchGoal, nodes: Option<u64>, native: bool) -> Self {
+        Self::with_maximum_plies(position, goal, nodes, native, 32)
+    }
+
+    fn with_maximum_plies(
+        position: Position,
+        goal: SearchGoal,
+        nodes: Option<u64>,
+        native: bool,
+        maximum_plies: u16,
+    ) -> Self {
         let mut stores = PalsStores::new(StoreLimits {
             states: 128,
             situations: 128,
@@ -86,7 +96,7 @@ impl Fixture {
                 native_ledger: ledger.as_ref().map(CpuCreditLedger::identity),
             },
             FrontierLimits {
-                maximum_goal_plies: NonZeroU16::new(32).unwrap(),
+                maximum_goal_plies: NonZeroU16::new(maximum_plies).unwrap(),
                 maximum_frames: 64,
                 maximum_paths: 128,
                 maximum_mate_nodes: 128,
@@ -119,6 +129,195 @@ impl Fixture {
             self.clock.now().unwrap(),
         )
     }
+}
+
+#[test]
+fn passive_mate_uses_only_paid_rules_edges_and_never_issues_missing_questions() {
+    for (fen, movement) in [
+        ("7k/5Q2/6K1/8/8/8/8/8 w - - 0 1", "f7g7"),
+        ("8/8/8/8/8/6k1/5q2/7K b - - 0 1", "f2g2"),
+    ] {
+        let mut fixture = Fixture::new(
+            Position::from_fen(fen).unwrap(),
+            SearchGoal::default(),
+            None,
+            false,
+        );
+        fixture.observe(&[mv(movement)]).unwrap();
+        let snapshot = fixture.frontier.snapshot();
+        assert_eq!(snapshot.work.checked_transitions, 1);
+        assert_eq!(snapshot.work.native_nodes, 0);
+        assert_eq!(snapshot.work.total_node_visits(), Some(2));
+        let proof = snapshot.mate[0].unwrap();
+        assert_eq!(proof.exact_uci_mate(), Some(1));
+        let strategy = snapshot.mate_strategy.unwrap();
+        assert_eq!(strategy.best_move(), mv(movement));
+        assert_eq!(strategy.conclusion(), proof);
+        assert!(strategy.validates_root(
+            fixture.frontier.registration.root_rules.rules().snapshot(),
+            fixture.frontier.root_moves().allowed(),
+        ));
+        assert_eq!(snapshot.goal, FrontierGoalStatus::MateSatisfied);
+        assert!(
+            fixture
+                .frontier
+                .missing_mate_questions(64, fixture.clock.domain(), fixture.clock.now().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        fixture.observe(&[mv(movement)]).unwrap();
+        assert_eq!(fixture.frontier.snapshot().work.checked_transitions, 1);
+    }
+}
+
+#[test]
+fn passive_cooperative_terminal_does_not_close_unvisited_defenses() {
+    let mut root = Position::from_fen("6k1/p7/5K2/8/8/8/P7/5Q2 w - - 0 1").unwrap();
+    for movement in ["a2a3", "a7a6", "f1g1"] {
+        root.make_uci(movement).unwrap();
+    }
+    let mut fixture = Fixture::new(root, SearchGoal::default(), None, false);
+    fixture.observe(&[mv("g8h8"), mv("g1g7")]).unwrap();
+    let snapshot = fixture.frontier.snapshot();
+    assert_eq!(snapshot.work.checked_transitions, 2);
+    assert_eq!(snapshot.work.total_node_visits(), Some(3));
+    assert_eq!(
+        snapshot.mate[1].unwrap().conclusion,
+        MateConclusion::Unknown
+    );
+    assert_eq!(snapshot.goal, FrontierGoalStatus::Pending);
+    assert!(
+        fixture
+            .frontier
+            .missing_mate_questions(64, fixture.clock.domain(), fixture.clock.now().unwrap())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn passive_nonterminal_cutoff_stays_unknown_and_one_edge_cannot_exceed_root_cap() {
+    let mut fixture =
+        Fixture::with_maximum_plies(Position::startpos(), SearchGoal::default(), None, false, 2);
+    let checked = fixture
+        .frontier
+        .observe_rules_prefix(
+            &[mv("e2e4"), mv("e7e5")],
+            &fixture.stores,
+            fixture.clock.domain(),
+            fixture.clock.now().unwrap(),
+        )
+        .unwrap();
+    for lane in fixture.frontier.mate.iter().flatten() {
+        assert_eq!(
+            lane.proof.root_conclusion().conclusion,
+            MateConclusion::Unknown
+        );
+        let node = lane
+            .paths
+            .iter()
+            .find_map(|(node, path)| (*path == checked.path()).then_some(*node))
+            .unwrap();
+        assert_eq!(lane.proof.remaining(node).unwrap(), ChessPly(1));
+        assert_eq!(
+            lane.proof.conclusion(node).unwrap(),
+            MateConclusion::Unknown
+        );
+    }
+    assert_eq!(
+        fixture.frontier.advance_path(
+            checked.path(),
+            mv("g1f3"),
+            fixture.clock.domain(),
+            fixture.clock.now().unwrap(),
+        ),
+        Err(FrontierError::DepthHorizon)
+    );
+    assert_eq!(fixture.frontier.snapshot().work.checked_transitions, 2);
+    assert_eq!(
+        fixture.frontier.snapshot().horizon.maximum_examined_ply,
+        ChessPly(2)
+    );
+}
+
+#[test]
+fn readonly_prefix_lookup_requires_original_paid_path_without_creating_work() {
+    let mut fixture = Fixture::new(Position::startpos(), SearchGoal::default(), None, false);
+    assert!(
+        fixture
+            .frontier
+            .existing_rules_prefix(&[mv("e2e4")], &fixture.stores)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fixture.frontier.snapshot().work.checked_transitions, 0);
+    fixture.observe(&[mv("e2e4")]).unwrap();
+    let checked = fixture
+        .frontier
+        .existing_rules_prefix(&[mv("e2e4")], &fixture.stores)
+        .unwrap()
+        .unwrap();
+    assert!(checked.matches(&fixture.frontier, &fixture.stores));
+    assert!(
+        fixture
+            .frontier
+            .existing_rules_prefix(&[mv("e2e4"), mv("e7e5")], &fixture.stores)
+            .unwrap()
+            .is_none()
+    );
+    let other = Fixture::new(Position::startpos(), SearchGoal::default(), None, false);
+    assert!(matches!(
+        fixture
+            .frontier
+            .existing_rules_prefix(&[mv("e2e4")], &other.stores),
+        Err(FrontierError::StoreUnavailable)
+    ));
+    assert_eq!(fixture.frontier.snapshot().work.checked_transitions, 1);
+}
+
+#[test]
+fn checked_snapshot_reducer_rejects_foreign_root_and_wrong_step_without_advancing_rules() {
+    let mut fixture = Fixture::new(Position::startpos(), SearchGoal::default(), None, false);
+    fixture.observe(&[mv("e2e4")]).unwrap();
+    let checked = fixture
+        .frontier
+        .existing_rules_prefix(&[mv("e2e4")], &fixture.stores)
+        .unwrap()
+        .unwrap();
+    let mut foreign_position = Position::startpos();
+    foreign_position.make_uci("d2d4").unwrap();
+    let mut foreign =
+        MateProofStore::new(&foreign_position, Color::White, ChessPly(3), None, 16).unwrap();
+    let foreign_root = foreign.root();
+    assert_eq!(
+        foreign.observe_checked_child(foreign_root, &checked, 0),
+        Err(MateProofError::ForeignHandle)
+    );
+    assert_eq!(foreign.len(), 1);
+    let root = Position::startpos();
+    let mut proof = MateProofStore::new(&root, Color::White, ChessPly(3), None, 16).unwrap();
+    let proof_root = proof.root();
+    assert_eq!(
+        proof.observe_checked_child(proof_root, &checked, 1),
+        Err(MateProofError::ForeignHandle)
+    );
+    let child = proof
+        .observe_checked_child(proof_root, &checked, 0)
+        .unwrap();
+    assert!(
+        proof
+            .snapshot(child)
+            .unwrap()
+            .same_state(checked.endpoint_snapshot())
+    );
+    assert_eq!(
+        proof
+            .observe_checked_child(proof_root, &checked, 0)
+            .unwrap(),
+        child
+    );
+    assert_eq!(proof.len(), 2);
+    assert_eq!(fixture.frontier.snapshot().work.checked_transitions, 1);
 }
 
 #[test]

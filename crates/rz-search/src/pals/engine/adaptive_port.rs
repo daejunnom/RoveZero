@@ -14,6 +14,7 @@ use rz_contracts::{Deadline, Digest as ContractDigest, OwnerId, RequestId};
 use rz_position::contracts::{ContractPosition, ContractState};
 use std::collections::{HashMap, HashSet, VecDeque};
 mod branch_queue;
+mod checked_replay;
 mod conditional_evidence;
 mod consumption_observation;
 mod continuation_blueprint;
@@ -28,6 +29,8 @@ mod model_namespace;
 mod nnuec_port;
 #[cfg(test)]
 mod port_tests;
+mod preparing_nnuec;
+mod preparing_port;
 mod reciprocal_port;
 mod role_commit;
 pub use reciprocal_port::{
@@ -55,6 +58,8 @@ pub use nnuec_port::{
     AdaptiveNnuecCaptureError, AdaptiveNnuecPreparationError, AdaptiveNnuecReviewRequest,
     AdaptiveNnuecReviewSeal,
 };
+pub use preparing_nnuec::{PreparingRootNnuecRequest, PreparingRootViewSeal};
+pub use preparing_port::{AdaptivePreparingRootAdmission, AdaptivePreparingRootCustody};
 pub mod archive_worker;
 /// The process registry remains owned by UCI. Search cannot invent an owner
 /// from a root generation or reuse one for a separately owned Rules instance.
@@ -668,17 +673,44 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             Ok(prepared) => prepared,
             Err(error) => return Err((engine, error)),
         };
-        Ok(Self {
+        Ok(Self::from_admitted_root(
             engine,
             root,
             rules,
             authority,
             deadline,
             limits,
-            started: Instant::now(),
+            rules_owner_issuer,
+            Instant::now(),
+            false,
+        ))
+    }
+
+    /// Only existing successful admission or an opaque PreparingRoot handoff
+    /// reaches this initializer. It issues no Rules owner or root nonce.
+    #[allow(clippy::too_many_arguments)]
+    fn from_admitted_root(
+        engine: PalsEngine<M>,
+        root: usize,
+        rules: Arc<ContractState>,
+        authority: SearchAuthority,
+        deadline: Deadline,
+        limits: PalsLimits,
+        rules_owner_issuer: AdaptiveRulesOwnerIssuer,
+        started: Instant,
+        root_rules_scanned: bool,
+    ) -> Self {
+        Self {
+            engine,
+            root,
+            rules,
+            authority,
+            deadline,
+            limits,
+            started,
             counters: PalsCounters::default(),
             next_question: 1,
-            root_rules_scanned: false,
+            root_rules_scanned,
             root_round: 0,
             root_ranking_pending: false,
             root_ranking_question: None,
@@ -710,7 +742,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             validator_state: validator_port::ValidatorPortState::default(),
             last_legacy_full_snapshot: None,
             reciprocal: reciprocal_port::ReciprocalPortState::default(),
-        })
+        }
     }
     /// Explicit root-local diagnostic opt-in before the first observed call.
     /// No callback, worker, acceptance or coordinator-transition authority.
@@ -1183,8 +1215,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if !self.root_move_allowed(movement) {
             return Err(RoleError::InvalidOutput.into());
         }
-        let child = self.connect_hot(self.root, movement)?;
         let prefix = vec![movement];
+        let child = self.replay_node(&prefix)?;
         let stage = if self.engine.config.line_plies <= 1
             || self.engine.semantic.nodes[child].terminal.is_some()
         {
@@ -1648,12 +1680,21 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        let root = &self.engine.semantic.nodes[self.root].position;
-        let mut replay = root.clone();
-        for movement in &query.context.prefix {
-            replay.make_move(*movement)?;
-        }
-        if !replay.snapshot().same_state(&query.position.snapshot()) {
+        let exact = if self.rovent_frontier().is_some() {
+            self.existing_checked_frontier_line(&query.context.prefix)?
+                .ok_or(crate::pals::rovent_frontier::FrontierError::Invalid(
+                    "question prefix has no original charged Rules path",
+                ))?
+                .endpoint_snapshot()
+                .clone()
+        } else {
+            let mut replay = self.engine.semantic.nodes[self.root].position.clone();
+            for movement in &query.context.prefix {
+                replay.make_move(*movement)?;
+            }
+            replay.snapshot()
+        };
+        if !exact.same_state(&query.position.snapshot()) {
             return Err(ReviewError::AnchorMismatch.into());
         }
         Ok(())
@@ -1834,6 +1875,15 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     }
 
     fn divergence_indices(&self, line: &[BoardMove]) -> Result<Vec<usize>, PalsError> {
+        let checked = if self.rovent_frontier().is_some() {
+            Some(self.existing_checked_frontier_line(line)?.ok_or(
+                crate::pals::rovent_frontier::FrontierError::Invalid(
+                    "divergence line has no original charged Rules path",
+                ),
+            )?)
+        } else {
+            None
+        };
         let mut replay = self.engine.semantic.nodes[self.root].position.clone();
         let color = replay.side_to_move();
         let mut indices = Vec::new();
@@ -1843,7 +1893,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             {
                 indices.push(ply);
             }
-            replay.make_move(*movement)?;
+            if let Some(checked) = &checked {
+                replay =
+                    Position::from_snapshot(checked.steps()[ply].snapshot(), Default::default())?;
+            } else {
+                replay.make_move(*movement)?;
+            }
         }
         Ok(indices)
     }
@@ -1913,6 +1968,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         Ok(engine.semantic.nodes.len() - 1)
     }
     fn connect_hot(&mut self, parent: usize, movement: BoardMove) -> Result<usize, PalsError> {
+        if self.rovent_frontier().is_some() {
+            return Err(crate::pals::rovent_frontier::FrontierError::Invalid(
+                "uncharged hot connection under original frontier",
+            )
+            .into());
+        }
         if let Some(edge) = self.engine.semantic.nodes[parent]
             .edges
             .iter()
@@ -1930,6 +1991,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         Ok(child)
     }
     fn replay_node(&mut self, prefix: &[BoardMove]) -> Result<usize, PalsError> {
+        if self.rovent_frontier().is_some() {
+            return self.replay_checked_frontier(prefix);
+        }
         let mut node = self.root;
         for movement in prefix {
             node = self.connect_hot(node, *movement)?;
