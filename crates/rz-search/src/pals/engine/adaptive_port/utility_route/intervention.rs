@@ -3,6 +3,7 @@
 use super::*;
 use crate::pals::coordinator::UtilityInterventionReadySource;
 use crate::pals::review_context::ReviewQuerySequences;
+use rz_contracts::pals::Move16 as ContractMove16;
 
 pub const UTILITY_INTERVENTION_TARGET_DOMAIN: &str = "rz-rovent-utility-intervention-target/1";
 
@@ -130,7 +131,7 @@ impl<Q> UtilityInterventionTarget<Q> {
     pub fn record_scope_digest(&self) -> ContractDigest {
         ContractDigest(self.source.work().input.view.record_scope_digest())
     }
-    pub fn first_move(&self) -> Move16 {
+    pub fn first_move(&self) -> ContractMove16 {
         self.source.work().original_first_move
     }
     pub fn budget(&self) -> FrameBudget {
@@ -189,7 +190,7 @@ impl<Q> UtilityInterventionCandidate<Q> {
     pub fn input(&self) -> &FrameInput<ReviewView, Q> {
         &self.input
     }
-    pub fn first_move(&self) -> Move16 {
+    pub fn first_move(&self) -> ContractMove16 {
         self.target.first_move()
     }
     pub fn budget(&self) -> FrameBudget {
@@ -268,7 +269,7 @@ impl<Q> UtilityInterventionAdmission<Q> {
     pub fn record_scope_digest(&self) -> ContractDigest {
         self.target.record_scope_digest()
     }
-    pub fn first_move(&self) -> Move16 {
+    pub fn first_move(&self) -> ContractMove16 {
         self.target.first_move()
     }
     pub fn budget(&self) -> FrameBudget {
@@ -318,7 +319,7 @@ pub(super) struct UtilityInterventionSource {
 /// cannot itself prevent the original Store from reaching pin zero.
 struct UtilityInterventionWorkSource {
     frame: FrameId,
-    first: Move16,
+    first: ContractMove16,
     deadline: Deadline,
     budget: FrameBudget,
     stage: RefinementStage,
@@ -966,7 +967,7 @@ mod tests {
         let mut machine = Machine::new(port.authority, port.deadline, 512).unwrap();
         let frame = machine
             .admit(
-                Move16::pack(line[0]).unwrap(),
+                ContractMove16::encode(rz_contracts::Move::try_from(line[0]).unwrap()),
                 input,
                 budget,
                 port.deadline.clock,

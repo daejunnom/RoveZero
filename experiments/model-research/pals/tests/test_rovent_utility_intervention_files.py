@@ -156,4 +156,3 @@ class InterventionFilesTests(unittest.TestCase):
                 self.skipTest("hardlink creation unavailable")
             with self.assertRaises(ValueError):
                 files.read_intervention_files(reference, read_accounting=budget())
-

@@ -76,4 +76,3 @@ class InterventionProfileTests(unittest.TestCase):
             value["input"][key] = invalid
             with self.subTest(key=key, invalid=invalid), self.assertRaises(ValueError):
                 intervention.validate_intervention_profile(value)
-
