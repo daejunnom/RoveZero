@@ -28,6 +28,7 @@ fn main() -> std::process::ExitCode {
                     "teacher_failure_count":receipt.teacher_failure_count,
                     "historical_data":receipt.historical_dataset.observation(),
                     "resource":resource,"r_data":r_data,"r_sidecars":receipt.r_sidecars,
+                    "utility_root_local_files":receipt.utility_root_local_files,
                     "training_executed":false}),
                 ))
             }

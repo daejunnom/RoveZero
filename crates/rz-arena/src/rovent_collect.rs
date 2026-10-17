@@ -1100,6 +1100,10 @@ pub use r_semantic::*;
 mod r_unsubmitted;
 #[cfg(feature = "pals-collection-onnx")]
 pub use r_unsubmitted::*;
+#[cfg(feature = "pals-collection-onnx")]
+mod utility_owner;
+#[cfg(feature = "pals-collection-onnx")]
+pub use utility_owner::*;
 mod r_publication;
 pub use r_publication::*;
 mod r_writer;

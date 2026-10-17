@@ -38,6 +38,7 @@ use std::{
 pub const ROVENT_COLLECTION_LAUNCH_PLAN: &str = "rz-rovent-collection-launch/1";
 mod r_stream;
 mod resources;
+mod utility_stream;
 pub use r_stream::{RoventRCollectionAncestor, RoventRCollectionPlan};
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
 
@@ -352,6 +353,7 @@ struct CollectionCaller {
     plan: RoventCollectionLaunchPlan,
     resource: resources::CollectionResourceCustody,
     r: Option<r_stream::RStream>,
+    utility: utility_stream::UtilityRootLocalStream,
     unmatched_r_retirement: Option<
         rz_uci::pals_adaptive::AdaptiveCpuSemanticRetirement<
             rz_search::pals::engine::adaptive_port::AdaptivePortQuestion,
@@ -378,6 +380,26 @@ struct CollectionCaller {
 }
 
 impl CollectionCaller {
+    fn utility_completed(
+        &mut self,
+        actual: &Arc<rz_uci::pals_adaptive::CompletedUtilityRouteAction>,
+        source: Arc<rz_uci::rovent_bootstrap::nnuec_source::LoadedRoventNnuecSource>,
+    ) -> Result<(), ArenaError> {
+        let admission = self
+            .closed
+            .iter()
+            .find(|root| root.admission.authority() == actual.id().authority())
+            .map(|root| root.admission.clone())
+            .ok_or_else(|| invalid("utility completed action has no original closed root"))?;
+        self.utility.completed(
+            actual,
+            admission,
+            source,
+            &self.directory,
+            Duration::from_millis(self.plan.publication_timeout_ms),
+            &self.cancellation,
+        )
+    }
     fn admit(&mut self, admission: RoventCollectionRootAdmission) -> Result<(), ArenaError> {
         check(
             self.failure.is_none()
@@ -718,6 +740,7 @@ pub struct RoventCollectionLaunchReceipt {
     pub r_datasets:
         Vec<Arc<crate::rovent_training_process::recovery::VerifiedRoventRAuxiliaryDataset>>,
     pub r_sidecars: Vec<RoventTrainingFilePin>,
+    pub utility_root_local_files: Vec<RoventTrainingFilePin>,
     original: Arc<Mutex<CollectionCaller>>,
 }
 impl RoventCollectionLaunchReceipt {
@@ -823,6 +846,7 @@ pub fn run_rovent_collection(
     let shared = Arc::new(Mutex::new(CollectionCaller {
         plan: plan.clone(),
         r,
+        utility: utility_stream::UtilityRootLocalStream::default(),
         unmatched_r_retirement: None,
         resource: resources::CollectionResourceCustody::prepare(
             input_directory,
@@ -909,6 +933,23 @@ pub fn run_rovent_collection(
                 }
                 _ => None,
             };
+            let utility_caller = Arc::clone(&original);
+            let utility_route_completed = r_source.clone().map(|source| {
+                Arc::new(
+                    move |actual: &Arc<rz_uci::pals_adaptive::CompletedUtilityRouteAction>| {
+                        hook(&utility_caller, |state| {
+                            state.utility_completed(actual, Arc::clone(&source))
+                        })
+                    },
+                )
+                    as Arc<
+                        dyn Fn(
+                                &Arc<rz_uci::pals_adaptive::CompletedUtilityRouteAction>,
+                            ) -> Result<(), AdaptiveManagerError>
+                            + Send
+                            + Sync,
+                    >
+            });
             match native {
                 RoventCollectionPreparedNative::Pc(prepared) => {
                     let hooks = RoventPcCollectionHooks {
@@ -988,7 +1029,7 @@ pub fn run_rovent_collection(
                             })
                         })),
                         external_teacher: None,
-                        utility_route_completed: None,
+                        utility_route_completed,
                         cooperative: Some(poll),
                     };
                     match native {
@@ -1139,6 +1180,7 @@ pub fn run_rovent_collection(
                 .as_ref()
                 .map(|stream| stream.sidecars())
                 .unwrap_or_default(),
+            utility_root_local_files: state.utility.files(&state.plan.output_directory),
             original: Arc::clone(&shared),
         })
     };
