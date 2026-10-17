@@ -14,6 +14,7 @@ from .generation_data import digest, fields, identifier, sha, uint
 from .rovent_utility_cohort_files import (HistoricalUtilityCohortFiles,
     PUBLICATION_FILE, ACK_FILE, COST_SCOPE, read_utility_cohort_files)
 from .rovent_utility_input import SubmittedUtilityInputObservation, validate_submitted_utility_input
+from .rovent_native_v2 import _artifact
 from .rovent_utility_training import (COHORT_PREPARATION_DOMAIN,
     normalize_known_pairs, validate_training_preparation)
 
@@ -137,10 +138,9 @@ def _report(value, captured, preparation, publication):
         if source["role"] not in ("proposer", "critic") or source["role"] in roles:
             raise ValueError("distinct original proposer and critic source roles required")
         roles.add(source["role"])
-        artifact = fields(source["artifact"], ("path", "sha256", "bytes"), "original frozen P/C raw artifact")
-        if type(artifact["path"]) is not str or not artifact["path"] or not uint(artifact["bytes"]):
-            raise ValueError("bounded original frozen P/C artifact required")
-        sha(artifact["sha256"])
+        # Collection preserves ArtifactRef provenance as well as raw file pins.
+        # The execution registration separately supplies an exact FilePin.
+        _artifact(source["artifact"])
         for key in ("model_semantics_sha256", "model_identity_sha256", "encoding_sha256"):
             sha(source[key])
     return copy.deepcopy(value)

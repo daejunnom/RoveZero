@@ -32,6 +32,7 @@ _guard = NeuralImportsForbidden()
 sys.meta_path.insert(0, _guard)
 try:
     from rz_pals_model import rovent_utility_tensor_training as tensors
+    from rz_pals_model import rovent_utility_training_run as run
     from rz_pals_model import rovent_utility_training as training
     from rz_pals_model.generation_data import digest
 finally:

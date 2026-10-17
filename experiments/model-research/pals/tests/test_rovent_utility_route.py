@@ -110,7 +110,8 @@ def report_fixture(files, captured, prepared, *, split="train", ancestors=(), an
         "submission_target_sha256": captured.submission_target_sha256, "utility_context_sha256": captured.context_sha256,
         "known_pairs": [[6, 4], [5, 4]], "known_pair_sha256": [all_pairs[2], all_pairs[0]], "all_pair_sha256": all_pairs,
         "frozen_pc_sources": [{"role": role, "artifact": {"path": "/synthetic-only/" + role + ".onnx",
-            "sha256": seal(role + ":raw-file"), "bytes": 37}, "model_semantics_sha256": seal(role + ":semantics"),
+            "sha256": seal(role + ":raw-file"), "bytes": 37, "source": "synthetic-only",
+            "license": "synthetic-only"}, "model_semantics_sha256": seal(role + ":semantics"),
             "model_identity_sha256": seal(role + ":identity"), "encoding_sha256": seal(role + ":encoding")}
             for role in ("critic", "proposer")],
         "split": split, "opening_id": label + "-opening", "game_id": label + "-game",
@@ -365,6 +366,9 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
                        lambda sources: sources[0].update(role="validator"),
                        lambda sources: sources[0].update(extra="unknown"),
                        lambda sources: sources[0]["artifact"].update(bytes=True),
+                       lambda sources: sources[0]["artifact"].pop("source"),
+                       lambda sources: sources[0]["artifact"].update(license=""),
+                       lambda sources: sources[0]["artifact"].update(extra="unknown"),
                        lambda sources: sources[0].update(encoding_sha256="bad")):
             report = copy.deepcopy(original)
             mutate(report["frozen_pc_sources"])
