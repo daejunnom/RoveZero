@@ -22,6 +22,34 @@ fn validator_write_bytes(hash: &mut Sha256, bytes: &[u8]) {
     hash.update((bytes.len() as u64).to_le_bytes());
     hash.update(bytes);
 }
+fn validator_write_profiled_constraint(
+    hash: &mut Sha256,
+    constraint: crate::pals::store::ProfiledExternalConstraint,
+) {
+    use crate::pals::store::ProfiledExternalConstraint as Limit;
+    match constraint {
+        Limit::Combined {
+            depth,
+            reported_nodes,
+        } => {
+            hash.update([0]);
+            hash.update(depth.to_le_bytes());
+            hash.update(reported_nodes.to_le_bytes());
+        }
+        Limit::Nodes { reported_nodes } => {
+            hash.update([1]);
+            hash.update(reported_nodes.to_le_bytes());
+        }
+        Limit::Depth { depth } => {
+            hash.update([2]);
+            hash.update(depth.to_le_bytes());
+        }
+        Limit::MoveTime { milliseconds } => {
+            hash.update([3]);
+            hash.update(milliseconds.to_le_bytes());
+        }
+    }
+}
 fn validator_write_moves(hash: &mut Sha256, moves: &[BoardMove]) -> Result<(), PalsError> {
     hash.update((moves.len() as u64).to_le_bytes());
     for movement in moves {
@@ -1058,6 +1086,28 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             return Err(PalsError::Capacity);
         }
         let obs = self.engine.semantic.stores.observations.get(id)?;
+        // Legacy witness bytes stay unchanged. This new domain includes both
+        // the submitted single-limit meaning and the actual issued clamp;
+        // neither may be reconstructed by relabeling an existing TaskKey.
+        if let EvidenceScope::ProfiledExternalUci {
+            requested,
+            issued,
+            reported_depth,
+            seldepth,
+            bound,
+        } = obs.scope
+        {
+            hash.update(b"rz-validator-profiled-external-observation/1\0");
+            validator_write_profiled_constraint(hash, requested);
+            validator_write_profiled_constraint(hash, issued);
+            for depth in [reported_depth, seldepth] {
+                hash.update([u8::from(depth.is_some())]);
+                if let Some(depth) = depth {
+                    hash.update(depth.to_le_bytes());
+                }
+            }
+            hash.update([bound as u8]);
+        }
         hash.update([obs.kind as u8]);
         hash.update(
             rz_position::contracts::rules_snapshot_semantic_digest(
@@ -1553,6 +1603,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     && execution.epoch == self.authority.epoch
                     && !self.external_action_committed(work.input.question_digest, job, execution)
             }
+            StepExecution::ProfiledExternal { .. } => {
+                return Err(
+                    RoleError::Unsupported("profiled R has no legacy V action witness").into(),
+                );
+            }
         };
         if tracking.frame != Some(work.frame)
             || tracking.first != work.original_first_move
@@ -1670,6 +1725,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     raw.update(job.sequence.to_le_bytes());
                     raw.update(execution.sequence.to_le_bytes());
                 }
+                StepExecution::ProfiledExternal { .. } => {
+                    return Err(RoleError::Unsupported(
+                        "profiled R has no legacy V action witness",
+                    )
+                    .into());
+                }
             }
             raw.update(identity.0);
             raw.update((sequence as u64).to_le_bytes());
@@ -1695,6 +1756,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             StepExecution::Role(id) => tracking.role_requests.contains(&id),
             StepExecution::Cpu { execution, .. } | StepExecution::ExternalCpu { execution, .. } => {
                 tracking.executions.contains(&execution)
+            }
+            StepExecution::ProfiledExternal { .. } => {
+                return Err(
+                    RoleError::Unsupported("profiled R has no legacy V action witness").into(),
+                );
             }
         };
         let new_count = witnesses
@@ -1733,6 +1799,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 if !tracking.executions.insert(execution) {
                     return Err(RoleError::InvalidOutput.into());
                 }
+            }
+            StepExecution::ProfiledExternal { .. } => {
+                return Err(
+                    RoleError::Unsupported("profiled R has no legacy V action witness").into(),
+                );
             }
         }
         for witness in witnesses {

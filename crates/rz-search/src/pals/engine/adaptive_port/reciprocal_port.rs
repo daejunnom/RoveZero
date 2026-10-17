@@ -558,6 +558,36 @@ impl AdaptiveAcceptedReciprocalAnswer {
 }
 
 impl<M: RoleModel> AdaptiveEnginePort<M> {
+    /// Preserve an already-issued peer R question instead of replacing its
+    /// parent/origin with an unrelated local descriptor for an external job.
+    pub(super) fn profiled_reciprocal_question(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<Option<QuestionEnvelope>, PalsError> {
+        let Some(pending) = self
+            .reciprocal
+            .pending
+            .values()
+            .find(|pending| pending.envelope.question_digest == work.input.question_digest)
+        else {
+            return Ok(None);
+        };
+        if pending.request.is_some()
+            || pending.envelope.recipient != SearchRecipient::Researcher
+            || pending.envelope.original_first_move != Some(work.original_first_move)
+            || pending.envelope.original_deadline != work.original_deadline
+            || pending.input.view_seal != work.input.view_seal
+            || !Arc::ptr_eq(&pending.input.question, &work.input.question)
+            || !Arc::ptr_eq(&pending.input.view, &work.input.view)
+            || !pending
+                .anchor
+                .snapshot()
+                .same_state(&work.input.question.position.snapshot())
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        Ok(Some(pending.envelope))
+    }
     pub fn accepted_source_opinion(
         &self,
         request: RequestId,

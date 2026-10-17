@@ -3,10 +3,16 @@
 //! the synchronous RoleModel compatibility driver for native inference.
 
 use super::configuration::{ExecutionConfiguration, ResearchValueConfiguration};
-use super::nnuec_session::{RoventNnuecSessionDriver, RoventNnuecSessionRejection};
+use super::external_session::{RoventExternalProductStartupRejection, external_researcher_session};
+use super::nnuec_session::{
+    RoventNnuecCollectionHooks, RoventNnuecSessionDriver, RoventNnuecSessionRejection,
+};
 use super::nnuec_source::LoadedRoventNnuecSource;
 use super::pc_session::{RoventPcCollectionHooks, RoventPcSessionDriver};
-use super::{PreparedRoventNative, RoventNativeBackend, RoventPinnedNativeSources};
+use super::{
+    PreparedRoventNative, RoventNativeBackend, RoventPinnedExternalRSource,
+    RoventPinnedNativeSources,
+};
 use crate::EngineIdentity;
 use crate::engine::{OwnerRegistry, ProcessClock};
 use crate::pals_adaptive::{
@@ -63,6 +69,7 @@ pub enum RoventProductStartupOwners {
     PcrRejected(AdaptiveSessionAdmissionRejection<RoventNativeBackend<AdaptivePortQuestion>>),
     PcrDriver(Box<PcrDriver>),
     NnuecRejected(Box<RoventNnuecSessionRejection>),
+    ExternalRejected(Box<RoventExternalProductStartupRejection>),
 }
 pub struct RoventProductStartupRejection {
     pub failure: SearchSessionFailure,
@@ -72,6 +79,40 @@ pub struct RoventProductStartupRejection {
 }
 
 impl RoventNativeProductDriver {
+    /// The external source stays dormant until an actual live root admission.
+    /// It never creates a native CPU checker or substitutes an own-R engine.
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
+    pub fn external_pcr(
+        prepared: PreparedRoventNative<AdaptivePortQuestion>,
+        external: RoventPinnedExternalRSource,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        hooks: Option<AdaptiveSessionCollectionHooks<RoventNativeBackend<AdaptivePortQuestion>>>,
+    ) -> Result<Self, RoventProductStartupRejection> {
+        let sources = Arc::clone(prepared.sources());
+        let driver = external_researcher_session(
+            prepared,
+            external,
+            clock,
+            owners,
+            identity,
+            root_policy,
+            hooks,
+        )
+        .map_err(|rejected| RoventProductStartupRejection {
+            failure: rejected.failure.clone(),
+            owners: RoventProductStartupOwners::ExternalRejected(Box::new(rejected)),
+            sources: Arc::clone(&sources),
+        })?;
+        Ok(Self {
+            inner: Arc::new(ActualProductDriver::Pcr(driver)),
+            sources,
+            physically_closed: AtomicBool::new(false),
+        })
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn own_nnuec_pcr(
         prepared: PreparedRoventNative<AdaptivePortQuestion>,
@@ -95,6 +136,38 @@ impl RoventNativeProductDriver {
             physically_closed: AtomicBool::new(false),
         })
     }
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
+    pub fn own_nnuec_pcr_with_collection_hooks(
+        prepared: PreparedRoventNative<AdaptivePortQuestion>,
+        loaded: LoadedRoventNnuecSource,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        hooks: RoventNnuecCollectionHooks,
+    ) -> Result<Self, RoventProductStartupRejection> {
+        let sources = Arc::clone(prepared.sources());
+        let driver = RoventNnuecSessionDriver::new_with_collection_hooks(
+            prepared,
+            loaded,
+            clock,
+            owners,
+            identity,
+            root_policy,
+            Some(hooks),
+        )
+        .map_err(|rejected| RoventProductStartupRejection {
+            failure: rejected.failure.clone(),
+            owners: RoventProductStartupOwners::NnuecRejected(Box::new(rejected)),
+            sources: Arc::clone(&sources),
+        })?;
+        Ok(Self {
+            inner: Arc::new(ActualProductDriver::Nnuec(driver)),
+            sources,
+            physically_closed: AtomicBool::new(false),
+        })
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn pc(
         prepared: PreparedRoventNative<PcPortQuestion>,

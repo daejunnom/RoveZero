@@ -1466,6 +1466,22 @@ impl<M: RoleModel> PcSemanticPort<M> {
         kind: RecordKind,
         moves: &[BoardMove],
     ) -> Result<PublishedPcLine, PalsError> {
+        self.publish_pc_repair_line_inner(kind, moves, None)
+    }
+    fn publish_pc_repair_line_with_relations(
+        &mut self,
+        kind: RecordKind,
+        moves: &[BoardMove],
+        relations: repair_cycle::PcLineRelations,
+    ) -> Result<PublishedPcLine, PalsError> {
+        self.publish_pc_repair_line_inner(kind, moves, Some(relations))
+    }
+    fn publish_pc_repair_line_inner(
+        &mut self,
+        kind: RecordKind,
+        moves: &[BoardMove],
+        relations: Option<repair_cycle::PcLineRelations>,
+    ) -> Result<PublishedPcLine, PalsError> {
         let root = &self.owner.semantic.nodes[self.root];
         let root_state = root.state;
         let root_situation = root.situation;
@@ -1503,6 +1519,56 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 r.origin_state == root_state && r.line.first() == moves.first() && r.kind == kind
             })
             .map(|r| r.revision);
+        // Actual cycle publication names its own accepted lineage. Ordinary
+        // lanes retain the legacy latest-record selection above.
+        let (parent_revision, supersedes_revision, supersedes_observation) =
+            if let Some(relations) = relations {
+                for (relation, parent) in [(relations.parent, true), (relations.supersedes, false)]
+                {
+                    let Some(relation) = relation else { continue };
+                    let record = self
+                        .owner
+                        .semantic
+                        .records
+                        .iter()
+                        .find(|record| record.revision == relation.revision)
+                        .ok_or(StoreError::StaleConsumer)?;
+                    let observation = self
+                        .owner
+                        .semantic
+                        .stores
+                        .observations
+                        .get(relation.observation)?;
+                    if record.origin_state != root_state
+                        || record.kind != relation.kind
+                        || record.line.first() != moves.first()
+                        || self.owner.semantic.stores.lines.moves(relation.line)? != record.line
+                        || observation.state != root_state
+                        || observation.line != Some(relation.line)
+                        || if parent {
+                            match kind {
+                                RecordKind::Counterexample => !matches!(
+                                    record.kind,
+                                    RecordKind::Proposal | RecordKind::Repair
+                                ),
+                                RecordKind::Repair => record.kind != RecordKind::Counterexample,
+                                _ => true,
+                            }
+                        } else {
+                            record.kind != kind
+                        }
+                    {
+                        return Err(StoreError::InvalidEvidence("actual PC Repair lineage").into());
+                    }
+                }
+                (
+                    relations.parent.map(|line| line.revision),
+                    relations.supersedes.map(|line| line.revision),
+                    relations.supersedes.map(|line| line.observation),
+                )
+            } else {
+                (parent_revision, supersedes_revision, None)
+            };
         let focus = self
             .owner
             .semantic
@@ -1541,7 +1607,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
                     RecordKind::Repair => ObservationKind::Repair,
                     RecordKind::CpuVerification => return Err(RoleError::InvalidOutput.into()),
                 },
-                supersedes: None,
+                supersedes: supersedes_observation,
                 execution: None,
             })?;
         self.owner

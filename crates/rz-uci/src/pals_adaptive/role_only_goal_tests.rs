@@ -257,21 +257,38 @@ fn close_and_recover(mut manager: ActualGoalManager, until: Instant) -> RoleOnly
     let mut sources = manager
         .into_sources()
         .unwrap_or_else(|(_, error)| panic!("actual PC fence: {error}"));
-    let frontier = sources
-        .driver
-        .inner
-        .port_mut()
-        .retire_rovent_frontier()
-        .unwrap()
-        .unwrap();
-    let port = sources
+    // These fixture-only observations retain original views. Drop them only
+    // after the real native fence, before checking semantic pin retirement.
+    sources.driver.submitted.clear();
+    let mut port = sources
         .driver
         .inner
         .into_port(&receipt)
-        .unwrap_or_else(|(_, error)| panic!("PC after Frontier retirement: {error}"));
+        .unwrap_or_else(|(_, error)| panic!("PC after actual owner fence: {error}"));
     assert_eq!(std::mem::size_of_val(port.researcher()), 0);
+    let repair = port.take_repair_report().unwrap();
+    if let Some(report) = &repair {
+        assert_eq!(report.authority(), receipt.authority);
+        assert_eq!(report.root_budget(), receipt.root_budget);
+    }
+    let frontier = port.retire_rovent_frontier().unwrap().unwrap();
     assert_eq!(frontier.snapshot.work.native_nodes, 0);
     assert_eq!(frontier.snapshot.work.reserved_native_nodes, 0);
+    let mut owner = port.into_owner();
+    assert!(owner.retired_repair_report().is_none());
+    assert_eq!(owner.stores().review_pin_count().unwrap(), 0);
+    let next = SearchAuthority {
+        root: RootGeneration(receipt.authority.root.0 + 1),
+        ..receipt.authority
+    };
+    let registration = owner
+        .register_adaptive_root(&Position::startpos(), next)
+        .unwrap();
+    owner.abandon_unconsumed_adaptive_root(next).unwrap();
+    drop(registration);
+    // A recovered report is separate historical custody; it did not grant the
+    // actual fence or the next root and must not retain an old review lease.
+    drop(repair);
     sources.native.begin_shutdown(until);
     while !sources.native.try_join().unwrap() {
         assert!(Instant::now() < until, "actual native owner join timed out");

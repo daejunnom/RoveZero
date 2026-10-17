@@ -10,6 +10,7 @@ use crate::rovent_external_launch::{RoventExternalOwner, VerifiedRoventExternalS
 use crate::rovent_root_admission::RoventRootAdmission;
 use rz_contracts::pals::SearchAuthority;
 use rz_contracts::pals_adaptive::CpuWorkerId;
+use rz_eval::error::FailureKind;
 use rz_experiments::RoventExternalPurpose;
 use rz_runtime::CompletionSignal;
 use rz_runtime::adaptive::ControlMailbox;
@@ -17,13 +18,13 @@ use rz_runtime::contracts::ContractClock;
 use rz_search::cpu_checker::{CheckerError, CheckerShutdown};
 use rz_search::external_cpu::worker::ExternalWorkerStartup;
 use rz_search::external_cpu::{
-    ExternalCpuConfig, ExternalEnginePurpose, ProfiledExternalCompletion,
+    ExternalCpuConfig, ExternalEnginePurpose, ExternalGoConstraint, ProfiledExternalCompletion,
     ProfiledExternalCurrentRootFence, ProfiledExternalDiagnostics, ProfiledExternalDispatch,
     ProfiledExternalJob, ProfiledExternalProgress, ProfiledExternalRootSource,
     ProfiledExternalScope,
 };
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
@@ -109,6 +110,8 @@ pub struct ProfiledExternalManagerSource {
     root: Arc<RoventRootAdmission>,
     startup: VerifiedRoventExternalStartup,
     configuration: ExternalCpuConfig,
+    question_constraint: ExternalGoConstraint,
+    soft_quantum: Duration,
     source: ProfiledExternalRootSource,
     pending: Option<Pending>,
     next_root: Option<Arc<RoventRootAdmission>>,
@@ -134,6 +137,17 @@ impl ProfiledExternalManagerSource {
             {
                 return Err(invalid("profiled R original source purpose/lock differs"));
             }
+            // This policy comes only from the same original /3 startup source.
+            // Legacy sources have no implicit limit, and profile capabilities
+            // never manufacture or narrow the registered requested constraint.
+            let (question_constraint, soft_quantum) =
+                custody
+                    .question_policy()
+                    .map_err(|error| match error.kind {
+                        FailureKind::UnsupportedModel => CheckerError::Unsupported(error.detail),
+                        _ => invalid(error.detail),
+                    })?;
+            owner.launch().require_query(question_constraint, false)?;
             let startup = owner
                 .verified_startup()?
                 .ok_or(invalid("profiled R actual startup is pending"))?;
@@ -150,15 +164,23 @@ impl ProfiledExternalManagerSource {
                 .current_root_source()?
                 .ok_or(invalid("profiled R current root source is pending"))?;
             validate_source(&owner, &root, &startup, &configuration, &source)?;
-            Ok((startup, configuration, source))
+            Ok((
+                startup,
+                configuration,
+                question_constraint,
+                soft_quantum,
+                source,
+            ))
         })();
         match checked {
-            Ok((startup, configuration, source)) => Ok(Self {
+            Ok((startup, configuration, question_constraint, soft_quantum, source)) => Ok(Self {
                 owner,
                 custody,
                 root,
                 startup,
                 configuration,
+                question_constraint,
+                soft_quantum,
                 source,
                 pending: None,
                 next_root: None,
@@ -189,6 +211,14 @@ impl ProfiledExternalManagerSource {
 
     pub fn configuration(&self) -> &ExternalCpuConfig {
         &self.configuration
+    }
+
+    pub fn question_constraint(&self) -> ExternalGoConstraint {
+        self.question_constraint
+    }
+
+    pub fn soft_quantum(&self) -> Duration {
+        self.soft_quantum
     }
 
     pub fn worker_owner(&self) -> CpuWorkerId {
@@ -224,6 +254,11 @@ impl ProfiledExternalManagerSource {
     ) -> Result<ProfiledExternalDispatch, CheckerError> {
         if self.phase != Phase::Running || self.pending.is_some() || self.next_root.is_some() {
             return Err(invalid("profiled R source is closed or has pending work"));
+        }
+        if job.constraint != self.question_constraint || job.soft_quantum != self.soft_quantum {
+            return Err(invalid(
+                "profiled R requested question policy differs from original source",
+            ));
         }
         self.source.validate_current()?;
         if job.owner != self.source.worker_owner()

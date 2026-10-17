@@ -207,6 +207,10 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 include_str!("engine/pc_port/repair_cycle.rs"),
             ),
             (
+                "pals/engine/pc_port/repair_followup.rs",
+                include_str!("engine/pc_port/repair_followup.rs"),
+            ),
+            (
                 "pals/engine/pc_port/repair_witness.rs",
                 include_str!("engine/pc_port/repair_witness.rs"),
             ),
@@ -1820,6 +1824,14 @@ impl<M: RoleModel> PalsEngine<M> {
     }
     pub fn stores(&self) -> &PalsStores {
         &self.semantic.stores
+    }
+    /// Historical, unclaimed external work follows this exact Store owner.
+    /// Unknown accounting stays unknown; this does not certify root cleanup.
+    pub fn retired_profiled_external_host_bytes(&self) -> Option<u64> {
+        self.semantic
+            .retired_profiled_external
+            .as_ref()
+            .map_or(Some(0), |custody| custody.owned_host_bytes())
     }
     /// Derived neural cache eviction does not remove raw CPU/Rules observations.
     pub fn evict_derived_cache(&mut self) -> usize {

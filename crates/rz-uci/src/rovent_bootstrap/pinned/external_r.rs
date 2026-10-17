@@ -5,13 +5,19 @@
 //! owner must retain the returned custody through physical worker cleanup.
 
 use super::{PinnedBlob, RoventPinnedNativeSources, open_blob, read_blob};
+use crate::pals_checker_profile::rovent::RoventExternalProfile;
+use crate::rovent_bootstrap::configuration::ExecutionConfiguration;
 use crate::rovent_bootstrap::{RoventStartupControl, fail};
 use crate::rovent_external_launch::{PreparedRoventExternalLaunch, RoventExternalSlot};
 use rz_contracts::Digest;
 use rz_eval::error::{BackendError, FailureKind as K};
 use rz_experiments::{ArtifactRef, RoventExternalPurpose, RoventResearcher};
+use rz_search::cpu_checker::CheckerError;
+use rz_search::external_cpu::{
+    EXTERNAL_MIN_QUANTUM, EXTERNAL_STOP_DRAIN_RESERVE, ExternalEnginePurpose, ExternalGoConstraint,
+};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, fs::File, path::Path, sync::Arc};
+use std::{collections::BTreeSet, fs::File, path::Path, sync::Arc, time::Duration};
 
 const PROFILE_MAX: usize = 256 << 10;
 const BINARY_MAX: u64 = 256 << 20;
@@ -40,6 +46,7 @@ pub struct RoventPinnedExternalRSource {
     original: Arc<RoventPinnedNativeSources>,
     purpose: RoventExternalPurpose,
     prepared: PreparedRoventExternalLaunch,
+    source_profile: RoventExternalProfile,
     original_profile_bytes: Vec<u8>,
     profile: PinnedBlob,
     binary: PinnedBlob,
@@ -52,6 +59,7 @@ pub struct RoventPinnedExternalRSource {
 pub struct RoventExternalRSourceCustody {
     original: Arc<RoventPinnedNativeSources>,
     purpose: RoventExternalPurpose,
+    source_profile: RoventExternalProfile,
     _profile: PinnedBlob,
     _assets: Vec<(String, PinnedBlob)>,
 }
@@ -98,6 +106,7 @@ impl RoventPinnedExternalRSource {
         )
         .map_err(|_| invalid("original ExternalR profile/capability declaration differs"))?;
         let declaration = prepared.profile();
+        question_policy(original, declaration)?;
         if Path::new(&declaration.program) != original.private_root_path.join(&pin.binary.path)
             || Path::new(&declaration.working_directory)
                 != original
@@ -164,10 +173,12 @@ impl RoventPinnedExternalRSource {
             control.check()?;
         }
         control.check()?;
+        let source_profile = declaration.clone();
         Ok(Self {
             original: Arc::clone(original),
             purpose: pin.purpose,
             prepared,
+            source_profile,
             original_profile_bytes,
             profile,
             binary,
@@ -183,6 +194,18 @@ impl RoventPinnedExternalRSource {
     /// The actual original manifest pin's purpose, never a caller-set label.
     pub fn source_purpose(&self) -> RoventExternalPurpose {
         self.purpose
+    }
+
+    /// The immutable parsed declaration came from the original retained profile
+    /// bytes. It does not represent a worker's observed startup or liveness.
+    pub fn source_profile(&self) -> &RoventExternalProfile {
+        &self.source_profile
+    }
+
+    /// Exact /3 query selection and the original external slice quantum. No
+    /// limits are inferred from depth/node options or silently reduced.
+    pub fn question_policy(&self) -> Result<(ExternalGoConstraint, Duration), BackendError> {
+        question_policy(&self.original, &self.source_profile)
     }
 
     /// Move the original files to the actual worker owner without new IO,
@@ -204,6 +227,7 @@ impl RoventPinnedExternalRSource {
             RoventExternalRSourceCustody {
                 original: self.original,
                 purpose: self.purpose,
+                source_profile: self.source_profile,
                 _profile: self.profile,
                 _assets: self.assets,
             },
@@ -219,6 +243,64 @@ impl RoventExternalRSourceCustody {
     pub fn source_purpose(&self) -> RoventExternalPurpose {
         self.purpose
     }
+
+    pub fn source_profile(&self) -> &RoventExternalProfile {
+        &self.source_profile
+    }
+
+    /// Cheap revalidation over the original immutable configuration/profile;
+    /// the original profile and asset descriptors remain held without new IO.
+    pub fn question_policy(&self) -> Result<(ExternalGoConstraint, Duration), BackendError> {
+        question_policy(&self.original, &self.source_profile)
+    }
+}
+
+fn question_policy(
+    original: &RoventPinnedNativeSources,
+    profile: &RoventExternalProfile,
+) -> Result<(ExternalGoConstraint, Duration), BackendError> {
+    if profile.purpose != ExternalEnginePurpose::ResearchChecker {
+        return Err(invalid(
+            "original ExternalR profile has a different purpose",
+        ));
+    }
+    let configuration = original.configuration();
+    // Version dispatch preserves UnsupportedModel for /1 and /2 ExternalR.
+    let constraint = configuration
+        .external_question_limit()?
+        .ok_or_else(|| invalid("ExternalR source has no original external question selection"))?;
+    let fields = configuration.fields();
+    let ExecutionConfiguration::ExternalResearcher { slice, .. } = fields.execution else {
+        return Err(invalid("ExternalR source has no original external slice"));
+    };
+    let slice = slice.actual()?;
+    let quantum = slice.quantum;
+    profile
+        .require_query(
+            constraint,
+            original.lock.manifest.engine.search.searchmoves.is_some(),
+        )
+        .map_err(|error| match error {
+            CheckerError::Unsupported(detail) => fail(K::UnsupportedModel, detail),
+            CheckerError::Invalid(detail) => fail(K::InvalidInput, detail),
+            _ => invalid("original ExternalR query capability validation failed"),
+        })?;
+    let stop_grace = Duration::from_millis(profile.stop_grace_ms);
+    let task_wall = Duration::from_millis(profile.max_task_wall_time_ms);
+    let original_wall = Duration::from_millis(original.lock.manifest.wall_time_max_ms);
+    if quantum < EXTERNAL_MIN_QUANTUM
+        || quantum > Duration::from_secs(180)
+        || stop_grace < EXTERNAL_STOP_DRAIN_RESERVE
+        || quantum
+            .checked_add(stop_grace.max(slice.stop_drain_reserve))
+            .is_none_or(|required| required > task_wall || required > original_wall)
+    {
+        return Err(fail(
+            K::InvalidInput,
+            "original ExternalR quantum/stop/task-wall limits differ",
+        ));
+    }
+    Ok((constraint, quantum))
 }
 
 fn invalid(detail: &'static str) -> BackendError {

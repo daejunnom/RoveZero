@@ -195,6 +195,11 @@ impl ReviewView {
     pub fn query(&self) -> &ReviewQueryInput {
         &self.query
     }
+    /// Historical selected-input metadata only. This cannot select a bundle,
+    /// reconstruct a view pin or authorize another head consumption.
+    pub(crate) fn selected_bundle_ids(&self) -> &[u64] {
+        &self.bundles
+    }
     pub fn token_count(&self) -> u16 {
         self.tokens
     }
@@ -488,6 +493,7 @@ impl ReviewContextIndex {
             if !matches!(
                 observation.scope,
                 EvidenceScope::DepthLimited { .. }
+                    | EvidenceScope::ProfiledExternalUci { .. }
                     | EvidenceScope::ExternalUci { .. }
                     | EvidenceScope::RulesTerminal
             ) || !matches!(

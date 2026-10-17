@@ -23,6 +23,11 @@ pub struct RoventPeerFollowupPolicy {
     pub researcher: bool,
     pub max_sources_per_root: u16,
 }
+#[derive(Clone, Copy)]
+pub(super) struct RoventQuestionRouting {
+    mode: ExecutionMode,
+    root_budget: Digest,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerFollowupDisposition {
@@ -76,7 +81,7 @@ where
         self.check_running()?;
         if self.root_started
             || self.peer_policy.is_some()
-            || self.reciprocal_policy.is_none()
+            || self.reciprocal_routing.is_none()
             || !(policy.pc_peer || policy.researcher)
             || !(1..=64).contains(&policy.max_sources_per_root)
         {
@@ -169,9 +174,11 @@ where
         &mut self,
         held: &mut AcceptedRoleCustody<Q, B::Output>,
     ) -> Result<bool, AdaptiveManagerError> {
-        let config = self.reciprocal_policy.ok_or(AdaptiveManagerError::Invalid(
-            "accepted peer lost root registration",
-        ))?;
+        let config = self
+            .reciprocal_routing
+            .ok_or(AdaptiveManagerError::Invalid(
+                "accepted peer lost root registration",
+            ))?;
         let work = held
             .binding
             .work
@@ -435,7 +442,9 @@ where
     ) -> Result<(), AdaptiveManagerError> {
         self.check_running()?;
         if self.root_started
+            || self.researcher_source_kind() != AdaptiveResearcherSourceKind::Native
             || self.reciprocal_policy.is_some()
+            || self.reciprocal_routing.is_some()
             || !self.roles.is_empty()
             || self.own.iter().any(|slot| slot.binding.is_some())
             || self.foreign.is_some()
@@ -455,7 +464,43 @@ where
         self.machine
             .enable_reciprocal_questions(policy.mode, policy.root_budget)?;
         self.next_reciprocal_question = policy.first_question_sequence;
+        self.reciprocal_routing = Some(RoventQuestionRouting {
+            mode: policy.mode,
+            root_budget: policy.root_budget,
+        });
         self.reciprocal_policy = Some(policy);
+        Ok(())
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn configure_rovent_external_routing(
+        &mut self,
+        mode: ExecutionMode,
+        root_budget: Digest,
+        first_question_sequence: u64,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.check_running()?;
+        let source = self.researcher.profiled()?;
+        if self.root_started
+            || !self.roles.is_empty()
+            || self.reciprocal_routing.is_some()
+            || !mode.has_native_r()
+            || first_question_sequence == 0
+            || source.root_admission().root_budget_digest() != root_budget
+            || self.driver.rovent_root_budget()? != Some(root_budget)
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "profiled external original routing registration",
+            ));
+        }
+        self.driver.validate_profiled_external_registration(
+            source.current_source(),
+            source.root_admission(),
+        )?;
+        self.machine
+            .enable_reciprocal_questions(mode, root_budget)?;
+        self.next_reciprocal_question = first_question_sequence;
+        self.reciprocal_routing = Some(RoventQuestionRouting { mode, root_budget });
+        // There is no native callback policy, paused token or node interval.
         Ok(())
     }
 

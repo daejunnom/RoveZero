@@ -33,6 +33,8 @@ pub use adaptive::*;
 pub use profiled_researcher::ProfiledResearcherAdmission;
 pub use profiled_worker::*;
 pub use profiles::*;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use tests::FIXTURE_LOCK as EXTERNAL_FIXTURE_LOCK;
 
 pub const EXTERNAL_UCI_CHECKER_VERSION: &str = "rz-external-uci-checker/0.1";
 pub const EXTERNAL_UCI_SCORE_SEMANTICS: &str = "uci-native-cp-or-signed-mate-moves;root-side-to-move;reported-bounds;selectivity-unknown;no-cp-wdl-calibration;no-rules-proof";
@@ -2536,7 +2538,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(target_os = "linux")]
     fn fixture_mode(name: &str) -> bool {

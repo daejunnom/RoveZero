@@ -207,6 +207,8 @@ impl NnuecRootRetirementFailure {
 pub struct NnuecRootRetired {
     pub owner: ResearcherPreparingOwner<AdaptivePortModel>,
     pub actor: PreparationActor,
+    pub engine_release: NnuecEngineReleaseAck,
+    pub cache_release: NnuecCacheReleaseAck,
 }
 
 #[must_use = "pending and failure variants retain actual cleanup obligations"]
@@ -517,6 +519,8 @@ impl NnuecRootRetirement {
                         return NnuecRootRetirementStep::Ready(NnuecRootRetired {
                             owner: retired.owner,
                             actor,
+                            engine_release: retired.engine_release,
+                            cache_release: retired.cache_release,
                         });
                     }
                     Err(ResearcherRetirementRejection {

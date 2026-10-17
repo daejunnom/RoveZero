@@ -95,11 +95,53 @@ impl RoventFrontier {
         clock: ClockDomain,
         now: MonotonicTick,
     ) -> Result<FrontierExternalReservation, FrontierError> {
+        self.preflight_external_dispatch(source, clock, now)?;
+        self.record_observed_external_dispatch(source, dispatch)
+    }
+
+    /// Check the original live gate before the concrete owner submits. This
+    /// reserves no resource and issues no dispatch/completion capability. The
+    /// same single writer must still journal its actual opaque dispatch.
+    pub fn preflight_external_dispatch(
+        &mut self,
+        source: &ProfiledExternalRootSource,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
         self.check_control(clock, now)?;
         source
             .validate_current()
             .map_err(|_| FrontierError::MissingAcceptance)?;
         self.check_external_source(source)?;
+        self.check_external_journal_capacity()
+    }
+
+    /// Preserve a dispatch already admitted by the real private worker, even
+    /// if its original deadline/revocation raced the return to this writer.
+    /// The source/question/budget/deadline identity checks remain mandatory;
+    /// this projection grants no new admission, credit or extended lifetime.
+    pub fn record_observed_external_dispatch(
+        &mut self,
+        source: &ProfiledExternalRootSource,
+        dispatch: &ProfiledExternalDispatch,
+    ) -> Result<FrontierExternalReservation, FrontierError> {
+        self.check_external_source(source)?;
+        self.record_external_dispatch_projection(source, dispatch)
+    }
+
+    fn check_external_journal_capacity(&self) -> Result<(), FrontierError> {
+        if self.external.rows.len() >= self.limits.maximum_native_receipts {
+            Err(FrontierError::Capacity("external reported-work journal"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record_external_dispatch_projection(
+        &mut self,
+        source: &ProfiledExternalRootSource,
+        dispatch: &ProfiledExternalDispatch,
+    ) -> Result<FrontierExternalReservation, FrontierError> {
         self.check_external_dispatch(source, dispatch)?;
         if self
             .external
@@ -109,9 +151,7 @@ impl RoventFrontier {
         {
             return Err(FrontierError::Duplicate);
         }
-        if self.external.rows.len() >= self.limits.maximum_native_receipts {
-            return Err(FrontierError::Capacity("external reported-work journal"));
-        }
+        self.check_external_journal_capacity()?;
         self.external
             .rows
             .try_reserve(1)

@@ -46,6 +46,8 @@ use rz_search::pals::store::{ForeignAppendPermit, ObservationId, StoreError, Sto
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+mod profiled_external;
+use profiled_external::ProfiledDriverState;
 
 const MAX_RETAINED_QUESTIONS: usize = 64;
 const MAX_ARCHIVE_RECEIPTS: usize = 64;
@@ -133,6 +135,7 @@ pub struct AdaptivePortDriver<M: RoleModel + 'static> {
     transfer: Option<ArchiveTransfer>,
     foreign_transfer_question: Option<Digest>,
     foreign_permit: Option<(Digest, ForeignAppendPermit)>,
+    profiled: ProfiledDriverState,
     archive_receipts: VecDeque<ArchiveWorkReceipt>,
     quarantine: Option<Box<ArchiveQuarantine<M>>>,
     unexpected_archive_owner: Option<Box<ArchiveOwner<M>>>,
@@ -233,6 +236,7 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
             transfer: None,
             foreign_transfer_question: None,
             foreign_permit: None,
+            profiled: ProfiledDriverState::default(),
             archive_receipts: VecDeque::with_capacity(MAX_ARCHIVE_RECEIPTS),
             quarantine: None,
             unexpected_archive_owner: None,
@@ -408,6 +412,7 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
         receipt: &AdaptiveShutdownReceipt,
     ) -> Result<AdaptiveEnginePort<M>, (Self, AdaptiveManagerError)> {
         if !receipt.permits_semantic_closure()
+            || self.profiled.source.is_some()
             || receipt.authority != self.authority
             || !self.archive_joined
             || self.transfer.is_some()
@@ -448,7 +453,13 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
         if self.archive_close_requested
             || self.transfer.is_some()
             || self.foreign_permit.is_some()
-            || (self.closing && !matches!(&operation, ArchiveOperation::PrepareForeign { .. }))
+            || self.profiled.permit.is_some()
+            || (self.closing
+                && !matches!(
+                    &operation,
+                    ArchiveOperation::PrepareForeign { .. }
+                        | ArchiveOperation::PrepareProfiledForeign { .. }
+                ))
         {
             return Err(AdaptiveManagerError::AuxiliaryPending);
         }
@@ -467,15 +478,26 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
                 ArchiveOperation::PrepareForeign { issued, .. } => {
                     self.hard_deadline.min(issued.retain_until())
                 }
+                ArchiveOperation::PrepareProfiledForeign { issued, .. } => {
+                    self.hard_deadline.min(issued.retain_until())
+                }
                 _ => self.hard_deadline,
             },
             max_io_bytes: port.archive_remaining_io().min(16 * 1024 * 1024),
             operation,
         };
+        let profiled = matches!(
+            &work.operation,
+            ArchiveOperation::PrepareProfiledForeign { .. }
+        );
         match worker.submit(ArchiveOwner::Port(*port), self.authority, work) {
             Ok(transfer) => {
                 self.transfer = Some(transfer);
-                self.foreign_transfer_question = question;
+                if profiled {
+                    self.profiled.transfer_question = question;
+                } else {
+                    self.foreign_transfer_question = question;
+                }
                 Ok(())
             }
             Err(rejected) => {
@@ -608,6 +630,86 @@ fn checked(step: AdaptivePortMaterializedStep) -> CheckedStep<AdaptivePortQuesti
     }
 }
 impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for AdaptivePortDriver<M> {
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_profiled_external_registration(
+        &self,
+        source: &rz_search::external_cpu::ProfiledExternalRootSource,
+        root: &Arc<crate::rovent_root_admission::RoventRootAdmission>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.profile_validate(source, root)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn profiled_external_work(
+        &self,
+    ) -> Option<rz_search::pals::rovent_frontier::FrontierExternalWork> {
+        self.profile_work()
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn profiled_retained_host_bytes(&self) -> Option<u64> {
+        self.profile_retained_host_bytes()
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn prepare_profiled_external(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        config: &ExternalCpuConfig,
+        source: &rz_search::external_cpu::ProfiledExternalRootSource,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+        execution: rz_contracts::ExecutionId,
+        constraint: rz_search::external_cpu::ExternalGoConstraint,
+        quantum: Duration,
+        signal: CompletionSignal,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveProfiledExternalPreparation,
+        AdaptiveManagerError,
+    > {
+        self.profile_prepare(
+            work, config, source, id, execution, constraint, quantum, signal, clock, now,
+        )
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn profiled_external_admitted(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        source: &rz_search::external_cpu::ProfiledExternalRootSource,
+        dispatch: &rz_search::external_cpu::ProfiledExternalDispatch,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveProfiledExternalAdmission,
+        AdaptiveManagerError,
+    > {
+        self.profile_admitted(work, source, dispatch, clock, now)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn commit_profiled_external(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        source: &rz_search::external_cpu::ProfiledExternalRootSource,
+        reservation: rz_search::pals::rovent_frontier::FrontierExternalReservation,
+        packet: &Arc<rz_search::external_cpu::ProfiledExternalCompletion>,
+    ) -> Result<CheckedStep<AdaptivePortQuestion>, AdaptiveManagerError> {
+        self.profile_commit(work, source, reservation, packet)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn observe_profiled_external(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        source: &rz_search::external_cpu::ProfiledExternalRootSource,
+        reservation: rz_search::pals::rovent_frontier::FrontierExternalReservation,
+        packet: &Arc<rz_search::external_cpu::ProfiledExternalCompletion>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.profile_observe(work, source, reservation, packet)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn reject_profiled_external(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.profile_reject(work)
+    }
     fn review_lease_admission(
         &self,
     ) -> Result<Option<AdaptiveReviewLeaseAdmission>, AdaptiveManagerError> {
@@ -1123,8 +1225,16 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
             })? {
                 let nonce = transfer.nonce();
                 let foreign = self.foreign_transfer_question.take();
+                let profiled = self.profiled.transfer_question.take();
                 self.transfer = None;
-                let installed = if let Some(question) = foreign {
+                let installed = if let Some(question) = profiled {
+                    completed
+                        .install_with_profiled_foreign(self.authority, nonce)
+                        .map(|(owner, receipt, permit)| {
+                            self.profiled.permit = Some((question, permit));
+                            (owner, receipt)
+                        })
+                } else if let Some(question) = foreign {
                     completed.install_with_foreign(self.authority, nonce).map(
                         |(owner, receipt, permit)| {
                             self.foreign_permit = Some((question, permit));
@@ -1212,7 +1322,11 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         Ok(())
     }
     fn finish_auxiliary_shutdown(&mut self) -> Result<(), AdaptiveManagerError> {
-        if self.transfer.is_some() || self.foreign_permit.is_some() {
+        if self.transfer.is_some()
+            || self.foreign_permit.is_some()
+            || self.profiled.permit.is_some()
+            || self.profiled.transfer_question.is_some()
+        {
             return Err(AdaptiveManagerError::AuxiliaryPending);
         }
         self.archive_close_requested = true;

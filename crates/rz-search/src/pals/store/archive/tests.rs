@@ -1773,6 +1773,128 @@ fn foreign_observation(
     o
 }
 
+fn live_profiled_fixture(
+    store: &mut PalsStores,
+    requested: ProfiledExternalConstraint,
+) -> Observation {
+    let position = Position::startpos();
+    let root = store.focus_actual_moves(position.snapshot()).unwrap();
+    let state = store.situations.get(root).unwrap().state;
+    let mut key = foreign_key(state);
+    key.question = TaskQuestion::ProfiledExternal { requested };
+    key.requested_depth = requested.requested_depth().unwrap_or(0);
+    key.node_budget = requested.requested_nodes().unwrap_or(0);
+    let TaskAdmission::Start(execution) = store
+        .request_task(
+            key,
+            TaskConsumer {
+                id: 71,
+                situation: root,
+                revision: 0,
+                generation: store.generation(),
+                deadline_tick: 100,
+            },
+            0,
+        )
+        .unwrap()
+    else {
+        panic!("profiled archive task")
+    };
+    let pv = store.append_cpu_pv(&position, &[mv("e2e4")]).unwrap();
+    let mut raw = foreign_observation(state, execution, pv, mv("e2e4"), Color::White, 1);
+    let report = raw.external_report.as_mut().unwrap();
+    report.requested_depth = requested.requested_depth().unwrap_or(0);
+    raw.scope = EvidenceScope::ProfiledExternalUci {
+        requested,
+        issued: requested,
+        reported_depth: report.reported_depth,
+        seldepth: report.seldepth,
+        bound: report.bound,
+    };
+    raw
+}
+
+#[test]
+fn profiled_archive_roundtrip_retains_missing_limits_raw_units_and_question() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let requested = ProfiledExternalConstraint::MoveTime { milliseconds: 100 };
+    let raw = live_profiled_fixture(&mut store, requested);
+    let execution = raw.execution.unwrap();
+    let wire = ObservationWire::encode(&raw).unwrap();
+    let json = serde_json::to_vec(&wire).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<ObservationWire>(&json)
+            .unwrap()
+            .decode()
+            .unwrap(),
+        raw
+    );
+    let task_json = serde_json::to_vec(store.tasks.get(execution).unwrap()).unwrap();
+    let decoded: TaskRecord = serde_json::from_slice(&task_json).unwrap();
+    assert_eq!(decoded.key, store.tasks.get(execution).unwrap().key);
+    let observation = store
+        .append_observation_checked_with_archive_budget(raw.clone(), &mut budget())
+        .unwrap();
+    assert!(store.complete_task(execution, observation).is_err());
+    store.tasks.fail(execution).unwrap();
+    let mut next = Position::startpos();
+    next.make_move(mv("e2e4")).unwrap();
+    store.focus_actual_moves(next.snapshot()).unwrap();
+    let receipt = store.archive_inactive(budget()).unwrap().unwrap();
+    assert!(store.observations.get(observation).is_err());
+    let loaded = store
+        .pin_load(&receipt.observation_handle(observation), budget())
+        .unwrap();
+    assert_eq!(store.observations.get(observation).unwrap(), &raw);
+    assert_eq!(
+        store.tasks.get(execution).unwrap().key.question,
+        TaskQuestion::ProfiledExternal { requested }
+    );
+    assert_eq!(store.tasks.get(execution).unwrap().key.requested_depth, 0);
+    assert_eq!(store.tasks.get(execution).unwrap().key.node_budget, 0);
+    assert_eq!(
+        store.tasks.get(execution).unwrap().status,
+        TaskStatus::Failed
+    );
+    drop(loaded);
+}
+
+#[test]
+fn profiled_cold_load_rejects_an_individually_valid_but_replaced_constraint() {
+    let root = TestRoot::new();
+    let mut store = setup(&root);
+    let raw = live_profiled_fixture(
+        &mut store,
+        ProfiledExternalConstraint::MoveTime { milliseconds: 100 },
+    );
+    let execution = raw.execution.unwrap();
+    let observation = store
+        .append_observation_checked_with_archive_budget(raw, &mut budget())
+        .unwrap();
+    store.tasks.fail(execution).unwrap();
+    // Corruption fixture bypasses the public writer; the committed segment has
+    // a valid checksum, so its original task/observation relation must be checked.
+    let key = &mut store.tasks.tasks.get_mut(execution.0).unwrap().key;
+    key.question = TaskQuestion::ProfiledExternal {
+        requested: ProfiledExternalConstraint::Nodes { reported_nodes: 16 },
+    };
+    key.node_budget = 16;
+    let mut next = Position::startpos();
+    next.make_move(mv("e2e4")).unwrap();
+    store.focus_actual_moves(next.snapshot()).unwrap();
+    let receipt = store.archive_inactive(budget()).unwrap().unwrap();
+    let before = store.hot_stats();
+    assert_eq!(
+        store
+            .pin_load(&receipt.observation_handle(observation), budget())
+            .unwrap_err(),
+        StoreError::ArchiveIntegrity("profiled observation task constraint")
+    );
+    assert_eq!(store.hot_stats(), before);
+    assert!(store.observations.get(observation).is_err());
+}
+
 #[test]
 fn foreign_request_uniqueness_scan_shares_explicit_budget_and_fails_closed() {
     let root = TestRoot::new();

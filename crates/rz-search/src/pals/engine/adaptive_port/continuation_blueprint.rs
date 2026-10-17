@@ -382,6 +382,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if let Some((question, observation)) = step.feedback_gate {
             if !self.cpu_feedback_still_authorized(question, observation)
                 && !self.external_feedback_still_authorized(question, observation)
+                && !self.profiled_external_feedback_still_authorized(question, observation)
             {
                 return Err(StoreError::StaleConsumer.into());
             }

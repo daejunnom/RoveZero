@@ -12,7 +12,8 @@ use super::configuration::{
     ExecutionConfiguration, ResearchValueConfiguration, StartupConfigurationDocument,
 };
 use super::nnuec_preparing::{
-    InitialNnuecPhase, InitialNnuecPreparing, InitialNnuecReady, InitialNnuecStep,
+    InitialNnuecFailure, InitialNnuecPhase, InitialNnuecPreparing, InitialNnuecReady,
+    InitialNnuecStep,
 };
 use super::nnuec_source::LoadedRoventNnuecSource;
 use super::{
@@ -23,8 +24,10 @@ use crate::EngineIdentity;
 use crate::engine::{OwnerRegistry, ProcessClock};
 use crate::pals_adaptive::{
     AdaptiveExecutionLimits, AdaptiveExecutionManager, AdaptiveManagerCounters,
-    AdaptiveManagerError, AdaptiveManagerRegistration, AdaptiveManagerSources, AdaptivePortDriver,
-    AdaptiveRegisteredLedgerSources, AdaptiveShutdownReceipt, ManagerPhase,
+    AdaptiveManagerError, AdaptiveManagerRegistration, AdaptiveManagerSources,
+    AdaptiveNnuecRetiredOwner, AdaptivePortDriver, AdaptiveRegisteredLedgerSources,
+    AdaptiveSessionCollectionHooks, AdaptiveShutdownReceipt, ManagerPhase,
+    RoventCollectionRootAdmission, RoventNativeCollectionOrigin,
 };
 use crate::pals_native::ticketed::{TicketNativeEvent, VirtualReviewTicketOutput};
 use crate::rovent_root_admission::source_seal::{
@@ -35,7 +38,10 @@ use crate::search_driver::{
     DriverPhysicalCompletion, DriverWork, PalsCheckerRegistration, SearchKind,
     SearchSessionContext, SearchSessionDriver, SearchSessionFailure, SearchSessionReport,
 };
-use initial_cleanup::{NnuecInitialCleanup, NnuecInitialCleanupStep};
+use initial_cleanup::{
+    NnuecInitialCleaned, NnuecInitialCleanup, NnuecInitialCleanupObservations,
+    NnuecInitialCleanupStep,
+};
 use retirement::{NnuecRootRetirement, NnuecRootRetirementPins, NnuecRootRetirementStep};
 use rz_contracts::pals::SearchAuthority;
 use rz_contracts::pals_adaptive::CpuWorkerId;
@@ -43,18 +49,24 @@ use rz_contracts::{ContractError, Digest};
 use rz_position::{BoardMove, Position};
 use rz_runtime::adaptive::{ControllerConfig, CoordinatorPolicy};
 use rz_runtime::contracts::ContractClock;
-use rz_search::cpu_value::nnuec::v2::review::PreparationActor;
-use rz_search::cpu_worker::{DeferredNnuecCpuPlan, DeferredNnuecRSource};
+use rz_search::cpu_value::nnuec::v2::retirement::NnuecCacheReleaseAck;
+use rz_search::cpu_value::nnuec::v2::review::{PreparationActor, PreparationError};
+use rz_search::cpu_worker::{
+    CpuCreditLedger, CpuWorker, CpuWorkerError, DeferredNnuecCpuPlan, DeferredNnuecRSource,
+    NnuecAuthorityRevocation,
+};
 use rz_search::external_cpu::{CpuEndpointSelection, ExternalSlicePolicy};
 use rz_search::pals::engine::adaptive_port::{
-    AdaptivePortModel, AdaptivePortQuestion, AdaptiveRulesOwnerIssuer,
+    AdaptiveEnginePort, AdaptivePortModel, AdaptivePortQuestion, AdaptiveRulesOwnerIssuer,
 };
 use rz_search::pals::engine::preparing_root::{
-    ResearcherPreparingError, ResearcherPreparingOwner, ResearcherRootStartup,
+    InitialResearcherReleaseReceipt, ResearcherPreparingError, ResearcherPreparingOwner,
+    ResearcherRootStartup, RetiredPreparingRoot,
 };
 use rz_search::pals::engine::{
     PalsCompletion, PalsConfig, PalsLimits, ResearcherSemanticProfile, ResolverPolicy,
 };
+use rz_search::pals::rovent_engine::RootMoveDomain;
 use rz_search::pals::rovent_frontier::{
     FrontierError, FrontierGoalStatus, FrontierLimits, FrontierSnapshot, FrontierStop,
 };
@@ -74,9 +86,51 @@ type Backend = RoventNativeBackend<AdaptivePortQuestion>;
 type Manager =
     AdaptiveExecutionManager<AdaptivePortQuestion, Backend, AdaptivePortDriver<AdaptivePortModel>>;
 type SemanticOwner = ResearcherPreparingOwner<AdaptivePortModel>;
+pub type RoventNnuecCollectionHooks = AdaptiveSessionCollectionHooks<Backend>;
+type RootReturn = Result<
+    (Box<Idle>, SearchSessionReport, Arc<RoventNnuecRootReceipt>),
+    (State, SearchSessionFailure),
+>;
 
 pub const ROVENT_NNUEC_ROOT_DOMAIN: &str = "rz-rovent-nnuec-native-root/1";
 pub const ROVENT_NNUEC_INITIAL_DOMAIN: &str = "rz-rovent-nnuec-native-initial-stop/1";
+
+/// Producer-only original cleanup witnesses, distinct from a manager root
+/// fence. They grant no search result, native execution, or new Ready owner.
+pub struct RoventNnuecInitialRetirementReceipt {
+    original_phase: InitialNnuecPhase,
+    original_failure: Option<InitialNnuecFailure>,
+    release: Option<InitialResearcherReleaseReceipt>,
+    cache_release: NnuecCacheReleaseAck,
+    observations: NnuecInitialCleanupObservations,
+}
+impl std::fmt::Debug for RoventNnuecInitialRetirementReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoventNnuecInitialRetirementReceipt")
+            .field("original_phase", &self.original_phase)
+            .field("original_failure", &self.original_failure)
+            .field("has_original_release", &self.release.is_some())
+            .field("cache_release", &self.cache_release)
+            .finish_non_exhaustive()
+    }
+}
+impl RoventNnuecInitialRetirementReceipt {
+    pub fn original_phase(&self) -> InitialNnuecPhase {
+        self.original_phase
+    }
+    pub fn original_failure(&self) -> Option<&InitialNnuecFailure> {
+        self.original_failure.as_ref()
+    }
+    pub fn release(&self) -> Option<&InitialResearcherReleaseReceipt> {
+        self.release.as_ref()
+    }
+    pub fn cache_release(&self) -> &NnuecCacheReleaseAck {
+        &self.cache_release
+    }
+    pub fn observations(&self) -> &NnuecInitialCleanupObservations {
+        &self.observations
+    }
+}
 
 /// Original semantic work and an optional actual manager researcher fence.
 /// Initial C/TT cleanup is recorded separately from a manager root fence.
@@ -88,6 +142,7 @@ pub struct RoventNnuecRootReceipt {
     pub root_admission: Arc<RoventRootAdmission>,
     pub frontier: Option<FrontierSnapshot>,
     pub physical: Option<AdaptiveShutdownReceipt>,
+    pub initial_retirement: Option<Arc<RoventNnuecInitialRetirementReceipt>>,
     pub counters: AdaptiveManagerCounters,
     pub stopped_before_research_execution: bool,
     pub deadline_before_frontier: bool,
@@ -261,6 +316,8 @@ pub struct RoventNnuecSessionDriver {
     identity: EngineIdentity,
     implementation: Digest,
     root_policy: RoventRootAdmissionPolicy,
+    collection_origin: Option<RoventNativeCollectionOrigin>,
+    collection_hooks: RoventNnuecCollectionHooks,
     selective_policy: Digest,
     frontier_limits: FrontierLimits,
     execution_limits: AdaptiveExecutionLimits,
@@ -286,168 +343,204 @@ impl RoventNnuecSessionDriver {
         identity: EngineIdentity,
         root_policy: RoventRootAdmissionPolicy,
     ) -> Result<Self, RoventNnuecSessionRejection> {
-        let built =
-            (|| -> Result<_, SearchSessionFailure> {
-                let document = prepared.sources().configuration();
-                document
-                    .require_supported_native_capabilities()
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecCapability", &e))?;
-                let fields = document.fields();
-                let ExecutionConfiguration::OwnResearcher {
-                    event_order,
-                    queues,
-                    max_rounds,
-                    max_native_nodes,
-                    cpu_depth,
-                    cpu_nodes_per_task,
-                    cpu_plan,
-                    value,
-                    controller,
-                    ..
-                } = fields.execution
-                else {
-                    return Err(failure(
-                        "RoventNnuecStartup",
-                        "actual own-R configuration required",
-                    ));
-                };
-                if !matches!(value, ResearchValueConfiguration::NnuecV2 { .. })
-                    || !prepared.snapshot().mode.has_native_r()
-                    || prepared.snapshot().process_epoch != clock.epoch().0
-                    || prepared.snapshot().input_lock != loaded.input_lock_digest()
-                    || !loaded.matches_sources(prepared.sources())
-                    || identity.name.is_empty()
-                    || identity.author.is_empty()
+        Self::new_with_collection_hooks(
+            prepared,
+            loaded,
+            clock,
+            owners,
+            identity,
+            root_policy,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
+    pub fn new_with_collection_hooks(
+        prepared: PreparedRoventNative<AdaptivePortQuestion>,
+        loaded: LoadedRoventNnuecSource,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        collection_hooks: Option<RoventNnuecCollectionHooks>,
+    ) -> Result<Self, RoventNnuecSessionRejection> {
+        let built = (|| -> Result<_, SearchSessionFailure> {
+            let document = prepared.sources().configuration();
+            document
+                .require_supported_native_capabilities()
+                .map_err(|e| SearchSessionFailure::debug("RoventNnuecCapability", &e))?;
+            let fields = document.fields();
+            let ExecutionConfiguration::OwnResearcher {
+                event_order,
+                queues,
+                max_rounds,
+                max_native_nodes,
+                cpu_depth,
+                cpu_nodes_per_task,
+                cpu_plan,
+                value,
+                controller,
+                ..
+            } = fields.execution
+            else {
+                return Err(failure(
+                    "RoventNnuecStartup",
+                    "actual own-R configuration required",
+                ));
+            };
+            if !matches!(value, ResearchValueConfiguration::NnuecV2 { .. })
+                || !prepared.snapshot().mode.has_native_r()
+                || prepared.snapshot().process_epoch != clock.epoch().0
+                || prepared.snapshot().input_lock != loaded.input_lock_digest()
+                || !loaded.matches_sources(prepared.sources())
+                || identity.name.is_empty()
+                || identity.author.is_empty()
+            {
+                return Err(failure(
+                    "RoventNnuecStartup",
+                    "loaded NNUEC/source/process identity mismatch",
+                ));
+            }
+            let collection_origin = match (
+                prepared.sources().lock().manifest.purpose,
+                &collection_hooks,
+            ) {
+                (rz_experiments::RoventPurpose::Collection, Some(hooks))
+                    if hooks.root_admission.is_some() =>
                 {
-                    return Err(failure(
-                        "RoventNnuecStartup",
-                        "loaded NNUEC/source/process identity mismatch",
-                    ));
+                    Some(prepared.collection_identity().map_err(|error| {
+                        SearchSessionFailure::debug("RoventNnuecCollectionOrigin", &error)
+                    })?)
                 }
-                if prepared.sources().lock().manifest.purpose
-                    == rz_experiments::RoventPurpose::Collection
-                {
+                (rz_experiments::RoventPurpose::Collection, _) | (_, Some(_)) => {
                     return Err(failure(
                         "RoventNnuecCollectionHooks",
-                        "actual NNUEC collection callbacks are not yet connected",
+                        "explicit Collection and actual root observer must be selected together",
                     ));
                 }
-                let ready = prepared
-                    .service
-                    .ready_clock()
-                    .ok_or_else(|| failure("RoventNnuecStartup", "actual native Ready absent"))?;
-                let original = clock.runtime_clock();
-                if prepared.service.is_quarantined()
-                    || ready.domain() != original.domain()
-                    || ready.origin() != original.origin()
-                {
-                    return Err(SearchSessionFailure::physical_completion_unknown());
-                }
-                let control = controller
-                    .actual(*event_order)
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecController", &e))?;
-                // One initial Bound materializes exactly one physical researcher.
-                // Wider declarations are rejected rather than silently resized.
-                if control.max_workers != 1 || control.initial_workers != 1 {
-                    return Err(failure(
-                        "RoventNnuecWorkers",
-                        "this same-source assembly requires one declared own worker",
-                    ));
-                }
-                let limits = queues
+                (_, None) => None,
+            };
+            let ready = prepared
+                .service
+                .ready_clock()
+                .ok_or_else(|| failure("RoventNnuecStartup", "actual native Ready absent"))?;
+            let original = clock.runtime_clock();
+            if prepared.service.is_quarantined()
+                || ready.domain() != original.domain()
+                || ready.origin() != original.origin()
+            {
+                return Err(SearchSessionFailure::physical_completion_unknown());
+            }
+            let control = controller
+                .actual(*event_order)
+                .map_err(|e| SearchSessionFailure::debug("RoventNnuecController", &e))?;
+            // One initial Bound materializes exactly one physical researcher.
+            // Wider declarations are rejected rather than silently resized.
+            if control.max_workers != 1 || control.initial_workers != 1 {
+                return Err(failure(
+                    "RoventNnuecWorkers",
+                    "this same-source assembly requires one declared own worker",
+                ));
+            }
+            let limits = queues
+                .actual()
+                .map_err(|e| SearchSessionFailure::debug("RoventNnuecQueues", &e))?;
+            if cpu_plan.paused_bytes_limit != limits.paused_bytes_per_worker_max {
+                return Err(failure(
+                    "RoventNnuecQueues",
+                    "actual paused-owner budget differs from queues",
+                ));
+            }
+            let plan = DeferredNnuecCpuPlan::new(
+                cpu_plan
                     .actual()
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecQueues", &e))?;
-                if cpu_plan.paused_bytes_limit != limits.paused_bytes_per_worker_max {
-                    return Err(failure(
-                        "RoventNnuecQueues",
-                        "actual paused-owner budget differs from queues",
-                    ));
-                }
-                let plan = DeferredNnuecCpuPlan::new(
-                    cpu_plan
-                        .actual()
-                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecPlan", &e))?,
-                    cpu_plan.ordering(),
-                    cpu_plan.paused_bytes_limit,
-                    cpu_plan.preserve_paused_side_scope,
-                    limits.worker_commands_max,
-                    cpu_plan.affinity(),
-                )
-                .map_err(|e| SearchSessionFailure::debug("RoventNnuecPlan", &e))?;
-                let source = DeferredNnuecRSource::new(Arc::clone(loaded.model()), plan);
-                let model =
-                    AdaptivePortModel::new_with_namespace(
-                        prepared.snapshot().role_model_identity(),
-                        Some(prepared.snapshot().model_value_identity().map_err(|e| {
-                            SearchSessionFailure::debug("RoventNnuecNamespace", &e)
-                        })?),
-                        prepared
-                            .snapshot()
-                            .model_namespace()
-                            .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?,
-                    )
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?;
-                let owner = ResearcherPreparingOwner::new_selected(
-                    ResearcherSemanticProfile {
-                        config: PalsConfig {
-                            beam_width: fields.semantic.beam_width,
-                            line_plies: fields.semantic.line_plies,
-                            max_nodes: fields.semantic.max_nodes,
-                            max_records: fields.semantic.max_records,
-                            max_role_calls: fields.semantic.max_role_calls,
-                            cpu_nodes_per_task: *cpu_nodes_per_task,
-                        },
-                        maximum_root_prefix_plies: fields.semantic.maximum_root_prefix_plies,
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecPlan", &e))?,
+                cpu_plan.ordering(),
+                cpu_plan.paused_bytes_limit,
+                cpu_plan.preserve_paused_side_scope,
+                limits.worker_commands_max,
+                cpu_plan.affinity(),
+            )
+            .map_err(|e| SearchSessionFailure::debug("RoventNnuecPlan", &e))?;
+            let source = DeferredNnuecRSource::new(Arc::clone(loaded.model()), plan);
+            let model = AdaptivePortModel::new_with_namespace(
+                prepared.snapshot().role_model_identity(),
+                Some(
+                    prepared
+                        .snapshot()
+                        .model_value_identity()
+                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?,
+                ),
+                prepared
+                    .snapshot()
+                    .model_namespace()
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?,
+            )
+            .map_err(|e| SearchSessionFailure::debug("RoventNnuecNamespace", &e))?;
+            let owner = ResearcherPreparingOwner::new_selected(
+                ResearcherSemanticProfile {
+                    config: PalsConfig {
+                        beam_width: fields.semantic.beam_width,
+                        line_plies: fields.semantic.line_plies,
+                        max_nodes: fields.semantic.max_nodes,
+                        max_records: fields.semantic.max_records,
+                        max_role_calls: fields.semantic.max_role_calls,
+                        cpu_nodes_per_task: *cpu_nodes_per_task,
                     },
-                    model,
-                    ResolverPolicy::ModelWdlRestricted,
-                    document.post_repair_policy_for(prepared.snapshot().mode),
-                    fields
-                        .review
-                        .actual()
-                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecReview", &e))?,
-                    fields
-                        .index
-                        .actual()
-                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecIndex", &e))?,
-                    source,
-                )
-                .map_err(|e| SearchSessionFailure::debug("RoventNnuecSemantic", &e))?;
-                let mut hash = Sha256::new();
-                hash.update(b"rz-rovent-nnuec-native-session/1\0");
-                hash.update(super::compiled_bootstrap_source_digest());
-                hash.update(include_bytes!("nnuec_session.rs"));
-                hash.update(include_bytes!("nnuec_session/retirement.rs"));
-                hash.update(include_bytes!("nnuec_session/initial_cleanup.rs"));
-                hash.update(
+                    maximum_root_prefix_plies: fields.semantic.maximum_root_prefix_plies,
+                },
+                model,
+                ResolverPolicy::ModelWdlRestricted,
+                document.post_repair_policy_for(prepared.snapshot().mode),
+                fields
+                    .review
+                    .actual()
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecReview", &e))?,
+                fields
+                    .index
+                    .actual()
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecIndex", &e))?,
+                source,
+            )
+            .map_err(|e| SearchSessionFailure::debug("RoventNnuecSemantic", &e))?;
+            let mut hash = Sha256::new();
+            hash.update(b"rz-rovent-nnuec-native-session/1\0");
+            hash.update(super::compiled_bootstrap_source_digest());
+            hash.update(include_bytes!("nnuec_session.rs"));
+            hash.update(include_bytes!("nnuec_session/retirement.rs"));
+            hash.update(include_bytes!("nnuec_session/initial_cleanup.rs"));
+            hash.update(
+                document
+                    .configuration_digest()
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecConfiguration", &e))?,
+            );
+            hash.update([match root_policy {
+                RoventRootAdmissionPolicy::ExactRegistered => 0,
+                RoventRootAdmissionPolicy::DynamicGo => 1,
+            }]);
+            Ok((
+                owner,
+                collection_origin,
+                Digest(hash.finalize().into()),
+                Digest(
                     document
-                        .configuration_digest()
+                        .search_configuration_digest()
                         .map_err(|e| SearchSessionFailure::debug("RoventNnuecConfiguration", &e))?,
-                );
-                hash.update([match root_policy {
-                    RoventRootAdmissionPolicy::ExactRegistered => 0,
-                    RoventRootAdmissionPolicy::DynamicGo => 1,
-                }]);
-                Ok((
-                    owner,
-                    Digest(hash.finalize().into()),
-                    Digest(document.search_configuration_digest().map_err(|e| {
-                        SearchSessionFailure::debug("RoventNnuecConfiguration", &e)
-                    })?),
-                    fields
-                        .frontier
-                        .actual()
-                        .map_err(|e| SearchSessionFailure::debug("RoventNnuecFrontier", &e))?,
-                    limits,
-                    control,
-                    event_order.actual(),
-                    *max_rounds,
-                    *max_native_nodes,
-                    *cpu_depth,
-                ))
-            })();
+                ),
+                fields
+                    .frontier
+                    .actual()
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecFrontier", &e))?,
+                limits,
+                control,
+                event_order.actual(),
+                *max_rounds,
+                *max_native_nodes,
+                *cpu_depth,
+            ))
+        })();
         let (
             owner,
+            collection_origin,
             implementation,
             selective_policy,
             frontier_limits,
@@ -480,6 +573,8 @@ impl RoventNnuecSessionDriver {
             identity,
             implementation,
             root_policy,
+            collection_origin,
+            collection_hooks: collection_hooks.unwrap_or_default(),
             selective_policy,
             frontier_limits,
             execution_limits,
@@ -537,27 +632,84 @@ impl RoventNnuecSessionDriver {
         native: NativeOwner,
         cleanup: super::nnuec_preparing::InitialNnuecCleanup,
         context: &SearchSessionContext,
+        admission: Arc<RoventRootAdmission>,
+        next_request_sequence: u64,
+        game: Option<u64>,
         code: &'static str,
-    ) -> (State, SearchSessionFailure) {
+    ) -> RootReturn {
         let signal = native.service.signal();
+        // Capture the original caller gate before cleanup revokes that same
+        // root's cancellation owner. Cleanup itself cannot invent a stop.
+        let original_control = context.accepts();
+        let original_stop =
+            matches!(original_control, Ok(false)) || context.soft_expired(Instant::now());
+        let control_error = original_control.err();
         let mut cleanup = NnuecInitialCleanup::new(cleanup);
         loop {
             if Instant::now() >= context.shutdown_deadline {
-                return self.retain(
-                    (native, cleanup),
+                return Err(self.retain(
+                    (native, cleanup, control_error),
                     code,
                     "original preparation cleanup deadline expired; exact owners retained",
-                );
+                ));
             }
             let observed = signal.version();
             match cleanup.step() {
                 NnuecInitialCleanupStep::Pending(pending) => cleanup = pending,
+                NnuecInitialCleanupStep::Ready(cleaned) => {
+                    if !original_stop
+                        || control_error.is_some()
+                        || !matches!(
+                            cleaned.original_failure.as_ref(),
+                            None | Some(InitialNnuecFailure::Preparation(
+                                PreparationError::Cancelled | PreparationError::Expired
+                            )) | Some(InitialNnuecFailure::Worker(
+                                CpuWorkerError::NnuecAuthorityRevoked(
+                                    NnuecAuthorityRevocation::Cancelled
+                                        | NnuecAuthorityRevocation::Expired
+                                )
+                            ))
+                        )
+                    {
+                        return Err(self.retain(
+                            (native, cleaned, control_error),
+                            code,
+                            "actual initial preparation failure is not a normal control stop",
+                        ));
+                    }
+                    let NnuecInitialCleaned {
+                        retired,
+                        actor,
+                        original_phase,
+                        original_failure,
+                        release,
+                        cache_release,
+                        observations,
+                    } = cleaned;
+                    let proof = Arc::new(RoventNnuecInitialRetirementReceipt {
+                        original_phase,
+                        original_failure,
+                        release,
+                        cache_release,
+                        observations,
+                    });
+                    return self.finish_preparing_retirement(
+                        native,
+                        retired,
+                        Some(actor),
+                        next_request_sequence,
+                        game,
+                        context,
+                        admission,
+                        Some(proof),
+                    );
+                }
                 NnuecInitialCleanupStep::Retained(retained) => {
-                    return self.retain(
-                        (native, retained),
+                    return Err(self.retain(
+                        (native, retained, control_error),
                         code,
                         "actual physical cleanup observed; original semantic owners remain quarantined",
-                    );
+                    ));
                 }
             }
             signal.wait_changed(
@@ -568,6 +720,282 @@ impl RoventNnuecSessionDriver {
                     .min(Duration::from_millis(1)),
             );
         }
+    }
+
+    /// Only an actual preparing-root retirement issues this move-only owner.
+    /// This path never constructs a manager, native ticket, R grant or worker.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_preparing_retirement(
+        &self,
+        native: NativeOwner,
+        retired: RetiredPreparingRoot<AdaptivePortModel>,
+        actor: Option<PreparationActor>,
+        next_request_sequence: u64,
+        game: Option<u64>,
+        context: &SearchSessionContext,
+        admission: Arc<RoventRootAdmission>,
+        initial_retirement: Option<Arc<RoventNnuecInitialRetirementReceipt>>,
+    ) -> RootReturn {
+        let original_ledger = retired.ledger.registration_observation();
+        if retired.root_budget != admission.root_budget_digest()
+            || retired.cleanup_deadline != context.shutdown_deadline
+            || !matches!(original_ledger, Ok(observed)
+                if observed.authority == context.authority
+                    && observed.clock_domain == self.clock.domain()
+                    && observed.clock_origin == self.clock.runtime_clock().origin()
+                    && observed.native_node_limit == self.max_native_nodes
+                    && observed.spent_native_nodes == 0
+                    && observed.reserved_native_nodes == 0
+                    && observed.active_jobs == 0
+                    && observed.outstanding_executions == 0
+                    && observed.quarantined_jobs == 0)
+        {
+            return Err(self.retain(
+                (native, retired, actor, initial_retirement, original_ledger),
+                "RoventNnuecInitialRetirement",
+                "actual initial retirement differs from the original root/ledger controls",
+            ));
+        }
+        let receipt = Arc::new(RoventNnuecRootReceipt {
+            domain: ROVENT_NNUEC_ROOT_DOMAIN,
+            authority: context.authority,
+            input_lock: self.snapshot.input_lock,
+            root_admission: admission.clone(),
+            frontier: retired.frontier.map(|r| r.snapshot),
+            physical: None,
+            initial_retirement,
+            counters: AdaptiveManagerCounters::default(),
+            stopped_before_research_execution: true,
+            deadline_before_frontier: retired.deadline_before_frontier,
+        });
+        let work = match receipt.work() {
+            Ok(work) => work,
+            Err(error) => {
+                return Err(self.retain(
+                    (
+                        native,
+                        retired.owner,
+                        actor,
+                        retired.ledger,
+                        retired.root_rules,
+                        retired.root_moves,
+                        receipt,
+                    ),
+                    "RoventNnuecInitialWork",
+                    &error.detail,
+                ));
+            }
+        };
+        let mate_strategy = receipt
+            .frontier
+            .as_ref()
+            .and_then(|f| f.mate_strategy.clone());
+        let best_move = mate_strategy
+            .as_ref()
+            .map(|s| s.best_move())
+            .or_else(|| admission.allowed_root_moves().first().copied());
+        let report = SearchSessionReport {
+            best_move,
+            work,
+            mate_strategy,
+        };
+        Ok((
+            Box::new(Idle {
+                native,
+                owner: Box::new(retired.owner),
+                actor,
+                next_request_sequence,
+                game,
+                previous_root: Some(receipt.clone()),
+            }),
+            report,
+            receipt,
+        ))
+    }
+
+    /// The initial handoff already owns a real Ready worker. A control stop
+    /// here needs no expired live-driver constructor and no manager admission.
+    #[allow(clippy::too_many_arguments)]
+    fn cleanup_adopted_initial(
+        &self,
+        native: NativeOwner,
+        mut port: AdaptiveEnginePort<AdaptivePortModel>,
+        mut worker: CpuWorker,
+        actor: PreparationActor,
+        pins: NnuecRootRetirementPins,
+        ledger: CpuCreditLedger,
+        root_budget: Digest,
+        cleanup_deadline: Instant,
+        root_moves: Arc<RootMoveDomain>,
+        next_request_sequence: u64,
+        game: Option<u64>,
+        context: &SearchSessionContext,
+        admission: Arc<RoventRootAdmission>,
+    ) -> RootReturn {
+        let signal = native.service.signal();
+        let root_rules = port.root_rules();
+        context.control.cancellation.store(true, Ordering::Release);
+        match port.with_rovent_frontier(|frontier, _| {
+            frontier.cancel();
+            Ok(())
+        }) {
+            Ok(Some(())) => {}
+            other => {
+                return Err(self.retain(
+                    (native, port, worker, actor, pins, ledger, root_moves, other),
+                    "RoventNnuecAdoptedCancel",
+                    "original adopted frontier cancellation was not observed",
+                ));
+            }
+        }
+        worker.request_shutdown();
+        let shutdown = loop {
+            if Instant::now() >= context.shutdown_deadline {
+                return Err(self.retain(
+                    (native, port, worker, actor, pins, ledger, root_moves),
+                    "RoventNnuecAdoptedJoin",
+                    "original cleanup deadline expired before actual Ready worker join",
+                ));
+            }
+            let observed = signal.version();
+            match worker.try_join() {
+                Ok(Some(shutdown)) => break shutdown,
+                Ok(None) => {}
+                Err(error) => {
+                    let detail = error.to_string();
+                    return Err(self.retain(
+                        (native, port, worker, actor, pins, ledger, root_moves, error),
+                        "RoventNnuecAdoptedJoin",
+                        &detail,
+                    ));
+                }
+            }
+            signal.wait_changed(
+                observed,
+                context
+                    .shutdown_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(1)),
+            );
+        };
+        if !initial_cleanup::permits_initial_reuse(&shutdown) {
+            return Err(self.retain(
+                (
+                    native, port, worker, actor, pins, ledger, root_moves, shutdown,
+                ),
+                "RoventNnuecAdoptedStartup",
+                "actual initial Ready/affinity/join readbacks do not permit reuse",
+            ));
+        }
+        let recovered = match worker.take_nnuec_retirement() {
+            Ok(engine) => engine,
+            Err(error) => {
+                let detail = error.to_string();
+                return Err(self.retain(
+                    (
+                        native, port, worker, actor, pins, ledger, root_moves, shutdown, error,
+                    ),
+                    "RoventNnuecAdoptedEngine",
+                    &detail,
+                ));
+            }
+        };
+        let frontier = match port.retire_rovent_frontier() {
+            Ok(Some(frontier)) => frontier,
+            other => {
+                return Err(self.retain(
+                    (
+                        native, port, worker, actor, pins, ledger, root_moves, shutdown, recovered,
+                        other,
+                    ),
+                    "RoventNnuecAdoptedFrontier",
+                    "original adopted frontier retirement was not observed",
+                ));
+            }
+        };
+        let mut retirement = NnuecRootRetirement::new(
+            actor,
+            AdaptiveNnuecRetiredOwner {
+                engine: recovered,
+                last_installation: None,
+            },
+            pins,
+            port.into_engine(),
+        );
+        let retired = loop {
+            if Instant::now() >= context.shutdown_deadline {
+                return Err(self.retain(
+                    (
+                        native, retirement, worker, ledger, root_moves, shutdown, frontier,
+                    ),
+                    "RoventNnuecAdoptedRelease",
+                    "original cleanup deadline expired before actual same-actor release",
+                ));
+            }
+            let observed = signal.version();
+            match retirement.step() {
+                NnuecRootRetirementStep::Pending(pending) => retirement = pending,
+                NnuecRootRetirementStep::Ready(retired) => break retired,
+                NnuecRootRetirementStep::RetainedFailure(failed) => {
+                    return Err(self.retain(
+                        (
+                            native, failed, worker, ledger, root_moves, shutdown, frontier,
+                        ),
+                        "RoventNnuecAdoptedRelease",
+                        "actual initial engine/cache release failed; original owners retained",
+                    ));
+                }
+            }
+            signal.wait_changed(
+                observed,
+                context
+                    .shutdown_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(1)),
+            );
+        };
+        let mut observations = NnuecInitialCleanupObservations::default();
+        observations.root_cancel_requested = true;
+        observations.ready_shutdown_requested = true;
+        observations.ready_shutdown = Some(shutdown);
+        observations.engine_release_matches_original = Some(
+            retired
+                .engine_release
+                .matches_source(retired.owner.source()),
+        );
+        observations.cache_clears_released_engine = Some(
+            retired
+                .engine_release
+                .matches_cache_release(&retired.cache_release),
+        );
+        let proof = Arc::new(RoventNnuecInitialRetirementReceipt {
+            original_phase: InitialNnuecPhase::AdoptPort,
+            original_failure: None,
+            release: Some(InitialResearcherReleaseReceipt::Worker(
+                retired.engine_release,
+            )),
+            cache_release: retired.cache_release,
+            observations,
+        });
+        self.finish_preparing_retirement(
+            native,
+            RetiredPreparingRoot {
+                owner: retired.owner,
+                ledger,
+                root_budget,
+                frontier: Some(frontier),
+                deadline_before_frontier: false,
+                root_rules,
+                root_moves,
+                cleanup_deadline,
+            },
+            Some(retired.actor),
+            next_request_sequence,
+            game,
+            context,
+            admission,
+            Some(proof),
+        )
     }
 
     fn run_root(
@@ -775,13 +1203,18 @@ impl RoventNnuecSessionDriver {
             }
         }
         // Every root control is consulted before actor creation and before C.
-        if !context.accepts().unwrap_or(false)
-            || Instant::now()
-                >= context
-                    .control
-                    .soft_deadline
-                    .min(context.control.admission_deadline)
-        {
+        let accepted = match context.accepts() {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                let detail = error.to_string();
+                return Err(self.retain(
+                    (native, root, actor, error),
+                    "RoventNnuecInitialControl",
+                    &detail,
+                ));
+            }
+        };
+        if !accepted || context.soft_expired(Instant::now()) {
             root.cancel();
         }
         let terminal = root.deadline_before_frontier()
@@ -799,59 +1232,16 @@ impl RoventNnuecSessionDriver {
                     ));
                 }
             };
-            let receipt = Arc::new(RoventNnuecRootReceipt {
-                domain: ROVENT_NNUEC_ROOT_DOMAIN,
-                authority: context.authority,
-                input_lock: self.snapshot.input_lock,
-                root_admission: admission.clone(),
-                frontier: retired.frontier.map(|r| r.snapshot),
-                physical: None,
-                counters: AdaptiveManagerCounters::default(),
-                stopped_before_research_execution: true,
-                deadline_before_frontier: retired.deadline_before_frontier,
-            });
-            let work = match receipt.work() {
-                Ok(w) => w,
-                Err(e) => {
-                    return Err(self.retain(
-                        (
-                            native,
-                            retired.owner,
-                            actor,
-                            retired.ledger,
-                            retired.root_rules,
-                            retired.root_moves,
-                        ),
-                        "RoventNnuecInitialWork",
-                        &e.detail,
-                    ));
-                }
-            };
-            let mate_strategy = receipt
-                .frontier
-                .as_ref()
-                .and_then(|f| f.mate_strategy.clone());
-            let best_move = mate_strategy
-                .as_ref()
-                .map(|s| s.best_move())
-                .or_else(|| admission.allowed_root_moves().first().copied());
-            let report = SearchSessionReport {
-                best_move,
-                work,
-                mate_strategy,
-            };
-            return Ok((
-                Box::new(Idle {
-                    native,
-                    owner: Box::new(retired.owner),
-                    actor,
-                    next_request_sequence,
-                    game,
-                    previous_root: Some(receipt.clone()),
-                }),
-                report,
-                receipt,
-            ));
+            return self.finish_preparing_retirement(
+                native,
+                retired,
+                actor,
+                next_request_sequence,
+                game,
+                context,
+                admission,
+                None,
+            );
         }
         let signal = native.service.signal();
         if actor.is_none() {
@@ -876,32 +1266,44 @@ impl RoventNnuecSessionDriver {
             signal.clone(),
         );
         let ready = loop {
-            if initial.phase() != InitialNnuecPhase::AdoptPort
-                && (!context.accepts().unwrap_or(false)
-                    || Instant::now()
-                        >= context
-                            .control
-                            .soft_deadline
-                            .min(context.control.admission_deadline))
-            {
-                return Err(self.cleanup_initial(
-                    native,
-                    initial.into_cleanup(),
-                    context,
-                    "RoventNnuecInitialStopped",
-                ));
+            if initial.phase() != InitialNnuecPhase::AdoptPort {
+                let accepted = match context.accepts() {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        let detail = error.to_string();
+                        return Err(self.retain(
+                            (native, initial.into_cleanup(), error),
+                            "RoventNnuecInitialControl",
+                            &detail,
+                        ));
+                    }
+                };
+                if !accepted || context.soft_expired(Instant::now()) {
+                    return self.cleanup_initial(
+                        native,
+                        initial.into_cleanup(),
+                        context,
+                        admission,
+                        next_request_sequence,
+                        game,
+                        "RoventNnuecInitialStopped",
+                    );
+                }
             }
             let observed = signal.version();
             match initial.step() {
                 InitialNnuecStep::Pending(pending) => initial = pending,
                 InitialNnuecStep::Ready(ready) => break ready,
                 InitialNnuecStep::RetainedFailure(failed) => {
-                    return Err(self.cleanup_initial(
+                    return self.cleanup_initial(
                         native,
                         failed.into_cleanup(),
                         context,
+                        admission,
+                        next_request_sequence,
+                        game,
                         "RoventNnuecInitialPreparation",
-                    ));
+                    );
                 }
             }
             signal.wait_changed(
@@ -942,9 +1344,38 @@ impl RoventNnuecSessionDriver {
                 ));
             }
         }
+        let root_moves = Arc::clone(&custody.root_moves);
         let (ledger, root_budget, cleanup_deadline, pins) =
             NnuecRootRetirementPins::from_custody(custody, metadata);
-        let driver = match AdaptivePortDriver::new_with_coordinator_policy_retaining(
+        let accepted = match context.accepts() {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                let detail = error.to_string();
+                return Err(self.retain(
+                    (native, port, worker, actor, pins, ledger, root_moves, error),
+                    "RoventNnuecAdoptedControl",
+                    &detail,
+                ));
+            }
+        };
+        if !accepted || context.soft_expired(Instant::now()) {
+            return self.cleanup_adopted_initial(
+                native,
+                port,
+                worker,
+                actor,
+                pins,
+                ledger,
+                root_budget,
+                cleanup_deadline,
+                root_moves,
+                next_request_sequence,
+                game,
+                context,
+                admission,
+            );
+        }
+        let mut driver = match AdaptivePortDriver::new_with_coordinator_policy_retaining(
             port,
             context.control.deadline,
             Arc::new(signal.clone()),
@@ -952,6 +1383,26 @@ impl RoventNnuecSessionDriver {
             self.policy,
         ) {
             Ok(d) => d,
+            Err((port, AdaptiveManagerError::Deadline)) => {
+                // The original hard boundary can race the prior live gate.
+                // The returned original port follows cleanup, never a fresh
+                // driver, deadline, worker, or manager construction.
+                return self.cleanup_adopted_initial(
+                    native,
+                    port,
+                    worker,
+                    actor,
+                    pins,
+                    ledger,
+                    root_budget,
+                    cleanup_deadline,
+                    root_moves,
+                    next_request_sequence,
+                    game,
+                    context,
+                    admission,
+                );
+            }
             Err((port, e)) => {
                 return Err(self.retain(
                     (native, port, worker, actor, pins, ledger),
@@ -960,6 +1411,15 @@ impl RoventNnuecSessionDriver {
                 ));
             }
         };
+        if let Some(observer) = &self.collection_hooks.external_teacher {
+            if let Err(error) = driver.set_external_teacher_observer(Arc::clone(observer)) {
+                return Err(self.retain(
+                    (native, driver, worker, actor, pins, ledger),
+                    "RoventNnuecTeacherObserver",
+                    &error.to_string(),
+                ));
+            }
+        }
         let registration = AdaptiveManagerRegistration {
             authority: context.authority,
             hard_deadline: context.control.deadline,
@@ -998,7 +1458,16 @@ impl RoventNnuecSessionDriver {
                 ));
             }
         };
+        let mut collection_admitted = false;
         let execution = catch_unwind(AssertUnwindSafe(|| -> Result<(), AdaptiveManagerError> {
+            if manager.registered_cleanup_deadline() != Some(context.shutdown_deadline) {
+                return Err(AdaptiveManagerError::Invalid(
+                    "NNUEC original cleanup boundary differs",
+                ));
+            }
+            if let Some(clock) = &context.effective_clock {
+                manager.register_effective_clock(clock.clone())?;
+            }
             manager.enable_nnuec_preparation(Arc::clone(self.loaded.model()))?;
             let fields = self.configuration.fields();
             if let ExecutionConfiguration::OwnResearcher {
@@ -1016,14 +1485,34 @@ impl RoventNnuecSessionDriver {
                         .map_err(|e| AdaptiveManagerError::Semantic(e.to_string()))?,
                 )?;
             }
+            if context.accepts().unwrap_or(false) && !context.soft_expired(Instant::now()) {
+                if let Some(origin) = &self.collection_origin {
+                    let frontier = manager
+                        .driver()
+                        .port()
+                        .and_then(|port| port.rovent_frontier())
+                        .ok_or(AdaptiveManagerError::Invalid(
+                            "actual NNUEC collection frontier absent",
+                        ))?;
+                    let cap = RoventCollectionRootAdmission::from_attached_frontier(
+                        origin,
+                        frontier,
+                        self.snapshot.input_lock,
+                        root_budget,
+                        self.selective_policy,
+                        Arc::clone(&admission),
+                    )?;
+                    manager.admit_collection_root(cap)?;
+                    if let Some(observer) = &self.collection_hooks.root_admission {
+                        observer(&mut manager)?;
+                    }
+                    collection_admitted = true;
+                }
+            }
             // A completed initial Ready is still not permission to create a
             // fresh native input after original UCI admission has closed.
             if context.accepts().unwrap_or(false)
-                && Instant::now()
-                    < context
-                        .control
-                        .soft_deadline
-                        .min(context.control.admission_deadline)
+                && !context.soft_expired(Instant::now())
                 && !should_quiesce(&manager)?
             {
                 let input = manager.driver_mut().root_input()?;
@@ -1038,14 +1527,15 @@ impl RoventNnuecSessionDriver {
                     let accepts = context.accepts().unwrap_or(false);
                     if manager.phase() == ManagerPhase::Running
                         && (!accepts
-                            || Instant::now()
-                                >= context
-                                    .control
-                                    .soft_deadline
-                                    .min(context.control.admission_deadline)
+                            || context.soft_expired(Instant::now())
                             || should_quiesce(manager)?)
                     {
                         manager.begin_root_quiesce(context.shutdown_deadline)?;
+                    }
+                    if collection_admitted {
+                        if let Some(pump) = &self.collection_hooks.cooperative {
+                            pump()?;
+                        }
                     }
                     manager.pump_nnuec_preparation(&actor)?;
                     if context.accepts().unwrap_or(false) {
@@ -1121,6 +1611,17 @@ impl RoventNnuecSessionDriver {
                 ));
             }
         };
+        if collection_admitted {
+            if let Some(observer) = &self.collection_hooks.root_closure {
+                if let Err(error) = observer(&mut manager, result.completion) {
+                    return Err(self.retain(
+                        (manager, actor, pins),
+                        "RoventNnuecCollectionClosure",
+                        &error.to_string(),
+                    ));
+                }
+            }
+        }
         let frontier = match manager.driver_mut().retire_rovent_frontier() {
             Ok(Some(r)) => r.snapshot,
             _ => {
@@ -1141,6 +1642,7 @@ impl RoventNnuecSessionDriver {
             counters: manager.counters(),
             stopped_before_research_execution: false,
             deadline_before_frontier: false,
+            initial_retirement: None,
         });
         let work = match receipt.work() {
             Ok(w) => w,
@@ -1287,6 +1789,10 @@ impl RoventNnuecSessionDriver {
 }
 
 impl SearchSessionDriver for RoventNnuecSessionDriver {
+    fn supports_ponder_clock(&self) -> bool {
+        true
+    }
+
     fn node_budget_semantics(&self) -> crate::bridge::NodeBudgetSemantics {
         crate::bridge::NodeBudgetSemantics::RoventPositionVisits
     }

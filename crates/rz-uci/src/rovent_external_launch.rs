@@ -55,6 +55,17 @@ pub struct PreparedRoventExternalLaunch {
     root_budget: Option<Digest>,
 }
 
+/// spawn 이전 실패의 원 source를 보존한다. low worker는 thread 생성 이후에는
+/// 항상 owner를 반환하므로 실제 startup 실패는 이 source-only 오류가 아니라
+/// 반환된 worker의 startup/physical cleanup 경로에 남는다.
+#[derive(Debug)]
+pub struct RoventExternalSpawnRejection {
+    pub failure: CheckerError,
+    pub launch: PreparedRoventExternalLaunch,
+    pub executable: File,
+    pub working_directory: File,
+}
+
 /// Only the retained worker's actual startup can construct this observation.
 #[derive(Clone, Debug)]
 pub struct VerifiedRoventExternalStartup {
@@ -223,6 +234,68 @@ impl PreparedRoventExternalLaunch {
         startup_deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<RoventExternalOwner, CheckerError> {
+        self.spawn_pinned_retaining(
+            executable,
+            working_directory,
+            owner,
+            clock,
+            initial_root,
+            startup_deadline,
+            cancel,
+        )
+        .map_err(|rejection| rejection.failure)
+    }
+
+    /// 실제 source state는 실패 시 이 원 launch/FD를 다음 root 또는 명시
+    /// 정리까지 보존한다. low worker에는 FD 복제만 넘기며 가중치 bytes는 복사하지 않는다.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_pinned_retaining(
+        self,
+        executable: File,
+        working_directory: File,
+        owner: CpuWorkerId,
+        clock: ExternalWorkerClock,
+        initial_root: SearchAuthority,
+        startup_deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<RoventExternalOwner, RoventExternalSpawnRejection> {
+        let result = self.spawn_worker_from_original_descriptors(
+            &executable,
+            &working_directory,
+            owner,
+            clock,
+            initial_root,
+            startup_deadline,
+            cancel,
+        );
+        match result {
+            Ok(worker) => Ok(RoventExternalOwner {
+                launch: self,
+                worker,
+                initial_root,
+                legacy_dispatched: false,
+                active_root: None,
+            }),
+            Err(failure) => Err(RoventExternalSpawnRejection {
+                failure,
+                launch: self,
+                executable,
+                working_directory,
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_worker_from_original_descriptors(
+        &self,
+        executable: &File,
+        working_directory: &File,
+        owner: CpuWorkerId,
+        clock: ExternalWorkerClock,
+        initial_root: SearchAuthority,
+        startup_deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<ProfiledExternalWorker, CheckerError> {
         if cancel.load(Ordering::Acquire) || Instant::now() >= startup_deadline {
             return Err(invalid("external startup canceled or expired"));
         }
@@ -252,10 +325,16 @@ impl PreparedRoventExternalLaunch {
                     "external held executable size differs from manifest",
                 ));
             }
+            let executable = executable
+                .try_clone()
+                .map_err(|_| invalid("external original executable descriptor clone failed"))?;
+            let working_directory = working_directory
+                .try_clone()
+                .map_err(|_| invalid("external original cwd descriptor clone failed"))?;
             let launch_pin =
                 ExternalLaunchPin::from_owned_descriptors(executable, working_directory)?;
             let p = self.profile.profile();
-            let worker = ProfiledExternalWorker::spawn(
+            ProfiledExternalWorker::spawn(
                 self.profile.configuration()?,
                 p.engine,
                 p.purpose,
@@ -264,14 +343,7 @@ impl PreparedRoventExternalLaunch {
                 initial_root,
                 startup_deadline,
                 Some(launch_pin),
-            )?;
-            Ok(RoventExternalOwner {
-                launch: self,
-                worker,
-                initial_root,
-                legacy_dispatched: false,
-                active_root: None,
-            })
+            )
         }
     }
 

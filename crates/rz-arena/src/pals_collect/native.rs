@@ -729,6 +729,16 @@ fn recheck_observation_json(observation: &Observation) -> serde_json::Value {
         } => {
             serde_json::json!({"kind":"ExternalUci","requested_depth":requested_depth,"reported_depth":reported_depth,"seldepth":seldepth,"bound":format!("{:?}",bound)})
         }
+        EvidenceScope::ProfiledExternalUci {
+            requested,
+            issued,
+            reported_depth,
+            seldepth,
+            bound,
+        } => {
+            serde_json::json!({"kind":"ProfiledExternalUci","requested":requested,"issued":issued,
+                "reported_depth":reported_depth,"seldepth":seldepth,"bound":format!("{:?}",bound)})
+        }
         EvidenceScope::Model {
             model,
             encoding,

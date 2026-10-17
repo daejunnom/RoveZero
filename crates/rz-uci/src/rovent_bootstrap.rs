@@ -5,6 +5,7 @@
 //! model is not a complete engine, first inference, resource or numeric proof.
 
 pub mod configuration;
+pub mod external_session;
 pub mod launch;
 pub mod nnuec_preparing;
 pub mod nnuec_session;
@@ -707,7 +708,9 @@ pub fn compiled_bootstrap_source_digest() -> [u8; 32] {
         include_str!("rovent_bootstrap/pinned.rs"),
         include_str!("rovent_bootstrap/configuration.rs"),
         include_str!("rovent_bootstrap/configuration/v2.rs"),
+        include_str!("rovent_bootstrap/configuration/v3.rs"),
         include_str!("rovent_bootstrap/pinned/external_r.rs"),
+        include_str!("rovent_bootstrap/external_session.rs"),
         include_str!("rovent_bootstrap/pc_session.rs"),
         include_str!("rovent_bootstrap/product.rs"),
         include_str!("rovent_bootstrap/launch.rs"),

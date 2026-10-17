@@ -9,6 +9,7 @@ mod accepted_peer;
 mod external_binding;
 mod machine;
 mod native_acceptance;
+mod profiled_external_binding;
 mod ranking;
 #[cfg(test)]
 mod test_support;
@@ -20,6 +21,7 @@ pub(crate) use accepted_peer::{AcceptedPeerSourceSeal, accepted_peer_semantic_di
 pub use external_binding::*;
 pub use machine::*;
 pub use native_acceptance::*;
+pub use profiled_external_binding::*;
 pub use ranking::*;
 pub use ticket_observation::{RoleTicketCumulativeObservation, RoleTicketPhaseOccupancy};
 pub use tickets::*;
@@ -101,6 +103,10 @@ pub fn coordinator_source_digest() -> rz_contracts::Digest {
         (
             "coordinator/external_binding.rs",
             include_bytes!("coordinator/external_binding.rs").as_slice(),
+        ),
+        (
+            "coordinator/profiled_external_binding.rs",
+            include_bytes!("coordinator/profiled_external_binding.rs").as_slice(),
         ),
     ] {
         hash.update((name.len() as u64).to_le_bytes());

@@ -8,6 +8,7 @@ use crate::pals::coordinator::AcceptedPeerSourceSeal;
 /// endpoint View. This is historical progress, never a resumable action.
 pub struct PcRepairProgress {
     pub(super) cycle: u64,
+    pub(super) parent_cycle: Option<u64>,
     pub(super) phase: PcRepairPhase,
     pub(super) first: BoardMove,
     pub(super) model: ModelValueIdentity,
@@ -20,6 +21,9 @@ pub struct PcRepairProgress {
 impl PcRepairProgress {
     pub fn cycle(&self) -> u64 {
         self.cycle
+    }
+    pub fn parent_cycle(&self) -> Option<u64> {
+        self.parent_cycle
     }
     pub fn phase(&self) -> PcRepairPhase {
         self.phase
@@ -100,6 +104,12 @@ impl PcRepairReport {
     }
     pub fn incomplete_progress(&self) -> impl Iterator<Item = &PcRepairProgress> {
         self.cycles.active.values().map(|facts| &facts.progress)
+    }
+    pub fn incomplete_stopped_reason(&self, cycle: u64) -> Option<&'static str> {
+        self.cycles
+            .active
+            .get(&cycle)
+            .and_then(|facts| facts.stopped_reason)
     }
     pub fn incomplete_last_accepted(&self, cycle: u64) -> Option<&AcceptedRoleOrigin> {
         self.cycles
@@ -294,6 +304,9 @@ pub(super) fn model_bytes(model: &ModelValueIdentity) -> Option<u64> {
 }
 fn facts_bytes(facts: &CycleFacts) -> Option<u64> {
     let mut bytes = inline::<CycleFacts>()?.checked_add(facts.progress.owned_host_bytes()?)?;
+    if let Some(recipe) = &facts.followup {
+        bytes = bytes.checked_add(recipe.owned_host_bytes()?)?;
+    }
     if let Some(source) = &facts.target {
         bytes = bytes.checked_add(source.owned_host_bytes()?)?;
     }

@@ -305,12 +305,42 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         clock: ClockDomain,
         now: MonotonicTick,
     ) -> Result<(), FrontierError> {
+        self.attach_rovent_frontier_inner(registration, limits, actual, None, clock, now)
+    }
+
+    /// An actual current-root external owner is required independently of
+    /// registration metadata. Its reported work never acquires a native ledger.
+    pub fn attach_rovent_external_frontier(
+        &mut self,
+        registration: FrontierRegistration,
+        limits: FrontierLimits,
+        actual: AdaptiveFrontierStartup<'_>,
+        source: &crate::external_cpu::ProfiledExternalRootSource,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
+        if !self.engine.is_external() || actual.native_ledger.is_some() {
+            return Err(FrontierError::ForeignRoot);
+        }
+        self.attach_rovent_frontier_inner(registration, limits, actual, Some(source), clock, now)
+    }
+
+    fn attach_rovent_frontier_inner(
+        &mut self,
+        registration: FrontierRegistration,
+        limits: FrontierLimits,
+        actual: AdaptiveFrontierStartup<'_>,
+        external: Option<&crate::external_cpu::ProfiledExternalRootSource>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
         self.check_live().map_err(|_| FrontierError::ForeignRoot)?;
         if self.engine.semantic.rovent_frontier.is_some()
             || self.root_rules_scanned
             || self.next_question != 1
             || !self.accepted.is_empty()
             || !self.cpu_admissions.is_empty()
+            || !self.profiled_external.is_empty()
         {
             return Err(FrontierError::Invalid(
                 "frontier attachment after root work",
@@ -330,27 +360,42 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 self.engine.semantic.model.value_identity(),
             )
             .map_err(|_| FrontierError::ForeignRoot)?;
-        let frontier = RoventFrontier::new(
-            registration,
-            limits,
-            &self.engine.semantic.stores,
-            clock,
-            now,
-        )?;
-        frontier.validate_attachment(
-            FrontierAttachment {
-                authority: self.authority,
-                mode: actual.mode,
-                original_deadline: self.deadline,
-                root_budget: actual.root_budget,
-                root_rules: &self.rules,
-                root_moves: actual.root_moves,
-                root_state: self.engine.semantic.nodes[self.root].state,
-                model_namespace: namespace,
-                native_ledger: actual.native_ledger,
-            },
-            &self.engine.semantic.stores,
-        )?;
+        let frontier = match external {
+            Some(source) => RoventFrontier::new_external(
+                registration,
+                limits,
+                &self.engine.semantic.stores,
+                source,
+                clock,
+                now,
+            )?,
+            None => RoventFrontier::new(
+                registration,
+                limits,
+                &self.engine.semantic.stores,
+                clock,
+                now,
+            )?,
+        };
+        let attachment = FrontierAttachment {
+            authority: self.authority,
+            mode: actual.mode,
+            original_deadline: self.deadline,
+            root_budget: actual.root_budget,
+            root_rules: &self.rules,
+            root_moves: actual.root_moves,
+            root_state: self.engine.semantic.nodes[self.root].state,
+            model_namespace: namespace,
+            native_ledger: actual.native_ledger,
+        };
+        match external {
+            Some(source) => frontier.validate_external_attachment(
+                attachment,
+                &self.engine.semantic.stores,
+                source,
+            )?,
+            None => frontier.validate_attachment(attachment, &self.engine.semantic.stores)?,
+        }
         self.engine.semantic.rovent_frontier = Some(Box::new(frontier));
         Ok(())
     }
@@ -377,22 +422,28 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(FrontierError::ForeignRoot);
         }
-        frontier.validate_attachment(
-            FrontierAttachment {
-                authority: self.authority,
-                mode: frontier.registration().mode,
-                original_deadline: self.deadline,
-                root_budget: frontier.registration().root_budget,
-                root_rules: &self.rules,
-                root_moves: frontier.root_moves(),
-                root_state: self.engine.semantic.nodes[self.root].state,
-                model_namespace: self
-                    .model_namespace()
-                    .map_err(|_| FrontierError::ForeignRoot)?,
-                native_ledger: frontier.registration().native_ledger.as_ref(),
-            },
-            &self.engine.semantic.stores,
-        )?;
+        let attachment = FrontierAttachment {
+            authority: self.authority,
+            mode: frontier.registration().mode,
+            original_deadline: self.deadline,
+            root_budget: frontier.registration().root_budget,
+            root_rules: &self.rules,
+            root_moves: frontier.root_moves(),
+            root_state: self.engine.semantic.nodes[self.root].state,
+            model_namespace: self
+                .model_namespace()
+                .map_err(|_| FrontierError::ForeignRoot)?,
+            native_ledger: frontier.registration().native_ledger.as_ref(),
+        };
+        if let Some(source) = frontier.external_source() {
+            frontier.validate_external_attachment(
+                attachment,
+                &self.engine.semantic.stores,
+                source,
+            )?;
+        } else {
+            frontier.validate_attachment(attachment, &self.engine.semantic.stores)?;
+        }
         if clock != self.deadline.clock {
             return Err(FrontierError::ForeignRoot);
         }

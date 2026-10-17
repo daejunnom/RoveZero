@@ -15,6 +15,8 @@ pub const ROVENT_PCR_INITIAL_DOMAIN: &str = "rz-rovent-pcr-native-initial-stop/1
 pub(super) enum RoventPcrIdleCustody {
     StartupReady,
     RetiredRoot(AdaptiveShutdownReceipt),
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    RetiredProfiledRoot(super::super::ProfiledExternalShutdownReceipt),
 }
 
 /// Producer-only evidence for a Start that did not create live root work.
@@ -40,10 +42,21 @@ impl RoventPcrInitialReceipt {
         match &self.idle_custody {
             RoventPcrIdleCustody::StartupReady => None,
             RoventPcrIdleCustody::RetiredRoot(receipt) => Some(receipt),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            RoventPcrIdleCustody::RetiredProfiledRoot(_) => None,
         }
     }
     pub fn used_original_startup_ready(&self) -> bool {
         matches!(self.idle_custody, RoventPcrIdleCustody::StartupReady)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn previous_clean_profiled_root(
+        &self,
+    ) -> Option<&super::super::ProfiledExternalShutdownReceipt> {
+        match &self.idle_custody {
+            RoventPcrIdleCustody::RetiredProfiledRoot(receipt) => Some(receipt),
+            _ => None,
+        }
     }
     fn report(&self) -> SearchSessionReport {
         SearchSessionReport {
@@ -106,6 +119,16 @@ where
                 &owners.rovent_idle_custody,
                 RoventPcrIdleCustody::RetiredRoot(receipt) if !receipt.permits_root_reuse()
             )
+            || {
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                {
+                    matches!(&owners.rovent_idle_custody, RoventPcrIdleCustody::RetiredProfiledRoot(receipt) if !receipt.permits_root_reuse())
+                }
+                #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+                {
+                    false
+                }
+            }
         {
             return Err(SearchSessionFailure::physical_completion_unknown());
         }

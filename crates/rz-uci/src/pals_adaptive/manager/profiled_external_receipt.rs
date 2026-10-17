@@ -20,6 +20,7 @@ pub struct ProfiledExternalShutdownReceipt {
     pub(super) request_sequence_high_water: u64,
     pub(super) counters: AdaptiveManagerCounters,
     pub(super) reported_work: Option<FrontierExternalWork>,
+    pub(super) retained_semantic_host_bytes: Option<u64>,
 }
 
 impl ProfiledExternalShutdownReceipt {
@@ -61,6 +62,9 @@ impl ProfiledExternalShutdownReceipt {
     }
     pub fn reported_work(&self) -> Option<FrontierExternalWork> {
         self.reported_work
+    }
+    pub fn retained_semantic_host_bytes(&self) -> Option<u64> {
+        self.retained_semantic_host_bytes
     }
     fn settled(&self) -> bool {
         !self.quarantined

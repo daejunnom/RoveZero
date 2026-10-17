@@ -8,6 +8,9 @@ use super::*;
 use crate::pals::coordinator::AcceptedPeerSourceSeal;
 use crate::pals::value::ModelValueIdentity;
 
+#[path = "repair_followup.rs"]
+mod repair_followup;
+
 const MAX_CYCLES: usize = super::super::frozen_recheck::MAX_PENDING_REPAIRS;
 const MAX_PER_FIRST: u8 = super::super::frozen_recheck::MAX_REPAIRS_PER_FIRST;
 
@@ -44,6 +47,7 @@ pub(super) struct PcRepairOrigin {
 pub(super) struct PcRepairStep {
     origin: Arc<PcRepairOrigin>,
     cycle: u64,
+    parent_cycle: Option<u64>,
     phase: PcRepairPhase,
     prefix: Vec<BoardMove>,
     proposal: Vec<BoardMove>,
@@ -65,16 +69,27 @@ pub(super) struct PublishedPcLine {
     pub(super) kind: RecordKind,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct PcLineRelations {
+    pub(super) parent: Option<PublishedPcLine>,
+    pub(super) supersedes: Option<PublishedPcLine>,
+}
+
 /// Mutable cycle facts are single-writer port state. Every stored head came
 /// from the port's actual one-use AcceptedRoleStep consumption boundary.
 pub(super) struct CycleFacts {
     pub(super) phase: PcRepairPhase,
+    pub(super) stopped_reason: Option<&'static str>,
     pub(super) progress: super::repair_report::PcRepairProgress,
     pub(super) last_accepted: Option<AcceptedPeerSourceSeal>,
+    pub(super) proposal: Option<PublishedPcLine>,
     pub(super) counter: Option<PublishedPcLine>,
+    pub(super) previous_repair: Option<PublishedPcLine>,
     pub(super) target: Option<Arc<super::repair_witness::PcDivergenceSource>>,
     pub(super) repair: Option<Arc<super::repair_witness::PcRepairAcceptedLine>>,
     pub(super) recheck: Option<Arc<super::repair_witness::PcRepairAcceptedLine>>,
+    pub(super) recheck_publication: Option<PublishedPcLine>,
+    pub(super) followup: Option<PcRepairStep>,
     pub(super) repair_endpoint: Option<super::repair_witness::PcAcceptedFreshEndpoint>,
     pub(super) counter_endpoint: Option<super::repair_witness::PcAcceptedFreshEndpoint>,
 }
@@ -112,6 +127,7 @@ impl super::repair_report::PcRepairProgress {
     pub(super) fn capture(step: &PcRepairStep) -> Self {
         Self {
             cycle: step.cycle,
+            parent_cycle: step.parent_cycle,
             phase: step.phase,
             first: step.origin.first,
             model: step.origin.model.clone(),
@@ -183,6 +199,10 @@ impl PcRepairStep {
         let mut hash = Sha256::new();
         hash.update(b"rz-rovent-pc-pals-repair-recheck-question/1\0");
         hash.update(self.cycle.to_le_bytes());
+        hash.update([u8::from(self.parent_cycle.is_some())]);
+        if let Some(parent) = self.parent_cycle {
+            hash.update(parent.to_le_bytes());
+        }
         hash.update([self.phase as u8]);
         hash.update(self.origin.root_budget.0);
         hash.update(self.origin.initial_source.origin().seal_digest().0);
@@ -327,6 +347,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
         let step = PcRepairStep {
             origin,
             cycle: id,
+            parent_cycle: None,
             phase: PcRepairPhase::Proposal,
             prefix: prefix.to_vec(),
             proposal: prefix.to_vec(),
@@ -348,12 +369,17 @@ impl<M: RoleModel> PcSemanticPort<M> {
             id,
             CycleFacts {
                 phase: step.phase,
+                stopped_reason: None,
                 progress: super::repair_report::PcRepairProgress::capture(&step),
                 last_accepted: None,
+                proposal: None,
                 counter: None,
+                previous_repair: None,
                 target: None,
                 repair: None,
                 recheck: None,
+                recheck_publication: None,
+                followup: None,
                 repair_endpoint: None,
                 counter_endpoint: None,
             },
@@ -452,14 +478,15 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 .as_ref()
                 .and_then(|cycles| cycles.active.get(&step.cycle))
                 .is_none_or(|facts| {
-                    facts.phase != step.phase
-                        && !matches!(
-                            (facts.phase, step.phase),
-                            (
-                                PcRepairPhase::FreshRepair | PcRepairPhase::FreshCounter,
-                                PcRepairPhase::FreshRepair | PcRepairPhase::FreshCounter
-                            )
-                        )
+                    facts.stopped_reason.is_some()
+                        || (facts.phase != step.phase
+                            && !matches!(
+                                (facts.phase, step.phase),
+                                (
+                                    PcRepairPhase::FreshRepair | PcRepairPhase::FreshCounter,
+                                    PcRepairPhase::FreshRepair | PcRepairPhase::FreshCounter
+                                )
+                            ))
                 })
         {
             return Err(RoleError::InvalidOutput.into());
@@ -662,7 +689,19 @@ impl<M: RoleModel> PcSemanticPort<M> {
         match next.phase {
             PcRepairPhase::Proposal => {
                 next.proposal = next.prefix.clone();
-                self.publish_line(RecordKind::Proposal, &next.proposal)?;
+                let line = self.publish_pc_repair_line_with_relations(
+                    RecordKind::Proposal,
+                    &next.proposal,
+                    PcLineRelations {
+                        parent: None,
+                        supersedes: None,
+                    },
+                )?;
+                self.repair_cycles
+                    .as_mut()
+                    .and_then(|cycles| cycles.active.get_mut(&next.cycle))
+                    .ok_or(RoleError::InvalidOutput)?
+                    .proposal = Some(line);
                 if terminal {
                     return self.finish_repair_unknown(
                         next.cycle,
@@ -692,7 +731,20 @@ impl<M: RoleModel> PcSemanticPort<M> {
             }
             PcRepairPhase::CounterTail => {
                 next.counter = Some(next.prefix.clone());
-                let line = self.publish_pc_repair_line(RecordKind::Counterexample, &next.prefix)?;
+                let parent = self
+                    .repair_cycles
+                    .as_ref()
+                    .and_then(|cycles| cycles.active.get(&next.cycle))
+                    .and_then(|facts| facts.proposal)
+                    .ok_or(RoleError::InvalidOutput)?;
+                let line = self.publish_pc_repair_line_with_relations(
+                    RecordKind::Counterexample,
+                    &next.prefix,
+                    PcLineRelations {
+                        parent: Some(parent),
+                        supersedes: None,
+                    },
+                )?;
                 self.repair_cycles
                     .as_mut()
                     .and_then(|cycles| cycles.active.get_mut(&next.cycle))
@@ -711,7 +763,21 @@ impl<M: RoleModel> PcSemanticPort<M> {
             }
             PcRepairPhase::Repair => {
                 next.repaired = Some(next.prefix.clone());
-                let line = self.publish_pc_repair_line(RecordKind::Repair, &next.prefix)?;
+                let facts = self
+                    .repair_cycles
+                    .as_ref()
+                    .and_then(|cycles| cycles.active.get(&next.cycle))
+                    .ok_or(RoleError::InvalidOutput)?;
+                let parent = facts.counter.ok_or(RoleError::InvalidOutput)?;
+                let previous = facts.previous_repair;
+                let line = self.publish_pc_repair_line_with_relations(
+                    RecordKind::Repair,
+                    &next.prefix,
+                    PcLineRelations {
+                        parent: Some(parent),
+                        supersedes: previous,
+                    },
+                )?;
                 let fact = super::repair_witness::PcRepairAcceptedLine::capture(
                     input,
                     accepted,
@@ -775,7 +841,27 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 )
             }
             PcRepairPhase::RecheckTail => {
-                let line = self.publish_pc_repair_line(RecordKind::Counterexample, &next.prefix)?;
+                let facts = self
+                    .repair_cycles
+                    .as_ref()
+                    .and_then(|cycles| cycles.active.get(&next.cycle))
+                    .ok_or(RoleError::InvalidOutput)?;
+                let repair = facts.repair.as_ref().ok_or(RoleError::InvalidOutput)?;
+                let parent = PublishedPcLine {
+                    line: repair.line(),
+                    observation: repair.observation(),
+                    revision: repair.revision(),
+                    kind: repair.kind(),
+                };
+                let previous = facts.counter;
+                let line = self.publish_pc_repair_line_with_relations(
+                    RecordKind::Counterexample,
+                    &next.prefix,
+                    PcLineRelations {
+                        parent: Some(parent),
+                        supersedes: previous,
+                    },
+                )?;
                 let fact = super::repair_witness::PcRepairAcceptedLine::capture(
                     input,
                     accepted,
@@ -799,6 +885,16 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 }
                 next.counter = Some(next.prefix.clone());
                 next.phase = PcRepairPhase::FreezePair;
+                // Keep the complete, actually accepted C frontier before the
+                // two Fresh questions filter duties to their own descendants.
+                // This recipe has no selected View or native latent custody.
+                let facts = self
+                    .repair_cycles
+                    .as_mut()
+                    .and_then(|cycles| cycles.active.get_mut(&next.cycle))
+                    .ok_or(RoleError::InvalidOutput)?;
+                facts.recheck_publication = Some(line);
+                facts.followup = Some(next.clone());
                 self.push_repair_plan(node, next, None)
             }
             _ => Err(RoleError::InvalidOutput.into()),
@@ -810,13 +906,15 @@ impl<M: RoleModel> PcSemanticPort<M> {
             .repair_cycles
             .as_mut()
             .ok_or(PalsError::InvalidConfig)?;
-        if cycles
-            .active
-            .get(&id)
-            .ok_or(RoleError::InvalidOutput)?
-            .target
-            .is_some()
-        {
+        let facts = cycles.active.get_mut(&id).ok_or(RoleError::InvalidOutput)?;
+        if facts.target.is_none() {
+            // There is no visible-counter label to mint, but earlier accepted
+            // root/P/C heads are still real historical consumption. Preserve
+            // their bounded progress instead of treating this cycle as absent.
+            facts.stopped_reason = Some(reason);
+            return Ok(());
+        }
+        if facts.target.is_some() {
             if cycles.witnesses.len() >= MAX_CYCLES {
                 return Err(PalsError::Capacity);
             }
@@ -1039,9 +1137,20 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 .clone(),
             event,
         )?;
+        // A completed actual C frontier remains eligible for another bounded
+        // Repair even when the conditional WDL comparison is unknown. Prepare
+        // all admission capacity while the original completed facts remain.
+        let followup = self.prepare_completed_repair_followup(step.cycle)?;
+        let cycles = self
+            .repair_cycles
+            .as_mut()
+            .ok_or(PalsError::InvalidConfig)?;
         cycles.active.remove(&step.cycle);
         cycles.next_event = next;
         cycles.witnesses.push_back(witness);
+        if let Some(followup) = followup {
+            self.enqueue_completed_repair_followup(followup)?;
+        }
         Ok(())
     }
 }

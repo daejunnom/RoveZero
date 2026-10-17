@@ -1464,7 +1464,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     }
 }
 
-fn foreign_stage(stage: RefinementStage) -> bool {
+pub(super) fn foreign_stage(stage: RefinementStage) -> bool {
     matches!(
         stage,
         RefinementStage::CpuValidation
@@ -1475,7 +1475,7 @@ fn foreign_stage(stage: RefinementStage) -> bool {
     )
 }
 
-fn foreign_root_restriction(
+pub(super) fn foreign_root_restriction(
     question: &AdaptivePortQuestion,
 ) -> Result<Option<Vec<BoardMove>>, PalsError> {
     let legal = question.position.legal_moves();

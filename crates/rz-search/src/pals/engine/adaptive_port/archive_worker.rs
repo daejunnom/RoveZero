@@ -6,7 +6,8 @@
 use super::{AdaptiveEnginePort, PalsEngine, PalsError, RoleModel};
 use crate::pals::store::{
     ArchiveIoBudget, ArchiveOwnerSnapshot, ArchiveStats, ForeignAppendPermit, ForeignGoIssuedProof,
-    Observation, SituationId, StoreError, StorePins, StoreReadOwner,
+    Observation, ProfiledForeignAppendPermit, ProfiledForeignGoIssuedProof, SituationId,
+    StoreError, StorePins, StoreReadOwner,
 };
 use rz_contracts::pals::SearchAuthority;
 use rz_position::Position;
@@ -61,6 +62,12 @@ pub enum ArchiveOperation {
         observation: Observation,
         issued: ForeignGoIssuedProof,
     },
+    /// Separate profiled query namespace; no legacy job or completed-depth
+    /// evidence is manufactured when the original go omitted a limit.
+    PrepareProfiledForeign {
+        observation: Observation,
+        issued: ProfiledForeignGoIssuedProof,
+    },
     /// Official lifecycle reset on the exclusive worker. This also supports an
     /// explicitly declared archive-off profile; it never changes archive mode.
     NewGame { next_authority: SearchAuthority },
@@ -72,6 +79,7 @@ pub enum ArchiveOperationKind {
     ReclaimHot,
     PrepareForeign,
     NewGame,
+    PrepareProfiledForeign,
 }
 impl ArchiveOperation {
     fn kind(&self) -> ArchiveOperationKind {
@@ -80,6 +88,7 @@ impl ArchiveOperation {
             Self::LoadRoot { .. } => ArchiveOperationKind::LoadRoot,
             Self::ReclaimHot { .. } => ArchiveOperationKind::ReclaimHot,
             Self::PrepareForeign { .. } => ArchiveOperationKind::PrepareForeign,
+            Self::PrepareProfiledForeign { .. } => ArchiveOperationKind::PrepareProfiledForeign,
             Self::NewGame { .. } => ArchiveOperationKind::NewGame,
         }
     }
@@ -142,6 +151,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         pins.situations.insert(root.situation);
         pins.lines.insert(situation.focus);
         merge_pins(&mut pins, &self.goal_local_protected_pins()?);
+        merge_pins(&mut pins, &self.profiled_external_protected_pins()?);
         for admission in self.cpu_admissions.values() {
             if let Some(execution) = admission.execution {
                 pins.executions.insert(execution);
@@ -245,10 +255,14 @@ pub struct ArchiveQuarantine<M: RoleModel> {
     pub receipt: ArchiveWorkReceipt,
     owner: ArchiveOwner<M>,
     foreign_permit: Option<ForeignAppendPermit>,
+    profiled_foreign_permit: Option<ProfiledForeignAppendPermit>,
 }
 impl<M: RoleModel> ArchiveQuarantine<M> {
     pub fn retains_foreign_permit(&self) -> bool {
         self.foreign_permit.is_some()
+    }
+    pub fn retains_profiled_foreign_permit(&self) -> bool {
+        self.profiled_foreign_permit.is_some()
     }
     pub fn into_owner_for_shutdown(self) -> ArchiveOwner<M> {
         self.owner
@@ -263,6 +277,7 @@ pub struct ArchiveCompletion<M: RoleModel> {
     deadline: Instant,
     cancel: Arc<AtomicBool>,
     foreign_permit: Option<ForeignAppendPermit>,
+    profiled_foreign_permit: Option<ProfiledForeignAppendPermit>,
 }
 impl<M: RoleModel> ArchiveCompletion<M> {
     pub fn receipt(&self) -> &ArchiveWorkReceipt {
@@ -283,8 +298,15 @@ impl<M: RoleModel> ArchiveCompletion<M> {
                 "foreign scan requires install_with_foreign",
             ));
         }
+        if self.result.is_ok()
+            && self.receipt.operation == ArchiveOperationKind::PrepareProfiledForeign
+        {
+            self.result = Err(ArchiveQuarantineReason::InvalidReturn(
+                "profiled foreign scan requires install_with_profiled_foreign",
+            ));
+        }
         self.install_checked(expected_authority, expected_nonce)
-            .map(|(owner, receipt, _)| (owner, receipt))
+            .map(|(owner, receipt, _, _)| (owner, receipt))
     }
     // Same by-value quarantine as install, including the one-use foreign proof.
     #[allow(clippy::result_large_err)]
@@ -302,11 +324,44 @@ impl<M: RoleModel> ArchiveCompletion<M> {
             ));
         }
         self.install_checked(expected_authority, expected_nonce)
-            .map(|(owner, receipt, permit)| {
+            .map(|(owner, receipt, permit, _)| {
                 (owner, receipt, permit.expect("checked foreign permit"))
             })
     }
-    // Both public install paths share this allocation-free owner rejection.
+
+    /// Only this path returns the exact profiled permit. A wrong operation,
+    /// late return or invalid owner keeps it in the original quarantine.
+    #[allow(clippy::result_large_err)]
+    pub fn install_with_profiled_foreign(
+        mut self,
+        expected_authority: SearchAuthority,
+        expected_nonce: u64,
+    ) -> Result<
+        (
+            ArchiveOwner<M>,
+            ArchiveWorkReceipt,
+            ProfiledForeignAppendPermit,
+        ),
+        ArchiveQuarantine<M>,
+    > {
+        if self.result.is_ok()
+            && (self.receipt.operation != ArchiveOperationKind::PrepareProfiledForeign
+                || self.profiled_foreign_permit.is_none())
+        {
+            self.result = Err(ArchiveQuarantineReason::InvalidReturn(
+                "profiled foreign permit missing",
+            ));
+        }
+        self.install_checked(expected_authority, expected_nonce)
+            .map(|(owner, receipt, _, permit)| {
+                (
+                    owner,
+                    receipt,
+                    permit.expect("checked profiled foreign permit"),
+                )
+            })
+    }
+    // All install paths share this allocation-free owner rejection.
     #[allow(clippy::result_large_err)]
     fn install_checked(
         self,
@@ -317,6 +372,7 @@ impl<M: RoleModel> ArchiveCompletion<M> {
             ArchiveOwner<M>,
             ArchiveWorkReceipt,
             Option<ForeignAppendPermit>,
+            Option<ProfiledForeignAppendPermit>,
         ),
         ArchiveQuarantine<M>,
     > {
@@ -333,17 +389,35 @@ impl<M: RoleModel> ArchiveCompletion<M> {
             self.validate_return()
         });
         match checked {
-            Ok(()) => Ok((self.owner, self.receipt, self.foreign_permit)),
+            Ok(()) => Ok((
+                self.owner,
+                self.receipt,
+                self.foreign_permit,
+                self.profiled_foreign_permit,
+            )),
             Err(reason) => Err(ArchiveQuarantine {
                 reason,
                 receipt: self.receipt,
                 owner: self.owner,
                 foreign_permit: self.foreign_permit,
+                profiled_foreign_permit: self.profiled_foreign_permit,
             }),
         }
     }
     fn validate_return(&self) -> Result<(), ArchiveQuarantineReason> {
         let invalid = ArchiveQuarantineReason::InvalidReturn;
+        let permit_shape_matches = match self.receipt.operation {
+            ArchiveOperationKind::PrepareForeign => {
+                self.foreign_permit.is_some() && self.profiled_foreign_permit.is_none()
+            }
+            ArchiveOperationKind::PrepareProfiledForeign => {
+                self.profiled_foreign_permit.is_some() && self.foreign_permit.is_none()
+            }
+            _ => self.foreign_permit.is_none() && self.profiled_foreign_permit.is_none(),
+        };
+        if !permit_shape_matches {
+            return Err(invalid("archive typed permit differs from operation"));
+        }
         let engine = self.owner.engine();
         if self.receipt.operation == ArchiveOperationKind::NewGame {
             let next = self
@@ -454,7 +528,9 @@ impl<M: RoleModel> ArchiveCompletion<M> {
             .map_err(|_| invalid("worker CPU task pins"))?;
         if matches!(
             self.receipt.operation,
-            ArchiveOperationKind::ReclaimHot | ArchiveOperationKind::PrepareForeign
+            ArchiveOperationKind::ReclaimHot
+                | ArchiveOperationKind::PrepareForeign
+                | ArchiveOperationKind::PrepareProfiledForeign
         ) && (engine.semantic.nodes.len() != self.seal.node_handles.len()
             || engine
                 .semantic
@@ -734,13 +810,20 @@ fn seal_owner<M: RoleModel>(
             return Err(StoreError::ArchiveDeadline.into());
         }
     }
+    if let ArchiveOperation::PrepareProfiledForeign { issued, .. } = &work.operation {
+        if work.deadline > issued.retain_until() {
+            return Err(StoreError::ArchiveDeadline.into());
+        }
+    }
     if let ArchiveOwner::Port(port) = owner {
         if port.authority != authority || work.deadline > port.limits.deadline {
             return Err(StoreError::StaleConsumer.into());
         }
         if !matches!(
             work.operation,
-            ArchiveOperation::ReclaimHot { .. } | ArchiveOperation::PrepareForeign { .. }
+            ArchiveOperation::ReclaimHot { .. }
+                | ArchiveOperation::PrepareForeign { .. }
+                | ArchiveOperation::PrepareProfiledForeign { .. }
         ) {
             return Err(
                 StoreError::InvalidConditions("active port cannot compact engine nodes").into(),
@@ -799,6 +882,10 @@ fn seal_owner<M: RoleModel>(
     let mut active_cpu_pins = StorePins::default();
     if let ArchiveOwner::Port(port) = owner {
         merge_pins(&mut active_cpu_pins, &port.goal_local_protected_pins()?);
+        merge_pins(
+            &mut active_cpu_pins,
+            &port.profiled_external_protected_pins()?,
+        );
         for admission in port.cpu_admissions.values() {
             active_cpu_pins.executions.extend(admission.execution);
             if let Some(execution) = admission.execution {
@@ -883,6 +970,7 @@ fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
     let operation = command.work.operation;
     let mut loaded_root = None;
     let mut foreign_permit = None;
+    let mut profiled_foreign_permit = None;
     let result = catch_archive_work(|| {
         if command.cancel.load(Ordering::Acquire) {
             return Err(ArchiveQuarantineReason::Canceled);
@@ -938,6 +1026,26 @@ fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
                 foreign_permit = Some(prepared?);
                 Ok(())
             }
+            ArchiveOperation::PrepareProfiledForeign {
+                observation,
+                issued,
+            } => {
+                let initial = budget.max_bytes;
+                let prepared = engine
+                    .semantic
+                    .stores
+                    .prepare_profiled_foreign_append_permit(observation, issued, &mut budget)
+                    .map(|permit| {
+                        // Preserve the actual scan result even if subsequent I/O
+                        // accounting fails and this owner must be quarantined.
+                        profiled_foreign_permit = Some(permit);
+                    });
+                if command.seal.is_port {
+                    engine.charge_engine_archive_io(initial.saturating_sub(budget.max_bytes))?;
+                }
+                prepared?;
+                Ok(())
+            }
             ArchiveOperation::NewGame { next_authority } => {
                 engine.try_adaptive_new_game(next_authority, command.work.deadline, &command.cancel)
             }
@@ -981,6 +1089,7 @@ fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
         deadline: command.work.deadline,
         cancel: command.cancel,
         foreign_permit,
+        profiled_foreign_permit,
     }
 }
 
@@ -1214,6 +1323,67 @@ mod tests {
         assert_eq!(owner.engine().stores().hot_stats(), before);
         worker.finish().unwrap();
         drop(owner);
+        drop(scratch);
+    }
+
+    #[test]
+    fn ordinary_archive_completion_cannot_issue_a_profiled_permit() {
+        let (mut engine, scratch) = fixture(true);
+        populate(&mut engine);
+        let authority = authority(&engine);
+        let source = engine.semantic.stores.read_owner();
+        let mut worker = ArchiveWorker::start().unwrap();
+        let transfer = worker
+            .submit(ArchiveOwner::Engine(engine), authority, work(MAX_IO_BYTES))
+            .unwrap_or_else(|_| panic!("fixture transfer rejected"));
+        let quarantine = match receive(&mut worker, &transfer)
+            .install_with_profiled_foreign(authority, transfer.nonce())
+        {
+            Err(quarantine) => quarantine,
+            Ok(_) => panic!("ordinary archive work issued a profiled permit"),
+        };
+        assert!(matches!(
+            quarantine.reason,
+            ArchiveQuarantineReason::InvalidReturn("profiled foreign permit missing")
+        ));
+        assert!(!quarantine.retains_foreign_permit());
+        assert!(!quarantine.retains_profiled_foreign_permit());
+        assert!(source.matches(quarantine.owner.engine().stores()));
+        assert_eq!(
+            quarantine.receipt.operation,
+            ArchiveOperationKind::ReclaimHot
+        );
+        worker.finish().unwrap();
+        drop(quarantine);
+        drop(scratch);
+    }
+
+    #[test]
+    fn profiled_install_preserves_the_original_archive_failure_metadata() {
+        let (mut engine, scratch) = fixture(true);
+        populate(&mut engine);
+        let authority = authority(&engine);
+        let source = engine.semantic.stores.read_owner();
+        let before = engine.semantic.stores.hot_stats();
+        let mut worker = ArchiveWorker::start().unwrap();
+        let transfer = worker
+            .submit(ArchiveOwner::Engine(engine), authority, work(1))
+            .unwrap_or_else(|_| panic!("registered small allowance rejected"));
+        let quarantine = match receive(&mut worker, &transfer)
+            .install_with_profiled_foreign(authority, transfer.nonce())
+        {
+            Err(quarantine) => quarantine,
+            Ok(_) => panic!("failed archive work issued a profiled permit"),
+        };
+        assert!(matches!(
+            quarantine.reason,
+            ArchiveQuarantineReason::Operation(_)
+        ));
+        assert!(source.matches(quarantine.owner.engine().stores()));
+        assert_eq!(quarantine.owner.engine().stores().hot_stats(), before);
+        assert!(!quarantine.retains_profiled_foreign_permit());
+        worker.finish().unwrap();
+        drop(quarantine);
         drop(scratch);
     }
 

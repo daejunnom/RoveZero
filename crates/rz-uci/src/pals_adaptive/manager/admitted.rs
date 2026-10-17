@@ -87,6 +87,10 @@ where
             external,
             foreign: None,
             researcher,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            profiled_binding: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            profiled_orphan: None,
             cpu_slice_diagnostic: OnceLock::new(),
             #[cfg(feature = "pals-adaptive-diagnostics")]
             continuation_diagnostic: None,
@@ -133,6 +137,7 @@ where
             exclusive_scope: None,
             finished_at: None,
             reciprocal_policy: None,
+            reciprocal_routing: None,
             next_reciprocal_question: 1,
             peer_policy: None,
             accepted_roles: Vec::with_capacity(MAX_ROLE_PENDING),

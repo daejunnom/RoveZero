@@ -482,6 +482,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let evidence = ContractDigest(hash.finalize().into());
         if !self.cpu_observation_consumed(work, observation)
             && !self.external_observation_consumed(work, observation)
+            && !self.profiled_external_observation_consumed(work, observation)
         {
             return Ok(AdaptivePortStep {
                 evidence,

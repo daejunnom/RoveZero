@@ -250,6 +250,10 @@ pub enum StepExecution {
         job: CpuJobId,
         execution: rz_contracts::ExecutionId,
     },
+    ProfiledExternal {
+        question: ReciprocalQuestionId,
+        execution: rz_contracts::ExecutionId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -981,7 +985,11 @@ impl<V, Q> RefinementMachine<V, Q> {
             && self.frame(frame_id).is_some_and(|frame| {
                 matches!(
                     frame.last_execution,
-                    Some(StepExecution::Cpu { .. } | StepExecution::ExternalCpu { .. })
+                    Some(
+                        StepExecution::Cpu { .. }
+                            | StepExecution::ExternalCpu { .. }
+                            | StepExecution::ProfiledExternal { .. }
+                    )
                 )
             })
         {
@@ -1526,6 +1534,53 @@ pub enum ValidatorActionAdmission {
 }
 
 impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
+    /// The opaque port binding retains the actual single-limit question and
+    /// source. It never constructs a CpuJobId or reserves native credit.
+    pub fn bind_profiled_external_cpu(
+        &mut self,
+        id: FrameId,
+        proof: &super::CheckedProfiledExternalBinding,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), CoordinatorError> {
+        self.check_control(clock, now)?;
+        self.check_not_waiting(id)?;
+        if self.used_cpu_executions.contains(&proof.execution) {
+            return Err(CoordinatorError::Duplicate);
+        }
+        if self.used_cpu_executions.len() == MAX_STEP_BINDING_HISTORY {
+            return Err(CoordinatorError::Capacity(
+                "external execution binding history",
+            ));
+        }
+        let frame = self.match_frame_mut(id)?;
+        super::ranking::validate_actual_view(&frame.input.view, frame.input.view_seal)?;
+        if proof.frame != id
+            || proof.question.question_digest != frame.input.question_digest
+            || proof.view != frame.input.view_seal
+            || proof.public_context != frame.input.public_context
+            || proof.input_digest != Digest(frame.input.view.digest())
+            || frame.phase != FramePhase::Ready
+            || frame.input.stage.role().is_some()
+            || proof.question.id.authority != id.authority
+            || proof.question.original_deadline != frame.original_deadline
+            || frame.cpu_owner.is_some()
+        {
+            return Err(CoordinatorError::IdentityMismatch(
+                "profiled external original frame binding",
+            ));
+        }
+        let execution = StepExecution::ProfiledExternal {
+            question: proof.question.id,
+            execution: proof.execution,
+        };
+        frame.phase = FramePhase::Waiting(execution);
+        frame.last_execution = Some(execution);
+        self.used_cpu_executions.insert(proof.execution);
+        self.observe_history_peak();
+        Ok(())
+    }
+
     /// Register an actual Repair's queued question while its original bound
     /// step, or unsubmitted exact Rules-terminal question, still exists. A
     /// parent may then continue several other counters;

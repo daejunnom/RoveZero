@@ -251,6 +251,12 @@ fn actual_pc_repair_recheck_freezes_two_endpoints_and_emits_conditional_witness(
         if !cycle && input.question.context.prefix.is_empty() {
             original_root = Some((input, accepted, output));
         }
+        if port.divergence_witnesses().next().is_some() {
+            // This fixture accepts one complete pair. Iteration is covered by
+            // a separate actual-caller case; cancel its unsubmitted successor.
+            port.revoke();
+            break;
+        }
     }
     assert_eq!(frozen_count, 2);
     let witnesses: Vec<_> = port.divergence_witnesses().collect();
@@ -293,7 +299,11 @@ fn actual_pc_repair_recheck_freezes_two_endpoints_and_emits_conditional_witness(
     assert_eq!(report.authority(), original_authority);
     assert_eq!(report.root_budget(), original_budget);
     assert_eq!(report.witnesses().count(), 1);
-    assert_eq!(report.incomplete_cycle_count(), 0);
+    assert_eq!(report.incomplete_cycle_count(), 1);
+    let successor = report.incomplete_progress().next().unwrap();
+    assert_eq!(successor.parent_cycle(), Some(1));
+    assert_eq!(successor.phase(), PcRepairPhase::VisibleCounterReview);
+    assert!(report.incomplete_target(successor.cycle()).is_none());
     assert!(report.owned_host_bytes().unwrap() > 0);
     assert!(port.take_repair_report().unwrap().is_none());
     port.retire_rovent_frontier().unwrap();
@@ -435,4 +445,164 @@ fn partial_actual_fresh_report_survives_owner_transfer_and_blocks_reset_until_re
     );
     // Report historical evidence remains readable after a legitimate new game.
     assert_eq!(report.incomplete_repair(cycle).unwrap().moves(), repaired);
+}
+
+#[test]
+fn actual_unknown_frozen_frontiers_iterate_three_repairs_with_the_original_scope() {
+    use std::collections::{HashMap, HashSet};
+    let proposal = moves("e2e4 e7e5 g1f3 b8c6 f1c4 g8f6 d2d3 f8c5 c2c3 d7d6");
+    let counter = moves("e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 a7a6");
+    let repairs = [
+        moves("e2e4 c7c5 b1c3 b8c6 f1b5 g8f6 g1f3 a7a6 b5c6 b7c6"),
+        moves("e2e4 c7c5 b1c3 d7d6 d2d4 g8f6 g1f3 c5d4 f3d4 a7a6"),
+        moves("e2e4 c7c5 b1c3 d7d6 d2d4 b8c6 g1e2 c5d4 e2d4 a7a6"),
+    ];
+    let rechecks = [
+        moves("e2e4 c7c5 b1c3 d7d6 g1f3 g8f6 d2d4 c5d4 f3d4 a7a6"),
+        moves("e2e4 c7c5 b1c3 d7d6 d2d4 b8c6 g1f3 c5d4 f3d4 a7a6"),
+        moves("e2e4 c7c5 b1c3 d7d6 d2d4 b8c6 g1e2 g8f6 e2g3 a7a6"),
+    ];
+    let mut port = repair_port();
+    port.owner.config.line_plies = 10;
+    port.owner.profile.semantic.line_plies = 10;
+    let authority = port.authority;
+    let deadline = port.deadline;
+    let budget = port.original_root_budget();
+    let first = proposal[0];
+    let mut calls = 0;
+    let mut frames = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut frozen = HashMap::new();
+    let mut fresh_count = 0;
+    while let Some(input) = port.next_role().unwrap() {
+        calls += 1;
+        assert!(
+            calls <= 100,
+            "bounded cycle and role admission must make progress"
+        );
+        let query = input.view.query();
+        let purpose = input.question.context.purpose;
+        let selected = if let Some(step) = input.question.repair.as_ref() {
+            assert!(
+                (1..=3).contains(&step.cycle),
+                "a fourth Repair was admitted"
+            );
+            assert_eq!(
+                step.parent_cycle,
+                (step.cycle > 1).then_some(step.cycle - 1)
+            );
+            assert_eq!(step.origin.authority, authority);
+            assert_eq!(step.origin.deadline, deadline);
+            assert_eq!(Some(step.origin.root_budget), budget);
+            assert_eq!(step.origin.first, first);
+            assert_eq!(step.origin.end, 10);
+            frames.insert(step.origin.frame);
+            seen.insert(step.cycle);
+            let index = usize::try_from(step.cycle - 1).unwrap();
+            if purpose == RoleQueryPurpose::ValueFresh {
+                let scope = frozen.entry(step.cycle).or_insert(input.public_context);
+                assert_eq!(*scope, input.public_context);
+                assert!(query.prefix == repairs[index] || query.prefix == rechecks[index]);
+                fresh_count += 1;
+                None
+            } else if query.legal.is_empty() {
+                assert_eq!(purpose, RoleQueryPurpose::DivergencePolicy);
+                if step.cycle > 1 {
+                    assert_eq!(query.proposal, repairs[index - 1]);
+                    assert_eq!(query.counterexample.as_ref(), Some(&rechecks[index - 1]));
+                    assert_eq!(query.divergences, vec![index * 2 + 1]);
+                }
+                None
+            } else {
+                let line = match step.phase {
+                    PcRepairPhase::Proposal => &proposal,
+                    PcRepairPhase::CounterStart | PcRepairPhase::CounterTail => &counter,
+                    PcRepairPhase::Repair => &repairs[index],
+                    PcRepairPhase::RecheckStart | PcRepairPhase::RecheckTail => &rechecks[index],
+                    _ => panic!("unexpected actual iteration phase"),
+                };
+                assert!(line.starts_with(&query.prefix));
+                Some(line[query.prefix.len()])
+            }
+        } else if query.legal.is_empty() || purpose == RoleQueryPurpose::ValueFresh {
+            None
+        } else if query.prefix.is_empty() {
+            Some(first)
+        } else {
+            query.legal.first().copied()
+        };
+        let (accepted, output) =
+            accepted_scripted(&mut port, &input, calls, selected, [0.25, 0.5, 0.25]);
+        let physical = evidence(&port, &input, calls);
+        port.consume_accepted(&input, &accepted, &output, Some(physical))
+            .unwrap();
+        assert!(
+            port.role_consumption_recorded(accepted.ticket(), &input)
+                .unwrap()
+        );
+    }
+    assert_eq!(seen.len(), 3);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(fresh_count, 6);
+    let cycles = port.repair_cycles.as_ref().unwrap();
+    assert_eq!(cycles.per_first.get(&first), Some(&3));
+    assert_eq!(cycles.next_cycle, 4);
+    assert!(cycles.active.is_empty());
+    let witnesses: Vec<_> = port.divergence_witnesses().collect();
+    assert_eq!(witnesses.len(), 3);
+    for (index, witness) in witnesses.iter().enumerate() {
+        assert_eq!(witness.event_sequence(), u64::try_from(index + 1).unwrap());
+        assert_eq!(witness.resolution(), PcDivergenceResolution::Unknown);
+        assert!(!witness.target_known());
+        assert_eq!(witness.source().divergence_ply(), index * 2 + 1);
+        let repair = witness.repair().unwrap();
+        let recheck = witness.recheck().unwrap();
+        assert_eq!(repair.moves(), repairs[index]);
+        assert_eq!(recheck.moves(), rechecks[index]);
+        let repair_record = port
+            .owner
+            .records()
+            .iter()
+            .find(|record| record.revision == repair.revision())
+            .unwrap();
+        let recheck_record = port
+            .owner
+            .records()
+            .iter()
+            .find(|record| record.revision == recheck.revision())
+            .unwrap();
+        assert_eq!(
+            repair_record.parent_revision,
+            Some(witness.source().counter_revision())
+        );
+        assert_eq!(recheck_record.parent_revision, Some(repair.revision()));
+        assert_eq!(
+            recheck_record.supersedes_revision,
+            Some(witness.source().counter_revision())
+        );
+        if index > 0 {
+            assert_eq!(
+                witness.source().counter_revision(),
+                witnesses[index - 1].recheck().unwrap().revision()
+            );
+            assert_eq!(
+                repair_record.supersedes_revision,
+                Some(witnesses[index - 1].repair().unwrap().revision())
+            );
+        }
+    }
+    assert_eq!(port.counters.consumed_role_outputs, calls);
+    assert_eq!(port.counters.completed_nn_inputs, Some(calls));
+    assert_eq!(std::mem::size_of_val(port.researcher()), 0);
+    assert!(
+        port.owner
+            .semantic
+            .nodes
+            .iter()
+            .all(|node| node.evidence.is_none() && node.resume.is_none())
+    );
+    drop(witnesses);
+    let report = port.take_repair_report().unwrap().unwrap();
+    assert_eq!(report.witnesses().count(), 3);
+    assert_eq!(report.incomplete_cycle_count(), 0);
 }

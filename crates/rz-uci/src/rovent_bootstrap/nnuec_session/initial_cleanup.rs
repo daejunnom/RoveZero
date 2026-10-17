@@ -1,8 +1,8 @@
 //! Bounded physical cleanup of the original, pre-admission NNUEC owners.
 //!
-//! Actual engines follow the cleanup-only same-actor transfer. This stable
-//! helper retains the original semantic owner until the typed initial-root
-//! retirement dependency is available; it never returns a fabricated Idle.
+//! Actual engines follow the cleanup-only same-actor transfer. Only the
+//! preparing root's typed retirement API may return its same semantic owner,
+//! after actual release/cache witnesses and matching external pin release.
 //!
 //! Every step crosses at most one non-waiting actor/worker boundary. The caller
 //! supplies its original cleanup deadline and retains Pending on expiry. Both
@@ -12,16 +12,20 @@
 use super::super::nnuec_preparing::{
     InitialNnuecCleanup, InitialNnuecCleanupOwners, InitialNnuecFailure, InitialNnuecPhase,
 };
-use rz_search::cpu_value::nnuec::v2::retirement::{
-    NnuecCacheInvalidation, NnuecCacheReleaseAck,
-};
+use rz_search::cpu_value::nnuec::v2::retirement::{NnuecCacheInvalidation, NnuecCacheReleaseAck};
 use rz_search::cpu_value::nnuec::v2::review::{
-    Completion, PreparationError, PreparationObservation, Provenance,
+    Completion, PreparationActor, PreparationError, PreparationObservation, Provenance,
 };
 use rz_search::cpu_worker::{
-    CpuWorkerError, CpuWorkerShutdown, MaterializationCompletion, NnuecEngineReleaseAck,
-    NnuecEngineRetirementCompletion, NnuecEngineRetirementId, NnuecMaterializationReleaseAck,
-    NnuecMaterializationReleaseCompletion, NnuecMaterializationReleaseId, RecoveredNnuecEngine,
+    CpuWorkerError, CpuWorkerShutdown, CpuWorkerThreadAffinityShutdown, MaterializationCompletion,
+    NnuecAuthorityRevocation, NnuecEngineReleaseAck, NnuecEngineRetirementCompletion,
+    NnuecEngineRetirementId, NnuecMaterializationReleaseAck, NnuecMaterializationReleaseCompletion,
+    NnuecMaterializationReleaseId, RecoveredNnuecEngine,
+};
+use rz_search::pals::engine::adaptive_port::AdaptivePortModel;
+use rz_search::pals::engine::preparing_root::{
+    InitialPreparingRetirementRejection, InitialResearcherRelease, InitialResearcherReleaseReceipt,
+    ResearcherPreparingError, RetiredPreparingRoot,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +46,9 @@ pub enum NnuecInitialCleanupPhase {
     SubmitEngineRetirement,
     AwaitEngineRetirement,
     AwaitCacheRelease,
+    SelectSemanticRelease,
+    ReleaseExternalPins,
+    RetireSemanticRoot,
     StopActor,
     JoinActor,
     Retain,
@@ -51,6 +58,7 @@ pub enum NnuecInitialCleanupPhase {
 pub enum NnuecInitialCleanupIssue {
     Preparation(PreparationError),
     Worker(CpuWorkerError),
+    PreparingRoot(ResearcherPreparingError),
     Invalid(&'static str),
 }
 
@@ -89,6 +97,7 @@ pub struct NnuecInitialCleanupObservations {
     pub cache_clears_released_engine: Option<bool>,
     pub cache_clears_released_materialization: Option<bool>,
     pub actor_join: Option<Result<(), PreparationError>>,
+    pub semantic_rejection: Option<InitialPreparingRetirementRejection<AdaptivePortModel>>,
     pub issues: Vec<NnuecInitialCleanupIssue>,
 }
 
@@ -97,6 +106,7 @@ struct Custody {
     original_failure: Option<InitialNnuecFailure>,
     owners: InitialNnuecCleanupOwners,
     observations: NnuecInitialCleanupObservations,
+    selected_release: Option<InitialResearcherRelease>,
 }
 
 /// Physical observations plus the exact unreleased semantic/source owners.
@@ -118,6 +128,9 @@ impl NnuecInitialCleanupRetained {
     pub fn observations(&self) -> &NnuecInitialCleanupObservations {
         &self.custody().observations
     }
+    pub fn selected_release(&self) -> Option<&InitialResearcherRelease> {
+        self.custody().selected_release.as_ref()
+    }
     fn custody(&self) -> &Custody {
         self.custody.as_deref().expect("retained actual custody")
     }
@@ -135,7 +148,21 @@ impl Drop for NnuecInitialCleanupRetained {
 #[must_use = "retain pending or terminal actual cleanup custody"]
 pub enum NnuecInitialCleanupStep {
     Pending(NnuecInitialCleanup),
+    Ready(NnuecInitialCleaned),
     Retained(NnuecInitialCleanupRetained),
+}
+
+/// The original semantic owner was returned by its actual typed retirement
+/// API. The same preparation actor remains alive for the next root.
+#[must_use = "transfer the actual retired owner and same actor into session custody"]
+pub struct NnuecInitialCleaned {
+    pub retired: RetiredPreparingRoot<AdaptivePortModel>,
+    pub actor: PreparationActor,
+    pub original_phase: InitialNnuecPhase,
+    pub original_failure: Option<InitialNnuecFailure>,
+    pub release: Option<InitialResearcherReleaseReceipt>,
+    pub cache_release: NnuecCacheReleaseAck,
+    pub observations: NnuecInitialCleanupObservations,
 }
 
 #[must_use = "poll bounded cleanup or retain it under the original deadline"]
@@ -153,6 +180,7 @@ impl NnuecInitialCleanup {
                 original_failure,
                 owners,
                 observations: NnuecInitialCleanupObservations::default(),
+                selected_release: None,
             })),
         }
     }
@@ -547,6 +575,184 @@ impl NnuecInitialCleanup {
                             .push(NnuecInitialCleanupIssue::Preparation(error)),
                     }
                 }
+                self.phase = NnuecInitialCleanupPhase::SelectSemanticRelease;
+            }
+            NnuecInitialCleanupPhase::SelectSemanticRelease => {
+                let normal_stop = matches!(
+                    custody.original_failure.as_ref(),
+                    None | Some(InitialNnuecFailure::Preparation(
+                        PreparationError::Cancelled | PreparationError::Expired
+                    )) | Some(InitialNnuecFailure::Worker(
+                        CpuWorkerError::NnuecAuthorityRevoked(
+                            NnuecAuthorityRevocation::Cancelled | NnuecAuthorityRevocation::Expired
+                        )
+                    ))
+                ) && observed
+                    .review_terminal_result
+                    .as_ref()
+                    .is_none_or(|result| {
+                        matches!(
+                            result,
+                            Ok(())
+                                | Err(PreparationError::Cancelled | PreparationError::Expired)
+                        )
+                    })
+                    // Only actual typed source cancellation/expiry can join
+                    // the normal-stop path; strings and other revocations do not.
+                    && observed
+                        .materialization_terminal_error
+                        .as_ref()
+                        .is_none_or(|error| {
+                            matches!(
+                                error,
+                                CpuWorkerError::NnuecAuthorityRevoked(
+                                    NnuecAuthorityRevocation::Cancelled
+                                        | NnuecAuthorityRevocation::Expired
+                                )
+                            )
+                        })
+                    && observed
+                        .starting_shutdown
+                        .as_ref()
+                        .is_none_or(normal_initial_shutdown)
+                    && observed
+                        .ready_shutdown
+                        .as_ref()
+                        .is_none_or(normal_initial_shutdown);
+                let unambiguous = normal_stop
+                    && observed.issues.is_empty()
+                    && observed.cache_release.is_some()
+                    && observed.review_matches_original != Some(false)
+                    && observed.materialization_matches_original != Some(false)
+                    && observed.engine_release_matches_original != Some(false)
+                    && observed.materialization_release_matches_original != Some(false)
+                    && observed.cache_clears_released_engine != Some(false)
+                    && observed.cache_clears_released_materialization != Some(false)
+                    && observed.drained_review.is_none()
+                    && observed.drained_materialization.is_none()
+                    && observed.unmatched_retirement.is_none()
+                    && observed.unmatched_materialization_release.is_none()
+                    && observed.retirement_request.is_none()
+                    && observed.materialization_release_request.is_none()
+                    && observed.recovered_engine.is_none()
+                    && owners.unmatched_review.is_none()
+                    && owners.unmatched_materialization.is_none()
+                    && !owners.preparation_outstanding
+                    && !owners.materialization_outstanding
+                    && owners.materialization_handoff.is_none()
+                    && owners.materialized_engine.is_none()
+                    && owners.root.is_some()
+                    && owners.root_handoff.is_none()
+                    && (owners.starting_worker.is_none()
+                        || observed
+                            .starting_shutdown
+                            .as_ref()
+                            .is_some_and(clean_initial_shutdown))
+                    && (owners.worker.is_none()
+                        || observed
+                            .ready_shutdown
+                            .as_ref()
+                            .is_some_and(clean_initial_shutdown));
+                if !unambiguous {
+                    self.phase = NnuecInitialCleanupPhase::StopActor;
+                } else if owners.original_seal.is_none()
+                    && custody.original_phase == InitialNnuecPhase::PrepareReview
+                    && owners.expected.is_none()
+                    && owners.original_request.is_none()
+                    && owners.bound.is_none()
+                    && owners.preparation_terminal_ack.is_none()
+                    && owners.materialization_request.is_none()
+                    && owners.ready.is_none()
+                    && owners.metadata.is_none()
+                    && owners.checker_mirror.is_none()
+                    && owners.starting_worker.is_none()
+                    && owners.worker.is_none()
+                {
+                    // This API itself checks that the root never created its
+                    // first view. A failed PrepareReview may still be too late.
+                    let root = owners.root.take().expect("original root checked");
+                    match root.retire_before_materialization() {
+                        Ok(retired) => {
+                            let cache = observed
+                                .cache_release
+                                .take()
+                                .expect("actual cache release checked");
+                            return self.ready(retired, None, cache);
+                        }
+                        Err((root, error)) => {
+                            owners.root = Some(root);
+                            observed
+                                .issues
+                                .push(NnuecInitialCleanupIssue::PreparingRoot(error));
+                            self.phase = NnuecInitialCleanupPhase::StopActor;
+                        }
+                    }
+                } else if owners.original_seal.is_some() {
+                    custody.selected_release = if let Some(ack) = observed.engine_release.take() {
+                        Some(InitialResearcherRelease::Worker(ack))
+                    } else if let Some(ack) = observed.materialization_release.take() {
+                        Some(InitialResearcherRelease::Materialization(ack))
+                    } else if let Some(ack) = owners.preparation_terminal_ack.take() {
+                        Some(InitialResearcherRelease::Preparation(ack))
+                    } else {
+                        owners
+                            .original_request
+                            .take()
+                            .map(InitialResearcherRelease::Unsubmitted)
+                    };
+                    self.phase = if custody.selected_release.is_some() {
+                        NnuecInitialCleanupPhase::ReleaseExternalPins
+                    } else {
+                        NnuecInitialCleanupPhase::StopActor
+                    };
+                } else {
+                    self.phase = NnuecInitialCleanupPhase::StopActor;
+                }
+            }
+            NnuecInitialCleanupPhase::ReleaseExternalPins => {
+                // All physical engine transfers above are acknowledged. Only
+                // the selected actual cleanup capability and original seal
+                // cross into semantic retirement; no latest-view substitute.
+                drop(owners.original_request.take());
+                drop(owners.bound.take());
+                drop(owners.materialization_request.take());
+                drop(owners.ready.take());
+                drop(owners.starting_worker.take());
+                drop(owners.worker.take());
+                drop(owners.metadata.take());
+                drop(owners.checker_mirror.take());
+                drop(owners.preparation_terminal_ack.take());
+                self.phase = NnuecInitialCleanupPhase::RetireSemanticRoot;
+            }
+            NnuecInitialCleanupPhase::RetireSemanticRoot => {
+                match (
+                    owners.root.take(),
+                    owners.original_seal.take(),
+                    custody.selected_release.take(),
+                    observed.cache_release.take(),
+                ) {
+                    (Some(root), Some(seal), Some(release), Some(cache)) => {
+                        match root.retire_after_initial_preparation(seal, release, cache) {
+                            Ok(retired) => {
+                                return self.ready(
+                                    retired.retired,
+                                    Some(retired.release),
+                                    retired.cache_release,
+                                );
+                            }
+                            Err(rejection) => observed.semantic_rejection = Some(rejection),
+                        }
+                    }
+                    (root, seal, release, cache) => {
+                        owners.root = root;
+                        owners.original_seal = seal;
+                        custody.selected_release = release;
+                        observed.cache_release = cache;
+                        observed.issues.push(NnuecInitialCleanupIssue::Invalid(
+                            "original semantic retirement custody absent",
+                        ));
+                    }
+                }
                 self.phase = NnuecInitialCleanupPhase::StopActor;
             }
             NnuecInitialCleanupPhase::StopActor => {
@@ -576,6 +782,32 @@ impl NnuecInitialCleanup {
         NnuecInitialCleanupStep::Pending(self)
     }
 
+    fn ready(
+        mut self,
+        retired: RetiredPreparingRoot<AdaptivePortModel>,
+        release: Option<InitialResearcherReleaseReceipt>,
+        cache_release: NnuecCacheReleaseAck,
+    ) -> NnuecInitialCleanupStep {
+        let Custody {
+            original_phase,
+            original_failure,
+            owners,
+            observations,
+            selected_release,
+        } = *self.custody.take().expect("retired actual custody");
+        // The success gates and typed semantic API consumed/released every
+        // original semantic and physical obligation except this same actor.
+        debug_assert!(selected_release.is_none());
+        NnuecInitialCleanupStep::Ready(NnuecInitialCleaned {
+            retired,
+            actor: owners.actor,
+            original_phase,
+            original_failure,
+            release,
+            cache_release,
+            observations,
+        })
+    }
 }
 impl Drop for NnuecInitialCleanup {
     fn drop(&mut self) {
@@ -592,4 +824,22 @@ fn clean_initial_shutdown(receipt: &CpuWorkerShutdown) -> bool {
         && receipt.events.is_empty()
         && receipt.value_installation_receipt.is_none()
         && receipt.value_installation_error.is_none()
+}
+
+/// Share the exact initial-worker reuse gate with post-handoff cleanup.
+pub(super) fn permits_initial_reuse(receipt: &CpuWorkerShutdown) -> bool {
+    clean_initial_shutdown(receipt) && normal_initial_shutdown(receipt)
+}
+
+/// Engine recovery can be safe despite a rejected startup. Reuse requires
+/// the separate actual Ready probe and any requested affinity restoration.
+fn normal_initial_shutdown(receipt: &CpuWorkerShutdown) -> bool {
+    receipt.ready_readback.as_ref().is_some_and(Result::is_ok)
+        && match &receipt.thread_affinity {
+            CpuWorkerThreadAffinityShutdown::NotRequested => true,
+            CpuWorkerThreadAffinityShutdown::Requested { ready, finished } => {
+                ready.as_ref().is_some_and(Result::is_ok)
+                    && finished.as_ref().is_some_and(Result::is_ok)
+            }
+        }
 }

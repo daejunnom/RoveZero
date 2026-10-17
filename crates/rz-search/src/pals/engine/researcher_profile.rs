@@ -53,6 +53,42 @@ impl<M: RoleModel> PalsEngine<M> {
         ))
     }
 
+    /// A source-pinned external declaration may support full legal root
+    /// questions without supporting searchmoves. The actual external worker
+    /// still rejects a restricted question; legacy admission remains strict.
+    pub fn new_with_boxed_profiled_researcher_and_rovent_profile(
+        profile: ResearcherSemanticProfile,
+        model: M,
+        cpu: Box<dyn CpuChecker>,
+        resolver: ResolverPolicy,
+        policy: PostRepairRecheckPolicy,
+        declared: &crate::external_cpu::ProfiledResearcherAdmission,
+    ) -> Result<Self, PalsError> {
+        profile.validate()?;
+        let mut admission = Self::admit_profiled_researcher(
+            &profile.config,
+            &model,
+            cpu.as_ref(),
+            resolver,
+            policy,
+            declared,
+        )?;
+        let semantic = PalsSemanticState::new_researcher_admitted(
+            &profile,
+            model,
+            admission.model_registered_value.take(),
+        )?;
+        Ok(Self::from_admitted_researcher(
+            profile.config,
+            cpu,
+            resolver,
+            policy,
+            Some(profile.maximum_root_prefix_plies),
+            admission,
+            semantic,
+        ))
+    }
+
     /// The caller has already checked model/checker admission in its original
     /// order. Moving a prepared semantic owner here creates no second Store.
     pub(super) fn from_admitted_researcher(

@@ -105,10 +105,13 @@ pub use profiled_external_receipt::{
     ProfiledExternalPersistentParts, ProfiledExternalShutdownReceipt,
 };
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod profiled_external_dispatch;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 mod profiled_external_manager;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub use profiled_external_manager::{
     ProfiledExternalExecutionManager, ProfiledExternalManagerAdmissionRejection,
+    ProfiledExternalPersistentRejection,
 };
 mod frontier;
 mod goal_local;
@@ -191,6 +194,8 @@ pub enum AdaptiveManagerError {
     GoalLocalBlocked(GoalLocalBlockReason),
     NnuecPreparation(NnuecWorkError),
     ProfiledExternal(rz_search::cpu_checker::CheckerError),
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    ProfiledQueryUnsupported(rz_search::pals::engine::adaptive_port::ProfiledExternalUnsupported),
     AdmissionClosed,
     ReviewLeaseBackpressure {
         current: usize,
@@ -290,6 +295,87 @@ pub struct CandidateFrame<Q> {
 /// remain with the independent archive owner and finish after worker fences.
 pub trait AdaptiveSearchDriver<Q> {
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_profiled_external(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &ExternalCpuConfig,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: ReciprocalQuestionId,
+        _: ExecutionId,
+        _: rz_search::external_cpu::ExternalGoConstraint,
+        _: Duration,
+        _: rz_runtime::CompletionSignal,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveProfiledExternalPreparation,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no profiled external producer",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn profiled_external_admitted(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: &rz_search::external_cpu::ProfiledExternalDispatch,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveProfiledExternalAdmission,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no actual profiled external binding",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn commit_profiled_external(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: rz_search::pals::rovent_frontier::FrontierExternalReservation,
+        _: &Arc<rz_search::external_cpu::ProfiledExternalCompletion>,
+    ) -> Result<CheckedStep<Q>, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no actual profiled external consumer",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn observe_profiled_external(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: rz_search::pals::rovent_frontier::FrontierExternalReservation,
+        _: &Arc<rz_search::external_cpu::ProfiledExternalCompletion>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no profiled external raw observer",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn reject_profiled_external(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no unsubmitted profiled question",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn validate_profiled_external_registration(
         &self,
         _: &rz_search::external_cpu::ProfiledExternalRootSource,
@@ -305,6 +391,10 @@ pub trait AdaptiveSearchDriver<Q> {
     fn profiled_external_work(
         &self,
     ) -> Option<rz_search::pals::rovent_frontier::FrontierExternalWork> {
+        None
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn profiled_retained_host_bytes(&self) -> Option<u64> {
         None
     }
     fn root_rules(&self) -> Arc<ContractState>;
@@ -1447,6 +1537,11 @@ pub struct RetainedNativeCompletion<O> {
 // Inline variants avoid allocating error-recovery boxes per deferred receipt.
 #[allow(clippy::large_enum_variant)]
 enum DeferredCommit<Q> {
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    ProfiledExternal {
+        binding: profiled_external_dispatch::ProfiledExternalBinding<Q>,
+        packet: Arc<rz_search::external_cpu::ProfiledExternalCompletion>,
+    },
     Role {
         ticket: RoleTicketEnvelope,
         accepted: bool,
@@ -1601,6 +1696,10 @@ where
     external: Option<ExternalManagerWorker>,
     foreign: Option<ForeignBinding<Q>>,
     researcher: ResearcherResources,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    profiled_binding: Option<profiled_external_dispatch::ProfiledExternalBinding<Q>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    profiled_orphan: Option<profiled_external_source::ProfiledExternalManagerCompletion>,
     cpu_slice_diagnostic: OnceLock<AdaptiveCpuSliceDiagnostic>,
     #[cfg(feature = "pals-adaptive-diagnostics")]
     continuation_diagnostic: Option<ContinuationDiagnostic>,
@@ -1650,6 +1749,7 @@ where
     exclusive_scope: Option<ExclusiveActionScope>,
     finished_at: Option<Instant>,
     reciprocal_policy: Option<RoventReciprocalPolicy>,
+    reciprocal_routing: Option<reciprocal::RoventQuestionRouting>,
     next_reciprocal_question: u64,
     peer_policy: Option<RoventPeerFollowupPolicy>,
     accepted_roles: Vec<reciprocal::AcceptedRoleCustody<Q, B::Output>>,
@@ -2390,6 +2490,7 @@ where
             || !self.roles.is_empty()
             || self.own.iter().any(|slot| slot.binding.is_some())
             || self.foreign.is_some()
+            || self.profiled_busy()
         {
             return Err(AdaptiveManagerError::Invalid(
                 "original cleanup deadline admission",
@@ -2546,6 +2647,7 @@ where
             || self.machine.frames().next().is_some()
             || self.own.iter().any(|slot| slot.binding.is_some())
             || self.foreign.is_some()
+            || self.profiled_busy()
             || !self.deferred.is_empty()
             || !self.native_frontier_events.is_empty()
             || !self.driver.semantic_owner_available()
@@ -2556,6 +2658,13 @@ where
         &mut self,
         input: FrameInput<ReviewView, Q>,
     ) -> Result<PreparationId, AdaptiveManagerError> {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let ResearcherResources::ProfiledExternal(source) = &self.researcher {
+            self.driver.validate_profiled_external_registration(
+                source.current_source(),
+                source.root_admission(),
+            )?;
+        }
         if input.stage != RefinementStage::ProposerRanking
             || !self.roles.is_empty()
             || self.machine.frames().next().is_some()
@@ -2856,6 +2965,11 @@ where
             self.begin_selected_shutdown(self.cleanup_until()?)?;
         }
         let mut changed = false;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        match self.poll_profiled_events() {
+            Ok(progress) => changed |= progress,
+            Err(error) => self.record_failure(error),
+        }
         match self.driver.poll_auxiliary() {
             Ok(progress) => changed |= progress,
             Err(error) => self.record_failure(error),
@@ -3840,7 +3954,7 @@ where
                     }
                     self.driver.role_consumed(&ticket, &input.view)?;
                     self.mark_role_consumed(index)?;
-                    if self.reciprocal_policy.is_some() || self.peer_policy.is_some() {
+                    if self.reciprocal_routing.is_some() || self.peer_policy.is_some() {
                         if let Some(observer) = &mut self.collection_observer {
                             let proof = match self.collection_admission.as_ref() {
                                 Some(admission) => {
@@ -4102,6 +4216,10 @@ where
             let consumed_before_event = self.counters.consumed_role_outputs;
             changed = true;
             let result = match &event {
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                DeferredCommit::ProfiledExternal { binding, packet } => {
+                    self.commit_profiled_packet(binding, packet)
+                }
                 DeferredCommit::Role { ticket, accepted } => self.retire_role(*ticket, *accepted),
                 DeferredCommit::Own { binding, report } => {
                     if self.phase == ManagerPhase::Running {
@@ -5406,6 +5524,7 @@ where
                         .as_ref()
                         .is_none_or(|scope| scope.allows(frame.id))
                     && !self.ready_ids.contains(&frame.id)
+                    && !self.profiled_frame_pending(frame.id)
                     && self
                         .nnuec_pending
                         .as_ref()
@@ -5460,9 +5579,14 @@ where
                 .map_err(|_| AdaptiveManagerError::Capacity("ready frame descriptor"))?;
             self.ready_ids.push(id);
         }
-        let advice = self.advice(now)?;
+        let advice = if self.researcher_source_kind() == AdaptiveResearcherSourceKind::Native {
+            Some(self.advice(now)?)
+        } else {
+            None
+        };
+        let native_worker_limit = advice.map_or(0, |advice| usize::from(advice.workers));
         let mut changed = peers_changed || reciprocal_changed;
-        if advice.yield_selected_worker {
+        if advice.is_some_and(|advice| advice.yield_selected_worker) {
             if let Some(selection) = self.advised_yield.take() {
                 // Advice and delivery refer to the same original execution;
                 // do not rescan and transfer one owner's forecast to another.
@@ -5543,7 +5667,7 @@ where
                         .map_err(|_| AdaptiveManagerError::Invalid("detached CPU cancel"))?;
                     binding.resume_pending = false;
                     changed = true;
-                } else if let Some(slice) = advice.slice {
+                } else if let Some(slice) = advice.and_then(|advice| advice.slice) {
                     let result = self.resume_cpu(index, slice.node_credit, slice.soft_lease);
                     changed |= self.native_admission_result(result)?;
                 }
@@ -5618,7 +5742,7 @@ where
                             .validator_reviewed_execution = Some(execution);
                     }
                 }
-                let Some(slice) = advice.slice else {
+                let Some(slice) = advice.and_then(|advice| advice.slice) else {
                     continue;
                 };
                 let result = self.resume_cpu(index, slice.node_credit, slice.soft_lease);
@@ -5636,6 +5760,7 @@ where
                         .is_some_and(|binding| binding.reciprocal.is_none())
                 })
                 || self.foreign.is_some()
+                || self.profiled_busy()
                 || !self.deferred.is_empty())
         {
             return Ok(changed);
@@ -5651,7 +5776,7 @@ where
             let own_available = self
                 .own
                 .iter()
-                .take(usize::from(advice.workers))
+                .take(native_worker_limit)
                 .any(|slot| slot.binding.is_none() && !slot.joined);
             // Do not keep selecting an ineligible CPU job merely to alter its
             // deficit. The role queue may still progress while CPU is occupied.
@@ -5668,6 +5793,7 @@ where
                             } else {
                                 (own_available && self.nnuec_work_eligible(frame.id))
                                     || (self.external.is_some() && self.foreign.is_none())
+                                    || self.profiled_dispatch_available()
                             }) && self
                                 .exclusive_scope
                                 .as_ref()
@@ -5681,16 +5807,17 @@ where
                     .set_dependencies_ready(&id, eligible)
                     .map_err(|_| AdaptiveManagerError::Invalid("ready dependency update"))?;
             }
-            let selected =
-                if let Some(pending) = self.nnuec_pending.as_ref().filter(|pending| {
-                    pending.job_ready() && pending.slot < usize::from(advice.workers)
-                }) {
-                    Some(pending.selection.clone())
-                } else {
-                    self.ready
-                        .select(now_duration, None)
-                        .map_err(|_| AdaptiveManagerError::Invalid("ready fairness selector"))?
-                };
+            let selected = if let Some(pending) = self
+                .nnuec_pending
+                .as_ref()
+                .filter(|pending| pending.job_ready() && pending.slot < native_worker_limit)
+            {
+                Some(pending.selection.clone())
+            } else {
+                self.ready
+                    .select(now_duration, None)
+                    .map_err(|_| AdaptiveManagerError::Invalid("ready fairness selector"))?
+            };
             let Some(selected) = selected else {
                 break;
             };
@@ -5772,7 +5899,7 @@ where
                         || self.foreign.is_some()
                         || !self.deferred.is_empty()
                         || self.registry.occupancy() != 0
-                        || self.native_ledger()?.global_usage()?.1 != 0
+                        || self.native_credit_outstanding()?
                     {
                         return Err(AdaptiveManagerError::Invalid(
                             "exclusive scope requires idle physical owners",
@@ -5862,6 +5989,14 @@ where
                     Err(error) => return Err(error),
                 }
             } else {
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                if self.researcher_source_kind() == AdaptiveResearcherSourceKind::ProfiledExternal {
+                    changed |= self.begin_profiled_cpu(work)?;
+                    if self.registration.policy == CoordinatorPolicy::Synchronous {
+                        break;
+                    }
+                    continue;
+                }
                 let (spent, reserved) = self.native_ledger()?.global_usage()?;
                 let total = spent
                     .checked_add(reserved)
@@ -5895,11 +6030,10 @@ where
                     && !physical_budget_exhausted
                     && self.nnuec_pending.is_none()
                 {
-                    let Some(slot) = self
-                        .own
-                        .iter()
-                        .take(usize::from(advice.workers))
-                        .position(|slot| slot.binding.is_none() && !slot.joined && !slot.panicked)
+                    let Some(slot) =
+                        self.own.iter().take(native_worker_limit).position(|slot| {
+                            slot.binding.is_none() && !slot.joined && !slot.panicked
+                        })
                     else {
                         break;
                     };
@@ -6003,13 +6137,13 @@ where
                         } else {
                             self.own
                                 .iter()
-                                .take(usize::from(advice.workers))
+                                .take(native_worker_limit)
                                 .position(|slot| slot.binding.is_none() && !slot.joined)
                         };
                         let Some(slot) = slot else {
                             break;
                         };
-                        let Some(slice) = advice.slice else {
+                        let Some(slice) = advice.and_then(|advice| advice.slice) else {
                             break;
                         };
                         let result = self.begin_cpu(

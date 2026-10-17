@@ -905,6 +905,15 @@ impl<M: RoleModel> PalsEngine<M> {
             pins.situations.extend(&protected.situations);
             pins.executions.extend(&protected.executions);
         }
+        if let Some(custody) = &self.semantic.retired_profiled_external {
+            custody.validate_owner(&self.semantic.stores)?;
+            let protected = custody.protected_pins()?;
+            pins.states.extend(&protected.states);
+            pins.lines.extend(&protected.lines);
+            pins.observations.extend(&protected.observations);
+            pins.situations.extend(&protected.situations);
+            pins.executions.extend(&protected.executions);
+        }
         for node in &self.semantic.nodes {
             if !self
                 .semantic

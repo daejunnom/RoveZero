@@ -2,10 +2,10 @@
 //!
 //! DynamicGo inherits the original source/assets/resources/profile declaration;
 //! it never relabels another root as the startup's exact registered workload.
-//! The original UCI owner supplies its ProcessClock clone. This context does
-//! not carry an independent clock-origin capability, so this boundary cannot
-//! identify a caller-created second clock with the same epoch. No new origin
-//! or deadline is created here, and no raw Instant is serialized.
+//! The original UCI owner supplies both its ProcessClock clone and private
+//! immutable Start custody. Metadata or a caller-created clock with the same
+//! epoch cannot replace those original instances. No new origin or deadline is
+//! created here, and no raw Instant is serialized.
 
 use crate::{engine::ProcessClock, parser::GoLimits, search_driver::SearchSessionContext};
 use rz_contracts::{Deadline, Digest, pals::SearchAuthority, rovent::SearchGoal};

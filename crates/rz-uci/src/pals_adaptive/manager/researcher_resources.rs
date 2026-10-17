@@ -117,4 +117,41 @@ where
             },
         }
     }
+    pub(super) fn profiled_busy(&self) -> bool {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self.profiled_binding.is_some()
+            || self.profiled_orphan.is_some()
+            || self
+                .deferred
+                .iter()
+                .any(|event| matches!(event, DeferredCommit::ProfiledExternal { .. }))
+        {
+            return true;
+        }
+        false
+    }
+    pub(super) fn profiled_frame_pending(&self, id: FrameId) -> bool {
+        #[cfg(all(feature="pals-adaptive",feature="onnx-cpu"))]
+        return self.profiled_binding.as_ref().is_some_and(|binding|binding.work.frame==id)
+            || self.deferred.iter().any(|event|matches!(event,DeferredCommit::ProfiledExternal{binding,..} if binding.work.frame==id));
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        {
+            let _ = id;
+            false
+        }
+    }
+    pub(super) fn profiled_dispatch_available(&self) -> bool {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        return self.researcher_source_kind() == AdaptiveResearcherSourceKind::ProfiledExternal
+            && !self.profiled_busy()
+            && self.researcher.profiled().is_ok_and(|source| {
+                source.pending_dispatch().is_none()
+                    && !source.is_quarantined()
+                    && !source.root_drained()
+            });
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        {
+            false
+        }
+    }
 }

@@ -90,6 +90,15 @@ impl ProfiledExternalDispatch {
     pub fn root_restriction(&self) -> Digest {
         self.root_restriction
     }
+    pub(crate) fn profile(&self) -> ExternalEngineProfile {
+        self.profile
+    }
+    pub(crate) fn purpose(&self) -> ExternalEnginePurpose {
+        self.purpose
+    }
+    pub(crate) fn evaluation_namespace(&self) -> Digest {
+        self.evaluation_namespace
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +168,18 @@ impl ProfiledExternalCompletion {
     }
     pub fn root_restriction(&self) -> Digest {
         self.root_restriction
+    }
+    pub(crate) fn profile(&self) -> ExternalEngineProfile {
+        self.profile
+    }
+    pub(crate) fn purpose(&self) -> ExternalEnginePurpose {
+        self.purpose
+    }
+    pub(crate) fn evaluation_namespace(&self) -> Digest {
+        self.evaluation_namespace
+    }
+    pub(crate) fn requested(&self) -> ExternalGoConstraint {
+        self.requested
     }
     pub fn matches_submission(&self, dispatch: &ProfiledExternalDispatch) -> bool {
         self.question == dispatch.question

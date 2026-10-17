@@ -17,8 +17,33 @@ impl<M: RoleModel> PalsEngine<M> {
         resolver: ResolverPolicy,
         policy: PostRepairRecheckPolicy,
     ) -> Result<ResearcherAdmission, PalsError> {
+        Self::admit_researcher_with_profile(config, model, cpu, resolver, policy, None)
+    }
+
+    pub(super) fn admit_profiled_researcher(
+        config: &PalsConfig,
+        model: &M,
+        cpu: &dyn CpuChecker,
+        resolver: ResolverPolicy,
+        policy: PostRepairRecheckPolicy,
+        admission: &crate::external_cpu::ProfiledResearcherAdmission,
+    ) -> Result<ResearcherAdmission, PalsError> {
+        Self::admit_researcher_with_profile(config, model, cpu, resolver, policy, Some(admission))
+    }
+
+    fn admit_researcher_with_profile(
+        config: &PalsConfig,
+        model: &M,
+        cpu: &dyn CpuChecker,
+        resolver: ResolverPolicy,
+        policy: PostRepairRecheckPolicy,
+        profiled: Option<&crate::external_cpu::ProfiledResearcherAdmission>,
+    ) -> Result<ResearcherAdmission, PalsError> {
         config.validate()?;
         cpu.identity().validate()?;
+        if let Some(admission) = profiled {
+            admission.validate_checker(cpu)?;
+        }
         if resolver == ResolverPolicy::OwnRawRestricted
             && matches!(cpu.identity(), CheckerIdentity::ExternalUci(_))
         {
@@ -34,7 +59,7 @@ impl<M: RoleModel> PalsEngine<M> {
             .into());
         }
         let capabilities = cpu.capabilities();
-        if !capabilities.divergence || !capabilities.root_moves {
+        if !capabilities.divergence || (!capabilities.root_moves && profiled.is_none()) {
             return Err(CpuError::Unsupported(
                 "PALS independent CPU divergence/root-move discovery",
             )
@@ -43,7 +68,10 @@ impl<M: RoleModel> PalsEngine<M> {
         if capabilities.max_depth == 0
             || capabilities.max_depth > 64
             || capabilities.max_prefix_plies < config.line_plies.saturating_sub(1)
-            || capabilities.max_root_moves < 256
+            || (capabilities.max_root_moves < 256
+                && !(profiled.is_some()
+                    && !capabilities.root_moves
+                    && capabilities.max_root_moves == 0))
             || cpu.conditions().is_empty()
             || cpu.conditions().len()
                 > if matches!(cpu.identity(), CheckerIdentity::ExternalUci(_)) {

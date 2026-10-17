@@ -38,6 +38,7 @@ mod nnuec_port;
 mod port_tests;
 mod preparing_nnuec;
 mod preparing_port;
+mod profiled_external_port;
 mod reciprocal_port;
 mod role_commit;
 pub use reciprocal_port::{
@@ -71,6 +72,13 @@ pub use nnuec_port::{
 };
 pub use preparing_nnuec::{PreparingRootNnuecRequest, PreparingRootViewSeal};
 pub use preparing_port::{AdaptivePreparingRootAdmission, AdaptivePreparingRootCustody};
+pub(in crate::pals::engine) use profiled_external_port::ProfiledExternalRetiredCustody;
+pub use profiled_external_port::{
+    AdaptiveProfiledExternalAdmission, AdaptiveProfiledExternalCommit,
+    AdaptiveProfiledExternalPreparation, AdaptiveProfiledForeignPublication,
+    ProfiledExternalRetiredPacket, ProfiledExternalRetirementIdentity,
+    ProfiledExternalRootRetirement, ProfiledExternalUnsupported,
+};
 pub mod archive_worker;
 /// The process registry remains owned by UCI. Search cannot invent an owner
 /// from a root generation or reuse one for a separately owned Rules instance.
@@ -477,6 +485,7 @@ pub struct AdaptiveEnginePort<M: RoleModel> {
     fresh_pending: HashMap<ContractDigest, FrameInput<ReviewView, AdaptivePortQuestion>>,
     rules_owner_issuer: AdaptiveRulesOwnerIssuer,
     external_admissions: HashMap<ContractDigest, external_commit::ExternalPortAdmission>,
+    profiled_external: profiled_external_port::ProfiledExternalPortState,
     supported_counters: HashMap<ContractDigest, conditional_evidence::SupportedCounter>,
     conditional_witnesses: HashMap<ObservationId, (ObservationKind, Vec<BoardMove>)>,
     pending_counters: HashMap<BoardMove, VecDeque<branch_queue::PendingCounter>>,
@@ -750,6 +759,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             fresh_pending: HashMap::new(),
             rules_owner_issuer,
             external_admissions: HashMap::new(),
+            profiled_external: profiled_external_port::ProfiledExternalPortState::default(),
             supported_counters: HashMap::new(),
             conditional_witnesses: HashMap::new(),
             pending_counters: HashMap::new(),
@@ -879,6 +889,15 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let pins = self.goal_local_protected_pins();
         let state = std::mem::take(&mut self.goal_local);
         self.engine.semantic.retired_goal_local = goal_local::GoalLocalRetiredCustody::preserve(
+            state,
+            pins,
+            self.engine.semantic.stores.read_owner(),
+            self.engine.semantic.stores.generation(),
+            self.authority,
+        );
+        let pins = self.profiled_external_protected_pins();
+        let state = std::mem::take(&mut self.profiled_external);
+        self.engine.semantic.retired_profiled_external = ProfiledExternalRetiredCustody::preserve(
             state,
             pins,
             self.engine.semantic.stores.read_owner(),

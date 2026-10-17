@@ -2,6 +2,7 @@
 //! converted here. This declaration owns constructor values, not observations.
 
 pub mod v2;
+pub mod v3;
 
 use super::{fail, hex};
 use crate::pals_adaptive::{
@@ -16,7 +17,7 @@ use rz_eval::pals_onnx::{PalsCuDnnConvSearch, PalsOnnxConfig};
 use rz_experiments::{ArtifactRef, RoventDevice, RoventInputLock, RoventResearcher};
 use rz_runtime::adaptive::{AdaptiveController, ControllerConfig, CoordinatorPolicy, LogicalCpu};
 use rz_search::cpu::{CpuConfig, CpuOrderingPolicy, CpuProfile};
-use rz_search::external_cpu::ExternalSlicePolicy;
+use rz_search::external_cpu::{ExternalGoConstraint, ExternalSlicePolicy};
 use rz_search::pals::engine::{PalsSemanticConfig, PcSemanticProfile, PostRepairRecheckPolicy};
 use rz_search::pals::review_context::{ReviewAnchorMode, ReviewIndexLimits, ReviewSelectionPolicy};
 use rz_search::pals::rovent_frontier::FrontierLimits;
@@ -42,12 +43,13 @@ pub struct RoventStartupConfiguration {
     pub execution: ExecutionConfiguration,
 }
 
-/// Exact version dispatch over original bytes. Neither variant upgrades or
-/// supplies policy defaults for the other version's immutable wire contract.
+/// Exact version dispatch over original bytes. No variant upgrades or supplies
+/// policy defaults for another version's immutable wire contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StartupConfigurationDocument {
     V1(RoventStartupConfiguration),
     V2(v2::RoventStartupConfigurationV2),
+    V3(v3::RoventStartupConfigurationV3),
 }
 impl StartupConfigurationDocument {
     pub fn from_json(bytes: &[u8]) -> Result<Self, BackendError> {
@@ -67,6 +69,9 @@ impl StartupConfigurationDocument {
             v2::ROVENT_STARTUP_CONFIGURATION_V2_DOMAIN => {
                 v2::RoventStartupConfigurationV2::from_json(bytes).map(Self::V2)
             }
+            v3::ROVENT_STARTUP_CONFIGURATION_V3_DOMAIN => {
+                v3::RoventStartupConfigurationV3::from_json(bytes).map(Self::V3)
+            }
             _ => Err(invalid("startup configuration version domain")),
         }
     }
@@ -74,52 +79,60 @@ impl StartupConfigurationDocument {
         match self {
             Self::V1(config) => config.fields(),
             Self::V2(config) => config.fields(),
+            Self::V3(config) => config.fields(),
         }
     }
     pub fn validate(&self) -> Result<(), BackendError> {
         match self {
             Self::V1(config) => config.validate(),
             Self::V2(config) => config.validate(),
+            Self::V3(config) => config.validate(),
         }
     }
     pub fn admit_against(&self, lock: &RoventInputLock) -> Result<(), BackendError> {
         match self {
             Self::V1(config) => config.admit_against(lock),
             Self::V2(config) => config.admit_against(lock),
+            Self::V3(config) => config.admit_against(lock),
         }
     }
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, BackendError> {
         match self {
             Self::V1(config) => config.canonical_bytes(),
             Self::V2(config) => config.canonical_bytes(),
+            Self::V3(config) => config.canonical_bytes(),
         }
     }
     pub fn configuration_digest(&self) -> Result<[u8; 32], BackendError> {
         match self {
             Self::V1(config) => config.configuration_digest(),
             Self::V2(config) => config.configuration_digest(),
+            Self::V3(config) => config.configuration_digest(),
         }
     }
     pub fn search_configuration_digest(&self) -> Result<[u8; 32], BackendError> {
         match self {
             Self::V1(config) => config.search_configuration_digest(),
             Self::V2(config) => config.search_configuration_digest(),
+            Self::V3(config) => config.search_configuration_digest(),
         }
     }
     pub fn nnuec_conditions_digest(&self) -> Result<Option<[u8; 32]>, BackendError> {
         match self {
             Self::V1(config) => config.nnuec_search_conditions_digest(),
             Self::V2(config) => config.nnuec_search_conditions_digest(),
+            Self::V3(config) => config.nnuec_search_conditions_digest(),
         }
     }
     pub fn require_supported_native_capabilities(&self) -> Result<(), BackendError> {
         match self {
             Self::V1(config) => config.require_supported_native_capabilities(),
             Self::V2(config) => config.require_supported_native_capabilities(),
+            Self::V3(config) => config.require_supported_native_capabilities(),
         }
     }
     /// Legacy PC and PCR keep their separately established policy choices.
-    /// Only /2 supplies a common explicit selection for both assemblies.
+    /// /2 and /3 supply a common explicit selection for both assemblies.
     pub fn post_repair_policy_for(&self, mode: ExecutionMode) -> PostRepairRecheckPolicy {
         match self {
             Self::V1(_) => match mode {
@@ -129,6 +142,27 @@ impl StartupConfigurationDocument {
                 }
             },
             Self::V2(config) => config.post_repair_policy(),
+            Self::V3(config) => config.post_repair_policy(),
+        }
+    }
+    /// Legacy external declarations carry no explicit query selection. They
+    /// remain decodable metadata and cannot silently acquire Combined work.
+    pub fn external_question_limit(&self) -> Result<Option<ExternalGoConstraint>, BackendError> {
+        match self {
+            Self::V3(config) => config.external_question_limit(),
+            Self::V1(_) | Self::V2(_) => {
+                self.validate()?;
+                if matches!(
+                    self.fields().execution,
+                    ExecutionConfiguration::ExternalResearcher { .. }
+                ) {
+                    return Err(fail(
+                        K::UnsupportedModel,
+                        "UnsupportedCapability: external researcher requires explicit startup configuration /3 question_limit",
+                    ));
+                }
+                Ok(None)
+            }
         }
     }
 }

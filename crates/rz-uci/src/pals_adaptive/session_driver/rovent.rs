@@ -17,6 +17,8 @@ use rz_search::pals::rovent_frontier::{
 use std::num::NonZeroU16;
 
 pub const ROVENT_NATIVE_ROOT_DOMAIN: &str = "rz-rovent-native-root/1";
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub const ROVENT_PROFILED_EXTERNAL_ROOT_DOMAIN: &str = "rz-rovent-profiled-external-root/1";
 
 /// Admitted alongside the actual native/CPU sources, never inferred from a
 /// SearchKind label. PC uses its distinct typed role-only owner instead.
@@ -182,6 +184,8 @@ pub struct RoventNativeRootReceipt {
     pub native_accounting: Option<AdaptiveNativeAccountingSnapshot>,
     pub native_reservations: crate::pals_adaptive::RoventNativeAccountingObservation,
     pub physical: Option<AdaptiveShutdownReceipt>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub profiled_physical: Option<crate::pals_adaptive::ProfiledExternalShutdownReceipt>,
 }
 impl RoventNativeRootReceipt {
     pub fn work(&self) -> Result<DriverWork, SearchSessionFailure> {
@@ -374,7 +378,11 @@ where
             .rovent_frontier_receipt()
             .map_err(|error| SearchSessionFailure::debug("RoventFrontierObservation", &error))?;
         let receipt = Arc::new(RoventNativeRootReceipt {
-            domain: ROVENT_NATIVE_ROOT_DOMAIN,
+            domain: match self.researcher_class {
+                SessionResearcherClass::Legacy => ROVENT_NATIVE_ROOT_DOMAIN,
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                SessionResearcherClass::ProfiledExternal => ROVENT_PROFILED_EXTERNAL_ROOT_DOMAIN,
+            },
             authority: context.authority,
             mode: profile.mode,
             input_lock: profile.input_lock,
@@ -389,6 +397,8 @@ where
                 .map(|observation| observation.native_accounting()),
             native_reservations: manager.rovent_native_accounting(),
             physical: manager.shutdown_receipt().ok(),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            profiled_physical: manager.profiled_shutdown_receipt().ok(),
         });
         *self
             .latest_rovent_root

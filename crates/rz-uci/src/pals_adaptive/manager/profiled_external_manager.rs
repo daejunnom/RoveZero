@@ -20,6 +20,13 @@ where
 {
     inner: AdaptiveExecutionManager<Q, B, D>,
 }
+pub struct ProfiledExternalPersistentRejection<Q, B, D>
+where
+    B: TicketNativeBackend<ReviewView, Q>,
+{
+    pub error: AdaptiveManagerError,
+    pub manager: ProfiledExternalExecutionManager<Q, B, D>,
+}
 
 impl<Q, B, D> ProfiledExternalExecutionManager<Q, B, D>
 where
@@ -75,6 +82,61 @@ where
     }
     pub fn tick(&mut self) -> Result<bool, AdaptiveManagerError> {
         self.inner.tick()
+    }
+    pub fn registered_cleanup_deadline(&self) -> Option<Instant> {
+        self.inner.registered_cleanup_deadline()
+    }
+    pub fn profiled_shutdown_receipt(
+        &self,
+    ) -> Result<ProfiledExternalShutdownReceipt, AdaptiveManagerError> {
+        self.inner.profiled_shutdown_receipt()
+    }
+    pub fn run_profiled_root_until(
+        &mut self,
+        until: Instant,
+        canceled: &AtomicBool,
+    ) -> Result<ProfiledExternalShutdownReceipt, AdaptiveManagerError> {
+        self.inner
+            .run_profiled_root_until_observed(until, canceled, &mut |_| Ok(()))
+    }
+    pub fn run_profiled_until(
+        &mut self,
+        until: Instant,
+        canceled: &AtomicBool,
+    ) -> Result<ProfiledExternalShutdownReceipt, AdaptiveManagerError> {
+        self.inner.run_profiled_until(until, canceled)
+    }
+    #[allow(clippy::result_large_err)]
+    pub fn into_profiled_persistent_parts(
+        self,
+    ) -> Result<
+        ProfiledExternalPersistentParts<Q, B, D>,
+        ProfiledExternalPersistentRejection<Q, B, D>,
+    > {
+        self.inner
+            .into_profiled_persistent_parts()
+            .map_err(|rejected| ProfiledExternalPersistentRejection {
+                error: rejected.error,
+                manager: Self {
+                    inner: rejected.manager,
+                },
+            })
+    }
+    #[allow(clippy::result_large_err)]
+    pub fn into_profiled_process_parts(
+        self,
+    ) -> Result<
+        ProfiledExternalPersistentParts<Q, B, D>,
+        ProfiledExternalPersistentRejection<Q, B, D>,
+    > {
+        self.inner
+            .into_profiled_process_parts()
+            .map_err(|rejected| ProfiledExternalPersistentRejection {
+                error: rejected.error,
+                manager: Self {
+                    inner: rejected.manager,
+                },
+            })
     }
 }
 
@@ -171,6 +233,8 @@ where
                 + self.retained_native_receipts.len()
                 + self.deferred.len()
                 + self.native.occupancy()
+                + usize::from(self.profiled_binding.is_some())
+                + usize::from(self.profiled_orphan.is_some())
                 + usize::from(source.pending_dispatch().is_some()),
             quarantined: self.phase == ManagerPhase::Quarantined
                 || self.native.is_quarantined()
@@ -179,10 +243,12 @@ where
                 || self.external.is_some()
                 || self.foreign.is_some()
                 || self.nnuec.is_some()
+                || self.profiled_orphan.is_some()
                 || !self.native_frontier_events.is_empty(),
             request_sequence_high_water: self.registry.next_request_sequence().saturating_sub(1),
             counters: self.counters,
             reported_work: self.driver.profiled_external_work(),
+            retained_semantic_host_bytes: self.driver.profiled_retained_host_bytes(),
         })
     }
     pub fn run_profiled_root_until_observed(
@@ -322,9 +388,6 @@ where
                     "profiled external original source: {error:?}"
                 ))
             })?;
-            sources
-                .driver
-                .validate_profiled_external_registration(source, root)?;
             if let Some(previous) = &continuation {
                 if registration.authority.epoch != previous.authority.epoch
                     || registration.authority.implementation != previous.authority.implementation

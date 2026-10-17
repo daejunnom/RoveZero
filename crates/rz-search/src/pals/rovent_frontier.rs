@@ -6,13 +6,13 @@
 //! receipts. Missing mate defenses are questions for that same manager queue.
 
 use super::coordinator::{AcceptedRoleStep, CoordinatorWork, FrameId, FrameInput, RefinementStage};
-use super::engine::RoleQueryPurpose;
 use super::engine::adaptive_port::{
     AdaptiveModelNamespace, AdaptivePortQuestion, AdaptivePortRoleEvidence,
 };
 use super::engine::pc_port::{PcPortQuestion, PcResponsibilitySource};
+use super::engine::RoleQueryPurpose;
 use super::review_context::ReviewView;
-use super::rovent_engine::{AdmittedRoleQuestion, ROVENT_NODE_UNIT, RootMoveDomain};
+use super::rovent_engine::{AdmittedRoleQuestion, RootMoveDomain, ROVENT_NODE_UNIT};
 use super::rovent_goals::{
     HorizonBoundary, HorizonError, HorizonInterruption, HorizonObligationId, HorizonObligationKind,
     HorizonSnapshot, RootPlyAnchor, SelectiveHorizon,
@@ -36,8 +36,8 @@ use rz_position::contracts::ContractState;
 use rz_position::{BoardMove, Color, PlayStatus, Position, PositionError, PositionSnapshot};
 use std::collections::HashMap;
 use std::num::NonZeroU16;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 mod external;
@@ -157,6 +157,7 @@ pub struct FrontierPath {
 /// This is a process-local authority, never a serialized snapshot declaration.
 pub(crate) struct CheckedFrontierLine {
     owner: u64,
+    source: Weak<CheckedFrontierSource>,
     store_owner: StoreReadOwner,
     authority: SearchAuthority,
     root_budget: Digest,
@@ -164,6 +165,18 @@ pub(crate) struct CheckedFrontierLine {
     path: FrontierPath,
     prefix: Vec<BoardMove>,
     steps: Vec<CheckedFrontierStep>,
+}
+
+/// One live controller owns this source and its current pin. Paid snapshots
+/// retain only Weak references, so they neither extend root lifetime nor add
+/// a review lease. Replacing the pin updates this same source identity.
+struct CheckedFrontierSource {
+    owner: u64,
+    authority: SearchAuthority,
+    root_budget: Digest,
+    store_owner: StoreReadOwner,
+    pin: Mutex<Weak<StoreReadPin>>,
+    closed: AtomicBool,
 }
 
 pub(crate) struct CheckedFrontierStep {
@@ -179,6 +192,23 @@ impl CheckedFrontierStep {
     }
 }
 impl CheckedFrontierLine {
+    pub(crate) fn matches_store(&self, stores: &PalsStores) -> bool {
+        let Some(source) = self.source.upgrade() else {
+            return false;
+        };
+        source.owner == self.owner
+            && source.authority == self.authority
+            && source.root_budget == self.root_budget
+            && !source.closed.load(Ordering::Acquire)
+            && source.store_owner.matches(stores)
+            && self.store_owner.matches(stores)
+            && self.authority.root.0 == stores.generation()
+            && source
+                .pin
+                .lock()
+                .is_ok_and(|pin| pin.upgrade().is_some_and(|pin| pin.validates(stores)))
+            && !source.closed.load(Ordering::Acquire)
+    }
     /// Declared owned backing excluding allocator overhead and physical
     /// sharing. Used by retained semantic custody, never a measured peak.
     pub(crate) fn owned_host_bytes(&self) -> Option<u64> {
@@ -201,6 +231,9 @@ impl CheckedFrontierLine {
     }
     pub(crate) fn matches(&self, frontier: &RoventFrontier, stores: &PalsStores) -> bool {
         self.owner == frontier.owner
+            && self
+                .source
+                .ptr_eq(&Arc::downgrade(&frontier.checked_source))
             && self.authority == frontier.registration.authority
             && self.root_budget == frontier.registration.root_budget
             && self.store_owner.matches(stores)
@@ -515,7 +548,8 @@ pub struct RoventFrontier {
     // still closes consumption of an already paid in-flight selection.
     consumption_stop: Option<FrontierStop>,
     pins: StorePins,
-    pin: StoreReadPin,
+    pin: Arc<StoreReadPin>,
+    checked_source: Arc<CheckedFrontierSource>,
     store_owner: StoreReadOwner,
     original_clock: ClockDomain,
     original_entry_tick: MonotonicTick,
@@ -609,7 +643,15 @@ impl RoventFrontier {
             .map_err(|_| FrontierError::Capacity("frontier owner"))?;
         let mut pins = StorePins::default();
         pins.states.insert(registration.root_state);
-        let pin = stores.pin_review(pins.clone())?;
+        let pin = Arc::new(stores.pin_review(pins.clone())?);
+        let checked_source = Arc::new(CheckedFrontierSource {
+            owner,
+            authority: registration.authority,
+            root_budget: registration.root_budget,
+            store_owner: stores.read_owner(),
+            pin: Mutex::new(Arc::downgrade(&pin)),
+            closed: AtomicBool::new(false),
+        });
         let mut mate: [Option<MateLane>; 2] = [None, None];
         for (lane, attacker) in [root.side_to_move(), root.side_to_move().opposite()]
             .into_iter()
@@ -683,6 +725,7 @@ impl RoventFrontier {
             consumption_stop: None,
             pins,
             pin,
+            checked_source,
             store_owner: stores.read_owner(),
             original_clock: clock,
             original_entry_tick: now,
@@ -1121,6 +1164,7 @@ impl RoventFrontier {
         }
         Ok(CheckedFrontierLine {
             owner: self.owner,
+            source: Arc::downgrade(&self.checked_source),
             store_owner: self.store_owner.clone(),
             authority: self.registration.authority,
             root_budget: self.registration.root_budget,
@@ -2164,6 +2208,9 @@ impl RoventFrontier {
         Ok(())
     }
     fn interrupt(&mut self, stop: FrontierStop) {
+        if stop != FrontierStop::WorkBudget {
+            self.checked_source.closed.store(true, Ordering::Release);
+        }
         if stop != FrontierStop::WorkBudget && self.consumption_stop.is_none() {
             self.consumption_stop = Some(stop);
         }
@@ -2195,8 +2242,8 @@ impl RoventFrontier {
         let mut pins = self.pins.clone();
         pins.states.insert(state);
         pins.lines.insert(line);
-        let pin = stores.pin_review(pins.clone())?;
-        self.pin = pin;
+        let pin = Arc::new(stores.pin_review(pins.clone())?);
+        self.replace_checked_source_pin(pin)?;
         self.pins = pins;
         Ok(())
     }
@@ -2222,9 +2269,19 @@ impl RoventFrontier {
         pins.states.insert(source.state);
         pins.lines.insert(source.focus);
         pins.situations.insert(source.situation);
-        let pin = stores.pin_review(pins.clone())?;
-        self.pin = pin;
+        let pin = Arc::new(stores.pin_review(pins.clone())?);
+        self.replace_checked_source_pin(pin)?;
         self.pins = pins;
+        Ok(())
+    }
+    fn replace_checked_source_pin(&mut self, pin: Arc<StoreReadPin>) -> Result<(), FrontierError> {
+        let mut current = self
+            .checked_source
+            .pin
+            .lock()
+            .map_err(|_| FrontierError::StoreUnavailable)?;
+        *current = Arc::downgrade(&pin);
+        self.pin = pin;
         Ok(())
     }
     fn observe_prefix(
