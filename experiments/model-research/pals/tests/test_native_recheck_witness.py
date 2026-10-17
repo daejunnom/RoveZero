@@ -4,7 +4,9 @@ The whole positive fixture reads the independently pinned reviewed Rust sources,
 then uses the public strict-loader, Repair, Rules, anchor and whole factories.
 Its build/process/Rules/CPU records are synthetic caller observations, never
 evidence that a compiler, child, model, loss, optimizer or chess replay executed.
-Production gates and the closed source-profile table are never patched here.
+Production gates and historical literal profiles are never patched here. The
+new closure-consumer tests patch only the separate private registry with static
+synthetic source text inside each test; they never enroll current file hashes.
 """
 import copy
 import json
@@ -12,6 +14,7 @@ from pathlib import Path
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from rz_pals_model import native_recheck_witness as witness
 from rz_pals_model import frozen_producer as frozen
@@ -67,6 +70,50 @@ class SyntheticPolicy:
         self.raw = canonical(self.registration)
         self.source["native"]["refinement_registration"] = copy.deepcopy(self.registration)
         self.source["native"]["refinement_registration_sha256"] = byte_pin(self.raw)["sha256"]
+
+
+class SyntheticClosureBuild(SyntheticBuild):
+    """Static fixture source text, never current files or a compiled build.
+
+    The complete expected roster is independent of the production helper's
+    required-components table. Only individual tests patch its private review
+    registry; these pins never register the checkout or authorize execution.
+    """
+    def __init__(self, lane="legacy_single_reply"):
+        super().__init__()
+        texts = {
+            "crates/rz-search/src/pals/engine.rs": b"// synthetic closed engine fixture\n",
+            "crates/rz-arena/src/pals_collect/native.rs": b"// synthetic closed collector fixture\n",
+            "crates/rz-search/src/pals/engine/semantic_state.rs": b"// synthetic semantic state fixture\n",
+            "crates/rz-search/src/pals/engine/researcher_admission.rs": b"// synthetic researcher admission fixture\n",
+            "crates/rz-search/src/pals/engine/researcher_profile.rs": b"// synthetic researcher profile fixture\n",
+            "crates/rz-search/src/pals/engine/review_lifecycle.rs": b"// synthetic review lifecycle fixture\n",
+            "crates/rz-search/src/pals/engine/cpu_lifecycle.rs": b"// synthetic CPU lifecycle fixture\n",
+            "crates/rz-search/src/pals/engine/followup_execution.rs": b"// synthetic followup execution fixture\n",
+            "crates/rz-search/src/pals/engine/archive_lifecycle.rs": b"// synthetic archive lifecycle fixture\n",
+            "crates/rz-arena/src/pals_collect.rs": b"// synthetic collector entry fixture\n",
+            "crates/rz-arena/src/pals_collect/full_line.rs": b"// synthetic full line fixture\n",
+            "crates/rz-arena/src/pals_collect/divergence.rs": b"// synthetic divergence fixture\n",
+            "crates/rz-arena/src/pals_collect/continuation.rs": b"// synthetic continuation fixture\n",
+            "crates/rz-arena/src/pals_collect/producer.rs": b"// synthetic producer fixture\n",
+        }
+        self.raws.update(engine_source=texts[witness._SOURCE_PATHS[0]], native_source=texts[witness._SOURCE_PATHS[1]])
+        components = {path: byte_pin(text) for path, text in texts.items()}
+        compiled = byte_pin(b"synthetic independently declared compiled closure fact\n")["sha256"]
+        self.profile = {"schema": "rz-pals-native-reviewed-transition-profile/1",
+            "review_id": "synthetic-full-closure-only", "lane": lane,
+            "transition_sources": {path: copy.deepcopy(components[path]) for path in witness._SOURCE_PATHS},
+            "component_pins": components, "compiled_search_implementation_sha256": compiled,
+            "closure_sha256": semantic.digest("rz-pals-native-reviewed-transition-closure/1", components)}
+        self.manifest["files"] = [{"path": path, **pin} for path, pin in sorted(components.items())]
+        self.source["native"] = {"search_implementation_sha256": compiled}
+        self.reseal()
+
+    def opt_in(self):
+        policy = SyntheticPolicy()
+        policy.source["native"]["search_implementation_sha256"] = self.profile["compiled_search_implementation_sha256"]
+        self.source = copy.deepcopy(policy.source)
+        return policy.raw
 
 
 class SyntheticReply:
@@ -137,6 +184,110 @@ class SyntheticEndpoint:
 
     def read(self):
         return witness._endpoint(self.endpoint,prepared=self.prepared,value_identity=self.value_identity,root_white=True,plies=5)
+
+
+class NativeRecheckClosureConsumerTests(unittest.TestCase):
+    def test_new_pair_requires_full_literal_closure_and_returns_detached_metadata_only(self):
+        from rz_pals_model import native_source_review as reviewed
+        fixture = SyntheticClosureBuild()
+        policy = fixture.opt_in()
+        with patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", ()):
+            with self.assertRaisesRegex(witness.UnsupportedNativeRecheck, "unreviewed_opt_in_collector_transition_source_pair"):
+                witness._source_review(fixture.raws, fixture.source, policy)
+        registered = copy.deepcopy(fixture.profile)
+        with patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", (registered,)):
+            result = witness._source_review(fixture.raws, fixture.source, policy)
+            proof = result["reviewed_transition_closure"]
+            self.assertEqual(set(proof), {"schema", "review_id", "lane", "transition_sources", "component_pins",
+                "compiled_search_implementation_sha256", "closure_sha256", "unreviewed_manifest_files",
+                "historical_metadata_only", "execution_authorized", "original_native_authority_reissued",
+                "rules_proof_authorized", "training_target_authorized"})
+            self.assertEqual(proof["lane"], "legacy_single_reply")
+            self.assertEqual(proof["component_pins"], fixture.profile["component_pins"])
+            self.assertEqual(result["reviewed_transition_sources"], fixture.profile["transition_sources"])
+            self.assertEqual(result["source_review_profile"], fixture.profile["review_id"])
+            self.assertIs(proof["historical_metadata_only"], True)
+            for key in ("execution_authorized", "original_native_authority_reissued", "rules_proof_authorized", "training_target_authorized"):
+                self.assertIs(proof[key], False)
+            original_bytes = canonical(result)
+            proof["component_pins"][witness._SOURCE_PATHS[0]]["sha256"] = "0" * 64
+            self.assertEqual(canonical(witness._source_review(fixture.raws, fixture.source, policy)), original_bytes)
+            self.assertEqual(registered, fixture.profile)
+
+    def test_full_helper_roster_and_actual_compiled_fact_are_required_by_consumer(self):
+        from rz_pals_model import native_source_review as reviewed
+        helper = "crates/rz-search/src/pals/engine/semantic_state.rs"
+        for change in ("replacement", "missing_helper", "profile_omission", "compiled_mismatch", "compiled_missing", "wrong_lane"):
+            fixture = SyntheticClosureBuild()
+            policy = fixture.opt_in()
+            registered = copy.deepcopy(fixture.profile)
+            if change == "replacement":
+                next(row for row in fixture.manifest["files"] if row["path"] == helper).update(byte_pin(b"changed helper fixture\n"))
+            elif change == "missing_helper":
+                fixture.manifest["files"] = [row for row in fixture.manifest["files"] if row["path"] != helper]
+            elif change == "profile_omission":
+                del registered["component_pins"][helper]
+                registered["closure_sha256"] = semantic.digest("rz-pals-native-reviewed-transition-closure/1", registered["component_pins"])
+            elif change == "compiled_mismatch":
+                fixture.source["native"]["search_implementation_sha256"] = "e" * 64
+            elif change == "compiled_missing":
+                del fixture.source["native"]["search_implementation_sha256"]
+            else:
+                registered["lane"] = "default_disabled"
+            fixture.reseal()
+            boundary = {"replacement": "helper closure differs", "missing_helper": "helper closure differs",
+                "profile_omission": "omits a required source helper", "compiled_mismatch": "compiled search closure differs",
+                "compiled_missing": "original_compiled_search_closure_fact_missing", "wrong_lane": "unreviewed_opt_in_collector_transition_source_pair"}[change]
+            with self.subTest(change=change), patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", (registered,)):
+                with self.assertRaisesRegex(ValueError, boundary):
+                    witness._source_review(fixture.raws, fixture.source, policy)
+
+    def test_build_binary_source_and_registered_policy_gates_precede_new_closure(self):
+        from rz_pals_model import native_source_review as reviewed
+        for change in ("exit", "verified", "binary", "unbound_component", "policy"):
+            fixture = SyntheticClosureBuild()
+            policy = fixture.opt_in()
+            if change == "exit":
+                fixture.build["actual_build_exit_code"] = False
+            elif change == "verified":
+                fixture.build["source_verified_before_and_after_build"] = False
+            elif change == "binary":
+                fixture.build["binary"]["sha256"] = "e" * 64
+            elif change == "unbound_component":
+                fixture.raws["native_source"] += b"// not in original manifest\n"
+            else:
+                fixture.source["native"]["refinement_registration_sha256"] = "e" * 64
+            fixture.reseal()
+            boundary = {"exit": "successful original build observation", "verified": "successful original build observation",
+                "binary": "registered collector binary binding", "unbound_component": "source bytes absent from original",
+                "policy": "policy registration/base registry/binary binding"}[change]
+            with self.subTest(change=change), patch.object(reviewed, "review_transition_sources",
+                    side_effect=AssertionError("source closure must not hide an earlier failed gate")) as lookup:
+                with self.assertRaisesRegex(ValueError, boundary):
+                    witness._source_review(fixture.raws, fixture.source, policy)
+                lookup.assert_not_called()
+
+    def test_new_pair_cannot_hybridize_one_registered_component(self):
+        from rz_pals_model import native_source_review as reviewed
+        for name, path in zip(("engine_source", "native_source"), witness._SOURCE_PATHS):
+            fixture = SyntheticClosureBuild()
+            policy = fixture.opt_in()
+            fixture.raws[name] += b"// separately bound successor fixture\n"
+            next(row for row in fixture.manifest["files"] if row["path"] == path).update(byte_pin(fixture.raws[name]))
+            fixture.reseal()
+            with self.subTest(component=name), patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", (copy.deepcopy(fixture.profile),)):
+                with self.assertRaisesRegex(witness.UnsupportedNativeRecheck, "unreviewed_opt_in_collector_transition_source_pair"):
+                    witness._source_review(fixture.raws, fixture.source, policy)
+
+    def test_historical_literal_lookup_remains_detached_and_does_not_enroll_a_closure(self):
+        from rz_pals_model import native_source_review as reviewed
+        expected = copy.deepcopy(REVIEWED_WHOLE_SOURCE_PINS)
+        with patch.object(reviewed, "review_transition_sources", side_effect=AssertionError("historical lookup must stay separate")) as lookup:
+            name, retained = witness._reviewed_source_pair(expected)
+            before = canonical([name, expected])
+            retained[witness._SOURCE_PATHS[0]]["sha256"] = "0" * 64
+            self.assertEqual(canonical(list(witness._reviewed_source_pair(expected))), before)
+            lookup.assert_not_called()
 
 
 class NativeRecheckBoundaryTests(unittest.TestCase):

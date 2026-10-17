@@ -403,6 +403,7 @@ mod tests {
             feedback_already_forwarded: false,
         };
         let report = CpuSliceReport {
+            reciprocal_request: None,
             grant: SliceGrant {
                 job: job.id,
                 execution: ExecutionId {

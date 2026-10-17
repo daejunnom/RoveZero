@@ -78,6 +78,7 @@ impl SearchSessionDriver for RulesOnlyPreflightDriver {
         }
         let best_move = position.legal_moves().into_iter().next();
         Ok(SearchSessionReport {
+            mate_strategy: None,
             best_move,
             work: DriverWork::Pals {
                 rounds: 0,

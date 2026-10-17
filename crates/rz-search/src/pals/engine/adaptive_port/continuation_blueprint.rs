@@ -171,12 +171,21 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         self.check_live()?;
         let endpoint = self
             .engine
+            .semantic
             .nodes
             .get(node)
             .ok_or(RoleError::InvalidOutput)?;
-        if self.engine.stores.situations.get(endpoint.situation)?.state != endpoint.state
+        if self
+            .engine
+            .semantic
+            .stores
+            .situations
+            .get(endpoint.situation)?
+            .state
+            != endpoint.state
             || !self
                 .engine
+                .semantic
                 .stores
                 .states
                 .get(endpoint.state)?
@@ -188,10 +197,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             authority: self.authority,
             deadline: self.deadline,
             hard_deadline: self.limits.deadline,
-            owner: self.engine.stores.read_owner(),
-            generation: self.engine.stores.generation(),
-            root: self.engine.nodes[self.root].state,
-            revision: self.engine.revision,
+            owner: self.engine.semantic.stores.read_owner(),
+            generation: self.engine.semantic.stores.generation(),
+            root: self.engine.semantic.nodes[self.root].state,
+            revision: self.engine.semantic.revision,
             endpoint: (
                 node,
                 endpoint.state,
@@ -224,7 +233,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             return Err(ReviewError::ViewCapacity.into());
         }
         let seal = self.blueprint_seal(node)?;
-        let mut replay = self.engine.nodes[self.root].position.clone();
+        let mut replay = self.engine.semantic.nodes[self.root].position.clone();
         for movement in &prefix {
             replay.make_move(*movement)?;
         }
@@ -261,7 +270,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let seal = self.blueprint_seal(input.question.node)?;
         if input.stage != RefinementStage::FreshCounterEndpoint
             || input.view_seal != self.seal(&input.view)
-            || !input.view.validates(&self.engine.stores)
+            || !input.view.validates(&self.engine.semantic.stores)
         {
             return Err(RoleError::InvalidOutput.into());
         }
@@ -283,6 +292,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let seal = self.blueprint_seal(repaired_node)?;
         let counter_snapshot = self
             .engine
+            .semantic
             .nodes
             .get(counter_node)
             .ok_or(RoleError::InvalidOutput)?
@@ -316,16 +326,17 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let seal = &blueprint.seal;
         let node = self
             .engine
+            .semantic
             .nodes
             .get(seal.endpoint.0)
             .ok_or(RoleError::InvalidOutput)?;
         if seal.authority != self.authority
             || seal.deadline != self.deadline
             || seal.hard_deadline != self.limits.deadline
-            || !seal.owner.matches(&self.engine.stores)
-            || seal.generation != self.engine.stores.generation()
-            || seal.root != self.engine.nodes[self.root].state
-            || seal.revision > self.engine.revision
+            || !seal.owner.matches(&self.engine.semantic.stores)
+            || seal.generation != self.engine.semantic.stores.generation()
+            || seal.root != self.engine.semantic.nodes[self.root].state
+            || seal.revision > self.engine.semantic.revision
             || node.state != seal.endpoint.1
             || node.situation != seal.endpoint.2
             || !node.position.snapshot().same_state(&seal.endpoint.3)
@@ -371,9 +382,40 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if let Some((question, observation)) = step.feedback_gate {
             if !self.cpu_feedback_still_authorized(question, observation)
                 && !self.external_feedback_still_authorized(question, observation)
+                && !self.profiled_external_feedback_still_authorized(question, observation)
             {
                 return Err(StoreError::StaleConsumer.into());
             }
+        }
+        let utility_cause = if self.utility_continuations.enabled() {
+            match &step.transition {
+                AdaptivePortTransition::Continue(blueprint) => {
+                    self.validate_blueprint(blueprint)?;
+                    if let Some(cause) = &blueprint.cause {
+                        if step.consumption_gate
+                            != Some((cause.request, cause.question, cause.view))
+                        {
+                            return Err(RoleError::InvalidOutput.into());
+                        }
+                        Some(utility_dependencies::UtilityContinuationCause::Role {
+                            request: cause.request,
+                            frame: cause.frame,
+                            question: cause.question,
+                            view: cause.view,
+                        })
+                    } else if let Some((question, observation)) = step.feedback_gate {
+                        self.utility_cpu_continuation_cause(question, observation)?
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if utility_cause.is_some() {
+            self.utility_continuations.reserve()?;
         }
         let transition = match step.transition {
             AdaptivePortTransition::Complete { scope } => FrameTransition::Complete { scope },
@@ -404,7 +446,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     }
                     BlueprintContent::FrozenSecond(input) => {
                         if input.view_seal != self.seal(&input.view)
-                            || !input.view.validates(&self.engine.stores)
+                            || !input.view.validates(&self.engine.semantic.stores)
                         {
                             return Err(RoleError::InvalidOutput.into());
                         }
@@ -421,6 +463,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     } => {
                         if !self
                             .engine
+                            .semantic
                             .nodes
                             .get(counter_node)
                             .ok_or(RoleError::InvalidOutput)?
@@ -441,7 +484,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                                     refutation: None,
                                     divergences: &[],
                                 },
-                                &self.engine.nodes[repaired_node].position.legal_moves(),
+                                &self.engine.semantic.nodes[repaired_node]
+                                    .position
+                                    .legal_moves(),
                                 counter_node,
                                 RoleQuestion {
                                     purpose: RoleQueryPurpose::ValueFresh,
@@ -450,7 +495,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                                     refutation: None,
                                     divergences: &[],
                                 },
-                                &self.engine.nodes[counter_node].position.legal_moves(),
+                                &self.engine.semantic.nodes[counter_node]
+                                    .position
+                                    .legal_moves(),
                             )?
                             .ok_or(PalsError::InvalidConfig)?;
                         let mut first_input = self.input(
@@ -513,6 +560,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 FrameTransition::Continue(input)
             }
         };
+        if let (Some(cause), FrameTransition::Continue(input)) = (utility_cause, &transition) {
+            self.record_utility_continuation(cause, input)?;
+        }
         let queued_recheck = self.seal_queued_recheck(step.queue_question, step.evidence)?;
         Ok(AdaptivePortMaterializedStep {
             evidence: step.evidence,
@@ -535,12 +585,15 @@ mod tests {
         let submitted = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
         let (ticket, response) = output(&submitted, 1);
         let questions = port.next_question;
-        let leases = port.engine.stores.review_pin_count().unwrap();
+        let leases = port.engine.semantic.stores.review_pin_count().unwrap();
         let step = port
             .commit_role(&submitted, &ticket, &response, None)
             .unwrap();
         assert_eq!(port.next_question, questions);
-        assert_eq!(port.engine.stores.review_pin_count().unwrap(), leases);
+        assert_eq!(
+            port.engine.semantic.stores.review_pin_count().unwrap(),
+            leases
+        );
         assert!(matches!(
             step.transition,
             AdaptivePortTransition::Continue(_)
@@ -655,7 +708,12 @@ mod tests {
             setup_with_resolver(Position::startpos(), 3, ResolverPolicy::ModelWdlRestricted);
         let submitted = work(&mut port, "e2e4", RefinementStage::ProposalValueFresh, 1);
         let (ticket, response) = output(&submitted, 1);
-        let observations = port.engine.stores.observations.next_observation_sequence();
+        let observations = port
+            .engine
+            .semantic
+            .stores
+            .observations
+            .next_observation_sequence();
         let completed = AdaptivePortRoleEvidence {
             execution: Some(rz_contracts::ExecutionId::new(ticket.id.epoch, 1)),
             completed_nn_inputs: Some(2),
@@ -696,7 +754,11 @@ mod tests {
             assert!(!port.attempted_role_commits.contains(&ticket.id));
             assert!(!port.accepted.contains(&ticket.id));
             assert_eq!(
-                port.engine.stores.observations.next_observation_sequence(),
+                port.engine
+                    .semantic
+                    .stores
+                    .observations
+                    .next_observation_sequence(),
                 observations
             );
         }
@@ -711,7 +773,12 @@ mod tests {
                 setup_with_resolver(Position::startpos(), 3, ResolverPolicy::ModelWdlRestricted);
             let submitted = work(&mut port, "e2e4", RefinementStage::ProposalValueFresh, 1);
             let (ticket, response) = output(&submitted, 1);
-            let observations = port.engine.stores.observations.next_observation_sequence();
+            let observations = port
+                .engine
+                .semantic
+                .stores
+                .observations
+                .next_observation_sequence();
             let physical = Some(AdaptivePortRoleEvidence {
                 execution: Some(rz_contracts::ExecutionId::new(ticket.id.epoch, 1)),
                 completed_nn_inputs: Some(completed_nn_inputs),
@@ -723,22 +790,37 @@ mod tests {
                 .unwrap_or_else(|error| {
                     panic!("{completed_nn_inputs} completed inputs: {error:?}")
                 });
-            let observation = port.engine.nodes[submitted.input.question.node]
+            let observation = port.engine.semantic.nodes[submitted.input.question.node]
                 .model_observation
                 .expect("one committed model value");
-            let stored = port.engine.stores.observations.get(observation).unwrap();
+            let stored = port
+                .engine
+                .semantic
+                .stores
+                .observations
+                .get(observation)
+                .unwrap();
             assert!(matches!(stored.score, RawScore::ContextWdl { .. }));
             assert_eq!(stored.model_value_input, Some(response.key.input.0));
             assert!(port.attempted_role_commits.contains(&ticket.id));
             assert!(port.accepted.contains(&ticket.id));
-            let committed = port.engine.stores.observations.next_observation_sequence();
+            let committed = port
+                .engine
+                .semantic
+                .stores
+                .observations
+                .next_observation_sequence();
             assert_eq!(committed, observations + 1);
             assert!(
                 port.commit_role(&submitted, &ticket, &response, physical)
                     .is_err()
             );
             assert_eq!(
-                port.engine.stores.observations.next_observation_sequence(),
+                port.engine
+                    .semantic
+                    .stores
+                    .observations
+                    .next_observation_sequence(),
                 committed
             );
             port.role_consumed(&ticket, &submitted.input.view).unwrap();
@@ -755,22 +837,22 @@ mod tests {
         let submitted = work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
         let (ticket, response) = output(&submitted, 1);
         port.engine.config.max_records = 0;
-        let nodes = port.engine.nodes.len();
+        let nodes = port.engine.semantic.nodes.len();
         assert!(matches!(
             port.commit_role(&submitted, &ticket, &response, None),
             Err(PalsError::Store(StoreError::PinSaturated(_)))
         ));
-        assert!(port.engine.nodes.len() > nodes);
+        assert!(port.engine.semantic.nodes.len() > nodes);
         assert!(port.attempted_role_commits.contains(&ticket.id));
         assert!(!port.accepted.contains(&ticket.id));
-        let nodes_after_failure = port.engine.nodes.len();
+        let nodes_after_failure = port.engine.semantic.nodes.len();
         assert!(matches!(
             port.commit_role(&submitted, &ticket, &response, None),
             Err(PalsError::Store(StoreError::InvalidEvidence(
                 "role semantic commit was already attempted"
             )))
         ));
-        assert_eq!(port.engine.nodes.len(), nodes_after_failure);
+        assert_eq!(port.engine.semantic.nodes.len(), nodes_after_failure);
         assert_eq!(port.counters.consumed_role_outputs, 0);
     }
 
@@ -810,7 +892,7 @@ mod tests {
         let repaired_node = port.replay_node(&repaired).unwrap();
         let counter_node = port.replay_node(&counter).unwrap();
         let questions = port.next_question;
-        let leases = port.engine.stores.review_pin_count().unwrap();
+        let leases = port.engine.semantic.stores.review_pin_count().unwrap();
         let blueprint = port
             .blueprint_fresh_pair(
                 &submitted.input.question,
@@ -822,7 +904,10 @@ mod tests {
             .unwrap();
         assert!(port.fresh_pending.is_empty());
         assert_eq!(port.next_question, questions);
-        assert_eq!(port.engine.stores.review_pin_count().unwrap(), leases);
+        assert_eq!(
+            port.engine.semantic.stores.review_pin_count().unwrap(),
+            leases
+        );
         let step = AdaptivePortStep {
             evidence: ContractDigest([1; 32]),
             transition: AdaptivePortTransition::Continue(blueprint),
@@ -873,7 +958,7 @@ mod tests {
         port.engine
             .enable_archive(ArchiveConfig::new(root.clone(), repository))
             .unwrap();
-        let position = port.engine.nodes[port.root].position.clone();
+        let position = port.engine.semantic.nodes[port.root].position.clone();
         port.engine
             .prepare_archive_root(&position, port.limits.deadline, &AtomicBool::new(false))
             .unwrap();
@@ -884,9 +969,10 @@ mod tests {
             .unwrap();
         port.role_consumed(&ticket, &submitted.input.view).unwrap();
         drop(submitted);
-        assert_eq!(port.engine.stores.review_pin_count().unwrap(), 0);
+        assert_eq!(port.engine.semantic.stores.review_pin_count().unwrap(), 0);
         let inactive = port
             .engine
+            .semantic
             .stores
             .insert_situation(
                 Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 100")
@@ -894,7 +980,14 @@ mod tests {
                     .snapshot(),
             )
             .unwrap();
-        let state = port.engine.stores.situations.get(inactive).unwrap().state;
+        let state = port
+            .engine
+            .semantic
+            .stores
+            .situations
+            .get(inactive)
+            .unwrap()
+            .state;
         let authority = port.authority;
         let deadline = port.limits.deadline;
         let allowance = port.archive_remaining_io();
@@ -926,7 +1019,7 @@ mod tests {
             panic!("port owner kind")
         };
         assert!(matches!(
-            port.engine.stores.states.get(state),
+            port.engine.semantic.stores.states.get(state),
             Err(StoreError::ColdRecord(_))
         ));
         assert!(matches!(

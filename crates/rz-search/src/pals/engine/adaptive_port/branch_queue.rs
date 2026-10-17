@@ -189,6 +189,25 @@ pub(super) struct PendingCounter {
     source: Option<ObservationId>,
     repair_direct: bool,
 }
+#[cfg(test)]
+impl PendingCounter {
+    /// Authored queue metadata only; this grants no accepted observation.
+    pub(super) fn authored_without_observation_for_test(
+        first: BoardMove,
+        proposal: Vec<BoardMove>,
+        counter: Vec<BoardMove>,
+        attack: usize,
+    ) -> Self {
+        Self {
+            first,
+            proposal,
+            counter,
+            attack,
+            source: None,
+            repair_direct: false,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub enum AdaptiveBranchOutcome {
     Complete(FrameCompletionScope),
@@ -239,8 +258,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        if !self.engine.records.iter().any(|record| {
-            record.origin_state == self.engine.nodes[self.root].state
+        if !self.engine.semantic.records.iter().any(|record| {
+            record.origin_state == self.engine.semantic.nodes[self.root].state
                 && record.kind == RecordKind::Repair
                 && record.line == repaired
         }) {
@@ -456,16 +475,28 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        let mut checked = self.engine.nodes[self.root].position.clone();
-        for movement in &pending.counter {
-            checked.make_move(*movement)?;
+        if self.rovent_frontier().is_some() {
+            // A queued alternative has not been selected for examination yet.
+            // Reserve/check its Rules path without publishing hot graph edges;
+            // begin_counter adopts those snapshots at the actual selection.
+            if self
+                .existing_checked_frontier_line(&pending.counter)?
+                .is_none()
+            {
+                self.checked_frontier_line(&pending.counter)?;
+            }
+        } else {
+            let mut checked = self.engine.semantic.nodes[self.root].position.clone();
+            for movement in &pending.counter {
+                checked.make_move(*movement)?;
+            }
         }
         let mut hash = Sha256::new();
         hash.update(b"rz-pals-pending-counter/1\0");
         hash.update(self.authority.epoch.0.to_le_bytes());
         hash.update(self.authority.game.0.to_le_bytes());
         hash.update(self.authority.root.0.to_le_bytes());
-        hash.update(self.engine.revision.to_le_bytes());
+        hash.update(self.engine.semantic.revision.to_le_bytes());
         hash.update(role_line_sha256(b"proposal", &pending.proposal)?);
         hash.update(role_line_sha256(b"counter", &pending.counter)?);
         hash.update([u8::from(pending.repair_direct)]);
@@ -525,7 +556,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             );
         }
         let done = pending.counter.len() >= self.engine.config.line_plies
-            || self.engine.nodes[node].terminal.is_some();
+            || self.engine.semantic.nodes[node].terminal.is_some();
         let stage = if done {
             self.record_hot(RecordKind::Counterexample, &pending.counter, pending.source)?;
             self.counters.refutations += 1;
@@ -662,11 +693,21 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .zip(&counter)
             .position(|(a, b)| a != b)
             .ok_or(RoleError::InvalidOutput)?;
-        let mut position = self.engine.nodes[self.root].position.clone();
-        for movement in &proposal[..attack] {
-            position.make_move(*movement)?;
-        }
-        if position.side_to_move() == self.engine.nodes[self.root].position.side_to_move() {
+        let position = if self.rovent_frontier().is_some() {
+            let node = self.replay_node(&proposal[..attack])?;
+            self.engine.semantic.nodes[node].position.clone()
+        } else {
+            let mut position = self.engine.semantic.nodes[self.root].position.clone();
+            for movement in &proposal[..attack] {
+                position.make_move(*movement)?;
+            }
+            position
+        };
+        if position.side_to_move()
+            == self.engine.semantic.nodes[self.root]
+                .position
+                .side_to_move()
+        {
             return Err(RoleError::InvalidOutput.into());
         }
         self.enqueue_counter(PendingCounter {

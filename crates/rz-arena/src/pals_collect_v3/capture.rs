@@ -197,6 +197,34 @@ pub fn capture_submitted_review_v3(
     input: &PalsVirtualReviewInput,
     context: &GenerationCaptureContextV3,
 ) -> Result<GenerationInputV3, ArenaError> {
+    let mut captured = capture_submitted_review_common_fields(ticket, view, input, context)?;
+    captured.divergence_record_ids = view
+        .query()
+        .divergences
+        .iter()
+        .map(|slot| {
+            captured
+                .selected_view
+                .records
+                .get(*slot)
+                .filter(|r| r.kind == GenerationRecordKindV3::Counter)
+                .map(|r| r.record_id.clone())
+                .ok_or_else(|| invalid("submitted divergence index absent/noncounter"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    captured.validate()?;
+    Ok(captured)
+}
+
+/// 공통 실제 Rules/query/tensor capture 계산이다. 이 중간 projection은
+/// legacy V3나 새 Rovent 입력으로 발행하지 않는다. 각 명시 wrapper가 자기
+/// divergence 의미를 추가하고 전체 형식 검증을 완료해야 한다.
+pub(crate) fn capture_submitted_review_common_fields(
+    ticket: &RoleTicketEnvelope,
+    view: &ReviewView,
+    input: &PalsVirtualReviewInput,
+    context: &GenerationCaptureContextV3,
+) -> Result<GenerationInputV3, ArenaError> {
     use sha2::{Digest, Sha256};
     use std::hash::{Hash, Hasher};
     check(
@@ -396,19 +424,6 @@ pub fn capture_submitted_review_v3(
         .snapshot()
         .repetition_identity()
         .hash(&mut transposition);
-    let divergence_record_ids = view
-        .query()
-        .divergences
-        .iter()
-        .map(|slot| {
-            selected_view
-                .records
-                .get(*slot)
-                .filter(|r| r.kind == GenerationRecordKindV3::Counter)
-                .map(|r| r.record_id.clone())
-                .ok_or_else(|| invalid("submitted divergence index absent/noncounter"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let (worker_id, job_id, slice_id) = context.work_scope.identifiers(ticket)?;
     let captured = GenerationInputV3 {
         game_id: context.game_id.clone(),
@@ -430,9 +445,8 @@ pub fn capture_submitted_review_v3(
         legal_moves: input.candidates.iter().map(component_bits).collect(),
         action_support_mask: context.action_support.for_ticket(ticket)?,
         encoded_model_input: virtual_review_json_v3(input)?,
-        divergence_record_ids,
+        divergence_record_ids: Vec::new(),
     };
-    captured.validate()?;
     Ok(captured)
 }
 

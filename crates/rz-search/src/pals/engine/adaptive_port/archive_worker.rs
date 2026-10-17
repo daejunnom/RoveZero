@@ -3,10 +3,15 @@
 //! Commands and completion notifications each have one slot. Cancellation is
 //! separate from that queue; a timed-out owner is quarantined, never recycled.
 
+use super::profiled_retirement_archive::{
+    MAX_PROFILED_RETIREMENT_IO_BYTES, ProfiledRetirementCommit, RegisteredProfiledRetirementSink,
+};
 use super::{AdaptiveEnginePort, PalsEngine, PalsError, RoleModel};
+use super::{ProfiledExternalRetirementIdentity, ProfiledExternalRootRetirement};
 use crate::pals::store::{
     ArchiveIoBudget, ArchiveOwnerSnapshot, ArchiveStats, ForeignAppendPermit, ForeignGoIssuedProof,
-    Observation, SituationId, StoreError, StorePins, StoreReadOwner,
+    Observation, ProfiledForeignAppendPermit, ProfiledForeignGoIssuedProof, SituationId,
+    StoreError, StorePins, StoreReadOwner,
 };
 use rz_contracts::pals::SearchAuthority;
 use rz_position::Position;
@@ -61,6 +66,17 @@ pub enum ArchiveOperation {
         observation: Observation,
         issued: ForeignGoIssuedProof,
     },
+    /// Separate profiled query namespace; no legacy job or completed-depth
+    /// evidence is manufactured when the original go omitted a limit.
+    PrepareProfiledForeign {
+        observation: Observation,
+        issued: ProfiledForeignGoIssuedProof,
+    },
+    /// Persist one original drained root without releasing its source/view
+    /// owners. Only the dedicated install may return this move-only payload.
+    PersistProfiledRetirement {
+        payload: PersistProfiledRetirementWork,
+    },
     /// Official lifecycle reset on the exclusive worker. This also supports an
     /// explicitly declared archive-off profile; it never changes archive mode.
     NewGame { next_authority: SearchAuthority },
@@ -72,6 +88,8 @@ pub enum ArchiveOperationKind {
     ReclaimHot,
     PrepareForeign,
     NewGame,
+    PrepareProfiledForeign,
+    PersistProfiledRetirement,
 }
 impl ArchiveOperation {
     fn kind(&self) -> ArchiveOperationKind {
@@ -80,6 +98,10 @@ impl ArchiveOperation {
             Self::LoadRoot { .. } => ArchiveOperationKind::LoadRoot,
             Self::ReclaimHot { .. } => ArchiveOperationKind::ReclaimHot,
             Self::PrepareForeign { .. } => ArchiveOperationKind::PrepareForeign,
+            Self::PrepareProfiledForeign { .. } => ArchiveOperationKind::PrepareProfiledForeign,
+            Self::PersistProfiledRetirement { .. } => {
+                ArchiveOperationKind::PersistProfiledRetirement
+            }
             Self::NewGame { .. } => ArchiveOperationKind::NewGame,
         }
     }
@@ -88,6 +110,44 @@ pub struct ArchiveWork {
     pub operation: ArchiveOperation,
     pub deadline: Instant,
     pub max_io_bytes: u64,
+}
+
+/// The exact source recovery and sink stay together before execution, during
+/// an unwind and after physical completion. A commit never replaces them.
+pub struct PersistProfiledRetirementWork {
+    retirement: ProfiledExternalRootRetirement,
+    sink: RegisteredProfiledRetirementSink,
+    commit: Option<ProfiledRetirementCommit>,
+}
+impl PersistProfiledRetirementWork {
+    pub fn new(
+        retirement: ProfiledExternalRootRetirement,
+        sink: RegisteredProfiledRetirementSink,
+    ) -> Self {
+        Self {
+            retirement,
+            sink,
+            commit: None,
+        }
+    }
+    pub fn retirement(&self) -> &ProfiledExternalRootRetirement {
+        &self.retirement
+    }
+    pub fn sink(&self) -> &RegisteredProfiledRetirementSink {
+        &self.sink
+    }
+    pub fn commit(&self) -> Option<&ProfiledRetirementCommit> {
+        self.commit.as_ref()
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        ProfiledExternalRootRetirement,
+        RegisteredProfiledRetirementSink,
+        Option<ProfiledRetirementCommit>,
+    ) {
+        (self.retirement, self.sink, self.commit)
+    }
 }
 
 /// A small source-only change stamp for the manager's no-progress latch. It
@@ -115,7 +175,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     pub fn archive_maintenance_proposal(
         &self,
     ) -> Result<Option<ArchiveMaintenanceProposal>, PalsError> {
-        if !self.engine.archive_enabled() || !self.engine.stores.archive_pressure() {
+        if !self.engine.archive_enabled() || !self.engine.semantic.stores.archive_pressure() {
             return Ok(None);
         }
         self.engine.ensure_archive_admission_open()?;
@@ -126,9 +186,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if max_io_bytes == 0 {
             return Err(StoreError::ArchiveByteBudget.into());
         }
-        let stores = &self.engine.stores;
+        let stores = &self.engine.semantic.stores;
         let root = self
             .engine
+            .semantic
             .nodes
             .get(self.root)
             .ok_or(StoreError::InvalidHandle("adaptive archive root"))?;
@@ -140,6 +201,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         pins.states.insert(root.state);
         pins.situations.insert(root.situation);
         pins.lines.insert(situation.focus);
+        merge_pins(&mut pins, &self.goal_local_protected_pins()?);
+        merge_pins(&mut pins, &self.profiled_external_protected_pins()?);
         for admission in self.cpu_admissions.values() {
             if let Some(execution) = admission.execution {
                 pins.executions.insert(execution);
@@ -153,7 +216,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             deadline: self.limits.deadline,
             stamp: ArchiveMaintenanceStamp {
                 store_generation: stores.generation(),
-                public_revision: self.engine.revision,
+                public_revision: self.engine.semantic.revision,
                 hot: stores.hot_stats(),
             },
         }))
@@ -178,6 +241,7 @@ pub struct ArchiveShutdownReceipt {
 /// Rejection does not consume ownership; it returns the exact submitted value.
 pub struct ArchiveRejected<M: RoleModel> {
     pub owner: ArchiveOwner<M>,
+    pub work: ArchiveWork,
     pub error: PalsError,
 }
 /// A transfer is opaque and belongs to one worker. Cancel remains reachable
@@ -207,6 +271,8 @@ struct ArchiveSeal {
     record_revisions: Vec<u64>,
     review_pins: StorePins,
     active_cpu_pins: StorePins,
+    profiled_retirement_pins: StorePins,
+    profiled_retirement_identity: Option<ProfiledExternalRetirementIdentity>,
     archive_owner: Option<ArchiveOwnerSnapshot>,
     registry_owner: Weak<()>,
     next_game: Option<SearchAuthority>,
@@ -243,13 +309,31 @@ pub struct ArchiveQuarantine<M: RoleModel> {
     pub receipt: ArchiveWorkReceipt,
     owner: ArchiveOwner<M>,
     foreign_permit: Option<ForeignAppendPermit>,
+    profiled_foreign_permit: Option<ProfiledForeignAppendPermit>,
+    profiled_retirement: Option<PersistProfiledRetirementWork>,
 }
 impl<M: RoleModel> ArchiveQuarantine<M> {
     pub fn retains_foreign_permit(&self) -> bool {
         self.foreign_permit.is_some()
     }
-    pub fn into_owner_for_shutdown(self) -> ArchiveOwner<M> {
-        self.owner
+    pub fn retains_profiled_foreign_permit(&self) -> bool {
+        self.profiled_foreign_permit.is_some()
+    }
+    pub fn profiled_retirement(&self) -> Option<&PersistProfiledRetirementWork> {
+        self.profiled_retirement.as_ref()
+    }
+    pub fn retains_profiled_retirement(&self) -> bool {
+        self.profiled_retirement.is_some()
+    }
+    /// A retirement has its own failed descriptors, pins and possible commit.
+    /// Owner-only teardown cannot silently discard those original resources.
+    #[allow(clippy::result_large_err)]
+    pub fn into_owner_for_shutdown(self) -> Result<ArchiveOwner<M>, Self> {
+        if self.profiled_retirement.is_some() {
+            Err(self)
+        } else {
+            Ok(self.owner)
+        }
     }
 }
 
@@ -261,6 +345,8 @@ pub struct ArchiveCompletion<M: RoleModel> {
     deadline: Instant,
     cancel: Arc<AtomicBool>,
     foreign_permit: Option<ForeignAppendPermit>,
+    profiled_foreign_permit: Option<ProfiledForeignAppendPermit>,
+    profiled_retirement: Option<PersistProfiledRetirementWork>,
 }
 impl<M: RoleModel> ArchiveCompletion<M> {
     pub fn receipt(&self) -> &ArchiveWorkReceipt {
@@ -276,13 +362,28 @@ impl<M: RoleModel> ArchiveCompletion<M> {
         expected_authority: SearchAuthority,
         expected_nonce: u64,
     ) -> Result<(ArchiveOwner<M>, ArchiveWorkReceipt), ArchiveQuarantine<M>> {
-        if self.receipt.operation == ArchiveOperationKind::PrepareForeign {
+        if self.result.is_ok() && self.receipt.operation == ArchiveOperationKind::PrepareForeign {
             self.result = Err(ArchiveQuarantineReason::InvalidReturn(
                 "foreign scan requires install_with_foreign",
             ));
         }
+        if self.result.is_ok()
+            && self.receipt.operation == ArchiveOperationKind::PrepareProfiledForeign
+        {
+            self.result = Err(ArchiveQuarantineReason::InvalidReturn(
+                "profiled foreign scan requires install_with_profiled_foreign",
+            ));
+        }
+        if self.result.is_ok()
+            && (self.receipt.operation == ArchiveOperationKind::PersistProfiledRetirement
+                || self.profiled_retirement.is_some())
+        {
+            self.result = Err(ArchiveQuarantineReason::InvalidReturn(
+                "retirement persistence requires install_with_profiled_retirement",
+            ));
+        }
         self.install_checked(expected_authority, expected_nonce)
-            .map(|(owner, receipt, _)| (owner, receipt))
+            .map(|(owner, receipt, _, _, _)| (owner, receipt))
     }
     // Same by-value quarantine as install, including the one-use foreign proof.
     #[allow(clippy::result_large_err)]
@@ -292,20 +393,94 @@ impl<M: RoleModel> ArchiveCompletion<M> {
         expected_nonce: u64,
     ) -> Result<(ArchiveOwner<M>, ArchiveWorkReceipt, ForeignAppendPermit), ArchiveQuarantine<M>>
     {
-        if self.receipt.operation != ArchiveOperationKind::PrepareForeign
-            || self.foreign_permit.is_none()
+        if self.result.is_ok()
+            && (self.receipt.operation != ArchiveOperationKind::PrepareForeign
+                || self.foreign_permit.is_none()
+                || self.profiled_retirement.is_some())
         {
             self.result = Err(ArchiveQuarantineReason::InvalidReturn(
                 "foreign permit missing",
             ));
         }
         self.install_checked(expected_authority, expected_nonce)
-            .map(|(owner, receipt, permit)| {
+            .map(|(owner, receipt, permit, _, _)| {
                 (owner, receipt, permit.expect("checked foreign permit"))
             })
     }
-    // Both public install paths share this allocation-free owner rejection.
+
+    /// Only this path returns the exact profiled permit. A wrong operation,
+    /// late return or invalid owner keeps it in the original quarantine.
     #[allow(clippy::result_large_err)]
+    pub fn install_with_profiled_foreign(
+        mut self,
+        expected_authority: SearchAuthority,
+        expected_nonce: u64,
+    ) -> Result<
+        (
+            ArchiveOwner<M>,
+            ArchiveWorkReceipt,
+            ProfiledForeignAppendPermit,
+        ),
+        ArchiveQuarantine<M>,
+    > {
+        if self.result.is_ok()
+            && (self.receipt.operation != ArchiveOperationKind::PrepareProfiledForeign
+                || self.profiled_foreign_permit.is_none()
+                || self.profiled_retirement.is_some())
+        {
+            self.result = Err(ArchiveQuarantineReason::InvalidReturn(
+                "profiled foreign permit missing",
+            ));
+        }
+        self.install_checked(expected_authority, expected_nonce)
+            .map(|(owner, receipt, _, permit, _)| {
+                (
+                    owner,
+                    receipt,
+                    permit.expect("checked profiled foreign permit"),
+                )
+            })
+    }
+    /// The original retirement and sink are returned only with their actual
+    /// opaque commit. Wrong-kind, late, canceled and invalid-owner results
+    /// retain the whole payload in quarantine, including any completed commit.
+    #[allow(clippy::result_large_err)]
+    pub fn install_with_profiled_retirement(
+        mut self,
+        expected_authority: SearchAuthority,
+        expected_nonce: u64,
+    ) -> Result<
+        (
+            ArchiveOwner<M>,
+            ArchiveWorkReceipt,
+            PersistProfiledRetirementWork,
+        ),
+        ArchiveQuarantine<M>,
+    > {
+        if self.result.is_ok()
+            && (self.receipt.operation != ArchiveOperationKind::PersistProfiledRetirement
+                || self
+                    .profiled_retirement
+                    .as_ref()
+                    .is_none_or(|payload| payload.commit.is_none()))
+        {
+            self.result = Err(ArchiveQuarantineReason::InvalidReturn(
+                "profiled retirement commit missing",
+            ));
+        }
+        self.install_checked(expected_authority, expected_nonce)
+            .map(|(owner, receipt, _, _, payload)| {
+                (
+                    owner,
+                    receipt,
+                    payload.expect("checked profiled retirement payload"),
+                )
+            })
+    }
+    // All install paths share this allocation-free owner rejection.
+    #[allow(clippy::result_large_err)]
+    // Return each original owner/permit without a box or unchecked wrapper.
+    #[allow(clippy::type_complexity)]
     fn install_checked(
         self,
         expected_authority: SearchAuthority,
@@ -315,6 +490,8 @@ impl<M: RoleModel> ArchiveCompletion<M> {
             ArchiveOwner<M>,
             ArchiveWorkReceipt,
             Option<ForeignAppendPermit>,
+            Option<ProfiledForeignAppendPermit>,
+            Option<PersistProfiledRetirementWork>,
         ),
         ArchiveQuarantine<M>,
     > {
@@ -331,17 +508,53 @@ impl<M: RoleModel> ArchiveCompletion<M> {
             self.validate_return()
         });
         match checked {
-            Ok(()) => Ok((self.owner, self.receipt, self.foreign_permit)),
+            Ok(()) => Ok((
+                self.owner,
+                self.receipt,
+                self.foreign_permit,
+                self.profiled_foreign_permit,
+                self.profiled_retirement,
+            )),
             Err(reason) => Err(ArchiveQuarantine {
                 reason,
                 receipt: self.receipt,
                 owner: self.owner,
                 foreign_permit: self.foreign_permit,
+                profiled_foreign_permit: self.profiled_foreign_permit,
+                profiled_retirement: self.profiled_retirement,
             }),
         }
     }
     fn validate_return(&self) -> Result<(), ArchiveQuarantineReason> {
         let invalid = ArchiveQuarantineReason::InvalidReturn;
+        let permit_shape_matches = match self.receipt.operation {
+            ArchiveOperationKind::PrepareForeign => {
+                self.foreign_permit.is_some()
+                    && self.profiled_foreign_permit.is_none()
+                    && self.profiled_retirement.is_none()
+            }
+            ArchiveOperationKind::PrepareProfiledForeign => {
+                self.profiled_foreign_permit.is_some()
+                    && self.foreign_permit.is_none()
+                    && self.profiled_retirement.is_none()
+            }
+            ArchiveOperationKind::PersistProfiledRetirement => {
+                self.foreign_permit.is_none()
+                    && self.profiled_foreign_permit.is_none()
+                    && self
+                        .profiled_retirement
+                        .as_ref()
+                        .is_some_and(|payload| payload.commit.is_some())
+            }
+            _ => {
+                self.foreign_permit.is_none()
+                    && self.profiled_foreign_permit.is_none()
+                    && self.profiled_retirement.is_none()
+            }
+        };
+        if !permit_shape_matches {
+            return Err(invalid("archive typed permit differs from operation"));
+        }
         let engine = self.owner.engine();
         if self.receipt.operation == ArchiveOperationKind::NewGame {
             let next = self
@@ -355,18 +568,25 @@ impl<M: RoleModel> ArchiveCompletion<M> {
                     .registry_owner
                     .ptr_eq(&engine.adaptive_registry_identity())
                 || engine.adaptive_new_game_scope() != Some(next)
-                || engine.game_generation != Some(next.game.0)
-                || engine.stores.generation() != 0
-                || engine.stores.root().is_some()
-                || self.seal.store_owner.matches(&engine.stores)
-                || engine.stores.tasks.active_states().next().is_some()
+                || engine.semantic.game_generation != Some(next.game.0)
+                || engine.semantic.stores.generation() != 0
+                || engine.semantic.stores.root().is_some()
+                || self.seal.store_owner.matches(&engine.semantic.stores)
                 || engine
+                    .semantic
+                    .stores
+                    .tasks
+                    .active_states()
+                    .next()
+                    .is_some()
+                || engine
+                    .semantic
                     .stores
                     .review_pin_count()
                     .map_err(|error| ArchiveQuarantineReason::Operation(error.into()))?
                     != 0
-                || !engine.nodes.is_empty()
-                || !engine.records.is_empty()
+                || !engine.semantic.nodes.is_empty()
+                || !engine.semantic.records.is_empty()
             {
                 return Err(invalid("official newgame owner transition"));
             }
@@ -376,6 +596,7 @@ impl<M: RoleModel> ArchiveCompletion<M> {
             match (self.seal.archive_owner, actual) {
                 (Some(old), Some(new)) => {
                     let previous = engine
+                        .semantic
                         .archive_state
                         .previous_closed_owner
                         .ok_or_else(|| invalid("previous archive close missing"))?;
@@ -394,20 +615,20 @@ impl<M: RoleModel> ArchiveCompletion<M> {
             }
             return Ok(());
         }
-        if !self.seal.store_owner.matches(&engine.stores)
-            || engine.game_generation != self.seal.game_generation
-            || engine.revision != self.seal.revision
+        if !self.seal.store_owner.matches(&engine.semantic.stores)
+            || engine.semantic.game_generation != self.seal.game_generation
+            || engine.semantic.revision != self.seal.revision
             || matches!(self.owner, ArchiveOwner::Port(_)) != self.seal.is_port
         {
             return Err(invalid("store owner, game or semantic revision"));
         }
-        let generation = engine.stores.generation();
+        let generation = engine.semantic.stores.generation();
         if generation != self.seal.store_generation {
             // Root preparation alone may retire the previous exact root after
             // its attested metadata commit; it does not admit the next root.
             let retired = self.receipt.operation == ArchiveOperationKind::PrepareRoot
                 && self.seal.root.is_some()
-                && engine.stores.root().is_none()
+                && engine.semantic.stores.root().is_none()
                 && self.seal.store_generation.checked_add(1) == Some(generation)
                 && engine.last_engine_archive().is_some_and(|receipt| {
                     receipt
@@ -420,42 +641,82 @@ impl<M: RoleModel> ArchiveCompletion<M> {
             if !retired {
                 return Err(invalid("store generation"));
             }
-        } else if engine.stores.root() != self.seal.root {
+        } else if engine.semantic.stores.root() != self.seal.root {
             return Err(invalid("store root"));
         }
         let actual = engine
             .archive_owner_snapshot()
-            .map_err(ArchiveQuarantineReason::Operation)?
-            .ok_or_else(|| invalid("archive owner missing"))?;
-        let expected = self
-            .seal
-            .archive_owner
-            .ok_or_else(|| invalid("submitted archive owner missing"))?;
-        if actual.owner_id != expected.owner_id
-            || actual.root_sha256 != expected.root_sha256
-            || actual.repository_sha256 != expected.repository_sha256
-            || actual.admission_closed
-        {
-            return Err(invalid("archive persistence owner"));
+            .map_err(ArchiveQuarantineReason::Operation)?;
+        let explicitly_archive_off = self.receipt.operation
+            == ArchiveOperationKind::PersistProfiledRetirement
+            && self.seal.archive_owner.is_none()
+            && actual.is_none();
+        if !explicitly_archive_off {
+            let actual = actual.ok_or_else(|| invalid("archive owner missing"))?;
+            let expected = self
+                .seal
+                .archive_owner
+                .ok_or_else(|| invalid("submitted archive owner missing"))?;
+            if actual.owner_id != expected.owner_id
+                || actual.root_sha256 != expected.root_sha256
+                || actual.repository_sha256 != expected.repository_sha256
+                || actual.admission_closed
+            {
+                return Err(invalid("archive persistence owner"));
+            }
         }
-        validate_pins(&engine.stores, &self.seal.review_pins)
+        validate_pins(&engine.semantic.stores, &self.seal.review_pins)
             .map_err(|_| invalid("submitted review pins"))?;
-        validate_pins(&engine.stores, &self.seal.active_cpu_pins)
+        validate_pins(&engine.semantic.stores, &self.seal.active_cpu_pins)
             .map_err(|_| invalid("worker CPU task pins"))?;
+        validate_pins(&engine.semantic.stores, &self.seal.profiled_retirement_pins)
+            .map_err(|_| invalid("profiled retirement pins"))?;
+        if let Some(payload) = &self.profiled_retirement {
+            let identity = self
+                .seal
+                .profiled_retirement_identity
+                .as_ref()
+                .ok_or_else(|| invalid("submitted profiled retirement identity missing"))?;
+            if !payload.retirement.matches_identity(identity)
+                || payload.retirement.authority() != self.seal.authority
+                || !matches!(self.owner, ArchiveOwner::Engine(_))
+            {
+                return Err(invalid("profiled retirement original owner"));
+            }
+            payload
+                .retirement
+                .validate_owner(&engine.semantic.stores)
+                .map_err(ArchiveQuarantineReason::Operation)?;
+            let commit = payload
+                .commit
+                .as_ref()
+                .ok_or_else(|| invalid("profiled retirement commit missing"))?;
+            payload
+                .sink
+                .validate_commit(&engine.semantic.stores, &payload.retirement, commit)
+                .map_err(ArchiveQuarantineReason::Operation)?;
+        } else if self.seal.profiled_retirement_identity.is_some() {
+            return Err(invalid("submitted profiled retirement payload missing"));
+        }
         if matches!(
             self.receipt.operation,
-            ArchiveOperationKind::ReclaimHot | ArchiveOperationKind::PrepareForeign
-        ) && (engine.nodes.len() != self.seal.node_handles.len()
+            ArchiveOperationKind::ReclaimHot
+                | ArchiveOperationKind::PrepareForeign
+                | ArchiveOperationKind::PrepareProfiledForeign
+                | ArchiveOperationKind::PersistProfiledRetirement
+        ) && (engine.semantic.nodes.len() != self.seal.node_handles.len()
             || engine
+                .semantic
                 .nodes
                 .iter()
                 .map(|node| (node.state, node.situation))
                 .ne(self.seal.node_handles.iter().copied())
-            || engine.records.iter().map(|record| record.revision).ne(self
-                .seal
-                .record_revisions
+            || engine
+                .semantic
+                .records
                 .iter()
-                .copied()))
+                .map(|record| record.revision)
+                .ne(self.seal.record_revisions.iter().copied()))
         {
             return Err(invalid("active engine topology"));
         }
@@ -550,23 +811,24 @@ impl<M: RoleModel + 'static> ArchiveWorker<M> {
         authority: SearchAuthority,
         work: ArchiveWork,
     ) -> Result<ArchiveTransfer, ArchiveRejected<M>> {
-        let reject = |owner, detail| ArchiveRejected {
+        let reject = |owner, work, detail| ArchiveRejected {
             owner,
+            work,
             error: PalsError::Store(StoreError::InvalidConditions(detail)),
         };
         if self.pending.is_some() {
-            return Err(reject(owner, "archive worker busy"));
+            return Err(reject(owner, work, "archive worker busy"));
         }
         let Some(command) = &self.command else {
-            return Err(reject(owner, "archive worker closed"));
+            return Err(reject(owner, work, "archive worker closed"));
         };
         let seal = match seal_owner(&owner, authority, &work) {
             Ok(seal) => seal,
-            Err(error) => return Err(ArchiveRejected { owner, error }),
+            Err(error) => return Err(ArchiveRejected { owner, work, error }),
         };
         let nonce = self.next_nonce;
         let Some(next) = nonce.checked_add(1) else {
-            return Err(reject(owner, "archive transfer sequence exhausted"));
+            return Err(reject(owner, work, "archive transfer sequence exhausted"));
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let message = Command {
@@ -586,10 +848,14 @@ impl<M: RoleModel + 'static> ArchiveWorker<M> {
                     cancel,
                 })
             }
-            Err(TrySendError::Full(message)) => Err(reject(message.owner, "archive command full")),
-            Err(TrySendError::Disconnected(message)) => {
-                Err(reject(message.owner, "archive worker unavailable"))
+            Err(TrySendError::Full(message)) => {
+                Err(reject(message.owner, message.work, "archive command full"))
             }
+            Err(TrySendError::Disconnected(message)) => Err(reject(
+                message.owner,
+                message.work,
+                "archive worker unavailable",
+            )),
         }
     }
     /// Nonblocking manager poll. mpsc supplies the existing bounded completion
@@ -706,18 +972,55 @@ fn seal_owner<M: RoleModel>(
     work: &ArchiveWork,
 ) -> Result<ArchiveSeal, PalsError> {
     let engine = owner.engine();
-    if engine.game_generation != Some(authority.game.0)
-        || engine.stores.generation() != authority.root.0
+    let is_profiled_retirement = matches!(
+        &work.operation,
+        ArchiveOperation::PersistProfiledRetirement { .. }
+    );
+    if engine.semantic.game_generation != Some(authority.game.0)
+        || engine.semantic.stores.generation() != authority.root.0
     {
         return Err(StoreError::StaleConsumer.into());
     }
-    if work.max_io_bytes == 0 || work.max_io_bytes > MAX_IO_BYTES {
+    let allowance_ceiling = if is_profiled_retirement {
+        MAX_PROFILED_RETIREMENT_IO_BYTES
+    } else {
+        MAX_IO_BYTES
+    };
+    if work.max_io_bytes == 0 || work.max_io_bytes > allowance_ceiling {
         return Err(StoreError::InvalidConditions("archive worker I/O allowance").into());
     }
     if Instant::now() >= work.deadline {
         return Err(StoreError::ArchiveDeadline.into());
     }
+    let mut profiled_retirement_pins = StorePins::default();
+    let mut profiled_retirement_identity = None;
+    if let ArchiveOperation::PersistProfiledRetirement { payload } = &work.operation {
+        if !matches!(owner, ArchiveOwner::Engine(_)) || payload.commit.is_some() {
+            return Err(StoreError::InvalidConditions(
+                "profiled retirement requires untouched payload and exclusive Engine owner",
+            )
+            .into());
+        }
+        payload.sink.validate_owner(
+            &engine.semantic.stores,
+            &payload.retirement,
+            authority,
+            work.deadline,
+            work.max_io_bytes,
+        )?;
+        merge_pins(
+            &mut profiled_retirement_pins,
+            payload.retirement.protected_pins()?,
+        );
+        validate_pins(&engine.semantic.stores, &profiled_retirement_pins)?;
+        profiled_retirement_identity = Some(payload.retirement.identity());
+    }
     if let ArchiveOperation::PrepareForeign { issued, .. } = &work.operation {
+        if work.deadline > issued.retain_until() {
+            return Err(StoreError::ArchiveDeadline.into());
+        }
+    }
+    if let ArchiveOperation::PrepareProfiledForeign { issued, .. } = &work.operation {
         if work.deadline > issued.retain_until() {
             return Err(StoreError::ArchiveDeadline.into());
         }
@@ -728,7 +1031,9 @@ fn seal_owner<M: RoleModel>(
         }
         if !matches!(
             work.operation,
-            ArchiveOperation::ReclaimHot { .. } | ArchiveOperation::PrepareForeign { .. }
+            ArchiveOperation::ReclaimHot { .. }
+                | ArchiveOperation::PrepareForeign { .. }
+                | ArchiveOperation::PrepareProfiledForeign { .. }
         ) {
             return Err(
                 StoreError::InvalidConditions("active port cannot compact engine nodes").into(),
@@ -751,7 +1056,13 @@ fn seal_owner<M: RoleModel>(
         ArchiveOperation::PrepareRoot { .. }
             | ArchiveOperation::LoadRoot { .. }
             | ArchiveOperation::NewGame { .. }
-    ) && engine.stores.tasks.active_states().next().is_some()
+    ) && engine
+        .semantic
+        .stores
+        .tasks
+        .active_states()
+        .next()
+        .is_some()
     {
         return Err(
             StoreError::InvalidConditions("root maintenance requires drained CPU tasks").into(),
@@ -759,7 +1070,8 @@ fn seal_owner<M: RoleModel>(
     }
     engine.ensure_archive_admission_open()?;
     let archive_owner = engine.archive_owner_snapshot()?;
-    if !matches!(work.operation, ArchiveOperation::NewGame { .. })
+    if !is_profiled_retirement
+        && !matches!(work.operation, ArchiveOperation::NewGame { .. })
         && (archive_owner.is_none() || !engine.archive_enabled())
     {
         return Err(StoreError::ArchiveDisabled.into());
@@ -776,39 +1088,48 @@ fn seal_owner<M: RoleModel>(
         None
     };
     if let ArchiveOperation::ReclaimHot { incoming_pins } = &work.operation {
-        validate_pins(&engine.stores, incoming_pins)?;
+        validate_pins(&engine.semantic.stores, incoming_pins)?;
     }
     let mut active_cpu_pins = StorePins::default();
     if let ArchiveOwner::Port(port) = owner {
+        merge_pins(&mut active_cpu_pins, &port.goal_local_protected_pins()?);
+        merge_pins(
+            &mut active_cpu_pins,
+            &port.profiled_external_protected_pins()?,
+        );
         for admission in port.cpu_admissions.values() {
             active_cpu_pins.executions.extend(admission.execution);
             if let Some(execution) = admission.execution {
                 active_cpu_pins
                     .states
-                    .insert(engine.stores.tasks.get(execution)?.key.state);
+                    .insert(engine.semantic.stores.tasks.get(execution)?.key.state);
             }
         }
-        validate_pins(&engine.stores, &active_cpu_pins)?;
+        validate_pins(&engine.semantic.stores, &active_cpu_pins)?;
     }
     Ok(ArchiveSeal {
         authority,
-        store_owner: engine.stores.read_owner(),
-        store_generation: engine.stores.generation(),
-        game_generation: engine.game_generation,
-        root: engine.stores.root(),
-        revision: engine.revision,
+        store_owner: engine.semantic.stores.read_owner(),
+        store_generation: engine.semantic.stores.generation(),
+        game_generation: engine.semantic.game_generation,
+        root: engine.semantic.stores.root(),
+        revision: engine.semantic.revision,
         node_handles: engine
+            .semantic
             .nodes
             .iter()
             .map(|node| (node.state, node.situation))
             .collect(),
         record_revisions: engine
+            .semantic
             .records
             .iter()
             .map(|record| record.revision)
             .collect(),
-        review_pins: engine.stores.review_pin_union()?,
+        review_pins: engine.semantic.stores.review_pin_union()?,
         active_cpu_pins,
+        profiled_retirement_pins,
+        profiled_retirement_identity,
         archive_owner,
         registry_owner: engine.adaptive_registry_identity(),
         next_game,
@@ -853,15 +1174,25 @@ fn catch_archive_work(
 
 fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
     let began = Instant::now();
-    let before = command.owner.engine().stores.hot_stats();
+    let before = command.owner.engine().stores().hot_stats();
     let mut budget = ArchiveIoBudget {
         deadline: command.work.deadline,
         max_bytes: command.work.max_io_bytes,
     };
     let kind = command.work.operation.kind();
-    let operation = command.work.operation;
+    // Keep the original source/sink/commit outside the unwind closure. Merely
+    // moving this operation into match inside it would drop those owners on a
+    // panic or an early pre-operation cancel/deadline return.
+    let (operation, mut profiled_retirement) = match command.work.operation {
+        ArchiveOperation::PersistProfiledRetirement { payload } => (None, Some(payload)),
+        operation => (Some(operation), None),
+    };
+    let profiled_io_before = profiled_retirement
+        .as_ref()
+        .and_then(|payload| payload.sink.data_io_bytes());
     let mut loaded_root = None;
     let mut foreign_permit = None;
+    let mut profiled_foreign_permit = None;
     let result = catch_archive_work(|| {
         if command.cancel.load(Ordering::Acquire) {
             return Err(ArchiveQuarantineReason::Canceled);
@@ -870,53 +1201,102 @@ fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
             return Err(ArchiveQuarantineReason::Deadline);
         }
         let engine = command.owner.engine_mut();
-        let operation: Result<(), PalsError> = (|| match operation {
-            ArchiveOperation::PrepareRoot { position } => {
-                let result =
-                    engine.prepare_archive_root(&position, command.work.deadline, &command.cancel);
-                budget.max_bytes = engine.archive_remaining_io();
-                result
-            }
-            ArchiveOperation::LoadRoot { position } => engine
-                .load_archived_root_with_budget(&position, &mut budget)
-                .map(|root| {
-                    loaded_root = Some(root);
-                }),
-            ArchiveOperation::ReclaimHot { incoming_pins } => {
-                let mut pins = engine.resident_archive_pins()?;
-                merge_pins(&mut pins, &incoming_pins);
-                // Independent review leases are already protected by Store;
-                // adding the submission union also covers release during I/O.
-                merge_pins(&mut pins, &command.seal.review_pins);
-                merge_pins(&mut pins, &command.seal.active_cpu_pins);
-                engine.stores.set_archive_pins(pins)?;
-                let initial = budget.max_bytes;
-                let result = engine.stores.archive_inactive_with_budget(&mut budget);
-                if command.seal.is_port {
-                    engine.charge_engine_archive_io(initial.saturating_sub(budget.max_bytes))?;
+        let operation: Result<(), PalsError> = if let Some(payload) = profiled_retirement.as_mut() {
+            // persist borrows the move-only owners and returns the actual ACK.
+            // Save that ACK before any post-operation cancellation checks.
+            payload
+                .sink
+                .persist(
+                    &engine.semantic.stores,
+                    &payload.retirement,
+                    &mut budget,
+                    &command.cancel,
+                )
+                .map(|commit| payload.commit = Some(commit))
+        } else {
+            (|| match operation {
+                None | Some(ArchiveOperation::PersistProfiledRetirement { .. }) => {
+                    Err(StoreError::InvalidConditions("archive operation payload shape").into())
                 }
-                result?;
-                Ok(())
-            }
-            ArchiveOperation::PrepareForeign {
-                observation,
-                issued,
-            } => {
-                let initial = budget.max_bytes;
-                let prepared =
-                    engine
+                Some(ArchiveOperation::PrepareRoot { position }) => {
+                    let result = engine.prepare_archive_root(
+                        &position,
+                        command.work.deadline,
+                        &command.cancel,
+                    );
+                    budget.max_bytes = engine.archive_remaining_io();
+                    result
+                }
+                Some(ArchiveOperation::LoadRoot { position }) => engine
+                    .load_archived_root_with_budget(&position, &mut budget)
+                    .map(|root| {
+                        loaded_root = Some(root);
+                    }),
+                Some(ArchiveOperation::ReclaimHot { incoming_pins }) => {
+                    let mut pins = engine.resident_archive_pins()?;
+                    merge_pins(&mut pins, &incoming_pins);
+                    // Independent review leases are already protected by Store;
+                    // adding the submission union also covers release during I/O.
+                    merge_pins(&mut pins, &command.seal.review_pins);
+                    merge_pins(&mut pins, &command.seal.active_cpu_pins);
+                    engine.semantic.stores.set_archive_pins(pins)?;
+                    let initial = budget.max_bytes;
+                    let result = engine
+                        .semantic
                         .stores
-                        .prepare_foreign_append_permit(observation, issued, &mut budget);
-                if command.seal.is_port {
-                    engine.charge_engine_archive_io(initial.saturating_sub(budget.max_bytes))?;
+                        .archive_inactive_with_budget(&mut budget);
+                    if command.seal.is_port {
+                        engine
+                            .charge_engine_archive_io(initial.saturating_sub(budget.max_bytes))?;
+                    }
+                    result?;
+                    Ok(())
                 }
-                foreign_permit = Some(prepared?);
-                Ok(())
-            }
-            ArchiveOperation::NewGame { next_authority } => {
-                engine.try_adaptive_new_game(next_authority, command.work.deadline, &command.cancel)
-            }
-        })();
+                Some(ArchiveOperation::PrepareForeign {
+                    observation,
+                    issued,
+                }) => {
+                    let initial = budget.max_bytes;
+                    let prepared = engine.semantic.stores.prepare_foreign_append_permit(
+                        observation,
+                        issued,
+                        &mut budget,
+                    );
+                    if command.seal.is_port {
+                        engine
+                            .charge_engine_archive_io(initial.saturating_sub(budget.max_bytes))?;
+                    }
+                    foreign_permit = Some(prepared?);
+                    Ok(())
+                }
+                Some(ArchiveOperation::PrepareProfiledForeign {
+                    observation,
+                    issued,
+                }) => {
+                    let initial = budget.max_bytes;
+                    let prepared = engine
+                        .semantic
+                        .stores
+                        .prepare_profiled_foreign_append_permit(observation, issued, &mut budget)
+                        .map(|permit| {
+                            // Preserve the actual scan result even if subsequent I/O
+                            // accounting fails and this owner must be quarantined.
+                            profiled_foreign_permit = Some(permit);
+                        });
+                    if command.seal.is_port {
+                        engine
+                            .charge_engine_archive_io(initial.saturating_sub(budget.max_bytes))?;
+                    }
+                    prepared?;
+                    Ok(())
+                }
+                Some(ArchiveOperation::NewGame { next_authority }) => engine.try_adaptive_new_game(
+                    next_authority,
+                    command.work.deadline,
+                    &command.cancel,
+                ),
+            })()
+        };
         operation.map_err(ArchiveQuarantineReason::Operation)?;
         if command.cancel.load(Ordering::Acquire) {
             return Err(ArchiveQuarantineReason::Canceled);
@@ -926,20 +1306,30 @@ fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
         }
         Ok(())
     });
+    if matches!(result, Err(ArchiveQuarantineReason::Panic)) {
+        if let Some(payload) = profiled_retirement.as_mut() {
+            // A panic may interrupt file/hash/sync work. Preserve its sink and
+            // descriptors without treating the remaining reservation as free.
+            payload.sink.quarantine_completion_unknown();
+            budget.max_bytes = 0;
+        }
+    }
     let engine = command.owner.engine();
     let receipt = ArchiveWorkReceipt {
         nonce: command.nonce,
         authority: command.seal.authority,
         operation: kind,
         generation_before: command.seal.store_generation,
-        generation_after: engine.stores.generation(),
+        generation_after: engine.semantic.stores.generation(),
         hot_before: before,
-        hot_after: engine.stores.hot_stats(),
+        hot_after: engine.semantic.stores.hot_stats(),
         io_bytes: if matches!(result, Err(ArchiveQuarantineReason::Panic))
             || (kind == ArchiveOperationKind::PrepareRoot && result.is_err())
             || kind == ArchiveOperationKind::NewGame
         {
             None
+        } else if let Some(payload) = &profiled_retirement {
+            profiled_io_before.and_then(|before| payload.sink.data_io_bytes()?.checked_sub(before))
         } else {
             command.work.max_io_bytes.checked_sub(budget.max_bytes)
         },
@@ -956,6 +1346,8 @@ fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
         deadline: command.work.deadline,
         cancel: command.cancel,
         foreign_permit,
+        profiled_foreign_permit,
+        profiled_retirement,
     }
 }
 
@@ -1014,7 +1406,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        engine.stores = PalsStores::new(StoreLimits {
+        engine.semantic.stores = PalsStores::new(StoreLimits {
             states: 8,
             situations: 8,
             line_chunks: 16,
@@ -1033,6 +1425,7 @@ mod tests {
                 .unwrap();
         }
         engine
+            .semantic
             .stores
             .focus_actual_moves(Position::startpos().snapshot())
             .unwrap();
@@ -1041,8 +1434,8 @@ mod tests {
     fn authority(engine: &PalsEngine<LegalOrderRoleMock>) -> SearchAuthority {
         SearchAuthority {
             epoch: ProcessEpoch(1),
-            game: GameGeneration(engine.game_generation.unwrap()),
-            root: RootGeneration(engine.stores.generation()),
+            game: GameGeneration(engine.semantic.game_generation.unwrap()),
+            root: RootGeneration(engine.semantic.stores.generation()),
             implementation: Digest([7; 32]),
         }
     }
@@ -1053,8 +1446,18 @@ mod tests {
                     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 {fullmove}"
                 ))
                 .unwrap();
-                let situation = engine.stores.insert_situation(position.snapshot()).unwrap();
-                engine.stores.situations.get(situation).unwrap().state
+                let situation = engine
+                    .semantic
+                    .stores
+                    .insert_situation(position.snapshot())
+                    .unwrap();
+                engine
+                    .semantic
+                    .stores
+                    .situations
+                    .get(situation)
+                    .unwrap()
+                    .state
             })
             .collect()
     }
@@ -1085,10 +1488,10 @@ mod tests {
     fn actual_archive_reclaim_returns_same_owner_and_preserves_submitted_pins() {
         let (mut engine, scratch) = fixture(true);
         let inactive = populate(&mut engine);
-        let original_owner = engine.stores.read_owner();
+        let original_owner = engine.semantic.stores.read_owner();
         let mut review = StorePins::default();
         review.states.insert(inactive[1]);
-        let lease = engine.stores.pin_review(review).unwrap();
+        let lease = engine.semantic.stores.pin_review(review).unwrap();
         let mut incoming = StorePins::default();
         incoming.states.insert(inactive[0]);
         let authority = authority(&engine);
@@ -1112,19 +1515,19 @@ mod tests {
         let ArchiveOwner::Engine(engine) = owner else {
             panic!("owner kind changed")
         };
-        assert!(original_owner.matches(&engine.stores));
-        assert!(lease.validates(&engine.stores));
+        assert!(original_owner.matches(&engine.semantic.stores));
+        assert!(lease.validates(&engine.semantic.stores));
         assert_eq!(receipt.generation_before, receipt.generation_after);
         assert!(receipt.io_bytes.is_some_and(|bytes| bytes > 0));
         assert!(receipt.hot_after.states < receipt.hot_before.states);
-        assert!(engine.stores.states.get(inactive[0]).is_ok());
-        assert!(engine.stores.states.get(inactive[1]).is_ok());
+        assert!(engine.semantic.stores.states.get(inactive[0]).is_ok());
+        assert!(engine.semantic.stores.states.get(inactive[1]).is_ok());
         assert!(matches!(
-            engine.stores.states.get(inactive[2]),
+            engine.semantic.stores.states.get(inactive[2]),
             Err(StoreError::ColdRecord(_))
         ));
-        assert_eq!(engine.revision, 0);
-        assert!(engine.nodes.is_empty() && engine.records.is_empty());
+        assert_eq!(engine.semantic.revision, 0);
+        assert!(engine.semantic.nodes.is_empty() && engine.semantic.records.is_empty());
         drop(lease);
         worker.finish().unwrap();
         drop(engine);
@@ -1134,7 +1537,7 @@ mod tests {
     #[test]
     fn archive_disabled_rejection_returns_original_store_without_fallback() {
         let (engine, scratch) = fixture(false);
-        let source = engine.stores.read_owner();
+        let source = engine.semantic.stores.read_owner();
         let authority = authority(&engine);
         let mut worker = ArchiveWorker::start().unwrap();
         let rejected =
@@ -1146,7 +1549,7 @@ mod tests {
             rejected.error,
             PalsError::Store(StoreError::ArchiveDisabled)
         ));
-        assert!(source.matches(&rejected.owner.engine().stores));
+        assert!(source.matches(rejected.owner.engine().stores()));
         assert!(!worker.is_busy());
         worker.finish().unwrap();
         drop(rejected);
@@ -1158,8 +1561,8 @@ mod tests {
         let (mut engine, scratch) = fixture(true);
         populate(&mut engine);
         let authority = authority(&engine);
-        let source = engine.stores.read_owner();
-        let before = engine.stores.hot_stats();
+        let source = engine.semantic.stores.read_owner();
+        let before = engine.semantic.stores.hot_stats();
         let mut worker = ArchiveWorker::start().unwrap();
         let transfer = worker
             .submit(ArchiveOwner::Engine(engine), authority, work(1))
@@ -1173,11 +1576,135 @@ mod tests {
             quarantine.reason,
             ArchiveQuarantineReason::Operation(_)
         ));
-        let owner = quarantine.into_owner_for_shutdown();
-        assert!(source.matches(&owner.engine().stores));
-        assert_eq!(owner.engine().stores.hot_stats(), before);
+        let owner = quarantine
+            .into_owner_for_shutdown()
+            .unwrap_or_else(|_| panic!("ordinary archive quarantine retained retirement payload"));
+        assert!(source.matches(owner.engine().stores()));
+        assert_eq!(owner.engine().stores().hot_stats(), before);
         worker.finish().unwrap();
         drop(owner);
+        drop(scratch);
+    }
+
+    #[test]
+    fn ordinary_archive_completion_cannot_issue_a_profiled_permit() {
+        let (mut engine, scratch) = fixture(true);
+        populate(&mut engine);
+        let authority = authority(&engine);
+        let source = engine.semantic.stores.read_owner();
+        let mut worker = ArchiveWorker::start().unwrap();
+        let transfer = worker
+            .submit(ArchiveOwner::Engine(engine), authority, work(MAX_IO_BYTES))
+            .unwrap_or_else(|_| panic!("fixture transfer rejected"));
+        let quarantine = match receive(&mut worker, &transfer)
+            .install_with_profiled_foreign(authority, transfer.nonce())
+        {
+            Err(quarantine) => quarantine,
+            Ok(_) => panic!("ordinary archive work issued a profiled permit"),
+        };
+        assert!(matches!(
+            quarantine.reason,
+            ArchiveQuarantineReason::InvalidReturn("profiled foreign permit missing")
+        ));
+        assert!(!quarantine.retains_foreign_permit());
+        assert!(!quarantine.retains_profiled_foreign_permit());
+        assert!(source.matches(quarantine.owner.engine().stores()));
+        assert_eq!(
+            quarantine.receipt.operation,
+            ArchiveOperationKind::ReclaimHot
+        );
+        worker.finish().unwrap();
+        drop(quarantine);
+        drop(scratch);
+    }
+
+    #[test]
+    fn ordinary_archive_completion_cannot_issue_a_profiled_retirement_commit() {
+        let (mut engine, scratch) = fixture(true);
+        populate(&mut engine);
+        let authority = authority(&engine);
+        let source = engine.semantic.stores.read_owner();
+        let mut worker = ArchiveWorker::start().unwrap();
+        let transfer = worker
+            .submit(ArchiveOwner::Engine(engine), authority, work(MAX_IO_BYTES))
+            .unwrap_or_else(|_| panic!("fixture transfer rejected"));
+        let quarantine = match receive(&mut worker, &transfer)
+            .install_with_profiled_retirement(authority, transfer.nonce())
+        {
+            Err(quarantine) => quarantine,
+            Ok(_) => panic!("ordinary archive work issued a profiled retirement commit"),
+        };
+        assert!(matches!(
+            quarantine.reason,
+            ArchiveQuarantineReason::InvalidReturn("profiled retirement commit missing")
+        ));
+        assert!(!quarantine.retains_profiled_retirement());
+        assert!(quarantine.profiled_retirement().is_none());
+        assert!(source.matches(quarantine.owner.engine().stores()));
+        assert_eq!(
+            quarantine.receipt.operation,
+            ArchiveOperationKind::ReclaimHot
+        );
+        worker.finish().unwrap();
+        drop(quarantine);
+        drop(scratch);
+    }
+
+    #[test]
+    fn retirement_install_preserves_the_original_archive_failure_metadata() {
+        let (mut engine, scratch) = fixture(true);
+        populate(&mut engine);
+        let authority = authority(&engine);
+        let source = engine.semantic.stores.read_owner();
+        let before = engine.semantic.stores.hot_stats();
+        let mut worker = ArchiveWorker::start().unwrap();
+        let transfer = worker
+            .submit(ArchiveOwner::Engine(engine), authority, work(1))
+            .unwrap_or_else(|_| panic!("registered small allowance rejected"));
+        let quarantine = match receive(&mut worker, &transfer)
+            .install_with_profiled_retirement(authority, transfer.nonce())
+        {
+            Err(quarantine) => quarantine,
+            Ok(_) => panic!("failed archive work issued a profiled retirement commit"),
+        };
+        assert!(matches!(
+            quarantine.reason,
+            ArchiveQuarantineReason::Operation(_)
+        ));
+        assert!(!quarantine.retains_profiled_retirement());
+        assert!(source.matches(quarantine.owner.engine().stores()));
+        assert_eq!(quarantine.owner.engine().stores().hot_stats(), before);
+        worker.finish().unwrap();
+        drop(quarantine);
+        drop(scratch);
+    }
+
+    #[test]
+    fn profiled_install_preserves_the_original_archive_failure_metadata() {
+        let (mut engine, scratch) = fixture(true);
+        populate(&mut engine);
+        let authority = authority(&engine);
+        let source = engine.semantic.stores.read_owner();
+        let before = engine.semantic.stores.hot_stats();
+        let mut worker = ArchiveWorker::start().unwrap();
+        let transfer = worker
+            .submit(ArchiveOwner::Engine(engine), authority, work(1))
+            .unwrap_or_else(|_| panic!("registered small allowance rejected"));
+        let quarantine = match receive(&mut worker, &transfer)
+            .install_with_profiled_foreign(authority, transfer.nonce())
+        {
+            Err(quarantine) => quarantine,
+            Ok(_) => panic!("failed archive work issued a profiled permit"),
+        };
+        assert!(matches!(
+            quarantine.reason,
+            ArchiveQuarantineReason::Operation(_)
+        ));
+        assert!(source.matches(quarantine.owner.engine().stores()));
+        assert_eq!(quarantine.owner.engine().stores().hot_stats(), before);
+        assert!(!quarantine.retains_profiled_foreign_permit());
+        worker.finish().unwrap();
+        drop(quarantine);
         drop(scratch);
     }
 
@@ -1186,7 +1713,7 @@ mod tests {
         let (mut engine, scratch) = fixture(true);
         populate(&mut engine);
         let authority = authority(&engine);
-        let source = engine.stores.read_owner();
+        let source = engine.semantic.stores.read_owner();
         let mut worker = ArchiveWorker::start().unwrap();
         let transfer = worker
             .submit(ArchiveOwner::Engine(engine), authority, work(MAX_IO_BYTES))
@@ -1200,8 +1727,10 @@ mod tests {
             quarantine.reason,
             ArchiveQuarantineReason::InvalidReturn("transfer authority")
         ));
-        let owner = quarantine.into_owner_for_shutdown();
-        assert!(source.matches(&owner.engine().stores));
+        let owner = quarantine
+            .into_owner_for_shutdown()
+            .unwrap_or_else(|_| panic!("ordinary archive quarantine retained retirement payload"));
+        assert!(source.matches(owner.engine().stores()));
         worker.finish().unwrap();
         drop(owner);
         drop(scratch);
@@ -1236,13 +1765,14 @@ mod tests {
     fn expired_submission_does_not_consume_owner_or_start_work() {
         let (engine, scratch) = fixture(true);
         let authority = authority(&engine);
-        let source = engine.stores.read_owner();
+        let source = engine.semantic.stores.read_owner();
         let mut worker = ArchiveWorker::start().unwrap();
+        let submitted_deadline = Instant::now();
         let rejected = match worker.submit(
             ArchiveOwner::Engine(engine),
             authority,
             ArchiveWork {
-                deadline: Instant::now(),
+                deadline: submitted_deadline,
                 ..work(MAX_IO_BYTES)
             },
         ) {
@@ -1253,7 +1783,13 @@ mod tests {
             rejected.error,
             PalsError::Store(StoreError::ArchiveDeadline)
         ));
-        assert!(source.matches(&rejected.owner.engine().stores));
+        assert!(source.matches(rejected.owner.engine().stores()));
+        assert_eq!(rejected.work.deadline, submitted_deadline);
+        assert_eq!(rejected.work.max_io_bytes, MAX_IO_BYTES);
+        assert!(matches!(
+            rejected.work.operation,
+            ArchiveOperation::ReclaimHot { .. }
+        ));
         assert!(!worker.is_busy());
         worker.finish().unwrap();
         drop(rejected);
@@ -1294,7 +1830,7 @@ mod tests {
         let (mut engine, scratch) = fixture(true);
         populate(&mut engine);
         let authority = authority(&engine);
-        let source = engine.stores.read_owner();
+        let source = engine.semantic.stores.read_owner();
         let mut worker = ArchiveWorker::start().unwrap();
         let retained = Arc::clone(&worker.orphan);
         let join = worker.join.take().unwrap();
@@ -1314,7 +1850,7 @@ mod tests {
             .unwrap()
             .take()
             .expect("actual owner retained");
-        assert!(source.matches(&completed.owner.engine().stores));
+        assert!(source.matches(completed.owner.engine().stores()));
         let quarantine = match completed.install(authority, transfer.nonce()) {
             Err(value) => value,
             Ok(_) => panic!("abandoned transfer accepted"),
@@ -1331,15 +1867,15 @@ mod tests {
     fn panic_guard_keeps_borrowed_owner_and_hot_facts() {
         let (engine, scratch) = fixture(true);
         let mut owner = ArchiveOwner::Engine(engine);
-        let source = owner.engine().stores.read_owner();
-        let before = owner.engine().stores.hot_stats();
+        let source = owner.engine().stores().read_owner();
+        let before = owner.engine().stores().hot_stats();
         let result = catch_archive_work(|| {
             let _exact_borrow = owner.engine_mut();
             panic!("bounded archive failure fixture");
         });
         assert!(matches!(result, Err(ArchiveQuarantineReason::Panic)));
-        assert!(source.matches(&owner.engine().stores));
-        assert_eq!(owner.engine().stores.hot_stats(), before);
+        assert!(source.matches(owner.engine().stores()));
+        assert_eq!(owner.engine().stores().hot_stats(), before);
         drop(owner);
         drop(scratch);
     }
@@ -1371,8 +1907,8 @@ mod tests {
     fn root_maintenance_does_not_retire_worker_owned_paused_task() {
         use crate::pals::store::{TaskAdmission, TaskConsumer, TaskKey, TaskQuestion, TaskStatus};
         let (mut engine, scratch) = fixture(true);
-        let root = engine.stores.root().unwrap();
-        let situation = engine.stores.situations.get(root).unwrap();
+        let root = engine.semantic.stores.root().unwrap();
+        let situation = engine.semantic.stores.situations.get(root).unwrap();
         let key = TaskKey {
             state: situation.state,
             line: None,
@@ -1380,9 +1916,9 @@ mod tests {
             root_moves: Vec::new(),
             model: 1,
             epoch: 0,
-            value_identity: engine.cpu_registered_value.clone(),
-            checker_identity: Some(engine.checker_registered_identity.clone()),
-            cpu_condition: Some(engine.cpu_registered_condition.clone()),
+            value_identity: engine.researcher.cpu_registered_value.clone(),
+            checker_identity: Some(engine.researcher.checker_registered_identity.clone()),
+            cpu_condition: Some(engine.researcher.cpu_registered_condition.clone()),
             profile: 1,
             condition: 1,
             input_revision: 0,
@@ -1393,14 +1929,22 @@ mod tests {
             id: 1,
             situation: root,
             revision: situation.revision,
-            generation: engine.stores.generation(),
+            generation: engine.semantic.stores.generation(),
             deadline_tick: 100_000,
         };
-        let TaskAdmission::Start(execution) = engine.stores.request_task(key, consumer, 0).unwrap()
+        let TaskAdmission::Start(execution) = engine
+            .semantic
+            .stores
+            .request_task(key, consumer, 0)
+            .unwrap()
         else {
             panic!("fixture admission")
         };
-        engine.stores.pause_task(execution, 17, None).unwrap();
+        engine
+            .semantic
+            .stores
+            .pause_task(execution, 17, None)
+            .unwrap();
         let authority = authority(&engine);
         let mut worker = ArchiveWorker::start().unwrap();
         let rejected = match worker.submit(
@@ -1426,7 +1970,7 @@ mod tests {
             rejected
                 .owner
                 .engine()
-                .stores
+                .stores()
                 .tasks
                 .get(execution)
                 .unwrap()
@@ -1465,7 +2009,7 @@ mod tests {
         let (mut engine, scratch) = fixture(true);
         populate(&mut engine);
         let authority = authority(&engine);
-        let source = engine.stores.read_owner();
+        let source = engine.semantic.stores.read_owner();
         let mut worker = ArchiveWorker::start().unwrap();
         let transfer = worker
             .submit(ArchiveOwner::Engine(engine), authority, work(MAX_IO_BYTES))
@@ -1477,8 +2021,10 @@ mod tests {
             Err(value) => value,
             Ok(_) => panic!("shutdown canceled transfer admitted"),
         };
-        let owner = quarantine.into_owner_for_shutdown();
-        assert!(source.matches(&owner.engine().stores));
+        let owner = quarantine
+            .into_owner_for_shutdown()
+            .unwrap_or_else(|_| panic!("ordinary archive quarantine retained retirement payload"));
+        assert!(source.matches(owner.engine().stores()));
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if worker.try_join().unwrap().is_some() {

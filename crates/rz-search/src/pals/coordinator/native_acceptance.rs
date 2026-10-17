@@ -12,6 +12,7 @@ use std::sync::Arc;
 pub(super) struct NativeAcceptanceSeal {
     ticket: RoleTicketEnvelope,
     output_digest: Digest,
+    reciprocal: bool,
 }
 
 /// Registry-issued, non-Clone authority to ask the exact native owner to
@@ -77,6 +78,153 @@ pub struct RejectedNativeAcceptance {
     pub receipt: NativeAcceptanceReceipt,
 }
 
+/// Successful original P/C native acceptance and registry consumption. Public
+/// RoleAcceptance descriptions and a caller boolean cannot construct this seal.
+#[derive(Debug)]
+pub struct AcceptedRoleStep {
+    ticket: RoleTicketEnvelope,
+    output_digest: Digest,
+}
+impl AcceptedRoleStep {
+    pub fn ticket(&self) -> &RoleTicketEnvelope {
+        &self.ticket
+    }
+    pub fn output_digest(&self) -> Digest {
+        self.output_digest
+    }
+    pub fn validates_output(&self, output: &RoleOutput) -> bool {
+        output.id == self.ticket.id
+            && output.authority == self.ticket.authority
+            && output.key == self.ticket.representation
+            && native_acceptance_output_digest(output).ok() == Some(self.output_digest)
+    }
+
+    /// A local accepted checkpoint is not a fictitious P->P or R->P message.
+    /// Only an actual peer envelope may populate QuestionEnvelope.parent.
+    pub fn origin(
+        &self,
+        frame: super::FrameId,
+        peer: Option<rz_contracts::rovent::QuestionEnvelope>,
+    ) -> Result<AcceptedRoleOrigin, CoordinatorError> {
+        if frame.authority != self.ticket.authority || frame.sequence == 0 {
+            return Err(CoordinatorError::IdentityMismatch("accepted source frame"));
+        }
+        if let Some(peer) = peer {
+            let recipient = match self.ticket.role {
+                Role::Proposer => rz_contracts::rovent::SearchRecipient::Proposer,
+                Role::Critic => rz_contracts::rovent::SearchRecipient::Critic,
+                Role::Validator => {
+                    return Err(CoordinatorError::InvalidTransition(
+                        "V is not a reciprocal source",
+                    ));
+                }
+            };
+            if peer.id.authority != self.ticket.authority
+                || peer.question_digest != self.ticket.question
+                || peer.view != self.ticket.view
+                || peer.recipient != recipient
+                || peer.original_deadline != self.ticket.original_deadline
+            {
+                return Err(CoordinatorError::IdentityMismatch(
+                    "actual peer source ticket/view",
+                ));
+            }
+        }
+        Ok(AcceptedRoleOrigin {
+            frame,
+            ticket: self.ticket,
+            output_digest: self.output_digest,
+            kind: peer.map_or(
+                AcceptedRoleOriginKind::LocalAccepted,
+                AcceptedRoleOriginKind::PeerQuestion,
+            ),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// A bounded value seal preserves the public Copy origin contract. Heap-backed
+// ownership would change that contract; this is not a measured memory claim.
+#[allow(clippy::large_enum_variant)]
+pub enum AcceptedRoleOriginKind {
+    LocalAccepted,
+    PeerQuestion(rz_contracts::rovent::QuestionEnvelope),
+}
+
+/// Opaque origin relation, not a peer question and not new execution credit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcceptedRoleOrigin {
+    frame: super::FrameId,
+    ticket: RoleTicketEnvelope,
+    output_digest: Digest,
+    kind: AcceptedRoleOriginKind,
+}
+impl AcceptedRoleOrigin {
+    pub fn frame(&self) -> super::FrameId {
+        self.frame
+    }
+    pub fn ticket(&self) -> &RoleTicketEnvelope {
+        &self.ticket
+    }
+    pub fn output_digest(&self) -> Digest {
+        self.output_digest
+    }
+    pub fn kind(&self) -> AcceptedRoleOriginKind {
+        self.kind
+    }
+    pub fn matches(&self, accepted: &AcceptedRoleStep) -> bool {
+        self.ticket == accepted.ticket && self.output_digest == accepted.output_digest
+    }
+    /// Invocation seal includes actual source ownership/issuance. It is kept
+    /// outside the model input and semantic deduplication digest.
+    pub fn seal_digest(&self) -> Digest {
+        let mut hash = Sha256::new();
+        hash.update(b"rz-rovent-accepted-local-origin-seal/1\0");
+        hash.update(self.frame.sequence.to_le_bytes());
+        hash.update(self.ticket.id.sequence.to_le_bytes());
+        hash.update(self.ticket.authority.epoch.0.to_le_bytes());
+        hash.update(self.ticket.authority.game.0.to_le_bytes());
+        hash.update(self.ticket.authority.root.0.to_le_bytes());
+        hash.update(self.ticket.authority.implementation.0);
+        hash.update(self.ticket.question.0);
+        hash.update(self.ticket.view.view_digest.0);
+        hash.update(self.ticket.view.view_sequence.to_le_bytes());
+        hash.update(self.output_digest.0);
+        for digest in [
+            self.ticket.representation.input,
+            self.ticket.representation.history,
+            self.ticket.representation.candidates,
+            self.ticket.representation.mask_positions,
+            self.ticket.representation.model,
+            self.ticket.representation.encoding,
+        ] {
+            hash.update(digest.0);
+        }
+        hash.update(self.ticket.representation.frozen_epoch.to_le_bytes());
+        hash.update(self.ticket.representation.record_revision.to_le_bytes());
+        hash.update([self.ticket.role as u8]);
+        match self.ticket.representation.precision {
+            rz_contracts::PrecisionProfile::Fp32 => hash.update([0]),
+            rz_contracts::PrecisionProfile::Fp16 => hash.update([1]),
+            rz_contracts::PrecisionProfile::Bf16 => hash.update([2]),
+            rz_contracts::PrecisionProfile::Quantized(profile) => {
+                hash.update([3]);
+                hash.update(profile.0);
+            }
+        }
+        hash.update(self.ticket.original_deadline.at.0.to_le_bytes());
+        match self.kind {
+            AcceptedRoleOriginKind::LocalAccepted => hash.update([0]),
+            AcceptedRoleOriginKind::PeerQuestion(peer) => {
+                hash.update([1]);
+                hash.update(peer.id.sequence.to_le_bytes());
+                hash.update(peer.question_digest.0);
+            }
+        }
+        Digest(hash.finalize().into())
+    }
+}
+
 impl<V, O> RoleTicketRegistry<V, O> {
     /// Register only the verifier emitted by the actual spawned service owner.
     /// It cannot be replaced later to make another owner's receipt succeed.
@@ -127,6 +275,7 @@ impl<V, O> RoleTicketRegistry<V, O> {
         let seal = NativeAcceptanceSeal {
             ticket: *ticket,
             output_digest,
+            reciprocal: false,
         };
         held.native_acceptance_issued = Some(seal);
         Ok(NativeAcceptancePermit { seal })
@@ -159,6 +308,7 @@ impl<V, O> RoleTicketRegistry<V, O> {
                 || !held.successful_payload
                 || held.native_acceptance_issued != Some(receipt.permit.seal)
                 || held.native_acceptance_confirmed
+                || receipt.permit.seal.reciprocal
             {
                 return Err(CoordinatorError::IdentityMismatch(
                     "original native acceptance permit/head",
@@ -168,6 +318,129 @@ impl<V, O> RoleTicketRegistry<V, O> {
             Ok(())
         })();
         check.map_err(|error| RejectedNativeAcceptance { error, receipt })
+    }
+}
+
+impl<V, O: super::ProposerRankingOutput> RoleTicketRegistry<V, O> {
+    /// Capture the actual physically completed P/C output before take_ready
+    /// transfers it. Physical-unknown payloads retain the old quarantine path.
+    #[expect(
+        clippy::result_large_err,
+        reason = "preserve original physical completion custody on rejection"
+    )]
+    pub fn complete_reciprocal_role(
+        &mut self,
+        completion: super::RoleCompletion<O>,
+    ) -> Result<(), super::RejectedRoleCompletion<O>> {
+        if completion.physical == super::PhysicalRoleCompletion::Unknown {
+            return self.complete(completion);
+        }
+        let digest = match &completion.result {
+            Ok(output) => {
+                let output = output.proposer_ranking_output();
+                if output.id != completion.ticket.id
+                    || output.authority != completion.ticket.authority
+                    || output.key != completion.ticket.representation
+                    || !matches!(completion.ticket.role, Role::Proposer | Role::Critic)
+                {
+                    return Err(super::RejectedRoleCompletion {
+                        error: CoordinatorError::IdentityMismatch("reciprocal original P/C output"),
+                        completion,
+                    });
+                }
+                match native_acceptance_output_digest(output) {
+                    Ok(digest) => Some(digest),
+                    Err(error) => return Err(super::RejectedRoleCompletion { error, completion }),
+                }
+            }
+            Err(_) => None,
+        };
+        let ticket = completion.ticket;
+        self.complete(completion)?;
+        self.match_ticket_mut(&ticket)
+            .expect("completed original ticket")
+            .reciprocal_output_digest = digest;
+        Ok(())
+    }
+}
+
+impl<V, O> RoleTicketRegistry<V, O> {
+    pub fn issue_reciprocal_native_acceptance(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<NativeAcceptancePermit, CoordinatorError> {
+        ticket.validate(clock, now, self.token_budget)?;
+        if self.native_acceptance_verifier.is_none() {
+            return Err(CoordinatorError::MissingEvidence);
+        }
+        let held = self.match_ticket_mut(ticket)?;
+        if held.phase != TicketPhase::Delivered || held.revoked || !held.successful_payload {
+            return Err(CoordinatorError::InvalidTransition(
+                "reciprocal acceptance requires original eligible delivery",
+            ));
+        }
+        if held.native_acceptance_issued.is_some() || held.native_acceptance_confirmed {
+            return Err(CoordinatorError::Duplicate);
+        }
+        let seal = NativeAcceptanceSeal {
+            ticket: *ticket,
+            output_digest: held
+                .reciprocal_output_digest
+                .ok_or(CoordinatorError::MissingEvidence)?,
+            reciprocal: true,
+        };
+        held.native_acceptance_issued = Some(seal);
+        Ok(NativeAcceptancePermit { seal })
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "retain the original owner success receipt on rejection"
+    )]
+    pub fn accept_reciprocal_native(
+        &mut self,
+        receipt: NativeAcceptanceReceipt,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<AcceptedRoleStep, RejectedNativeAcceptance> {
+        let checked = (|| {
+            let verifier = self
+                .native_acceptance_verifier
+                .as_ref()
+                .ok_or(CoordinatorError::MissingEvidence)?;
+            if !Arc::ptr_eq(&verifier.identity, &receipt.identity) {
+                return Err(CoordinatorError::IdentityMismatch(
+                    "original reciprocal native owner",
+                ));
+            }
+            let ticket = receipt.ticket();
+            ticket.validate(clock, now, self.token_budget)?;
+            let held = self.match_ticket_mut(ticket)?;
+            if held.phase != TicketPhase::Delivered
+                || held.revoked
+                || !held.successful_payload
+                || held.native_acceptance_issued != Some(receipt.permit.seal)
+                || held.native_acceptance_confirmed
+                || !receipt.permit.seal.reciprocal
+                || held.reciprocal_output_digest != Some(receipt.output_digest())
+            {
+                return Err(CoordinatorError::IdentityMismatch(
+                    "reciprocal original ticket/head/permit",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = checked {
+            return Err(RejectedNativeAcceptance { error, receipt });
+        }
+        let step = AcceptedRoleStep {
+            ticket: *receipt.ticket(),
+            output_digest: receipt.output_digest(),
+        };
+        self.retire_accepted(step.ticket.id);
+        Ok(step)
     }
 }
 
@@ -211,6 +484,37 @@ pub fn native_acceptance_output_digest(output: &RoleOutput) -> Result<Digest, Co
             }
             hash.update(b"rz-pals-accepted-validator-head/1\0");
             for value in task_logits {
+                hash.update(value.to_bits().to_le_bytes());
+            }
+        }
+        RolePayload::Counterexample {
+            candidate_logits,
+            divergence_logits,
+            wdl,
+        } if output.key.role == Role::Critic => {
+            if (candidate_logits.is_empty() && divergence_logits.is_empty())
+                || candidate_logits.len() > 256
+                || divergence_logits.len() > 256
+                || candidate_logits
+                    .iter()
+                    .chain(divergence_logits)
+                    .any(|v| !v.is_finite())
+            {
+                return Err(CoordinatorError::InvalidTransition(
+                    "native acceptance critic head",
+                ));
+            }
+            let [win, draw, loss] = wdl.probabilities();
+            Wdl::try_new(win, draw, loss, 1e-4)?;
+            hash.update(b"rz-rovent-accepted-critic-head/1\0");
+            hash.update((candidate_logits.len() as u64).to_le_bytes());
+            hash.update((divergence_logits.len() as u64).to_le_bytes());
+            for value in candidate_logits
+                .iter()
+                .copied()
+                .chain(divergence_logits.iter().copied())
+                .chain(wdl.probabilities())
+            {
                 hash.update(value.to_bits().to_le_bytes());
             }
         }

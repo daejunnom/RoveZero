@@ -16,6 +16,16 @@ mod driver;
 pub use driver::*;
 mod validator;
 pub use validator::*;
+mod utility_route;
+pub use utility_route::*;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod utility_cohort;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use utility_cohort::*;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod utility_cohort_historical;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use utility_cohort_historical::*;
 mod native_accounting;
 mod session_driver;
 pub use native_accounting::AdaptiveNativeAccountingSnapshot;
@@ -37,6 +47,10 @@ pub fn adaptive_execution_manager_source_digest() -> [u8; 32] {
         (
             "pals_adaptive/manager.rs",
             include_bytes!("pals_adaptive/manager.rs").as_slice(),
+        ),
+        (
+            "pals_adaptive/manager/reciprocal.rs",
+            include_bytes!("pals_adaptive/manager/reciprocal.rs").as_slice(),
         ),
         (
             "pals_adaptive/continuation_diagnostic.rs",

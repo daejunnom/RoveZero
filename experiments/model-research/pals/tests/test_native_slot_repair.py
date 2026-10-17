@@ -7,6 +7,8 @@ review profile; no compiler, process, Rules replay, model or training runs.
 Known is conditional fixture coverage only. The usual engine path observes
 publication at the next D, which stays not_examined. These bytes do not prove
 execution of the narrow ordinary branch/role-limit path that can be known.
+New closure-consumer cases use only static fixture text and a scoped synthetic
+review registry; no current source pin or production enrollment is changed.
 """
 import copy
 import hashlib
@@ -406,6 +408,122 @@ class SlotFixture(RepairFixture):
 
     def admit_slot(self):
         return slot_witness.admit_native_slot_repair(**self.slot_arguments())
+
+
+class NativeSlotClosureConsumerTests(unittest.TestCase):
+    def fixture(self, lane="default_disabled"):
+        from test_native_recheck_witness import SyntheticClosureBuild
+        return SyntheticClosureBuild(lane)
+
+    def review(self, fixture):
+        values = {"work_summary": b"", **fixture.raws}
+        return slot_witness._source_review(values, fixture.source)
+
+    def test_new_disabled_pair_requires_explicit_full_closure_and_keeps_metadata_detached(self):
+        from rz_pals_model import native_source_review as reviewed
+        fixture = self.fixture()
+        old_profiles = copy.deepcopy(slot_witness._SOURCE_REVIEW_PROFILES)
+        with patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", ()):
+            with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
+                self.review(fixture)
+        registered = copy.deepcopy(fixture.profile)
+        with patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", (registered,)):
+            result = self.review(fixture)
+            proof = result["reviewed_transition_closure"]
+            self.assertEqual(set(proof), {"schema", "review_id", "lane", "transition_sources", "component_pins",
+                "compiled_search_implementation_sha256", "closure_sha256", "unreviewed_manifest_files",
+                "historical_metadata_only", "execution_authorized", "original_native_authority_reissued",
+                "rules_proof_authorized", "training_target_authorized"})
+            self.assertEqual(proof["lane"], "default_disabled")
+            self.assertEqual(proof["component_pins"], fixture.profile["component_pins"])
+            self.assertEqual(result["reviewed_transition_sources"], fixture.profile["transition_sources"])
+            self.assertIs(proof["historical_metadata_only"], True)
+            for key in ("execution_authorized", "original_native_authority_reissued", "rules_proof_authorized", "training_target_authorized"):
+                self.assertIs(proof[key], False)
+            original_bytes = semantic.canonical(result)
+            proof["component_pins"][slot_witness._SOURCE_PATHS[0]]["sha256"] = "0" * 64
+            self.assertEqual(semantic.canonical(self.review(fixture)), original_bytes)
+            self.assertEqual(registered, fixture.profile)
+        self.assertEqual(slot_witness._SOURCE_REVIEW_PROFILES, old_profiles)
+
+    def test_required_helpers_compiled_fact_and_lane_cannot_be_replaced_or_omitted(self):
+        from rz_pals_model import native_source_review as reviewed
+        helper = "crates/rz-search/src/pals/engine/semantic_state.rs"
+        for change in ("replacement", "missing_helper", "profile_omission", "compiled_mismatch", "compiled_missing", "wrong_lane"):
+            fixture = self.fixture()
+            registered = copy.deepcopy(fixture.profile)
+            if change == "replacement":
+                next(row for row in fixture.manifest["files"] if row["path"] == helper).update(semantic.byte_pin(b"changed helper fixture\n"))
+            elif change == "missing_helper":
+                fixture.manifest["files"] = [row for row in fixture.manifest["files"] if row["path"] != helper]
+            elif change == "profile_omission":
+                del registered["component_pins"][helper]
+                registered["closure_sha256"] = semantic.digest("rz-pals-native-reviewed-transition-closure/1", registered["component_pins"])
+            elif change == "compiled_mismatch":
+                fixture.source["native"]["search_implementation_sha256"] = "e" * 64
+            elif change == "compiled_missing":
+                del fixture.source["native"]["search_implementation_sha256"]
+            else:
+                registered["lane"] = "legacy_single_reply"
+            fixture.reseal()
+            boundary = {"replacement": "helper closure differs", "missing_helper": "helper closure differs",
+                "profile_omission": "omits a required source helper", "compiled_mismatch": "compiled search closure differs",
+                "compiled_missing": "original_compiled_search_closure_fact_missing", "wrong_lane": "unreviewed_collector_transition_source_pair"}[change]
+            with self.subTest(change=change), patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", (registered,)):
+                error_type = slot_witness._Unsupported if change in ("compiled_missing", "wrong_lane") else ValueError
+                with self.assertRaisesRegex(error_type, boundary):
+                    self.review(fixture)
+
+    def test_actual_build_binary_and_source_binding_fail_before_closure_lookup(self):
+        from rz_pals_model import native_source_review as reviewed
+        for change in ("exit", "verified", "binary", "unbound_component"):
+            fixture = self.fixture()
+            if change == "exit":
+                fixture.build["actual_build_exit_code"] = False
+            elif change == "verified":
+                fixture.build["source_verified_before_and_after_build"] = False
+            elif change == "binary":
+                fixture.build["binary"]["sha256"] = "e" * 64
+            else:
+                fixture.raws["engine_source"] += b"// absent from original manifest\n"
+            fixture.reseal()
+            boundary = "actual transition source bytes absent" if change == "unbound_component" else (
+                "build binary differs" if change == "binary" else "successful pre/post collector build observation")
+            with self.subTest(change=change), patch.object(reviewed, "review_transition_sources",
+                    side_effect=AssertionError("closure lookup cannot mask original build failure")) as lookup:
+                with self.assertRaisesRegex(ValueError, boundary):
+                    self.review(fixture)
+                lookup.assert_not_called()
+
+    def test_new_closure_does_not_allow_active_policy_or_a_one_component_hybrid(self):
+        from rz_pals_model import native_source_review as reviewed
+        for name, path in zip(("engine_source", "native_source"), slot_witness._SOURCE_PATHS):
+            fixture = self.fixture()
+            fixture.raws[name] += b"// separately bound successor fixture\n"
+            next(row for row in fixture.manifest["files"] if row["path"] == path).update(semantic.byte_pin(fixture.raws[name]))
+            fixture.reseal()
+            with self.subTest(component=name), patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", (copy.deepcopy(fixture.profile),)):
+                with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
+                    self.review(fixture)
+        for owner in ("source", "native", "search_configuration", "independent_registry"):
+            fixture = self.fixture()
+            target = fixture.source if owner == "source" else fixture.source["native"] if owner == "native" else fixture.source["native"].setdefault(owner, {})
+            target["pals_search_policy"] = "same_repaired_line_once_v1"
+            with self.subTest(owner=owner), patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", (copy.deepcopy(fixture.profile),)):
+                with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_refinement_policy"):
+                    self.review(fixture)
+
+    def test_historical_literal_lookup_keeps_old_bytes_without_closure_enrollment(self):
+        from rz_pals_model import native_source_review as reviewed
+        expected = dict(zip(slot_witness._SOURCE_PATHS, (
+            {"bytes": 260542, "sha256": "4469f9d8721264c2053380fd8900ef00b23602d42220adb99b8199cef8b62afb"},
+            {"bytes": 73365, "sha256": "564d2b29d873df1c7b0424bfcee0b52a8f314cbfd88fa68ef35f4fda99a600d5"})))
+        before = semantic.canonical(expected)
+        with patch.object(reviewed, "review_transition_sources", side_effect=AssertionError("historical lookup stays independent")) as lookup:
+            retained = slot_witness._reviewed_source_pair(expected)
+            retained[slot_witness._SOURCE_PATHS[0]]["sha256"] = "0" * 64
+            self.assertEqual(semantic.canonical(slot_witness._reviewed_source_pair(expected)), before)
+            lookup.assert_not_called()
 
 
 class NativeSlotRepairTests(unittest.TestCase):

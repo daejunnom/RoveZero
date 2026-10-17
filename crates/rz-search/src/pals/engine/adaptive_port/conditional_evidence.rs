@@ -15,7 +15,7 @@ pub(super) struct SupportedCounter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use rz_contracts::{ClockDomain, GameGeneration, MonotonicTick, ProcessEpoch, RootGeneration};
 
@@ -28,7 +28,7 @@ mod tests {
             .collect()
     }
 
-    fn port(position: Position) -> Port {
+    pub(in crate::pals::engine::adaptive_port) fn port(position: Position) -> Port {
         port_with_line_plies(position, 4)
     }
 
@@ -82,7 +82,12 @@ mod tests {
 
     // Contract fixtures below fabricate no physical search claims. They seal
     // checked hot task/observation inputs to exercise the semantic consumer.
-    fn accepted_raw(port: &mut Port, moves: &[BoardMove], score: i32, depth: u16) -> ObservationId {
+    pub(in crate::pals::engine::adaptive_port) fn accepted_raw(
+        port: &mut Port,
+        moves: &[BoardMove],
+        score: i32,
+        depth: u16,
+    ) -> ObservationId {
         raw_fixture(port, moves, score, depth, false)
     }
 
@@ -94,9 +99,9 @@ mod tests {
         paused: bool,
     ) -> ObservationId {
         let node = port.replay_node(moves).unwrap();
-        let state = port.engine.nodes[node].state;
-        let situation = port.engine.nodes[node].situation;
-        let identity = port.engine.cpu_registered_value.clone().unwrap();
+        let state = port.engine.semantic.nodes[node].state;
+        let situation = port.engine.semantic.nodes[node].situation;
+        let identity = port.engine.researcher.cpu_registered_value.clone().unwrap();
         let descriptor = port.engine.owned_descriptor().unwrap();
         let profile = stable_id(descriptor.config.profile.identity());
         let condition = stable_id(&format!(
@@ -119,22 +124,24 @@ mod tests {
             requested_depth: port.limits.cpu_depth,
             node_budget: 100,
         };
-        port.engine.consumer_id += 1;
+        port.engine.semantic.consumer_id += 1;
         let consumer = TaskConsumer {
-            id: port.engine.consumer_id,
+            id: port.engine.semantic.consumer_id,
             situation,
             revision: port
                 .engine
+                .semantic
                 .stores
                 .situations
                 .get(situation)
                 .unwrap()
                 .revision,
-            generation: port.engine.stores.generation(),
+            generation: port.engine.semantic.stores.generation(),
             deadline_tick: 100,
         };
         let TaskAdmission::Start(execution) = port
             .engine
+            .semantic
             .stores
             .hot_request_task(key.clone(), consumer, 0)
             .unwrap()
@@ -143,6 +150,7 @@ mod tests {
         };
         let observation = port
             .engine
+            .semantic
             .stores
             .hot_append_observation(Observation {
                 state,
@@ -164,7 +172,7 @@ mod tests {
                 },
                 score: RawScore::Cpu {
                     value: score,
-                    perspective: port.engine.nodes[node].position.side_to_move(),
+                    perspective: port.engine.semantic.nodes[node].position.side_to_move(),
                     bound: BoundKind::ExactWithinSearch,
                 },
                 budget: 1,
@@ -175,25 +183,29 @@ mod tests {
             .unwrap();
         if paused {
             port.engine
+                .semantic
                 .stores
                 .pause_task(execution, 7, Some(observation))
                 .unwrap();
         } else {
             port.engine
+                .semantic
                 .stores
                 .complete_task(execution, observation)
                 .unwrap();
             port.engine
+                .semantic
                 .stores
                 .consume_task(execution, consumer.id, 0)
                 .unwrap();
         }
-        port.engine.nodes[node].evidence = Some(CpuEvidence {
+        port.engine.semantic.nodes[node].evidence = Some(CpuEvidence {
             score,
             depth,
             scope: CpuScoreScope::CompletedIteration,
             value_identity: identity,
             provenance: Some((observation, execution)),
+            context: None,
         });
         observation
     }
@@ -254,8 +266,8 @@ mod tests {
         port.record_hot(RecordKind::Counterexample, &counter, None)
             .unwrap();
         let node = port.replay_node(&counter).unwrap();
-        let observations = port.engine.stores.observations.len();
-        let executions = port.engine.stores.tasks.len();
+        let observations = port.engine.semantic.stores.observations.len();
+        let executions = port.engine.semantic.stores.tasks.len();
         assert!(port.engine.admit_iterative_repair(counter[0]));
         let transition = port
             .begin_repair_continuation(
@@ -274,9 +286,12 @@ mod tests {
                 scope: FrameCompletionScope::NoRepairContinuation
             }
         ));
-        assert_eq!(port.engine.stores.tasks.len(), executions);
-        assert_eq!(port.engine.stores.observations.len(), observations + 1);
-        let repair = port.engine.records.last().unwrap();
+        assert_eq!(port.engine.semantic.stores.tasks.len(), executions);
+        assert_eq!(
+            port.engine.semantic.stores.observations.len(),
+            observations + 1
+        );
+        let repair = port.engine.semantic.records.last().unwrap();
         assert_eq!(repair.kind, RecordKind::Repair);
         assert_eq!(repair.line, counter);
         assert!(repair.parent_revision.is_some());
@@ -386,7 +401,7 @@ mod tests {
         let proposal = line(&["g2g4", "a7a6"]);
         let counter = line(&["g2g4", "d8h4"]);
         let node = port.replay_node(&counter).unwrap();
-        assert!(port.engine.nodes[node].terminal.is_some());
+        assert!(port.engine.semantic.nodes[node].terminal.is_some());
         let transition = port
             .begin_repair_continuation(
                 node,
@@ -424,9 +439,9 @@ mod tests {
             None,
         );
         assert!(port.publish_supported_counter(&query).unwrap());
-        let before = port.engine.stores.observations.len();
+        let before = port.engine.semantic.stores.observations.len();
         assert!(!port.publish_supported_counter(&query).unwrap());
-        assert_eq!(before, port.engine.stores.observations.len());
+        assert_eq!(before, port.engine.semantic.stores.observations.len());
         let support = port.supported_counters.values().next().unwrap().clone();
         assert_eq!(
             port.conditional_witness_kind(support.refutation),
@@ -437,7 +452,7 @@ mod tests {
             Some(counter.as_slice())
         );
         assert!(
-            matches!(port.engine.stores.observations.get(support.refutation).unwrap().score,
+            matches!(port.engine.semantic.stores.observations.get(support.refutation).unwrap().score,
             RawScore::Estimate { value, perspective: Color::White } if value == -100.0)
         );
         accepted_raw(&mut port, &repaired, 0, 2);
@@ -452,9 +467,10 @@ mod tests {
         assert!(port.supported_counters.is_empty());
         let current = port
             .engine
+            .semantic
             .stores
             .situations
-            .get(port.engine.nodes[port.root].situation)
+            .get(port.engine.semantic.nodes[port.root].situation)
             .unwrap();
         let conclusion = current.conclusions.get(support.proposal_line).unwrap();
         assert!(matches!(
@@ -463,6 +479,7 @@ mod tests {
         ));
         let observation = port
             .engine
+            .semantic
             .stores
             .observations
             .get(conclusion.evidence.unwrap())
@@ -499,9 +516,9 @@ mod tests {
                 &counter,
                 None,
             );
-            let before = port.engine.stores.observations.len();
+            let before = port.engine.semantic.stores.observations.len();
             assert!(!port.publish_supported_counter(&query).unwrap());
-            assert_eq!(before, port.engine.stores.observations.len());
+            assert_eq!(before, port.engine.semantic.stores.observations.len());
             assert!(port.supported_counters.is_empty());
         }
     }
@@ -523,13 +540,18 @@ mod tests {
         assert!(port.supported_counters.is_empty());
         let execution = port
             .engine
+            .semantic
             .stores
             .observations
             .get(observation)
             .unwrap()
             .execution
             .unwrap();
-        port.engine.stores.hot_retire_paused(execution).unwrap();
+        port.engine
+            .semantic
+            .stores
+            .hot_retire_paused(execution)
+            .unwrap();
         assert!(!port.publish_supported_counter(&query).unwrap());
         assert!(port.supported_counters.is_empty());
         assert_eq!(port.counters.supported_refutations, 0);
@@ -558,9 +580,9 @@ mod tests {
             &counter,
             Some(&optimistic_opponent),
         );
-        let before = port.engine.stores.observations.len();
+        let before = port.engine.semantic.stores.observations.len();
         assert!(!port.publish_supported_repair(&query).unwrap());
-        assert_eq!(before, port.engine.stores.observations.len());
+        assert_eq!(before, port.engine.semantic.stores.observations.len());
         assert_eq!(port.counters.supported_repairs, 0);
     }
 
@@ -593,7 +615,7 @@ mod tests {
         accepted_raw(&mut port, &proposal, 100, 2);
         accepted_raw(&mut port, &counter, -100, 2);
         let node = port.replay_node(&counter).unwrap();
-        let accepted = port.engine.nodes[node].evidence.as_mut().unwrap();
+        let accepted = port.engine.semantic.nodes[node].evidence.as_mut().unwrap();
         // An unproven front-end value must not piggyback on a raw task receipt.
         accepted.score = -300;
         let query = question(
@@ -636,13 +658,15 @@ mod tests {
         let (proposal, _, _) = branches();
         let focus = port
             .engine
+            .semantic
             .stores
             .situations
-            .get(port.engine.nodes[port.root].situation)
+            .get(port.engine.semantic.nodes[port.root].situation)
             .unwrap()
             .focus;
         let line = port
             .engine
+            .semantic
             .stores
             .hot_append_line(focus, &proposal)
             .unwrap();
@@ -652,6 +676,43 @@ mod tests {
         assert_eq!(port.conditional_witness_kind(uncommitted), None);
         assert_eq!(port.conditional_witness_line(uncommitted), None);
         assert_eq!(port.counters.supported_refutations, 0);
+    }
+
+    #[test]
+    fn different_contextual_binding_is_not_a_comparable_raw_basis() {
+        let mut port = port(Position::startpos());
+        let (proposal, counter, _) = branches();
+        accepted_raw(&mut port, &proposal, 100, 2);
+        accepted_raw(&mut port, &counter, -100, 2);
+        let proposal_node = port.replay_node(&proposal).unwrap();
+        let counter_node = port.replay_node(&counter).unwrap();
+        let mut old = port
+            .conditional_endpoint(proposal_node, proposal.len())
+            .unwrap()
+            .unwrap();
+        let mut new = port
+            .conditional_endpoint(counter_node, counter.len())
+            .unwrap()
+            .unwrap();
+        assert!(old.comparable(&new));
+        let EndpointBasis::OwnCpu {
+            base_condition: old_condition,
+            ..
+        } = &mut old.basis
+        else {
+            panic!("actual accepted own CPU fixture")
+        };
+        old_condition.push_str(";nnuec-context-binding=original-view");
+        assert!(!old.comparable(&new));
+        let EndpointBasis::OwnCpu {
+            base_condition: new_condition,
+            ..
+        } = &mut new.basis
+        else {
+            panic!("actual accepted own CPU fixture")
+        };
+        new_condition.push_str(";nnuec-context-binding=other-view");
+        assert!(!old.comparable(&new));
     }
 }
 
@@ -752,9 +813,13 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         // publication; neither this operation nor the conclusion invokes I/O.
         self.pin_conditional_endpoint(&old)?;
         self.pin_conditional_endpoint(&new)?;
-        let root = self.engine.nodes[self.root].situation;
-        let focus = self.engine.stores.situations.get(root)?.focus;
-        let proposal_line = self.engine.stores.hot_append_line(focus, &query.proposal)?;
+        let root = self.engine.semantic.nodes[self.root].situation;
+        let focus = self.engine.semantic.stores.situations.get(root)?.focus;
+        let proposal_line = self
+            .engine
+            .semantic
+            .stores
+            .hot_append_line(focus, &query.proposal)?;
         let refutation = self.conditional_observation(
             proposal_line,
             ObservationKind::Refutation,
@@ -765,6 +830,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .pin_archive_active_record(proposal_line, refutation)?;
         self.check_live()?;
         self.engine
+            .semantic
             .stores
             .hot_refute_continuation(root, proposal_line, refutation)?;
         self.conditional_witnesses
@@ -798,9 +864,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let Some(previous) = self.supported_counters.get(&key).cloned() else {
             return Ok(false);
         };
-        let root = self.engine.nodes[self.root].situation;
+        let root = self.engine.semantic.nodes[self.root].situation;
         let active = self
             .engine
+            .semantic
             .stores
             .situations
             .get(root)?
@@ -834,8 +901,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             return Err(StoreError::PinSaturated("adaptive conditional witness registry").into());
         }
         self.pin_conditional_endpoint(&after)?;
-        let focus = self.engine.stores.situations.get(root)?.focus;
-        let repaired_line = self.engine.stores.hot_append_line(focus, repaired)?;
+        let focus = self.engine.semantic.stores.situations.get(root)?.focus;
+        let repaired_line = self
+            .engine
+            .semantic
+            .stores
+            .hot_append_line(focus, repaired)?;
         if repaired_line == previous.proposal_line {
             return Ok(false);
         }
@@ -848,9 +919,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         self.engine
             .pin_archive_active_record(repaired_line, evidence)?;
         self.check_live()?;
-        self.engine
-            .stores
-            .hot_repair(root, previous.proposal_line, repaired_line, evidence)?;
+        self.engine.semantic.stores.hot_repair(
+            root,
+            previous.proposal_line,
+            repaired_line,
+            evidence,
+        )?;
         self.conditional_witnesses
             .insert(evidence, (ObservationKind::Repair, repaired.to_vec()));
         self.supported_counters.remove(&key);
@@ -901,11 +975,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        let mut divergence = self.engine.nodes[self.root].position.clone();
+        let mut divergence = self.engine.semantic.nodes[self.root].position.clone();
         for movement in &query.proposal[..attack] {
             divergence.make_move(*movement)?;
         }
-        if divergence.side_to_move() == self.engine.nodes[self.root].position.side_to_move()
+        if divergence.side_to_move()
+            == self.engine.semantic.nodes[self.root]
+                .position
+                .side_to_move()
             || !matches!(
                 divergence.classify_position()?.play_status,
                 PlayStatus::Ongoing
@@ -928,7 +1005,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             self.authority.epoch.0,
             self.authority.game.0,
             self.authority.root.0,
-            self.engine.nodes[self.root].state.0 as u64,
+            self.engine.semantic.nodes[self.root].state.0 as u64,
             attack as u64,
         ] {
             hash.update(value.to_le_bytes());
@@ -951,12 +1028,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     ) -> Result<(), PalsError> {
         if query.node != node
             || query.context.prefix != line
-            || query.context.state != self.engine.nodes[node].state
-            || query.context.situation != self.engine.nodes[node].situation
+            || query.context.state != self.engine.semantic.nodes[node].state
+            || query.context.situation != self.engine.semantic.nodes[node].situation
             || !query
                 .position
                 .snapshot()
-                .same_state(&self.engine.nodes[node].position.snapshot())
+                .same_state(&self.engine.semantic.nodes[node].position.snapshot())
         {
             return Err(ReviewError::AnchorMismatch.into());
         }
@@ -966,7 +1043,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     fn is_own_repair(&self, query: &AdaptivePortQuestion) -> Result<bool, PalsError> {
         let counter = query.counter.as_deref().ok_or(RoleError::InvalidOutput)?;
         let repaired = query.repaired.as_deref().ok_or(RoleError::InvalidOutput)?;
-        let mut position = self.engine.nodes[self.root].position.clone();
+        let mut position = self.engine.semantic.nodes[self.root].position.clone();
         let root_color = position.side_to_move();
         for (old, new) in counter.iter().zip(repaired) {
             if old != new {
@@ -983,14 +1060,22 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         node: usize,
         plies: usize,
     ) -> Result<Option<ConditionalEndpoint>, PalsError> {
-        let endpoint = &self.engine.nodes[node];
+        let endpoint = &self.engine.semantic.nodes[node];
         if !self
             .engine
+            .semantic
             .stores
             .states
             .get(endpoint.state)?
             .same_state(&endpoint.position.snapshot())
-            || self.engine.stores.situations.get(endpoint.situation)?.state != endpoint.state
+            || self
+                .engine
+                .semantic
+                .stores
+                .situations
+                .get(endpoint.situation)?
+                .state
+                != endpoint.state
         {
             return Err(ReviewError::AnchorMismatch.into());
         }
@@ -1043,17 +1128,25 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         node: usize,
         plies: usize,
     ) -> Result<Option<ConditionalEndpoint>, PalsError> {
-        let endpoint = &self.engine.nodes[node];
+        let endpoint = &self.engine.semantic.nodes[node];
         if endpoint.terminal.is_some() {
             return Ok(None);
         }
         if !self
             .engine
+            .semantic
             .stores
             .states
             .get(endpoint.state)?
             .same_state(&endpoint.position.snapshot())
-            || self.engine.stores.situations.get(endpoint.situation)?.state != endpoint.state
+            || self
+                .engine
+                .semantic
+                .stores
+                .situations
+                .get(endpoint.situation)?
+                .state
+                != endpoint.state
         {
             return Err(ReviewError::AnchorMismatch.into());
         }
@@ -1062,7 +1155,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         };
         if accepted.scope != CpuScoreScope::CompletedIteration
             || accepted.depth < self.limits.cpu_depth
-            || Some(&accepted.value_identity) != self.engine.cpu_registered_value.as_ref()
+            || Some(&accepted.value_identity)
+                != self.engine.researcher.cpu_registered_value.as_ref()
         {
             return Ok(None);
         }
@@ -1074,9 +1168,20 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let Some((observation_id, execution)) = accepted.provenance else {
             return Ok(None);
         };
-        let observation = self.engine.stores.observations.get(observation_id)?;
-        let task = self.engine.stores.tasks.get(execution)?;
-        let base_condition = self.engine.cpu_condition();
+        let observation = self
+            .engine
+            .semantic
+            .stores
+            .observations
+            .get(observation_id)?;
+        let task = self.engine.semantic.stores.tasks.get(execution)?;
+        let base_condition = task
+            .key
+            .cpu_condition
+            .clone()
+            .ok_or(StoreError::InvalidEvidence(
+                "adaptive conditional CPU condition missing",
+            ))?;
         let descriptor = self.engine.owned_descriptor()?;
         let profile = stable_id(descriptor.config.profile.identity());
         let condition = stable_id(&format!(
@@ -1099,11 +1204,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             || observation.model_value_identity.is_some()
             || observation.cpu_condition.is_none()
             || observation.cpu_condition != task.key.cpu_condition
-            || task
-                .key
-                .cpu_condition
-                .as_ref()
-                .is_none_or(|actual| actual != &base_condition)
+            || !self.conditional_cpu_task_condition_matches(
+                accepted,
+                &task.key,
+                execution,
+                observation_id,
+            )
             || task.key.state != endpoint.state
             || task.key.line.is_some()
             || task.key.question != TaskQuestion::AnalyzePosition
@@ -1168,7 +1274,15 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         } = &endpoint.basis
         {
             // Retain both immutable raw evidence and its checked task lineage.
-            if self.engine.stores.observations.get(*observation)?.execution != Some(*execution) {
+            if self
+                .engine
+                .semantic
+                .stores
+                .observations
+                .get(*observation)?
+                .execution
+                != Some(*execution)
+            {
                 return Err(
                     StoreError::InvalidEvidence("conditional CPU evidence task changed").into(),
                 );
@@ -1189,16 +1303,17 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     ) -> Result<ObservationId, PalsError> {
         self.check_live()?;
         self.engine
+            .semantic
             .stores
             .hot_append_observation(Observation {
-                state: self.engine.nodes[self.root].state,
+                state: self.engine.semantic.nodes[self.root].state,
                 line: Some(line),
                 source: stable_id(self.engine.search_identity()),
                 epoch: 0,
                 scope: EvidenceScope::Model {
-                    model: stable_id(self.engine.model.identity()),
+                    model: stable_id(self.engine.semantic.model.identity()),
                     encoding: stable_id("pals-restricted-summary-v1"),
-                    input: self.engine.revision,
+                    input: self.engine.semantic.revision,
                 },
                 value_identity: None,
                 checker_identity: None,
@@ -1210,7 +1325,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 cpu_pv: None,
                 score: RawScore::Estimate {
                     value: value as f32,
-                    perspective: self.engine.nodes[self.root].position.side_to_move(),
+                    perspective: self.engine.semantic.nodes[self.root]
+                        .position
+                        .side_to_move(),
                 },
                 budget: 0,
                 kind,

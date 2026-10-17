@@ -16,7 +16,8 @@ mod see;
 mod stack;
 
 use crate::cpu_value::{
-    BootstrapCpuValue, CpuAccumulator, CpuValueError, CpuValueEvaluator, CpuValueIdentity,
+    BootstrapCpuValue, CpuAccumulator, CpuValueCacheContext, CpuValueError, CpuValueEvaluator,
+    CpuValueIdentity,
 };
 use rz_position::{
     BoardMove, Color, PieceKind, PlayStatus, Position, PositionError, PositionIdentity, Square,
@@ -204,6 +205,9 @@ pub enum CpuCompletion {
     /// Cooperative worker release. This is neither cancellation nor expiry;
     /// an owned PausedStack continuation remains live for the same job.
     Yielded,
+    /// An entered node owns a sealed P/C question. This is not a voluntary
+    /// Yield and plain resume may not bypass the missing response.
+    AwaitReciprocal,
     /// A checked quiescence frontier cannot be statically evaluated safely.
     QuiescenceLimit,
     Terminal(TerminalReason),
@@ -233,6 +237,7 @@ pub struct CpuSliceControl {
     pub mailbox: Arc<CpuControlMailbox>,
     observed_yield_sequence: AtomicU64,
     observed_yield_cause: AtomicU64,
+    nnuec_capture: Option<crate::cpu_value::nnuec::v2::capture::NnuecActiveCapture>,
 }
 
 impl CpuSliceControl {
@@ -250,7 +255,21 @@ impl CpuSliceControl {
             mailbox,
             observed_yield_sequence: AtomicU64::new(0),
             observed_yield_cause: AtomicU64::new(0),
+            nnuec_capture: None,
         })
+    }
+    pub(crate) fn with_nnuec_capture(
+        mut self,
+        capture: crate::cpu_value::nnuec::v2::capture::NnuecActiveCapture,
+    ) -> Result<Self, CpuError> {
+        let scope = self.mailbox.scope();
+        if !capture.matches_slice(scope.job, scope.owner) {
+            return Err(CpuError::InvalidLimits(
+                "NNUEC capture belongs to another Job/owner",
+            ));
+        }
+        self.nnuec_capture = Some(capture);
+        Ok(self)
     }
     fn observe_yield(&self, cause: CpuYieldCause, sequence: u64) {
         self.observed_yield_sequence
@@ -273,6 +292,175 @@ pub struct CpuControlledReport {
     pub yield_ack_sequence: Option<u64>,
     /// This sequence only acknowledges a completed iteration publication.
     pub publish_ack_sequence: u64,
+}
+
+/// Immutable scheduling context for actual R -> P/C -> R node feedback.
+/// The manager still owns question IDs, Store pins and the original ledger.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CpuReciprocalScope {
+    pub job: rz_contracts::pals_adaptive::CpuJobEnvelope,
+    pub owner: rz_contracts::pals_adaptive::CpuWorkerId,
+    pub parent: rz_contracts::rovent::QuestionEnvelope,
+    pub recipient: rz_contracts::rovent::SearchRecipient,
+    pub max_questions: u16,
+    pub node_interval: u64,
+}
+
+impl CpuReciprocalScope {
+    fn validate(&self) -> Result<(), CpuError> {
+        use rz_contracts::rovent::SearchRecipient;
+        if self.job.id.authority != self.parent.id.authority
+            || self.job.question != self.parent.question_digest
+            || self.job.state_identity != self.parent.anchor
+            || self.job.hard_deadline != self.parent.original_deadline
+            || self.job.hard_deadline.clock.0 != self.job.id.authority.epoch
+            || self.parent.recipient != SearchRecipient::Researcher
+            || !matches!(
+                self.recipient,
+                SearchRecipient::Proposer | SearchRecipient::Critic
+            )
+            || self.job.id.sequence == 0
+            || self.parent.id.sequence == 0
+            || !(1..=64).contains(&self.max_questions)
+            || self.node_interval == 0
+            || self.job.total_native_node_credit == 0
+        {
+            return Err(CpuError::InvalidLimits("invalid reciprocal CPU job scope"));
+        }
+        self.parent
+            .view
+            .validate(self.job.id.authority, 512)
+            .map_err(|_| CpuError::InvalidLimits("invalid reciprocal frozen view"))?;
+        Ok(())
+    }
+}
+
+/// Issued only by an entered native node. Private pointer authority makes a
+/// copied description insufficient to resume another task or another node.
+#[derive(Clone, Debug)]
+pub struct CpuReciprocalRequest {
+    seal: Arc<()>,
+    scope: CpuReciprocalScope,
+    position: Position,
+    /// Actual entered moves from this R job's anchor; never a guessed PV or
+    /// an accumulated played-game trace. Issued with the same opaque seal.
+    relative_prefix: Vec<BoardMove>,
+    ply: u16,
+    remaining_depth: u16,
+    ordinal: u16,
+    candidates: Vec<BoardMove>,
+}
+
+impl CpuReciprocalRequest {
+    pub fn scope(&self) -> &CpuReciprocalScope {
+        &self.scope
+    }
+    pub fn position(&self) -> &Position {
+        &self.position
+    }
+    pub fn relative_prefix(&self) -> &[BoardMove] {
+        &self.relative_prefix
+    }
+    pub fn ply(&self) -> u16 {
+        self.ply
+    }
+    pub fn remaining_depth(&self) -> u16 {
+        self.remaining_depth
+    }
+    /// Local observation only; the manager separately issues the global question ID.
+    pub fn ordinal(&self) -> u16 {
+        self.ordinal
+    }
+    pub fn candidates(&self) -> &[BoardMove] {
+        &self.candidates
+    }
+    /// Exact issued-request equality, including its private owner authority.
+    /// Matching public descriptions alone cannot authorize another R parent.
+    pub fn same_request(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.seal, &other.seal)
+            && self.scope == other.scope
+            && self.position.position_identity() == other.position.position_identity()
+            && self.relative_prefix == other.relative_prefix
+            && self.ply == other.ply
+            && self.remaining_depth == other.remaining_depth
+            && self.ordinal == other.ordinal
+            && self.candidates == other.candidates
+    }
+}
+
+/// Accepted neural feedback changes move ordering only. It is neither a
+/// minimax bound nor a Rules proof, and cannot fabricate a completed node.
+#[derive(Clone, Debug)]
+pub struct CpuReciprocalReply {
+    request: CpuReciprocalRequest,
+    question: rz_contracts::rovent::QuestionEnvelope,
+    preferred: Vec<BoardMove>,
+}
+
+impl CpuReciprocalReply {
+    pub fn new(
+        request: &CpuReciprocalRequest,
+        question: rz_contracts::rovent::QuestionEnvelope,
+        anchor: &rz_position::contracts::ContractState,
+        preferred: Vec<BoardMove>,
+    ) -> Result<Self, CpuError> {
+        use rz_contracts::rovent::SearchRecipient;
+        let parent = request.scope.parent;
+        if question.parent != Some(parent.id)
+            || question.id.authority != parent.id.authority
+            || question.id.sequence <= parent.id.sequence
+            || question.sender != SearchRecipient::Researcher
+            || question.recipient != request.scope.recipient
+            || question.view.authority != parent.view.authority
+            || question.view.context_policy != parent.view.context_policy
+            || question.view.root_state != parent.view.root_state
+            || question.root_budget != parent.root_budget
+            || question.original_first_move != parent.original_first_move
+            || question.original_deadline != parent.original_deadline
+            || (question.line_digest.is_none() && question.line_offset.0 != 0)
+            || question.anchor != anchor.snapshot().identity()
+            || !anchor
+                .rules()
+                .snapshot()
+                .same_state(&request.position.snapshot())
+            || question.anchor_root_ply.0
+                != parent
+                    .anchor_root_ply
+                    .0
+                    .checked_add(request.ply)
+                    .ok_or(CpuError::InvalidLimits("reciprocal anchor ply overflow"))?
+            || preferred.len() > request.candidates.len()
+            || preferred.iter().enumerate().any(|(index, movement)| {
+                !request.candidates.contains(movement) || preferred[..index].contains(movement)
+            })
+        {
+            return Err(CpuError::ResumeMismatch(
+                "reciprocal response seal, anchor or candidates mismatch",
+            ));
+        }
+        question
+            .view
+            .validate(parent.id.authority, 512)
+            .map_err(|_| CpuError::ResumeMismatch("reciprocal child view is invalid"))?;
+        Ok(Self {
+            request: request.clone(),
+            question,
+            preferred,
+        })
+    }
+
+    pub fn question(&self) -> rz_contracts::rovent::QuestionEnvelope {
+        self.question
+    }
+    pub fn preferred(&self) -> &[BoardMove] {
+        &self.preferred
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CpuReciprocalControlledReport {
+    pub controlled: CpuControlledReport,
+    pub request: Option<CpuReciprocalRequest>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -534,6 +722,7 @@ struct TtEntry {
     identity: PositionIdentity,
     profile: CpuProfile,
     value_identity: Arc<CpuValueIdentity>,
+    value_context: CpuValueCacheContext,
     depth: u16,
     /// Mate distance normalized to this node, not the root that stored it.
     score: i32,
@@ -1163,6 +1352,30 @@ impl CpuEngine {
     pub fn value_identity(&self) -> &CpuValueIdentity {
         &self.value_identity
     }
+    /// Preserve an actual evaluator's immutable contextual registration across
+    /// known owner recovery. This does not recreate a revoked view authority.
+    pub fn job_binding_digest(&self) -> Result<Option<rz_contracts::Digest>, CpuError> {
+        self.validate_frozen_value_namespace()?;
+        self.evaluator.job_binding_digest().map_err(CpuError::Value)
+    }
+    /// Known joined-owner cleanup keeps original immutable value identity but
+    /// intentionally does not require a live cancellation/deadline authority.
+    pub(crate) fn nnuec_retirement_owner(
+        &self,
+    ) -> Result<Option<crate::cpu_value::nnuec::v2::retirement::NnuecValueRetirementOwner>, CpuError>
+    {
+        self.validate_frozen_value_namespace()?;
+        let owner = self.evaluator.nnuec_retirement_owner();
+        if owner
+            .as_ref()
+            .is_some_and(|owner| owner.model_identity() != self.value_identity.as_ref())
+        {
+            return Err(CpuError::Value(
+                crate::cpu_value::CpuValueError::StateMismatch,
+            ));
+        }
+        Ok(owner)
+    }
 
     pub fn search_conditions(&self) -> String {
         let legacy = format!(
@@ -1316,6 +1529,14 @@ impl CpuEngine {
             &mut observer,
             control,
         )?;
+        self.finish_controlled_report(report, control)
+    }
+
+    fn finish_controlled_report(
+        &mut self,
+        report: CpuReport,
+        control: &CpuSliceControl,
+    ) -> Result<CpuControlledReport, CpuError> {
         let yield_cause = if report.completion == CpuCompletion::Yielded {
             match control.observed_yield_cause.load(Ordering::Acquire) {
                 1 => Some(CpuYieldCause::Requested),
@@ -1341,6 +1562,86 @@ impl CpuEngine {
             yield_cause,
             yield_ack_sequence,
             publish_ack_sequence: control.mailbox.snapshot().publish_ack,
+        })
+    }
+
+    /// Read-only admission, used by the private worker before consuming its
+    /// terminal seat or continuation. Invalid feedback leaves both untouched.
+    pub fn validate_reciprocal_resume(
+        &self,
+        token: Option<&CpuResumeToken>,
+        scope: &CpuReciprocalScope,
+        reply: Option<&CpuReciprocalReply>,
+    ) -> Result<(), CpuError> {
+        scope.validate()?;
+        stack::validate_reciprocal_resume(self, token, scope, reply)
+    }
+
+    pub fn pending_reciprocal_request(&self) -> Option<CpuReciprocalRequest> {
+        stack::pending_reciprocal_request(self)
+    }
+
+    /// The same owned native traversal consumes a P/C ordering response at its
+    /// saved node stage. It never restarts the node or issues a fresh budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn analyze_controlled_reciprocal(
+        &mut self,
+        position: &Position,
+        root_moves: Option<&[BoardMove]>,
+        limits: CpuLimits,
+        cancellation: &AtomicBool,
+        control: &CpuSliceControl,
+        resume: Option<&CpuResumeToken>,
+        scope: &CpuReciprocalScope,
+        reply: Option<&CpuReciprocalReply>,
+        mut observer: impl FnMut(CpuIterationProgress),
+    ) -> Result<CpuReciprocalControlledReport, CpuError> {
+        self.last_attempt_work = Some(CpuWork::default());
+        self.validate_reciprocal_resume(resume, scope, reply)?;
+        if resume.is_none() {
+            let anchor = rz_position::contracts::ContractPosition::new(
+                scope.job.state_identity.owner,
+                position.clone(),
+            )
+            .export()
+            .map_err(|_| CpuError::ResumeMismatch("reciprocal Rules export failed"))?;
+            if anchor.snapshot().identity() != scope.job.state_identity {
+                return Err(CpuError::ResumeMismatch(
+                    "reciprocal job names another Rules state or history",
+                ));
+            }
+        }
+        if self.resume_policy != CpuResumePolicy::PausedStack {
+            return Err(CpuError::Unsupported(
+                "reciprocal feedback requires PausedStack",
+            ));
+        }
+        if control.node_credit == 0
+            || control.mailbox.snapshot().terminal
+            || control.mailbox.scope().job != scope.job.id
+            || control.mailbox.scope().owner != scope.owner
+            || resume.is_some_and(|token| token.root_moves.as_deref() != root_moves)
+        {
+            return Err(CpuError::ResumeMismatch(
+                "reciprocal control or root restriction changed",
+            ));
+        }
+        let report = stack::run_reciprocal(
+            self,
+            position,
+            root_moves,
+            limits,
+            cancellation,
+            resume,
+            &mut observer,
+            control,
+            scope,
+            reply,
+        )?;
+        let request = self.pending_reciprocal_request();
+        Ok(CpuReciprocalControlledReport {
+            controlled: self.finish_controlled_report(report, control)?,
+            request,
         })
     }
 
@@ -1732,7 +2033,16 @@ impl CpuEngine {
         control: &Control<'_>,
         position: &Position,
     ) -> Result<i32, CpuValueError> {
-        let score = self.evaluator.score(&control.value, position)?;
+        let score = match control
+            .cooperative
+            .and_then(|slice| slice.nnuec_capture.as_ref())
+        {
+            Some(capture) => {
+                self.evaluator
+                    .score_with_capture(&control.value, position, capture)?
+            }
+            None => self.evaluator.score(&control.value, position)?,
+        };
         if !(-CPU_FRONTIER_SCORE_LIMIT..=CPU_FRONTIER_SCORE_LIMIT).contains(&score) {
             return Err(CpuValueError::ScoreOutsideFrontierNamespace);
         }
@@ -1838,7 +2148,8 @@ impl CpuEngine {
         let alpha_original = alpha;
         let hash = tt_hash(position);
         let identity = position.position_identity();
-        let tt = self.probe(hash, &identity).cloned();
+        let value_context = self.evaluator.cache_context(&control.value, position)?;
+        let tt = self.probe(hash, &identity, &value_context).cloned();
         if let Some(entry) = &tt {
             control.tt_hits += 1;
             // A depth-8 bound cannot masquerade as a depth-10 result.
@@ -1925,6 +2236,7 @@ impl CpuEngine {
             identity,
             profile: self.config.profile,
             value_identity: Arc::clone(&self.value_identity),
+            value_context,
             depth,
             score: to_tt_score(best.score, ply),
             bound,
@@ -2096,7 +2408,12 @@ impl CpuEngine {
             [mv.to.index() as usize]
     }
 
-    fn probe(&self, hash: u64, identity: &PositionIdentity) -> Option<&TtEntry> {
+    fn probe(
+        &self,
+        hash: u64,
+        identity: &PositionIdentity,
+        value_context: &CpuValueCacheContext,
+    ) -> Option<&TtEntry> {
         if self.tt.is_empty() {
             return None;
         }
@@ -2106,6 +2423,7 @@ impl CpuEngine {
                 entry.hash == hash
                     && entry.profile == self.config.profile
                     && entry.value_identity == self.value_identity
+                    && entry.value_context == *value_context
                     && entry.identity == *identity
             })
     }
@@ -2116,7 +2434,11 @@ impl CpuEngine {
         }
         let index = entry.hash as usize % self.tt.len();
         if self.tt[index].as_ref().is_some_and(|old| {
-            old.hash == entry.hash && old.identity == entry.identity && old.depth > entry.depth
+            old.hash == entry.hash
+                && old.identity == entry.identity
+                && old.value_identity == entry.value_identity
+                && old.value_context == entry.value_context
+                && old.depth > entry.depth
         }) {
             return;
         }
@@ -2878,13 +3200,28 @@ mod tests {
             identity: played.position_identity(),
             profile: CpuProfile::PlanAssisted,
             value_identity: Arc::clone(&cpu.value_identity),
+            value_context: CpuValueCacheContext::default(),
             depth: 8,
             score: 1234,
             bound: Bound::Exact,
             best_move: played.legal_moves().first().copied(),
         });
-        assert!(cpu.probe(hash, &played.position_identity()).is_some());
-        assert!(cpu.probe(hash, &imported.position_identity()).is_none());
+        assert!(
+            cpu.probe(
+                hash,
+                &played.position_identity(),
+                &CpuValueCacheContext::default()
+            )
+            .is_some()
+        );
+        assert!(
+            cpu.probe(
+                hash,
+                &imported.position_identity(),
+                &CpuValueCacheContext::default()
+            )
+            .is_none()
+        );
         let mut deeper = played.clone();
         let cancel = AtomicBool::new(false);
         let mut control = Control {
@@ -2902,7 +3239,13 @@ mod tests {
         let result = cpu.negamax(&mut deeper, 10, 0, -INFINITY, INFINITY, &mut control);
         assert!(matches!(result, Err(Abort::Stop(CpuCompletion::NodeLimit))));
         assert_eq!(
-            cpu.probe(hash, &played.position_identity()).unwrap().depth,
+            cpu.probe(
+                hash,
+                &played.position_identity(),
+                &CpuValueCacheContext::default()
+            )
+            .unwrap()
+            .depth,
             8
         );
     }

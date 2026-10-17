@@ -34,17 +34,42 @@ pub use work::{
 pub enum SearchKind {
     Cpu,
     Pals,
+    Rovent,
 }
 
 #[derive(Clone, Debug)]
 pub struct SearchSessionContext {
     pub authority: rz_contracts::pals::SearchAuthority,
+    /// The received go, before ponder normalization or Rules subset sealing.
+    /// Legacy callers may omit it; native Rovent admission requires it.
+    pub original_go: Option<Arc<crate::parser::GoLimits>>,
+    /// Exact actual Start allocation. No later hit or root descriptor rebuild
+    /// may replace this original clock evidence.
+    pub original_time_budget: Option<rz_search::time::TimeBudget>,
+    /// Private immutable custody issued only by the actual Session Start.
+    /// Legacy consumers have no native Rovent work authority through `None`.
+    pub(crate) original_start: Option<Arc<crate::engine::DriverStartSource>>,
+    /// Read-only same-Start effective admission/stop clock. It never replaces
+    /// the immutable deadlines of an already submitted role or CPU job.
+    pub effective_clock: Option<crate::rovent_ponder::RoventPonderClockHandle>,
+    /// Canonical root-only subset. Child legal/policy order remains Rules-owned.
+    pub root_moves: Option<Arc<[BoardMove]>>,
+    pub goal: rz_contracts::rovent::SearchGoal,
+    /// Exact explicit UCI nodes limit, before legacy simulation defaults.
+    pub requested_nodes: Option<u64>,
     pub control: SearchControl,
     pub cancellation: CancelToken,
     pub shutdown_deadline: Instant,
     pub(crate) current: Arc<Mutex<SessionScope>>,
 }
 impl SearchSessionContext {
+    pub fn soft_expired(&self, now: Instant) -> bool {
+        self.effective_clock
+            .as_ref()
+            .map_or(now >= self.control.soft_deadline, |clock| {
+                clock.snapshot(now).soft_expired(now)
+            })
+    }
     /// Called at a task/commit boundary. An old root cannot mutate a new root.
     pub fn accepts(&self) -> Result<bool, ContractError> {
         let current = self.current.lock().map_err(|_| {
@@ -76,6 +101,37 @@ pub enum DriverWork {
         completed_tasks: u64,
         consumed_role_outputs: u64,
         retained_situations: usize,
+    },
+    Rovent {
+        root_entries: u64,
+        total_node_visits: u64,
+        role_calls: u64,
+        accepted_policy: u64,
+        accepted_fresh_values: u64,
+        checked_transitions: u64,
+        native_r_calls: u64,
+        native_nodes: u64,
+        native_qsearch_nodes: u64,
+        native_pvs_entries: Option<u64>,
+        native_see_nodes: Option<u64>,
+        external_teacher_calls: u64,
+        completed_depth: Option<u16>,
+        maximum_examined_ply: u16,
+    },
+    /// Actual ticket-manager observations; head-specific acceptance is not
+    /// inferred from total role counts. Unknown physical work stays unknown.
+    RoventNative {
+        root_entries: u64,
+        total_node_visits: Option<u64>,
+        checked_transitions: u64,
+        native_nodes: Option<u64>,
+        native_qsearch_nodes: Option<u64>,
+        submitted_role_tickets: u64,
+        consumed_role_outputs: u64,
+        completed_nn_inputs: Option<u64>,
+        consumed_nn_inputs: Option<u64>,
+        completed_depth: Option<u16>,
+        maximum_examined_ply: u16,
     },
 }
 
@@ -1341,6 +1397,7 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
                     detail: error.to_string(),
                 })? {
                     return Ok(SearchSessionReport {
+                        mate_strategy: None,
                         best_move: None,
                         work: DriverWork::Pals {
                             rounds: 0,
@@ -1369,6 +1426,7 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
                 detail: error.to_string(),
             })? {
                 return Ok(SearchSessionReport {
+                    mate_strategy: None,
                     best_move: None,
                     work: DriverWork::Pals {
                         rounds: 0,
@@ -1478,6 +1536,7 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
                 }
             }
             Ok(SearchSessionReport {
+                mate_strategy: None,
                 best_move: report.best_move,
                 work: DriverWork::Pals {
                     rounds: report.counters.rounds,
@@ -1748,6 +1807,9 @@ fn checker_implementation(
 }
 #[derive(Clone, Debug)]
 pub struct SearchSessionReport {
+    /// The actual checked strategy belongs to this immutable final report.
+    /// Numeric CP/WDL and a later global observation cannot create it.
+    pub mate_strategy: Option<rz_search::pals::rovent_frontier::FrontierMateStrategy>,
     pub best_move: Option<BoardMove>,
     pub work: DriverWork,
 }
@@ -1819,6 +1881,39 @@ impl std::error::Error for SearchSessionFailure {}
 /// from `run` acknowledges bounded completion/drain, not just logical cancel.
 /// Progress is advisory: UCI checks its exact root legal set and authority.
 pub trait SearchSessionDriver: Send + Sync + 'static {
+    /// Opt in only when the actual root owner consumes the effective clock.
+    /// Legacy hit-to-stop behavior remains a separate compatibility path.
+    fn supports_ponder_clock(&self) -> bool {
+        false
+    }
+    /// The node unit is explicit. Legacy simulation limits are not reused as
+    /// Rovent position-visit limits or converted into role/NN call counts.
+    fn node_budget_semantics(&self) -> crate::bridge::NodeBudgetSemantics {
+        crate::bridge::NodeBudgetSemantics::LegacySimulations
+    }
+    /// Pure preadmission, before replacing/canceling an existing UCI search.
+    /// It must not create a root, clock, worker, native call or live capability.
+    fn validate_go(
+        &self,
+        _position: &Position,
+        _go: &crate::parser::GoLimits,
+    ) -> Result<(), ContractError> {
+        Ok(())
+    }
+    /// Advertise only a driver that consumes the root-relative depth and
+    /// Rules mate goals. Legacy drivers keep admission disabled.
+    fn search_goal_capability(&self) -> Option<std::num::NonZeroU16> {
+        None
+    }
+    /// Close the complete search-session owner after its workers have joined.
+    /// This is distinct from ending only an optional CPU checker. None is an
+    /// unavailable/legacy interface and never an invented successful fence.
+    fn finish_session(
+        &self,
+        _deadline: Instant,
+    ) -> Result<Option<DriverPhysicalCompletion>, SearchSessionFailure> {
+        Ok(None)
+    }
     #[cfg(feature = "search-work-receipts")]
     fn followup_lifecycle(
         &self,
@@ -2001,6 +2096,13 @@ impl SearchSessionDriver for CpuSessionDriver {
             .map_err(|error| SearchSessionFailure::debug("CpuWorkReceipt", &error))?;
         let mut observation = AttemptObservation::NoWork;
         let result = (|| {
+            if context.goal.has_goal() {
+                return Err(SearchSessionFailure {
+                    physical_completion: DriverPhysicalCompletion::Confirmed,
+                    code: "CpuUnsupportedSearchGoal",
+                    detail: "legacy CPU session does not implement Rovent depth/mate goals".into(),
+                });
+            }
             if context.control.max_simulations > self.max_nodes {
                 return Err(SearchSessionFailure {
                     physical_completion: DriverPhysicalCompletion::Confirmed,
@@ -2015,6 +2117,7 @@ impl SearchSessionDriver for CpuSessionDriver {
                     detail: error.to_string(),
                 })? {
                     return Ok(SearchSessionReport {
+                        mate_strategy: None,
                         best_move: None,
                         work: DriverWork::Cpu {
                             nodes: 0,
@@ -2040,6 +2143,7 @@ impl SearchSessionDriver for CpuSessionDriver {
                 detail: error.to_string(),
             })? {
                 return Ok(SearchSessionReport {
+                    mate_strategy: None,
                     best_move: None,
                     work: DriverWork::Cpu {
                         nodes: 0,
@@ -2056,22 +2160,46 @@ impl SearchSessionDriver for CpuSessionDriver {
                 deadline: Some(context.control.admission_deadline),
             };
             observation = AttemptObservation::CpuStarted;
-            let attempted = engine.analyze_with_progress(
-                position,
-                limits,
-                &context.control.cancellation,
-                |iteration| {
-                    if let Some(movement) = iteration.best_move {
-                        progress(movement);
-                    }
-                },
-            );
+            // The existing restricted API preserves child legality and TT
+            // namespace. It has no per-iteration observer; only the final
+            // validated report is published for this branch.
+            let attempted = if let Some(root_moves) = &context.root_moves {
+                engine.analyze_root_moves(
+                    position,
+                    root_moves,
+                    limits,
+                    &context.control.cancellation,
+                )
+            } else {
+                engine.analyze_with_progress(
+                    position,
+                    limits,
+                    &context.control.cancellation,
+                    |iteration| {
+                        if let Some(movement) = iteration.best_move {
+                            progress(movement);
+                        }
+                    },
+                )
+            };
             if let Some(work) = engine.last_attempt_work() {
                 observation = AttemptObservation::CpuFailed(work);
             }
             let report =
                 attempted.map_err(|error| SearchSessionFailure::debug("CpuSearch", &error))?;
             observation = AttemptObservation::cpu(&report, limits.max_depth);
+            if report.best_move.is_some_and(|movement| {
+                context
+                    .root_moves
+                    .as_ref()
+                    .is_some_and(|moves| !moves.contains(&movement))
+            }) {
+                return Err(SearchSessionFailure {
+                    physical_completion: DriverPhysicalCompletion::Confirmed,
+                    code: "CpuRootRestriction",
+                    detail: "CPU result escaped the immutable root restriction".into(),
+                });
+            }
             if context.accepts().map_err(|error| SearchSessionFailure {
                 physical_completion: DriverPhysicalCompletion::Confirmed,
                 code: "CpuAuthority",
@@ -2082,6 +2210,7 @@ impl SearchSessionDriver for CpuSessionDriver {
                 }
             }
             Ok(SearchSessionReport {
+                mate_strategy: None,
                 best_move: report.best_move,
                 work: DriverWork::Cpu {
                     nodes: report.nodes,
@@ -2201,6 +2330,13 @@ mod tests {
             };
             let context = SearchSessionContext {
                 authority,
+                root_moves: None,
+                goal: rz_contracts::rovent::SearchGoal::default(),
+                original_go: None,
+                original_time_budget: None,
+                original_start: None,
+                effective_clock: None,
+                requested_nodes: None,
                 control,
                 cancellation: CancelToken::new(),
                 shutdown_deadline: budget.output_deadline,
@@ -2453,11 +2589,93 @@ mod tests {
         control.soft_deadline = now + Duration::from_secs(4);
         SearchSessionContext {
             authority,
+            root_moves: None,
+            goal: rz_contracts::rovent::SearchGoal::default(),
+            original_go: None,
+            original_time_budget: None,
+            original_start: None,
+            effective_clock: None,
+            requested_nodes: None,
             control,
             cancellation: CancelToken::new(),
             shutdown_deadline: now + Duration::from_secs(6),
             current: Arc::new(Mutex::new(SessionScope::Search(authority))),
         }
+    }
+
+    #[test]
+    fn own_cpu_session_consumes_the_root_restriction_for_search_and_progress() {
+        let driver = CpuSessionDriver::new(
+            CpuConfig {
+                tt_entries: 0,
+                max_depth: 1,
+                ..CpuConfig::default()
+            },
+            64,
+        )
+        .unwrap();
+        let mut context = checker_context(&driver);
+        let allowed = BoardMove::from_uci("e2e4").unwrap();
+        context.root_moves = Some(Arc::from([allowed]));
+        let mut observed = Vec::new();
+        let report = driver
+            .run(&Position::startpos(), &context, &mut |movement| {
+                observed.push(movement)
+            })
+            .unwrap();
+        assert_eq!(report.best_move, Some(allowed));
+        assert!(!observed.is_empty());
+        assert!(observed.iter().all(|movement| *movement == allowed));
+        let DriverWork::Cpu { nodes, .. } = report.work else {
+            panic!("CPU work only")
+        };
+        assert!(nodes > 0 && nodes <= context.control.max_simulations);
+    }
+
+    #[test]
+    fn own_cpu_session_preserves_special_root_moves_and_rejects_goals_without_capability() {
+        for (fen, movement) in [
+            ("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", "e1g1"),
+            ("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2", "e5d6"),
+            ("4k3/P7/8/8/8/8/8/4K3 w - - 0 1", "a7a8n"),
+        ] {
+            let driver = CpuSessionDriver::new(
+                CpuConfig {
+                    tt_entries: 0,
+                    max_depth: 1,
+                    ..CpuConfig::default()
+                },
+                64,
+            )
+            .unwrap();
+            let mut context = checker_context(&driver);
+            let allowed = BoardMove::from_uci(movement).unwrap();
+            let position = Position::from_fen(fen).unwrap();
+            assert!(position.legal_moves().contains(&allowed));
+            context.root_moves = Some(Arc::from([allowed]));
+            let report = driver.run(&position, &context, &mut |_| {}).unwrap();
+            assert_eq!(report.best_move, Some(allowed));
+        }
+        let driver = CpuSessionDriver::new(
+            CpuConfig {
+                tt_entries: 0,
+                ..CpuConfig::default()
+            },
+            64,
+        )
+        .unwrap();
+        let mut context = checker_context(&driver);
+        context.goal.depth_plies = std::num::NonZeroU16::new(1);
+        let failure = driver
+            .run(&Position::startpos(), &context, &mut |_| {
+                panic!("unsupported goal must not publish progress")
+            })
+            .unwrap_err();
+        assert_eq!(failure.code, "CpuUnsupportedSearchGoal");
+        assert_eq!(
+            failure.physical_completion,
+            DriverPhysicalCompletion::Confirmed
+        );
     }
 
     fn refinement_config() -> PalsConfig {
