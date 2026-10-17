@@ -16,9 +16,12 @@ from pathlib import Path
 
 from .generation_data import digest, fields, identifier, sha, uint
 from . import rovent_corpus as original
+from .rovent_corpus_codec import (LEGACY_CODEC, SUBMITTED_CODEC, codec_from_publication,
+    validate_container_pair, validate_record_codec)
 from .rovent_training_bootstrap import MAX_READ_BYTES as _MAX_SHARED_READ_BYTES
 
 PUBLICATION_DOMAIN = "rz-rovent-corpus-publication/1"
+SUBMITTED_PUBLICATION_DOMAIN = "rz-rovent-corpus-publication/2"
 OBSERVATION_DOMAIN = "rz-rovent-historical-corpus-observation/1"
 NATIVE_DOMAIN = "rz-rovent-native-owner-event/2"
 ROOT_DOMAIN = "rz-rovent-collection-root-admission/1"
@@ -144,11 +147,21 @@ def _relative_pin(value, *, maximum, description):
 
 
 def _publication(value, limits):
+    """The original /1 parser does not admit or convert submitted /2 bytes."""
+    return _publication_for_codec(value, limits, LEGACY_CODEC)
+
+
+def _submitted_publication(value, limits):
+    """Select the explicit submitted family without changing its body."""
+    return _publication_for_codec(value, limits, SUBMITTED_CODEC)
+
+
+def _publication_for_codec(value, limits, codec):
     fields(value, ("schema", "manifest", "index", "chunks", "canonical_manifest_sha256",
                    "canonical_index_sha256", "source_commit", "source_sha256", "runtime_sha256",
                    "record_count", "total_payload_bytes", "native_admission_sha256", "admissions"),
            "historical corpus publication")
-    if value["schema"] != PUBLICATION_DOMAIN:
+    if codec not in (LEGACY_CODEC, SUBMITTED_CODEC) or value["schema"] != codec.publication_domain:
         raise ValueError("explicit historical Rovent publication domain required")
     for name in ("manifest", "index"):
         _relative_pin(value[name], maximum=min(_MAX_METADATA_BYTES, limits.max_file_bytes),
@@ -239,12 +252,22 @@ def _read_file(root, pin, budget, *, relative=True, json_metadata=False):
 
 
 def _join_metadata(registration, publication, manifest, index):
+    return _join_metadata_for_codec(registration, publication, manifest, index, LEGACY_CODEC)
+
+
+def _join_submitted_metadata(registration, publication, manifest, index):
+    return _join_metadata_for_codec(registration, publication, manifest, index, SUBMITTED_CODEC)
+
+
+def _join_metadata_for_codec(registration, publication, manifest, index, codec):
     # The caller already bounded metadata files and allocation. The same
     # original schema checker is used here and by the final full reader.
-    original._manifest(manifest, original.CorpusLimits())
+    if codec_from_publication(publication) is not codec:
+        raise ValueError("historical publication/manifest wire family mismatch; no conversion")
+    original._manifest(manifest, original.CorpusLimits(), codec=codec)
     fields(index, ("schema", "manifest_sha256", "record_count", "chunks", "origins"),
            "historical original corpus index")
-    if index["schema"] != original.INDEX_DOMAIN:
+    if validate_container_pair(manifest, index) is not codec:
         raise ValueError("historical original corpus index domain required")
     for key, registration_key in (("source_commit", "collection_source_commit"),
                                   ("source_sha256", "collection_source_sha256"),
@@ -254,8 +277,8 @@ def _join_metadata(registration, publication, manifest, index):
     for key in ("model_semantics_sha256", "model_epoch", "context_epoch", "recipe_sha256", "stage_id"):
         if manifest[key] != registration[key]:
             raise ValueError("historical manifest model/epoch/recipe/stage mismatch")
-    if (digest(original.MANIFEST_DOMAIN, manifest) != publication["canonical_manifest_sha256"]
-            or digest(original.INDEX_DOMAIN, index) != publication["canonical_index_sha256"]
+    if (digest(codec.manifest_domain, manifest) != publication["canonical_manifest_sha256"]
+            or digest(codec.index_domain, index) != publication["canonical_index_sha256"]
             or index.get("manifest_sha256") != publication["canonical_manifest_sha256"]):
         raise ValueError("historical publication canonical manifest/index mismatch")
     if (index.get("record_count") != publication["record_count"] or type(index.get("chunks")) is not list
@@ -359,6 +382,21 @@ def _join_record(registration, record, admissions, runtime_bundles=None):
     for name in ("raw_submission", "raw_completion", "raw_retirement"):
         if native[name].get("schema") != NATIVE_DOMAIN:
             raise ValueError("historical publication requires explicit native raw /2; no conversion")
+    return _join_record_assets(registration, record, admissions, runtime_bundles)
+
+
+def _join_submitted_record(registration, manifest, record, admissions, runtime_bundles=None):
+    """Require submitted raw /3 and its original selected metadata, never /2."""
+    if validate_record_codec(manifest, record) is not SUBMITTED_CODEC:
+        raise ValueError("historical submitted publication requires its explicit record family")
+    from .rovent_native_v3 import validate_native_v3
+    validate_native_v3(manifest, record)
+    return _join_record_assets(registration, record, admissions, runtime_bundles)
+
+
+def _join_record_assets(registration, record, admissions, runtime_bundles):
+    """Original lock, loaded assets and root seals shared by the two codecs."""
+    native = record["native"]
     retired = native["raw_retirement"]
     admission = retired.get("root_admission")
     if type(admission) is not dict or admission.get("schema") != ROOT_DOMAIN:
@@ -437,11 +475,20 @@ class HistoricalRoventCorpus:
             raise ValueError("bounded typed historical ancestor owners required")
         root = _registration(registration)
         registration = copy.deepcopy(registration)
-        publication = _publication(_read_file(root, registration["publication"], read_budget,
-                                              relative=False, json_metadata=True), limits)
+        publication_body = _read_file(root, registration["publication"], read_budget,
+                                      relative=False, json_metadata=True)
+        codec = codec_from_publication(publication_body)
+        if codec is LEGACY_CODEC:
+            publication = _publication(publication_body, limits)
+            join_metadata = _join_metadata
+            read_corpus = original.RoventTrainingCorpus.from_files
+        else:
+            publication = _submitted_publication(publication_body, limits)
+            join_metadata = _join_submitted_metadata
+            read_corpus = original.RoventTrainingCorpus.from_submitted_files
         manifest = _read_file(root, publication["manifest"], read_budget, json_metadata=True)
         index = _read_file(root, publication["index"], read_budget, json_metadata=True)
-        _join_metadata(registration, publication, manifest, index)
+        join_metadata(registration, publication, manifest, index)
         for pin in publication["chunks"]:
             _read_file(root, pin, read_budget)
         locks_by_path, admissions, bundles_by_sha, runtime_bundles = {}, {}, {}, {}
@@ -469,21 +516,27 @@ class HistoricalRoventCorpus:
         # Reuse the full original decoder and bounded owner rows. Every read in
         # this second pass uses the same per-call budget as the publication,
         # first pass and original lock artifacts; there is no global patch.
-        corpus = original.RoventTrainingCorpus.from_files(root / publication["manifest"]["path"],
+        corpus = read_corpus(root / publication["manifest"]["path"],
             manifest_sha256=publication["manifest"]["sha256"],
             index_path=root / publication["index"]["path"], index_sha256=publication["index"]["sha256"],
             ancestors=tuple(owner.corpus for owner in ancestors), limits=limits, read_accounting=read_budget)
-        if (corpus.manifest_semantic_sha256 != publication["canonical_manifest_sha256"]
+        if (corpus._codec is not codec
+                or corpus.manifest_semantic_sha256 != publication["canonical_manifest_sha256"]
                 or corpus.index_semantic_sha256 != publication["canonical_index_sha256"]):
             raise ValueError("historical original reader changed publication canonical seals")
-        actual_admissions = sorted({_join_record(registration, record, admissions, runtime_bundles) for record in corpus._records})
+        if codec is LEGACY_CODEC:
+            actual_admissions = sorted({_join_record(registration, record, admissions, runtime_bundles)
+                for record in corpus._records})
+        else:
+            actual_admissions = sorted({_join_submitted_record(registration, corpus._manifest, record,
+                admissions, runtime_bundles) for record in corpus._records})
         if actual_admissions != publication["native_admission_sha256"]:
             raise ValueError("historical publication full native admission set mismatch")
         expected_ancestors = sorted(owner.corpus.index_semantic_sha256 for owner in ancestors)
         if expected_ancestors != list(declared_ancestors) or len(set(expected_ancestors)) != len(expected_ancestors):
             raise ValueError("historical original ancestor publication set mismatch")
         owner = cls.__new__(cls)
-        owner._corpus, owner._registration, owner._publication = corpus, registration, publication
+        owner._corpus, owner._registration, owner._publication, owner._codec = corpus, registration, publication, codec
         owner._observation = {"schema": OBSERVATION_DOMAIN, "historical_evidence_only": True,
             "publication_sha256": registration["publication"]["sha256"],
             "manifest_sha256": corpus.corpus_sha256, "index_sha256": corpus.index_sha256,
@@ -505,6 +558,9 @@ class HistoricalRoventCorpus:
         return owner
 
     def _check(self):
+        if (self._codec is not codec_from_publication(self._publication)
+                or self._corpus._codec is not self._codec):
+            raise ValueError("historical corpus owner changed its original wire family")
         if digest(OBSERVATION_DOMAIN, [self._registration, self._publication, self._observation]) != self._owner_sha256:
             raise ValueError("historical corpus observation owner metadata changed")
         self._corpus._check_owner(full=True)

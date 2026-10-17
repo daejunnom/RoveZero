@@ -21,7 +21,7 @@ try:
     from rz_pals_model import rovent_r_corpus as r
     from rz_pals_model import rovent_r_readout as wire
     from rz_pals_model import generation_data as data
-    from test_rovent_r_corpus import fixture, config, seal, write, h
+    from test_rovent_r_corpus import fixture, config, seal, write, h, submitted_pc_owner
     from test_rovent_corpus import original_fixture, seal_record, write_corpus
 finally:
     sys.meta_path.remove(_guard)
@@ -41,27 +41,32 @@ def reseal_pc(manifest, row):
     seal_record(manifest, row)
 
 
-def paired_owners(root, *, pc_split="train", r_split="train", leak=False, pc_already_in_r=False, pc_model_epoch=None):
+def paired_owners(root, *, pc_split="train", r_split="train", leak=False, pc_already_in_r=False, pc_model_epoch=None,
+                  submitted_pc=False):
     recipe, manifest, r_row, lock = fixture()
     splits = recipe.to_dict()["opening_splits"]
     pc_opening = next(key for key, split in splits.items() if split == pc_split)
     r_opening = next(key for key, split in splits.items() if split == r_split)
-    _original_recipe, pc_manifest, pc_row = original_fixture(opening=pc_opening)
-    for key in ("source_commit", "source_sha256", "runtime_sha256", "model_semantics_sha256", "recipe_sha256", "model_epoch", "context_epoch"):
-        pc_manifest[key] = manifest["collection"][key]
-    if pc_model_epoch is not None:
-        pc_manifest["model_epoch"] = pc_model_epoch
-    pc_row["input"].update(model_epoch=pc_manifest["model_epoch"], context_epoch=pc_manifest["context_epoch"])
-    pc_row["split"] = pc_split
+    if submitted_pc:
+        pc_owner, pc_row = submitted_pc_owner(root / "pc", recipe, manifest["collection"], lock,
+            opening=pc_opening, model_epoch=pc_model_epoch)
+    else:
+        _original_recipe, pc_manifest, pc_row = original_fixture(opening=pc_opening)
+        for key in ("source_commit", "source_sha256", "runtime_sha256", "model_semantics_sha256", "recipe_sha256", "model_epoch", "context_epoch"):
+            pc_manifest[key] = manifest["collection"][key]
+        if pc_model_epoch is not None:
+            pc_manifest["model_epoch"] = pc_model_epoch
+        pc_row["input"].update(model_epoch=pc_manifest["model_epoch"], context_epoch=pc_manifest["context_epoch"])
+        pc_row["split"] = pc_split
+        reseal_pc(pc_manifest, pc_row)
+        pc_root = root / "pc"
+        pc_root.mkdir(parents=True)
+        pc_owner = write_corpus(pc_root, pc_manifest, [pc_row])
+        pc_owner.admit_stage(recipe, pc_manifest["stage_id"], pc_manifest["model_epoch"], pc_manifest["context_epoch"], [], [])
     r_row["lineage"]["opening_id"] = r_opening
     r_row["split"] = r_split
     if leak:
         r_row["lineage"]["transposition_sha256"] = pc_row["input"]["transposition_sha256"]
-    reseal_pc(pc_manifest, pc_row)
-    pc_root = root / "pc"
-    pc_root.mkdir(parents=True)
-    pc_owner = write_corpus(pc_root, pc_manifest, [pc_row])
-    pc_owner.admit_stage(recipe, pc_manifest["stage_id"], pc_manifest["model_epoch"], pc_manifest["context_epoch"], [], [])
     if pc_already_in_r:
         manifest["pc_ancestor_index_sha256"] = [pc_owner.index_semantic_sha256]
         r_row["manifest_sha256"] = data.digest(wire.MANIFEST_DOMAIN, manifest)
@@ -191,6 +196,40 @@ class JointCorpusTests(unittest.TestCase):
             self.assertEqual(view.pool_metadata()["pool_sha256"], old_pool)
             self.assertEqual(r_owner._manifest["collection"]["model_epoch"], 1)
             self.assertFalse(view.observation()["execution_authorized"])
+
+    def test_submitted_pc_opaque_tokens_keep_new_domain_in_joint_current_stream(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pc_owner, r_owner, pc_row, _r_row = paired_owners(Path(directory), submitted_pc=True)
+            view = build(pc_owner, r_owner, pc_inputs=[pc_row["input_sha256"]], pc_origins=[pc_row["origin_sha256"]])
+            token = view.pc_rows("proposer")[0]
+            self.assertIs(type(token), pc.CorpusRow)
+            self.assertIs(token._owner, pc_owner)
+            self.assertEqual(pc_owner.training_sample(token)["input"]["schema"], "rz-rovent-submitted-input/1")
+            sources = {row.source.source_domain for row in view._union.all_occurrences()}
+            self.assertEqual(sources, {"rz-rovent-training-record/2", "rz-rovent-r-readout-record/1"})
+            self.assertIn(pc_row["record_sha256"], view.observation()["allowed_pc_record_sha256"])
+            self.assertFalse(view.observation()["execution_authorized"])
+
+    def test_submitted_pc_and_r_holdout_are_excluded_without_erasing_raw_occurrences(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pc_owner, r_owner, pc_row, _r_row = paired_owners(Path(directory), submitted_pc=True, r_split="holdout", leak=True)
+            view = build(pc_owner, r_owner)
+            self.assertEqual(len(view.pc_rows("proposer")), 0)
+            self.assertEqual(len(view.r_rows("holdout", optimization=False)), 0)
+            self.assertEqual(view.observation()["lineage"]["occurrence_count"], 2)
+            self.assertEqual(len(pc_owner.rows("proposer")), 1)
+            with self.assertRaisesRegex(ValueError, "global holdout/cross-split contamination"):
+                build(pc_owner, r_owner, pc_inputs=[pc_row["input_sha256"]], pc_origins=[pc_row["origin_sha256"]])
+
+    def test_submitted_pc_declared_by_r_is_deduplicated_without_becoming_legacy_pc(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pc_owner, r_owner, _pc_row, _r_row = paired_owners(Path(directory), submitted_pc=True, pc_already_in_r=True)
+            view = build(pc_owner, r_owner)
+            self.assertEqual(view.observation()["lineage"]["occurrence_count"], 2)
+            self.assertEqual(len(view.pc_rows("proposer")), 1)
+            self.assertEqual(len(view.r_rows()), 1)
+            self.assertFalse(any(row.source.source_domain == "rz-rovent-training-record/1"
+                                 for row in view._union.all_occurrences()))
 
 
 if __name__ == "__main__":

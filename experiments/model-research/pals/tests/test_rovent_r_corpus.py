@@ -213,6 +213,66 @@ def open_owner(root, *, source=None, rows=None, **options):
         expected_nnuec_parameter_sha256=first["bound"]["parameter_sha256"], **options)
 
 
+def submitted_pc_owner(root, recipe, collection, lock, *, opening="train-a", model_epoch=None):
+    """New-format synthetic wire via the explicit loader, never a live source.
+
+    Reuse only the schema fixture's original raw bodies. No real corpus is
+    converted, and no parent Rules replay or historical native proof is claimed.
+    """
+    from rz_pals_model import rovent_corpus as pc
+    from rz_pals_model import rovent_corpus_codec as codecs
+    from rz_pals_model import rovent_submitted_input as submitted
+    from rz_pals_model import rovent_native_v3 as native_v3
+    from test_rovent_native_v3 import native_fixture
+    manifest, row = native_fixture()
+    family = codecs.SUBMITTED_CODEC
+    for key in ("source_commit", "source_sha256", "runtime_sha256", "model_semantics_sha256", "recipe_sha256",
+                "model_epoch", "context_epoch", "teachers", "opening_splits"):
+        manifest[key] = copy.deepcopy(collection[key])
+    if model_epoch is not None:
+        manifest["model_epoch"] = model_epoch
+    row["input"].update(opening_id=opening, model_epoch=manifest["model_epoch"], context_epoch=manifest["context_epoch"])
+    row["split"] = manifest["opening_splits"][opening]
+    row["input_sha256"] = submitted.seal_input(row["input"])
+    native = row["native"]
+    native["source_sha256"] = manifest["source_sha256"]
+    root_admission = native["raw_retirement"]["root_admission"]
+    origin = root_admission["native_origin"]
+    origin.update(source_commit=manifest["source_commit"], source_sha256=manifest["source_sha256"],
+        source_components=copy.deepcopy(lock["manifest"]["engine"]["source_components"]),
+        runtime_sha256=manifest["runtime_sha256"], runtime_library_sha256=manifest["runtime_sha256"],
+        model_semantics_sha256=manifest["model_semantics_sha256"])
+    root_admission["native_origin_sha256"] = data.digest(corpus.ORIGIN_DOMAIN, origin)
+    native["raw_retirement"]["root_admission_sha256"] = data.digest(corpus.ROOT_DOMAIN, root_admission)
+    for name in ("raw_submission", "raw_completion", "raw_retirement"):
+        native[name].update(source_sha256=manifest["source_sha256"], input_sha256=row["input_sha256"])
+        if name != "raw_submission":
+            native[name]["submitted_sha256"] = native["raw_submission_sha256"]
+        if name == "raw_retirement":
+            native[name]["completed_sha256"] = native["raw_completion_sha256"]
+        native[name + "_sha256"] = data.digest(native_v3.NATIVE_DOMAIN, native[name])
+    row["origin_sha256"] = data.digest(pc.ORIGIN_DOMAIN, pc._origin(manifest, row))
+    row["record_sha256"] = pc._record_digest(row)
+    indexed = {key: row[key] for key in ("record_sha256", "input_sha256", "origin_sha256", "split")}
+    indexed.update({key: row["input"][key] for key in ("game_id", "opening_id", "line_genealogy_id", "transposition_sha256")})
+    indexed.update(copy.deepcopy(row["lineage"]))
+    root.mkdir(parents=True, exist_ok=True)
+    chunk = raw(row)
+    (root / "chunks").mkdir()
+    index = {"schema": family.index_domain, "manifest_sha256": data.digest(family.manifest_domain, manifest),
+        "record_count": 1, "chunks": [{"path": "chunks/000000.jsonl", "bytes": len(chunk),
+            "sha256": hashlib.sha256(chunk).hexdigest(), "records": 1}], "origins": [indexed]}
+    manifest_bytes, index_bytes = raw(manifest), raw(index)
+    (root / "manifest.json").write_bytes(manifest_bytes)
+    (root / "index.json").write_bytes(index_bytes)
+    (root / "chunks" / "000000.jsonl").write_bytes(chunk)
+    owner = pc.RoventTrainingCorpus.from_submitted_files(root / "manifest.json",
+        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(), index_path=root / "index.json",
+        index_sha256=hashlib.sha256(index_bytes).hexdigest())
+    owner.admit_stage(recipe, manifest["stage_id"], manifest["model_epoch"], manifest["context_epoch"], [], [])
+    return owner, row
+
+
 def add_candidate_wdl(row):
     """Synthetic terminal metadata only; current R producer emits no WDL yet."""
     anchor = copy.deepcopy(row["bound"]["current_rules"]["anchor"])
@@ -590,6 +650,66 @@ class RCorpusTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "source anchors must match selected record order/count"):
                 open_owner(Path(directory), source=source)
+
+    def test_submitted_pc_ancestor_uses_explicit_new_source_domain(self):
+        recipe, manifest, row, lock = fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pc_owner, pc_row = submitted_pc_owner(root / "pc", recipe, manifest["collection"], lock)
+            manifest["pc_ancestor_index_sha256"] = [pc_owner.index_semantic_sha256]
+            row["manifest_sha256"] = data.digest(wire.MANIFEST_DOMAIN, manifest)
+            seal(row)
+            owner = open_owner(root / "r", source=(recipe, manifest, row, lock), pc_corpora=(pc_owner,))
+            occurrences = owner._union.all_occurrences()
+            actual = next(value for value in occurrences if value.record_sha256 == pc_row["record_sha256"])
+            self.assertEqual(actual.source.source_domain, "rz-rovent-training-record/2")
+            self.assertFalse(any(value.source.source_domain == "rz-rovent-training-record/1" for value in occurrences))
+            self.assertEqual(len(owner.rows()), 1)
+            self.assertFalse(owner.observation()["execution_authorized"])
+
+    def test_r_causal_genealogy_resolves_exact_submitted_pc_domain(self):
+        recipe, manifest, row, lock = fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pc_owner, pc_row = submitted_pc_owner(root / "pc", recipe, manifest["collection"], lock)
+            manifest["pc_ancestor_index_sha256"] = [pc_owner.index_semantic_sha256]
+            row["lineage"]["pc_genealogy"] = {key: pc_row[key] for key in ("record_sha256", "input_sha256", "origin_sha256")}
+            row["manifest_sha256"] = data.digest(wire.MANIFEST_DOMAIN, manifest)
+            seal(row)
+            owner = open_owner(root / "r", source=(recipe, manifest, row, lock), pc_corpora=(pc_owner,))
+            occurrence = next(value for value in owner._union.all_occurrences() if value.source.source_domain == wire.RECORD_DOMAIN)
+            self.assertEqual([(source.source_domain, source.origin_sha256) for source in occurrence.ancestor_origins],
+                             [("rz-rovent-training-record/2", pc_row["origin_sha256"])])
+
+    def test_original_r_manifest_pc_index_set_accepts_both_pc_wire_families(self):
+        from rz_pals_model import rovent_corpus as pc
+        from test_rovent_corpus import original_fixture, seal_record, reseal_native, write_corpus
+        recipe, manifest, row, lock = fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            new_owner, new_row = submitted_pc_owner(root / "new", recipe, manifest["collection"], lock)
+            _old_recipe, old_manifest, old_row = original_fixture()
+            for key in ("source_commit", "source_sha256", "runtime_sha256", "model_semantics_sha256", "recipe_sha256",
+                        "model_epoch", "context_epoch"):
+                old_manifest[key] = manifest["collection"][key]
+            old_row["input"].update(model_epoch=old_manifest["model_epoch"], context_epoch=old_manifest["context_epoch"])
+            old_row["input_sha256"] = data.seal_input(old_row["input"])
+            old_row["native"]["source_sha256"] = old_manifest["source_sha256"]
+            for name in ("raw_submission", "raw_completion", "raw_retirement"):
+                old_row["native"][name].update(source_sha256=old_manifest["source_sha256"], input_sha256=old_row["input_sha256"])
+            reseal_native(old_row)
+            seal_record(old_manifest, old_row)
+            (root / "old").mkdir()
+            old_owner = write_corpus(root / "old", old_manifest, [old_row])
+            manifest["pc_ancestor_index_sha256"] = sorted([old_owner.index_semantic_sha256, new_owner.index_semantic_sha256])
+            row["manifest_sha256"] = data.digest(wire.MANIFEST_DOMAIN, manifest)
+            seal(row)
+            owner = open_owner(root / "r", source=(recipe, manifest, row, lock), pc_corpora=(new_owner, old_owner))
+            sources = {value.record_sha256: value.source.source_domain for value in owner._union.all_occurrences()}
+            self.assertEqual(sources[old_row["record_sha256"]], "rz-rovent-training-record/1")
+            self.assertEqual(sources[new_row["record_sha256"]], "rz-rovent-training-record/2")
+            self.assertEqual(len(owner._union.all_occurrences()), 3)
+            self.assertEqual(len(owner.rows()), 1)
 
 
 if __name__ == "__main__":

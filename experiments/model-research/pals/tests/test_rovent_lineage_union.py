@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError
 import hashlib
 import importlib.abc
 import sys
+from types import SimpleNamespace
 import unittest
 
 
@@ -19,6 +20,7 @@ try:
     from rz_pals_model import rovent_lineage_union as union
     from rz_pals_model import rovent_generation as legacy
     from rz_pals_model.generation_data import digest
+    from rz_pals_model import rovent_corpus_codec as codec
     from test_rovent_generation import recipe_value
 finally:
     sys.meta_path.remove(_guard)
@@ -209,6 +211,66 @@ class LineageUnionTests(unittest.TestCase):
         self.assertEqual(len(owner.rows("validation", source_domain=union.R_SOURCE)), 1)
         with self.assertRaisesRegex(ValueError, "validation/global holdout cannot enter optimization"):
             owner.rows("validation", optimization=True)
+
+    def test_old_pc_r_only_union_keeps_original_domains_seal_and_source_counts(self):
+        registered = recipe()
+        rows = [entry(registered, union.PC_SOURCE, "old"), entry(registered, union.R_SOURCE, "r")]
+        owner = union.LineageUnion.from_projections(registered, rows)
+        self.assertEqual(owner.sha256, digest("rz-rovent-pc-r-lineage-union/1",
+            {"recipe_sha256": registered.sha256, "occurrences": rows}))
+        self.assertEqual(owner.observation().to_mapping()["sources"], [
+            {"source_domain": "rz-rovent-training-record/1", "occurrence_count": 1, "unique_input_count": 1},
+            {"source_domain": "rz-rovent-r-readout-record/1", "occurrence_count": 1, "unique_input_count": 1}])
+
+    def test_submitted_pc_domain_is_preserved_without_relabelling_repeated_inputs(self):
+        registered = recipe()
+        first = entry(registered, union.PC_SOURCE, "old")
+        second = entry(registered, union.PC_SOURCE_V2, "submitted", input_sha256=first["projection"]["input_sha256"])
+        owner = union.LineageUnion.from_projections(registered, [first, second])
+        self.assertEqual([row.source.source_domain for row in owner.all_occurrences()],
+                         ["rz-rovent-training-record/1", "rz-rovent-training-record/2"])
+        self.assertEqual(len(owner.rows("train", optimization=True, source_domain=union.PC_SOURCE_V2)), 1)
+        self.assertEqual(owner.sha256, digest(union.UNION_DOMAIN,
+            {"recipe_sha256": registered.sha256, "occurrences": [first, second]}))
+        self.assertEqual(owner.observation().occurrence_count, 2)
+        self.assertNotIn("valid_target_count", owner.observation().to_mapping())
+
+    def test_mixed_pc_families_and_r_share_cross_split_exclusion_and_retained_rejection(self):
+        registered = recipe()
+        old = entry(registered, union.PC_SOURCE, "old")
+        submitted = entry(registered, union.PC_SOURCE_V2, "new", input_sha256=old["projection"]["input_sha256"])
+        holdout = entry(registered, union.R_SOURCE, "holdout", split="holdout")
+        holdout["projection"]["transposition_sha256"] = submitted["projection"]["transposition_sha256"]
+        owner = union.LineageUnion.from_projections(registered, [old, submitted, holdout])
+        self.assertEqual(owner.rows("train", optimization=True), ())
+        self.assertEqual(owner.observation().excluded_occurrence_count, 3)
+        self.assertEqual(len(owner.all_occurrences()), 3)
+        with self.assertRaisesRegex(ValueError, "global holdout/cross-split contamination"):
+            owner.require_training_origins("common", [ref(submitted)])
+
+    def test_submitted_ancestor_edge_retains_its_own_domain_in_mixed_chain(self):
+        registered = recipe()
+        old = entry(registered, union.PC_SOURCE, "old")
+        submitted = entry(registered, union.PC_SOURCE_V2, "new", stage="sf-ft", ancestors=(ref(old),))
+        current = entry(registered, union.R_SOURCE, "r", stage="sf-ft", ancestors=(ref(submitted),))
+        owner = union.LineageUnion.from_projections(registered, [old, submitted, current])
+        audit = owner.require_training_origins("sf-ft", sorted((ref(old), ref(submitted), ref(current)),
+            key=lambda value: (value["source_domain"], value["origin_sha256"])))
+        self.assertEqual({value.source_domain for value in audit.origins}, set((*union.PC_SOURCES, union.R_SOURCE)))
+        wrong = copy.deepcopy(current)
+        wrong["ancestor_origins"][0]["source_domain"] = union.PC_SOURCE
+        with self.assertRaisesRegex(ValueError, "ancestor origin missing from full source union"):
+            union.LineageUnion.from_projections(registered, [old, submitted, wrong])
+
+    def test_owner_codec_must_explicitly_match_original_manifest_family(self):
+        old = SimpleNamespace(_manifest={"schema": codec.LEGACY_CODEC.manifest_domain})
+        submitted = SimpleNamespace(_manifest={"schema": codec.SUBMITTED_CODEC.manifest_domain}, _codec=codec.SUBMITTED_CODEC)
+        self.assertEqual(union.pc_source_domain(old), union.PC_SOURCE)
+        self.assertEqual(union.pc_source_domain(submitted), union.PC_SOURCE_V2)
+        for owner in (SimpleNamespace(_manifest=submitted._manifest),
+                      SimpleNamespace(_manifest=old._manifest, _codec=codec.SUBMITTED_CODEC)):
+            with self.assertRaisesRegex(ValueError, "owner codec differs from its manifest family"):
+                union.pc_source_domain(owner)
 
 
 if __name__ == "__main__":

@@ -14,19 +14,41 @@ import json
 
 from .generation_data import digest, fields, sha, uint
 from .rovent_generation import SeriesRecipe, validate_record_origin
+from .rovent_corpus_codec import LEGACY_CODEC, SUBMITTED_CODEC, codec_from_manifest
 
 UNION_DOMAIN = "rz-rovent-pc-r-lineage-union/1"
 OBSERVATION_DOMAIN = "rz-rovent-pc-r-lineage-observation/1"
 INHERITED_DOMAIN = "rz-rovent-pc-r-inherited-origin-observation/1"
 PC_SOURCE = "rz-rovent-training-record/1"
+PC_SOURCE_V2 = "rz-rovent-training-record/2"
+PC_SOURCES = (PC_SOURCE, PC_SOURCE_V2)
 R_SOURCE = "rz-rovent-r-readout-record/1"
-_SOURCES = (PC_SOURCE, R_SOURCE)
+_LEGACY_SOURCES = (PC_SOURCE, R_SOURCE)
+_SOURCES = (*_LEGACY_SOURCES, PC_SOURCE_V2)
 _PROJECTION_FIELDS = ("input_sha256", "record_sha256", "producer_sha256", "stage_id", "round_id",
                       "teacher_actor_id", "opening_id", "game_id", "line_genealogy_id",
                       "rules_state_sha256", "transposition_sha256")
 _MAX_OCCURRENCES = 262144
 _MAX_METADATA_BYTES = 256 * 1024 * 1024
 _MAX_EDGES = 1048576
+
+
+def pc_source_domain(owner):
+    """Retain an already-open PC owner's explicit wire family.
+
+    This is a metadata join, not a substitute for the original opaque owner
+    type or its integrity check. Callers must perform both before using rows.
+    An old owner may omit the field; a submitted owner must explicitly carry
+    the new codec instead of acquiring it from relabelled manifest JSON.
+    """
+    codec = codec_from_manifest(owner._manifest)
+    if codec is not getattr(owner, "_codec", LEGACY_CODEC):
+        raise ValueError("original P/C owner codec differs from its manifest family")
+    if codec is LEGACY_CODEC:
+        return PC_SOURCE
+    if codec is SUBMITTED_CODEC:
+        return PC_SOURCE_V2
+    raise ValueError("unsupported original P/C source family")
 
 
 @dataclass(frozen=True, order=True)
@@ -236,8 +258,13 @@ class LineageUnion:
         owner._splits, owner._scopes = tuple(sorted(splits.items())), tuple(sorted(scopes.items()))
         owner._recipe_sha256, owner._maximum_metadata = recipe.sha256, max_metadata_bytes
         owner.sha256 = _seal(recipe.sha256, entries, max_metadata_bytes)
+        # Keep the old PC/R observation and integrity projection byte-for-byte
+        # unchanged when no submitted-format occurrence exists. The new source
+        # appears explicitly only in unions which actually contain that source.
+        observed_sources = (*_LEGACY_SOURCES, *((PC_SOURCE_V2,) if any(
+            entry.source.source_domain == PC_SOURCE_V2 for entry in entries) else ()))
         source_counts = tuple(SourceCount(domain, sum(entry.source.source_domain == domain for entry in entries),
-            len({entry.input_sha256 for entry in entries if entry.source.source_domain == domain})) for domain in _SOURCES)
+            len({entry.input_sha256 for entry in entries if entry.source.source_domain == domain})) for domain in observed_sources)
         owner._observation = LineageUnionObservation(OBSERVATION_DOMAIN, recipe.sha256, owner.sha256, len(entries),
             len({(entry.source.source_domain, entry.input_sha256) for entry in entries}), len(contaminated), len(excluded), source_counts)
         owner._integrity_sha256 = owner._integrity()

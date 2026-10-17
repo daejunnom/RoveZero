@@ -22,6 +22,8 @@ from collections.abc import Sequence
 from .generation_data import digest, fields, identifier, sha, uint, validate_input, seal_input
 from .generation_data import wdl_target, divergence_target, task_pairs, trajectory_digest
 from .rovent_generation import GlobalLineageIndex, SeriesRecipe, index_original_input
+from .rovent_corpus_codec import (LEGACY_CODEC, SUBMITTED_CODEC, codec_from_manifest,
+    validate_container_pair, validate_record_codec)
 
 MANIFEST_DOMAIN = "rz-rovent-corpus-manifest/1"
 RECORD_DOMAIN = "rz-rovent-training-record/1"
@@ -39,13 +41,13 @@ def _sha_list(value, maximum, description):
     return value
 
 
-def _manifest(value, limits):
+def _manifest(value, limits, *, codec=LEGACY_CODEC):
     fields(value, ("schema", "corpus_id", "source_commit", "source_sha256", "runtime_sha256",
                    "model_semantics_sha256", "model_epoch", "context_epoch", "recipe_sha256",
                    "stage_id", "round", "round_id", "student", "learner", "one_learner", "inherited_input_sha256",
                    "inherited_origin_sha256", "teachers", "opening_splits", "ancestor_index_sha256"),
            "original Rovent corpus manifest")
-    if value["schema"] != MANIFEST_DOMAIN or value["one_learner"] is not True:
+    if codec not in (LEGACY_CODEC, SUBMITTED_CODEC) or value["schema"] != codec.manifest_domain or value["one_learner"] is not True:
         raise ValueError("new single-learner Rovent corpus domain required")
     for name in ("corpus_id", "stage_id", "round_id", "student", "learner"):
         identifier(value[name])
@@ -92,7 +94,10 @@ def _origin(manifest, record):
 
 def _record_digest(record):
     projected = {**record, "record_sha256": "", "input": {"sealed_input_sha256": record["input_sha256"]}}
-    return digest(RECORD_DOMAIN, projected)
+    domain = record.get("schema")
+    if domain not in (LEGACY_CODEC.record_domain, SUBMITTED_CODEC.record_domain):
+        raise ValueError("explicit original record domain required for its semantic seal")
+    return digest(domain, projected)
 
 
 def _teacher_pin(value):
@@ -135,6 +140,9 @@ def _validate_teachers(recipe, stage, manifest):
 def _native(manifest, record):
     native = record.get("native")
     raw = native.get("raw_submission") if type(native) is dict else None
+    if type(raw) is dict and raw.get("schema") == "rz-rovent-raw-record/3":
+        from .rovent_native_v3 import validate_native_v3
+        return validate_native_v3(manifest, record)
     if type(raw) is dict and raw.get("schema") == "rz-rovent-native-owner-event/2":
         from .rovent_native_v2 import validate_native_v2
         return validate_native_v2(manifest, record)
@@ -424,8 +432,15 @@ def _teacher_head(manifest, record, source, label):
     _teacher_pin(pin)
     binding = raw["binding"]
     collection = type(binding) is dict and binding.get("schema") == COLLECTION_BINDING_DOMAIN
+    submitted = record["native"]["raw_submission"].get("schema") == "rz-rovent-raw-record/3"
+    if submitted and not collection:
+        raise ValueError("submitted corpus requires its independent Collection teacher binding")
     if collection:
-        validate_collection_teacher_binding(manifest, record, actor, pin, binding)
+        if submitted:
+            from .rovent_collection_teacher import validate_collection_teacher_binding_v3
+            validate_collection_teacher_binding_v3(manifest, record, actor, pin, binding)
+        else:
+            validate_collection_teacher_binding(manifest, record, actor, pin, binding)
     else:
         # Preserve the historical exact body and its digest. Descriptor-bearing
         # legacy dispatches are a second explicit variant, never loose extras.
@@ -537,7 +552,8 @@ def _teacher_head(manifest, record, source, label):
 
 
 def _rules_head(record, source, label):
-    native_v2 = record["native"]["raw_submission"].get("schema") == "rz-rovent-native-owner-event/2"
+    native_v2 = record["native"]["raw_submission"].get("schema") in (
+        "rz-rovent-native-owner-event/2", "rz-rovent-raw-record/3")
     extra = ("rules_replay",) if native_v2 else ()
     raw = fields(source["raw_receipt"], ("schema", "kind", "input_sha256", "anchor", "trajectory", "rules_receipt", *extra),
                  "original actual Rules outcome body")
@@ -625,12 +641,23 @@ def _validate_row(manifest, record, indexed_origin, limits):
     fields(record, ("schema", "role", "split", "input", "input_sha256", "origin_sha256", "record_sha256", "lineage",
                     "native", "head_sources", "targets", "divergence_index", "nnuec_input", "nnuec_input_sha256",
                     "nnuec_model_sha256", "nnuec_semantics", "nnuec_wdl"), "original Rovent training record")
-    if record["schema"] != RECORD_DOMAIN:
+    codec = codec_from_manifest(manifest)
+    if codec is SUBMITTED_CODEC:
+        validate_record_codec(manifest, record)
+    elif record["schema"] != RECORD_DOMAIN:
         raise ValueError("new original Rovent corpus record required; legacy/diagnostic records are not converted")
-    snapshot = validate_input(record["input"])
+    if codec is SUBMITTED_CODEC and (type(record["targets"]) is not dict or record["targets"].get("task") is not None
+            or any(record[name] is not None for name in ("nnuec_input", "nnuec_input_sha256", "nnuec_model_sha256",
+                "nnuec_semantics", "nnuec_wdl"))
+            or type(record["head_sources"]) is not dict or set(record["head_sources"]) - {"policy", "wdl", "divergence"}):
+        raise ValueError("submitted P/C record cannot manufacture V or separate R/NNUEC evidence")
+    input_validator, input_seal = validate_input, seal_input
+    if codec is SUBMITTED_CODEC:
+        from .rovent_submitted_input import validate_input as input_validator, seal_input as input_seal
+    snapshot = input_validator(record["input"])
     if (record["role"] != snapshot["role"] or record["split"] != manifest["opening_splits"].get(snapshot["opening_id"])
             or snapshot["model_epoch"] != manifest["model_epoch"] or snapshot["context_epoch"] != manifest["context_epoch"]
-            or sha(record["input_sha256"]) != seal_input(snapshot)):
+            or sha(record["input_sha256"]) != input_seal(snapshot)):
         raise ValueError("original record role/input/model/context/global split mismatch")
     lineage = fields(record["lineage"], ("actor_id", "teacher_actor_id", "ancestor_origin_sha256"), "original row lineage")
     identifier(lineage["actor_id"])
@@ -659,11 +686,18 @@ def _validate_row(manifest, record, indexed_origin, limits):
                 or (record["role"] != "validator" and head == "task")
                 or (head == "divergence" and record["role"] != "critic")):
             raise ValueError("original corpus target violates private role routing")
-        result[head] = function(snapshot, labels[head])
+        if codec is SUBMITTED_CODEC and head == "divergence":
+            from .rovent_divergence import divergence_target as submitted_divergence_target
+            result[head] = submitted_divergence_target(snapshot, labels[head])
+        else:
+            result[head] = function(snapshot, labels[head])
     divergence_index = record["divergence_index"]
     if labels["divergence"] is None:
         if divergence_index is not None:
             raise ValueError("divergence target index without an original known target")
+    elif codec is SUBMITTED_CODEC:
+        if type(divergence_index) is not int or divergence_index != labels["divergence"]["slot"]:
+            raise ValueError("submitted divergence target changed its original attack head slot")
     elif (type(divergence_index) is not int or divergence_index != snapshot["divergence_record_ids"].index(
             labels["divergence"]["counter_record_id"])):
         raise ValueError("original divergence candidate order/target index mismatch")
@@ -860,6 +894,21 @@ class RoventTrainingCorpus:
     @classmethod
     def from_files(cls, manifest_path, *, manifest_sha256, index_path, index_sha256,
                    ancestors=(), limits=CorpusLimits(), read_accounting=None):
+        return cls._from_files(manifest_path, manifest_sha256=manifest_sha256, index_path=index_path,
+            index_sha256=index_sha256, ancestors=ancestors, limits=limits, read_accounting=read_accounting,
+            codec=LEGACY_CODEC)
+
+    @classmethod
+    def from_submitted_files(cls, manifest_path, *, manifest_sha256, index_path, index_sha256,
+                             ancestors=(), limits=CorpusLimits(), read_accounting=None):
+        """Explicit /2 reader; no legacy file or checkpoint is converted."""
+        return cls._from_files(manifest_path, manifest_sha256=manifest_sha256, index_path=index_path,
+            index_sha256=index_sha256, ancestors=ancestors, limits=limits, read_accounting=read_accounting,
+            codec=SUBMITTED_CODEC)
+
+    @classmethod
+    def _from_files(cls, manifest_path, *, manifest_sha256, index_path, index_sha256,
+                    ancestors, limits, read_accounting, codec):
         if type(limits) is not CorpusLimits:
             raise ValueError("validated original corpus limits required")
         manifest_path, index_path = _regular_path(manifest_path), _regular_path(index_path)
@@ -868,12 +917,13 @@ class RoventTrainingCorpus:
             raise ValueError("original corpus aggregate byte limit exceeded")
         manifest = _read_pinned_json(manifest_path, manifest_sha256, manifest_path.stat().st_size,
                                      limits.max_file_bytes, read_accounting=read_accounting)
-        _manifest(manifest, limits)
+        _manifest(manifest, limits, codec=codec)
         index = _read_pinned_json(index_path, index_sha256, index_path.stat().st_size, limits.max_file_bytes,
                                   read_accounting=read_accounting)
         fields(index, ("schema", "manifest_sha256", "record_count", "chunks", "origins"),
                "original Rovent corpus index")
-        if index["schema"] != INDEX_DOMAIN or index["manifest_sha256"] != digest(MANIFEST_DOMAIN, manifest):
+        if (validate_container_pair(manifest, index) is not codec
+                or index["manifest_sha256"] != digest(codec.manifest_domain, manifest)):
             raise ValueError("original corpus index/manifest semantic seal mismatch")
         uint(index["record_count"], limits.max_records)
         if (type(index["chunks"]) is not list or len(index["chunks"]) > limits.max_records
@@ -919,9 +969,9 @@ class RoventTrainingCorpus:
         # These objects have just been decoded from private pinned descriptors
         # and have never been returned to the caller. Transfer their ownership
         # rather than retaining a second full corpus snapshot in RAM.
-        owner._manifest, owner._index, owner._records = manifest, index, tuple(records)
+        owner._manifest, owner._index, owner._records, owner._codec = manifest, index, tuple(records), codec
         owner.corpus_sha256, owner.index_sha256 = sha(manifest_sha256), sha(index_sha256)
-        owner.manifest_semantic_sha256, owner.index_semantic_sha256 = digest(MANIFEST_DOMAIN, manifest), digest(INDEX_DOMAIN, index)
+        owner.manifest_semantic_sha256, owner.index_semantic_sha256 = digest(codec.manifest_domain, manifest), digest(codec.index_domain, index)
         owner._pins = (owner.corpus_sha256, owner.index_sha256, owner.manifest_semantic_sha256,
                        owner.index_semantic_sha256)
         owner._ancestors, owner._limits, owner._admission = tuple(ancestors), limits, None
@@ -938,6 +988,8 @@ class RoventTrainingCorpus:
         return owner
 
     def _check_owner(self, *, full=False):
+        if getattr(self, "_codec", LEGACY_CODEC) is not codec_from_manifest(self._manifest):
+            raise ValueError("original corpus owner changed its explicit wire family")
         if self._pins != (self.corpus_sha256, self.index_sha256, self.manifest_semantic_sha256,
                           self.index_semantic_sha256):
             raise ValueError("recovered original corpus owner pins changed")
@@ -980,7 +1032,7 @@ class RoventTrainingCorpus:
         original, raw_by_origin = [], {}
         for owner in owners:
             owner._check_owner(full=True)
-            _manifest(owner._manifest, owner._limits)
+            _manifest(owner._manifest, owner._limits, codec=getattr(owner, "_codec", LEGACY_CODEC))
             ancestor_manifest = owner._manifest
             if not set(ancestor_manifest["ancestor_index_sha256"]) <= declared_ancestors:
                 raise ValueError("original ancestor index dependency is missing")

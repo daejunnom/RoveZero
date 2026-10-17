@@ -962,7 +962,11 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
                         check_admission()
                         # Pass only the submitted immutable input to the model;
                         # targets and future witnesses never enter its encoder.
-                        batch, outputs = compact_collate_and_forward(owner.model, role, copy.deepcopy(sample["input"]))
+                        collate = compact_collate_and_forward
+                        if sample["input"].get("schema") == "rz-rovent-submitted-input/1":
+                            from .rovent_submitted_input import submitted_collate_and_forward
+                            collate = submitted_collate_and_forward
+                        batch, outputs = collate(owner.model, role, copy.deepcopy(sample["input"]))
                         owner.cost["forward_calls"] += 1
                         owner.cost["samples"] += 1
                         sums = loss_sums(outputs, batch, sample["targets"], role, divergence_index=sample["divergence_index"])

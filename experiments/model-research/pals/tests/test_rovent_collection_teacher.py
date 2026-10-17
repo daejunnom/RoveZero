@@ -20,8 +20,11 @@ try:
     from rz_pals_model import rovent_collection_teacher as teacher
     from rz_pals_model import rovent_corpus as corpus
     from rz_pals_model import generation_data as data
+    from rz_pals_model import rovent_submitted_input as submitted_inputs
+    from rz_pals_model import rovent_native_v3 as submitted_native
     from rz_pals_model.virtual_review import input_digest
     from test_rovent_corpus import original_fixture, add_teacher_policy, seal_record, reseal_head, h
+    from test_rovent_submitted_input import fixture as submitted_input_fixture
 finally:
     sys.meta_path.remove(_guard)
 
@@ -43,9 +46,8 @@ def seal_descriptor(descriptor):
     return domain_nul("rz-rovent-root-admission/1", descriptor)
 
 
-def seal_native(record):
+def seal_native(record, domain="rz-rovent-native-owner-event/2"):
     native = record["native"]
-    domain = "rz-rovent-native-owner-event/2"
     native["raw_submission_sha256"] = data.digest(domain, native["raw_submission"])
     native["raw_completion"]["submitted_sha256"] = native["raw_submission_sha256"]
     native["raw_completion_sha256"] = data.digest(domain, native["raw_completion"])
@@ -171,6 +173,63 @@ def fixture(*, collection=True, role="proposer"):
     reseal_head(record, "policy")
     seal_record(manifest, record)
     return manifest, record
+
+
+def submitted_fixture(*, role="proposer"):
+    """Construct new synthetic /3 binding bytes, never convert original data."""
+    manifest, record = fixture(role=role)
+    manifest["schema"] = "rz-rovent-corpus-manifest/2"
+    record["schema"] = "rz-rovent-training-record/2"
+    snapshot = record["input"]
+    prepared = submitted_input_fixture(role=role)
+    del snapshot["divergence_record_ids"]
+    snapshot.update({name: copy.deepcopy(prepared[name]) for name in
+        ("schema", "attack_mapping", "action_support_mask", "selected_view", "view_sha256", "encoded_model_input")})
+    record["input_sha256"] = submitted_inputs.seal_input(snapshot)
+    native = record["native"]
+    native["input_digest"] = input_digest(snapshot["encoded_model_input"])
+    actual_tokens = sum(len(row["moves"]) for row in snapshot["selected_view"]["records"]) + sum(
+        len(snapshot["selected_view"]["query"][key]) for key in ("prefix", "proposal", "counter"))
+    for name in ("raw_submission", "raw_completion", "raw_retirement"):
+        raw = native[name]
+        raw.update(schema="rz-rovent-raw-record/3", input_sha256=record["input_sha256"])
+        raw["ticket"]["representation"]["input"] = native["input_digest"]
+        raw["ticket"]["actual_tokens"] = actual_tokens
+    native["raw_submission"]["input_digest"] = native["input_digest"]
+    ticket = native["raw_submission"]["ticket"]
+    native["raw_submission"]["submitted_review"] = {"schema": "rz-rovent-submitted-review-evidence/1",
+        "sequence": ticket["view_sequence"], "generation": native["root_generation"],
+        "root_state": native["raw_retirement"]["root_admission"]["store_root_state"],
+        "policy": {"mode": "anchored_compact", "token_budget": snapshot["selected_view"]["token_budget"],
+            "max_records": 64, "max_anchors": 4, "required_bundle": None},
+        "input_sha256": h("synthetic original ReviewView semantic input"), "view_seal_sha256": ticket["view_digest"],
+        "record_scope_sha256": h("synthetic original ReviewView scope"), "source_anchors": [], "record_metadata": []}
+    output = native["raw_completion"]["output"]
+    output["representation"]["input"] = native["input_digest"]
+    if role == "critic":
+        count = len(snapshot["encoded_model_input"]["divergences"])
+        output["payload"]["divergence_logits_bits"] = [0] * count
+        numbers = output["payload"]["candidate_logits_bits"] + output["payload"]["divergence_logits_bits"] + output["payload"]["wdl_bits"]
+        framed = (b"rz-rovent-accepted-critic-head/1\0" + len(snapshot["legal_moves"]).to_bytes(8, "little")
+            + count.to_bytes(8, "little") + b"".join(bits.to_bytes(4, "little") for bits in numbers))
+        native["output_digest"] = hashlib.sha256(framed).hexdigest()
+        native["raw_completion"]["output_digest"] = native["raw_retirement"]["output_digest"] = native["output_digest"]
+    source, label = record["head_sources"]["policy"], record["targets"]["policy"]
+    source["raw_receipt"]["input_sha256"] = record["input_sha256"]
+    source["raw_receipt"]["binding"]["input_scope"].update(input_sha256=record["input_sha256"], view_sha256=snapshot["view_sha256"])
+    label["view_sha256"] = snapshot["view_sha256"]
+    seal_native(record, "rz-rovent-raw-record/3")
+    reseal_head(record, "policy")
+    seal_record(manifest, record)
+    projected = {**record, "record_sha256": "", "input": {"sealed_input_sha256": record["input_sha256"]}}
+    record["record_sha256"] = data.digest("rz-rovent-training-record/2", projected)
+    return manifest, record
+
+
+def validate_binding(manifest, record, *, submitted=False):
+    raw = record["head_sources"]["policy"]["raw_receipt"]
+    function = teacher.validate_collection_teacher_binding_v3 if submitted else teacher.validate_collection_teacher_binding
+    return function(manifest, record, raw["actor_id"], raw["teacher_pin"], raw["binding"])
 
 
 def validate_head(manifest, record):
@@ -478,6 +537,69 @@ class CollectionTeacherTests(unittest.TestCase):
         seal_root(record)
         with self.assertRaisesRegex(ValueError, "positive root search limit"):
             corpus._native(manifest, record)
+
+    def test_explicit_raw3_entry_preserves_new_submitted_input_and_generation_view_seal(self):
+        for role in ("proposer", "critic"):
+            with self.subTest(role=role):
+                manifest, record = submitted_fixture(role=role)
+                before = copy.deepcopy(record)
+                submitted_native.validate_native_v3(manifest, record)
+                validate_binding(manifest, record, submitted=True)
+                self.assertEqual(record, before)
+                scope = record["head_sources"]["policy"]["raw_receipt"]["binding"]["input_scope"]
+                self.assertEqual(scope["input_sha256"], submitted_inputs.seal_input(record["input"]))
+                self.assertEqual(scope["view_sha256"], record["input"]["view_sha256"])
+                self.assertNotEqual(scope["view_sha256"], record["native"]["view_digest"])
+
+    def test_legacy_entry_rejects_raw3_without_retagging_or_auto_dispatch(self):
+        manifest, record = submitted_fixture()
+        before = copy.deepcopy(record)
+        with self.assertRaisesRegex(ValueError, "original native /2 root data"):
+            validate_binding(manifest, record)
+        self.assertEqual(record, before)
+
+    def test_new_entry_rejects_legacy_family_without_retagging_or_auto_conversion(self):
+        manifest, record = fixture()
+        before = copy.deepcopy(record)
+        with self.assertRaisesRegex(ValueError, "raw /3 entry requires the submitted corpus family"):
+            validate_binding(manifest, record, submitted=True)
+        self.assertEqual(record, before)
+
+    def test_raw3_entry_does_not_accept_a_mixed_completion_family(self):
+        manifest, record = submitted_fixture()
+        record["native"]["raw_completion"]["schema"] = "rz-rovent-native-owner-event/2"
+        with self.assertRaisesRegex(ValueError, "record/native wire family mismatch|one schema revision"):
+            validate_binding(manifest, record, submitted=True)
+
+    def test_raw3_entry_recomputes_new_seal_before_accepting_bound_scope(self):
+        manifest, record = submitted_fixture()
+        record["input"]["game_id"] = "another-game-with-unreissued-input-seal"
+        with self.assertRaisesRegex(ValueError, "raw /3 original submitted input seal changed"):
+            validate_binding(manifest, record, submitted=True)
+
+    def test_raw3_entry_keeps_original_scope_and_loaded_root_checks(self):
+        manifest, record = submitted_fixture(role="critic")
+        binding = record["head_sources"]["policy"]["raw_receipt"]["binding"]
+        binding["input_scope"]["view_sha256"] = record["native"]["view_digest"]
+        with self.assertRaisesRegex(ValueError, "submitted input/view/source/role/Rules/frozen actor"):
+            validate_binding(manifest, record, submitted=True)
+        manifest, record = submitted_fixture()
+        root = record["native"]["raw_retirement"]["root_admission"]
+        root["native_origin"]["source_sha256"] = h("other native source")
+        root["native_origin_sha256"] = data.digest("rz-rovent-collection-native-origin/1", root["native_origin"])
+        record["native"]["raw_retirement"]["root_admission_sha256"] = data.digest("rz-rovent-collection-root-admission/1", root)
+        with self.assertRaisesRegex(ValueError, "collection source/runtime/model domain mismatch"):
+            validate_binding(manifest, record, submitted=True)
+
+    def test_legacy_descriptor_path_stays_raw2_only(self):
+        manifest, record = fixture(collection=False)
+        raw = record["head_sources"]["policy"]["raw_receipt"]
+        for name in ("raw_submission", "raw_completion", "raw_retirement"):
+            record["native"][name]["schema"] = "rz-rovent-raw-record/3"
+        before = copy.deepcopy(record)
+        with self.assertRaisesRegex(ValueError, "original native /2 root data"):
+            teacher.validate_legacy_teacher_root(manifest, record, raw["binding"])
+        self.assertEqual(record, before)
 
 
 if __name__ == "__main__":

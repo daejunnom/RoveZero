@@ -16,14 +16,15 @@ from .rovent_root_descriptor import _positive, validate_root_descriptor
 COLLECTION_BINDING_DOMAIN = "rz-rovent-collection-teacher-binding/1"
 FROZEN_ACTOR_DOMAIN = "rz-rovent-frozen-teacher-actor/1"
 
-def _root_join(manifest, record, binding):
-    """Join a descriptor to original native /2 data; loaded lock stays Rust-owned."""
-    from .rovent_native_v2 import NATIVE_DOMAIN, _root_admission
+def _root_join(manifest, record, binding, *, native_domain):
+    """Join one explicitly selected raw family; loaded lock stays Rust-owned."""
+    from .rovent_native_v2 import _root_admission
 
     native = record["native"]
     submitted, retired = native["raw_submission"], native["raw_retirement"]
-    if submitted.get("schema") != NATIVE_DOMAIN or retired.get("schema") != NATIVE_DOMAIN:
-        raise ValueError("Collection teacher descriptor requires original native /2 root data")
+    if submitted.get("schema") != native_domain or retired.get("schema") != native_domain:
+        revision = "/2" if native_domain == "rz-rovent-native-owner-event/2" else "/3"
+        raise ValueError(f"Collection teacher descriptor requires original native {revision} root data")
     _root_admission(manifest, record, retired)
     root = retired["root_admission"]
     descriptor, descriptor_sha = binding["root_descriptor"], binding["root_descriptor_sha256"]
@@ -50,7 +51,8 @@ def _root_join(manifest, record, binding):
 
 def validate_legacy_teacher_root(manifest, record, binding):
     """Explicit descriptor-bearing legacy variant; no old-body rewriting."""
-    inp = _root_join(manifest, record, binding)
+    from .rovent_native_v2 import NATIVE_DOMAIN
+    inp = _root_join(manifest, record, binding, native_domain=NATIVE_DOMAIN)
     question, hard = binding["question"], inp["clock"]["hard"]
     if (question["root_budget"] != binding["root_budget"]
             or question["root_budget"] != binding["root_descriptor"]["root_budget_sha256"]
@@ -60,7 +62,27 @@ def validate_legacy_teacher_root(manifest, record, binding):
 
 
 def validate_collection_teacher_binding(manifest, record, actor_id, teacher_pin, binding):
-    """Validate persisted original scope only, returning no execution capability."""
+    """Validate the original raw /2 entry only; do not infer another family."""
+    from .rovent_native_v2 import NATIVE_DOMAIN
+    _validate_collection_teacher_binding(manifest, record, actor_id, teacher_pin, binding, native_domain=NATIVE_DOMAIN)
+
+
+def validate_collection_teacher_binding_v3(manifest, record, actor_id, teacher_pin, binding):
+    """Validate raw /3 against its new submitted-input seal, never retagging it."""
+    from .rovent_corpus_codec import SUBMITTED_CODEC, validate_record_codec
+    from .rovent_native_v3 import NATIVE_DOMAIN
+    from .rovent_submitted_input import validate_input, seal_input
+
+    if validate_record_codec(manifest, record) is not SUBMITTED_CODEC:
+        raise ValueError("Collection teacher raw /3 entry requires the submitted corpus family")
+    snapshot = validate_input(record["input"])
+    if sha(record["input_sha256"]) != seal_input(snapshot):
+        raise ValueError("Collection teacher raw /3 original submitted input seal changed")
+    _validate_collection_teacher_binding(manifest, record, actor_id, teacher_pin, binding, native_domain=NATIVE_DOMAIN)
+
+
+def _validate_collection_teacher_binding(manifest, record, actor_id, teacher_pin, binding, *, native_domain):
+    """Shared persisted-data joins only; this returns no execution capability."""
     fields(binding, ("schema", "job_id", "input_scope", "requested", "process", "root_restriction",
         "position_anchor", "root_moves", "soft_quantum_ns", "original_deadline", "root_descriptor", "root_descriptor_sha256"),
         "original Collection teacher dispatch binding")
@@ -90,7 +112,7 @@ def validate_collection_teacher_binding(manifest, record, actor_id, teacher_pin,
         raise ValueError("Collection teacher changed original submitted input/view/source/role/Rules/frozen actor")
     if any(scope[key] == "0" * 64 for key in ("input_lock", "root_admission", "root_budget", "frozen_actor")):
         raise ValueError("Collection teacher original root/actor scope cannot be zero")
-    inp = _root_join(manifest, record, binding)
+    inp = _root_join(manifest, record, binding, native_domain=native_domain)
     if (scope["input_lock"] != inp["startup_lock_sha256"]
             or scope["root_admission"] != binding["root_descriptor_sha256"]
             or scope["root_budget"] != binding["root_descriptor"]["root_budget_sha256"]):

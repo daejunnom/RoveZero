@@ -309,8 +309,11 @@ def common_teacher_forks(recipe, checkpoint):
 def index_original_input(recipe, *, input_snapshot, input_sha256, record_sha256, producer_sha256,
                          stage_id, round_id, teacher_actor_id):
     """Bind original input semantics without accepting or editing future labels."""
-    validate_input(input_snapshot)
-    if sha(input_sha256) != seal_input(input_snapshot):
+    input_validator, input_seal = validate_input, seal_input
+    if type(input_snapshot) is dict and input_snapshot.get("schema") == "rz-rovent-submitted-input/1":
+        from .rovent_submitted_input import validate_input as input_validator, seal_input as input_seal
+    input_validator(input_snapshot)
+    if sha(input_sha256) != input_seal(input_snapshot):
         raise ValueError("original selected input seal mismatch")
     value = {"input_sha256": input_sha256, "record_sha256": record_sha256, "producer_sha256": producer_sha256,
              "stage_id": stage_id, "round_id": round_id, "teacher_actor_id": teacher_actor_id,

@@ -23,7 +23,8 @@ from .generation_data import trajectory_digest, RULES_ENDINGS, DRAW_ENDINGS
 from . import rovent_corpus as pc
 from .rovent_generation import SeriesRecipe, index_original_input, validate_record_origin
 from .rovent_historical_corpus import HistoricalReadBudget, _input_lock, _source_aggregate, _read_observation
-from .rovent_lineage_union import LineageUnion, PC_SOURCE, R_SOURCE
+from .rovent_lineage_union import LineageUnion, R_SOURCE, pc_source_domain
+from .rovent_corpus_codec import codec_from_manifest
 from .rovent_native_v2 import validate_position_replay, _artifact, _profile
 from . import rovent_r_readout as wire
 
@@ -899,19 +900,20 @@ class RoventRCorpus:
         for owner in self._pc_corpora:
             owner._check_owner(full=True)
             declaration = owner._manifest
+            source_domain = pc_source_domain(owner)
             declarations.append(declaration)
-            pc._manifest(declaration, owner._limits)
+            pc._manifest(declaration, owner._limits, codec=codec_from_manifest(declaration))
             if (declaration["recipe_sha256"] != self._recipe.sha256
                     or not set(declaration["ancestor_index_sha256"]) <= set(manifest["pc_ancestor_index_sha256"])):
                 raise ValueError("PC ancestor source/closure differs from R collection recipe")
             for row in owner._records:
-                if pc._record_digest(row) != row["record_sha256"]:
+                if row["schema"] != source_domain or pc._record_digest(row) != row["record_sha256"]:
                     raise ValueError("original PC ancestor record changed")
                 projection = index_original_input(self._recipe, input_snapshot=row["input"], input_sha256=row["input_sha256"],
                     record_sha256=row["record_sha256"], producer_sha256=owner.manifest_semantic_sha256,
                     stage_id=declaration["stage_id"], round_id=declaration["round_id"], teacher_actor_id=row["lineage"]["teacher_actor_id"])
-                pc_records[row["origin_sha256"]] = row
-                remember(PC_SOURCE, row["origin_sha256"], projection, row["lineage"]["ancestor_origin_sha256"])
+                pc_records[(source_domain, row["origin_sha256"])] = row
+                remember(source_domain, row["origin_sha256"], projection, row["lineage"]["ancestor_origin_sha256"])
         for owner in (*self._r_ancestors, self):
             owner._check_owner(full=True)
             declaration = owner._manifest
@@ -939,10 +941,15 @@ class RoventRCorpus:
                     raise ValueError("PC/R original ancestor origin is missing or source-ambiguous")
                 references.add(keys[0])
             if link is not None:
-                original = pc_records.get(link["origin_sha256"])
-                if original is None or any(original[key] != link[key] for key in ("record_sha256", "input_sha256", "origin_sha256")):
+                matches = [source for source, original in pc_records.items()
+                    if source[1] == link["origin_sha256"] and all(original[key] == link[key]
+                        for key in ("record_sha256", "input_sha256", "origin_sha256"))]
+                if len(matches) != 1:
                     raise ValueError("R causal PC genealogy lacks original exact PC row")
-                references.add((PC_SOURCE, link["origin_sha256"]))
+                # The old genealogy wire carries three pins, not a domain.
+                # Resolve them to exactly one original PC source; never retag
+                # a submitted row as the legacy PC family.
+                references.add(matches[0])
             occurrences.append({"source_domain": domain, "origin_sha256": origin, "projection": projection,
                 "ancestor_origins": [{"source_domain": key[0], "origin_sha256": key[1]} for key in sorted(references)]})
         union = LineageUnion.from_projections(self._recipe, occurrences, max_occurrences=self._limits.max_records)
