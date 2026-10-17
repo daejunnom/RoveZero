@@ -205,7 +205,7 @@ mod tests {
     use crate::pals::engine::adaptive_port::validator_port::{
         BoundedObservationPreimage, ObservationSink,
     };
-    use sha2::{Digest as _, Sha256};
+    use sha2::Sha256;
 
     struct Fixture {
         source: ObservationSource,

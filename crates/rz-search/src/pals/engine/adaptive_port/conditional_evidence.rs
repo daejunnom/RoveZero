@@ -1140,6 +1140,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         }
         // Foreign raw observations and model-resolver estimates are distinct
         // namespaces. Only a separately sealed Fresh pair can compare WDL.
+        if endpoint.position.classify_position()?.play_status != PlayStatus::Ongoing {
+            return Err(StoreError::InvalidEvidence(
+                "adaptive CPU endpoint is an actual Rules terminal",
+            )
+            .into());
+        }
         if self.engine.is_external() || self.engine.uses_model_resolver() {
             return Ok(None);
         }
@@ -1257,6 +1263,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             || task.key.requested_depth != self.limits.cpu_depth
             || task.key.value_identity.as_ref() != Some(&accepted.value_identity)
             || task.key.checker_identity.is_some()
+            || task.key.node_budget == 0
+            || observation.epoch != task.key.epoch
             || observation.budget > task.key.node_budget
             || !scoped
             || !scored

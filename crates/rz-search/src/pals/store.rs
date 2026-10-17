@@ -1413,6 +1413,45 @@ pub struct TaskKey {
     pub node_budget: u64,
 }
 
+impl TaskKey {
+    /// Known separately allocated payload of this owned key. Fixed fields are
+    /// charged by its containing owner. Tree/hash nodes and allocator overhead
+    /// are not included, so this is never a total heap or resident peak.
+    pub(crate) fn known_owned_payload_bytes(&self) -> Option<u64> {
+        fn identity_bytes(value: &CpuValueIdentity) -> Option<usize> {
+            let mut bytes = value
+                .semantics
+                .capacity()
+                .checked_add(value.weights_sha256.as_ref().map_or(0, String::capacity))?;
+            if let crate::cpu_value::CpuTrainingState::Learned {
+                run_id,
+                dataset_sha256,
+                ..
+            } = &value.training
+            {
+                bytes = bytes
+                    .checked_add(run_id.capacity())?
+                    .checked_add(dataset_sha256.capacity())?;
+            }
+            Some(bytes)
+        }
+        let mut bytes = self
+            .root_moves
+            .capacity()
+            .checked_mul(std::mem::size_of::<Move16>())?
+            .checked_add(self.cpu_condition.as_ref().map_or(0, String::capacity))?;
+        if let Some(identity) = &self.value_identity {
+            bytes = bytes.checked_add(identity_bytes(identity)?)?;
+        }
+        // Conditional own-CPU sources never carry a foreign checker. Its
+        // unsupported owned payload remains unknown rather than zero bytes.
+        if self.checker_identity.is_some() {
+            return None;
+        }
+        u64::try_from(bytes).ok()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TaskConsumer {
     pub id: u64,
@@ -1874,6 +1913,19 @@ impl TaskTable {
     }
     pub fn consumer_count(&self) -> usize {
         self.consumers.len()
+    }
+    /// Actual retained consumer-vector capacities, including completed and
+    /// cancelled rows. This issues no consumer and does not change flags.
+    /// Task arrays, tree nodes, and allocator overhead remain outside this
+    /// known subset; callers must not report it as total Store memory.
+    pub(crate) fn historical_consumer_backing_bytes(&self) -> Option<u64> {
+        self.tasks.iter().try_fold(0_u64, |sum, task| {
+            let bytes = task
+                .consumers
+                .capacity()
+                .checked_mul(std::mem::size_of::<ConsumerRecord>())?;
+            sum.checked_add(u64::try_from(bytes).ok()?)
+        })
     }
     /// Read an already recorded use of this exact original consumer. This
     /// historical projection never admits work, reopens a deadline or makes
@@ -3459,6 +3511,64 @@ mod tests {
             weights_sha256: Some(weight_digit.to_string().repeat(64)),
             training: crate::cpu_value::CpuTrainingState::Untrained,
         }
+    }
+
+    #[test]
+    fn historical_consumer_backing_counts_spare_capacity_without_changing_flags() {
+        let mut table = TaskTable::new(4, 16, 4);
+        let mut consumers = Vec::with_capacity(8);
+        consumers.push(ConsumerRecord {
+            consumer: TaskConsumer {
+                id: 1,
+                situation: SituationId {
+                    slot: 0,
+                    generation: 1,
+                },
+                revision: 3,
+                generation: 4,
+                deadline_tick: 5,
+            },
+            consumed: true,
+            cancelled: false,
+        });
+        let expected = (consumers.capacity() * std::mem::size_of::<ConsumerRecord>()) as u64;
+        table
+            .tasks
+            .push(TaskRecord {
+                key: key(StateId(0)),
+                status: TaskStatus::Completed(ObservationId(0)),
+                resumed_from: None,
+                consumers,
+            })
+            .unwrap();
+        let original = table.tasks.get(0).unwrap().consumers[0].consumer;
+        let before = serde_json::to_vec(table.tasks.get(0).unwrap()).unwrap();
+        assert_eq!(table.historical_consumer_backing_bytes(), Some(expected));
+        assert!(
+            table
+                .historical_consumer_was_consumed(ExecutionId(0), original)
+                .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(table.tasks.get(0).unwrap()).unwrap(),
+            before
+        );
+        assert!(expected > std::mem::size_of::<ConsumerRecord>() as u64);
+    }
+
+    #[test]
+    fn historical_task_key_backing_counts_owned_namespace_capacity() {
+        let mut task = key(StateId(0));
+        let before = task.known_owned_payload_bytes().unwrap();
+        let old_capacity = task.cpu_condition.as_ref().unwrap().capacity();
+        task.cpu_condition.as_mut().unwrap().reserve(4096);
+        let new_capacity = task.cpu_condition.as_ref().unwrap().capacity();
+        assert_eq!(
+            task.known_owned_payload_bytes(),
+            Some(before + (new_capacity - old_capacity) as u64)
+        );
+        task.checker_identity = Some(CheckerIdentity::Owned(cpu_value_identity()));
+        assert!(task.known_owned_payload_bytes().is_none());
     }
 
     fn external_identity() -> crate::cpu_checker::ExternalCheckerIdentity {

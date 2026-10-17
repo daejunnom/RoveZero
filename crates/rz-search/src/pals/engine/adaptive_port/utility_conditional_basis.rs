@@ -24,6 +24,8 @@ const DOMAIN: &str = "rz-rovent-utility-cohort-conditional-basis/1";
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LINE: usize = 256;
 mod raw_join;
+#[cfg(test)]
+mod tests;
 
 /// Original accepted CPU source, projected only from the private consume seal.
 /// This owns no View, Bound, worker stack or live Store pin.
@@ -935,6 +937,66 @@ impl UtilityWitnessCpuMetadata {
 }
 
 impl<M: RoleModel> AdaptiveEnginePort<M> {
+    /// Conservative known backing retained for conditional history. Shared
+    /// context occurrences may be charged more than once. Store consumer Vec
+    /// capacities, cloned CPU context payload, source Vec capacities, and the
+    /// original-consumer slots are included; map/tree/Arc internals, temporary
+    /// serialization DTOs and allocator overhead remain unknown. This is not
+    /// total heap, RSS, physical sharing or a memory peak.
+    pub fn utility_conditional_known_retained_host_bytes(&self) -> Option<u64> {
+        let mut bytes = self
+            .engine
+            .semantic
+            .stores
+            .tasks
+            .historical_consumer_backing_bytes()?;
+        for (_, line, source) in self.conditional_witnesses.values() {
+            bytes = bytes.checked_add(
+                u64::try_from(
+                    line.capacity()
+                        .checked_mul(std::mem::size_of::<BoardMove>())?,
+                )
+                .ok()?,
+            )?;
+            if let Some(source) = source {
+                bytes = bytes.checked_add(source.owned_host_bytes()?)?;
+            }
+        }
+        for node in &self.engine.semantic.nodes {
+            if let Some(context) = node
+                .evidence
+                .as_ref()
+                .and_then(|value| value.context.as_ref())
+            {
+                bytes = bytes.checked_add(context.known_owned_backing_bytes()?)?;
+            }
+        }
+        bytes.checked_add(
+            u64::try_from(
+                self.cpu_admissions
+                    .len()
+                    .checked_mul(std::mem::size_of::<Option<TaskConsumer>>())?,
+            )
+            .ok()?,
+        )
+    }
+
+    /// A narrow admission against the already issued history payload limit.
+    /// It does not redefine the runtime's global resource policy or attest
+    /// unknown process memory. Overflow/missing known backing is fail-closed.
+    pub(super) fn check_utility_conditional_known_backing(
+        &self,
+        additional: u64,
+    ) -> Result<(), PalsError> {
+        let limit = u64::try_from(self.utility_continuations.witness_payload_limit())
+            .map_err(|_| PalsError::Capacity)?;
+        self.utility_conditional_known_retained_host_bytes()
+            .and_then(|used| used.checked_add(additional))
+            .filter(|total| *total <= limit)
+            .map(|_| ())
+            .ok_or(PalsError::Capacity)
+    }
+
     pub(super) fn capture_utility_conditional_comparison(
         &self,
         before_line: &[BoardMove],
@@ -946,18 +1008,27 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         // Source insufficiency is a historical mask; it never changes the
         // already checked publisher's semantic decision.
         let captured = (|| -> Result<Vec<u8>, Unavailable> {
-            let mut used = 0usize;
-            for (_, _, source) in self.conditional_witnesses.values() {
-                if let Some(source) = source {
-                    used = used
-                        .checked_add(source.original.len())
-                        .ok_or(Unavailable::Capacity)?;
-                }
-            }
+            let used = usize::try_from(
+                self.utility_conditional_known_retained_host_bytes()
+                    .ok_or(Unavailable::Capacity)?,
+            )
+            .map_err(|_| Unavailable::Capacity)?;
+            // The upcoming witness retains this line and a source object in
+            // addition to the byte Vec. Their known backing uses the same
+            // original local allowance instead of a second hidden budget.
+            let additional_fixed = std::mem::size_of::<ConditionalComparisonSource>()
+                .checked_add(
+                    after_line
+                        .len()
+                        .checked_mul(std::mem::size_of::<BoardMove>())
+                        .ok_or(Unavailable::Capacity)?,
+                )
+                .ok_or(Unavailable::Capacity)?;
             let maximum = self
                 .utility_continuations
                 .witness_payload_limit()
                 .checked_sub(used)
+                .and_then(|remaining| remaining.checked_sub(additional_fixed))
                 .ok_or(Unavailable::Capacity)?;
             if maximum == 0 {
                 return Err(Unavailable::Capacity);
@@ -987,7 +1058,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             } else {
                 (None, None)
             };
-            encoded(
+            let original = encoded(
                 &ComparisonRecipe {
                     root,
                     before,
@@ -996,7 +1067,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     previous,
                 },
                 maximum.min(MAX_BYTES),
-            )
+            )?;
+            let additional = additional_fixed
+                .checked_add(original.capacity())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or(Unavailable::Capacity)?;
+            self.check_utility_conditional_known_backing(additional)
+                .map_err(|_| Unavailable::Capacity)?;
+            Ok(original)
         })();
         Ok(match captured {
             Ok(original) => ConditionalComparisonSource {
@@ -1194,6 +1272,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             comparison,
         };
         let original = encoded(&basis, maximum)?;
+        let retained = std::mem::size_of::<UtilityConditionalWitnessBasis>()
+            .checked_add(original.capacity())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(Unavailable::Capacity)?;
+        self.check_utility_conditional_known_backing(retained)
+            .map_err(|_| Unavailable::Capacity)?;
         let sha256 = ContractDigest(Sha256::digest(&original).into());
         validate_utility_witness_basis(
             &original,
@@ -1695,6 +1779,22 @@ fn validate_endpoint(
             namespace,
             ..
         } => {
+            let position = Position::from_snapshot(
+                &snapshot,
+                PositionLimits {
+                    max_history_positions: snapshot.known_history_len(),
+                    ..Default::default()
+                },
+            )
+            .map_err(|_| BasisError::Invalid("CPU endpoint Rules snapshot"))?;
+            if position
+                .classify_position()
+                .map_err(|_| BasisError::Invalid("CPU endpoint Rules classification"))?
+                .play_status
+                != PlayStatus::Ongoing
+            {
+                return Err(BasisError::Invalid("CPU endpoint is Rules terminal"));
+            }
             identity
                 .validate()
                 .map_err(|_| BasisError::Invalid("CPU value identity"))?;
@@ -1702,6 +1802,7 @@ fn validate_endpoint(
             if *plies != line.len()
                 || *depth == 0
                 || key.requested_depth == 0
+                || key.node_budget == 0
                 || *depth < key.requested_depth
                 || base_condition.is_empty()
                 || base_condition.len() > 64 * 1024
@@ -1719,6 +1820,7 @@ fn validate_endpoint(
                 || observation.condition.as_ref() != Some(base_condition)
                 || observation.supersedes.is_some()
                 || observation.budget > key.node_budget
+                || observation.epoch != key.epoch
                 || key.question != TaskQuestion::AnalyzePosition
                 || key.line.is_some()
                 || !key.root_moves.is_empty()

@@ -245,6 +245,10 @@ pub(in crate::pals::engine::adaptive_port) enum HistoricalWitnessRawScore<'a> {
         perspective: Color,
         bound: BoundKind,
     },
+    // Preserve the complete parsed external report. Cohort comparison admits
+    // only Rules, internal completed CPU, or original Fresh-WDL evidence;
+    // external CP/mate fields must not become a conditional value target.
+    #[allow(dead_code)]
     ExternalUci {
         value: ExternalRawScore,
         bound: ExternalBound,

@@ -23,6 +23,17 @@ pub(in crate::pals::engine) struct CpuEvidenceContextSeal {
     original_consumer: TaskConsumer,
 }
 
+impl CpuEvidenceContextSeal {
+    /// Fixed provenance (including its original TaskConsumer) and the cloned
+    /// TaskKey's owned namespace payload. Arc headers, Store/map internals and
+    /// shared allocations remain outside this known subset.
+    pub(super) fn known_owned_backing_bytes(&self) -> Option<u64> {
+        u64::try_from(std::mem::size_of::<Self>())
+            .ok()?
+            .checked_add(self.task.known_owned_payload_bytes()?)
+    }
+}
+
 /// Live installation admission is checked before the Store consumes anything.
 /// Finalizing that already consumed fact never reopens a canceled authority.
 pub(super) struct PreparedCpuEvidenceContext {
@@ -53,6 +64,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             )
             .into());
         }
+        self.admit_utility_conditional_cpu_context(&admission.task_key)?;
         Ok(Some(PreparedCpuEvidenceContext { profile }))
     }
 
@@ -112,6 +124,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             )
             .into());
         }
+        // Consumption may have grown the original Store consumer vector.
+        // Recheck its actual retained capacity before adding another seal.
+        self.admit_utility_conditional_cpu_context(&admission.task_key)?;
         Ok(Some(Arc::new(CpuEvidenceContextSeal {
             store: self.engine.semantic.stores.read_owner(),
             generation: self.engine.semantic.stores.generation(),
@@ -127,6 +142,17 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             profile,
             original_consumer,
         })))
+    }
+
+    fn admit_utility_conditional_cpu_context(&self, task: &TaskKey) -> Result<(), PalsError> {
+        if !self.utility_continuations.enabled() {
+            return Ok(());
+        }
+        let additional = u64::try_from(std::mem::size_of::<CpuEvidenceContextSeal>())
+            .ok()
+            .and_then(|fixed| fixed.checked_add(task.known_owned_payload_bytes()?))
+            .ok_or(PalsError::Capacity)?;
+        self.check_utility_conditional_known_backing(additional)
     }
 
     /// Project only the exact source already consumed by this Node. It adds
