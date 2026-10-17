@@ -40,7 +40,7 @@ fn replay(root: &Position, moves: &[rz_position::BoardMove]) -> Result<Position,
     }
     Ok(p)
 }
-pub(super) fn original_source_offer<'a>(preparation: &'a Value) -> Result<&'a Value, ArenaError> {
+pub(super) fn original_source_offer(preparation: &Value) -> Result<&Value, ArenaError> {
     let offers = array(preparation, "offers", 3)?;
     ["route_p", "route_r", "route_c"]
         .into_iter()
