@@ -1,13 +1,15 @@
 //! Strict Rovent-only startup values. Legacy V5 DTOs are neither decoded nor
 //! converted here. This declaration owns constructor values, not observations.
 
+pub mod v2;
+
 use super::{fail, hex};
 use crate::pals_adaptive::{
     AdaptiveExecutionLimits, RoventPeerFollowupPolicy, RoventReciprocalPolicy,
 };
 use crate::pals_native::ticketed::TicketServiceLimits;
 use rz_contracts::Digest;
-use rz_contracts::rovent::SearchRecipient;
+use rz_contracts::rovent::{ExecutionMode, SearchRecipient};
 use rz_eval::error::{BackendError, FailureKind as K};
 use rz_eval::onnx::{NativeLoadingProfile, Provider};
 use rz_eval::pals_onnx::{PalsCuDnnConvSearch, PalsOnnxConfig};
@@ -15,7 +17,7 @@ use rz_experiments::{ArtifactRef, RoventDevice, RoventInputLock, RoventResearche
 use rz_runtime::adaptive::{AdaptiveController, ControllerConfig, CoordinatorPolicy, LogicalCpu};
 use rz_search::cpu::{CpuConfig, CpuOrderingPolicy, CpuProfile};
 use rz_search::external_cpu::ExternalSlicePolicy;
-use rz_search::pals::engine::{PalsSemanticConfig, PcSemanticProfile};
+use rz_search::pals::engine::{PalsSemanticConfig, PcSemanticProfile, PostRepairRecheckPolicy};
 use rz_search::pals::review_context::{ReviewAnchorMode, ReviewIndexLimits, ReviewSelectionPolicy};
 use rz_search::pals::rovent_frontier::FrontierLimits;
 use serde::{Deserialize, Serialize};
@@ -38,6 +40,97 @@ pub struct RoventStartupConfiguration {
     pub frontier: FrontierConfiguration,
     pub native: NativeConfiguration,
     pub execution: ExecutionConfiguration,
+}
+
+/// Exact version dispatch over original bytes. Neither variant upgrades or
+/// supplies policy defaults for the other version's immutable wire contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StartupConfigurationDocument {
+    V1(RoventStartupConfiguration),
+    V2(v2::RoventStartupConfigurationV2),
+}
+impl StartupConfigurationDocument {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, BackendError> {
+        if bytes.is_empty() || bytes.len() > ROVENT_STARTUP_CONFIGURATION_MAX_BYTES {
+            return Err(invalid("startup configuration byte budget"));
+        }
+        #[derive(Deserialize)]
+        struct DomainProbe {
+            domain: String,
+        }
+        let domain: DomainProbe = serde_json::from_slice(bytes)
+            .map_err(|_| invalid("strict startup configuration version JSON"))?;
+        match domain.domain.as_str() {
+            ROVENT_STARTUP_CONFIGURATION_DOMAIN => {
+                RoventStartupConfiguration::from_json(bytes).map(Self::V1)
+            }
+            v2::ROVENT_STARTUP_CONFIGURATION_V2_DOMAIN => {
+                v2::RoventStartupConfigurationV2::from_json(bytes).map(Self::V2)
+            }
+            _ => Err(invalid("startup configuration version domain")),
+        }
+    }
+    pub fn fields(&self) -> ConfigurationFields<'_> {
+        match self {
+            Self::V1(config) => config.fields(),
+            Self::V2(config) => config.fields(),
+        }
+    }
+    pub fn validate(&self) -> Result<(), BackendError> {
+        match self {
+            Self::V1(config) => config.validate(),
+            Self::V2(config) => config.validate(),
+        }
+    }
+    pub fn admit_against(&self, lock: &RoventInputLock) -> Result<(), BackendError> {
+        match self {
+            Self::V1(config) => config.admit_against(lock),
+            Self::V2(config) => config.admit_against(lock),
+        }
+    }
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, BackendError> {
+        match self {
+            Self::V1(config) => config.canonical_bytes(),
+            Self::V2(config) => config.canonical_bytes(),
+        }
+    }
+    pub fn configuration_digest(&self) -> Result<[u8; 32], BackendError> {
+        match self {
+            Self::V1(config) => config.configuration_digest(),
+            Self::V2(config) => config.configuration_digest(),
+        }
+    }
+    pub fn search_configuration_digest(&self) -> Result<[u8; 32], BackendError> {
+        match self {
+            Self::V1(config) => config.search_configuration_digest(),
+            Self::V2(config) => config.search_configuration_digest(),
+        }
+    }
+    pub fn nnuec_conditions_digest(&self) -> Result<Option<[u8; 32]>, BackendError> {
+        match self {
+            Self::V1(config) => config.nnuec_search_conditions_digest(),
+            Self::V2(config) => config.nnuec_search_conditions_digest(),
+        }
+    }
+    pub fn require_supported_native_capabilities(&self) -> Result<(), BackendError> {
+        match self {
+            Self::V1(config) => config.require_supported_native_capabilities(),
+            Self::V2(config) => config.require_supported_native_capabilities(),
+        }
+    }
+    /// Legacy PC and PCR keep their separately established policy choices.
+    /// Only /2 supplies a common explicit selection for both assemblies.
+    pub fn post_repair_policy_for(&self, mode: ExecutionMode) -> PostRepairRecheckPolicy {
+        match self {
+            Self::V1(_) => match mode {
+                ExecutionMode::CpuPc | ExecutionMode::HybridPc => PostRepairRecheckPolicy::Disabled,
+                ExecutionMode::CpuPcr | ExecutionMode::HybridPcr => {
+                    PostRepairRecheckPolicy::IterativeFrozenModelWdlV2
+                }
+            },
+            Self::V2(config) => config.post_repair_policy(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -530,6 +623,16 @@ impl ExecutionConfiguration {
 }
 
 impl RoventStartupConfiguration {
+    pub fn fields(&self) -> ConfigurationFields<'_> {
+        ConfigurationFields {
+            semantic: &self.semantic,
+            review: &self.review,
+            index: &self.index,
+            frontier: &self.frontier,
+            native: &self.native,
+            execution: &self.execution,
+        }
+    }
     pub fn from_json(bytes: &[u8]) -> Result<Self, BackendError> {
         if bytes.is_empty() || bytes.len() > ROVENT_STARTUP_CONFIGURATION_MAX_BYTES {
             return Err(invalid("startup configuration byte budget"));
@@ -543,6 +646,70 @@ impl RoventStartupConfiguration {
         if self.domain != ROVENT_STARTUP_CONFIGURATION_DOMAIN {
             return Err(invalid("startup configuration domain"));
         }
+        self.fields().validate()
+    }
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, BackendError> {
+        self.validate()?;
+        canonical(self)
+    }
+    pub fn configuration_digest(&self) -> Result<[u8; 32], BackendError> {
+        framed_digest(
+            ROVENT_STARTUP_CONFIGURATION_DOMAIN,
+            &self.canonical_bytes()?,
+        )
+    }
+    /// Identifies actual constructor values consumed by every mode. It does
+    /// not certify that a declared mode, model or work item actually executed.
+    pub fn search_configuration_digest(&self) -> Result<[u8; 32], BackendError> {
+        self.validate()?;
+        framed_digest(
+            ROVENT_SEARCH_CONFIGURATION_DOMAIN,
+            &canonical(&(
+                &self.semantic,
+                &self.review,
+                &self.index,
+                &self.frontier,
+                &self.execution,
+            ))?,
+        )
+    }
+    /// Immutable NNUEC plan/policy only. Dynamic view/Bound seals stay with
+    /// the actual preparation actor and must never be filled from this hash.
+    pub fn nnuec_search_conditions_digest(&self) -> Result<Option<[u8; 32]>, BackendError> {
+        self.validate()?;
+        self.fields().nnuec_conditions_digest()
+    }
+    pub fn admit_against(&self, lock: &RoventInputLock) -> Result<(), BackendError> {
+        self.validate()?;
+        self.fields().admit_against(
+            lock,
+            || self.configuration_digest(),
+            || self.search_configuration_digest(),
+            || self.nnuec_search_conditions_digest(),
+        )
+    }
+    /// First native product path is NNUEC-free P/C. A registered shared
+    /// readout remains a valid R-free selection but needs its typed actor
+    /// consumer; it is not reclassified as an R topology mismatch.
+    pub fn require_supported_native_capabilities(&self) -> Result<(), BackendError> {
+        self.validate()?;
+        self.fields().require_supported_native_capabilities()
+    }
+}
+
+/// Read-only common constructor declarations. This borrows metadata and
+/// cannot issue root, worker, model or execution authority.
+#[derive(Clone, Copy, Debug)]
+pub struct ConfigurationFields<'a> {
+    pub semantic: &'a SemanticConfiguration,
+    pub review: &'a ReviewConfiguration,
+    pub index: &'a IndexConfiguration,
+    pub frontier: &'a FrontierConfiguration,
+    pub native: &'a NativeConfiguration,
+    pub execution: &'a ExecutionConfiguration,
+}
+impl ConfigurationFields<'_> {
+    fn validate(&self) -> Result<(), BackendError> {
         self.semantic.actual()?;
         self.review.actual()?;
         self.index.actual()?;
@@ -553,7 +720,7 @@ impl RoventStartupConfiguration {
         {
             return Err(invalid("shared context/role limits"));
         }
-        match &self.execution {
+        match self.execution {
             ExecutionConfiguration::RolesOnly {
                 shared_nnuec_readout,
                 ..
@@ -639,36 +806,8 @@ impl RoventStartupConfiguration {
         }
         Ok(())
     }
-    pub fn canonical_bytes(&self) -> Result<Vec<u8>, BackendError> {
-        self.validate()?;
-        canonical(self)
-    }
-    pub fn configuration_digest(&self) -> Result<[u8; 32], BackendError> {
-        framed_digest(
-            ROVENT_STARTUP_CONFIGURATION_DOMAIN,
-            &self.canonical_bytes()?,
-        )
-    }
-    /// Identifies actual constructor values consumed by every mode. It does
-    /// not certify that a declared mode, model or work item actually executed.
-    pub fn search_configuration_digest(&self) -> Result<[u8; 32], BackendError> {
-        self.validate()?;
-        framed_digest(
-            ROVENT_SEARCH_CONFIGURATION_DOMAIN,
-            &canonical(&(
-                &self.semantic,
-                &self.review,
-                &self.index,
-                &self.frontier,
-                &self.execution,
-            ))?,
-        )
-    }
-    /// Immutable NNUEC plan/policy only. Dynamic view/Bound seals stay with
-    /// the actual preparation actor and must never be filled from this hash.
-    pub fn nnuec_search_conditions_digest(&self) -> Result<Option<[u8; 32]>, BackendError> {
-        self.validate()?;
-        match &self.execution {
+    fn nnuec_conditions_digest(&self) -> Result<Option<[u8; 32]>, BackendError> {
+        match self.execution {
             ExecutionConfiguration::RolesOnly {
                 shared_nnuec_readout: Some(readout),
                 ..
@@ -693,13 +832,18 @@ impl RoventStartupConfiguration {
             _ => Ok(None),
         }
     }
-    pub fn admit_against(&self, lock: &RoventInputLock) -> Result<(), BackendError> {
-        self.validate()?;
+    fn admit_against(
+        &self,
+        lock: &RoventInputLock,
+        configuration_digest: impl Fn() -> Result<[u8; 32], BackendError>,
+        search_configuration_digest: impl Fn() -> Result<[u8; 32], BackendError>,
+        nnuec_conditions_digest: impl Fn() -> Result<Option<[u8; 32]>, BackendError>,
+    ) -> Result<(), BackendError> {
         lock.validate().map_err(|_| invalid("Rovent input lock"))?;
         let engine = &lock.manifest.engine;
         let declaration = &lock.manifest.coordinator;
-        if declaration.policy_sha256 != hex(self.configuration_digest()?)
-            || engine.search.search_configuration_sha256 != hex(self.search_configuration_digest()?)
+        if declaration.policy_sha256 != hex(configuration_digest()?)
+            || engine.search.search_configuration_sha256 != hex(search_configuration_digest()?)
             || engine.search.registered_max_chess_plies.get() != self.frontier.maximum_goal_plies
             || declaration.role_tickets_max as usize != self.execution.role_tickets_max()
             || self.frontier.maximum_frames > declaration.questions_max as usize
@@ -711,7 +855,7 @@ impl RoventStartupConfiguration {
             &engine.pc.device,
             matches!(engine.pc.device, RoventDevice::Cuda { .. }),
         )?;
-        match (&self.execution, &engine.researcher) {
+        match (self.execution, &engine.researcher) {
             (
                 ExecutionConfiguration::RolesOnly {
                     shared_nnuec_readout,
@@ -722,7 +866,7 @@ impl RoventStartupConfiguration {
                 match (
                     shared_nnuec_readout,
                     &engine.nnuec,
-                    self.nnuec_search_conditions_digest()?,
+                    nnuec_conditions_digest()?,
                 ) {
                     (None, None, None) => {}
                     (Some(readout), Some(pin), Some(conditions))
@@ -761,10 +905,10 @@ impl RoventStartupConfiguration {
                 {
                     return Err(invalid("locked original CPU credit/queue limits differ"));
                 }
-                if *search_configuration_sha256 != hex(self.search_configuration_digest()?) {
+                if *search_configuration_sha256 != hex(search_configuration_digest()?) {
                     return Err(invalid("locked own R configuration differs"));
                 }
-                match (value, &engine.nnuec, self.nnuec_search_conditions_digest()?) {
+                match (value, &engine.nnuec, nnuec_conditions_digest()?) {
                     (ResearchValueConfiguration::BaselineBoard, None, None) => {}
                     (
                         ResearchValueConfiguration::NnuecV2 {
@@ -808,11 +952,7 @@ impl RoventStartupConfiguration {
         }
         Ok(())
     }
-    /// First native product path is NNUEC-free P/C. A registered shared
-    /// readout remains a valid R-free selection but needs its typed actor
-    /// consumer; it is not reclassified as an R topology mismatch.
-    pub fn require_supported_native_capabilities(&self) -> Result<(), BackendError> {
-        self.validate()?;
+    fn require_supported_native_capabilities(&self) -> Result<(), BackendError> {
         if matches!(
             self.execution,
             ExecutionConfiguration::RolesOnly {
@@ -906,6 +1046,89 @@ mod tests {
                 shared_nnuec_readout: None,
             },
         }
+    }
+    #[test]
+    fn version_dispatch_preserves_original_v1_bytes_hashes_and_mode_policy() {
+        let original = pc();
+        let bytes = original.canonical_bytes().unwrap();
+        let selected = StartupConfigurationDocument::from_json(&bytes).unwrap();
+        assert!(matches!(selected, StartupConfigurationDocument::V1(_)));
+        assert_eq!(selected.canonical_bytes().unwrap(), bytes);
+        assert_eq!(
+            selected.configuration_digest().unwrap(),
+            original.configuration_digest().unwrap()
+        );
+        assert_eq!(
+            selected.search_configuration_digest().unwrap(),
+            original.search_configuration_digest().unwrap()
+        );
+        assert_eq!(
+            selected.nnuec_conditions_digest().unwrap(),
+            original.nnuec_search_conditions_digest().unwrap()
+        );
+        for mode in [ExecutionMode::CpuPc, ExecutionMode::HybridPc] {
+            assert_eq!(
+                selected.post_repair_policy_for(mode),
+                PostRepairRecheckPolicy::Disabled
+            );
+        }
+        for mode in [ExecutionMode::CpuPcr, ExecutionMode::HybridPcr] {
+            assert_eq!(
+                selected.post_repair_policy_for(mode),
+                PostRepairRecheckPolicy::IterativeFrozenModelWdlV2
+            );
+        }
+        let wire: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(wire.get("post_repair").is_none());
+    }
+
+    #[test]
+    fn version_dispatch_selects_exact_decoder_without_policy_default_or_fallback() {
+        let legacy = serde_json::to_value(pc()).unwrap();
+        // Explicit /2 test input; no production conversion API exists.
+        for (policy, expected) in [
+            ("disabled", PostRepairRecheckPolicy::Disabled),
+            (
+                "iterative_frozen_model_wdl_v2",
+                PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+            ),
+        ] {
+            let mut wire = legacy.clone();
+            wire["domain"] = serde_json::json!(v2::ROVENT_STARTUP_CONFIGURATION_V2_DOMAIN);
+            wire["post_repair"] = serde_json::json!(policy);
+            let bytes = serde_json::to_vec(&wire).unwrap();
+            let selected = StartupConfigurationDocument::from_json(&bytes).unwrap();
+            assert!(matches!(selected, StartupConfigurationDocument::V2(_)));
+            for mode in [
+                ExecutionMode::CpuPc,
+                ExecutionMode::HybridPc,
+                ExecutionMode::CpuPcr,
+                ExecutionMode::HybridPcr,
+            ] {
+                assert_eq!(selected.post_repair_policy_for(mode), expected);
+            }
+            assert!(RoventStartupConfiguration::from_json(&bytes).is_err());
+        }
+        let mut missing = legacy.clone();
+        missing["domain"] = serde_json::json!(v2::ROVENT_STARTUP_CONFIGURATION_V2_DOMAIN);
+        assert!(
+            StartupConfigurationDocument::from_json(&serde_json::to_vec(&missing).unwrap())
+                .is_err()
+        );
+        let mut wrong_version_shape = legacy.clone();
+        wrong_version_shape["post_repair"] = serde_json::json!("disabled");
+        assert!(
+            StartupConfigurationDocument::from_json(
+                &serde_json::to_vec(&wrong_version_shape).unwrap()
+            )
+            .is_err()
+        );
+        let mut unknown = legacy;
+        unknown["domain"] = serde_json::json!("rz-rovent-startup-configuration/3");
+        assert!(
+            StartupConfigurationDocument::from_json(&serde_json::to_vec(&unknown).unwrap())
+                .is_err()
+        );
     }
     #[test]
     fn strict_pc_decoder_rejects_r_fields_unknown_fields_and_legacy_domains() {

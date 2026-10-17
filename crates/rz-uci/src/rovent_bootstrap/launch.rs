@@ -2,6 +2,7 @@
 //! fabricated weights path participates in this source-bound native assembly.
 
 use super::configuration::{ExecutionConfiguration, ResearchValueConfiguration};
+use super::nnuec_source::LoadedRoventNnuecSource;
 use super::process_boundary::verify_actual_process_boundary;
 use super::product::{
     RoventNativeProductDriver, RoventProductStartupOwners, RoventProductStartupRejection,
@@ -294,18 +295,9 @@ pub fn run(arguments: Vec<String>) -> Result<(), RoventLaunchError> {
         .configuration()
         .require_supported_native_capabilities()
         .map_err(|failure| error("Capability", failure))?;
-    match &sources.configuration().execution {
+    match sources.configuration().fields().execution {
         ExecutionConfiguration::RolesOnly { .. } => {}
-        ExecutionConfiguration::OwnResearcher {
-            value: ResearchValueConfiguration::BaselineBoard,
-            ..
-        } => {}
-        ExecutionConfiguration::OwnResearcher { .. } => {
-            return Err(error(
-                "Capability",
-                "NNUEC preparing/Ready session is not yet admitted by this entry",
-            ));
-        }
+        ExecutionConfiguration::OwnResearcher { .. } => {}
         ExecutionConfiguration::ExternalResearcher { .. } => {
             return Err(error(
                 "Capability",
@@ -337,24 +329,41 @@ pub fn run(arguments: Vec<String>) -> Result<(), RoventLaunchError> {
             .pin_runtime()
             .map_err(|failure| error("Runtime", failure))?,
         configuration: configuration
+            .fields()
             .native
             .onnx(&lock.manifest.engine.pc.device, cuda_profile.is_some())
             .map_err(|failure| error("Configuration", failure))?,
         loading_profile: configuration
+            .fields()
             .native
             .loading_profile
             .map(|profile| profile.actual()),
         cuda_profile,
-        drain_limit: Duration::from_millis(configuration.native.drain_ms),
+        drain_limit: Duration::from_millis(configuration.fields().native.drain_ms),
         tickets: configuration
+            .fields()
             .native
-            .tickets(configuration.review.token_budget)
+            .tickets(configuration.fields().review.token_budget)
             .map_err(|failure| error("Configuration", failure))?,
-        command_capacity: configuration.native.command_capacity,
+        command_capacity: configuration.fields().native.command_capacity,
     };
     control
         .check()
         .map_err(|failure| error("StartupWindow", failure))?;
+    let loaded_nnuec = if matches!(
+        sources.configuration().fields().execution,
+        ExecutionConfiguration::OwnResearcher {
+            value: ResearchValueConfiguration::NnuecV2 { .. },
+            ..
+        }
+    ) {
+        Some(
+            LoadedRoventNnuecSource::load(Arc::clone(&sources), &control)
+                .map_err(|failure| error("NnuecSource", failure))?,
+        )
+    } else {
+        None
+    };
     let owners = Arc::new(OwnerRegistry::default());
     let identity = EngineIdentity {
         name: format!("Rovent {:?}", lock.manifest.engine.mode),
@@ -368,13 +377,23 @@ pub fn run(arguments: Vec<String>) -> Result<(), RoventLaunchError> {
             control.clone(),
         )
         .map_err(|failure| reject_factory(failure, cleanup_until))?;
-        RoventNativeProductDriver::own_board_pcr(
-            prepared,
-            clock.clone(),
-            Arc::clone(&owners),
-            identity,
-            arguments.root_policy,
-        )
+        match loaded_nnuec {
+            Some(loaded) => RoventNativeProductDriver::own_nnuec_pcr(
+                prepared,
+                loaded,
+                clock.clone(),
+                Arc::clone(&owners),
+                identity,
+                arguments.root_policy,
+            ),
+            None => RoventNativeProductDriver::own_board_pcr(
+                prepared,
+                clock.clone(),
+                Arc::clone(&owners),
+                identity,
+                arguments.root_policy,
+            ),
+        }
     } else {
         let prepared = prepare_native::<PcPortQuestion>(
             Arc::clone(&sources),
@@ -442,6 +461,9 @@ fn reject_product(mut failure: RoventProductStartupRejection, until: Instant) ->
     let confirmed = match &mut failure.owners {
         RoventProductStartupOwners::Pc(prepared) => drain_native(&mut prepared.service, until),
         RoventProductStartupOwners::Pcr(prepared) => drain_native(&mut prepared.service, until),
+        RoventProductStartupOwners::NnuecRejected(rejected) => {
+            drain_native(&mut rejected.prepared.service, until)
+        }
         RoventProductStartupOwners::PcrRejected(rejected) => {
             drain_native(&mut rejected.sources.native, until)
         }

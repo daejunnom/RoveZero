@@ -34,6 +34,9 @@ pub struct LoadedRoventNnuecSource {
 }
 
 impl LoadedRoventNnuecSource {
+    pub fn matches_sources(&self, sources: &Arc<RoventPinnedNativeSources>) -> bool {
+        Arc::ptr_eq(&self.sources, sources)
+    }
     pub fn load(
         sources: Arc<RoventPinnedNativeSources>,
         control: &RoventStartupControl,
@@ -102,7 +105,7 @@ impl LoadedRoventNnuecSource {
         verify_declarations(
             pin,
             &sources.lock().manifest.provenance,
-            sources.configuration().nnuec_search_conditions_digest()?,
+            sources.configuration().nnuec_conditions_digest()?,
             &body,
             &model,
             &registration,

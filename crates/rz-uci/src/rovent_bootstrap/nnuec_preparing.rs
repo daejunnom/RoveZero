@@ -17,7 +17,8 @@ use rz_contracts::pals_adaptive::CpuWorkerId;
 use rz_runtime::CompletionSignal;
 use rz_search::cpu_checker::{CheckerError, CpuChecker};
 use rz_search::cpu_value::nnuec::v2::review::{
-    BoundNnuecReviewContext, Completion, PreparationActor, PreparationError, Provenance, Request,
+    BoundNnuecReviewContext, Completion, NnuecPreparationTerminalAck, PreparationActor,
+    PreparationError, Provenance, Request,
 };
 use rz_search::cpu_worker::{
     CpuWorker, CpuWorkerError, MaterializationCompletion, MaterializationHandoff,
@@ -83,6 +84,9 @@ pub struct InitialNnuecCleanupOwners {
     pub checker_mirror: Option<Box<dyn CpuChecker>>,
     pub root_handoff: Option<PreparingRootHandoff<AdaptivePortModel>>,
     pub unmatched_review: Option<Completion>,
+    /// Actual same-actor C terminal; keep its one-use retirement capability
+    /// even when the original result is a cancellation or preparation error.
+    pub preparation_terminal_ack: Option<NnuecPreparationTerminalAck>,
     pub unmatched_materialization: Option<MaterializationCompletion>,
     /// A missing local Request is not a completion observation.
     pub preparation_outstanding: bool,
@@ -192,6 +196,7 @@ impl InitialNnuecPreparing {
                 checker_mirror: None,
                 root_handoff: None,
                 unmatched_review: None,
+                preparation_terminal_ack: None,
                 unmatched_materialization: None,
                 preparation_outstanding: false,
                 materialization_outstanding: false,
@@ -268,6 +273,7 @@ impl InitialNnuecPreparing {
                         return self.invalid("initial C completion differs from original request");
                     }
                     self.owners.preparation_outstanding = false;
+                    self.owners.preparation_terminal_ack = Some(completion.terminal_ack);
                     match completion.result {
                         Ok(bound) => {
                             let matches = self.owners.expected.as_ref() == Some(bound.provenance());

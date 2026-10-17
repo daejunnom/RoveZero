@@ -7,6 +7,7 @@
 pub mod configuration;
 pub mod launch;
 pub mod nnuec_preparing;
+pub mod nnuec_session;
 pub mod nnuec_source;
 pub mod pc_session;
 mod pinned;
@@ -15,7 +16,9 @@ pub mod product;
 
 pub use pinned::{
     RoventCollectionPreloadSources, RoventCollectionTeacherSourceCustody,
-    RoventCollectionTeacherSources, RoventTeacherAssetSelection, RoventTeacherSourceSelection,
+    RoventCollectionTeacherSources, RoventExternalRAssetSelection, RoventExternalRSourceCustody,
+    RoventExternalRSourceSelection, RoventPinnedExternalRSource, RoventTeacherAssetSelection,
+    RoventTeacherSourceSelection,
 };
 pub use pinned::{RoventNativeAssetSelection, RoventNativeGraphAsset, RoventPinnedNativeSources};
 
@@ -482,9 +485,13 @@ fn validate_native_resources(
     let pc = &lock.manifest.engine.pc;
     let startup = sources.configuration();
     let expected = startup
+        .fields()
         .native
         .onnx(&pc.device, resources.cuda_profile.is_some())?;
-    let tickets = startup.native.tickets(startup.review.token_budget)?;
+    let tickets = startup
+        .fields()
+        .native
+        .tickets(startup.fields().review.token_budget)?;
     let provider_matches = match (expected.provider, resources.configuration.provider) {
         (Provider::Cpu, Provider::Cpu) => true,
         (
@@ -505,12 +512,13 @@ fn validate_native_resources(
         || expected.device_public_memory != resources.configuration.device_public_memory
         || expected.cudnn_conv_search != resources.configuration.cudnn_conv_search
         || startup
+            .fields()
             .native
             .loading_profile
             .map(configuration::LoadingProfile::actual)
             != resources.loading_profile
-        || startup.native.command_capacity != resources.command_capacity
-        || Duration::from_millis(startup.native.drain_ms) != resources.drain_limit
+        || startup.fields().native.command_capacity != resources.command_capacity
+        || Duration::from_millis(startup.fields().native.drain_ms) != resources.drain_limit
         || tickets.review_token_budget != resources.tickets.review_token_budget
         || tickets.prepared_host_bytes_per_ticket
             != resources.tickets.prepared_host_bytes_per_ticket
@@ -698,11 +706,16 @@ pub fn compiled_bootstrap_source_digest() -> [u8; 32] {
         include_str!("rovent_bootstrap.rs"),
         include_str!("rovent_bootstrap/pinned.rs"),
         include_str!("rovent_bootstrap/configuration.rs"),
+        include_str!("rovent_bootstrap/configuration/v2.rs"),
+        include_str!("rovent_bootstrap/pinned/external_r.rs"),
         include_str!("rovent_bootstrap/pc_session.rs"),
         include_str!("rovent_bootstrap/product.rs"),
         include_str!("rovent_bootstrap/launch.rs"),
         include_str!("rovent_bootstrap/nnuec_source.rs"),
         include_str!("rovent_bootstrap/nnuec_preparing.rs"),
+        include_str!("rovent_bootstrap/nnuec_session.rs"),
+        include_str!("rovent_bootstrap/nnuec_session/retirement.rs"),
+        include_str!("rovent_bootstrap/nnuec_session/initial_cleanup.rs"),
         include_str!("rovent_bootstrap/pinned/nnuec.rs"),
         include_str!("rovent_bootstrap/pinned/collection.rs"),
         include_str!("pals_adaptive_bootstrap/runtime_assets.rs"),

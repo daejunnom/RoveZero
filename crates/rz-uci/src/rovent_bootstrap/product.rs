@@ -3,13 +3,16 @@
 //! the synchronous RoleModel compatibility driver for native inference.
 
 use super::configuration::{ExecutionConfiguration, ResearchValueConfiguration};
-use super::pc_session::RoventPcSessionDriver;
+use super::nnuec_session::{RoventNnuecSessionDriver, RoventNnuecSessionRejection};
+use super::nnuec_source::LoadedRoventNnuecSource;
+use super::pc_session::{RoventPcCollectionHooks, RoventPcSessionDriver};
 use super::{PreparedRoventNative, RoventNativeBackend, RoventPinnedNativeSources};
 use crate::EngineIdentity;
 use crate::engine::{OwnerRegistry, ProcessClock};
 use crate::pals_adaptive::{
-    AdaptiveCheckerMetadata, AdaptiveSessionAdmissionRejection, AdaptiveSessionDriver,
-    AdaptiveSessionOptions, AdaptiveSessionSources, PersistentCpuOwner, RoventPcrSessionProfile,
+    AdaptiveCheckerMetadata, AdaptiveSessionAdmissionRejection, AdaptiveSessionCollectionHooks,
+    AdaptiveSessionDriver, AdaptiveSessionOptions, AdaptiveSessionSources, PersistentCpuOwner,
+    RoventPcrSessionProfile,
 };
 use crate::rovent_root_admission::RoventRootAdmissionPolicy;
 use crate::search_driver::{
@@ -29,9 +32,7 @@ use rz_search::pals::engine::adaptive_port::{
     AdaptivePortModel, AdaptivePortQuestion, AdaptiveRulesOwnerIssuer,
 };
 use rz_search::pals::engine::pc_port::PcPortQuestion;
-use rz_search::pals::engine::{
-    PalsConfig, PalsEngine, PostRepairRecheckPolicy, ResearcherSemanticProfile, ResolverPolicy,
-};
+use rz_search::pals::engine::{PalsConfig, PalsEngine, ResearcherSemanticProfile, ResolverPolicy};
 use sha2::{Digest as _, Sha256};
 use std::{
     num::NonZeroU16,
@@ -46,6 +47,7 @@ type PcrDriver = AdaptiveSessionDriver<RoventNativeBackend<AdaptivePortQuestion>
 enum ActualProductDriver {
     Pc(RoventPcSessionDriver),
     Pcr(PcrDriver),
+    Nnuec(RoventNnuecSessionDriver),
 }
 
 /// Keeps the same original retained descriptors until actual whole-session
@@ -60,6 +62,7 @@ pub enum RoventProductStartupOwners {
     Pcr(PreparedRoventNative<AdaptivePortQuestion>),
     PcrRejected(AdaptiveSessionAdmissionRejection<RoventNativeBackend<AdaptivePortQuestion>>),
     PcrDriver(Box<PcrDriver>),
+    NnuecRejected(Box<RoventNnuecSessionRejection>),
 }
 pub struct RoventProductStartupRejection {
     pub failure: SearchSessionFailure,
@@ -69,6 +72,29 @@ pub struct RoventProductStartupRejection {
 }
 
 impl RoventNativeProductDriver {
+    #[allow(clippy::result_large_err)]
+    pub fn own_nnuec_pcr(
+        prepared: PreparedRoventNative<AdaptivePortQuestion>,
+        loaded: LoadedRoventNnuecSource,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Self, RoventProductStartupRejection> {
+        let sources = Arc::clone(prepared.sources());
+        let driver =
+            RoventNnuecSessionDriver::new(prepared, loaded, clock, owners, identity, root_policy)
+                .map_err(|rejected| RoventProductStartupRejection {
+                failure: rejected.failure.clone(),
+                owners: RoventProductStartupOwners::NnuecRejected(Box::new(rejected)),
+                sources: Arc::clone(&sources),
+            })?;
+        Ok(Self {
+            inner: Arc::new(ActualProductDriver::Nnuec(driver)),
+            sources,
+            physically_closed: AtomicBool::new(false),
+        })
+    }
     #[allow(clippy::result_large_err)]
     pub fn pc(
         prepared: PreparedRoventNative<PcPortQuestion>,
@@ -91,6 +117,36 @@ impl RoventNativeProductDriver {
         })
     }
 
+    #[allow(clippy::result_large_err)]
+    pub fn pc_with_collection_hooks(
+        prepared: PreparedRoventNative<PcPortQuestion>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        hooks: RoventPcCollectionHooks,
+    ) -> Result<Self, RoventProductStartupRejection> {
+        let sources = Arc::clone(prepared.sources());
+        let driver = RoventPcSessionDriver::new_with_collection_hooks(
+            prepared,
+            clock,
+            owners,
+            identity,
+            root_policy,
+            hooks,
+        )
+        .map_err(|rejected| RoventProductStartupRejection {
+            failure: rejected.failure,
+            owners: RoventProductStartupOwners::Pc(rejected.prepared),
+            sources: Arc::clone(&sources),
+        })?;
+        Ok(Self {
+            inner: Arc::new(ActualProductDriver::Pc(driver)),
+            sources,
+            physically_closed: AtomicBool::new(false),
+        })
+    }
+
     /// Actual existing material/PST integer board evaluator. This is a distinct
     /// M01 baseline, never a placeholder described as NNUEC.
     #[allow(clippy::result_large_err)]
@@ -101,7 +157,63 @@ impl RoventNativeProductDriver {
         identity: EngineIdentity,
         root_policy: RoventRootAdmissionPolicy,
     ) -> Result<Self, RoventProductStartupRejection> {
+        Self::admit_own_board_pcr(prepared, clock, owners, identity, root_policy, None)
+    }
+
+    /// Collection preserves the actual loaded origin and reuses the same
+    /// exclusive root owner. Upper callers retain independent teacher owners.
+    #[allow(clippy::result_large_err)]
+    pub fn own_board_pcr_with_collection_hooks(
+        prepared: PreparedRoventNative<AdaptivePortQuestion>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        hooks: AdaptiveSessionCollectionHooks<RoventNativeBackend<AdaptivePortQuestion>>,
+    ) -> Result<Self, RoventProductStartupRejection> {
+        Self::admit_own_board_pcr(prepared, clock, owners, identity, root_policy, Some(hooks))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn admit_own_board_pcr(
+        prepared: PreparedRoventNative<AdaptivePortQuestion>,
+        clock: ProcessClock,
+        owners: Arc<OwnerRegistry>,
+        identity: EngineIdentity,
+        root_policy: RoventRootAdmissionPolicy,
+        collection_hooks: Option<
+            AdaptiveSessionCollectionHooks<RoventNativeBackend<AdaptivePortQuestion>>,
+        >,
+    ) -> Result<Self, RoventProductStartupRejection> {
         let pins = Arc::clone(prepared.sources());
+        let collection = match (pins.lock().manifest.purpose, collection_hooks) {
+            (rz_experiments::RoventPurpose::Collection, Some(hooks))
+                if hooks.root_admission.is_some() =>
+            {
+                match prepared.collection_identity() {
+                    Ok(origin) => Some((origin, hooks)),
+                    Err(error) => {
+                        return Err(RoventProductStartupRejection {
+                            failure: SearchSessionFailure::debug("RoventCollectionOrigin", &error),
+                            owners: RoventProductStartupOwners::Pcr(prepared),
+                            sources: pins,
+                        });
+                    }
+                }
+            }
+            (rz_experiments::RoventPurpose::Collection, _) | (_, Some(_)) => {
+                return Err(RoventProductStartupRejection {
+                    failure: failure(
+                        "RoventCollectionHooks",
+                        "collection purpose and actual root observer must be selected together",
+                    ),
+                    owners: RoventProductStartupOwners::Pcr(prepared),
+                    sources: pins,
+                });
+            }
+            (_, None) => None,
+        };
+
         let build = (|| -> Result<_, SearchSessionFailure> {
             let configuration = pins.configuration();
             let ExecutionConfiguration::OwnResearcher {
@@ -116,7 +228,7 @@ impl RoventNativeProductDriver {
                 controller,
                 reciprocal,
                 peers,
-            } = &configuration.execution
+            } = configuration.fields().execution
             else {
                 return Err(failure(
                     "RoventPcrStartup",
@@ -139,7 +251,7 @@ impl RoventNativeProductDriver {
                     "this engine-retaining session does not apply a per-worker affinity request",
                 ));
             }
-            let semantic = &configuration.semantic;
+            let semantic = configuration.fields().semantic;
             let namespace = prepared
                 .snapshot()
                 .model_namespace()
@@ -199,7 +311,7 @@ impl RoventNativeProductDriver {
                 .map_err(|error| SearchSessionFailure::debug("RoventPcrMetadata", &error))?;
             let mirror = metadata.clone().into_mirror();
             let resolver = ResolverPolicy::ModelWdlRestricted;
-            let recheck = PostRepairRecheckPolicy::IterativeFrozenModelWdlV2;
+            let recheck = configuration.post_repair_policy_for(prepared.snapshot().mode);
             let registration =
                 PalsCheckerRegistration::capture_with_resolver(&mirror, &model, resolver)?;
             let engine = PalsEngine::new_with_boxed_checker_and_rovent_profile(
@@ -222,15 +334,23 @@ impl RoventNativeProductDriver {
             .map_err(|error| SearchSessionFailure::debug("RoventPcrSemantic", &error))?
             .with_selected_review_context(
                 configuration
+                    .fields()
                     .review
                     .actual()
                     .map_err(|error| SearchSessionFailure::debug("RoventPcrReview", &error))?,
                 configuration
+                    .fields()
                     .index
                     .actual()
                     .map_err(|error| SearchSessionFailure::debug("RoventPcrIndex", &error))?,
             )
             .map_err(|error| SearchSessionFailure::debug("RoventPcrReview", &error))?;
+            if engine.post_repair_recheck_policy() != recheck {
+                return Err(failure(
+                    "RoventPcrRecheckPolicy",
+                    "actual engine policy differs from its registered configuration",
+                ));
+            }
             let root_budget = Digest(
                 rz_eval::asset::parse_sha256(
                     &pins.lock().manifest.coordinator.original_root_budget_sha256,
@@ -252,7 +372,7 @@ impl RoventNativeProductDriver {
                 max_rounds: *max_rounds,
                 max_cpu_nodes: *max_native_nodes,
                 cpu_depth: *cpu_depth,
-                token_budget: configuration.review.token_budget,
+                token_budget: configuration.fields().review.token_budget,
                 policy: event_order.actual(),
                 endpoints: CpuEndpointSelection::deployment(),
                 controller: control,
@@ -262,8 +382,10 @@ impl RoventNativeProductDriver {
             };
             let profile = RoventPcrSessionProfile {
                 mode: prepared.snapshot().mode,
-                maximum_goal_plies: NonZeroU16::new(configuration.frontier.maximum_goal_plies)
-                    .ok_or_else(|| failure("RoventPcrGoal", "zero goal capability"))?,
+                maximum_goal_plies: NonZeroU16::new(
+                    configuration.fields().frontier.maximum_goal_plies,
+                )
+                .ok_or_else(|| failure("RoventPcrGoal", "zero goal capability"))?,
                 input_lock: prepared.snapshot().input_lock,
                 root_budget,
                 selective_policy: Digest(configuration.search_configuration_digest().map_err(
@@ -271,6 +393,7 @@ impl RoventNativeProductDriver {
                 )?),
                 model_namespace: Arc::new(namespace),
                 frontier_limits: configuration
+                    .fields()
                     .frontier
                     .actual()
                     .map_err(|error| SearchSessionFailure::debug("RoventPcrFrontier", &error))?,
@@ -312,15 +435,30 @@ impl RoventNativeProductDriver {
             checker_metadata: metadata,
         };
         let issuer: AdaptiveRulesOwnerIssuer = Arc::new(move || owners.allocate());
-        let mut driver = AdaptiveSessionDriver::new_rovent_pcr_with_resource_limits(
-            options,
-            limits,
-            sources,
-            clock,
-            issuer,
-            registration,
-            profile,
-        )
+        let mut driver = match collection {
+            Some((origin, hooks)) => {
+                AdaptiveSessionDriver::new_rovent_pcr_with_resource_limits_and_collection_hooks(
+                    options,
+                    limits,
+                    sources,
+                    clock,
+                    issuer,
+                    registration,
+                    profile,
+                    origin,
+                    hooks,
+                )
+            }
+            None => AdaptiveSessionDriver::new_rovent_pcr_with_resource_limits(
+                options,
+                limits,
+                sources,
+                clock,
+                issuer,
+                registration,
+                profile,
+            ),
+        }
         .map_err(|rejected| RoventProductStartupRejection {
             failure: rejected.failure.clone(),
             owners: RoventProductStartupOwners::PcrRejected(rejected),
@@ -345,10 +483,14 @@ impl RoventNativeProductDriver {
         match self.inner.as_ref() {
             ActualProductDriver::Pc(driver) => driver,
             ActualProductDriver::Pcr(driver) => driver,
+            ActualProductDriver::Nnuec(driver) => driver,
         }
     }
 }
 impl SearchSessionDriver for RoventNativeProductDriver {
+    fn supports_ponder_clock(&self) -> bool {
+        self.actual().supports_ponder_clock()
+    }
     fn node_budget_semantics(&self) -> crate::bridge::NodeBudgetSemantics {
         self.actual().node_budget_semantics()
     }

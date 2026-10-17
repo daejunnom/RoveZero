@@ -1,7 +1,7 @@
 //! Exact Rovent asset selection over retained, verified descriptor owners.
 //! No legacy manifest or V5 success record is synthesized for this model.
 
-use super::configuration::{ROVENT_STARTUP_CONFIGURATION_MAX_BYTES, RoventStartupConfiguration};
+use super::configuration::{ROVENT_STARTUP_CONFIGURATION_MAX_BYTES, StartupConfigurationDocument};
 use super::{
     RoventStartupControl, RoventStartupTopology, admitted_topology,
     compiled_bootstrap_source_digest, fail, hex,
@@ -29,6 +29,11 @@ use std::{
     sync::Arc,
 };
 mod collection;
+mod external_r;
+pub use external_r::{
+    RoventExternalRAssetSelection, RoventExternalRSourceCustody, RoventExternalRSourceSelection,
+    RoventPinnedExternalRSource,
+};
 mod nnuec;
 pub use collection::{
     RoventCollectionPreloadSources, RoventCollectionTeacherSourceCustody,
@@ -77,7 +82,7 @@ pub struct RoventPinnedNativeSources {
     _root: Dir,
     private_root_path: PathBuf,
     configuration_blob: PinnedBlob,
-    configuration: RoventStartupConfiguration,
+    configuration: StartupConfigurationDocument,
     export: PinnedBlob,
     rules: PinnedBlob,
     graphs: Vec<PinnedGraph>,
@@ -194,7 +199,7 @@ impl RoventPinnedNativeSources {
             selection.startup_configuration,
             ROVENT_STARTUP_CONFIGURATION_MAX_BYTES as u64,
         )?;
-        let configuration = RoventStartupConfiguration::from_json(&read_blob(
+        let configuration = StartupConfigurationDocument::from_json(&read_blob(
             &configuration_blob,
             ROVENT_STARTUP_CONFIGURATION_MAX_BYTES,
         )?)?;
@@ -313,7 +318,7 @@ impl RoventPinnedNativeSources {
     pub fn topology(&self) -> RoventStartupTopology {
         self.topology
     }
-    pub fn configuration(&self) -> &RoventStartupConfiguration {
+    pub fn configuration(&self) -> &StartupConfigurationDocument {
         &self.configuration
     }
     pub fn configuration_artifact(&self) -> &ArtifactRef {
@@ -437,7 +442,7 @@ impl RoventPinnedNativeSources {
                 "native topology changed after pinning",
             ));
         }
-        let configuration = RoventStartupConfiguration::from_json(&read_blob(
+        let configuration = StartupConfigurationDocument::from_json(&read_blob(
             &self.configuration_blob,
             ROVENT_STARTUP_CONFIGURATION_MAX_BYTES,
         )?)?;
