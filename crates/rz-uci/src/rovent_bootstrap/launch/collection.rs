@@ -15,6 +15,7 @@ use crate::rovent_bootstrap::{
     RoventStartupControl, RoventTeacherSourceSelection,
 };
 use crate::rovent_root_admission::RoventRootAdmissionPolicy;
+use rz_experiments::RoventInputLock;
 use rz_search::pals::engine::{adaptive_port::AdaptivePortQuestion, pc_port::PcPortQuestion};
 use std::sync::Arc;
 
@@ -81,5 +82,29 @@ pub fn run_collection<'a>(
             observer,
             assemble: Box::new(assemble),
         }),
+        None,
+    )
+}
+
+/// 원 lock/process boundary 확인 뒤 native 준비 전에 자원 owner를 인수한다.
+/// OS scope는 callback의 상위 owner가 보유하며 Result<()>는 권한을 만들지 않는다.
+pub fn run_collection_with_resource_admission<'a>(
+    arguments: Vec<String>,
+    teacher_selections: Vec<RoventTeacherSourceSelection>,
+    observer: Box<dyn VirtualReviewCollectionObserver>,
+    admit_resource: impl FnOnce(&Arc<RoventInputLock>) -> Result<(), RoventLaunchError> + 'a,
+    assemble: impl FnOnce(
+        RoventCollectionPreparedLaunch,
+    ) -> Result<RoventNativeProductDriver, RoventProductStartupRejection>
+    + 'a,
+) -> Result<(), RoventLaunchError> {
+    super::run_inner(
+        arguments,
+        Some(CollectionLaunch {
+            teacher_selections,
+            observer,
+            assemble: Box::new(assemble),
+        }),
+        Some(Box::new(admit_resource)),
     )
 }

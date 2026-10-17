@@ -51,6 +51,7 @@ mod evidence;
 use collection::CollectionLaunch;
 pub use collection::{
     RoventCollectionPreparedLaunch, RoventCollectionPreparedNative, run_collection,
+    run_collection_with_resource_admission,
 };
 pub use evidence::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 
@@ -262,12 +263,26 @@ impl ExternalSelectionWire {
 /// The caller passes only process arguments. No account, token or external
 /// credential file is inspected by this native UCI entry.
 pub fn run(arguments: Vec<String>) -> Result<(), RoventLaunchError> {
-    run_inner(arguments, None)
+    run_inner(arguments, None, None)
 }
 
-fn run_inner(
+/// 같은 원 lock으로 자원 admission을 한 번 수행한 뒤 native launch를 잇는다.
+/// 실제 OS scope와 실패 시 FD custody는 상위 caller가 전체 실행 동안 보유한다.
+/// build-capabilities 조회는 실행하지 않으므로 이 callback도 호출하지 않는다.
+pub fn run_with_resource_admission<'a>(
     arguments: Vec<String>,
-    collection: Option<CollectionLaunch<'_>>,
+    admit_resource: impl FnOnce(&Arc<RoventInputLock>) -> Result<(), RoventLaunchError> + 'a,
+) -> Result<(), RoventLaunchError> {
+    run_inner(arguments, None, Some(Box::new(admit_resource)))
+}
+
+type ResourceAdmission<'a> =
+    Box<dyn FnOnce(&Arc<RoventInputLock>) -> Result<(), RoventLaunchError> + 'a>;
+
+fn run_inner<'a>(
+    arguments: Vec<String>,
+    collection: Option<CollectionLaunch<'a>>,
+    resource_admission: Option<ResourceAdmission<'a>>,
 ) -> Result<(), RoventLaunchError> {
     if arguments == ["--build-capabilities-json"] {
         let sources = super::process_boundary::compiled_process_source_components()
@@ -350,6 +365,17 @@ fn run_inner(
         &control,
     )
     .map_err(|failure| error("ProcessBoundary", failure))?;
+    if let Some(admit_resource) = resource_admission {
+        // This is the same parsed and process-verified source owner. No model,
+        // ORT provider, teacher preload, external process or worker exists yet.
+        control
+            .check()
+            .map_err(|failure| error("ResourceAdmission", failure))?;
+        admit_resource(&lock)?;
+        control
+            .check()
+            .map_err(|failure| error("ResourceAdmission", failure))?;
+    }
     let selected: Vec<_> = lock
         .manifest
         .provenance

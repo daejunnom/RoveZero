@@ -4,18 +4,18 @@
 //! native model and keeps this owner across every success/failure return.
 #![cfg(target_os = "linux")]
 
+use crate::ArenaError;
 use crate::rovent_training_process::{
     RoventNativeProcessEntry, RoventTrainingResourceFailure, RoventTrainingResourcePolicy,
     RoventTrainingResources,
 };
-use crate::ArenaError;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::Dir;
 use rz_experiments::{
     ArtifactRef, RoventDevice, RoventInputLock, RoventObserved, RoventResourceObservation,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::{
     fs::File,
@@ -27,6 +27,8 @@ use std::{
 pub const ROVENT_NATIVE_RESOURCE_EVIDENCE: &str = "rz-rovent-native-resource-readback/1";
 const MAX_EVIDENCE_BYTES: usize = 4 << 20;
 
+pub mod launch;
+
 /// Declaration only. CPU/memory come from the same exact input lock; these
 /// remaining physical bounds are explicit and are checked by the OS owner.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -37,9 +39,9 @@ pub struct RoventNativeResourceOptions {
     pub device: String,
 }
 
-/// Functional validation still requires actual configured controls and a
-/// stable tree. A strict comparison additionally requires the complete plan
-/// readback; this bounded same-process probe deliberately cannot supply it.
+/// Both profiles require actual configured controls and a stable current tree
+/// before model loading. Strict comparison separately requires complete plan
+/// readback after execution; unobserved final peaks never prevent measurement.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RoventNativeResourceProfile {
@@ -130,7 +132,7 @@ impl RoventNativeResourceScope {
                     error,
                     lock,
                     delegated,
-                }))
+                }));
             }
         };
         let resources =
@@ -140,7 +142,7 @@ impl RoventNativeResourceScope {
                     return Err(Box::new(RoventNativeResourceFailure::Preparation {
                         failure,
                         lock,
-                    }))
+                    }));
                 }
             };
         let entry = match resources.enter_current_native_process() {
@@ -150,7 +152,7 @@ impl RoventNativeResourceScope {
                     error,
                     lock,
                     resources,
-                }))
+                }));
             }
         };
         Ok(Self {
@@ -252,11 +254,13 @@ impl RoventNativeResourceSnapshot {
         &self.raw
     }
 
-    /// This checks only the private actual readback snapshot. Deserializing a
-    /// declaration or resource receipt cannot create an admissible snapshot.
-    /// Strict comparison is held at this boundary, before any model loading,
-    /// while the original scope remains owned by the caller.
-    pub fn require_profile(&self, profile: RoventNativeResourceProfile) -> Result<(), ArenaError> {
+    /// Start only from actual current kernel controls/tree/affinity. This gate
+    /// does not require post-execution peaks or mistake a declaration for the
+    /// current OS readback. Deserialized JSON cannot create this snapshot.
+    pub fn require_admission(
+        &self,
+        _profile: RoventNativeResourceProfile,
+    ) -> Result<(), ArenaError> {
         if self.applied != Some(true)
             || !self.inventory_complete
             || self.threads.is_none()
@@ -266,10 +270,21 @@ impl RoventNativeResourceSnapshot {
                 "actual native leaf/tree readback is unavailable; original custody retained",
             ));
         }
+        Ok(())
+    }
+
+    /// This separate post-execution decision never gates initial measurement.
+    /// Keep the actual execution evidence and owner when strict acceptance is
+    /// held: the current same-process snapshot provides partial evidence only.
+    pub fn require_finished_profile(
+        &self,
+        profile: RoventNativeResourceProfile,
+    ) -> Result<(), ArenaError> {
+        self.require_admission(profile)?;
         match profile {
             RoventNativeResourceProfile::FunctionalValidation => Ok(()),
             RoventNativeResourceProfile::StrictComparison => Err(invalid(
-                "strict resource comparison held: complete quota ancestry, topology, ORT thread-role inventory, pre-entry memory charges and finished-run peaks are unknown",
+                "strict resource acceptance held after execution: complete quota ancestry, topology, ORT thread-role inventory, pre-entry memory charges and finished-run peaks are unknown",
             )),
         }
     }
@@ -391,9 +406,11 @@ mod tests {
     #[test]
     fn failed_kernel_probes_remain_unknown_not_unapplied_or_empty() {
         let snapshot = fixture_snapshot();
-        assert!(snapshot
-            .require_profile(RoventNativeResourceProfile::FunctionalValidation)
-            .is_err());
+        assert!(
+            snapshot
+                .require_admission(RoventNativeResourceProfile::FunctionalValidation)
+                .is_err()
+        );
         let observed = snapshot.project_observation(fixture_artifact());
         assert_eq!(observed.limits_applied, RoventObserved::Unknown);
         assert_eq!(observed.memory_high_bytes, RoventObserved::Unknown);
@@ -409,12 +426,21 @@ mod tests {
         partial.threads = Some(3);
         partial.limits = Some((6 << 30, 12 << 30));
         partial.inventory_complete = true;
-        assert!(partial
-            .require_profile(RoventNativeResourceProfile::FunctionalValidation)
-            .is_ok());
-        assert!(partial
-            .require_profile(RoventNativeResourceProfile::StrictComparison)
-            .is_err());
+        assert!(
+            partial
+                .require_admission(RoventNativeResourceProfile::FunctionalValidation)
+                .is_ok()
+        );
+        assert!(
+            partial
+                .require_admission(RoventNativeResourceProfile::StrictComparison)
+                .is_ok()
+        );
+        assert!(
+            partial
+                .require_finished_profile(RoventNativeResourceProfile::StrictComparison)
+                .is_err()
+        );
         let observed = partial.project_observation(fixture_artifact());
         assert!(matches!(
             observed.limits_applied,

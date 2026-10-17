@@ -41,6 +41,17 @@ pub struct RoventNativeTreeObservation {
 }
 
 impl RoventTrainingResources {
+    /// Read-only original descriptor preparation shared by native upper
+    /// callers. Reuse the same absolute no-follow path walk as the trainer;
+    /// this issues no resource entry or configuration authority.
+    pub fn open_native_delegation(path: &Path) -> Result<File, ArenaError> {
+        validate_absolute(path)?;
+        let directory = open_absolute(path)?;
+        let file = directory_file(&directory)?;
+        ensure_cgroup(&file)?;
+        Ok(file)
+    }
+
     /// Enter only this process before native/teacher/ORT threads are created.
     /// Existing ancestor controls are never written and Drop never migrates
     /// the caller back. On partial failure the same caller must keep this FD
@@ -161,9 +172,13 @@ impl RoventTrainingResources {
             })
             .ok_or_else(|| invalid("native tree thread count overflow"))?;
         Ok(RoventNativeTreeObservation {
-            root_pid: entry.root_pid, root_start_ticks: entry.root_start_ticks,
+            root_pid: entry.root_pid,
+            root_start_ticks: entry.root_start_ticks,
             original_membership: entry.original_membership.clone(),
-            membership: self.membership.clone(), processes: before, kernel_threads, readback,
+            membership: self.membership.clone(),
+            processes: before,
+            kernel_threads,
+            readback,
             live_leaf_memory_peak_bytes: peak.as_ref().ok().copied(),
             live_leaf_memory_peak_unknown_reason: peak.err().map(|error| error.to_string()),
             scope: "bounded_current_native_descendant_and_thread_snapshot_not_lifetime_topology_ancestry_or_final_peak_proof",

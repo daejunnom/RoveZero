@@ -66,6 +66,11 @@ name = "rz-rovent-collect"
 path = "src/bin/rovent-collect.rs"
 required-features = ["pals-collection-onnx"]
 
+[[bin]]
+name = "rz-rovent-native"
+path = "src/bin/rovent-native.rs"
+required-features = ["pals-collection-onnx"]
+
 [[example]]
 name = "pilot_failure_audit"
 required-features = ["native-cuda"]
