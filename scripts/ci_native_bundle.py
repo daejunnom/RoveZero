@@ -36,6 +36,10 @@ ARTIFACT_CAP = 512 << 20
 ELF_CAP = 256 << 20
 LOG_CAP = 8 << 20
 SOURCE_CAP = 128 << 20
+# Release compilation can exhaust the old 45-minute window after several
+# feature profiles have already completed. Keep an explicit finite build-only
+# ceiling; the requested window is recorded in the original resource receipt.
+MAX_BUILD_SECONDS = 5400
 SINGLETONS = {'Cargo.toml', 'Cargo.lock', 'LICENSE', 'rust-toolchain.toml',
               'experiments/model-research/pals/pyproject.toml',
               'experiments/baselines/fastchess-clock-ponder-v2.patch'}
@@ -381,7 +385,7 @@ def write_json(path, value):
 def run(source, root, expected_head, seconds):
     require(sys.platform == 'linux' and platform.machine() in ('x86_64', 'AMD64')
             and re.fullmatch('[a-f0-9]{40}', expected_head)
-            and 1 <= seconds <= 2700, 'LinuxFiniteBuildProfile')
+            and 1 <= seconds <= MAX_BUILD_SECONDS, 'LinuxFiniteBuildProfile')
     source, root = checked(source), checked(root)
     runner_temp = checked(Path(os.environ['RUNNER_TEMP']))
     require(root.is_relative_to(runner_temp / 'RoveZero') and not root.is_relative_to(source)
