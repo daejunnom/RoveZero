@@ -4,10 +4,13 @@
 //! returns the exact durable receipt pin. No filesystem or tensor work is here.
 
 use super::cost::{RoventUtilityCheckpointCost, RoventUtilityRecordedCost};
-use super::dataset::{UtilityContextAuthority, VerifiedUtilityDataset};
-use super::execution::{ROVENT_UTILITY_MAX_UPDATES, validate_utility_training_preparation};
-use super::registration_cohort::ROVENT_UTILITY_COHORT_PREPARATION_DOMAIN;
-use super::window_v2::RoventUtilityTrainWindowV2 as RoventUtilityTrainWindow;
+use super::execution::ROVENT_UTILITY_MAX_UPDATES;
+use super::numerical_parts::ValidatedUtilityNumericalParts;
+use super::runtime_family::{
+    RuntimeUtilityContext as UtilityContextAuthority,
+    RuntimeUtilityDataset as VerifiedUtilityDataset,
+    RuntimeUtilityWindow as RoventUtilityTrainWindow, UtilityRuntimeFamily,
+};
 use crate::ArenaError;
 use crate::rovent_training_process::RoventTrainingFilePin;
 use rz_experiments::pals_data_v3::{generation_digest, generation_sha};
@@ -15,7 +18,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 const STATE_DOMAIN: &str = "rz-rovent-utility-derived-training-state/1";
 const SAMPLER_DOMAIN: &str = "rz-rovent-utility-sampler/1";
@@ -128,6 +130,28 @@ fn accumulation_denominator(contexts: &[ConsumedContext]) -> Result<u64, ArenaEr
     contexts
         .iter()
         .try_fold(0u64, |total, row| add(total, row.unique_known_pairs))
+}
+
+fn zero_update_closure(
+    family: UtilityRuntimeFamily,
+    payload: &Value,
+    completed_delta: u64,
+    dispatched_delta: u64,
+) -> Result<bool, ArenaError> {
+    if payload["status"] != "no_update_checkpoint_not_published" {
+        return Ok(false);
+    }
+    check(
+        family == UtilityRuntimeFamily::InterventionV2
+            && completed_delta == 0
+            && dispatched_delta == 0
+            && payload["checkpoint"].is_null()
+            && payload["quarantined"] == false
+            && payload["physical_completion"] == "confirmed"
+            && payload["pending_microbatches"] == 0,
+        "zero-update closure cannot issue a checkpoint or hide dispatched/physical work",
+    )?;
+    Ok(true)
 }
 
 /// Hashes are observations of five distinct original state families. They are
@@ -395,7 +419,7 @@ struct ConsumedContext {
     unique_known_pairs: u64,
 }
 impl ConsumedContext {
-    fn from_original(context: &UtilityContextAuthority) -> Result<Self, ArenaError> {
+    fn from_original(context: UtilityContextAuthority<'_>) -> Result<Self, ArenaError> {
         let pairs = context.pair_sha256s().to_vec();
         check(
             generation_sha(context.sha256())
@@ -426,9 +450,10 @@ struct PendingUtilityUpdate {
 /// Single original process/window ledger. A prepared update is retained until
 /// its matching durable receipt arrives; it is never retried or counted twice.
 pub(super) struct UtilityLedger {
-    dataset: Arc<VerifiedUtilityDataset>,
+    dataset: VerifiedUtilityDataset,
     window: RoventUtilityTrainWindow,
-    preparation: Value,
+    _preparation: Value,
+    numerical: ValidatedUtilityNumericalParts,
     restored: RestoredUtilityState,
     sampler: UtilitySampler,
     states: UtilityStateSeals,
@@ -500,6 +525,10 @@ impl UtilityLedger {
     ) -> Result<Value, ArenaError> {
         window.validate()?;
         check(
+            window.family() == dataset.family(),
+            "sampler source family mismatch",
+        )?;
+        check(
             dataset.context_ids().iter().all(|sha| generation_sha(sha))
                 && !dataset.context_ids().is_empty()
                 && dataset.context_ids().len() <= 8192
@@ -523,7 +552,7 @@ impl UtilityLedger {
     pub(super) fn from_initial_measurement(
         window: RoventUtilityTrainWindow,
         preparation: Value,
-        dataset: Arc<VerifiedUtilityDataset>,
+        dataset: VerifiedUtilityDataset,
         measurement: InitialUtilityMeasurement,
     ) -> Result<Self, ArenaError> {
         check(
@@ -562,7 +591,7 @@ impl UtilityLedger {
     pub(super) fn from_fork_measurement(
         window: RoventUtilityTrainWindow,
         preparation: Value,
-        dataset: Arc<VerifiedUtilityDataset>,
+        dataset: VerifiedUtilityDataset,
         source: &RestoredUtilityState,
         measurement: InitialUtilityMeasurement,
     ) -> Result<Self, ArenaError> {
@@ -632,7 +661,7 @@ impl UtilityLedger {
     pub(super) fn new(
         window: RoventUtilityTrainWindow,
         preparation: Value,
-        dataset: Arc<VerifiedUtilityDataset>,
+        dataset: VerifiedUtilityDataset,
         restored: RestoredUtilityState,
     ) -> Result<Self, ArenaError> {
         check(
@@ -661,7 +690,7 @@ impl UtilityLedger {
     pub(super) fn for_historical_replay(
         window: RoventUtilityTrainWindow,
         preparation: Value,
-        dataset: Arc<VerifiedUtilityDataset>,
+        dataset: VerifiedUtilityDataset,
         restored: RestoredUtilityState,
         original_admission_scope: &str,
     ) -> Result<Self, ArenaError> {
@@ -685,15 +714,20 @@ impl UtilityLedger {
     fn new_inner(
         window: RoventUtilityTrainWindow,
         preparation: Value,
-        dataset: Arc<VerifiedUtilityDataset>,
+        dataset: VerifiedUtilityDataset,
         restored: RestoredUtilityState,
         state_admission: UtilityStateAdmission,
         mode: UtilityLedgerMode,
     ) -> Result<Self, ArenaError> {
         window.join_cohort_preparation(&preparation)?;
         check(
-            preparation["schema"] == ROVENT_UTILITY_COHORT_PREPARATION_DOMAIN,
-            "utility execution requires the new actual cohort preparation domain",
+            window.family() == dataset.family(),
+            "window/dataset family mismatch",
+        )?;
+        let numerical = window.family().numerical(&preparation)?;
+        check(
+            numerical.preparation_sha256() == window.preparation_sha256,
+            "original family preparation seal differs",
         )?;
         check(
             window.dataset_sha256 == dataset.dataset_sha256(),
@@ -741,8 +775,7 @@ impl UtilityLedger {
             )?;
         }
         check(
-            restored.frozen_base_weights_sha256
-                == preparation["registration"]["frozen_base"]["weights_sha256"]
+            restored.frozen_base_weights_sha256 == numerical.frozen_base_weights_sha256()
                 && generation_sha(&restored.frozen_base_mapping_sha256),
             "separate original frozen semantic/mapping identity differs",
         )?;
@@ -757,7 +790,8 @@ impl UtilityLedger {
         Ok(Self {
             dataset,
             window,
-            preparation,
+            _preparation: preparation,
+            numerical,
             states: restored.states.clone(),
             sampler,
             cost: restored.cost,
@@ -786,10 +820,10 @@ impl UtilityLedger {
             .iter()
             .chain(self.completion_receipts.iter().map(|pin| &pin.sha256))
             .collect::<Vec<_>>();
-        digest(STATE_DOMAIN, &hashes)
+        digest(self.window.family().domain(STATE_DOMAIN), &hashes)
     }
     pub(super) fn initial_ledger_projection(&self) -> Value {
-        json!({"schema":"rz-rovent-utility-initial-ledger-projection/1",
+        json!({"schema":self.window.family().domain("rz-rovent-utility-initial-ledger-projection/1"),
             "state_admission_scope":self.state_admission.scope(),"states":self.restored.states,
             "sampler":self.restored.sampler,"completed_updates":self.restored.completed_updates,
             "dispatched_updates":self.restored.dispatched_updates,"ancestor_updates":self.restored.ancestor_updates,
@@ -817,7 +851,7 @@ impl UtilityLedger {
             .map_or(self.dispatched_updates, |pending| {
                 pending.dispatched_updates
             });
-        json!({"schema":"rz-rovent-utility-parent-ledger-observation/1",
+        json!({"schema":self.window.family().domain("rz-rovent-utility-parent-ledger-observation/1"),
             "window_id":self.window.window_id,"run_id":self.window.run_id,"dataset_sha256":self.dataset.dataset_sha256(),
             "completed_updates":self.completed_updates,"dispatched_updates":self.dispatched_updates,
             "observed_dispatched_updates":observed_dispatched,
@@ -834,7 +868,7 @@ impl UtilityLedger {
     fn derived_state(&self) -> Result<Value, ArenaError> {
         let total = add(self.completed_updates, self.restored.ancestor_updates)?;
         Ok(
-            json!({"schema":STATE_DOMAIN,"initial_source_declaration":self.restored.initial_source_declaration,"current_tensor_kind":if total>0 {"learned"} else {"initial_source_only"},"completed_updates":self.completed_updates,"ancestor_updates":self.restored.ancestor_updates,"total_updates":total,"completion_chain_sha256":self.chain_sha256()?,"recipe_sha256":self.preparation["recipe_sha256"],"registration_sha256":self.preparation["registration_sha256"],"frozen_base_weights_sha256":self.restored.frozen_base_weights_sha256,"frozen_base_mapping_sha256":self.restored.frozen_base_mapping_sha256,"live_training_authority_reissued":false}),
+            json!({"schema":self.window.family().domain(STATE_DOMAIN),"initial_source_declaration":self.restored.initial_source_declaration,"current_tensor_kind":if total>0 {"learned"} else {"initial_source_only"},"completed_updates":self.completed_updates,"ancestor_updates":self.restored.ancestor_updates,"total_updates":total,"completion_chain_sha256":self.chain_sha256()?,"recipe_sha256":self.numerical.recipe_sha256(),"registration_sha256":self.numerical.source_registration_sha256(),"frozen_base_weights_sha256":self.restored.frozen_base_weights_sha256,"frozen_base_mapping_sha256":self.restored.frozen_base_mapping_sha256,"live_training_authority_reissued":false}),
         )
     }
     fn current(&self) -> Result<(), ArenaError> {
@@ -888,9 +922,12 @@ impl UtilityLedger {
         check(
             !self.begun
                 && self.pending_update.is_none()
-                && payload["schema"] == "rz-rovent-utility-trainer-begin/1"
-                && sha(&payload["preparation_sha256"])?
-                    == validate_utility_training_preparation(&self.preparation)?.canonical_sha256
+                && payload["schema"]
+                    == self
+                        .window
+                        .family()
+                        .domain("rz-rovent-utility-trainer-begin/1")
+                && sha(&payload["preparation_sha256"])? == self.numerical.preparation_sha256()
                 && sha(&payload["window_spec_sha256"])? == self.window.canonical_sha256()?
                 && sha(&payload["dataset_sha256"])? == self.dataset.dataset_sha256(),
             "one original begin/source/window/dataset binding required",
@@ -905,7 +942,10 @@ impl UtilityLedger {
                 && sha(&payload["frozen_base_weights_sha256"])?
                     == self.restored.frozen_base_weights_sha256
                 && sha(&payload["derived_training_state_sha256"])?
-                    == digest(STATE_DOMAIN, &self.derived_state()?)?,
+                    == digest(
+                        self.window.family().domain(STATE_DOMAIN),
+                        &self.derived_state()?,
+                    )?,
             "begin changed original five-state or completion-chain seal",
         )?;
         self.begun = true;
@@ -923,7 +963,11 @@ impl UtilityLedger {
         self.current()?;
         fields(payload, &["schema", "source_projection"])?;
         check(
-            payload["schema"] == "rz-rovent-utility-trainer-consume/1"
+            payload["schema"]
+                == self
+                    .window
+                    .family()
+                    .domain("rz-rovent-utility-trainer-consume/1")
                 && self.pending_contexts.len() < ACCUMULATION
                 && self.consumed < u64::from(self.window.max_contexts)
                 && self.groups < u64::from(self.window.max_groups)
@@ -983,7 +1027,11 @@ impl UtilityLedger {
         names.extend(STATE_FIELDS);
         fields(payload, &names)?;
         check(
-            payload["schema"] == "rz-rovent-utility-trainer-update/1"
+            payload["schema"]
+                == self
+                    .window
+                    .family()
+                    .domain("rz-rovent-utility-trainer-update/1")
                 && self.pending_contexts.len() == ACCUMULATION
                 && count(&payload["pending_microbatches"])? == 0
                 && sha(&payload["frozen_base_weights_sha256"])?
@@ -1015,7 +1063,11 @@ impl UtilityLedger {
             .map(|context| &context.sha256)
             .collect::<Vec<_>>();
         check(
-            event["schema"] == "rz-rovent-utility-learner-update/1"
+            event["schema"]
+                == self
+                    .window
+                    .family()
+                    .domain("rz-rovent-utility-learner-update/1")
                 && count(&event["completed_updates"])? == completed
                 && count(&event["dispatched_updates"])? == dispatched
                 && completed - self.initial_completed_updates <= self.window.max_optimizer_updates
@@ -1046,7 +1098,7 @@ impl UtilityLedger {
                 && observed.backward_calls == add(self.cost.backward_calls, active_contexts)?,
             "known-only forward/backward count differs from admitted accumulation",
         )?;
-        let body = json!({"schema":COMPLETION_DOMAIN,"window_id":self.window.window_id,"run_id":self.window.run_id,"dataset_sha256":self.dataset.dataset_sha256(),"preparation_sha256":self.window.preparation_sha256,"source_registration_sha256":self.preparation["registration_sha256"],"optimizer_owner":self.preparation["optimizer_owner"],"initial_state_admission_scope":self.state_admission.scope(),"completed_updates":completed,"dispatched_updates":dispatched,"ancestor_updates":self.restored.ancestor_updates,"window_completed_updates":completed-self.initial_completed_updates,"window_dispatched_updates":dispatched-self.initial_dispatched_updates,"consumed_contexts":self.pending_contexts.iter().map(|row|json!({"context_sha256":row.sha256,"source_projection":row.source_projection,"pair_sha256":row.pair_sha256,"unique_known_pairs":row.unique_known_pairs})).collect::<Vec<_>>(),"original_request":payload,"historical_evidence_only":true,"execution_authorized":false});
+        let body = json!({"schema":self.window.family().domain(COMPLETION_DOMAIN),"window_id":self.window.window_id,"run_id":self.window.run_id,"dataset_sha256":self.dataset.dataset_sha256(),"preparation_sha256":self.window.preparation_sha256,"source_registration_sha256":self.numerical.source_registration_sha256(),"optimizer_owner":self.numerical.optimizer_owner(),"initial_state_admission_scope":self.state_admission.scope(),"completed_updates":completed,"dispatched_updates":dispatched,"ancestor_updates":self.restored.ancestor_updates,"window_completed_updates":completed-self.initial_completed_updates,"window_dispatched_updates":dispatched-self.initial_dispatched_updates,"consumed_contexts":self.pending_contexts.iter().map(|row|json!({"context_sha256":row.sha256,"source_projection":row.source_projection,"pair_sha256":row.pair_sha256,"unique_known_pairs":row.unique_known_pairs})).collect::<Vec<_>>(),"original_request":payload,"historical_evidence_only":true,"execution_authorized":false});
         let mut canonical = body.clone();
         canonical.sort_all_objects();
         let mut bytes =
@@ -1136,7 +1188,11 @@ impl UtilityLedger {
         fields(payload, &names)?;
         check(
             !self.begun
-                && payload["schema"] == "rz-rovent-utility-trainer-resume/1"
+                && payload["schema"]
+                    == self
+                        .window
+                        .family()
+                        .domain("rz-rovent-utility-trainer-resume/1")
                 && sha(&payload["preparation_sha256"])? == self.window.preparation_sha256,
             "resume admission must precede original window",
         )?;
@@ -1157,7 +1213,10 @@ impl UtilityLedger {
                 && payload["source_snapshot_cost_observation"]
                     == json!(self.restored.source_snapshot_cost_observation)
                 && sha(&payload["derived_training_state_sha256"])?
-                    == digest(STATE_DOMAIN, &self.derived_state()?)?,
+                    == digest(
+                        self.window.family().domain(STATE_DOMAIN),
+                        &self.derived_state()?,
+                    )?,
             "resume changed original checkpoint/state/cost/derived chain",
         )?;
         let observation = self
@@ -1189,7 +1248,11 @@ impl UtilityLedger {
         names.extend(STATE_FIELDS);
         fields(payload, &names)?;
         check(
-            payload["schema"] == "rz-rovent-utility-trainer-checkpoint/1"
+            payload["schema"]
+                == self
+                    .window
+                    .family()
+                    .domain("rz-rovent-utility-trainer-checkpoint/1")
                 && pin(&payload["checkpoint"])? == *original_checkpoint
                 && pin(&payload["tensor_projection"])? == *original_tensor_projection
                 && count(&payload["pending_microbatches"])? == 0
@@ -1203,7 +1266,10 @@ impl UtilityLedger {
                 && states.sampler_state_sha256
                     == self.sampler.state_sha256(self.dataset.context_ids())?
                 && sha(&payload["derived_training_state_sha256"])?
-                    == digest(STATE_DOMAIN, &self.derived_state()?)?,
+                    == digest(
+                        self.window.family().domain(STATE_DOMAIN),
+                        &self.derived_state()?,
+                    )?,
             "checkpoint changed active states, exact sampler or completion chain",
         )?;
         let snapshot = cost(&payload["snapshot_cost"])?;
@@ -1223,7 +1289,7 @@ impl UtilityLedger {
             "checkpoint output bytes must be charged once to this original window",
         )?;
         Ok(
-            json!({"schema":"rz-rovent-utility-parent-checkpoint-projection/1","checkpoint":original_checkpoint,"tensor_projection":original_tensor_projection,"states":states,"completed_updates":self.completed_updates,"ancestor_updates":self.restored.ancestor_updates,"snapshot_cost":snapshot,"post_snapshot_cost":post,"unupdated_context_sha256":self.pending_contexts.iter().map(|row|&row.sha256).collect::<Vec<_>>(),"pending_receipt":false,"historical_evidence_only":true,"execution_authorized":false}),
+            json!({"schema":self.window.family().domain("rz-rovent-utility-parent-checkpoint-projection/1"),"checkpoint":original_checkpoint,"tensor_projection":original_tensor_projection,"states":states,"completed_updates":self.completed_updates,"ancestor_updates":self.restored.ancestor_updates,"snapshot_cost":snapshot,"post_snapshot_cost":post,"unupdated_context_sha256":self.pending_contexts.iter().map(|row|&row.sha256).collect::<Vec<_>>(),"pending_receipt":false,"historical_evidence_only":true,"execution_authorized":false}),
         )
     }
     pub(super) fn prepare_checkpoint_boundary(
@@ -1281,7 +1347,7 @@ impl UtilityLedger {
                         "unique_known_pairs",
                     ],
                 )?;
-                self.consume_inner(&json!({"schema":"rz-rovent-utility-trainer-consume/1","source_projection":context["source_projection"]}))?;
+                self.consume_inner(&json!({"schema":self.window.family().domain("rz-rovent-utility-trainer-consume/1"),"source_projection":context["source_projection"]}))?;
             }
         }
         check(
@@ -1353,14 +1419,21 @@ impl UtilityLedger {
         fields(payload, &names)?;
         let total = add(self.completed_updates, self.restored.ancestor_updates)?;
         check(
-            payload["schema"] == "rz-rovent-utility-trainer-export/1"
+            payload["schema"]
+                == self
+                    .window
+                    .family()
+                    .domain("rz-rovent-utility-trainer-export/1")
                 && matches!(payload["kind"].as_str(), Some("collection" | "deployment"))
                 && sha(&payload["preparation_sha256"])? == self.window.preparation_sha256
                 && total > 0
                 && self.pending_contexts.is_empty()
                 && UtilityStateSeals::from_payload(payload)? == self.states
                 && sha(&payload["derived_training_state_sha256"])?
-                    == digest(STATE_DOMAIN, &self.derived_state()?)?,
+                    == digest(
+                        self.window.family().domain(STATE_DOMAIN),
+                        &self.derived_state()?,
+                    )?,
             "learned export requires positive original held completion chain, frozen state and no partial work",
         )?;
         self.validate_counts(payload)?;
@@ -1392,8 +1465,18 @@ impl UtilityLedger {
         self.validate_cost(observed)?;
         let dispatched = count(&payload["dispatched_updates"])?;
         let window_dispatched = count(&payload["window_dispatched_updates"])?;
+        let no_update = zero_update_closure(
+            self.window.family(),
+            payload,
+            self.completed_updates - self.initial_completed_updates,
+            self.dispatched_updates - self.initial_dispatched_updates,
+        )?;
         check(
-            payload["schema"] == "rz-rovent-utility-trainer-end/1"
+            payload["schema"]
+                == self
+                    .window
+                    .family()
+                    .domain("rz-rovent-utility-trainer-end/1")
                 && dispatched == self.dispatched_updates
                 && window_dispatched == self.dispatched_updates - self.initial_dispatched_updates
                 && count(&payload["pending_microbatches"])? == 0
@@ -1402,25 +1485,27 @@ impl UtilityLedger {
                     payload["physical_completion"].as_str(),
                     Some("confirmed" | "unknown")
                 )
-                && matches!(
-                    payload["status"].as_str(),
-                    Some(
-                        "window_complete"
-                            | "window_limit"
-                            | "partial_accumulation_discarded"
-                            | "export_complete"
-                            | "export_failed"
-                    )
-                ),
+                && (no_update
+                    || matches!(
+                        payload["status"].as_str(),
+                        Some(
+                            "window_complete"
+                                | "window_limit"
+                                | "partial_accumulation_discarded"
+                                | "export_complete"
+                                | "export_failed"
+                        )
+                    )),
             "original end observation/count/status differs",
         )?;
         check(
             self.pending_contexts.is_empty()
-                || payload["status"] == "partial_accumulation_discarded",
+                || payload["status"] == "partial_accumulation_discarded"
+                || no_update,
             "unupdated original contexts require an explicit partial-accumulation closure observation",
         )?;
         Ok(
-            json!({"schema":"rz-rovent-utility-parent-ended-projection/1","original_end":payload,"window_completed_updates":self.completed_updates-self.initial_completed_updates,"window_dispatched_updates":window_dispatched,"consumed_contexts":self.consumed,"groups":self.groups,"masked_groups":self.masked_groups,"unupdated_context_sha256":self.pending_contexts.iter().map(|row|&row.sha256).collect::<Vec<_>>(),"pending_durable_receipt":false,"historical_evidence_only":true,"execution_authorized":false}),
+            json!({"schema":self.window.family().domain("rz-rovent-utility-parent-ended-projection/1"),"original_end":payload,"window_completed_updates":self.completed_updates-self.initial_completed_updates,"window_dispatched_updates":window_dispatched,"consumed_contexts":self.consumed,"groups":self.groups,"masked_groups":self.masked_groups,"unupdated_context_sha256":self.pending_contexts.iter().map(|row|&row.sha256).collect::<Vec<_>>(),"pending_durable_receipt":false,"historical_evidence_only":true,"execution_authorized":false}),
         )
     }
 }
@@ -1430,6 +1515,42 @@ mod tests {
     //! Plain metadata/framing only. No fixture constructs a verified dataset,
     //! live peer, tensor owner, durable receipt or learned capability.
     use super::*;
+
+    #[test]
+    fn zero_update_closure_is_new_family_only_and_never_grants_publication() {
+        let original = json!({
+            "status":"no_update_checkpoint_not_published",
+            "checkpoint":null,"quarantined":false,
+            "physical_completion":"confirmed","pending_microbatches":0
+        });
+        assert!(
+            zero_update_closure(UtilityRuntimeFamily::InterventionV2, &original, 0, 0).unwrap()
+        );
+        assert!(zero_update_closure(UtilityRuntimeFamily::CohortV1, &original, 0, 0).is_err());
+        for (completed, dispatched) in [(1, 1), (0, 1)] {
+            assert!(
+                zero_update_closure(
+                    UtilityRuntimeFamily::InterventionV2,
+                    &original,
+                    completed,
+                    dispatched
+                )
+                .is_err()
+            );
+        }
+        for (field, value) in [
+            ("checkpoint", json!({"path":"/unused/checkpoint.pt"})),
+            ("quarantined", json!(true)),
+            ("physical_completion", json!("unknown")),
+            ("pending_microbatches", json!(1)),
+        ] {
+            let mut changed = original.clone();
+            changed[field] = value;
+            assert!(
+                zero_update_closure(UtilityRuntimeFamily::InterventionV2, &changed, 0, 0).is_err()
+            );
+        }
+    }
 
     #[test]
     fn plain_sampler_digest_uses_typed_recursive_framing_not_json_digest() {

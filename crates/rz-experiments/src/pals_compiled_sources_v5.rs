@@ -1096,6 +1096,60 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
     (
         "trainer",
         &[
+            source!("crates/rz-arena/src/rovent_collect/launch/intervention.rs"),
+            source!("crates/rz-arena/src/rovent_collect/utility_intervention_owner.rs"),
+            source!("crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical.rs"),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical/context.rs"
+            ),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical/pairs.rs"
+            ),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical/trial.rs"
+            ),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical_files.rs"
+            ),
+            source!("crates/rz-arena/src/rovent_collect/utility_intervention_owner/source.rs"),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/trial_writer.rs"
+            ),
+            source!("crates/rz-arena/src/rovent_training_process/utility/checkpoint/machine.rs"),
+            source!(
+                "crates/rz-arena/src/rovent_training_process/utility/intervention_checkpoint.rs"
+            ),
+            source!("crates/rz-arena/src/rovent_training_process/utility/intervention_dataset.rs"),
+            source!(
+                "crates/rz-arena/src/rovent_training_process/utility/intervention_execution.rs"
+            ),
+            source!("crates/rz-arena/src/rovent_training_process/utility/intervention_window.rs"),
+            source!("crates/rz-arena/src/rovent_training_process/utility/numerical_parts.rs"),
+            source!("crates/rz-arena/src/rovent_training_process/utility/runtime_family.rs"),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_authority.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_checkpoint.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_child.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_dataset.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_execution.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_numerical.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_training.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_training_family.py"
+            ),
             source!("crates/rz-arena/src/bin/rovent-trainer.rs"),
             source!("crates/rz-arena/src/bin/rovent-utility-trainer.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/training_export_process.rs"),
@@ -1246,6 +1300,72 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
     (
         "checkpoint",
         &[
+            source!("crates/rz-arena/src/rovent_collect/launch/intervention.rs"),
+            source!("crates/rz-arena/src/rovent_collect/utility_intervention_owner.rs"),
+            source!("crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical.rs"),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical/context.rs"
+            ),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical/pairs.rs"
+            ),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical/trial.rs"
+            ),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical_files.rs"
+            ),
+            source!("crates/rz-arena/src/rovent_collect/utility_intervention_owner/source.rs"),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/trial_writer.rs"
+            ),
+            source!("crates/rz-arena/src/rovent_training_process/utility/checkpoint/machine.rs"),
+            source!(
+                "crates/rz-arena/src/rovent_training_process/utility/intervention_checkpoint.rs"
+            ),
+            source!("crates/rz-arena/src/rovent_training_process/utility/intervention_dataset.rs"),
+            source!(
+                "crates/rz-arena/src/rovent_training_process/utility/intervention_execution.rs"
+            ),
+            source!("crates/rz-arena/src/rovent_training_process/utility/intervention_window.rs"),
+            source!("crates/rz-arena/src/rovent_training_process/utility/numerical_parts.rs"),
+            source!("crates/rz-arena/src/rovent_training_process/utility/runtime_family.rs"),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_authority.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_checkpoint.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_child.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_dataset.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_execution.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_files.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_numerical.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_payload.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_preparation.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_training.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_training_family.py"
+            ),
             source!("crates/rz-arena/src/bin/rovent-trainer.rs"),
             source!("crates/rz-arena/src/bin/rovent-utility-trainer.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/training_export_process.rs"),
@@ -1352,6 +1472,17 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
     (
         "arena",
         &[
+            source!("crates/rz-arena/src/rovent_training_process/utility/checkpoint/machine.rs"),
+            source!(
+                "crates/rz-arena/src/rovent_training_process/utility/intervention_checkpoint.rs"
+            ),
+            source!("crates/rz-arena/src/rovent_training_process/utility/intervention_dataset.rs"),
+            source!(
+                "crates/rz-arena/src/rovent_training_process/utility/intervention_execution.rs"
+            ),
+            source!("crates/rz-arena/src/rovent_training_process/utility/intervention_window.rs"),
+            source!("crates/rz-arena/src/rovent_training_process/utility/numerical_parts.rs"),
+            source!("crates/rz-arena/src/rovent_training_process/utility/runtime_family.rs"),
             source!("crates/rz-arena/Cargo.toml"),
             source!("crates/rz-arena/src/bin/fixture-engine.rs"),
             source!("crates/rz-arena/src/bin/model-pair.rs"),

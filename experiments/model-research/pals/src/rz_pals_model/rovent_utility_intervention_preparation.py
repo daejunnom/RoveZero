@@ -82,7 +82,7 @@ def validate_intervention_source(value):
         kind = descriptor["kind"]
         if kind in ("pc_legacy", "pc_submitted_input_v1", "r_auxiliary"):
             names = ("manifest_file_sha256", "index_file_sha256", "canonical_manifest_sha256", "canonical_index_sha256")
-        elif kind == "utility_cohort":
+        elif kind in ("utility_cohort", "utility_intervention"):
             names = ("dataset_sha256", "pool_sha256", "preparation_sha256", "context_sha256")
         else:
             raise ValueError("explicit original P/C, R or utility ancestor kind required")
@@ -154,13 +154,29 @@ def _validate_ancestor_owners(original, ancestor_owners, read_budget):
     actual, rows = set(), []
     for owner in ancestor_owners:
         read_budget._check()
-        descriptor = _ancestor_descriptor(owner)
+        from .rovent_utility_intervention_dataset import HistoricalUtilityInterventionDataset
+        if type(owner) is HistoricalUtilityInterventionDataset:
+            owner._check()
+            descriptor = {"kind": "utility_intervention", "publication_sha256": owner.publication_pin["sha256"],
+                "metadata": {"dataset_sha256": owner._dataset_sha256, "pool_sha256": owner.pool_sha256,
+                    "preparation_sha256": owner._parts.preparation_sha256, "context_sha256": owner.context_ids[0]}}
+            nested = owner._original["report"]
+            keys = {(name, nested["lineage"][name]) for name in ("opening_id", "game_id", "line_genealogy_id")}
+            keys.update((("transposition_sha256", nested["transposition_sha256"]), ("rules_state_sha256", nested["root_rules_sha256"])))
+            keys.update(("input_seal", nested[name]) for name in (
+                "neutral_input_sha256", "neutral_target_sha256", "neutral_context_sha256"))
+            keys.update(("input_seal", query[name]) for query in nested["role_queries"]
+                for name in ("question_sha256", "view_sha256", "full_view_sha256"))
+            ancestor_rows = ((nested["split"], keys),)
+        else:
+            descriptor = _ancestor_descriptor(owner)
+            ancestor_rows = _ancestor_rows(owner)
         publication = descriptor["publication_sha256"]
         if (publication == original["original_files"].file_pin("utility-cohort-publication.json")["sha256"]
                 or publication in actual or descriptor != declarations.get(publication)):
             raise ValueError("intervention original ancestor kind/seals/publication differs")
         actual.add(publication)
-        for split, keys in _ancestor_rows(owner):
+        for split, keys in ancestor_rows:
             read_budget._check()
             if split not in ("train", "validation", "holdout") or len(rows) >= 262144:
                 raise ValueError("bounded original intervention ancestor split/row inventory required")

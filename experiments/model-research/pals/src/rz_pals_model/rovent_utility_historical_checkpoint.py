@@ -51,6 +51,11 @@ METADATA_FIELDS = ("schema", "model_schema", "model_semantics", "base_schema", "
     "frozen_base_mapping_sha256", "frozen_base_config", "hidden_width", "input_width", "initial_training")
 
 
+def _codec(value):
+    from .rovent_utility_training_family import LEGACY, require_family
+    return require_family(LEGACY if value is None else value)
+
+
 def _history(value):
     if value["historical_evidence_only"] is not True or value["execution_authorized"] is not False:
         raise ValueError("utility historical observations cannot issue execution permission")
@@ -111,11 +116,12 @@ def _process_receipt(value):
     return value
 
 
-def _closure(value):
+def _closure(value, *, _family=None):
+    family = _codec(_family)
     _fields(value, ("schema", "execution_id", "window_id", "run_id", "kind", "child_identity", "process_receipt",
         "terminal_receipt", "boundary_publication", "child_reap", "physical_completion", "historical_evidence_only", "execution_authorized"), "original utility closure")
     _history(value)
-    if value["schema"] != CLOSURE_DOMAIN:
+    if value["schema"] != family.domain(CLOSURE_DOMAIN):
         raise ValueError("separate original utility closure domain required")
     for name in ("execution_id", "window_id", "run_id"):
         _identifier(value[name])
@@ -136,11 +142,12 @@ def _closure(value):
     return value
 
 
-def parse_utility_checkpoint_publication(raw, *, publication_sha256, publication_bytes):
+def _parse_utility_checkpoint_publication(raw, *, publication_sha256, publication_bytes, _family=None):
+    family = _codec(_family)
     value = _raw_json(raw, expected_sha256=publication_sha256, expected_bytes=publication_bytes, maximum=MAX_PROJECTION_BYTES)
     _fields(value, PUBLICATION_FIELDS, "utility checkpoint publication")
     _history(value)
-    if value["schema"] != PUBLICATION_DOMAIN:
+    if value["schema"] != family.domain(PUBLICATION_DOMAIN):
         raise ValueError("original utility publication required; P/C/V conversion forbidden")
     for name in ("execution_id", "window_id", "run_id"):
         _identifier(value[name])
@@ -165,6 +172,11 @@ def parse_utility_checkpoint_publication(raw, *, publication_sha256, publication
     _relative_ref(value["cost"], MAX_PROJECTION_BYTES)
     _relative_ref(value["closure"], MAX_PROJECTION_BYTES)
     return copy.deepcopy(value)
+
+
+def parse_utility_checkpoint_publication(raw, *, publication_sha256, publication_bytes):
+    return _parse_utility_checkpoint_publication(raw, publication_sha256=publication_sha256,
+        publication_bytes=publication_bytes)
 
 
 def _json(value):
@@ -222,13 +234,15 @@ def _metadata(value, preparation):
     return value
 
 
-def _tensor_projection(value):
+def _tensor_projection(value, *, _family=None):
+    family = _codec(_family)
     _fields(value, TENSOR_PROJECTION_FIELDS, "original utility tensor projection")
-    if value["schema"] != TENSOR_PROJECTION_DOMAIN:
+    if value["schema"] != family.domain(TENSOR_PROJECTION_DOMAIN):
         raise ValueError("actual utility producer projection required; no historical wrapper conversion")
     _sha(value["payload_state_sha256"])
-    preparation = validate_training_preparation(value["preparation"])
-    if preparation["schema"] != COHORT_PREPARATION_DOMAIN:
+    parts = family.parts(value["preparation"])
+    preparation = parts.preparation
+    if not family.intervention and preparation["schema"] != COHORT_PREPARATION_DOMAIN:
         raise ValueError("actual historical utility source requires its separate cohort preparation/2")
     metadata = _metadata(value["metadata"], preparation)
     for name in STATE_FIELDS:
@@ -279,11 +293,12 @@ def _tensor_projection(value):
         run_id=sampler.get("run_id"), seed=sampler.get("seed"))
     if _plain_state_sha256(sampler) != value["sampler_state_sha256"]:
         raise ValueError("utility original sampler bytes differ from its typed state seal")
-    derived = {"schema": STATE_DOMAIN, "initial_source_declaration": metadata["initial_training"],
+    state_domain = family.domain(STATE_DOMAIN)
+    derived = {"schema": state_domain, "initial_source_declaration": metadata["initial_training"],
         "current_tensor_kind": "learned" if total else "initial_source_only", "completed_updates": completed,
         "ancestor_updates": ancestor, "total_updates": total,
-        "completion_chain_sha256": digest(STATE_DOMAIN, [*ancestor_shas, *(pin["sha256"] for pin in receipts)]),
-        "recipe_sha256": preparation["recipe_sha256"], "registration_sha256": preparation["registration_sha256"],
+        "completion_chain_sha256": digest(state_domain, [*ancestor_shas, *(pin["sha256"] for pin in receipts)]),
+        "recipe_sha256": parts.recipe_sha256, "registration_sha256": parts.source_registration_sha256,
         "frozen_base_weights_sha256": metadata["base_weights_sha256"],
         "frozen_base_mapping_sha256": metadata["frozen_base_mapping_sha256"], "live_training_authority_reissued": False}
     if not _equal(value["derived_training_state"], derived):
@@ -318,14 +333,15 @@ def _states(value):
     return value
 
 
-def _initial(value):
+def _initial(value, *, _family=None):
+    family = _codec(_family)
     _fields(value, ("schema", "state_admission_scope", "states", "sampler", "completed_updates", "dispatched_updates",
         "ancestor_updates", "cost", "ancestor_cost", "completion_receipts", "ancestor_completion_sha256",
         "initial_source_declaration", "frozen_base_weights_sha256", "frozen_base_mapping_sha256", "source_checkpoint",
         "source_payload_state_sha256", "source_snapshot_cost_observation", "source_snapshot_cost", "source_snapshot_ancestor_cost",
         "checkpoint_cost", "historical_evidence_only", "execution_authorized"), "utility initial ledger projection")
     _history(value)
-    if value["schema"] != INITIAL_DOMAIN or value["state_admission_scope"] not in (
+    if value["schema"] != family.domain(INITIAL_DOMAIN) or value["state_admission_scope"] not in (
             "actual_original_child_initial_observation_not_independent_torch_recomputation",
             "original_held_checkpoint_and_full_completion_chain",
             "original_checkpoint_model_and_chain_with_actual_child_reset_state_observation"):
@@ -370,10 +386,11 @@ def _initial(value):
     return value
 
 
-def _checkpoint_request(value):
+def _checkpoint_request(value, *, _family=None):
+    family = _codec(_family)
     _fields(value, ("schema", "checkpoint", "tensor_projection", "completed_updates", "ancestor_updates", "snapshot_cost",
         "post_snapshot_cost", "pending_microbatches", "derived_training_state_sha256", *STATE_FIELDS), "original utility checkpoint request")
-    if value["schema"] != "rz-rovent-utility-trainer-checkpoint/1" or type(value["pending_microbatches"]) is not int or value["pending_microbatches"] != 0:
+    if value["schema"] != family.domain("rz-rovent-utility-trainer-checkpoint/1") or type(value["pending_microbatches"]) is not int or value["pending_microbatches"] != 0:
         raise ValueError("original utility no-gradient checkpoint request required")
     _absolute_pin(value["checkpoint"], MAX_TENSOR_BYTES); _absolute_pin(value["tensor_projection"], MAX_PROJECTION_BYTES)
     _uint(value["completed_updates"], MAX_UPDATES); _uint(value["ancestor_updates"], MAX_UPDATES)
@@ -388,21 +405,22 @@ def _checkpoint_request(value):
     return value
 
 
-def parse_utility_checkpoint_retirement(raw, *, expected_sha256, expected_bytes):
+def _parse_utility_checkpoint_retirement(raw, *, expected_sha256, expected_bytes, _family=None):
+    family = _codec(_family)
     value = _raw_json(raw, expected_sha256=expected_sha256, expected_bytes=expected_bytes, maximum=MAX_PROJECTION_BYTES)
     _fields(value, ("schema", "checkpoint", "original_request", "parent_projection", "tensor_projection_sha256",
         "historical_evidence_only", "execution_authorized"), "original utility checkpoint retirement")
     _history(value)
-    if value["schema"] != RETIREMENT_DOMAIN:
+    if value["schema"] != family.domain(RETIREMENT_DOMAIN):
         raise ValueError("separate original utility retirement domain required")
     _absolute_pin(value["checkpoint"], MAX_TENSOR_BYTES); _sha(value["tensor_projection_sha256"])
-    request = _checkpoint_request(value["original_request"])
+    request = _checkpoint_request(value["original_request"], _family=family)
     parent = value["parent_projection"]
     _fields(parent, ("schema", "checkpoint", "tensor_projection", "states", "completed_updates", "ancestor_updates",
         "snapshot_cost", "post_snapshot_cost", "unupdated_context_sha256", "pending_receipt",
         "historical_evidence_only", "execution_authorized"), "original utility parent checkpoint projection")
     _history(parent); _states(parent["states"])
-    if (parent["schema"] != "rz-rovent-utility-parent-checkpoint-projection/1" or parent["pending_receipt"] is not False
+    if (parent["schema"] != family.domain("rz-rovent-utility-parent-checkpoint-projection/1") or parent["pending_receipt"] is not False
             or not _equal(parent["checkpoint"], request["checkpoint"]) or not _equal(value["checkpoint"], request["checkpoint"])
             or not _equal(parent["tensor_projection"], request["tensor_projection"])
             or value["tensor_projection_sha256"] != request["tensor_projection"]["sha256"]):
@@ -417,6 +435,10 @@ def parse_utility_checkpoint_retirement(raw, *, expected_sha256, expected_bytes)
     for identity in parent["unupdated_context_sha256"]:
         _sha(identity)
     return copy.deepcopy(value)
+
+
+def parse_utility_checkpoint_retirement(raw, *, expected_sha256, expected_bytes):
+    return _parse_utility_checkpoint_retirement(raw, expected_sha256=expected_sha256, expected_bytes=expected_bytes)
 
 
 def _monotone(before, after):
@@ -528,13 +550,11 @@ class _Archive:
                 os.close(fd)
 
 
-def _dataset_source(dataset, registration):
+def _dataset_source(dataset, registration, *, _family=None):
     # Importing this module is still stdlib-only. A raw cohort file observation
     # cannot substitute this separately validated historical target dataset.
-    from .rovent_utility_route import HistoricalUtilityRouteDataset
-    if type(dataset) is not HistoricalUtilityRouteDataset:
-        raise ValueError("original typed historical utility route dataset required")
-    observation = dataset.observation()
+    family = _codec(_family)
+    observation = family.require_dataset(dataset)
     for name, source in (("publication_pin", "publication"), ("durable_ack_pin", "durable_ack")):
         expected = _pin_identity(registration["current_dataset"][source])
         if not _equal(observation[name], expected):
@@ -544,7 +564,9 @@ def _dataset_source(dataset, registration):
 
 class _Replay:
     """Metadata replay only; no ACK, optimizer, native or physical capability."""
-    def __init__(self, archive, publication, preparation, window, initial, dataset):
+    def __init__(self, archive, publication, preparation, window, initial, dataset, *, _family=None):
+        self.family = _codec(_family)
+        self.parts = self.family.parts(preparation)
         self.archive, self.publication, self.preparation, self.window, self.initial, self.dataset = (
             archive, publication, preparation, window, initial, dataset)
         self.sampler = copy.deepcopy(initial["sampler"])
@@ -561,11 +583,12 @@ class _Replay:
 
     def derived(self):
         total = _uint(self.completed + self.initial["ancestor_updates"], MAX_UPDATES)
-        return {"schema": STATE_DOMAIN, "initial_source_declaration": self.initial["initial_source_declaration"],
+        domain = self.family.domain(STATE_DOMAIN)
+        return {"schema": domain, "initial_source_declaration": self.initial["initial_source_declaration"],
             "current_tensor_kind": "learned" if total else "initial_source_only", "completed_updates": self.completed,
             "ancestor_updates": self.initial["ancestor_updates"], "total_updates": total,
-            "completion_chain_sha256": digest(STATE_DOMAIN, [*self.ancestors, *(pin["sha256"] for pin in self.receipts)]),
-            "recipe_sha256": self.preparation["recipe_sha256"], "registration_sha256": self.preparation["registration_sha256"],
+            "completion_chain_sha256": digest(domain, [*self.ancestors, *(pin["sha256"] for pin in self.receipts)]),
+            "recipe_sha256": self.parts.recipe_sha256, "registration_sha256": self.parts.source_registration_sha256,
             "frozen_base_weights_sha256": self.initial["frozen_base_weights_sha256"],
             "frozen_base_mapping_sha256": self.initial["frozen_base_mapping_sha256"], "live_training_authority_reissued": False}
 
@@ -586,12 +609,12 @@ class _Replay:
             "initial_source_declaration", "frozen_base_mapping_sha256", "frozen_base_weights_sha256", "completed_updates",
             "ancestor_updates", "derived_training_state_sha256", *STATE_FIELDS), "original utility begin")
         self.counts(value)
-        expected = {"schema": "rz-rovent-utility-trainer-begin/1", "preparation_sha256": self.window["preparation_sha256"],
-            "window_spec_sha256": utility_window_v2_digest(self.window), "dataset_sha256": self.window["dataset_sha256"],
+        expected = {"schema": self.family.domain("rz-rovent-utility-trainer-begin/1"), "preparation_sha256": self.window["preparation_sha256"],
+            "window_spec_sha256": self.family.window_digest(self.window), "dataset_sha256": self.window["dataset_sha256"],
             "initial_source_declaration": self.initial["initial_source_declaration"],
             "frozen_base_mapping_sha256": self.initial["frozen_base_mapping_sha256"],
             "frozen_base_weights_sha256": self.initial["frozen_base_weights_sha256"], "completed_updates": self.completed,
-            "ancestor_updates": self.initial["ancestor_updates"], "derived_training_state_sha256": digest(STATE_DOMAIN, self.derived()),
+            "ancestor_updates": self.initial["ancestor_updates"], "derived_training_state_sha256": digest(self.family.domain(STATE_DOMAIN), self.derived()),
             **self.states}
         if self.begun or not _equal(value, expected):
             raise ValueError("one original utility begin with exact frozen metadata/5state required")
@@ -599,7 +622,7 @@ class _Replay:
 
     def consume(self, value):
         _fields(value, ("schema", "source_projection"), "original utility context consumption")
-        if (not self.begun or value["schema"] != "rz-rovent-utility-trainer-consume/1" or len(self.pending) >= 8
+        if (not self.begun or value["schema"] != self.family.domain("rz-rovent-utility-trainer-consume/1") or len(self.pending) >= 8
                 or self.consumed >= self.window["max_contexts"] or self.groups >= self.window["max_groups"]
                 or self.completed - self.initial["completed_updates"] >= self.window["max_optimizer_updates"]):
             raise ValueError("original utility full consume journal exceeds its registered credits")
@@ -624,7 +647,7 @@ class _Replay:
     def update(self, value, original_pin, ack):
         _fields(value, ("schema", "event", "cost", "pending_microbatches", "frozen_base_weights_sha256",
             "frozen_base_mapping_sha256", "prior_completion_chain_sha256", *STATE_FIELDS), "original utility update")
-        if (not self.begun or len(self.pending) != 8 or value["schema"] != "rz-rovent-utility-trainer-update/1"
+        if (not self.begun or len(self.pending) != 8 or value["schema"] != self.family.domain("rz-rovent-utility-trainer-update/1")
                 or type(value["pending_microbatches"]) is not int or value["pending_microbatches"] != 0):
             raise ValueError("original update requires eight actual prior journal consumes and no pending gradient")
         for name in ("frozen_base_weights_sha256", "frozen_base_mapping_sha256"):
@@ -633,7 +656,7 @@ class _Replay:
         if value["prior_completion_chain_sha256"] != self.derived()["completion_chain_sha256"]:
             raise ValueError("original utility update omitted/repeated a prior completion")
         denominator = sum(context["unique_known_pairs"] for context in self.pending)
-        event = {"schema": "rz-rovent-utility-learner-update/1", "completed_updates": self.completed + 1,
+        event = {"schema": self.family.domain("rz-rovent-utility-learner-update/1"), "completed_updates": self.completed + 1,
             "dispatched_updates": self.dispatched + 1, "unique_known_pair_denominator": denominator,
             "consumed_context_sha256": [context["context_sha256"] for context in self.pending], "groups": 1, "contexts": 8}
         if (not denominator or not _equal(value["event"], event)
@@ -647,10 +670,10 @@ class _Replay:
         active = sum(context["unique_known_pairs"] > 0 for context in self.pending)
         if any(value["cost"][name] != self.cost[name] + active for name in ("forward_calls", "backward_calls")):
             raise ValueError("original utility forward/backward count differs from known context occurrences")
-        expected = {"schema": "rz-rovent-utility-learner-completion/1", "window_id": self.window["window_id"],
+        expected = {"schema": self.family.domain("rz-rovent-utility-learner-completion/1"), "window_id": self.window["window_id"],
             "run_id": self.window["run_id"], "dataset_sha256": self.window["dataset_sha256"],
-            "preparation_sha256": self.window["preparation_sha256"], "source_registration_sha256": self.preparation["registration_sha256"],
-            "optimizer_owner": self.preparation["optimizer_owner"], "initial_state_admission_scope": self.initial["state_admission_scope"],
+            "preparation_sha256": self.window["preparation_sha256"], "source_registration_sha256": self.parts.source_registration_sha256,
+            "optimizer_owner": self.parts.optimizer_owner, "initial_state_admission_scope": self.initial["state_admission_scope"],
             "completed_updates": self.completed + 1, "dispatched_updates": self.dispatched + 1,
             "ancestor_updates": self.initial["ancestor_updates"], "window_completed_updates": self.completed + 1 - self.initial["completed_updates"],
             "window_dispatched_updates": self.dispatched + 1 - self.initial["dispatched_updates"],
@@ -669,10 +692,10 @@ class _Replay:
         self.highwater = copy.deepcopy(self.cost); self.pending.clear()
 
     def checkpoint(self, request):
-        _checkpoint_request(request); self.counts(request)
+        _checkpoint_request(request, _family=self.family); self.counts(request)
         if (not self.begun or any(request[name] != self.states[name] for name in STATE_FIELDS[:3])
                 or request["sampler_state_sha256"] != _plain_state_sha256(self.sampler)
-                or request["derived_training_state_sha256"] != digest(STATE_DOMAIN, self.derived())):
+                or request["derived_training_state_sha256"] != digest(self.family.domain(STATE_DOMAIN), self.derived())):
             raise ValueError("original utility checkpoint changed exact state, sampler or full completion chain")
         self.observed_cost(request["snapshot_cost"])
         _monotone(request["snapshot_cost"], request["post_snapshot_cost"])
@@ -684,7 +707,7 @@ class _Replay:
         for event in self.archive.journal(self.publication["original_rpc_journal"]):
             _fields(event, ("schema", "sequence", "kind", "request", "completion_receipt", "ack"), "utility journal event")
             self.sequence += 1
-            if (event["schema"] != JOURNAL_DOMAIN or type(event["sequence"]) is not int
+            if (event["schema"] != self.family.domain(JOURNAL_DOMAIN) or type(event["sequence"]) is not int
                     or event["sequence"] != self.sequence or self.sequence > 2000000):
                 raise ValueError("original utility journal sequence/domain differs")
             kind = event["kind"]
@@ -754,7 +777,8 @@ def _parent_join(initial, registration, parent):
 
 
 def _closure_join(archive, publication, closure, cost, replay, parent_unknown, retirement, projection):
-    _closure(closure)
+    family = replay.family
+    _closure(closure, _family=family)
     if any(closure[name] != publication[name] for name in ("execution_id", "window_id", "run_id")):
         raise ValueError("utility publication changed original process closure identity")
     if closure["kind"] == "optimizer_boundary":
@@ -762,12 +786,12 @@ def _closure_join(archive, publication, closure, cost, replay, parent_unknown, r
             raise ValueError("a running original boundary cannot claim known terminal expense")
         return "unresolved", None
     boundary_reference = closure["boundary_publication"]
-    boundary = parse_utility_checkpoint_publication(archive.raw(boundary_reference),
-        publication_sha256=boundary_reference["sha256"], publication_bytes=boundary_reference["bytes"])
+    boundary = _parse_utility_checkpoint_publication(archive.raw(boundary_reference),
+        publication_sha256=boundary_reference["sha256"], publication_bytes=boundary_reference["bytes"], _family=family)
     if not _equal({key: value for key, value in publication.items() if key not in ("closure", "cost")},
             {key: value for key, value in boundary.items() if key not in ("closure", "cost")}):
         raise ValueError("final utility publication changed its preserved original running boundary")
-    boundary_closure = _closure(archive.json(boundary["closure"]))
+    boundary_closure = _closure(archive.json(boundary["closure"]), _family=family)
     boundary_cost = validate_utility_checkpoint_cost(archive.json(boundary["cost"]))
     if (boundary_closure["kind"] != "optimizer_boundary"
             or any(not _equal(boundary_closure[name], closure[name]) for name in ("execution_id", "window_id", "run_id", "child_identity"))
@@ -784,7 +808,7 @@ def _closure_join(archive, publication, closure, cost, replay, parent_unknown, r
     _fields(terminal, ("schema", "execution_id", "window_id", "run_id", "end_payload", "process_receipt",
         "child_identity", "original_child_terminal", "historical_evidence_only", "execution_authorized"), "original utility parent terminal")
     _history(terminal)
-    if (terminal["schema"] != TERMINAL_DOMAIN
+    if (terminal["schema"] != family.domain(TERMINAL_DOMAIN)
             or any(terminal[name] != closure[name] for name in ("execution_id", "window_id", "run_id"))
             or not _equal(terminal["process_receipt"], closure["process_receipt"])
             or not _equal(terminal["child_identity"], closure["child_identity"])):
@@ -793,7 +817,7 @@ def _closure_join(archive, publication, closure, cost, replay, parent_unknown, r
     _fields(end, ("schema", "status", "completed_updates", "dispatched_updates", "window_dispatched_updates", "ancestor_updates",
         "cost", "pending_microbatches", "quarantined", "physical_completion", "checkpoint", "result"), "original utility end payload")
     replay.counts(end); replay.observed_cost(end["cost"])
-    if (end["schema"] != "rz-rovent-utility-trainer-end/1" or type(end["dispatched_updates"]) is not int
+    if (end["schema"] != family.domain("rz-rovent-utility-trainer-end/1") or type(end["dispatched_updates"]) is not int
             or end["dispatched_updates"] != replay.dispatched or type(end["window_dispatched_updates"]) is not int
             or end["window_dispatched_updates"] != replay.dispatched - replay.initial["dispatched_updates"]
             or type(end["pending_microbatches"]) is not int or end["pending_microbatches"] != 0
@@ -817,7 +841,7 @@ def _closure_join(archive, publication, closure, cost, replay, parent_unknown, r
     _fields(child, ("schema", "execution_id", "window_id", "status", "result", "bootstrap", "completed_updates",
         "window_completed_updates", "dispatched_updates", "window_dispatched_updates", "physical_completion",
         "physical_process_retirement", "arena_eligible", *optional), "original raw utility child terminal")
-    if (child["schema"] != "rz-rovent-utility-trainer-result/1" or child["execution_id"] != publication["execution_id"]
+    if (child["schema"] != family.domain("rz-rovent-utility-trainer-result/1") or child["execution_id"] != publication["execution_id"]
             or child["window_id"] != publication["window_id"] or child["status"] != "completed" or optional
             or child["arena_eligible"] is not False or child["physical_completion"] != "confirmed"
             or child["physical_process_retirement"] != "original_parent_join_required"
@@ -850,32 +874,36 @@ def _projection_source_join(projection, window, registration, parent):
         raise ValueError("original utility source cost or inherited fork tensor pointer changed")
 
 
-def _source(archive, reference, datasets, *, depth=0):
+def _source(archive, reference, datasets, *, depth=0, _family=None):
+    family = _codec(_family)
     if depth > 256 or len(archive.completed) + len(archive.active) >= 257:
         raise ValueError("bounded original utility checkpoint publication ancestry required")
     _relative_ref(reference, MAX_PROJECTION_BYTES)
-    identity = (reference["sha256"], reference["bytes"])
+    identity = (family.intervention, reference["sha256"], reference["bytes"])
     if identity in archive.active:
         raise ValueError("cyclic original utility checkpoint publication chain")
     if identity in archive.completed:
         return archive.completed[identity]
     archive.active.add(identity)
     try:
-        publication = parse_utility_checkpoint_publication(archive.raw(reference), publication_sha256=reference["sha256"],
-            publication_bytes=reference["bytes"])
-        preparation = validate_training_preparation(archive.json(publication["original_preparation"]))
-        if preparation["schema"] != COHORT_PREPARATION_DOMAIN:
+        publication = _parse_utility_checkpoint_publication(archive.raw(reference), publication_sha256=reference["sha256"],
+            publication_bytes=reference["bytes"], _family=family)
+        preparation = family.parts(archive.json(publication["original_preparation"])).preparation
+        if not family.intervention and preparation["schema"] != COHORT_PREPARATION_DOMAIN:
             raise ValueError("historical actual utility source requires its original cohort preparation/2")
-        window = validate_utility_window_v2(preparation, archive.json(publication["original_window"]))
-        from .rovent_utility_training_bootstrap import validate_utility_registration_v2
+        window = family.validate_window(preparation, archive.json(publication["original_window"]))
+        if family.intervention:
+            from .rovent_utility_intervention_execution import validate_intervention_registration as validate_registration
+        else:
+            from .rovent_utility_training_bootstrap import validate_utility_registration_v2 as validate_registration
         registration_value = archive.json(publication["original_registration"])
         # The old /1 parser remains available as its original declaration
         # codec. It is not an actual cohort learner checkpoint source.
-        registration = validate_utility_registration_v2(registration_value)
+        registration = validate_registration(registration_value)
         if (any(publication[name] != registration[name] for name in ("execution_id", "trainer_source_sha256", "trainer_dependency_set_sha256"))
                 or publication["trainer_python_executable_sha256"] != registration["trainer_python_executable"]["sha256"]
                 or any(publication[name] != window[name] for name in ("window_id", "run_id", "dataset_sha256", "preparation_sha256"))
-                or publication["window_spec_sha256"] != utility_window_v2_digest(window)
+                or publication["window_spec_sha256"] != family.window_digest(window)
                 or preparation["preparation_sha256"] != publication["preparation_sha256"]
                 or preparation["registration"]["trainer_source_sha256"] != registration["trainer_source_sha256"]
                 or not _equal(_pin_identity(registration["preparation"]), _pin_identity(publication["original_preparation"]))
@@ -884,17 +912,18 @@ def _source(archive, reference, datasets, *, depth=0):
         candidates = [dataset for dataset in datasets if dataset.observation()["dataset_sha256"] == publication["dataset_sha256"]]
         if len(candidates) != 1:
             raise ValueError("one exact original historical utility dataset for each checkpoint stage required")
-        dataset = _dataset_source(candidates[0], registration)
+        dataset = _dataset_source(candidates[0], registration, _family=family)
         dataset.validate_execution_sources(registration)
-        initial = _initial(archive.json(publication["initial_ledger_state"]))
+        initial = _initial(archive.json(publication["initial_ledger_state"]), _family=family)
         parent = None
         if publication["parent_publication"] is not None:
-            parent = _source(archive, publication["parent_publication"], datasets, depth=depth + 1)
+            parent = _source(archive, publication["parent_publication"], datasets, depth=depth + 1, _family=family)
         _parent_join(initial, registration, parent)
-        projection = parse_utility_tensor_projection(archive.raw(publication["tensor_projection"]),
-            expected_sha256=publication["tensor_projection"]["sha256"], expected_bytes=publication["tensor_projection"]["bytes"])
-        retirement = parse_utility_checkpoint_retirement(archive.raw(publication["retirement"]),
-            expected_sha256=publication["retirement"]["sha256"], expected_bytes=publication["retirement"]["bytes"])
+        projection = _tensor_projection(_raw_json(archive.raw(publication["tensor_projection"]),
+            expected_sha256=publication["tensor_projection"]["sha256"], expected_bytes=publication["tensor_projection"]["bytes"],
+            maximum=MAX_PROJECTION_BYTES), _family=family)
+        retirement = _parse_utility_checkpoint_retirement(archive.raw(publication["retirement"]),
+            expected_sha256=publication["retirement"]["sha256"], expected_bytes=publication["retirement"]["bytes"], _family=family)
         for name, original in (("tensor", retirement["checkpoint"]),
                 ("tensor_projection", retirement["original_request"]["tensor_projection"])):
             if not _equal(_pin_identity(publication[name]), _pin_identity(original)):
@@ -916,7 +945,7 @@ def _source(archive, reference, datasets, *, depth=0):
             raise ValueError("utility publication omitted/reordered original current or ancestor completion files")
         for receipt in (*ancestor, *current[:initial["completed_updates"]]):
             archive.verify(receipt, MAX_COMPLETION_RECEIPT_BYTES)
-        replay = _Replay(archive, publication, preparation, window, initial, dataset)
+        replay = _Replay(archive, publication, preparation, window, initial, dataset, _family=family)
         replay.replay()
         request = retirement["original_request"]
         replay.checkpoint(request)
@@ -943,7 +972,7 @@ def _source(archive, reference, datasets, *, depth=0):
         for tail in (cost["closure_tail"], *(item["tail"] for item in cost["inherited_unknown_tails"])):
             if tail["evidence"] is not None:
                 archive.verify(tail["evidence"], MAX_PROJECTION_BYTES)
-        closure = _closure(archive.json(publication["closure"]))
+        closure = _closure(archive.json(publication["closure"]), _family=family)
         classification, boundary_unknown = _closure_join(archive, publication, closure, cost, replay, expected_unknown, retirement, projection)
         if boundary_unknown is not None:
             expected_unknown.append(boundary_unknown)
@@ -984,35 +1013,41 @@ class HistoricalUtilityCheckpoint:
             raise ValueError("original utility historical checkpoint evidence changed")
 
     def observation(self):
-        self._check()
-        source, ancestors = self._source, []
-        current = source
-        while current is not None:
-            ancestors.append({"publication_pin": _pin_identity(current["publication_pin"]),
-                "execution_id": current["publication"]["execution_id"], "window_id": current["publication"]["window_id"],
-                "classification": current["classification"], "child_identity": copy.deepcopy(current["closure"]["child_identity"])})
-            current = current["parent"]
-        return {"schema": "rz-rovent-utility-historical-checkpoint-observation/1",
-            "publication_pin": _pin_identity(source["publication_pin"]), "tensor_pin": _pin_identity(source["publication"]["tensor"]),
-            "payload_state_sha256": source["projection"]["payload_state_sha256"], "completed_updates": source["projection"]["completed_updates"],
-            "ancestor_updates": source["projection"]["ancestor_updates"], "original_closure_chain": ancestors,
-            "historical_evidence_only": True, "past_native_authority_reissued": False,
-            "past_physical_completion_reissued": False, "old_run_reclamation_issued": False,
-            "execution_authorized": False}
+        return _historical_checkpoint_observation(self)
 
 
-def read_utility_historical_checkpoint(reference, *, read_accounting, datasets):
+def _historical_checkpoint_observation(owner, *, _family=None):
+    family = _codec(_family)
+    owner._check()
+    source, ancestors = owner._source, []
+    current = source
+    while current is not None:
+        ancestors.append({"publication_pin": _pin_identity(current["publication_pin"]),
+            "execution_id": current["publication"]["execution_id"], "window_id": current["publication"]["window_id"],
+            "classification": current["classification"], "child_identity": copy.deepcopy(current["closure"]["child_identity"])})
+        current = current["parent"]
+    return {"schema": family.domain("rz-rovent-utility-historical-checkpoint-observation/1"),
+        "publication_pin": _pin_identity(source["publication_pin"]), "tensor_pin": _pin_identity(source["publication"]["tensor"]),
+        "payload_state_sha256": source["projection"]["payload_state_sha256"], "completed_updates": source["projection"]["completed_updates"],
+        "ancestor_updates": source["projection"]["ancestor_updates"], "original_closure_chain": ancestors,
+        "historical_evidence_only": True, "past_native_authority_reissued": False,
+        "past_physical_completion_reissued": False, "old_run_reclamation_issued": False,
+        "execution_authorized": False}
+
+
+def _read_utility_historical_checkpoint(reference, *, read_accounting, datasets, _family=None):
     """Read full original archive evidence, with one shared bounded read budget.
 
     This neither unpickles `.pt` nor reclaims an old process. The actual new
     parent separately gates old-run closure and its new peer execution lease.
     A scratch tensor loader must independently join the immutable projection.
     """
+    family = _codec(_family)
     _fields(reference, ("root", "publication"), "original utility checkpoint reference")
-    from .rovent_utility_route import HistoricalUtilityRouteDataset
-    if (type(datasets) not in (tuple, list) or not 1 <= len(datasets) <= 257
-            or any(type(dataset) is not HistoricalUtilityRouteDataset for dataset in datasets)):
+    if type(datasets) not in (tuple, list) or not 1 <= len(datasets) <= 257:
         raise ValueError("bounded original typed utility source datasets required")
+    for dataset in datasets:
+        family.require_dataset(dataset)
     _absolute_pin(reference["publication"], MAX_PROJECTION_BYTES)
     archive = _Archive(reference["root"], read_accounting)
     try:
@@ -1020,10 +1055,20 @@ def read_utility_historical_checkpoint(reference, *, read_accounting, datasets):
         if type(path) is not type(archive.root) or not path.is_relative_to(archive.root) or path == archive.root:
             raise ValueError("original utility publication escaped its registered archive root")
         relative = {"path": path.relative_to(archive.root).as_posix(), **_pin_identity(reference["publication"])}
-        source = _source(archive, relative, datasets)
-        owner = HistoricalUtilityCheckpoint.__new__(HistoricalUtilityCheckpoint)
+        source = _source(archive, relative, datasets, _family=family)
+        if family.intervention:
+            from .rovent_utility_intervention_checkpoint import HistoricalUtilityInterventionCheckpoint
+            owner_type = HistoricalUtilityInterventionCheckpoint
+        else:
+            owner_type = HistoricalUtilityCheckpoint
+        owner = owner_type.__new__(owner_type)
         owner._source, owner._root = source, archive.root
-        owner._seal = digest("rz-rovent-utility-historical-checkpoint-owner/1", source)
+        owner._seal = digest(family.domain("rz-rovent-utility-historical-checkpoint-owner/1"), source)
         return owner
     finally:
         archive.close()
+
+
+def read_utility_historical_checkpoint(reference, *, read_accounting, datasets):
+    """Original /1 only; intervention history has its separate typed reader."""
+    return _read_utility_historical_checkpoint(reference, read_accounting=read_accounting, datasets=datasets)

@@ -44,24 +44,32 @@ def _read_startup(stream, count):
     return raw
 
 
-def _actual_registration(startup):
+def _checked_family(value):
+    from .rovent_utility_training_family import LEGACY, require_family
+    return require_family(LEGACY if value is None else value)
+
+
+def _actual_registration(startup, *, family=None):
+    family = _checked_family(family)
     registration = startup["registration"]
-    if registration["schema"] != "rz-rovent-utility-training-registration/2":
+    expected = "rz-rovent-utility-training-registration/3" if family.intervention else "rz-rovent-utility-training-registration/2"
+    if (registration["schema"] != expected
+            or family.intervention and registration.get("data_family") != "intervention_v2"):
         raise ValueError("actual utility child requires the separate mixed-ancestry registration/2")
     return registration
 
 
-def _metadata_inputs(startup, reads):
-    from .rovent_utility_training import validate_training_preparation
-    from .rovent_utility_training_window import validate_utility_window_v2
-    registration = _actual_registration(startup)
+def _metadata_inputs(startup, reads, *, family=None):
+    family = _checked_family(family)
+    registration = _actual_registration(startup, family=family)
     preparation = reads.json(registration["preparation"], maximum=65536)
-    if type(preparation) is not dict or preparation.get("schema") != "rz-rovent-utility-training-preparation/2":
+    if (not family.intervention and (type(preparation) is not dict
+            or preparation.get("schema") != "rz-rovent-utility-training-preparation/2")):
         raise ValueError("actual cohort utility child requires the separate preparation/2 codec")
-    checked = validate_training_preparation(preparation)
+    checked = family.parts(preparation).preparation
     if json.dumps(checked, sort_keys=True, separators=(",", ":"), allow_nan=False) != json.dumps(preparation, sort_keys=True, separators=(",", ":"), allow_nan=False):
         raise ValueError("utility preparation changed from its exact source codec")
-    spec = validate_utility_window_v2(checked, reads.json(registration["window_spec"], maximum=1024**2))
+    spec = family.validate_window(checked, reads.json(registration["window_spec"], maximum=1024**2))
     if (spec["window_id"] != startup["window_id"]
             or checked["registration"]["trainer_source_sha256"] != registration["trainer_source_sha256"]
             or spec["device"] != registration["resources_policy"]["device"]
@@ -73,7 +81,7 @@ def _metadata_inputs(startup, reads):
                            "model_or_tensor_instantiated": False, "actual_tensor_unchanged_observed": False}
 
 
-def _load_actual_cohort(startup, reads, preparation):
+def _load_actual_cohort(startup, reads, preparation, *, family=None):
     from .generation_data import sha
     from .rovent_generation import SeriesRecipe
     from . import rovent_historical_corpus as pc
@@ -81,6 +89,7 @@ def _load_actual_cohort(startup, reads, preparation):
     from .rovent_utility_route import HistoricalUtilityRouteDataset, read_historical_utility_dependencies
     from .rovent_utility_training import validate_training_preparation
     from .rovent_corpus_codec import LEGACY_CODEC, SUBMITTED_CODEC, codec_from_publication
+    family = _checked_family(family)
     registration = startup["registration"]
     entries, metadata, by_index = {}, {}, {}
     for entry in registration["ancestor_datasets"]:
@@ -107,6 +116,12 @@ def _load_actual_cohort(startup, reads, preparation):
         elif kind == "utility_cohort":
             original_preparation = validate_training_preparation(reads.json(entry["preparation"], maximum=65536))
             graph = read_historical_utility_dependencies(source, preparation=original_preparation, read_budget=reads)
+            metadata[identity] = {"index": None, "pc": (), "r": (),
+                "publication": tuple(graph["ancestor_dataset_publication_sha256"]), "preparation": original_preparation}
+        elif family.intervention and kind == "utility_intervention":
+            from .rovent_utility_intervention_dataset import read_intervention_utility_dependencies
+            original_preparation = family.parts(reads.json(entry["preparation"], maximum=65536)).preparation
+            graph = read_intervention_utility_dependencies(source, preparation=original_preparation, read_budget=reads)
             metadata[identity] = {"index": None, "pc": (), "r": (),
                 "publication": tuple(graph["ancestor_dataset_publication_sha256"]), "preparation": original_preparation}
         else:
@@ -148,35 +163,51 @@ def _load_actual_cohort(startup, reads, preparation):
                     raise ValueError("original R dependency kind differs from its registered source family")
                 owner = r.HistoricalRoventRCorpus.from_registration(source, recipe=graph["recipe"], read_budget=reads,
                     pc_corpora=tuple(item.corpus for item in pc_parents), r_ancestors=r_parents)
-            else:
+            elif kind == "utility_cohort":
                 owner = HistoricalUtilityRouteDataset.from_registration(source, preparation=graph["preparation"],
+                    read_budget=reads, ancestors=tuple(owners[dependency] for dependency in graph["publication"]))
+            else:
+                if not family.intervention or kind != "utility_intervention":
+                    raise ValueError("explicit typed original intervention ancestor required")
+                from .rovent_utility_intervention_dataset import HistoricalUtilityInterventionDataset
+                owner = HistoricalUtilityInterventionDataset.from_registration(source, preparation=graph["preparation"],
                     read_budget=reads, ancestors=tuple(owners[dependency] for dependency in graph["publication"]))
             owners[identity] = owner; pending.remove(identity); progressed = True
         if not progressed:
             raise ValueError("original mixed utility ancestry is cyclic or incomplete")
-    intake = HistoricalUtilityRouteDataset.from_registration(registration["current_dataset"], preparation=preparation,
+    if family.intervention:
+        from .rovent_utility_intervention_dataset import HistoricalUtilityInterventionDataset
+        dataset_type = HistoricalUtilityInterventionDataset
+    else:
+        dataset_type = HistoricalUtilityRouteDataset
+    intake = dataset_type.from_registration(registration["current_dataset"], preparation=preparation,
         read_budget=reads, ancestors=tuple(owners.values()))
     intake.validate_execution_sources(registration)
     if intake.observation()["split"] != "train":
         raise ValueError("only the original current train cohort can enter the utility learner")
-    return intake, tuple([intake, *(owner for owner in owners.values() if type(owner) is HistoricalUtilityRouteDataset)])
+    return intake, tuple([intake, *(owner for owner in owners.values() if type(owner) is dataset_type)])
 
 
-def _load_historical_owner(startup, reads, authority, preparation, spec, intake, base, torch, datasets):
+def _load_historical_owner(startup, reads, authority, preparation, spec, intake, base, torch, datasets, *, family=None):
     from .nnuec_utility_trainable import NnuecUtilityTrainableV1
     from .rovent_tensor_training import _load_pinned_tensor_file
     from .rovent_utility_historical_checkpoint import read_utility_historical_checkpoint
     from .rovent_utility_tensor_training import (CHECKPOINT_DOMAIN, MAX_CHECKPOINT_BYTES,
         stage_cohort_utility_resume, stage_utility_fork)
     from .rovent_utility_training_window import make_utility_sampler, validate_utility_sampler
+    family = _checked_family(family)
     source = startup["registration"]["initialization_source"]
-    historical = read_utility_historical_checkpoint(source["checkpoint"], read_accounting=reads, datasets=datasets)
+    if family.intervention:
+        from .rovent_utility_intervention_checkpoint import read_intervention_utility_historical_checkpoint
+        historical = read_intervention_utility_historical_checkpoint(source["checkpoint"], read_accounting=reads, datasets=datasets)
+    else:
+        historical = read_utility_historical_checkpoint(source["checkpoint"], read_accounting=reads, datasets=datasets)
     projection, pin = historical.projection(), historical.tensor_pin()
     # The tensor parser itself uses a nofollow/hash-pinned temporary snapshot
     # and weights_only. Its independent second lifecycle pass is charged again.
     payload, size = _load_pinned_tensor_file(pin["path"], pin["sha256"], MAX_CHECKPOINT_BYTES, torch,
         read_accounting=reads, snapshot_directory=startup["registration"]["checkpoint_directory"])
-    if (type(payload) is not dict or payload.get("schema") != CHECKPOINT_DOMAIN or size != pin["bytes"]
+    if (type(payload) is not dict or payload.get("schema") != family.domain(CHECKPOINT_DOMAIN) or size != pin["bytes"]
             or payload.get("state_sha256") != projection["payload_state_sha256"]
             or json.dumps(payload.get("metadata"), sort_keys=True, separators=(",", ":"), allow_nan=False)
                 != json.dumps(projection["metadata"], sort_keys=True, separators=(",", ":"), allow_nan=False)):
@@ -189,11 +220,18 @@ def _load_historical_owner(startup, reads, authority, preparation, spec, intake,
         return validate_utility_sampler(value, context_ids=original_sampler["context_ids"],
             pool_sha256=original_sampler["pool_sha256"], run_id=original_sampler["run_id"], seed=original_sampler["seed"])
     original_preparation = projection["preparation"]
-    staged = stage_cohort_utility_resume(pin["path"], pin["sha256"], template,
-        original_preparation["recipe"], original_preparation["registration"], original_preparation["parameter_spec"],
-        sampler_validator=source_sampler_validator, max_file_bytes=MAX_CHECKPOINT_BYTES,
-        read_accounting=reads, snapshot_directory=startup["registration"]["checkpoint_directory"], execute=True,
-        authority=authority, historical_checkpoint=historical)
+    if family.intervention:
+        from .rovent_utility_intervention_checkpoint import stage_intervention_utility_resume
+        staged = stage_intervention_utility_resume(pin["path"], pin["sha256"], template, original_preparation,
+            sampler_validator=source_sampler_validator, max_file_bytes=MAX_CHECKPOINT_BYTES,
+            read_accounting=reads, snapshot_directory=startup["registration"]["checkpoint_directory"], execute=True,
+            authority=authority, historical_checkpoint=historical)
+    else:
+        staged = stage_cohort_utility_resume(pin["path"], pin["sha256"], template,
+            original_preparation["recipe"], original_preparation["registration"], original_preparation["parameter_spec"],
+            sampler_validator=source_sampler_validator, max_file_bytes=MAX_CHECKPOINT_BYTES,
+            read_accounting=reads, snapshot_directory=startup["registration"]["checkpoint_directory"], execute=True,
+            authority=authority, historical_checkpoint=historical)
     def current_sampler_validator(value):
         return validate_utility_sampler(value, context_ids=intake.context_ids, pool_sha256=intake.pool_sha256,
             run_id=spec["run_id"], seed=spec["training_seed"])
@@ -206,6 +244,11 @@ def _load_historical_owner(startup, reads, authority, preparation, spec, intake,
     if source["mode"] != "fork":
         raise ValueError("original utility resume/fork tag required")
     sampler = make_utility_sampler(intake.context_ids, intake.pool_sha256, spec["training_seed"], run_id=spec["run_id"])
+    if family.intervention:
+        from .rovent_utility_intervention_checkpoint import stage_intervention_utility_fork
+        return stage_intervention_utility_fork(staged, preparation=preparation, authority=authority, sampler=sampler,
+            source_sampler_validator=source_sampler_validator, sampler_validator=current_sampler_validator,
+            reset_seed=spec["training_seed"], execute=True)
     return stage_utility_fork(staged, recipe=preparation["recipe"], registration=preparation["registration"],
         membership=preparation["parameter_spec"], sampler=sampler,
         source_sampler_validator=source_sampler_validator, sampler_validator=current_sampler_validator,
@@ -223,7 +266,7 @@ def _frozen_base(startup, reads, preparation):
     return base, readback
 
 
-def _initial_owner(startup, reads, preparation, spec, intake, base, torch):
+def _initial_owner(startup, reads, preparation, spec, intake, base, torch, *, authority=None, family=None):
     import random
     import numpy as np
     from .nnuec_reference import decode_json
@@ -231,6 +274,9 @@ def _initial_owner(startup, reads, preparation, spec, intake, base, torch):
     from .nnuec_utility_trainable import NnuecUtilityTrainableV1
     from .rovent_utility_tensor_training import create_cohort_utility_owner
     from .rovent_utility_training_window import make_utility_sampler, validate_utility_sampler
+    family = _checked_family(family)
+    if family.intervention:
+        family.require_authority(authority, allow_unleased=True)
     raw, _identity = reads.read(startup["registration"]["initialization_source"]["utility"], maximum=MAX_CHECKPOINT_BYTES)
     seed = spec["training_seed"]
     random.seed(seed); np.random.seed(seed); torch.random.default_generator.manual_seed(seed)
@@ -242,16 +288,21 @@ def _initial_owner(startup, reads, preparation, spec, intake, base, torch):
     def validate_sampler(value):
         return validate_utility_sampler(value, context_ids=intake.context_ids, pool_sha256=intake.pool_sha256,
             run_id=spec["run_id"], seed=seed)
+    if family.intervention:
+        from .rovent_utility_intervention_checkpoint import create_intervention_utility_owner
+        return create_intervention_utility_owner(model, preparation, authority=authority,
+            sampler=sampler, sampler_validator=validate_sampler, cuda_devices=devices, execute=True)
     return create_cohort_utility_owner(model, preparation["recipe"], preparation["registration"], preparation["parameter_spec"],
         sampler=sampler, sampler_validator=validate_sampler, cuda_devices=devices, execute=True)
 
 
-def _export_request(startup, reads):
+def _export_request(startup, reads, *, family=None):
     from .rovent_training_bootstrap import _child_path, _fields, _uint
+    family = _checked_family(family)
     registration = startup["registration"]
     request = reads.json(registration["export_request"], maximum=65536)
     _fields(request, ("schema", "kind", "path", "max_output_bytes"), "utility export request")
-    if request["schema"] != "rz-rovent-utility-export-request/1" or request["kind"] not in ("collection", "deployment"):
+    if request["schema"] != family.domain("rz-rovent-utility-export-request/1") or request["kind"] not in ("collection", "deployment"):
         raise ValueError("separate explicit utility export request required")
     target = Path(_child_path(registration["output_root"], request["path"], "utility export"))
     if target.suffix != ".json" or target.parent.resolve(strict=True) != target.parent or target.exists() or target.is_symlink():
@@ -260,9 +311,11 @@ def _export_request(startup, reads):
     return request
 
 
-def _execute_export(owner, intake, spec, request, authority, torch, *, clock):
+def _execute_export(owner, intake, spec, request, authority, torch, *, clock, family=None):
     from .generation_data import uint
     from .rovent_utility_tensor_training import export_utility_owner
+    family = _checked_family(family)
+    family.require_authority(authority, allow_unleased=True)
     lease = authority.begin_window(owner, intake, spec)
     started, status, result = clock(), "export_failed", None
     try:
@@ -271,7 +324,12 @@ def _execute_export(owner, intake, spec, request, authority, torch, *, clock):
         for device in owner.cuda_devices:
             torch.cuda.synchronize(device)
         owner.physical_completion = "confirmed"
-        result = export_utility_owner(owner, request["path"], authority=authority, kind=request["kind"],
+        if family.intervention:
+            from .rovent_utility_intervention_checkpoint import export_intervention_utility_owner
+            export = export_intervention_utility_owner
+        else:
+            export = export_utility_owner
+        result = export(owner, request["path"], authority=authority, kind=request["kind"],
             max_output_bytes=request["max_output_bytes"], execute=True)
         status = "export_complete"
         return result
@@ -294,18 +352,30 @@ def _execute_export(owner, intake, spec, request, authority, torch, *, clock):
 
 
 def original_utility_child_main(argv=None, *, stdin=None, clock=time.monotonic_ns):
+    from .rovent_utility_training_family import LEGACY
+    return _utility_child_main(argv, stdin=stdin, clock=clock, family=LEGACY)
+
+
+def _utility_child_main(argv=None, *, stdin=None, clock=time.monotonic_ns, family):
+    """Shared process machinery reached only through a closed family entry."""
+    family = _checked_family(family)
     args = _parser().parse_args(argv)
     if not args.execute:
         raise ValueError("one original finite utility child requires explicit execution")
     raw = _read_startup(sys.stdin.buffer if stdin is None else stdin, args.startup_bytes)
-    from .rovent_utility_training_bootstrap import validate_startup, bootstrap_utility_child
-    startup = validate_startup(raw, expected_sha256=args.startup_sha256, expected_bytes=args.startup_bytes,
+    if family.intervention:
+        from .rovent_utility_intervention_execution import validate_intervention_startup as validate
+        from .rovent_utility_intervention_execution import bootstrap_intervention_child as bootstrap_child
+        from .rovent_utility_intervention_authority import ParentSocketInterventionUtilityTrainerAuthority as Authority
+    else:
+        from .rovent_utility_training_bootstrap import validate_startup as validate, bootstrap_utility_child as bootstrap_child
+        from .rovent_utility_training_authority import ParentSocketUtilityTrainerAuthority as Authority
+    startup = validate(raw, expected_sha256=args.startup_sha256, expected_bytes=args.startup_bytes,
         execution_until_ns=args.execution_until_ns, whole_until_ns=args.whole_until_ns, now_ns=clock())
-    _actual_registration(startup)
-    bootstrap = bootstrap_utility_child(startup, until_ns=args.execution_until_ns, clock=clock)
+    _actual_registration(startup, family=family)
+    bootstrap = bootstrap_child(startup, until_ns=args.execution_until_ns, clock=clock)
     report, reads = bootstrap.report, bootstrap.budget
-    from .rovent_utility_training_authority import ParentSocketUtilityTrainerAuthority
-    authority = ParentSocketUtilityTrainerAuthority.connect_registered(startup, raw_startup=raw,
+    authority = Authority.connect_registered(startup, raw_startup=raw,
         expected_sha256=args.startup_sha256, read_accounting=reads, execute=True, clock=clock)
     owner, result, initial_output, initial_completed, initial_dispatched = None, None, 0, 0, 0
     tensor_admission_started = False
@@ -313,28 +383,30 @@ def original_utility_child_main(argv=None, *, stdin=None, clock=time.monotonic_n
     for name in (signal.SIGTERM, signal.SIGINT):
         old_handlers[name] = signal.signal(name, lambda _signal, _frame: authority.observe_cancel())
     try:
-        preparation, spec, preserved_pc = _metadata_inputs(startup, reads)
+        preparation, spec, preserved_pc = _metadata_inputs(startup, reads, family=family)
         report["frozen_pc_sources"] = preserved_pc
-        request = _export_request(startup, reads) if startup["registration"]["action"] == "export" else None
+        request = _export_request(startup, reads, family=family) if startup["registration"]["action"] == "export" else None
         # No tensor/runtime import is permitted until this actual new cohort
         # data-integrity owner exists and its publication matches the parent.
-        intake, utility_source_datasets = _load_actual_cohort(startup, reads, preparation)
+        intake, utility_source_datasets = _load_actual_cohort(startup, reads, preparation, family=family)
         from .rovent_training_child import _configure_runtime, _verify_imported_runtime
         tensor_admission_started = True
         torch = _configure_runtime(spec)
         report["imported_runtime"] = _verify_imported_runtime(startup, reads, torch)
         base, report["frozen_nnuec_base"] = _frozen_base(startup, reads, preparation)
         if startup["registration"]["initialization_source"]["mode"] == "initialize":
-            owner = _initial_owner(startup, reads, preparation, spec, intake, base, torch)
+            owner = _initial_owner(startup, reads, preparation, spec, intake, base, torch, authority=authority, family=family)
         else:
-            owner = _load_historical_owner(startup, reads, authority, preparation, spec, intake, base, torch, utility_source_datasets)
+            owner = _load_historical_owner(startup, reads, authority, preparation, spec, intake, base, torch,
+                utility_source_datasets, family=family)
         initial_output, initial_completed, initial_dispatched = owner.cost["output_bytes"], owner.completed_updates, owner.dispatched_updates
         if startup["registration"]["action"] == "export":
-            result = _execute_export(owner, intake, spec, request, authority, torch, clock=clock)
+            result = _execute_export(owner, intake, spec, request, authority, torch, clock=clock, family=family)
         else:
-            from .rovent_utility_training_run import train_utility_window
-            result = train_utility_window(owner, intake, spec, authority=authority,
-                checkpoint_directory=startup["registration"]["checkpoint_directory"], execute=True, clock=clock)
+            from .rovent_utility_training_run import _train_utility_window_core
+            result = _train_utility_window_core(owner, intake, spec, authority=authority,
+                checkpoint_directory=startup["registration"]["checkpoint_directory"], execute=True,
+                clock=clock, family=family)
         status, error = "completed", None
     except BaseException as failure:
         if owner is not None:
@@ -347,7 +419,7 @@ def original_utility_child_main(argv=None, *, stdin=None, clock=time.monotonic_n
         for name, handler in old_handlers.items():
             signal.signal(name, handler)
     report["read_bytes"] = reads.spent
-    terminal = {"schema": RESULT_DOMAIN, "execution_id": startup["execution_id"], "window_id": startup["window_id"],
+    terminal = {"schema": family.domain(RESULT_DOMAIN), "execution_id": startup["execution_id"], "window_id": startup["window_id"],
         "status": status, "result": result, "bootstrap": report,
         "completed_updates": 0 if owner is None else owner.completed_updates,
         "window_completed_updates": 0 if owner is None else owner.completed_updates - initial_completed,

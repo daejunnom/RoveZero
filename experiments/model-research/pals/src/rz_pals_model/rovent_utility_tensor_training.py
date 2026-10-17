@@ -59,14 +59,20 @@ def _metadata(model):
     return state
 
 
-def _validate_actual(model, preparation, torch):
+def _validate_actual(model, preparation, torch, *, numerical_parts=None):
     from .nnuec_utility_trainable import NnuecUtilityTrainableV1
     if type(model) is not NnuecUtilityTrainableV1:
         raise ValueError("actual concrete utility tensor owner required")
-    if preparation.get("schema") not in (PREPARATION_DOMAIN, COHORT_PREPARATION_DOMAIN):
-        raise ValueError("explicit separate utility preparation required")
-    # Recompute every declared identity before consulting actual tensor state.
-    checked = validate_training_preparation(preparation)
+    if numerical_parts is None:
+        if preparation.get("schema") not in (PREPARATION_DOMAIN, COHORT_PREPARATION_DOMAIN):
+            raise ValueError("explicit separate utility preparation required")
+        # The original named path remains PREP1/PREP2 only.
+        checked = validate_training_preparation(preparation)
+    else:
+        from .rovent_utility_intervention_numerical import ValidatedUtilityNumericalParts
+        if type(numerical_parts) is not ValidatedUtilityNumericalParts:
+            raise ValueError("sealed original intervention numerical parts required")
+        checked = numerical_parts.preparation
     if not _typed_equal(checked, preparation):
         raise ValueError("utility preparation seal changed")
     metadata = _metadata(model)
@@ -271,8 +277,15 @@ def _optimizer_state(owner, torch, clone):
 
 def _create_utility_owner(model, preparation, *, sampler,
                           sampler_validator, cuda_devices=(), execute=False,
-                          _fork_source=None):
-    preparation = validate_training_preparation(preparation)
+                          _fork_source=None, numerical_parts=None):
+    if numerical_parts is None:
+        preparation = validate_training_preparation(preparation)
+    else:
+        from .rovent_utility_intervention_numerical import ValidatedUtilityNumericalParts
+        if type(numerical_parts) is not ValidatedUtilityNumericalParts or not _typed_equal(
+                numerical_parts.preparation, preparation):
+            raise ValueError("sealed original intervention numerical parts/preparation differ")
+        preparation = numerical_parts.preparation
     registration = preparation["registration"]
     _plain(sampler); sampler_validator(copy.deepcopy(sampler))
     runtime = _runtime(execute)
@@ -283,12 +296,12 @@ def _create_utility_owner(model, preparation, *, sampler,
             # Parameter deepcopy creates fresh storages and does not preserve
             # an existing .grad. Inspect the caller's original ownership first
             # so cloning cannot conceal aliases or discard unfinished work.
-            original_parameters, _ = _validate_actual(model, preparation, torch)
+            original_parameters, _ = _validate_actual(model, preparation, torch, numerical_parts=numerical_parts)
             _device_roster(original_parameters, cuda_devices)
             if any(value.grad is not None for value in original_parameters.values()):
                 raise ValueError("utility initialization cannot discard existing gradients")
             scratch = copy.deepcopy(model)
-            parameters, metadata = _validate_actual(scratch, preparation, torch)
+            parameters, metadata = _validate_actual(scratch, preparation, torch, numerical_parts=numerical_parts)
             _device_roster(parameters, cuda_devices)
             if _fork_source is not _FORK_FROM_PINNED_SOURCE:
                 if scratch.current_weights_sha256() != registration["utility"]["initial_weights_sha256"]:
@@ -320,30 +333,58 @@ def create_cohort_utility_owner(model, recipe, registration, membership, *, samp
         sampler_validator=sampler_validator, cuda_devices=cuda_devices, execute=execute)
 
 
-def derived_training_state(owner):
+def _checkpoint_family(value):
+    from .rovent_utility_training_family import LEGACY, require_family
+    return require_family(LEGACY if value is None else value)
+
+
+def _family_resume_cost_state_sha256(owner, family):
+    family = _checkpoint_family(family)
+    return metadata_digest(family.domain(_RESUME_COST_STATE_DOMAIN), {
+        "cost": _plain(owner.cost), "ancestor_cost": _plain(owner.ancestor_cost),
+        "source_cost_observation": _plain(owner.source_cost_observation)})
+
+
+def _validate_checkpoint_actual(model, preparation, torch, family, parts):
+    if family.intervention:
+        return _validate_actual(model, preparation, torch, numerical_parts=parts)
+    return _validate_actual(model, preparation, torch)
+
+
+def _derived_training_state(owner, *, _family=None):
     _counts(owner)
+    family = _checkpoint_family(_family)
+    parts = family.parts(owner.preparation)
     from .generation_data import digest
-    return {"schema": STATE_DOMAIN,
+    domain = family.domain(STATE_DOMAIN)
+    return {"schema": domain,
         "initial_source_declaration": copy.deepcopy(owner.metadata["initial_training"]),
         "current_tensor_kind": "learned" if owner.total_updates() else "initial_source_only",
         "completed_updates": owner.completed_updates, "ancestor_updates": owner.ancestor_updates,
         "total_updates": owner.total_updates(),
-        "completion_chain_sha256": digest(STATE_DOMAIN,
+        "completion_chain_sha256": digest(domain,
             [*owner.ancestor_completion_sha256, *(item["sha256"] for item in owner.completion_receipts)]),
-        "recipe_sha256": owner.preparation["recipe_sha256"],
-        "registration_sha256": owner.preparation["registration_sha256"],
+        "recipe_sha256": parts.recipe_sha256,
+        "registration_sha256": parts.source_registration_sha256,
         "frozen_base_weights_sha256": owner.metadata["base_weights_sha256"],
         "frozen_base_mapping_sha256": owner.metadata["frozen_base_mapping_sha256"],
         "live_training_authority_reissued": False}
 
 
-def utility_tensor_payload(owner, *, sampler_validator, execute=False):
+def derived_training_state(owner):
+    """Original source-family projection; never accepts intervention metadata."""
+    return _derived_training_state(owner)
+
+
+def _utility_tensor_payload(owner, *, sampler_validator, execute=False, _family=None):
+    family = _checkpoint_family(_family)
+    parts = family.parts(owner.preparation)
     runtime = _runtime(execute)
     torch, clone, validate_rng, _, _, state_digest, _ = runtime
     _counts(owner)
     if owner.quarantined or any(value.grad is not None for value in owner.model.parameters()):
         raise ValueError("quarantined/partial utility owner cannot publish a checkpoint")
-    parameters, _ = _validate_actual(owner.model, owner.preparation, torch)
+    parameters, _ = _validate_checkpoint_actual(owner.model, owner.preparation, torch, family, parts)
     _device_roster(parameters, owner.cuda_devices)
     if not _typed_equal(_metadata(owner.model), owner.metadata):
         raise ValueError("immutable utility/frozen-base metadata changed")
@@ -351,7 +392,7 @@ def utility_tensor_payload(owner, *, sampler_validator, execute=False):
     validate_rng(owner.rng, owner.cuda_devices)
     model = clone(owner.model.state_dict())
     optimizer, scheduler = _optimizer_state(owner, torch, clone)
-    payload = {"schema": CHECKPOINT_DOMAIN, "preparation": _plain(owner.preparation),
+    payload = {"schema": family.domain(CHECKPOINT_DOMAIN), "preparation": _plain(owner.preparation),
         "metadata": _plain(owner.metadata), "model": model, "optimizer": optimizer,
         "scheduler": scheduler, "rng": clone(owner.rng), "sampler": _plain(owner.sampler),
         "cuda_devices": list(owner.cuda_devices), "parameter_names": list(owner.parameter_names),
@@ -362,15 +403,23 @@ def utility_tensor_payload(owner, *, sampler_validator, execute=False):
         "ancestor_completion_sha256": list(owner.ancestor_completion_sha256),
         "parent_checkpoint_sha256": owner.parent_checkpoint_sha256,
         "source_cost_observation": _plain(owner.source_cost_observation),
-        "derived_training_state": derived_training_state(owner)}
+        "derived_training_state": _derived_training_state(owner, _family=family)}
     payload["state_sha256"] = state_digest(payload)
     return payload
 
 
-def _tensor_projection(payload, runtime):
+def utility_tensor_payload(owner, *, sampler_validator, execute=False):
+    return _utility_tensor_payload(owner, sampler_validator=sampler_validator, execute=execute)
+
+
+def _tensor_projection(payload, runtime, *, _family=None):
     """Saved-payload observation only; this does not decode or attest tensors."""
     state_digest = runtime[5]
-    result = {"schema": PROJECTION_DOMAIN, "payload_state_sha256": payload["state_sha256"]}
+    family = _checkpoint_family(_family)
+    if payload["schema"] != family.domain(CHECKPOINT_DOMAIN):
+        raise ValueError("utility tensor projection cannot retag another source-family payload")
+    family.parts(payload["preparation"])
+    result = {"schema": family.domain(PROJECTION_DOMAIN), "payload_state_sha256": payload["state_sha256"]}
     for name in ("preparation", "metadata", "sampler", "cuda_devices", "parameter_names", "completed_updates",
                  "dispatched_updates", "ancestor_updates", "pending_microbatches", "cost", "ancestor_cost",
                  "completion_receipts", "ancestor_completion_sha256", "parent_checkpoint_sha256",
@@ -412,12 +461,13 @@ def _write_projection(path, value, *, maximum, read_accounting):
     return {"path": str(path), "sha256": observed, "bytes": size}
 
 
-def save_utility_checkpoint(owner, path, *, sampler_validator,
-                            max_file_bytes=MAX_CHECKPOINT_BYTES, read_accounting=None, execute=False):
+def _save_utility_checkpoint(owner, path, *, sampler_validator,
+                            max_file_bytes=MAX_CHECKPOINT_BYTES, read_accounting=None, execute=False, _family=None):
+    family = _checkpoint_family(_family)
     maximum = uint(max_file_bytes, MAX_CHECKPOINT_BYTES)
     if not maximum:
         raise ValueError("positive bounded utility checkpoint byte credit required")
-    payload = utility_tensor_payload(owner, sampler_validator=sampler_validator, execute=execute)
+    payload = _utility_tensor_payload(owner, sampler_validator=sampler_validator, execute=execute, _family=family)
     # Reuse the bounded serialization and no-replace primitives, not the
     # fixed P/C/V writer's ledger codec or its output-byte mutation loop.
     from .artifacts import publish_noreplace
@@ -443,7 +493,7 @@ def save_utility_checkpoint(owner, path, *, sampler_validator,
         publish_noreplace(partial, target)
         from .generation_export import _hash_file
         digest, size = _hash_file(path, maximum=maximum, read_accounting=read_accounting)
-        projection = _tensor_projection(payload, _runtime(True))
+        projection = _tensor_projection(payload, _runtime(True), _family=family)
         projection_pin = _write_projection(projection_path, projection,
             maximum=min(MAX_PROJECTION_BYTES, maximum - size), read_accounting=read_accounting)
         snapshot_cost = dict(owner.cost)
@@ -461,14 +511,22 @@ def save_utility_checkpoint(owner, path, *, sampler_validator,
             "snapshot_cost": snapshot_cost, "post_snapshot_cost": dict(owner.cost)}
 
 
-def _restore(payload, template, preparation, *, sampler_validator, runtime):
+def save_utility_checkpoint(owner, path, *, sampler_validator,
+                            max_file_bytes=MAX_CHECKPOINT_BYTES, read_accounting=None, execute=False):
+    return _save_utility_checkpoint(owner, path, sampler_validator=sampler_validator,
+        max_file_bytes=max_file_bytes, read_accounting=read_accounting, execute=execute)
+
+
+def _restore(payload, template, preparation, *, sampler_validator, runtime, _family=None):
+    family = _checkpoint_family(_family)
+    parts = family.parts(preparation)
     torch, clone, validate_rng, _, _, state_digest, equal = runtime
     names = ("schema", "preparation", "metadata", "model", "optimizer", "scheduler", "rng", "sampler",
         "cuda_devices", "parameter_names", "completed_updates", "dispatched_updates", "ancestor_updates",
         "pending_microbatches", "cost", "ancestor_cost", "completion_receipts", "ancestor_completion_sha256",
         "parent_checkpoint_sha256", "source_cost_observation", "derived_training_state", "state_sha256")
     fields(payload, names, "separate utility tensor checkpoint")
-    if payload["schema"] != CHECKPOINT_DOMAIN or not _typed_equal(payload["preparation"], preparation):
+    if payload["schema"] != family.domain(CHECKPOINT_DOMAIN) or not _typed_equal(payload["preparation"], preparation):
         raise ValueError("utility checkpoint recipe/source/frozen-base preparation differs")
     sha(payload["state_sha256"])
     if state_digest({name: value for name, value in payload.items() if name != "state_sha256"}) != payload["state_sha256"]:
@@ -476,7 +534,7 @@ def _restore(payload, template, preparation, *, sampler_validator, runtime):
     if not _typed_equal(_metadata(template), payload["metadata"]):
         raise ValueError("utility frozen base/initial metadata differs before scratch restore")
     scratch = copy.deepcopy(template)
-    parameters, metadata = _validate_actual(scratch, preparation, torch)
+    parameters, metadata = _validate_checkpoint_actual(scratch, preparation, torch, family, parts)
     _device_roster(parameters, payload["cuda_devices"])
     expected = scratch.state_dict()
     if (type(payload["model"]) is not dict or set(payload["model"]) != set(expected)
@@ -494,7 +552,7 @@ def _restore(payload, template, preparation, *, sampler_validator, runtime):
             raise ValueError("utility incoming tensor storage alias/layout is forbidden")
         source_storages.add(storage)
     scratch.load_state_dict(clone(payload["model"]), strict=True)
-    _validate_actual(scratch, preparation, torch)
+    _validate_checkpoint_actual(scratch, preparation, torch, family, parts)
     optimizer, scheduler, canonical = _fresh_optimizer(parameters, preparation, torch)
     if payload["parameter_names"] != list(canonical):
         raise ValueError("utility optimizer canonical parameter order differs")
@@ -513,11 +571,11 @@ def _restore(payload, template, preparation, *, sampler_validator, runtime):
         ancestor_completion_sha256=list(payload["ancestor_completion_sha256"]),
         parent_checkpoint_sha256=payload["parent_checkpoint_sha256"],
         source_cost_observation=_plain(payload["source_cost_observation"]))
-    if not _typed_equal(derived_training_state(owner), payload["derived_training_state"]):
+    if not _typed_equal(_derived_training_state(owner, _family=family), payload["derived_training_state"]):
         raise ValueError("utility current/ancestor derived training state differs")
     # Complete round-trip checks include every tensor byte and all five state
     # families, not just a caller-supplied state digest.
-    if not equal(utility_tensor_payload(owner, sampler_validator=sampler_validator, execute=True), payload):
+    if not equal(_utility_tensor_payload(owner, sampler_validator=sampler_validator, execute=True, _family=family), payload):
         raise ValueError("utility scratch checkpoint round-trip differs")
     return owner
 
@@ -526,14 +584,20 @@ def _stage_utility_resume(path, expected_sha256, template, preparation, *,
                           sampler_validator, max_file_bytes=MAX_CHECKPOINT_BYTES,
                           read_accounting=None, snapshot_directory=None, execute=False,
                           authority=None, historical_checkpoint=None,
-                          require_historical=False):
-    preparation = validate_training_preparation(preparation)
+                          require_historical=False, _family=None):
+    family = _checkpoint_family(_family)
+    preparation = family.parts(preparation).preparation
     if require_historical and authority is not None and historical_checkpoint is None:
         raise ValueError("actual cohort resume requires the original historical checkpoint owner")
     if historical_checkpoint is not None:
-        from .rovent_utility_historical_checkpoint import HistoricalUtilityCheckpoint
-        if (preparation["schema"] != COHORT_PREPARATION_DOMAIN
-                or type(historical_checkpoint) is not HistoricalUtilityCheckpoint):
+        if family.intervention:
+            from .rovent_utility_intervention_checkpoint import HistoricalUtilityInterventionCheckpoint
+            expected_type = HistoricalUtilityInterventionCheckpoint
+        else:
+            from .rovent_utility_historical_checkpoint import HistoricalUtilityCheckpoint
+            expected_type = HistoricalUtilityCheckpoint
+        if (not family.intervention and preparation["schema"] != COHORT_PREPARATION_DOMAIN
+                or type(historical_checkpoint) is not expected_type):
             raise ValueError("explicit typed cohort historical checkpoint source required")
         original_pin = historical_checkpoint.tensor_pin()
         if original_pin["sha256"] != expected_sha256:
@@ -554,14 +618,17 @@ def _stage_utility_resume(path, expected_sha256, template, preparation, *,
     with _LOCK:
         caller_rng = capture_rng(devices)
         try:
-            owner = _restore(payload, template, preparation, sampler_validator=sampler_validator, runtime=runtime)
+            owner = _restore(payload, template, preparation, sampler_validator=sampler_validator, runtime=runtime, _family=family)
             if historical_checkpoint is not None:
-                from .rovent_utility_historical_checkpoint import project_utility_tensor_scratch
+                if family.intervention:
+                    from .rovent_utility_intervention_checkpoint import project_intervention_utility_tensor_scratch as project_scratch
+                else:
+                    from .rovent_utility_historical_checkpoint import project_utility_tensor_scratch as project_scratch
                 if original_pin["bytes"] != source_bytes:
                     raise ValueError("utility historical raw tensor byte count differs from scratch")
-                measured = _tensor_projection(utility_tensor_payload(owner,
-                    sampler_validator=sampler_validator, execute=True), runtime)
-                project_utility_tensor_scratch(historical_checkpoint.projection(), observed_state=measured)
+                measured = _tensor_projection(_utility_tensor_payload(owner,
+                    sampler_validator=sampler_validator, execute=True, _family=family), runtime, _family=family)
+                project_scratch(historical_checkpoint.projection(), observed_state=measured)
             owner.source_checkpoint_sha256 = expected_sha256
             owner.source_payload_state_sha256 = payload["state_sha256"]
             owner.source_snapshot_cost_observation = _plain(payload["source_cost_observation"])
@@ -573,8 +640,7 @@ def _stage_utility_resume(path, expected_sha256, template, preparation, *,
                 owner.source_cost_observation = {"status": "unknown", "scope": "raw_snapshot_only",
                     "inherited": _plain(payload["source_cost_observation"])}
             else:
-                from .rovent_utility_training_authority import require_original_utility_authority
-                require_original_utility_authority(authority, allow_unleased=True)
+                family.require_authority(authority, allow_unleased=True)
                 owner.source_cost_observation = _plain(authority.validate_checkpoint_state(owner, {
                     "path": str(path), "sha256": expected_sha256, "bytes": source_bytes}))
                 # The concrete parent has verified original snapshot, output
@@ -586,7 +652,7 @@ def _stage_utility_resume(path, expected_sha256, template, preparation, *,
                     raise ValueError("utility original checkpoint cost scope differs from scratch snapshot")
                 owner.cost = {name: uint(cost["known_lower_bound"][name] - owner.ancestor_cost[name])
                     for name in COST_FIELDS}
-            owner.source_admitted_cost_state_sha256 = _resume_cost_state_sha256(owner)
+            owner.source_admitted_cost_state_sha256 = _family_resume_cost_state_sha256(owner, family)
             return owner
         finally:
             restore_rng(caller_rng, devices)
@@ -612,16 +678,20 @@ def stage_cohort_utility_resume(path, expected_sha256, template, recipe, registr
         historical_checkpoint=historical_checkpoint, require_historical=True)
 
 
-def stage_utility_fork(source, *, recipe, registration, membership, sampler,
-                       source_sampler_validator, sampler_validator, reset_seed, execute=False):
+def _stage_utility_fork(source, preparation, *, sampler,
+                       source_sampler_validator, sampler_validator, reset_seed, execute=False, _family=None):
     """A fork resets moments/sampler/counts; a resume preserves every state."""
+    family = _checkpoint_family(_family)
+    parts = family.parts(preparation)
+    preparation = parts.preparation
+    family.parts(source.preparation)
     runtime = _runtime(execute)
     _counts(source)
     if source.source_checkpoint_sha256 is None:
         raise ValueError("utility fork requires an exact pinned checkpoint source")
-    if source.source_admitted_cost_state_sha256 != _resume_cost_state_sha256(source):
+    if source.source_admitted_cost_state_sha256 != _family_resume_cost_state_sha256(source, family):
         raise ValueError("utility fork source changed after its exact pinned cost admission")
-    source_payload = utility_tensor_payload(source, sampler_validator=source_sampler_validator, execute=True)
+    source_payload = _utility_tensor_payload(source, sampler_validator=source_sampler_validator, execute=True, _family=family)
     # Parent source must still be precisely the tensor/journal snapshot that
     # was loaded. A later update cannot claim that older checkpoint as parent.
     original_projection = dict(source_payload)
@@ -643,12 +713,9 @@ def stage_utility_fork(source, *, recipe, registration, membership, sampler,
             torch.random.default_generator.manual_seed(reset_seed)
             for device in source.cuda_devices:
                 torch.cuda.default_generators[device].manual_seed(reset_seed)
-            preparation = (prepare_cohort_training(recipe, registration, membership)
-                if source.preparation["schema"] == COHORT_PREPARATION_DOMAIN
-                else prepare_training(recipe, registration, membership))
             child = _create_utility_owner(source.model, preparation, sampler=sampler,
                 sampler_validator=sampler_validator, cuda_devices=source.cuda_devices, execute=True,
-                _fork_source=_FORK_FROM_PINNED_SOURCE)
+                _fork_source=_FORK_FROM_PINNED_SOURCE, **({"numerical_parts": parts} if family.intervention else {}))
         finally:
             restore_rng(caller_rng, source.cuda_devices)
     if (child.metadata != source.metadata or child.preparation["registration"] != source.preparation["registration"]):
@@ -665,19 +732,30 @@ def stage_utility_fork(source, *, recipe, registration, membership, sampler,
     return child
 
 
-def export_utility_owner(owner, path, *, authority, kind,
-                         max_output_bytes=8 * 1024**2, execute=False):
+def stage_utility_fork(source, *, recipe, registration, membership, sampler,
+                       source_sampler_validator, sampler_validator, reset_seed, execute=False):
+    preparation = (prepare_cohort_training(recipe, registration, membership)
+        if source.preparation["schema"] == COHORT_PREPARATION_DOMAIN
+        else prepare_training(recipe, registration, membership))
+    return _stage_utility_fork(source, preparation, sampler=sampler,
+        source_sampler_validator=source_sampler_validator, sampler_validator=sampler_validator,
+        reset_seed=reset_seed, execute=execute)
+
+
+def _export_utility_owner(owner, path, *, authority, kind,
+                         max_output_bytes=8 * 1024**2, execute=False, _family=None):
     """Call the numerical writer only after original learned-source admission."""
+    family = _checkpoint_family(_family)
+    family.parts(owner.preparation)
     torch = _runtime(execute)[0]
     if kind not in ("collection", "deployment"):
         raise ValueError("registered utility export kind required")
     _counts(owner)
     if owner.quarantined or owner.pending_microbatches or owner.physical_completion != "confirmed":
         raise ValueError("utility export requires quiescent confirmed physical completion")
-    if owner.preparation["schema"] != COHORT_PREPARATION_DOMAIN:
+    if not family.intervention and owner.preparation["schema"] != COHORT_PREPARATION_DOMAIN:
         raise ValueError("learned utility export requires explicit cohort preparation/2")
-    from .rovent_utility_training_authority import require_original_utility_authority
-    require_original_utility_authority(authority)
+    family.require_authority(authority, owner=owner)
     training = authority.validate_learned_export(owner, kind)
     fields(training, ("kind", "steps", "run_id", "dataset_sha256"), "original utility learned training projection")
     if training["kind"] != "learned" or training["steps"] != owner.total_updates() or not owner.total_updates():
@@ -715,10 +793,16 @@ def export_utility_owner(owner, path, *, authority, kind,
         owner.quarantined = True
         owner.physical_completion = "unknown"
         raise
-    return {"schema": EXPORT_DOMAIN, "kind": kind, "artifact": pin,
-        "derived_training_state": derived_training_state(owner),
+    return {"schema": family.domain(EXPORT_DOMAIN), "kind": kind, "artifact": pin,
+        "derived_training_state": _derived_training_state(owner, _family=family),
         "registration": copy.deepcopy(owner.preparation["registration"]),
         "snapshot_cost_lower_bound": owner.total_cost(),
         "historical_cost_observation": _plain(owner.source_cost_observation),
         "v_present": False, "learned_admission": copy.deepcopy(training),
         "physical_completion": "confirmed"}
+
+
+def export_utility_owner(owner, path, *, authority, kind,
+                         max_output_bytes=8 * 1024**2, execute=False):
+    return _export_utility_owner(owner, path, authority=authority, kind=kind,
+        max_output_bytes=max_output_bytes, execute=execute)

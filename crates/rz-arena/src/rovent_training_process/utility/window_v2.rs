@@ -33,7 +33,7 @@ fn check(condition: bool, reason: &str) -> Result<(), ArenaError> {
         Err(invalid(reason))
     }
 }
-fn canonical_device(value: &str) -> bool {
+pub(super) fn canonical_device(value: &str) -> bool {
     value == "cpu"
         || value.strip_prefix("cuda:").is_some_and(|index| {
             !index.is_empty()

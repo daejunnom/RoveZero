@@ -86,9 +86,19 @@ def validate_utility_registration_v2(value):
 
 
 def _validate_registration(value, *, expected_domain):
-    _fields(value, REGISTRATION_FIELDS, "utility execution registration")
+    return _validate_registration_core(value, expected_domain=expected_domain, intervention=False)
+
+
+def _validate_registration_core(value, *, expected_domain, intervention):
+    if (type(intervention) is not bool
+            or intervention and expected_domain != "rz-rovent-utility-training-registration/3"
+            or not intervention and expected_domain not in (REGISTRATION_DOMAIN, REGISTRATION_V2_DOMAIN)):
+        raise ValueError("explicit closed utility registration source family required")
+    _fields(value, (*REGISTRATION_FIELDS, "data_family") if intervention else REGISTRATION_FIELDS, "utility execution registration")
     if value["schema"] != expected_domain:
         raise ValueError("separate utility execution registration required; no codec conversion")
+    if intervention and value["data_family"] != "intervention_v2":
+        raise ValueError("explicit intervention_v2 execution source family required")
     _identifier(value["execution_id"])
     _pin(value["preparation"], 65536); _pin(value["window_spec"], 1024**2)
     _sha(value["trainer_source_sha256"])
@@ -110,7 +120,10 @@ def _validate_registration(value, *, expected_domain):
         raise ValueError("bounded original utility dataset ancestry required")
     seen = {value["current_dataset"]["publication"]["sha256"]}
     for ancestor in value["ancestor_datasets"]:
-        if expected_domain == REGISTRATION_V2_DOMAIN:
+        if intervention:
+            from .rovent_utility_intervention_execution import validate_intervention_ancestor_registration
+            identity = validate_intervention_ancestor_registration(ancestor)
+        elif expected_domain == REGISTRATION_V2_DOMAIN:
             identity = _ancestor_v2(ancestor)
         else:
             _dataset_reference(ancestor)
@@ -160,7 +173,7 @@ def _validate_registration(value, *, expected_domain):
         raise ValueError("utility output and control owners overlap")
     _child_path(value["output_root"], value["checkpoint_directory"], "utility checkpoints")
     receipt = _child_path(value["output_root"], value["receipt_path"], "utility terminal receipt")
-    if expected_domain == REGISTRATION_V2_DOMAIN and (receipt.parent != output or receipt.suffix != ".json"
+    if (expected_domain == REGISTRATION_V2_DOMAIN or intervention) and (receipt.parent != output or receipt.suffix != ".json"
             or receipt == _absolute(value["checkpoint_directory"])):
         raise ValueError("utility /2 terminal must be a distinct direct output-root JSON file")
     _uint(value["max_rpc_messages"], 2000000, positive=True)
@@ -173,16 +186,29 @@ def _validate_registration(value, *, expected_domain):
 
 
 def validate_startup(raw, *, expected_sha256, expected_bytes, execution_until_ns, whole_until_ns, now_ns):
+    from .rovent_utility_training_family import LEGACY
+    return _validate_startup_core(raw, expected_sha256=expected_sha256, expected_bytes=expected_bytes,
+        execution_until_ns=execution_until_ns, whole_until_ns=whole_until_ns, now_ns=now_ns, family=LEGACY)
+
+
+def _validate_startup_core(raw, *, expected_sha256, expected_bytes, execution_until_ns, whole_until_ns, now_ns, family):
+    from .rovent_utility_training_family import require_family
+    family = require_family(family)
     _sha(expected_sha256); _uint(expected_bytes, MAX_JSON_BYTES, positive=True)
     if type(raw) is not bytes or len(raw) != expected_bytes or hashlib.sha256(raw).hexdigest() != expected_sha256:
         raise ValueError("original utility startup bytes/length/SHA differ")
     value = _strict_json(raw)
-    _fields(value, STARTUP_FIELDS, "utility startup")
-    if value["schema"] != STARTUP_DOMAIN:
+    _fields(value, (*STARTUP_FIELDS, "data_family") if family.intervention else STARTUP_FIELDS, "utility startup")
+    if value["schema"] != family.domain(STARTUP_DOMAIN):
         raise ValueError("separate utility startup domain required")
+    if family.intervention and value["data_family"] != "intervention_v2":
+        raise ValueError("explicit intervention startup data family required")
     _identifier(value["execution_id"]); _identifier(value["window_id"]); _sha(value["registration_sha256"])
     original_registration = value["registration"]
-    if type(original_registration) is dict and original_registration.get("schema") == REGISTRATION_V2_DOMAIN:
+    if family.intervention:
+        from .rovent_utility_intervention_execution import validate_intervention_registration
+        registration = validate_intervention_registration(original_registration)
+    elif type(original_registration) is dict and original_registration.get("schema") == REGISTRATION_V2_DOMAIN:
         registration = validate_utility_registration_v2(original_registration)
     else:
         registration = validate_registration(original_registration)
@@ -223,6 +249,13 @@ def validate_startup(raw, *, expected_sha256, expected_bytes, execution_until_ns
         "rovent_utility_training_bootstrap.py", "rovent_training_bootstrap.py", "rovent_utility_training_authority.py",
         "rovent_utility_training_window.py", "rovent_utility_training.py", "rovent_utility_training_run.py",
         "rovent_utility_tensor_training.py", "nnuec_utility_trainable.py")}
+    if family.intervention:
+        required.update(MODULE_RELATIVE + name for name in ("rovent_utility_intervention_child.py",
+            "rovent_utility_intervention_execution.py", "rovent_utility_intervention_authority.py",
+            "rovent_utility_intervention_dataset.py", "rovent_utility_intervention_numerical.py",
+            "rovent_utility_intervention_training.py", "rovent_utility_intervention_checkpoint.py",
+            "rovent_utility_intervention_preparation.py", "rovent_utility_intervention_payload.py",
+            "rovent_utility_intervention_files.py", "rovent_utility_intervention.py", "rovent_utility_training_family.py"))
     if not required <= inventory.keys():
         raise ValueError("actual utility entry/bootstrap/learner source pins are absent")
     dependencies = value["dependency_directories"]

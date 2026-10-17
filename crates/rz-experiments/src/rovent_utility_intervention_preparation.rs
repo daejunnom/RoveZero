@@ -161,6 +161,11 @@ pub enum RoventInterventionAncestorSource {
         publication_sha256: String,
         metadata: RoventInterventionUtilityAncestorPins,
     },
+    /// Separate /2 source family; never relabel an intervention as cohort /1.
+    UtilityIntervention {
+        publication_sha256: String,
+        metadata: RoventInterventionUtilityAncestorPins,
+    },
 }
 impl RoventInterventionAncestorSource {
     pub fn publication_sha256(&self) -> &str {
@@ -176,6 +181,9 @@ impl RoventInterventionAncestorSource {
             }
             | Self::UtilityCohort {
                 publication_sha256, ..
+            }
+            | Self::UtilityIntervention {
+                publication_sha256, ..
             } => publication_sha256,
         }
     }
@@ -189,7 +197,7 @@ impl RoventInterventionAncestorSource {
                 &metadata.canonical_manifest_sha256,
                 &metadata.canonical_index_sha256,
             ],
-            Self::UtilityCohort { metadata, .. } => [
+            Self::UtilityCohort { metadata, .. } | Self::UtilityIntervention { metadata, .. } => [
                 &metadata.dataset_sha256,
                 &metadata.pool_sha256,
                 &metadata.preparation_sha256,

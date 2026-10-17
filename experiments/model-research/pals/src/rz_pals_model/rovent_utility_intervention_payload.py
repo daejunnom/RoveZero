@@ -116,7 +116,20 @@ def _source_enrollment(files, profile, registration):
         raise ValueError("intervention opening lacks original registered split")
     validate_position_replay(source["rules_root"])
     sha(source["transposition_sha256"])
-    proof._ancestor_descriptors(source["ancestor_datasets"])
+    ancestors = proof._array(source["ancestor_datasets"], 256)
+    ancestor_publications = set()
+    for descriptor in ancestors:
+        if type(descriptor) is dict and descriptor.get("kind") == "utility_intervention":
+            fields(descriptor, ("kind", "publication_sha256", "metadata"), "original intervention ancestor")
+            fields(descriptor["metadata"], ("dataset_sha256", "pool_sha256", "preparation_sha256", "context_sha256"),
+                "original intervention ancestor source seals")
+            for seal in descriptor["metadata"].values(): sha(seal)
+            sha(descriptor["publication_sha256"])
+        else:
+            proof._ancestor_descriptors([descriptor])
+        if descriptor["publication_sha256"] in ancestor_publications:
+            raise ValueError("intervention original ancestor publication repeated")
+        ancestor_publications.add(descriptor["publication_sha256"])
     scopes = proof._array(source["resource_observation"], 3)
     if len(scopes) != files.publication()["trial_count"]:
         raise ValueError("intervention original per-trial resource custody coverage differs")

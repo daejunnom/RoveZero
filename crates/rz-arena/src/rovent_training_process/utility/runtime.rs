@@ -4,19 +4,22 @@
 #![cfg(target_os = "linux")]
 
 use super::ancestry::VerifiedUtilityAncestors;
-use super::checkpoint::{
-    PublishedUtilityCheckpointArchive, UtilityCheckpointArchiveFailure,
-    VerifiedUtilityCheckpointSource, VerifiedUtilityOldRunReclamation,
-    publish_closed_utility_checkpoint, publish_current_utility_checkpoint,
-};
 use super::cli::{RoventUtilityCliAction, RoventUtilityCliAdmissionRequest};
-use super::dataset::VerifiedUtilityDataset;
 use super::execution::{RoventUtilityExecutionAction, RoventUtilityInitializationSource};
-use super::execution_v2::RoventUtilityExecutionRegistrationV2 as RoventUtilityExecutionRegistration;
 use super::ledger::{
     InitialUtilityMeasurement, UtilityCheckpointBoundary, UtilityLedger, UtilityStateSeals,
 };
-use super::window_v2::RoventUtilityTrainWindowV2 as RoventUtilityTrainWindow;
+use super::runtime_family::{
+    RuntimePublishedUtilityCheckpointArchive as PublishedUtilityCheckpointArchive,
+    RuntimeUtilityCheckpointArchiveFailure as UtilityCheckpointArchiveFailure,
+    RuntimeUtilityCheckpointSource as VerifiedUtilityCheckpointSource,
+    RuntimeUtilityDataset as VerifiedUtilityDataset, RuntimeUtilityDatasetFailure,
+    RuntimeUtilityOldRunReclamation as VerifiedUtilityOldRunReclamation,
+    RuntimeUtilityRegistration as RoventUtilityExecutionRegistration, RuntimeUtilitySourceFailure,
+    RuntimeUtilityWindow as RoventUtilityTrainWindow, UtilityRuntimeFamily,
+    publish_closed as publish_closed_utility_checkpoint,
+    publish_current as publish_current_utility_checkpoint,
+};
 use crate::ArenaError;
 use crate::pals_collect_v3::training_process::{FileIdentity, directory_file, open_directory};
 use crate::process::{
@@ -218,6 +221,18 @@ fn utility_sources() -> Result<BTreeMap<&'static str, &'static [u8]>, ArenaError
         source!("rovent_utility_cohort_payload.py"),
         source!("rovent_utility_root_local.py"),
         source!("rovent_utility_historical_checkpoint.py"),
+        source!("rovent_utility_intervention.py"),
+        source!("rovent_utility_intervention_files.py"),
+        source!("rovent_utility_intervention_payload.py"),
+        source!("rovent_utility_intervention_preparation.py"),
+        source!("rovent_utility_intervention_numerical.py"),
+        source!("rovent_utility_intervention_dataset.py"),
+        source!("rovent_utility_intervention_execution.py"),
+        source!("rovent_utility_intervention_authority.py"),
+        source!("rovent_utility_intervention_training.py"),
+        source!("rovent_utility_intervention_checkpoint.py"),
+        source!("rovent_utility_intervention_child.py"),
+        source!("rovent_utility_training_family.py"),
     ] {
         files.insert(path, raw);
     }
@@ -280,7 +295,7 @@ impl Journal {
         receipt: Option<&RoventTrainingFilePin>,
         ack: &Value,
     ) -> Result<(), ArenaError> {
-        let event = json!({"schema":"rz-rovent-utility-ledger-event/1","sequence":self.events.len()+1,"kind":kind,"request":request,"completion_receipt":receipt,"ack":ack});
+        let event = json!({"schema":ctx.window.family().domain("rz-rovent-utility-ledger-event/1"),"sequence":self.events.len()+1,"kind":kind,"request":request,"completion_receipt":receipt,"ack":ack});
         let mut raw = encode(&event)?;
         raw.push(b'\n');
         require(
@@ -367,9 +382,9 @@ struct Broker {
     journal: Arc<Mutex<Journal>>,
     budget: Arc<RoventRecoveryReadBudget>,
     resources: Arc<RoventTrainingResources>,
-    dataset: Arc<VerifiedUtilityDataset>,
+    dataset: VerifiedUtilityDataset,
     ancestors: Arc<VerifiedUtilityAncestors>,
-    checkpoint: Option<Arc<VerifiedUtilityCheckpointSource>>,
+    checkpoint: Option<VerifiedUtilityCheckpointSource>,
     child_identity: Arc<Mutex<Option<RoventHistoricalChildIdentity>>>,
     fresh_identity: Option<InitialSourceIdentity>,
     registration_file: Arc<File>,
@@ -379,7 +394,7 @@ struct Broker {
     // that allocation when the retention registry grows instead of moving its
     // descriptor family out of the failure during quarantine.
     #[allow(clippy::vec_box)]
-    archive_failures: Arc<Mutex<Vec<Box<UtilityCheckpointArchiveFailure>>>>,
+    archive_failures: Arc<Mutex<Vec<UtilityCheckpointArchiveFailure>>>,
 }
 #[derive(Clone)]
 struct InitialSourceIdentity {
@@ -410,13 +425,13 @@ impl ActualUtilityCheckpointBoundary<'_> {
     pub(super) fn ledger_boundary(&self) -> &UtilityCheckpointBoundary<'_> {
         &self.boundary
     }
-    pub(super) fn dataset(&self) -> &Arc<VerifiedUtilityDataset> {
+    pub(super) fn dataset(&self) -> &VerifiedUtilityDataset {
         &self.ctx.dataset
     }
     pub(super) fn ancestors(&self) -> &Arc<VerifiedUtilityAncestors> {
         &self.ctx.ancestors
     }
-    pub(super) fn checkpoint_source(&self) -> Option<&Arc<VerifiedUtilityCheckpointSource>> {
+    pub(super) fn checkpoint_source(&self) -> Option<&VerifiedUtilityCheckpointSource> {
         self.ctx.checkpoint.as_ref()
     }
     pub(super) fn registration_file(&self) -> (&RoventTrainingFilePin, &File) {
@@ -508,7 +523,7 @@ pub(super) struct ActualUtilityClosedCheckpoint<'a> {
     registration: &'a RoventUtilityExecutionRegistration,
     window: &'a RoventUtilityTrainWindow,
     preparation: &'a Value,
-    dataset: &'a Arc<VerifiedUtilityDataset>,
+    dataset: &'a VerifiedUtilityDataset,
     ancestors: &'a Arc<VerifiedUtilityAncestors>,
     ledger: &'a UtilityLedger,
     held: &'a linux::LinuxHeld,
@@ -542,7 +557,7 @@ impl ActualUtilityClosedCheckpoint<'_> {
     pub(super) fn preparation(&self) -> &Value {
         self.preparation
     }
-    pub(super) fn dataset(&self) -> &Arc<VerifiedUtilityDataset> {
+    pub(super) fn dataset(&self) -> &VerifiedUtilityDataset {
         self.dataset
     }
     pub(super) fn ancestors(&self) -> &Arc<VerifiedUtilityAncestors> {
@@ -706,7 +721,7 @@ fn dispatch(
             let original = UtilityLedger::new(
                 source.window().clone(),
                 source.preparation().clone(),
-                Arc::clone(source.dataset()),
+                source.dataset(),
                 source.restored()?,
             )?;
             let ack = original.validate_checkpoint_state(payload)?;
@@ -720,7 +735,7 @@ fn dispatch(
                     UtilityLedger::from_initial_measurement(
                         ctx.window.clone(),
                         ctx.preparation.clone(),
-                        Arc::clone(&ctx.dataset),
+                        ctx.dataset.clone(),
                         measurement(ctx, payload)?,
                     )?
                 }
@@ -729,7 +744,7 @@ fn dispatch(
                     UtilityLedger::new(
                         ctx.window.clone(),
                         ctx.preparation.clone(),
-                        Arc::clone(&ctx.dataset),
+                        ctx.dataset.clone(),
                         ctx.checkpoint
                             .as_ref()
                             .ok_or_else(|| invalid("resume source"))?
@@ -744,7 +759,7 @@ fn dispatch(
                     UtilityLedger::from_fork_measurement(
                         ctx.window.clone(),
                         ctx.preparation.clone(),
-                        Arc::clone(&ctx.dataset),
+                        ctx.dataset.clone(),
                         &ctx.checkpoint
                             .as_ref()
                             .ok_or_else(|| invalid("fork source"))?
@@ -891,13 +906,14 @@ fn dispatch(
                     .map_err(|_| invalid("archive custody poisoned"))?
                     .push(archive),
                 Err(failure) => {
+                    let failure_observation = failure.observation();
                     ctx.archive_failures
                         .lock()
                         .map_err(|_| invalid("archive failure custody poisoned"))?
                         .push(failure);
-                    return Err(invalid(
-                        "utility checkpoint publication failed; original bytes retained",
-                    ));
+                    return Err(invalid(format!(
+                        "utility checkpoint publication failed; original bytes retained: {failure_observation}"
+                    )));
                 }
             }
             j.durable_event(ctx, held, "checkpoint_published", payload, None, &json!({}))?;
@@ -935,7 +951,7 @@ fn dispatch(
             )?;
             j.ended = Some(ack);
             let raw = encode(
-                &json!({"schema":"rz-rovent-utility-parent-end/1","execution_id":ctx.registration.execution_id,"window_id":ctx.window.window_id,"original_end":payload,"parent_projection":j.ended,"cost_high_water":j.cost_high_water,"cost_scope":"original_peer_report_validated_by_current_ledger_not_independent_OS_cost","execution_authorized":false}),
+                &json!({"schema":ctx.window.family().domain("rz-rovent-utility-parent-end/1"),"execution_id":ctx.registration.execution_id,"window_id":ctx.window.window_id,"original_end":payload,"parent_projection":j.ended,"cost_high_water":j.cost_high_water,"cost_scope":"original_peer_report_validated_by_current_ledger_not_independent_OS_cost","execution_authorized":false}),
             )?;
             let mut slot = ctx
                 .held
@@ -1014,7 +1030,7 @@ fn serve(ctx: Broker) -> Result<(), ArenaError> {
         let Some(raw) = raw else { break };
         let r: Request = decode(&raw)?;
         require(
-            r.schema == RPC
+            r.schema == ctx.window.family().domain(RPC)
                 && r.window_id == ctx.window.window_id
                 && r.startup_sha256 == ctx.startup_sha256
                 && r.sequence > 0
@@ -1052,7 +1068,7 @@ fn serve(ctx: Broker) -> Result<(), ArenaError> {
             .ok_or_else(|| invalid("utility sequence overflow"))?;
         let ack = prepare_unix_ack(
             encode(
-                &json!({"schema":ACK,"window_id":ctx.window.window_id,"startup_sha256":ctx.startup_sha256,"sequence":r.sequence,"operation":r.operation,"status":"ok","payload":payload}),
+                &json!({"schema":ctx.window.family().domain(ACK),"window_id":ctx.window.window_id,"startup_sha256":ctx.startup_sha256,"sequence":r.sequence,"operation":r.operation,"status":"ok","payload":payload}),
             )?,
             MAX_FRAME,
             "utility ACK frame",
@@ -1094,18 +1110,21 @@ struct Custody {
     process: Option<OriginalProcessOutput>,
     broker: Option<PendingBroker>,
     resources: Option<Arc<RoventTrainingResources>>,
-    dataset: Option<Arc<VerifiedUtilityDataset>>,
+    dataset: Option<VerifiedUtilityDataset>,
     ancestors: Option<Arc<VerifiedUtilityAncestors>>,
-    datasets: Vec<Arc<VerifiedUtilityDataset>>,
-    checkpoint: Option<Arc<VerifiedUtilityCheckpointSource>>,
+    datasets: Vec<VerifiedUtilityDataset>,
+    checkpoint: Option<VerifiedUtilityCheckpointSource>,
     registration: Option<(RoventTrainingFilePin, Arc<File>)>,
     archives: Arc<Mutex<Vec<PublishedUtilityCheckpointArchive>>>,
     // Shared with Broker: retain each publisher-returned partial-I/O allocation
     // intact through failure custody, including registry growth and shutdown.
     #[allow(clippy::vec_box)]
-    archive_failures: Arc<Mutex<Vec<Box<UtilityCheckpointArchiveFailure>>>>,
+    archive_failures: Arc<Mutex<Vec<UtilityCheckpointArchiveFailure>>>,
     admission_files: Vec<linux::HeldFile>,
     old_run_reclamation: Option<VerifiedUtilityOldRunReclamation>,
+    dataset_failures: Vec<RuntimeUtilityDatasetFailure>,
+    source_failures: Vec<RuntimeUtilitySourceFailure>,
+    family: Option<UtilityRuntimeFamily>,
 }
 impl Custody {
     fn new() -> Self {
@@ -1124,6 +1143,9 @@ impl Custody {
             archive_failures: Arc::new(Mutex::new(Vec::new())),
             admission_files: Vec::new(),
             old_run_reclamation: None,
+            dataset_failures: Vec::new(),
+            source_failures: Vec::new(),
+            family: None,
         }
     }
 }
@@ -1157,18 +1179,21 @@ fn initial_source_identity(
     base_raw: &[u8],
     utility_raw: &[u8],
     preparation: &Value,
+    family: UtilityRuntimeFamily,
 ) -> Result<InitialSourceIdentity, ArenaError> {
     use rz_search::cpu_value::nnuec::v2::{Checkpoint, Model, utility};
+    let numerical = family.numerical(preparation)?;
     let base: Checkpoint = decode(base_raw)?;
     base.validate().map_err(|e| invalid(e.to_string()))?;
     let frozen_weights = base.weights_sha256().map_err(|e| invalid(e.to_string()))?;
     require(
-        preparation["registration"]["frozen_base"]["weights_sha256"] == frozen_weights,
+        numerical.frozen_base_weights_sha256() == frozen_weights,
         "original frozen semantic weights changed",
     )?;
     require(
         serde_json::to_value(&base.base.config).map_err(|e| invalid(e.to_string()))?
-            == preparation["registration"]["frozen_base"]["config"],
+            == serde_json::to_value(numerical.frozen_base_config())
+                .map_err(|e| invalid(e.to_string()))?,
         "original frozen base configuration changed",
     )?;
     let model = Model::new(base).map_err(|e| invalid(e.to_string()))?;
@@ -1177,7 +1202,7 @@ fn initial_source_identity(
         .weights_sha256(&model)
         .map_err(|e| invalid(e.to_string()))?;
     require(
-        preparation["registration"]["utility"]["initial_weights_sha256"] == identity,
+        numerical.initial_utility_weights_sha256() == identity,
         "original utility semantic parameters differ",
     )?;
     let declaration =
@@ -1335,6 +1360,7 @@ pub fn run_rovent_utility_from_cli(
         let registration: RoventUtilityExecutionRegistration =
             read_json(&command.registration, &mut custody, &budget)?;
         registration.validate()?;
+        custody.family = Some(registration.family());
         require(
             command.scope.max_read_bytes == registration.max_read_bytes
                 && command.scope.max_output_bytes == registration.max_output_bytes,
@@ -1364,39 +1390,58 @@ pub fn run_rovent_utility_from_cli(
                 && window.interop_threads <= registration.resources_policy.affinity.len() as u32,
             "utility thread plan exceeds admitted CPU affinity",
         )?;
-        let dataset = Arc::new(VerifiedUtilityDataset::open(
-            &registration.current_dataset,
-            &preparation,
-            &budget,
-        )?);
-        dataset.validate_execution_sources_v2(&registration)?;
+        let dataset = match VerifiedUtilityDataset::open(&registration, &preparation, &budget) {
+            Ok(dataset) => dataset,
+            Err(failure) => {
+                let error = invalid(format!(
+                    "original utility dataset admission: {}",
+                    failure.error()
+                ));
+                custody.dataset_failures.push(failure);
+                return Err(error);
+            }
+        };
+        custody.dataset = Some(dataset.clone());
+        custody.datasets.push(dataset.clone());
+        dataset.validate_execution_sources(&registration)?;
         require(
             dataset.dataset_sha256() == window.dataset_sha256,
             "window dataset semantic seal differs",
         )?;
-        custody.dataset = Some(Arc::clone(&dataset));
-        custody.datasets.push(Arc::clone(&dataset));
         // Historical cohorts must use their own held original preparation.
         // The checkpoint reader opens these exact enrollments while replaying
         // its original chain; a current cost epoch is never applied to them.
-        let ancestors = Arc::new(VerifiedUtilityAncestors::open(
-            &registration.ancestor_datasets,
-            &budget,
-        )?);
+        let ancestors = Arc::new(match registration.open_ancestors(&budget) {
+            Ok(owners) => owners,
+            Err(failure) => {
+                let error = invalid(format!("original utility ancestors: {failure}"));
+                custody.source_failures.push(failure);
+                return Err(error);
+            }
+        });
         custody.ancestors = Some(Arc::clone(&ancestors));
         let references = std::iter::once(registration.current_dataset.clone())
             .chain(ancestors.utility_references())
+            .chain(
+                ancestors
+                    .intervention_datasets()
+                    .iter()
+                    .map(|dataset| dataset.reference().clone()),
+            )
             .collect::<Vec<_>>();
         if let RoventUtilityInitializationSource::Resume { checkpoint }
         | RoventUtilityInitializationSource::Fork { checkpoint } =
             &registration.initialization_source
         {
-            let source = Arc::new(VerifiedUtilityCheckpointSource::open(
-                checkpoint,
-                &references,
-                &registration.ancestor_datasets,
-                &budget,
-            )?);
+            let source = match registration.open_checkpoint(checkpoint, &references, &budget) {
+                Ok(source) => source,
+                Err(failure) => {
+                    let error = invalid(format!("original utility checkpoint: {failure}"));
+                    custody.source_failures.push(failure);
+                    return Err(error);
+                }
+            };
+            custody.checkpoint = Some(source.clone());
             if matches!(
                 registration.initialization_source,
                 RoventUtilityInitializationSource::Resume { .. }
@@ -1409,17 +1454,21 @@ pub fn run_rovent_utility_from_cli(
                     "resume changed original model/recipe/run/seed/cohort",
                 )?;
             } else {
+                let source_numerical = source.window().family().numerical(source.preparation())?;
+                let current_numerical = window.family().numerical(&preparation)?;
                 require(
-                    source.preparation()["recipe_sha256"] == preparation["recipe_sha256"]
-                        && source.preparation()["registration"]["frozen_base"]
-                            == preparation["registration"]["frozen_base"]
-                        && source.preparation()["parameter_spec_sha256"]
-                            == preparation["parameter_spec_sha256"],
-                    "fork changed original frozen base or utility parameter/optimizer semantics",
+                    source.window().family() == window.family()
+                        && source_numerical.recipe_sha256() == current_numerical.recipe_sha256()
+                        && source_numerical.frozen_base_weights_sha256()
+                            == current_numerical.frozen_base_weights_sha256()
+                        && source_numerical.frozen_base_config()
+                            == current_numerical.frozen_base_config()
+                        && source_numerical.parameter_spec_sha256()
+                            == current_numerical.parameter_spec_sha256(),
+                    "fork changed original family/frozen base/utility parameter or optimizer semantics",
                 )?;
             }
-            custody.datasets.extend(source.datasets().iter().cloned());
-            custody.checkpoint = Some(source);
+            custody.datasets.extend(source.datasets());
         }
         let mut required_checkpoint_publications = custody
             .checkpoint
@@ -1427,7 +1476,6 @@ pub fn run_rovent_utility_from_cli(
             .map(|source| source.required_publication_sha256s())
             .unwrap_or_default();
         required_checkpoint_publications.remove(&registration.current_dataset.publication.sha256);
-        ancestors.validate_current(&dataset, &required_checkpoint_publications)?;
         dataset.admit_ancestry(&ancestors, &required_checkpoint_publications)?;
         let (interpreter, _) = own(
             &registration.trainer_python_executable,
@@ -1465,7 +1513,12 @@ pub fn run_rovent_utility_from_cli(
                 &budget,
             )?;
             custody.admission_files.push(file);
-            Some(initial_source_identity(&base_raw, &raw, &preparation)?)
+            Some(initial_source_identity(
+                &base_raw,
+                &raw,
+                &preparation,
+                registration.family(),
+            )?)
         } else {
             None
         };
@@ -1483,7 +1536,10 @@ pub fn run_rovent_utility_from_cli(
                     && ["schema", "kind", "path", "max_output_bytes"]
                         .iter()
                         .all(|key| object.contains_key(*key))
-                    && export["schema"] == "rz-rovent-utility-export-request/1"
+                    && export["schema"]
+                        == registration
+                            .family()
+                            .domain("rz-rovent-utility-export-request/1")
                     && matches!(export["kind"].as_str(), Some("collection" | "deployment")),
                 "utility export request domain/fields",
             )?;
@@ -1511,7 +1567,7 @@ pub fn run_rovent_utility_from_cli(
         request.ensure_admission_open()?;
         if command.action == RoventUtilityCliAction::Inspect {
             return Ok(
-                json!({"schema":"rz-rovent-utility-trainer-inspection/1","status":"inspected","execution_id":registration.execution_id,"registration_sha256":command.registration.sha256,"preparation_sha256":window.preparation_sha256,"window_sha256":window.canonical_sha256()?,"dataset":dataset.observation(),"read_accounting":budget.observation(),"execution_authorized":false,"historical_evidence_only":true,"model_or_tensor_forward_executed":false}),
+                json!({"schema":registration.family().domain("rz-rovent-utility-trainer-inspection/1"),"status":"inspected","execution_id":registration.execution_id,"registration_sha256":command.registration.sha256,"preparation_sha256":window.preparation_sha256,"window_sha256":window.canonical_sha256()?,"dataset":dataset.observation(),"read_accounting":budget.observation(),"execution_authorized":false,"historical_evidence_only":true,"model_or_tensor_forward_executed":false}),
             );
         }
         if let Some(source) = &custody.checkpoint {
@@ -1630,7 +1686,7 @@ pub fn run_rovent_utility_from_cli(
             request.whole_deadline(),
         )?;
         budget.reserve(registration.max_child_read_bytes)?;
-        let startup = json!({"schema":STARTUP,"execution_id":registration.execution_id,"window_id":window.window_id,"registration_sha256":command.registration.sha256,"registration":registration,"control":{"socket_path":socket,"parent_pid":std::process::id(),"parent_start_ticks":parent_start,"control_device":control_device,"control_inode":control_inode},"original_started_ns":start_ns,"execution_until_ns":execution_ns,"whole_until_ns":whole_ns,"source_root":registration.output_root.join("source"),"package_root":registration.output_root.join("source").join(linux::PACKAGE),"source_files":sources,"dependency_directories":dependencies,"runtime_module_pins":registration.runtime_endpoints.iter().map(|p|p.artifact.clone()).collect::<Vec<_>>(),"python_runtime":{"version":registration.trainer_python_version,"executable":registration.trainer_python_executable},"resources":resources.startup_json()?,"artifact_watch_profile":{"schema":"rz-rovent-training-artifact-watch/1","maximum_total_bytes":registration.max_output_bytes-control_limit,"maximum_file_bytes":MAX_TENSOR,"maximum_files":registration.max_artifact_files,"scope":"new_trainer_owned_output_tree_only"},"child_read_credit":{"reserved_bytes":registration.max_child_read_bytes,"scope":"charged_in_parent_shared_budget_no_refund"}});
+        let startup = json!({"schema":registration.family().domain(STARTUP),"execution_id":registration.execution_id,"window_id":window.window_id,"registration_sha256":command.registration.sha256,"registration":registration,"control":{"socket_path":socket,"parent_pid":std::process::id(),"parent_start_ticks":parent_start,"control_device":control_device,"control_inode":control_inode},"original_started_ns":start_ns,"execution_until_ns":execution_ns,"whole_until_ns":whole_ns,"source_root":registration.output_root.join("source"),"package_root":registration.output_root.join("source").join(linux::PACKAGE),"source_files":sources,"dependency_directories":dependencies,"runtime_module_pins":registration.runtime_endpoints.iter().map(|p|p.artifact.clone()).collect::<Vec<_>>(),"python_runtime":{"version":registration.trainer_python_version,"executable":registration.trainer_python_executable},"resources":resources.startup_json()?,"artifact_watch_profile":{"schema":"rz-rovent-training-artifact-watch/1","maximum_total_bytes":registration.max_output_bytes-control_limit,"maximum_file_bytes":MAX_TENSOR,"maximum_files":registration.max_artifact_files,"scope":"new_trainer_owned_output_tree_only"},"child_read_credit":{"reserved_bytes":registration.max_child_read_bytes,"scope":"charged_in_parent_shared_budget_no_refund"}});
         let startup_raw = encode(&startup)?;
         require(
             startup_raw.len() <= crate::MAX_ORIGINAL_INPUT_BYTES,
@@ -1677,9 +1733,9 @@ pub fn run_rovent_utility_from_cli(
             journal: Arc::clone(&custody.journal),
             budget: Arc::clone(&budget),
             resources: Arc::clone(&resources),
-            dataset: Arc::clone(&dataset),
+            dataset: dataset.clone(),
             ancestors: Arc::clone(&ancestors),
-            checkpoint: custody.checkpoint.as_ref().map(Arc::clone),
+            checkpoint: custody.checkpoint.clone(),
             child_identity: Arc::clone(&child_identity),
             fresh_identity,
             registration_file,
@@ -1710,7 +1766,12 @@ pub fn run_rovent_utility_from_cli(
                 .join("source")
                 .join(linux::PACKAGE)
                 .into_os_string(),
-            OsString::from("rz_pals_model.rovent_utility_training_child"),
+            OsString::from(match registration.family() {
+                UtilityRuntimeFamily::CohortV1 => "rz_pals_model.rovent_utility_training_child",
+                UtilityRuntimeFamily::InterventionV2 => {
+                    "rz_pals_model.rovent_utility_intervention_child"
+                }
+            }),
             OsString::from("--execute"),
             OsString::from("--startup-sha256"),
             OsString::from(startup_sha),
@@ -1826,7 +1887,7 @@ pub fn run_rovent_utility_from_cli(
         let (terminal_file, terminal_raw) = own(&terminal_pin, MAX_JSON, true, &budget)?;
         let terminal: Value = decode(&terminal_raw)?;
         require(
-            terminal["schema"] == RESULT
+            terminal["schema"] == window.family().domain(RESULT)
                 && terminal["execution_id"] == registration.execution_id
                 && terminal["window_id"] == window.window_id
                 && terminal["status"] == "completed"
@@ -1963,7 +2024,26 @@ pub fn run_rovent_utility_from_cli(
             Instant::now() < request.whole_deadline(),
             "original utility preservation deadline expired",
         )?;
-        if registration.action == RoventUtilityExecutionAction::Train {
+        let no_update = window.family() == UtilityRuntimeFamily::InterventionV2
+            && ended["original_end"]["status"] == "no_update_checkpoint_not_published";
+        if no_update {
+            require(
+                registration.action == RoventUtilityExecutionAction::Train
+                    && terminal["window_completed_updates"] == 0
+                    && terminal["window_dispatched_updates"] == 0
+                    && ended["window_completed_updates"] == 0
+                    && ended["window_dispatched_updates"] == 0
+                    && ended["original_end"]["checkpoint"].is_null()
+                    && journal.export.is_none()
+                    && custody
+                        .archives
+                        .lock()
+                        .map_err(|_| invalid("zero-update archive custody poisoned"))?
+                        .is_empty(),
+                "zero-update close cannot publish a checkpoint, export or learned update",
+            )?;
+        }
+        if registration.action == RoventUtilityExecutionAction::Train && !no_update {
             require(
                 journal
                     .events
@@ -2018,14 +2098,15 @@ pub fn run_rovent_utility_from_cli(
                     archives.push(archive)
                 }
                 Err(failure) => {
+                    let failure_observation = failure.observation();
                     custody
                         .archive_failures
                         .lock()
                         .map_err(|_| invalid("closed archive failure custody poisoned"))?
                         .push(failure);
-                    return Err(invalid(
-                        "closed utility checkpoint publication failed; running publication retained",
-                    ));
+                    return Err(invalid(format!(
+                        "closed utility checkpoint publication failed; running publication retained: {failure_observation}"
+                    )));
                 }
             }
         }
@@ -2039,8 +2120,14 @@ pub fn run_rovent_utility_from_cli(
                 .map_err(|_| invalid("archive summary custody poisoned"))?;
             json!({"published_count":archives.len(),"latest_publication":archives.last().map(|archive|archive.publication_pin())})
         };
-        let mut observation = json!({"schema":"rz-rovent-utility-parent-outcome/1","status":"completed","execution_id":registration.execution_id,"window_id":window.window_id,"terminal_receipt":terminal_pin,"summary":summary,"ledger_end":ended,"dataset":dataset.observation(),"read_accounting":budget.observation(),"read_accounting_scope":{"parent":"registered_original_FD_and_bounded_kernel_reads","child":"declared_pinned_endpoints_one_reserved_credit_no_refund","transitive_import_and_mapped_IO":"unknown","torch_private_snapshot_IO":"unknown","global_OS_IO_enforced":false},"process_receipt":process.process().receipt,"process_observation":process.observation(),"resources":closed,"aggregate_resource_scope":{"required":registration.require_total_quota,"before":total_before,"after":total_after},"past_native_authority_reissued":false,"past_physical_completion_reissued":false,"performance_claim":false,"tensor_state_assurance":"current_child_measurement_and_original_metadata_replay_not_independent_torch_recomputation"});
+        let mut observation = json!({"schema":window.family().domain("rz-rovent-utility-parent-outcome/1"),"status":"completed","execution_id":registration.execution_id,"window_id":window.window_id,"terminal_receipt":terminal_pin,"summary":summary,"ledger_end":ended,"dataset":dataset.observation(),"read_accounting":budget.observation(),"read_accounting_scope":{"parent":"registered_original_FD_and_bounded_kernel_reads","child":"declared_pinned_endpoints_one_reserved_credit_no_refund","transitive_import_and_mapped_IO":"unknown","torch_private_snapshot_IO":"unknown","global_OS_IO_enforced":false},"process_receipt":process.process().receipt,"process_observation":process.observation(),"resources":closed,"aggregate_resource_scope":{"required":registration.require_total_quota,"before":total_before,"after":total_after},"past_native_authority_reissued":false,"past_physical_completion_reissued":false,"performance_claim":false,"tensor_state_assurance":"current_child_measurement_and_original_metadata_replay_not_independent_torch_recomputation"});
         observation["checkpoint_archives"] = archive_summary;
+        if no_update {
+            observation["training_status"] = json!("no_update_checkpoint_not_published");
+            observation["training_complete"] = json!(false);
+            observation["new_optimizer_updates"] = json!(0);
+            observation["new_checkpoint_published"] = json!(false);
+        }
         let receipt = linux::write_new(
             &registration
                 .control_root
@@ -2055,9 +2142,14 @@ pub fn run_rovent_utility_from_cli(
         // Detailed kernel/lineage observations stay in the held report. The
         // CLI emits a complete bounded JSON reference instead of truncating a
         // large successful resource report into invalid JSON after training.
-        Ok(
-            json!({"schema":"rz-rovent-utility-parent-outcome/1","status":"completed","execution_id":registration.execution_id,"window_id":window.window_id,"parent_receipt":parent_receipt,"terminal_receipt":terminal_pin,"checkpoint_archives":observation["checkpoint_archives"],"completed_updates":terminal["completed_updates"],"window_completed_updates":terminal["window_completed_updates"],"dispatched_updates":terminal["dispatched_updates"],"physical_completion":"confirmed","process_cleanup":"confirmed_original_supervisor","host_peak_bytes":observation["resources"]["memory_peak_bytes"],"read_accounting":budget.observation(),"performance_claim":false,"past_native_authority_reissued":false}),
-        )
+        let mut outcome = json!({"schema":window.family().domain("rz-rovent-utility-parent-outcome/1"),"status":"completed","execution_id":registration.execution_id,"window_id":window.window_id,"parent_receipt":parent_receipt,"terminal_receipt":terminal_pin,"checkpoint_archives":observation["checkpoint_archives"],"completed_updates":terminal["completed_updates"],"window_completed_updates":terminal["window_completed_updates"],"dispatched_updates":terminal["dispatched_updates"],"physical_completion":"confirmed","process_cleanup":"confirmed_original_supervisor","host_peak_bytes":observation["resources"]["memory_peak_bytes"],"read_accounting":budget.observation(),"performance_claim":false,"past_native_authority_reissued":false});
+        if no_update {
+            outcome["training_status"] = json!("no_update_checkpoint_not_published");
+            outcome["training_complete"] = json!(false);
+            outcome["new_optimizer_updates"] = json!(0);
+            outcome["new_checkpoint_published"] = json!(false);
+        }
+        Ok(outcome)
     })();
     match result {
         Ok(observation) => Ok(RoventUtilityTrainingOutcome {
@@ -2091,7 +2183,7 @@ pub fn run_rovent_utility_from_cli(
             } else {
                 custody.broker.is_none()
             };
-            let observation = json!({"schema":"rz-rovent-utility-parent-outcome/1","status":"failed","error":error.to_string(),"read_accounting":budget.observation(),"process_receipt":custody.process.as_ref().map(|p|&p.process().receipt),"physical_completion":"unknown","quarantined":true,"retry_authorized":false,"work_or_read_credit_refunded":false,"past_native_authority_reissued":false});
+            let observation = json!({"schema":custody.family.unwrap_or(UtilityRuntimeFamily::CohortV1).domain("rz-rovent-utility-parent-outcome/1"),"status":"failed","error":error.to_string(),"read_accounting":budget.observation(),"process_receipt":custody.process.as_ref().map(|p|&p.process().receipt),"physical_completion":"unknown","quarantined":true,"retry_authorized":false,"work_or_read_credit_refunded":false,"past_native_authority_reissued":false});
             let mut observation = observation;
             observation["broker_thread_joined"] = json!(broker_closed);
             if let Ok(archives) = custody.archives.try_lock() {

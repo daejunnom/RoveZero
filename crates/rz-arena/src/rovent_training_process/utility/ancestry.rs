@@ -2,9 +2,14 @@
 //! admitted by its original reader; declarations never become replay, native
 //! execution, physical-completion or optimizer authority.
 
+use super::dataset::UtilityDatasetLineage;
 use super::dataset::VerifiedUtilityDataset;
 use super::execution::RoventUtilityDatasetReference;
 use super::execution_v2::RoventUtilityAncestorDatasetRegistration;
+use super::intervention_dataset::{
+    RoventUtilityInterventionDatasetRejected, VerifiedUtilityInterventionDataset,
+};
+use super::intervention_execution::RoventUtilityInterventionAncestorRegistration;
 use crate::ArenaError;
 use crate::rovent_training_process::recovery::{
     HeldHistoricalFile, HistoricalDatasetLineage, RoventHistoricalDatasetRegistration,
@@ -42,9 +47,33 @@ pub struct VerifiedUtilityAncestors {
     pc: Vec<Arc<VerifiedRoventDataset>>,
     r: Vec<Arc<VerifiedRoventRAuxiliaryDataset>>,
     utility: Vec<Arc<VerifiedUtilityDataset>>,
+    intervention: Vec<Arc<VerifiedUtilityInterventionDataset>>,
     held: Vec<Arc<HeldHistoricalFile>>,
     dependencies: BTreeMap<String, BTreeSet<String>>,
 }
+
+/// Retains the partial source union and the exact rejected /2 FD owner.
+/// No historical failure is flattened into a successful or empty inventory.
+pub struct RoventUtilityInterventionAncestorsRejected {
+    pub error: ArenaError,
+    pub retained: Option<Box<VerifiedUtilityAncestors>>,
+    pub failed_dataset: Option<Box<RoventUtilityInterventionDatasetRejected>>,
+}
+impl std::fmt::Debug for RoventUtilityInterventionAncestorsRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoventUtilityInterventionAncestorsRejected")
+            .field("error", &self.error)
+            .field("partial_source_union_retained", &self.retained.is_some())
+            .field("failed_original_retained", &self.failed_dataset.is_some())
+            .finish()
+    }
+}
+impl std::fmt::Display for RoventUtilityInterventionAncestorsRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+impl std::error::Error for RoventUtilityInterventionAncestorsRejected {}
 
 impl VerifiedUtilityAncestors {
     pub fn open(
@@ -210,6 +239,7 @@ impl VerifiedUtilityAncestors {
             pc: pc.into_values().collect(),
             r: r.into_values().collect(),
             utility,
+            intervention: Vec::new(),
             held,
             dependencies,
         };
@@ -227,6 +257,95 @@ impl VerifiedUtilityAncestors {
         Ok(owner)
     }
 
+    /// Explicit /2 intake. Each original source keeps its own family and FD
+    /// owner; only this entry can admit utility_intervention declarations.
+    pub fn open_intervention(
+        registrations: &[RoventUtilityInterventionAncestorRegistration],
+        budget: &Arc<RoventRecoveryReadBudget>,
+    ) -> Result<Self, Box<RoventUtilityInterventionAncestorsRejected>> {
+        let legacy = registrations
+            .iter()
+            .filter_map(|row| row.legacy().cloned())
+            .collect::<Vec<_>>();
+        let mut owner = Self::open(&legacy, budget).map_err(|error| {
+            Box::new(RoventUtilityInterventionAncestorsRejected {
+                error,
+                retained: None,
+                failed_dataset: None,
+            })
+        })?;
+        let mut failed_dataset = None;
+        let admitted = (|| {
+            check(
+                registrations.len() <= MAX_SOURCES,
+                "intervention source capacity",
+            )?;
+            let mut publications = BTreeSet::new();
+            for declaration in registrations {
+                declaration.validate()?;
+                check(
+                    publications.insert(declaration.publication().sha256.clone()),
+                    "duplicate mixed intervention raw publication",
+                )?;
+                if let Some((reference, preparation)) = declaration.intervention() {
+                    let (held, raw) = budget.read(preparation, MAX_PREPARATION_BYTES, true)?;
+                    owner.held.push(Arc::new(held));
+                    let value: Value = decode(&raw)?;
+                    let dataset = match VerifiedUtilityInterventionDataset::open_retaining(
+                        reference, &value, budget,
+                    ) {
+                        Ok(dataset) => Arc::new(dataset),
+                        Err(rejected) => {
+                            let error = invalid(format!(
+                                "original intervention source admission failed: {}",
+                                rejected.error
+                            ));
+                            failed_dataset = Some(rejected);
+                            return Err(error);
+                        }
+                    };
+                    // Retain the newly admitted owner before any subsequent
+                    // graph validation can fail; the rejection then owns the
+                    // complete original partial source union.
+                    owner.intervention.push(dataset);
+                    let parents = checked_publications(
+                        owner
+                            .intervention
+                            .last()
+                            .expect("retained source")
+                            .source_ancestor_publications(),
+                    )?;
+                    check(
+                        owner
+                            .dependencies
+                            .insert(reference.publication.sha256.clone(), parents)
+                            .is_none(),
+                        "duplicate intervention source owner",
+                    )?;
+                }
+            }
+            check(
+                owner.publication_sha256s() == publications,
+                "intervention source full owner inventory differs",
+            )?;
+            owner.validate_source_graph()?;
+            for dataset in &owner.intervention {
+                let source = checked_publications(dataset.source_ancestor_publications())?;
+                let original = owner.subset(&source)?;
+                dataset.admit_ancestry(&original, &BTreeSet::new())?;
+            }
+            owner.revalidate(budget)
+        })();
+        match admitted {
+            Ok(()) => Ok(owner),
+            Err(error) => Err(Box::new(RoventUtilityInterventionAncestorsRejected {
+                error,
+                retained: Some(Box::new(owner)),
+                failed_dataset,
+            })),
+        }
+    }
+
     pub fn pc_datasets(&self) -> &[Arc<VerifiedRoventDataset>] {
         &self.pc
     }
@@ -235,6 +354,15 @@ impl VerifiedUtilityAncestors {
     }
     pub fn utility_datasets(&self) -> &[Arc<VerifiedUtilityDataset>] {
         &self.utility
+    }
+    pub fn intervention_datasets(&self) -> &[Arc<VerifiedUtilityInterventionDataset>] {
+        &self.intervention
+    }
+    pub fn intervention_references(&self) -> Vec<RoventUtilityDatasetReference> {
+        self.intervention
+            .iter()
+            .map(|owner| owner.reference().clone())
+            .collect()
     }
     pub fn utility_references(&self) -> Vec<RoventUtilityDatasetReference> {
         self.utility
@@ -294,6 +422,9 @@ impl VerifiedUtilityAncestors {
                 ),
             );
         }
+        for owner in &self.intervention {
+            descriptors.insert(owner.reference().publication.sha256.as_str(),("utility_intervention",json!({"dataset_sha256":owner.dataset_sha256(),"pool_sha256":owner.pool_sha256(),"preparation_sha256":owner.preparation_sha256(),"context_sha256":owner.context_sha256()})));
+        }
         descriptors
     }
 
@@ -330,6 +461,10 @@ impl VerifiedUtilityAncestors {
         required_checkpoint_publications: &BTreeSet<String>,
     ) -> Result<(), ArenaError> {
         check(
+            self.intervention.is_empty(),
+            "legacy current dataset cannot adopt intervention source owners",
+        )?;
+        check(
             required_checkpoint_publications
                 .iter()
                 .all(|sha| generation_sha(sha)),
@@ -347,7 +482,74 @@ impl VerifiedUtilityAncestors {
             "mixed source coverage differs from current source and original checkpoint union",
         )?;
         self.validate_source_graph()?;
-        self.validate_lineage(Some(current))
+        self.validate_lineage(Some(current.lineage()))
+    }
+
+    pub fn validate_intervention_current(
+        &self,
+        current: &VerifiedUtilityInterventionDataset,
+        required_checkpoint_publications: &BTreeSet<String>,
+    ) -> Result<(), ArenaError> {
+        check(
+            required_checkpoint_publications
+                .iter()
+                .all(|sha| generation_sha(sha)),
+            "invalid original intervention checkpoint publication",
+        )?;
+        let mut expected = checked_publications(current.source_ancestor_publications())?;
+        let originals = self.original_descriptors();
+        let mut seen = BTreeSet::new();
+        for descriptor in current.source_ancestor_descriptors() {
+            if descriptor.kind == "utility_intervention" {
+                let body = descriptor
+                    .metadata
+                    .as_object()
+                    .ok_or_else(|| invalid("intervention ancestor metadata object"))?;
+                check(
+                    body.len() == 4
+                        && [
+                            "dataset_sha256",
+                            "pool_sha256",
+                            "preparation_sha256",
+                            "context_sha256",
+                        ]
+                        .into_iter()
+                        .all(|key| {
+                            body.get(key)
+                                .and_then(Value::as_str)
+                                .is_some_and(generation_sha)
+                        })
+                        && generation_sha(&descriptor.publication_sha256),
+                    "exact intervention ancestor metadata4 required",
+                )?;
+            } else {
+                descriptor.validate()?;
+            }
+            check(
+                seen.insert(descriptor.publication_sha256.as_str()),
+                "repeated intervention ancestor descriptor",
+            )?;
+            let (kind, metadata) = originals
+                .get(descriptor.publication_sha256.as_str())
+                .ok_or_else(|| invalid("intervention ancestor lacks full original owner"))?;
+            check(
+                *kind == descriptor.kind.as_str() && metadata == &descriptor.metadata,
+                "original intervention ancestor family/metadata differs",
+            )?;
+        }
+        check(
+            seen == expected.iter().map(String::as_str).collect(),
+            "intervention original descriptor coverage differs",
+        )?;
+        self.subset(&expected)?;
+        expected.extend(required_checkpoint_publications.iter().cloned());
+        check(
+            !expected.contains(&current.reference().publication.sha256)
+                && expected == self.publication_sha256s(),
+            "intervention current/source/checkpoint union differs",
+        )?;
+        self.validate_source_graph()?;
+        self.validate_lineage(Some(current.lineage()))
     }
 
     pub fn revalidate(&self, budget: &RoventRecoveryReadBudget) -> Result<(), ArenaError> {
@@ -358,6 +560,9 @@ impl VerifiedUtilityAncestors {
             owner.revalidate(budget)?;
         }
         for owner in &self.utility {
+            owner.revalidate(budget)?;
+        }
+        for owner in &self.intervention {
             owner.revalidate(budget)?;
         }
         for original in &self.held {
@@ -400,6 +605,12 @@ impl VerifiedUtilityAncestors {
                 .filter(|owner| publications.contains(&owner.reference().publication.sha256))
                 .cloned()
                 .collect(),
+            intervention: self
+                .intervention
+                .iter()
+                .filter(|owner| publications.contains(&owner.reference().publication.sha256))
+                .cloned()
+                .collect(),
             held: self.held.clone(),
             dependencies,
         };
@@ -416,7 +627,10 @@ impl VerifiedUtilityAncestors {
         Ok(())
     }
 
-    fn validate_lineage(&self, current: Option<&VerifiedUtilityDataset>) -> Result<(), ArenaError> {
+    fn validate_lineage(
+        &self,
+        current: Option<UtilityDatasetLineage<'_>>,
+    ) -> Result<(), ArenaError> {
         let Some(current) = current else {
             // Original PC/R readers retain their own eligibility/exclusion
             // decisions. Each historical utility owner is checked separately
@@ -445,7 +659,18 @@ impl VerifiedUtilityAncestors {
                 transposition_sha256: row.transposition_sha256,
             })?;
         }
-        let row = current.lineage();
+        for owner in &self.intervention {
+            let row = owner.lineage();
+            components.observe(HistoricalDatasetLineage {
+                split: row.split,
+                opening_id: row.opening_id,
+                game_id: row.game_id,
+                line_genealogy_id: row.line_genealogy_id,
+                rules_state_sha256: row.rules_state_sha256,
+                transposition_sha256: row.transposition_sha256,
+            })?;
+        }
+        let row = current;
         let current_node = components.observe(HistoricalDatasetLineage {
             split: row.split,
             opening_id: row.opening_id,

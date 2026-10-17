@@ -43,17 +43,33 @@ class OriginalUtilityAuthorityRequired(ValueError):
 
 
 class _UtilityLease:
-    __slots__ = ("authority", "owner", "intake", "spec", "admission", "closed", "initial_dispatched")
+    __slots__ = ("authority", "owner", "intake", "spec", "admission", "closed", "initial_dispatched", "initial_completed")
 
     def __init__(self, authority, owner, intake, spec, admission):
         self.authority, self.owner, self.intake = authority, owner, intake
         self.spec, self.admission, self.closed = copy.deepcopy(spec), copy.deepcopy(admission), False
         self.initial_dispatched = owner.dispatched_updates
+        self.initial_completed = owner.completed_updates
 
 
 def require_original_utility_authority(authority, *, lease=None, owner=None, allow_unleased=False, cleanup=False):
     """Require this concrete connected owner, optionally its same opaque lease."""
-    if (type(authority) is not ParentSocketUtilityTrainerAuthority
+    from .rovent_utility_training_family import LEGACY
+    return _require_utility_authority(authority, family=LEGACY, lease=lease, owner=owner,
+        allow_unleased=allow_unleased, cleanup=cleanup)
+
+
+def _authority_type(family):
+    from .rovent_utility_training_family import require_family
+    family = require_family(family)
+    if family.intervention:
+        from .rovent_utility_intervention_authority import ParentSocketInterventionUtilityTrainerAuthority
+        return ParentSocketInterventionUtilityTrainerAuthority
+    return ParentSocketUtilityTrainerAuthority
+
+
+def _require_utility_authority(authority, *, family, lease=None, owner=None, allow_unleased=False, cleanup=False):
+    if (type(authority) is not _authority_type(family) or getattr(authority, "_family", None) is not family
             or getattr(authority, "_connection", None) is not _CONNECTED
             or authority._failed or authority._closed or authority._socket.fileno() < 0):
         raise OriginalUtilityAuthorityRequired("the original connected utility parent is required")
@@ -150,9 +166,13 @@ def validate_utility_checkpoint_cost(value):
 
 
 class ParentSocketUtilityTrainerAuthority:
-    def __init__(self, token, stream, startup, startup_sha256, read_accounting, clock):
+    def __init__(self, token, stream, startup, startup_sha256, read_accounting, clock, *, family=None):
         if token is not _CONNECTED:
             raise OriginalUtilityAuthorityRequired("live utility parent peer handshake required")
+        from .rovent_utility_training_family import LEGACY, require_family
+        self._family = require_family(LEGACY if family is None else family)
+        if type(self) is not _authority_type(self._family):
+            raise OriginalUtilityAuthorityRequired("exact original utility authority source family required")
         self._connection, self._socket, self._startup = token, stream, copy.deepcopy(startup)
         self._startup_sha256, self._read_budget, self._clock = startup_sha256, read_accounting, clock
         self._sequence, self._failed, self._closed, self._lease = 0, False, False, None
@@ -164,10 +184,21 @@ class ParentSocketUtilityTrainerAuthority:
                            execute=False, clock=time.monotonic_ns):
         if cls is not ParentSocketUtilityTrainerAuthority or execute is not True:
             raise OriginalUtilityAuthorityRequired("explicit original utility socket connection required")
+        from .rovent_utility_training_family import LEGACY
+        return cls._connect_registered_core(startup, raw_startup=raw_startup, expected_sha256=expected_sha256,
+            read_accounting=read_accounting, execute=execute, clock=clock, family=LEGACY)
+
+    @classmethod
+    def _connect_registered_core(cls, startup, *, raw_startup, expected_sha256, read_accounting, execute, clock, family):
+        if cls is not _authority_type(family) or execute is not True:
+            raise OriginalUtilityAuthorityRequired("explicit same-family original utility socket connection required")
         if (os.name != "posix" or not hasattr(socket, "SO_PEERCRED") or not hasattr(os, "getuid")
                 or type(read_accounting) is not PinnedReadBudget or not read_accounting.strict_growth_credit):
             raise OriginalUtilityAuthorityRequired("Linux peer credentials and one original strict read budget required")
-        from .rovent_utility_training_bootstrap import validate_startup
+        if family.intervention:
+            from .rovent_utility_intervention_execution import validate_intervention_startup as validate_startup
+        else:
+            from .rovent_utility_training_bootstrap import validate_startup
         checked = validate_startup(raw_startup, expected_sha256=expected_sha256, expected_bytes=len(raw_startup),
             execution_until_ns=startup["execution_until_ns"], whole_until_ns=startup["whole_until_ns"], now_ns=clock())
         if checked != startup or read_accounting.until_ns != startup["execution_until_ns"] or read_accounting.failed:
@@ -195,7 +226,7 @@ class ParentSocketUtilityTrainerAuthority:
                     or (current.st_dev, current.st_ino) != (directory.st_dev, directory.st_ino)
                     or clock() >= startup["execution_until_ns"]):
                 raise OriginalUtilityAuthorityRequired("connected peer is not the original utility parent")
-            result = cls(_CONNECTED, stream, startup, expected_sha256, read_accounting, clock)
+            result = cls(_CONNECTED, stream, startup, expected_sha256, read_accounting, clock, family=family)
             stream = None
             return result
         finally:
@@ -209,12 +240,15 @@ class ParentSocketUtilityTrainerAuthority:
             raise TimeoutError("utility original deadline expired; renewal/reconnect forbidden")
         return delta / 10**9
 
+    def _require(self, **kwargs):
+        return _require_utility_authority(self, family=self._family, **kwargs)
+
     def _rpc(self, operation, payload, *, validate=_empty, cleanup=False):
         with self._lock:
             try:
-                require_original_utility_authority(self, allow_unleased=True, cleanup=cleanup)
+                self._require(allow_unleased=True, cleanup=cleanup)
                 sequence = self._sequence + 1
-                request = {"schema": RPC_SCHEMA, "window_id": self._startup["window_id"],
+                request = {"schema": self._family.domain(RPC_SCHEMA), "window_id": self._startup["window_id"],
                     "startup_sha256": self._startup_sha256, "sequence": sequence, "operation": operation, "payload": payload}
                 raw = (json.dumps(request, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
                 if len(raw) > FRAME_BYTES:
@@ -235,7 +269,7 @@ class ParentSocketUtilityTrainerAuthority:
                         raise ValueError("utility acknowledgement exceeded one bounded frame")
                 ack = _strict_json(bytes(received), maximum=FRAME_BYTES)
                 _fields(ack, ("schema", "window_id", "startup_sha256", "sequence", "operation", "status", "payload"), "utility acknowledgement")
-                if (ack["schema"] != ACK_SCHEMA or ack["window_id"] != self._startup["window_id"]
+                if (ack["schema"] != self._family.domain(ACK_SCHEMA) or ack["window_id"] != self._startup["window_id"]
                         or ack["startup_sha256"] != self._startup_sha256 or type(ack["sequence"]) is not int
                         or ack["sequence"] != sequence or ack["operation"] != operation or ack["status"] != "ok"):
                     raise OriginalUtilityAuthorityRequired("utility parent rejected or changed the original request binding")
@@ -256,31 +290,27 @@ class ParentSocketUtilityTrainerAuthority:
                 "scheduler_state_sha256": seal(clone(owner.scheduler.state_dict())),
                 "rng_state_sha256": seal(clone(owner.rng)), "sampler_state_sha256": seal(owner.sampler)}
 
-    @staticmethod
-    def _derived(owner):
+    def _derived(self, owner):
         from .generation_data import digest
-        from .rovent_utility_tensor_training import STATE_DOMAIN, derived_training_state
-        return digest(STATE_DOMAIN, derived_training_state(owner))
+        from .rovent_utility_tensor_training import STATE_DOMAIN
+        return digest(self._family.domain(STATE_DOMAIN), self._family.derived(owner))
 
     @property
     def read_accounting(self):
         return self._read_budget
 
     def begin_window(self, owner, intake, spec):
-        require_original_utility_authority(self, allow_unleased=True)
+        self._require(allow_unleased=True)
         if self._lease is not None:
             raise OriginalUtilityAuthorityRequired("one original utility process cannot issue a second lease")
-        from .rovent_utility_route import HistoricalUtilityRouteDataset
-        if type(intake) is not HistoricalUtilityRouteDataset:
-            raise ValueError("the exact utility historical dataset owner is required")
-        admission = intake.observation()
-        checked = validate_utility_window_v2(owner.preparation, spec)
+        admission = self._family.require_dataset(intake)
+        checked = self._family.validate_window(owner.preparation, spec)
         if admission["dataset_sha256"] != checked["dataset_sha256"]:
             raise ValueError("utility window differs from its original dataset observation")
         validate_utility_sampler(owner.sampler, context_ids=intake.context_ids, pool_sha256=intake.pool_sha256,
             run_id=checked["run_id"], seed=checked["training_seed"])
-        payload = {"schema": "rz-rovent-utility-trainer-begin/1", "preparation_sha256": owner.preparation["preparation_sha256"],
-            "window_spec_sha256": utility_window_v2_digest(checked), "dataset_sha256": checked["dataset_sha256"],
+        payload = {"schema": self._family.domain("rz-rovent-utility-trainer-begin/1"), "preparation_sha256": owner.preparation["preparation_sha256"],
+            "window_spec_sha256": self._family.window_digest(checked), "dataset_sha256": checked["dataset_sha256"],
             "completed_updates": owner.completed_updates, "ancestor_updates": owner.ancestor_updates,
             # These are the same actual owner's numerical metadata observations.
             # The parent checks raw/semantic assets separately; its serde float
@@ -294,22 +324,22 @@ class ParentSocketUtilityTrainerAuthority:
         return self._lease
 
     def consume_pair_context(self, lease, source_projection):
-        require_original_utility_authority(self, lease=lease)
+        self._require(lease=lease)
         # This is an operand, not a local authority factory. Its exact original
         # context/action/pair roster is owned and checked by the Rust parent
         # against the held verified dataset before it can return an empty ACK.
         if type(source_projection) is not dict:
             raise ValueError("explicit original utility source projection required")
-        self._rpc("consume_pair_context", {"schema": "rz-rovent-utility-trainer-consume/1",
+        self._rpc("consume_pair_context", {"schema": self._family.domain("rz-rovent-utility-trainer-consume/1"),
                   "source_projection": copy.deepcopy(source_projection)})
 
     def completed_update(self, lease, event, owner):
-        require_original_utility_authority(self, lease=lease, owner=owner)
+        self._require(lease=lease, owner=owner)
         from .generation_data import digest
         from .rovent_utility_tensor_training import STATE_DOMAIN
         _fields(event, ("schema", "completed_updates", "dispatched_updates", "unique_known_pair_denominator",
                         "consumed_context_sha256", "groups", "contexts"), "utility completed update event")
-        if (event["schema"] != "rz-rovent-utility-learner-update/1"
+        if (event["schema"] != self._family.domain("rz-rovent-utility-learner-update/1")
                 or event["completed_updates"] != owner.completed_updates or event["dispatched_updates"] != owner.dispatched_updates
                 or len(owner.completion_receipts) != owner.completed_updates - 1):
             raise ValueError("utility completion event differs from one unacknowledged actual step")
@@ -319,18 +349,18 @@ class ParentSocketUtilityTrainerAuthority:
             raise ValueError("utility completion must retain every original consumed context in order")
         for value in event["consumed_context_sha256"]:
             _sha(value)
-        return self._rpc("completed_update", {"schema": "rz-rovent-utility-trainer-update/1", "event": copy.deepcopy(event),
+        return self._rpc("completed_update", {"schema": self._family.domain("rz-rovent-utility-trainer-update/1"), "event": copy.deepcopy(event),
             **self._state(owner), "cost": dict(owner.cost), "pending_microbatches": owner.pending_microbatches,
             "frozen_base_weights_sha256": owner.metadata["base_weights_sha256"],
             "frozen_base_mapping_sha256": owner.metadata["frozen_base_mapping_sha256"],
-            "prior_completion_chain_sha256": digest(STATE_DOMAIN, [*owner.ancestor_completion_sha256,
+            "prior_completion_chain_sha256": digest(self._family.domain(STATE_DOMAIN), [*owner.ancestor_completion_sha256,
                 *(item["sha256"] for item in owner.completion_receipts)])}, validate=_pin)
 
     def checkpoint_published(self, lease, checkpoint, owner):
-        require_original_utility_authority(self, lease=lease, owner=owner)
+        self._require(lease=lease, owner=owner)
         from .rovent_training_bootstrap import _pin as file_pin
         projection = file_pin(checkpoint["tensor_projection"], 16 * 1024**2)
-        self._rpc("checkpoint_published", {"schema": "rz-rovent-utility-trainer-checkpoint/1",
+        self._rpc("checkpoint_published", {"schema": self._family.domain("rz-rovent-utility-trainer-checkpoint/1"),
             "checkpoint": {name: checkpoint[name] for name in ("path", "sha256", "bytes")},
             "tensor_projection": copy.deepcopy(projection),
             "completed_updates": owner.completed_updates, "ancestor_updates": owner.ancestor_updates,
@@ -339,7 +369,7 @@ class ParentSocketUtilityTrainerAuthority:
             "derived_training_state_sha256": self._derived(owner)})
 
     def window_deadline_ns(self, lease):
-        require_original_utility_authority(self, lease=lease, cleanup=True)
+        self._require(lease=lease, cleanup=True)
         return self._startup["execution_until_ns"]
 
     def observe_cancel(self):
@@ -347,16 +377,16 @@ class ParentSocketUtilityTrainerAuthority:
         self._cancelled = True
 
     def should_stop(self, lease):
-        require_original_utility_authority(self, lease=lease, cleanup=True)
+        self._require(lease=lease, cleanup=True)
         return self._cancelled or self._clock() >= self._startup["execution_until_ns"]
 
     def end_window(self, lease, owner, status, *, physical_completion, dispatched_updates, checkpoint=None, result=None):
-        require_original_utility_authority(self, lease=lease, owner=owner, cleanup=True)
+        self._require(lease=lease, owner=owner, cleanup=True)
         if (physical_completion != owner.physical_completion or type(dispatched_updates) is not int
                 or dispatched_updates != owner.dispatched_updates - lease.initial_dispatched):
             raise ValueError("utility end must preserve actual physical/dispatched observations")
         try:
-            self._rpc("end_window", {"schema": "rz-rovent-utility-trainer-end/1", "status": status,
+            self._rpc("end_window", {"schema": self._family.domain("rz-rovent-utility-trainer-end/1"), "status": status,
                 "completed_updates": owner.completed_updates, "dispatched_updates": owner.dispatched_updates,
                 "window_dispatched_updates": dispatched_updates, "ancestor_updates": owner.ancestor_updates, "cost": dict(owner.cost),
                 "pending_microbatches": owner.pending_microbatches, "quarantined": owner.quarantined,
@@ -366,7 +396,7 @@ class ParentSocketUtilityTrainerAuthority:
             lease.closed = True
 
     def validate_checkpoint_state(self, owner, checkpoint):
-        require_original_utility_authority(self, allow_unleased=True)
+        self._require(allow_unleased=True)
         if self._lease is not None:
             raise OriginalUtilityAuthorityRequired("checkpoint state admission must precede the new utility window")
         def cost(payload):
@@ -374,7 +404,7 @@ class ParentSocketUtilityTrainerAuthority:
             if checked["snapshot_cost"] != owner.cost or checked["ancestor_cost"] != owner.ancestor_cost:
                 raise ValueError("utility original cost sidecar differs from the exact loaded snapshot")
             return checked
-        return self._rpc("validate_checkpoint_state", {"schema": "rz-rovent-utility-trainer-resume/1",
+        return self._rpc("validate_checkpoint_state", {"schema": self._family.domain("rz-rovent-utility-trainer-resume/1"),
             "checkpoint": {name: checkpoint[name] for name in ("path", "sha256", "bytes")},
             "preparation_sha256": owner.preparation["preparation_sha256"],
             "completed_updates": owner.completed_updates, "ancestor_updates": owner.ancestor_updates,
@@ -384,7 +414,7 @@ class ParentSocketUtilityTrainerAuthority:
             **self._state(owner), "derived_training_state_sha256": self._derived(owner)}, validate=cost)
 
     def validate_learned_export(self, owner, kind):
-        require_original_utility_authority(self, owner=owner)
+        self._require(owner=owner)
         if kind not in ("collection", "deployment"):
             raise ValueError("explicit utility export kind required")
         lease = self._lease
@@ -396,7 +426,7 @@ class ParentSocketUtilityTrainerAuthority:
                 raise ValueError("utility learned export differs from actual current/ancestor completions")
             _identifier(payload["run_id"]); _sha(payload["dataset_sha256"])
             return copy.deepcopy(payload)
-        return self._rpc("validate_learned_export", {"schema": "rz-rovent-utility-trainer-export/1", "kind": kind,
+        return self._rpc("validate_learned_export", {"schema": self._family.domain("rz-rovent-utility-trainer-export/1"), "kind": kind,
             "preparation_sha256": owner.preparation["preparation_sha256"], "completed_updates": owner.completed_updates,
             "ancestor_updates": owner.ancestor_updates, **self._state(owner),
             "derived_training_state_sha256": self._derived(owner)}, validate=learned)

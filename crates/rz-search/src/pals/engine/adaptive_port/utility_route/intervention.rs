@@ -137,6 +137,14 @@ pub enum UtilityInterventionUnavailable {
     MissingNativeCredit,
 }
 
+/// Bounded content checked before the original preparation becomes a Target.
+/// This is not a Ready/worker grant and has no public construction path.
+struct CheckedInterventionTarget {
+    proposal: Vec<BoardMove>,
+    unavailable: [Option<UtilityInterventionUnavailable>; 3],
+    digest: ContractDigest,
+}
+
 /// This owner was bound through the original same-Request C preparation. Its
 /// source work/view are retained until the intervention's physical retirement.
 /// No deserializer or public boolean can construct it.
@@ -658,7 +666,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             }
         };
         let checked = self.check_intervention_target(&action, source.work());
-        let (proposal, unavailable, digest) = match checked {
+        let CheckedInterventionTarget {
+            proposal,
+            unavailable,
+            digest,
+        } = match checked {
             Ok(value) => value,
             Err(error) => {
                 return Err(UtilityInterventionTargetBindRejection {
@@ -683,14 +695,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         &self,
         action: &UtilityRouteAction,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
-    ) -> Result<
-        (
-            Vec<BoardMove>,
-            [Option<UtilityInterventionUnavailable>; 3],
-            ContractDigest,
-        ),
-        PalsError,
-    > {
+    ) -> Result<CheckedInterventionTarget, PalsError> {
         let index = usize::from(action.preparation.target_record);
         let view = &work.input.view;
         let record = view.records().get(index).ok_or(RoleError::InvalidOutput)?;
@@ -794,7 +799,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             unavailable[2] = Some(UtilityInterventionUnavailable::MissingNativeResearcher);
         }
         let digest = utility_intervention_target_digest(&action.input)?;
-        Ok((record.line.clone(), unavailable, digest))
+        Ok(CheckedInterventionTarget {
+            proposal: record.line.clone(),
+            unavailable,
+            digest,
+        })
     }
 
     /// Mint a genuinely new policy-specific query over the original selected

@@ -95,8 +95,17 @@ def _validate_window_spec(preparation, value, *, expected_domain):
     expected = validate_training_preparation(preparation)
     if _json(preparation) != _json(expected):
         raise ValueError("utility preparation changed from its exact declared codec")
-    _fields(value, WINDOW_V2_FIELDS if expected_domain == WINDOW_V2_DOMAIN else WINDOW_FIELDS, "utility window")
-    if value["schema"] != expected_domain or value["preparation_sha256"] != expected["preparation_sha256"]:
+    return _validate_window_fields(expected["preparation_sha256"], value, expected_domain=expected_domain,
+        checkpoint_reserve=expected_domain == WINDOW_V2_DOMAIN)
+
+
+def _validate_window_fields(preparation_sha256, value, *, expected_domain, checkpoint_reserve):
+    """Shared bounded arithmetic only; callers validate their own preparation."""
+    if type(checkpoint_reserve) is not bool:
+        raise ValueError("explicit original checkpoint reserve policy required")
+    _sha(preparation_sha256)
+    _fields(value, WINDOW_V2_FIELDS if checkpoint_reserve else WINDOW_FIELDS, "utility window")
+    if value["schema"] != expected_domain or value["preparation_sha256"] != preparation_sha256:
         raise ValueError("separate utility window/preparation seal required")
     _identifier(value["window_id"]); _identifier(value["run_id"])
     _sha(value["preparation_sha256"]); _sha(value["dataset_sha256"])
@@ -113,7 +122,7 @@ def _validate_window_spec(preparation, value, *, expected_domain):
     _uint(value["max_optimizer_updates"], MAX_UPDATES)
     _uint(value["checkpoint_every_updates"], MAX_UPDATES, positive=True)
     _uint(value["max_wall_time_ns"], MAX_WALL_NS, positive=True)
-    if expected_domain == WINDOW_V2_DOMAIN:
+    if checkpoint_reserve:
         _uint(value["checkpoint_reserve_ns"], value["max_wall_time_ns"] - 1, positive=True)
     _uint(value["cleanup_time_ns"], MAX_CLEANUP_NS, positive=True)
     _uint(value["max_read_bytes"], MAX_READ_BYTES, positive=True)
