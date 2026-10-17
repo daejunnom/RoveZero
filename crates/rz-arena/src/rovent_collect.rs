@@ -1113,6 +1113,10 @@ mod utility_cohort_owner;
 #[cfg(feature = "pals-collection-onnx")]
 pub use utility_cohort_owner::*;
 #[cfg(feature = "pals-collection-onnx")]
+mod utility_intervention_owner;
+#[cfg(feature = "pals-collection-onnx")]
+pub use utility_intervention_owner::*;
+#[cfg(feature = "pals-collection-onnx")]
 mod utility_owner;
 #[cfg(feature = "pals-collection-onnx")]
 pub use utility_owner::*;

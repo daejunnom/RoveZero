@@ -40,6 +40,7 @@ mod cohort;
 mod cohort_audit;
 mod cohort_driver;
 mod cohort_prepare;
+mod intervention;
 mod r_stream;
 mod resources;
 mod utility_stream;
@@ -49,6 +50,11 @@ pub use cohort::{
     run_rovent_utility_cohort_from_cli,
 };
 pub use cohort_prepare::prepare_rovent_utility_cohort_pins_from_cli;
+pub use intervention::{
+    RoventUtilityInterventionLaunchFailure, RoventUtilityInterventionLaunchPlan,
+    RoventUtilityInterventionLaunchReceipt, run_rovent_utility_intervention,
+    run_rovent_utility_intervention_from_cli,
+};
 pub use r_stream::{RoventRCollectionAncestor, RoventRCollectionPlan};
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
 
@@ -58,6 +64,10 @@ pub enum RoventCollectionCliParse {
         plan: RoventPublicationFile,
     },
     Cohort {
+        plan: RoventPublicationFile,
+        arguments: Vec<String>,
+    },
+    Intervention {
         plan: RoventPublicationFile,
         arguments: Vec<String>,
     },
@@ -73,6 +83,12 @@ pub fn parse_rovent_collection_cli(
 ) -> Result<RoventCollectionCliParse, ArenaError> {
     if arguments == ["--help"] {
         return Ok(RoventCollectionCliParse::Help);
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument.starts_with("--utility-intervention-plan"))
+    {
+        return intervention::parse_intervention_cli(arguments);
     }
     if arguments
         .iter()
@@ -1113,6 +1129,7 @@ pub fn run_rovent_collection(
                         external_teacher: None,
                         utility_route_completed,
                         utility_trial_retired: None,
+                        utility_intervention_trial_retired: None,
                         cooperative: Some(poll),
                     };
                     match native {

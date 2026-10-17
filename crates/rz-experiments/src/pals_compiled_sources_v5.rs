@@ -912,6 +912,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/rovent_collect/historical_v2.rs"),
             source!("crates/rz-arena/src/rovent_collect/launch.rs"),
             source!("crates/rz-arena/src/rovent_collect/launch/cohort.rs"),
+            source!("crates/rz-arena/src/rovent_collect/launch/intervention.rs"),
             source!("crates/rz-arena/src/rovent_collect/launch/cohort_audit.rs"),
             source!("crates/rz-arena/src/rovent_collect/launch/cohort_driver.rs"),
             source!("crates/rz-arena/src/rovent_collect/launch/cohort_prepare.rs"),
@@ -940,6 +941,24 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/rovent_collect/teacher/pump.rs"),
             source!("crates/rz-arena/src/rovent_collect/teacher/session.rs"),
             source!("crates/rz-arena/src/rovent_collect/utility_cohort_owner.rs"),
+            source!("crates/rz-arena/src/rovent_collect/utility_intervention_owner.rs"),
+            source!("crates/rz-arena/src/rovent_collect/utility_intervention_owner/source.rs"),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/trial_writer.rs"
+            ),
+            source!("crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical.rs"),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical_files.rs"
+            ),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical/context.rs"
+            ),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical/trial.rs"
+            ),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical/pairs.rs"
+            ),
             source!("crates/rz-arena/src/rovent_collect/utility_cohort_owner/historical.rs"),
             source!("crates/rz-arena/src/rovent_collect/utility_cohort_owner/source.rs"),
             source!("crates/rz-arena/src/rovent_collect/utility_cohort_owner/trial_writer.rs"),
@@ -1428,6 +1447,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/rovent_collect/historical_v2.rs"),
             source!("crates/rz-arena/src/rovent_collect/launch.rs"),
             source!("crates/rz-arena/src/rovent_collect/launch/cohort.rs"),
+            source!("crates/rz-arena/src/rovent_collect/launch/intervention.rs"),
             source!("crates/rz-arena/src/rovent_collect/launch/cohort_audit.rs"),
             source!("crates/rz-arena/src/rovent_collect/launch/cohort_driver.rs"),
             source!("crates/rz-arena/src/rovent_collect/launch/cohort_prepare.rs"),
@@ -1454,6 +1474,24 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/rovent_collect/teacher/pump.rs"),
             source!("crates/rz-arena/src/rovent_collect/teacher/session.rs"),
             source!("crates/rz-arena/src/rovent_collect/utility_cohort_owner.rs"),
+            source!("crates/rz-arena/src/rovent_collect/utility_intervention_owner.rs"),
+            source!("crates/rz-arena/src/rovent_collect/utility_intervention_owner/source.rs"),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/trial_writer.rs"
+            ),
+            source!("crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical.rs"),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical_files.rs"
+            ),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical/context.rs"
+            ),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical/trial.rs"
+            ),
+            source!(
+                "crates/rz-arena/src/rovent_collect/utility_intervention_owner/historical/pairs.rs"
+            ),
             source!("crates/rz-arena/src/rovent_collect/utility_cohort_owner/historical.rs"),
             source!("crates/rz-arena/src/rovent_collect/utility_cohort_owner/source.rs"),
             source!("crates/rz-arena/src/rovent_collect/utility_cohort_owner/trial_writer.rs"),

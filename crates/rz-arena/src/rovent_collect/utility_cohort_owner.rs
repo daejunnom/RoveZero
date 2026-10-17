@@ -8,7 +8,7 @@ use super::*;
 use serde::{Deserialize, Serialize};
 mod source;
 pub use source::*;
-mod historical;
+pub(in crate::rovent_collect) mod historical;
 
 /// 원 payload 바이트의 순수 역사 검증이다. 현재 root/실행/학습 권한을
 /// 발급하지 않으며 FD와 원 file pin의 생존은 호출자가 별도로 보존한다.

@@ -744,7 +744,7 @@ pub fn run_rovent_utility_cohort(
     })
 }
 
-fn position_command(replay: &RoventRulesPositionReplay) -> Result<String, ArenaError> {
+pub(super) fn position_command(replay: &RoventRulesPositionReplay) -> Result<String, ArenaError> {
     replay.restore()?;
     let mut command = match replay.origin {
         RoventReplayOrigin::StartPosition => "position startpos".to_string(),
@@ -1023,6 +1023,7 @@ fn run_trial(
                         .map_err(manager_error)
                 })),
                 utility_route_completed: None,
+                utility_intervention_trial_retired: None,
                 external_teacher: None,
                 cooperative: None,
             };
@@ -1396,7 +1397,7 @@ impl CohortCaller {
     }
 }
 
-fn put_final_raw(
+pub(super) fn put_final_raw(
     root: &Dir,
     path: &str,
     bytes: &[u8],

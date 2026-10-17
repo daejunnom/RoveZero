@@ -5,7 +5,7 @@ fn main() -> std::process::ExitCode {
     use rz_arena::rovent_collect::launch::{
         ROVENT_COLLECTION_USAGE, RoventCollectionCliParse, parse_rovent_collection_cli,
         prepare_rovent_utility_cohort_pins_from_cli, run_rovent_collection_from_cli,
-        run_rovent_utility_cohort_from_cli,
+        run_rovent_utility_cohort_from_cli, run_rovent_utility_intervention_from_cli,
     };
     use std::io::Write;
     let run = || -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
@@ -19,6 +19,10 @@ fn main() -> std::process::ExitCode {
                 writeln!(
                     std::io::stdout().lock(),
                     "읽기 전용 예상 pin 준비: --prepare-utility-cohort-pins=inputs/<plan.json> --prepare-utility-cohort-pins-sha256=<SHA> --prepare-utility-cohort-pins-bytes=<bytes>"
+                )?;
+                writeln!(
+                    std::io::stdout().lock(),
+                    "독립 root 개입 비교 /2: --utility-intervention-plan=inputs/<plan.json> --utility-intervention-plan-sha256=<SHA> --utility-intervention-plan-bytes=<bytes> <원 source/config 인수>"
                 )?;
                 Ok(None)
             }
@@ -35,6 +39,17 @@ fn main() -> std::process::ExitCode {
                     "root":receipt.output_directory,"trials":receipt.trials,"pairs":receipt.pairs,
                     "resource":resources,"collection":collection,"training_executed":false}),
                 ))
+            }
+            RoventCollectionCliParse::Intervention { plan, arguments } => {
+                let receipt = run_rovent_utility_intervention_from_cli(&plan, arguments)?;
+                let resources = receipt.resource_observations()?;
+                let collection = receipt.collection_observations()?;
+                Ok(Some(serde_json::json!({
+                    "schema":"rz-rovent-utility-intervention-launch-result/1",
+                    "publication":receipt.publication,"durable_ack":receipt.durable_ack,
+                    "root":receipt.output_directory,"trials":receipt.trials,"pairs":receipt.pairs,
+                    "resource":resources,"collection":collection,"training_executed":false
+                })))
             }
             RoventCollectionCliParse::Run { plan, arguments } => {
                 let receipt = run_rovent_collection_from_cli(&plan, arguments)?;

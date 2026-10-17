@@ -11,7 +11,9 @@ use super::{
     materialize_rovent_r_semantics_retaining,
 };
 use rz_experiments::rovent_r_readout::{RoventRCaptureRetirement, RoventRReadoutManifest};
-use rz_uci::pals_adaptive::UtilityTrialPhysicalRetirement;
+use rz_uci::pals_adaptive::{
+    UtilityInterventionTrialPhysicalRetirement, UtilityTrialPhysicalRetirement,
+};
 use rz_uci::rovent_bootstrap::{RoventStartupControl, nnuec_source::LoadedRoventNnuecSource};
 use serde::Serialize;
 use serde_json::Value;
@@ -240,9 +242,44 @@ impl RoventRCohortMaterialization {
                 .map_or(0, |semantic| semantic.retained_serialized_bytes())
     }
     pub fn authorize_after_retirement_retaining(
-        mut self,
+        self,
         retirement: &UtilityTrialPhysicalRetirement,
         original_source: &Arc<LoadedRoventNnuecSource>,
+    ) -> Result<RoventRCohortPublicationReady, Box<RoventRCohortAuthorizationRejected>> {
+        self.authorize_actual_retirement_retaining(|semantic, publication, bytes| {
+            semantic.authorize_after_retirement_retaining(
+                retirement,
+                original_source,
+                publication,
+                bytes,
+            )
+        })
+    }
+    /// /2가 발급한 물리 퇴역 cap으로만 기존 R 원문을 게시한다.
+    pub fn authorize_after_intervention_retirement_retaining(
+        self,
+        retirement: &UtilityInterventionTrialPhysicalRetirement,
+        original_source: &Arc<LoadedRoventNnuecSource>,
+    ) -> Result<RoventRCohortPublicationReady, Box<RoventRCohortAuthorizationRejected>> {
+        self.authorize_actual_retirement_retaining(|semantic, publication, bytes| {
+            semantic.authorize_after_intervention_retirement_retaining(
+                retirement,
+                original_source,
+                publication,
+                bytes,
+            )
+        })
+    }
+    fn authorize_actual_retirement_retaining(
+        mut self,
+        authorize: impl FnOnce(
+            RoventRMaterializedSemantics,
+            Option<&RoventRCorpusPublication>,
+            Option<&[u8]>,
+        ) -> Result<
+            RoventRPublicationReadySemantics,
+            Box<super::RoventRSemanticAuthorizationRejected>,
+        >,
     ) -> Result<RoventRCohortPublicationReady, Box<RoventRCohortAuthorizationRejected>> {
         let semantic = self.semantic.take().expect("original detached semantics");
         let bytes = self
@@ -250,12 +287,7 @@ impl RoventRCohortMaterialization {
             .publication
             .as_ref()
             .map(|_| self.packed.publication_bytes.as_slice());
-        match semantic.authorize_after_retirement_retaining(
-            retirement,
-            original_source,
-            self.packed.publication.as_ref(),
-            bytes,
-        ) {
+        match authorize(semantic, self.packed.publication.as_ref(), bytes) {
             Ok(semantic) => Ok(RoventRCohortPublicationReady {
                 packed: self.packed,
                 semantic,

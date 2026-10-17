@@ -222,12 +222,12 @@ struct RecordMetadata {
     original_first_move: Option<u16>,
 }
 
-struct CheckedInput {
-    reference_json: String,
-    input_sha256: String,
-    target_sha256: String,
-    submission_target_sha256: String,
-    context_sha256: String,
+pub(in crate::rovent_collect) struct CheckedInput {
+    pub(in crate::rovent_collect) reference_json: String,
+    pub(in crate::rovent_collect) input_sha256: String,
+    pub(in crate::rovent_collect) target_sha256: String,
+    pub(in crate::rovent_collect) submission_target_sha256: String,
+    pub(in crate::rovent_collect) context_sha256: String,
 }
 
 fn boolean(value: &Value, key: &str) -> Result<bool, ArenaError> {
@@ -272,7 +272,10 @@ fn checked_authority(value: &Value) -> Result<(), ArenaError> {
     hash_field(value, "implementation_sha256")?;
     Ok(())
 }
-fn checked_view(value: &Value, original: &Value) -> Result<(), ArenaError> {
+pub(in crate::rovent_collect) fn checked_view(
+    value: &Value,
+    original: &Value,
+) -> Result<(), ArenaError> {
     fields(
         value,
         &[
@@ -402,6 +405,19 @@ fn verify_cost(
     value: &Value,
     profile: &RoventUtilityComparisonCohort,
 ) -> Result<rz_uci::pals_adaptive::UtilityCohortCostWire, ArenaError> {
+    verify_cost_input(value, &profile.input)
+}
+pub(in crate::rovent_collect) fn verify_cost_input(
+    value: &Value,
+    input: &rz_experiments::rovent_utility_cohort::RoventUtilityComparisonCohortInput,
+) -> Result<rz_uci::pals_adaptive::UtilityCohortCostWire, ArenaError> {
+    verify_cost_window_input(value, input, true)
+}
+pub(in crate::rovent_collect) fn verify_cost_window_input(
+    value: &Value,
+    input: &rz_experiments::rovent_utility_cohort::RoventUtilityComparisonCohortInput,
+    action_window_opened: bool,
+) -> Result<rz_uci::pals_adaptive::UtilityCohortCostWire, ArenaError> {
     fields(
         value,
         &[
@@ -432,7 +448,7 @@ fn verify_cost(
     )?;
     let cost: rz_uci::pals_adaptive::UtilityCohortCostWire =
         serde_json::from_value(value.clone()).map_err(error)?;
-    let p = &profile.input;
+    let p = input;
     ensure(
         same(&cost, value)?
             && cost.domain == "rz-rovent-utility-cohort-cost/1"
@@ -449,9 +465,11 @@ fn verify_cost(
             && cost.root_fence_tick <= cost.actor_release_tick
             && cost.actor_release_tick <= cost.physical_pin_zero_tick
             && cost.physical_pin_zero_tick - cost.started_tick == cost.whole_wall_ns
-            && cost.started_tick.checked_add(p.action_ns) == Some(cost.cohort_action_cutoff_tick)
-            && cost.cohort_action_cutoff_tick.checked_add(p.cleanup_ns)
-                == Some(cost.cohort_cleanup_cutoff_tick)
+            && (!action_window_opened
+                || (cost.started_tick.checked_add(p.action_ns)
+                    == Some(cost.cohort_action_cutoff_tick)
+                    && cost.cohort_action_cutoff_tick.checked_add(p.cleanup_ns)
+                        == Some(cost.cohort_cleanup_cutoff_tick)))
             && cost.native_credit_baseline.0 <= cost.native_credit_final.0
             && cost.native_credit_baseline.1 == 0
             && cost.native_credit_final.1 == 0,
@@ -568,12 +586,12 @@ fn runtime_resources_known(value: &Value) -> Result<bool, ArenaError> {
     Ok(known)
 }
 
-struct Prelude {
-    ready: String,
-    resource_known: bool,
-    recipients: Vec<u8>,
+pub(in crate::rovent_collect) struct Prelude {
+    pub(in crate::rovent_collect) ready: String,
+    pub(in crate::rovent_collect) resource_known: bool,
+    pub(in crate::rovent_collect) recipients: Vec<u8>,
 }
-fn verify_prelude(
+pub(in crate::rovent_collect) fn verify_prelude(
     value: &Value,
     root: &RoventRootAdmissionEvidence,
 ) -> Result<Prelude, ArenaError> {
@@ -1246,6 +1264,32 @@ fn verify_reference_input(
     frozen: &UtilityCohortFrozenDecision,
     root: &Position,
 ) -> Result<CheckedInput, ArenaError> {
+    let checked = verify_captured_utility_input(input, model, root)?;
+    let metadata: Vec<RecordMetadata> =
+        serde_json::from_value(input["records_metadata"].clone()).map_err(error)?;
+    let target = usize::try_from(number(input, "target_record")?).map_err(error)?;
+    let selected = metadata
+        .get(target)
+        .ok_or_else(|| error("original target record"))?;
+    ensure(
+        frozen.input_sha256 == checked.input_sha256
+            && frozen.target_sha256 == checked.target_sha256
+            && frozen.context_sha256 == checked.context_sha256
+            && frozen.input_bytes == number(input, "bytes")?
+            && same(&input["target_record_ids"], &frozen.target_record_ids)?
+            && frozen.root_rules_sha256 == exact_rules_anchor(root)?.rules_state_sha256
+            && selected.original_first_move == Some(frozen.original_first_move),
+        "original utility input/target/submission/frozen seals",
+    )?;
+    Ok(checked)
+}
+/// Shared exact Rules/numerical/provenance checks only. No /1 cohort metadata,
+/// frozen-decision authority or live capability is constructed by this leaf.
+pub(in crate::rovent_collect) fn verify_captured_utility_input(
+    input: &Value,
+    model: &v2::Model,
+    root: &Position,
+) -> Result<CheckedInput, ArenaError> {
     fields(
         input,
         &[
@@ -1503,14 +1547,7 @@ fn verify_reference_input(
     ensure(
         input_sha256 == string(input, "input_sha256")?
             && target_sha256 == string(input, "target_sha256")?
-            && submission_target_sha256 == string(input, "submission_target_sha256")?
-            && frozen.input_sha256 == input_sha256
-            && frozen.target_sha256 == target_sha256
-            && frozen.context_sha256 == context_sha256
-            && frozen.input_bytes == reference_json.len() as u64
-            && frozen.target_record_ids == ids
-            && frozen.root_rules_sha256 == exact_rules_anchor(&current)?.rules_state_sha256
-            && frozen.original_first_move == selected.original_first_move.unwrap(),
+            && submission_target_sha256 == string(input, "submission_target_sha256")?,
         "original utility input/target/submission/frozen seals",
     )?;
     Ok(CheckedInput {
@@ -1550,7 +1587,7 @@ fn verify_input_submission_seal(
 /// input identity alone deliberately excludes these process-local fields;
 /// retain and compare their original source instead of treating a matching
 /// tensor as permission to relabel a different Ready view.
-fn verify_submitted_input_source(
+pub(in crate::rovent_collect) fn verify_submitted_input_source(
     input: &Value,
     selected_offer: &Value,
     root: &RoventRootAdmissionEvidence,
@@ -1570,13 +1607,13 @@ fn verify_submitted_input_source(
     )
 }
 
-struct Physical {
-    authority: Value,
-    cache_known: bool,
-    fresh_product: bool,
-    high_water: u64,
+pub(in crate::rovent_collect) struct Physical {
+    pub(in crate::rovent_collect) authority: Value,
+    pub(in crate::rovent_collect) cache_known: bool,
+    pub(in crate::rovent_collect) fresh_product: bool,
+    pub(in crate::rovent_collect) high_water: u64,
 }
-fn verify_physical(
+pub(in crate::rovent_collect) fn verify_physical(
     trial: &Value,
     cost: &rz_uci::pals_adaptive::UtilityCohortCostWire,
     model: &v2::Model,
@@ -2007,9 +2044,9 @@ fn verify_origin(
     )
 }
 
-struct Semantic {
-    witnesses: BTreeSet<String>,
-    bodies_complete: bool,
+pub(in crate::rovent_collect) struct Semantic {
+    pub(in crate::rovent_collect) witnesses: BTreeSet<String>,
+    pub(in crate::rovent_collect) bodies_complete: bool,
 }
 fn verify_semantic(
     body: &Value,
@@ -2017,6 +2054,27 @@ fn verify_semantic(
     root_rules: &Position,
     physical: &Physical,
     model: &v2::Model,
+) -> Result<Semantic, ArenaError> {
+    let original_store_limit = array(&body["prelude"], "offers", 3)?
+        .iter()
+        .find(|offer| offer["recipient"] == body["recipient"])
+        .ok_or_else(|| error("basis original ready source missing"))?;
+    verify_semantic_with_store_limit(
+        body,
+        root,
+        root_rules,
+        physical,
+        model,
+        number(&original_store_limit["budget"], "original_store_byte_limit")?,
+    )
+}
+pub(in crate::rovent_collect) fn verify_semantic_with_store_limit(
+    body: &Value,
+    root: &RoventRootAdmissionEvidence,
+    root_rules: &Position,
+    physical: &Physical,
+    model: &v2::Model,
+    original_store_byte_limit: u64,
 ) -> Result<Semantic, ArenaError> {
     let value = &body["semantic"];
     fields(
@@ -2426,17 +2484,13 @@ fn verify_semantic(
     // A framing-valid old preimage does not contain all ContextWDL/CPU
     // comparison facts. The additional original Store basis is mandatory for
     // a known comparison and is verified separately from the old raw body.
-    let original_store_limit = array(&body["prelude"], "offers", 3)?
-        .iter()
-        .find(|offer| offer["recipient"] == body["recipient"])
-        .ok_or_else(|| error("basis original ready source missing"))?;
     let basis_complete = verify_witness_basis(
         value,
         &by_id,
         root_rules,
         root,
         model,
-        number(&original_store_limit["budget"], "original_store_byte_limit")?,
+        original_store_byte_limit,
     )?;
     Ok(Semantic {
         witnesses,
@@ -3244,7 +3298,10 @@ fn verify_trial(
     })
 }
 
-fn verify_unresolved(value: &Value, recipient: u8) -> Result<(), ArenaError> {
+pub(in crate::rovent_collect) fn verify_unresolved(
+    value: &Value,
+    recipient: u8,
+) -> Result<(), ArenaError> {
     fields(
         value,
         &[
@@ -3597,4 +3654,11 @@ pub(super) fn verify_historical_utility_cohort(
         ancestor_dataset_publication_sha256: ancestors,
         ancestor_datasets: source.ancestor_datasets,
     })
+}
+
+pub(in crate::rovent_collect) fn restore_rules_snapshot(
+    value: &Value,
+) -> Result<Position, ArenaError> {
+    let snapshot: RulesSnapshot = serde_json::from_value(value.clone()).map_err(error)?;
+    snapshot.restore()
 }

@@ -12,7 +12,9 @@ use super::{
 };
 use rz_contracts::pals::SearchAuthority;
 use rz_search::cpu_value::nnuec::v2::capture::{NnuecCaptureEnding, NnuecCaptureLineage};
-use rz_uci::pals_adaptive::UtilityTrialPhysicalRetirement;
+use rz_uci::pals_adaptive::{
+    UtilityInterventionTrialPhysicalRetirement, UtilityTrialPhysicalRetirement,
+};
 use rz_uci::rovent_bootstrap::nnuec_source::LoadedRoventNnuecSource;
 use rz_uci::rovent_root_admission::RoventRootAdmission;
 use serde::Serialize;
@@ -220,6 +222,50 @@ pub struct RoventRSemanticAuthorizationRejected {
     pub error: ArenaError,
     pub materialized: RoventRMaterializedSemantics,
 }
+// Private variants can only borrow the actual domain-specific final caps.
+// Shared checks retain the exact /1 source, interval and publication guards.
+enum ActualRPublicationRetirement<'a> {
+    Ready(&'a UtilityTrialPhysicalRetirement),
+    Intervention(&'a UtilityInterventionTrialPhysicalRetirement),
+}
+impl ActualRPublicationRetirement<'_> {
+    fn root_fence_tick(&self) -> u64 {
+        match self {
+            Self::Ready(value) => value.cost().root_fence_tick,
+            Self::Intervention(value) => value.cost().root_fence_tick,
+        }
+    }
+    fn physical_pin_zero_tick(&self) -> u64 {
+        match self {
+            Self::Ready(value) => value.cost().physical_pin_zero_tick,
+            Self::Intervention(value) => value.cost().physical_pin_zero_tick,
+        }
+    }
+    fn matches_root_admission(&self, root: &Arc<RoventRootAdmission>) -> bool {
+        match self {
+            Self::Ready(value) => value.matches_root_admission(root),
+            Self::Intervention(value) => value.matches_root_admission(root),
+        }
+    }
+    fn authority(&self) -> SearchAuthority {
+        match self {
+            Self::Ready(value) => value.authority(),
+            Self::Intervention(value) => value.authority(),
+        }
+    }
+    fn input_lock_sha256(&self) -> &str {
+        match self {
+            Self::Ready(value) => &value.source_pins().input_lock_sha256,
+            Self::Intervention(value) => &value.source_pins().input_lock_sha256,
+        }
+    }
+    fn parameter_sha256(&self) -> &str {
+        match self {
+            Self::Ready(value) => &value.source_pins().frozen_nnuec_model_sha256,
+            Self::Intervention(value) => &value.source_pins().frozen_nnuec_model_sha256,
+        }
+    }
+}
 impl RoventRMaterializedSemantics {
     pub fn retained_serialized_bytes(&self) -> usize {
         self.staged.byte_len()
@@ -237,6 +283,35 @@ impl RoventRMaterializedSemantics {
         publication: Option<&RoventRCorpusPublication>,
         publication_bytes: Option<&[u8]>,
     ) -> Result<RoventRPublicationReadySemantics, Box<RoventRSemanticAuthorizationRejected>> {
+        self.authorize_actual_retirement_retaining(
+            ActualRPublicationRetirement::Ready(retirement),
+            original_source,
+            publication,
+            publication_bytes,
+        )
+    }
+    /// /2 원 cap만 받는다. /1으로 재태깅하거나 역사 JSON에서 인가하지 않는다.
+    pub fn authorize_after_intervention_retirement_retaining(
+        self,
+        retirement: &UtilityInterventionTrialPhysicalRetirement,
+        original_source: &Arc<LoadedRoventNnuecSource>,
+        publication: Option<&RoventRCorpusPublication>,
+        publication_bytes: Option<&[u8]>,
+    ) -> Result<RoventRPublicationReadySemantics, Box<RoventRSemanticAuthorizationRejected>> {
+        self.authorize_actual_retirement_retaining(
+            ActualRPublicationRetirement::Intervention(retirement),
+            original_source,
+            publication,
+            publication_bytes,
+        )
+    }
+    fn authorize_actual_retirement_retaining(
+        self,
+        retirement: ActualRPublicationRetirement<'_>,
+        original_source: &Arc<LoadedRoventNnuecSource>,
+        publication: Option<&RoventRCorpusPublication>,
+        publication_bytes: Option<&[u8]>,
+    ) -> Result<RoventRPublicationReadySemantics, Box<RoventRSemanticAuthorizationRejected>> {
         let checked = (|| {
             let root = self
                 .root
@@ -248,8 +323,8 @@ impl RoventRMaterializedSemantics {
                     .ok_or_else(|| invalid("cohort R original materialization clock overflow"))
             };
             check(
-                tick(self.created_at)? >= retirement.cost().root_fence_tick
-                    && tick(self.finished_at)? <= retirement.cost().physical_pin_zero_tick
+                tick(self.created_at)? >= retirement.root_fence_tick()
+                    && tick(self.finished_at)? <= retirement.physical_pin_zero_tick()
                     && self.finished_at >= self.created_at,
                 "cohort R bounded materialization is outside the actual fence-to-PinZero interval",
             )?;
@@ -257,8 +332,8 @@ impl RoventRMaterializedSemantics {
                 retirement.matches_root_admission(&root)
                     && retirement.authority() == self.authority
                     && self.matches_source(original_source)
-                    && retirement.source_pins().input_lock_sha256 == self.input_lock_sha256
-                    && retirement.source_pins().frozen_nnuec_model_sha256 == self.parameter_sha256,
+                    && retirement.input_lock_sha256() == self.input_lock_sha256
+                    && retirement.parameter_sha256() == self.parameter_sha256,
                 "cohort R final retirement differs from original root/source",
             )?;
             check(

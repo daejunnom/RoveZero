@@ -112,7 +112,7 @@ impl RoventRecoveryReadBudget {
             raw,
         ))
     }
-    pub(super) fn verify_held(
+    pub(crate) fn verify_held(
         &self,
         file: &File,
         pin: &RoventTrainingFilePin,
