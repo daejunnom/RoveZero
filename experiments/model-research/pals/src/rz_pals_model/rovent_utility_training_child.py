@@ -44,12 +44,17 @@ def _read_startup(stream, count):
     return raw
 
 
-def _metadata_inputs(startup, reads):
-    from .rovent_utility_training import validate_training_preparation
-    from .rovent_utility_training_window import validate_window_spec
+def _actual_registration(startup):
     registration = startup["registration"]
     if registration["schema"] != "rz-rovent-utility-training-registration/2":
         raise ValueError("actual utility child requires the separate mixed-ancestry registration/2")
+    return registration
+
+
+def _metadata_inputs(startup, reads):
+    from .rovent_utility_training import validate_training_preparation
+    from .rovent_utility_training_window import validate_window_spec
+    registration = _actual_registration(startup)
     preparation = reads.json(registration["preparation"], maximum=65536)
     if type(preparation) is not dict or preparation.get("schema") != "rz-rovent-utility-training-preparation/2":
         raise ValueError("actual cohort utility child requires the separate preparation/2 codec")
@@ -296,6 +301,7 @@ def original_utility_child_main(argv=None, *, stdin=None, clock=time.monotonic_n
     from .rovent_utility_training_bootstrap import validate_startup, bootstrap_utility_child
     startup = validate_startup(raw, expected_sha256=args.startup_sha256, expected_bytes=args.startup_bytes,
         execution_until_ns=args.execution_until_ns, whole_until_ns=args.whole_until_ns, now_ns=clock())
+    _actual_registration(startup)
     bootstrap = bootstrap_utility_child(startup, until_ns=args.execution_until_ns, clock=clock)
     report, reads = bootstrap.report, bootstrap.budget
     from .rovent_utility_training_authority import ParentSocketUtilityTrainerAuthority

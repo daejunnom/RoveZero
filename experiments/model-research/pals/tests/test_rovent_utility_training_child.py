@@ -3,6 +3,7 @@ import io
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from rz_pals_model import rovent_utility_training_child as child
 
@@ -30,6 +31,16 @@ class UtilityChildBoundaryTests(unittest.TestCase):
         startup = {"registration": {"schema": "rz-rovent-utility-training-registration/1"}}
         with self.assertRaisesRegex(ValueError, "mixed-ancestry registration/2"):
             child._metadata_inputs(startup, None)
+
+    def test_old_startup_cannot_reach_os_bootstrap_or_socket_before_actual_v2_guard(self):
+        startup = {"registration": {"schema": "rz-rovent-utility-training-registration/1"}}
+        args = ["--execute", "--startup-sha256", "10" * 32, "--startup-bytes", "1",
+                "--execution-until-ns", "100", "--whole-until-ns", "200"]
+        with patch("rz_pals_model.rovent_utility_training_bootstrap.validate_startup", return_value=startup), \
+                patch("rz_pals_model.rovent_utility_training_bootstrap.bootstrap_utility_child") as bootstrap:
+            with self.assertRaisesRegex(ValueError, "mixed-ancestry registration/2"):
+                child.original_utility_child_main(args, stdin=io.BytesIO(b"x"), clock=lambda: 1)
+            bootstrap.assert_not_called()
 
     def test_execute_flag_is_required_before_any_startup_or_runtime_work(self):
         args = ["--startup-sha256", "10" * 32, "--startup-bytes", "1",

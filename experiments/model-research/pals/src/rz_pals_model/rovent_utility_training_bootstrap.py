@@ -159,7 +159,10 @@ def _validate_registration(value, *, expected_domain):
     if type(output) is not type(control) or output.is_relative_to(control) or control.is_relative_to(output):
         raise ValueError("utility output and control owners overlap")
     _child_path(value["output_root"], value["checkpoint_directory"], "utility checkpoints")
-    _child_path(value["output_root"], value["receipt_path"], "utility terminal receipt")
+    receipt = _child_path(value["output_root"], value["receipt_path"], "utility terminal receipt")
+    if expected_domain == REGISTRATION_V2_DOMAIN and (receipt.parent != output or receipt.suffix != ".json"
+            or receipt == _absolute(value["checkpoint_directory"])):
+        raise ValueError("utility /2 terminal must be a distinct direct output-root JSON file")
     _uint(value["max_rpc_messages"], 2000000, positive=True)
     _uint(value["max_rpc_bytes"], 18 << 30, positive=True)
     _uint(value["max_read_bytes"], MAX_READ_BYTES, positive=True)

@@ -153,6 +153,16 @@ class UtilityBootstrapTests(unittest.TestCase):
             mutate(changed["ancestor_datasets"][0])
             with self.assertRaises(ValueError): bootstrap.validate_utility_registration_v2(changed)
 
+    def test_v2_requires_a_distinct_direct_json_terminal_without_changing_legacy_metadata(self):
+        value = fixture()["registration"]
+        value["schema"] = "rz-rovent-utility-training-registration/2"
+        self.assertEqual(bootstrap.validate_utility_registration_v2(value), value)
+        for path in (value["output_root"] + "/nested/receipt.json", value["output_root"] + "/receipt.pt", value["checkpoint_directory"]):
+            changed = copy.deepcopy(value); changed["receipt_path"] = path
+            with self.assertRaises(ValueError): bootstrap.validate_utility_registration_v2(changed)
+        old = fixture()["registration"]; old["receipt_path"] = old["output_root"] + "/nested/receipt.bin"
+        self.assertEqual(bootstrap.validate_registration(old), old)
+
 
 if __name__ == "__main__":
     unittest.main()

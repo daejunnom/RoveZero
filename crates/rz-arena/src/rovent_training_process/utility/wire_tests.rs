@@ -207,7 +207,7 @@ fn fixture() -> Value {
         max_rpc_messages: 512,
         max_rpc_bytes: 1 << 20,
         max_read_bytes: 16 << 20,
-        max_child_read_bytes: 8 << 20,
+        max_child_read_bytes: 1 << 20,
         max_output_bytes: 2 << 20,
         max_artifact_files: 256,
     };
