@@ -43,84 +43,13 @@ impl LoadedRoventNnuecSource {
         sources: Arc<RoventPinnedNativeSources>,
         control: &RoventStartupControl,
     ) -> Result<Self, BackendError> {
-        control.check()?;
-        sources.lock().validate().map_err(|error| {
-            invalid("original NNUEC input lock")
-                .with_external_cause(CauseCode::ProfileParse, &error)
-        })?;
-        sources.configuration().admit_against(sources.lock())?;
-        let pin = sources
-            .lock()
-            .manifest
-            .engine
-            .nnuec
-            .as_ref()
-            .ok_or_else(|| {
-                fail(
-                    K::UnsupportedModel,
-                    "original startup does not declare NNUEC",
-                )
-            })?;
-        if !(1..=NNUEC_WEIGHTS_MAX_BYTES as u64).contains(&pin.weights.bytes)
-            || !(1..=NNUEC_PROVENANCE_MAX_BYTES as u64).contains(&pin.provenance.bytes)
-        {
-            return Err(fail(
-                K::ResourceExhausted,
-                "declared NNUEC source byte budget",
-            ));
-        }
-        let (weights_artifact, weights, provenance_artifact, provenance) = sources
-            .nnuec_artifact_bytes()?
-            .ok_or_else(|| mismatch("original NNUEC descriptors are absent"))?;
-        control.check()?;
-        if weights_artifact != pin.weights || provenance_artifact != pin.provenance {
-            return Err(mismatch(
-                "original NNUEC retained descriptors differ from lock",
-            ));
-        }
-        verify_raw_artifact(
-            &weights_artifact,
-            &weights,
-            NNUEC_WEIGHTS_MAX_BYTES,
-            control,
-        )?;
-        verify_raw_artifact(
-            &provenance_artifact,
-            &provenance,
-            NNUEC_PROVENANCE_MAX_BYTES,
-            control,
-        )?;
-        let body = decode_provenance(&provenance)?;
-        control.check()?;
-        // This existing bounded CPU parser is synchronous, not preemptible.
-        // Checks on both sides reject late admission without claiming that
-        // parsing itself must return by `until` or renewing that boundary.
-        let model = Arc::new(Model::from_reader(weights.as_slice()).map_err(|error| {
-            invalid("actual NNUEC V2 model load failed")
-                .with_external_cause(CauseCode::ModelLoad, &error)
-        })?);
-        control.check()?;
-        let registration = model.registration().map_err(|error| {
-            invalid("actual NNUEC V2 registration failed")
-                .with_external_cause(CauseCode::ModelLoad, &error)
-        })?;
-        verify_declarations(
-            pin,
-            &sources.lock().manifest.provenance,
-            sources.configuration().nnuec_conditions_digest()?,
-            &body,
-            &model,
-            &registration,
-        )?;
-        control.check()?;
-        // The temporary serialized buffers are released here; only the actual
-        // model and its original read-only source owner survive construction.
+        let verified = verify_source_metadata(&sources, control)?;
         Ok(Self {
             sources,
-            model,
-            registration,
-            weights_artifact,
-            provenance_artifact,
+            model: verified.model,
+            registration: verified.registration,
+            weights_artifact: verified.weights_artifact,
+            provenance_artifact: verified.provenance_artifact,
         })
     }
 
@@ -173,6 +102,104 @@ impl LoadedRoventNnuecSource {
         control.check()?;
         Ok((weights, weights_bytes, provenance, provenance_bytes))
     }
+}
+
+/// Read-only metadata verification reuses the actual loader's original byte,
+/// provenance and compiled-registration checks. The temporary parsed model is
+/// dropped here; no Loaded source, Bound, worker or execution cap is created.
+pub(crate) fn verify_metadata_registration(
+    sources: &RoventPinnedNativeSources,
+    control: &RoventStartupControl,
+) -> Result<NnuecV2Registration, BackendError> {
+    Ok(verify_source_metadata(sources, control)?.registration)
+}
+
+struct VerifiedNnuecMetadata {
+    model: Arc<Model>,
+    registration: NnuecV2Registration,
+    weights_artifact: ArtifactRef,
+    provenance_artifact: ArtifactRef,
+}
+
+fn verify_source_metadata(
+    sources: &RoventPinnedNativeSources,
+    control: &RoventStartupControl,
+) -> Result<VerifiedNnuecMetadata, BackendError> {
+    control.check()?;
+    sources.lock().validate().map_err(|error| {
+        invalid("original NNUEC input lock").with_external_cause(CauseCode::ProfileParse, &error)
+    })?;
+    sources.configuration().admit_against(sources.lock())?;
+    let pin = sources
+        .lock()
+        .manifest
+        .engine
+        .nnuec
+        .as_ref()
+        .ok_or_else(|| {
+            fail(
+                K::UnsupportedModel,
+                "original startup does not declare NNUEC",
+            )
+        })?;
+    if !(1..=NNUEC_WEIGHTS_MAX_BYTES as u64).contains(&pin.weights.bytes)
+        || !(1..=NNUEC_PROVENANCE_MAX_BYTES as u64).contains(&pin.provenance.bytes)
+    {
+        return Err(fail(
+            K::ResourceExhausted,
+            "declared NNUEC source byte budget",
+        ));
+    }
+    let (weights_artifact, weights, provenance_artifact, provenance) = sources
+        .nnuec_artifact_bytes()?
+        .ok_or_else(|| mismatch("original NNUEC descriptors are absent"))?;
+    control.check()?;
+    if weights_artifact != pin.weights || provenance_artifact != pin.provenance {
+        return Err(mismatch(
+            "original NNUEC retained descriptors differ from lock",
+        ));
+    }
+    verify_raw_artifact(
+        &weights_artifact,
+        &weights,
+        NNUEC_WEIGHTS_MAX_BYTES,
+        control,
+    )?;
+    verify_raw_artifact(
+        &provenance_artifact,
+        &provenance,
+        NNUEC_PROVENANCE_MAX_BYTES,
+        control,
+    )?;
+    let body = decode_provenance(&provenance)?;
+    control.check()?;
+    // This existing bounded CPU parser is synchronous, not preemptible.
+    // Checks on both sides reject late admission without claiming that
+    // parsing itself must return by `until` or renewing that boundary.
+    let model = Arc::new(Model::from_reader(weights.as_slice()).map_err(|error| {
+        invalid("actual NNUEC V2 model load failed")
+            .with_external_cause(CauseCode::ModelLoad, &error)
+    })?);
+    control.check()?;
+    let registration = model.registration().map_err(|error| {
+        invalid("actual NNUEC V2 registration failed")
+            .with_external_cause(CauseCode::ModelLoad, &error)
+    })?;
+    verify_declarations(
+        pin,
+        &sources.lock().manifest.provenance,
+        sources.configuration().nnuec_conditions_digest()?,
+        &body,
+        &model,
+        &registration,
+    )?;
+    control.check()?;
+    Ok(VerifiedNnuecMetadata {
+        model,
+        registration,
+        weights_artifact,
+        provenance_artifact,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]

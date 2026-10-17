@@ -1679,6 +1679,28 @@ fn execution_backend_digest(
     control: Option<[u8; 32]>,
     warm: bool,
 ) -> [u8; 32] {
+    virtual_review_backend_digest_from_metadata(
+        runtime.binary_digest(),
+        runtime.native_loading_profile_digest(),
+        runtime.bundle_digest(),
+        config,
+        control,
+        warm,
+    )
+}
+
+/// Predict the unchanged backend identity from explicitly registered inputs.
+/// This shared byte codec never loads ORT, checks a provider, creates a session
+/// or grants execution authority. The actual backend passes its independently
+/// observed runtime identities through the same codec above.
+pub fn virtual_review_backend_digest_from_metadata(
+    runtime_binary: [u8; 32],
+    native_loading_profile: Option<[u8; 32]>,
+    runtime_bundle: Option<[u8; 32]>,
+    config: PalsOnnxConfig,
+    control: Option<[u8; 32]>,
+    warm: bool,
+) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"rz-pals-virtual-review-actual-backend-fp32/1");
     h.update(if warm {
@@ -1686,8 +1708,8 @@ fn execution_backend_digest(
     } else {
         SHARED_LAYOUT.as_bytes()
     });
-    h.update(runtime.binary_digest());
-    if let Some(profile) = runtime.native_loading_profile_digest() {
+    h.update(runtime_binary);
+    if let Some(profile) = native_loading_profile {
         h.update([1]);
         h.update(profile);
     } else {
@@ -1704,7 +1726,7 @@ fn execution_backend_digest(
         PalsCuDnnConvSearch::ExperimentalDefault => 1,
         PalsCuDnnConvSearch::ExperimentalDefaultDeviceWarm => 2,
     }]);
-    match runtime.bundle_digest() {
+    match runtime_bundle {
         Some(d) => {
             h.update([1]);
             h.update(d);
@@ -1887,6 +1909,54 @@ mod tests {
         ReviewAnchorInput, ReviewQueryInput, ReviewQueryPurpose, ReviewRecordInput,
         ReviewRecordKind, INPUT_SCHEMA,
     };
+    #[test]
+    fn expected_backend_codec_preserves_original_cpu_bytes_and_distinguishes_inputs() {
+        let config = PalsOnnxConfig::cpu();
+        let runtime = [7; 32];
+        // Original byte framing, independent of the production shared helper.
+        let mut original = Sha256::new();
+        original.update(b"rz-pals-virtual-review-actual-backend-fp32/1");
+        original.update(SHARED_LAYOUT.as_bytes());
+        original.update(runtime);
+        original.update([0, 0, 0, 0, 0]); // loading/control/cuDNN/bundle/CPU
+        original.update((config.intra_threads as u64).to_le_bytes());
+        original.update(b"inter1;spinningoff;tf32off;B1");
+        let expected: [u8; 32] = original.finalize().into();
+        assert_eq!(
+            virtual_review_backend_digest_from_metadata(runtime, None, None, config, None, false),
+            expected
+        );
+        for changed in [
+            virtual_review_backend_digest_from_metadata([8; 32], None, None, config, None, false),
+            virtual_review_backend_digest_from_metadata(
+                runtime,
+                Some([1; 32]),
+                None,
+                config,
+                None,
+                false,
+            ),
+            virtual_review_backend_digest_from_metadata(
+                runtime,
+                None,
+                Some([1; 32]),
+                config,
+                None,
+                false,
+            ),
+            virtual_review_backend_digest_from_metadata(
+                runtime,
+                None,
+                None,
+                config,
+                Some([1; 32]),
+                false,
+            ),
+            virtual_review_backend_digest_from_metadata(runtime, None, None, config, None, true),
+        ] {
+            assert_ne!(changed, expected);
+        }
+    }
     fn accounting_stats() -> PalsBackendStats {
         PalsBackendStats {
             admitted_role_requests: 0,

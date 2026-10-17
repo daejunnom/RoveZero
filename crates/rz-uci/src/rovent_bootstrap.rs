@@ -610,9 +610,27 @@ pub fn configuration_digest(
     resources: &RoventNativeResources,
     control_inventory: Option<[u8; 32]>,
 ) -> Result<[u8; 32], BackendError> {
+    configuration_digest_from_metadata(
+        resources.configuration,
+        resources.loading_profile,
+        resources.runtime.binary_digest(),
+        resources.runtime.bundle_digest(),
+        control_inventory,
+    )
+}
+
+/// Shared declaration codec. Unlike `configuration_digest`, this receives no
+/// runtime owner and therefore cannot attest loading, a provider or readiness.
+pub fn configuration_digest_from_metadata(
+    configuration: PalsOnnxConfig,
+    loading_profile: Option<NativeLoadingProfile>,
+    runtime_binary: [u8; 32],
+    runtime_bundle: Option<[u8; 32]>,
+    control_inventory: Option<[u8; 32]>,
+) -> Result<[u8; 32], BackendError> {
     let mut hash = Sha256::new();
     hash.update(ROVENT_NATIVE_CONFIGURATION_DOMAIN.as_bytes());
-    match resources.configuration.provider {
+    match configuration.provider {
         Provider::Cpu => hash.update([0]),
         Provider::Cuda {
             device_id,
@@ -623,15 +641,15 @@ pub fn configuration_digest(
             hash.update((arena_bytes as u64).to_le_bytes());
         }
     }
-    hash.update((resources.configuration.intra_threads as u64).to_le_bytes());
+    hash.update((configuration.intra_threads as u64).to_le_bytes());
     hash.update([
-        u8::from(resources.configuration.cache_public_memory),
-        u8::from(resources.configuration.device_public_memory),
+        u8::from(configuration.cache_public_memory),
+        u8::from(configuration.device_public_memory),
     ]);
-    let cudnn = format!("{:?}", resources.configuration.cudnn_conv_search);
+    let cudnn = format!("{:?}", configuration.cudnn_conv_search);
     hash.update((cudnn.len() as u64).to_le_bytes());
     hash.update(cudnn.as_bytes());
-    match resources.loading_profile {
+    match loading_profile {
         None => hash.update([0]),
         Some(profile) => {
             hash.update([1]);
@@ -639,8 +657,8 @@ pub fn configuration_digest(
             hash.update(profile.identifier().as_bytes());
         }
     }
-    hash.update(resources.runtime.binary_digest());
-    for digest in [resources.runtime.bundle_digest(), control_inventory] {
+    hash.update(runtime_binary);
+    for digest in [runtime_bundle, control_inventory] {
         match digest {
             None => hash.update([0]),
             Some(value) => {

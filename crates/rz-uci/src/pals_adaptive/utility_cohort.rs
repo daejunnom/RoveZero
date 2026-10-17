@@ -64,30 +64,114 @@ impl UtilityCohortSourcePins {
         {
             return Err(invalid("cohort source is not the original admitted root"));
         }
+        let pc_namespace = utility_pc_namespace_projection(original)?;
+        let projected = Self::from_projection(
+            lock,
+            source.registration(),
+            &pc_namespace,
+            actual.declared_ceilings(),
+        )?;
+        if projected.input_lock_sha256 != hex(source.input_lock_digest())
+            || projected.source_sha256 != string(original, "source_sha256")?
+            || projected.frozen_nnuec_model_sha256
+                != source
+                    .semantic_weights_identity()
+                    .weights_sha256
+                    .clone()
+                    .ok_or_else(|| invalid("cohort actual NNUEC has no semantic weights"))?
+        {
+            return Err(invalid("cohort original source projection differs"));
+        }
+        Ok(projected)
+    }
+
+    /// Expected metadata only. The caller must separately verify original
+    /// lock/config/export/runtime/NNUEC descriptor bytes. This cannot issue a
+    /// Ready snapshot, current root, cache ACK, offer or trial admission.
+    pub fn from_registered_metadata(
+        lock: &rz_experiments::RoventInputLock,
+        registration: &rz_search::cpu_value::nnuec::v2::registration::NnuecV2Registration,
+        export_manifest: &rz_experiments::ArtifactRef,
+        backend: Digest,
+    ) -> Result<Self, AdaptiveManagerError> {
+        use rz_eval::pals_model::{PalsModelProfile, virtual_review};
+        let model = &lock.manifest.engine.pc.proposer;
+        if !lock.manifest.provenance.contains(export_manifest)
+            || model.semantics != virtual_review::MODEL_SEMANTICS
+            || model.encoding != virtual_review::ENCODING
+        {
+            return Err(invalid("cohort metadata original export/model differs"));
+        }
         let pc_namespace = json!({
-            "model_semantics":original["model_semantics"],
-            "model_semantics_sha256":original["model_semantics_sha256"],
-            "encoding":original["encoding"], "encoding_sha256":original["encoding_sha256"],
-            "encoding_registry_sha256":original["encoding_registry_sha256"],
-            "model_implementation_sha256":original["model_implementation_sha256"],
-            "representation_model_domain":original["representation_model_domain"],
-            "frozen_epoch":original["frozen_epoch"], "weights_sha256":original["weights_sha256"],
-            "export_manifest_sha256":original["export_manifest_sha256"],
-            "backend_sha256":original["backend_sha256"],
+            "model_semantics":model.semantics,
+            "model_semantics_sha256":hex(Digest(PalsModelProfile::VirtualReviewV1.registered_semantics_sha256())),
+            "encoding":model.encoding,
+            "encoding_sha256":hex(Digest(Sha256::digest(virtual_review::ENCODING.as_bytes()).into())),
+            "encoding_registry_sha256":hex(Digest(virtual_review::registered_encoding_sha256())),
+            "model_implementation_sha256":model.implementation_sha256,
+            "representation_model_domain":"loaded_checkpoint_sha256",
+            "frozen_epoch":1,
+            "weights_sha256":model.weights.sha256,
+            "export_manifest_sha256":export_manifest.sha256,
+            "backend_sha256":hex(backend),
         });
+        Self::from_projection(
+            lock,
+            registration,
+            &pc_namespace,
+            &Self::registered_ceilings(lock),
+        )
+    }
+
+    fn registered_ceilings(
+        lock: &rz_experiments::RoventInputLock,
+    ) -> rz_experiments::RoventRootDeclaredCeilings {
+        rz_experiments::RoventRootDeclaredCeilings {
+            resource_plan: lock.manifest.resources.clone(),
+            registered_max_chess_plies: lock.manifest.engine.search.registered_max_chess_plies,
+            cpu_credit_limit: lock.manifest.coordinator.cpu_credit_limit,
+            questions_max: lock.manifest.coordinator.questions_max,
+            ancestor_depth_max: lock.manifest.coordinator.ancestor_depth_max,
+            waiting_jobs_max: lock.manifest.coordinator.waiting_jobs_max,
+            role_tickets_max: lock.manifest.coordinator.role_tickets_max,
+            wall_time_max_ms: lock.manifest.wall_time_max_ms,
+            cleanup_max_ms: lock.manifest.cleanup_max_ms,
+            output_bytes_max: lock.manifest.output_bytes_max,
+        }
+    }
+
+    fn from_projection(
+        lock: &rz_experiments::RoventInputLock,
+        registration: &rz_search::cpu_value::nnuec::v2::registration::NnuecV2Registration,
+        pc_namespace: &Value,
+        ceilings: &rz_experiments::RoventRootDeclaredCeilings,
+    ) -> Result<Self, AdaptiveManagerError> {
+        lock.validate()
+            .map_err(|e| AdaptiveManagerError::Semantic(e.to_string()))?;
+        if ceilings != &Self::registered_ceilings(lock) {
+            return Err(invalid(
+                "cohort original declared ceilings differ from lock",
+            ));
+        }
+        let pc_namespace = utility_pc_namespace_projection(pc_namespace)?;
+        let weights = registration
+            .model_identity()
+            .weights_sha256
+            .clone()
+            .ok_or_else(|| invalid("cohort NNUEC registration has no semantic weights"))?;
         Ok(Self {
-            input_lock_sha256: hex(source.input_lock_digest()),
-            source_sha256: string(original, "source_sha256")?,
-            frozen_nnuec_model_sha256: source
-                .semantic_weights_identity()
-                .weights_sha256
-                .clone()
-                .ok_or_else(|| invalid("cohort actual NNUEC has no semantic weights"))?,
+            input_lock_sha256: lock.canonical_sha256.clone(),
+            source_sha256: rz_experiments::rovent_source_aggregate_sha256(
+                &lock.manifest.engine.source_commit,
+                &lock.manifest.engine.source_components,
+            )
+            .map_err(|e| AdaptiveManagerError::Semantic(e.to_string()))?,
+            frozen_nnuec_model_sha256: weights,
             frozen_nnuec_namespace_sha256: hex(value_digest(
                 "rz-rovent-utility-cohort-nnuec-namespace/1",
-                source.registration(),
+                registration,
             )?),
-            frozen_pc_model_sha256: string(original, "weights_sha256")?,
+            frozen_pc_model_sha256: string(&pc_namespace, "weights_sha256")?,
             frozen_pc_namespace_sha256: hex(value_digest(
                 "rz-rovent-utility-cohort-pc-namespace/1",
                 &pc_namespace,
@@ -99,7 +183,7 @@ impl UtilityCohortSourcePins {
                 .map_err(|e| AdaptiveManagerError::Semantic(e.to_string()))?,
             logical_budget_sha256: hex(value_digest(
                 "rz-rovent-utility-cohort-logical-budget/1",
-                actual.declared_ceilings(),
+                ceilings,
             )?),
         })
     }
@@ -114,6 +198,43 @@ impl UtilityCohortSourcePins {
             && self.resource_plan_sha256 == i.resource_plan_sha256
             && self.logical_budget_sha256 == i.logical_budget_sha256
     }
+}
+
+fn utility_pc_namespace_projection(original: &Value) -> Result<Value, AdaptiveManagerError> {
+    let names = [
+        "model_semantics",
+        "model_semantics_sha256",
+        "encoding",
+        "encoding_sha256",
+        "encoding_registry_sha256",
+        "model_implementation_sha256",
+        "representation_model_domain",
+        "frozen_epoch",
+        "weights_sha256",
+        "export_manifest_sha256",
+        "backend_sha256",
+    ];
+    let mut selected = serde_json::Map::new();
+    for name in names {
+        let value = original
+            .get(name)
+            .ok_or_else(|| invalid("cohort PC namespace field absent"))?;
+        if name == "frozen_epoch" {
+            if value.as_u64() != Some(1) {
+                return Err(invalid("cohort PC namespace frozen epoch differs"));
+            }
+        } else if name.ends_with("sha256") {
+            let text = value
+                .as_str()
+                .ok_or_else(|| invalid("cohort PC namespace SHA type"))?;
+            rz_eval::asset::parse_sha256(text)
+                .map_err(|_| invalid("cohort PC namespace SHA invalid"))?;
+        } else if value.as_str().is_none_or(|s| s.is_empty() || s.len() > 256) {
+            return Err(invalid("cohort PC namespace semantic tag invalid"));
+        }
+        selected.insert(name.into(), value.clone());
+    }
+    Ok(Value::Object(selected))
 }
 
 /// The first successful source-action bind freezes these original bytes before
@@ -1641,6 +1762,42 @@ fn checked_trial_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn expected_pc_namespace_excludes_root_authority_and_clock_but_pins_weights_and_backend() {
+        let mut original = json!({"model_semantics":"model-v3","model_semantics_sha256":"1".repeat(64),
+            "encoding":"encoding-v3","encoding_sha256":"2".repeat(64),
+            "encoding_registry_sha256":"3".repeat(64),"model_implementation_sha256":"4".repeat(64),
+            "representation_model_domain":"loaded_checkpoint_sha256","frozen_epoch":1,
+            "weights_sha256":"5".repeat(64),"export_manifest_sha256":"6".repeat(64),
+            "backend_sha256":"7".repeat(64),"process_epoch":1,"actual_start_tick":100,
+            "root_authority":{"root":1}});
+        let selected = utility_pc_namespace_projection(&original).unwrap();
+        let first = value_digest("rz-rovent-utility-cohort-pc-namespace/1", &selected).unwrap();
+        original["process_epoch"] = json!(99);
+        original["actual_start_tick"] = json!(999);
+        original["root_authority"] = json!({"root":99});
+        assert_eq!(
+            utility_pc_namespace_projection(&original).unwrap(),
+            selected
+        );
+        for name in ["weights_sha256", "backend_sha256", "export_manifest_sha256"] {
+            let mut changed = original.clone();
+            changed[name] = json!("8".repeat(64));
+            assert_ne!(
+                value_digest(
+                    "rz-rovent-utility-cohort-pc-namespace/1",
+                    &utility_pc_namespace_projection(&changed).unwrap()
+                )
+                .unwrap(),
+                first
+            );
+        }
+        original["backend_sha256"] = json!("invalid");
+        assert!(utility_pc_namespace_projection(&original).is_err());
+        original["backend_sha256"] = json!("7".repeat(64));
+        original["frozen_epoch"] = json!(2);
+        assert!(utility_pc_namespace_projection(&original).is_err());
+    }
     #[test]
     fn registered_window_preserves_exact_original_boundary_without_shrinking() {
         let started = Instant::now();

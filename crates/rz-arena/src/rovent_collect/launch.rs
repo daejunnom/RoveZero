@@ -39,6 +39,7 @@ pub const ROVENT_COLLECTION_LAUNCH_PLAN: &str = "rz-rovent-collection-launch/1";
 mod cohort;
 mod cohort_audit;
 mod cohort_driver;
+mod cohort_prepare;
 mod r_stream;
 mod resources;
 mod utility_stream;
@@ -47,11 +48,15 @@ pub use cohort::{
     RoventUtilityCohortLaunchReceipt, run_rovent_utility_cohort,
     run_rovent_utility_cohort_from_cli,
 };
+pub use cohort_prepare::prepare_rovent_utility_cohort_pins_from_cli;
 pub use r_stream::{RoventRCollectionAncestor, RoventRCollectionPlan};
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
 
 pub enum RoventCollectionCliParse {
     Help,
+    PrepareCohortPins {
+        plan: RoventPublicationFile,
+    },
     Cohort {
         plan: RoventPublicationFile,
         arguments: Vec<String>,
@@ -68,6 +73,12 @@ pub fn parse_rovent_collection_cli(
 ) -> Result<RoventCollectionCliParse, ArenaError> {
     if arguments == ["--help"] {
         return Ok(RoventCollectionCliParse::Help);
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument.starts_with("--prepare-utility-cohort-pins"))
+    {
+        return cohort_prepare::parse_preparation_cli(arguments);
     }
     if arguments
         .iter()

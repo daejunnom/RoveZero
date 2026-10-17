@@ -4,7 +4,8 @@
 fn main() -> std::process::ExitCode {
     use rz_arena::rovent_collect::launch::{
         ROVENT_COLLECTION_USAGE, RoventCollectionCliParse, parse_rovent_collection_cli,
-        run_rovent_collection_from_cli, run_rovent_utility_cohort_from_cli,
+        prepare_rovent_utility_cohort_pins_from_cli, run_rovent_collection_from_cli,
+        run_rovent_utility_cohort_from_cli,
     };
     use std::io::Write;
     let run = || -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
@@ -15,7 +16,14 @@ fn main() -> std::process::ExitCode {
                     std::io::stdout().lock(),
                     "선택형 cohort: --utility-cohort-plan=inputs/<plan.json> --utility-cohort-plan-sha256=<SHA> --utility-cohort-plan-bytes=<bytes> <원 source/config 인수>"
                 )?;
+                writeln!(
+                    std::io::stdout().lock(),
+                    "읽기 전용 예상 pin 준비: --prepare-utility-cohort-pins=inputs/<plan.json> --prepare-utility-cohort-pins-sha256=<SHA> --prepare-utility-cohort-pins-bytes=<bytes>"
+                )?;
                 Ok(None)
+            }
+            RoventCollectionCliParse::PrepareCohortPins { plan } => {
+                Ok(Some(prepare_rovent_utility_cohort_pins_from_cli(&plan)?))
             }
             RoventCollectionCliParse::Cohort { plan, arguments } => {
                 let receipt = run_rovent_utility_cohort_from_cli(&plan, arguments)?;
@@ -51,10 +59,10 @@ fn main() -> std::process::ExitCode {
     };
     match run() {
         Ok(result) => {
-            if let Some(result) = result {
-                if writeln!(std::io::stderr().lock(), "{result}").is_err() {
-                    return std::process::ExitCode::FAILURE;
-                }
+            if let Some(result) = result
+                && writeln!(std::io::stderr().lock(), "{result}").is_err()
+            {
+                return std::process::ExitCode::FAILURE;
             }
             std::process::ExitCode::SUCCESS
         }

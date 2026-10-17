@@ -46,8 +46,13 @@ const EXTERNAL_SELECTION_DOMAIN: &str = "rz-rovent-external-r-sources/1";
 const MAX_LOCK_BYTES: u64 = 1 << 20;
 const MAX_SELECTION_BYTES: u64 = 64 << 10;
 
+mod cohort_prepare;
 mod collection;
 mod evidence;
+pub use cohort_prepare::{
+    EXPECTED_UTILITY_COHORT_PREPARATION, ExpectedUtilityCohortPreparation,
+    prepare_expected_utility_cohort_source_pins,
+};
 use collection::CollectionLaunch;
 pub use collection::{
     RoventCollectionPreparedLaunch, RoventCollectionPreparedNative, run_collection,
