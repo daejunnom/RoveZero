@@ -13,6 +13,11 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 
 pub const ROVENT_UTILITY_COMPARISON_COHORT_DOMAIN: &str = "rz-rovent-utility-comparison-cohort/1";
+pub const ROVENT_UTILITY_INTERVENTION_COHORT_DOMAIN: &str = "rz-rovent-utility-comparison-cohort/2";
+pub const ROVENT_UTILITY_INTERVENTION_TARGET_DOMAIN: &str =
+    "rz-rovent-utility-intervention-target/1";
+pub const ROVENT_UTILITY_INTERVENTION_TRIAL_DOMAIN: &str = "rz-rovent-utility-cohort-trial/2";
+pub const ROVENT_UTILITY_INTERVENTION_PAIR_DOMAIN: &str = "rz-rovent-utility-cohort-pair/2";
 pub const ROVENT_UTILITY_COMPARISON_COST_SCOPE: &str = "cohort_route_with_bounded_materialization_and_physical_pin_zero_excluding_durable_dataset_io_v1";
 pub const MAX_ROVENT_UTILITY_COHORT_BYTES: usize = 64 << 10;
 pub const MAX_ROVENT_UTILITY_COHORT_WINDOW_NS: u64 = 86_400_000_000_000;
@@ -216,6 +221,116 @@ impl RoventUtilityComparisonCohort {
     }
 }
 
+/// An explicit experimental intervention, never an assertion that the normal
+/// scheduler already offers these alternatives at the same instant.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RoventUtilityInterventionPolicyV2 {
+    /// Extend an actual proposal with P, request C divergence where supported,
+    /// or validate that actual proposal with installed own R. Repair requires
+    /// separate original counter evidence and is not synthesized by this policy.
+    FrozenProposalReviewV1,
+}
+
+/// Passive /2 registration. The original neutral target and NNUEC input are
+/// captured from each fresh root after the same bounded prelude. A role-specific
+/// query/view has its own seal and must not be relabeled the common input.
+/// Decoding these declarations cannot issue a target, frame or trial capability.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RoventUtilityInterventionCohortV2 {
+    pub domain: String,
+    pub input: RoventUtilityComparisonCohortInput,
+    pub target_record: u16,
+    pub policy: RoventUtilityInterventionPolicyV2,
+}
+impl RoventUtilityInterventionCohortV2 {
+    pub fn seal(
+        input: RoventUtilityComparisonCohortInput,
+        target_record: u16,
+    ) -> Result<Self, ManifestError> {
+        let value = Self {
+            domain: ROVENT_UTILITY_INTERVENTION_COHORT_DOMAIN.into(),
+            input,
+            target_record,
+            policy: RoventUtilityInterventionPolicyV2::FrozenProposalReviewV1,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, ManifestError> {
+        require(
+            input.len() <= MAX_ROVENT_UTILITY_COHORT_BYTES,
+            "intervention JSON exceeds 64 KiB",
+        )?;
+        let raw: serde_json::Value = decode_json(input)?;
+        require(
+            raw.is_object() && raw.get("input").is_some_and(serde_json::Value::is_object),
+            "intervention root and input must be objects",
+        )?;
+        let value: Self =
+            serde_json::from_value(raw).map_err(|error| ManifestError::Parse(error.to_string()))?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        require(
+            self.domain == ROVENT_UTILITY_INTERVENTION_COHORT_DOMAIN,
+            "unsupported intervention cohort domain",
+        )?;
+        // The declared source, window and whole-route cost boundaries retain
+        // their exact meanings. Execution policy and evidence have a new domain.
+        self.input.validate()?;
+        require(
+            self.input.requested_recipients.len() >= 2,
+            "an intervention comparison requires at least two distinct declared arms",
+        )?;
+        require(
+            self.target_record < 64,
+            "intervention target exceeds the selected-view bound",
+        )?;
+        self.canonical_unchecked()?;
+        Ok(())
+    }
+
+    pub fn total_window_ns(&self) -> Result<u64, ManifestError> {
+        self.validate()?;
+        self.input.total_window_ns()
+    }
+
+    fn canonical_unchecked(&self) -> Result<Vec<u8>, ManifestError> {
+        let mut value =
+            serde_json::to_value(self).map_err(|error| ManifestError::Parse(error.to_string()))?;
+        value.sort_all_objects();
+        let bytes =
+            serde_json::to_vec(&value).map_err(|error| ManifestError::Parse(error.to_string()))?;
+        require(
+            bytes.len() <= MAX_ROVENT_UTILITY_COHORT_BYTES,
+            "canonical intervention JSON exceeds 64 KiB",
+        )?;
+        Ok(bytes)
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestError> {
+        self.validate()?;
+        self.canonical_unchecked()
+    }
+
+    pub fn canonical_sha256(&self) -> Result<String, ManifestError> {
+        Ok(crate::digest(&self.canonical_bytes()?))
+    }
+
+    pub fn digest(&self) -> Result<Digest, ManifestError> {
+        let mut hash = Sha256::new();
+        hash.update(ROVENT_UTILITY_INTERVENTION_COHORT_DOMAIN.as_bytes());
+        hash.update([0]);
+        hash.update(self.canonical_bytes()?);
+        Ok(Digest(hash.finalize().into()))
+    }
+}
+
 fn canonical(cohort: &RoventUtilityComparisonCohort) -> Result<Vec<u8>, ManifestError> {
     // validate() bounds all strings and the sole collection before this
     // conversion. This helper never calls validate(), avoiding recursion.
@@ -276,6 +391,56 @@ mod tests {
             cost_scope: ROVENT_UTILITY_COMPARISON_COST_SCOPE.into(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn intervention_is_explicit_and_never_decodes_as_a_ready_cohort() {
+        let mut input = cohort().input;
+        input
+            .requested_recipients
+            .push(RoventUtilityCohortRecipient::Critic);
+        let value = RoventUtilityInterventionCohortV2::seal(input, 0).unwrap();
+        let raw = String::from_utf8(value.canonical_bytes().unwrap()).unwrap();
+        assert_eq!(
+            RoventUtilityInterventionCohortV2::from_json(&raw).unwrap(),
+            value
+        );
+        assert!(RoventUtilityComparisonCohort::from_json(&raw).is_err());
+        assert!(
+            RoventUtilityInterventionCohortV2::from_json(
+                &serde_json::to_string(&cohort()).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn intervention_requires_comparable_declared_arms_and_bounded_target() {
+        let mut input = cohort().input;
+        assert!(RoventUtilityInterventionCohortV2::seal(input.clone(), 0).is_err());
+        input
+            .requested_recipients
+            .push(RoventUtilityCohortRecipient::Critic);
+        let value = RoventUtilityInterventionCohortV2::seal(input.clone(), 63).unwrap();
+        assert!(RoventUtilityInterventionCohortV2::seal(input, 64).is_err());
+        let mut raw = serde_json::to_value(value).unwrap();
+        raw["policy"] = "pretend_existing_ready".into();
+        assert!(RoventUtilityInterventionCohortV2::from_json(&raw.to_string()).is_err());
+    }
+
+    #[test]
+    fn intervention_digest_binds_target_and_requested_order() {
+        let mut input = cohort().input;
+        input
+            .requested_recipients
+            .push(RoventUtilityCohortRecipient::Critic);
+        let value = RoventUtilityInterventionCohortV2::seal(input, 0).unwrap();
+        let mut changed = value.clone();
+        changed.target_record = 1;
+        assert_ne!(changed.digest().unwrap(), value.digest().unwrap());
+        changed = value.clone();
+        changed.input.requested_recipients.reverse();
+        assert_ne!(changed.digest().unwrap(), value.digest().unwrap());
     }
 
     #[test]
