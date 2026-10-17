@@ -768,6 +768,11 @@ fn position_command(replay: &RoventRulesPositionReplay) -> Result<String, ArenaE
     Ok(command)
 }
 
+// The assembly closure must return this trial's original prepared Product,
+// Store and cleanup owners on startup rejection. It has one active startup;
+// adding an error allocation here would introduce another failure path while
+// the original typed custody and physical-drain obligations must be retained.
+#[allow(clippy::result_large_err)]
 fn run_trial(
     shared: &Arc<Mutex<CohortCaller>>,
     trial: &Arc<Mutex<TrialCaller>>,
@@ -1220,7 +1225,6 @@ impl CohortCaller {
                 )?;
             }
         }
-        drop(insert);
         for left in 0..trials.len() {
             for right in left + 1..trials.len() {
                 match rz_uci::pals_adaptive::UtilityCohortPair::compare(

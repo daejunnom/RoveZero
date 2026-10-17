@@ -238,19 +238,18 @@ fn validate_reservation(
             "original reservation does not match this receiver's selected question",
         ));
     }
-    if let Some(retirement) = reservation.retirement() {
-        if !retirement.matches_model(shared.source.model())
+    if let Some(retirement) = reservation.retirement()
+        && (!retirement.matches_model(shared.source.model())
             || retirement.limits() != shared.limits.capture
             || retirement.job().id.authority != shared.admission.authority()
             || retirement.frame() != lineage.frame()
             || retirement.question_digest() != lineage.question_digest()
-            || retirement.capture_sequence() != lineage.capture_sequence()
-        {
-            return Err(callback_error(
-                "RObserverSource",
-                "actual terminal differs from original loaded model/question/capture limits",
-            ));
-        }
+            || retirement.capture_sequence() != lineage.capture_sequence())
+    {
+        return Err(callback_error(
+            "RObserverSource",
+            "actual terminal differs from original loaded model/question/capture limits",
+        ));
     }
     Ok(())
 }
@@ -503,6 +502,10 @@ pub struct RoventRCollectionCloseRejected {
 impl RoventRCollectionReceiver {
     /// 실제 manager가 physical fence 뒤에만 발급하는 owner를 받는다.
     /// 검증 실패 시에도 수신 cap과 미수신 manager cap을 모두 보존한다.
+    // Rejection returns the original receiver, capture outbox and post-fence
+    // retirement owner. Do not allocate a new error box or discard custody
+    // while reconciling that bounded root's actual physical completion.
+    #[allow(clippy::result_large_err)]
     pub fn finish_retaining(
         self,
         original: AdaptiveCpuSemanticRetirement<AdaptivePortQuestion>,

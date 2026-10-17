@@ -556,10 +556,7 @@ impl CollectionCaller {
             self.retiring.is_none() && self.publishing.is_none() && self.chunk.is_none(),
             "Collection failed publication custody must be recovered before next row",
         )?;
-        loop {
-            let Some(active) = &mut self.active else {
-                break;
-            };
+        while let Some(active) = &mut self.active {
             let Some(divergence) = active.pump.next_ready_submitted_input_is_divergence() else {
                 break;
             };
@@ -860,6 +857,11 @@ fn hook(
 
 /// 원 root/native hook과 별도 teacher caller를 실제 제품 launch에 연결한다.
 /// arguments는 기존 UCI source/config/FD 경계를 그대로 통과한다.
+// The native assembly closure returns the original prepared Product/Store and
+// cleanup owners in RoventProductStartupRejection. Keeping that bounded single
+// startup custody inline avoids allocating while handling a failed startup;
+// this does not replace failure with a metadata-only error or release its pins.
+#[allow(clippy::result_large_err)]
 pub fn run_rovent_collection(
     arguments: Vec<String>,
     plan: RoventCollectionLaunchPlan,

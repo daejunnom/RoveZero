@@ -526,7 +526,7 @@ pub(super) fn publish_sidecar(
     directory.remove_file(&pending).map_err(io)?;
     root.sync_all().map_err(io)?;
     Ok(RoventPublicationFile {
-        path: name.into(),
+        path: name,
         ..file_pin
     })
 }

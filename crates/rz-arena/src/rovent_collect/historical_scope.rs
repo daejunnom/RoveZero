@@ -302,7 +302,7 @@ fn verify_historical_native_fields_for_root(
             "historical corpus teacher is absent from original loaded lock",
         )?;
     }
-    verify_original_native_key(generation_input, native, &submission, &origin)?;
+    verify_original_native_key(generation_input, native, &submission, origin)?;
     Ok(RoventHistoricalRecordEvidence {
         native_admission_sha256: root_sha,
         collection_source_commit: origin.source_commit.clone(),

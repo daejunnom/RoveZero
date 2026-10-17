@@ -234,7 +234,7 @@ impl RoventCorpusProducerV2 {
         output: &RoleOutput,
     ) -> Result<RoventRetiredRecordV2, ArenaError> {
         let original = self.original.retire_accepted(admission, accepted, output)?;
-        self.into_retired(original)
+        self.join_retired_input(original)
     }
     pub fn retire_root_ranking(
         &mut self,
@@ -242,9 +242,9 @@ impl RoventCorpusProducerV2 {
         output: &RoleOutput,
     ) -> Result<RoventRetiredRecordV2, ArenaError> {
         let original = self.original.retire_root_ranking(accepted, output)?;
-        self.into_retired(original)
+        self.join_retired_input(original)
     }
-    fn into_retired(
+    fn join_retired_input(
         &mut self,
         original: RoventRetiredRecord,
     ) -> Result<RoventRetiredRecordV2, ArenaError> {

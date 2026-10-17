@@ -89,7 +89,7 @@ pub fn materialize_rovent_r_semantics_retaining(
                 && captured.len() <= 64
                 && closure.witnesses().len() <= 256
                 && planned_publication.is_some() == planned_publication_bytes.is_some()
-                && planned_publication.is_some() == !captured.is_empty()
+                && planned_publication.is_some() != captured.is_empty()
                 && closure
                     .nnuec_source()
                     .semantic_weights_identity()
