@@ -340,6 +340,17 @@ class UtilityTensorLifecycleTests(unittest.TestCase):
             self.assertEqual(owner.physical_completion, "unknown")
             self.assertTrue((self.root / (label + ".pt")).exists() or list(self.root.glob(label + ".pt.*.partial")))
 
+    def test_post_publication_cost_overflow_preserves_files_and_quarantines_owner(self):
+        owner = self.owner()
+        owner.cost["output_bytes"] = 2**64 - 1
+        with self.assertRaises(ValueError):
+            self.save(owner, name="cost-overflow.pt")
+        self.assertTrue((self.root / "cost-overflow.pt").is_file())
+        self.assertTrue((self.root / "cost-overflow.pt.projection.json").is_file())
+        self.assertTrue(owner.quarantined)
+        self.assertEqual(owner.physical_completion, "unknown")
+        self.assertEqual(owner.cost["output_bytes"], 2**64 - 1)
+
     def test_no_replace_checkpoint_publication_preserves_existing_bytes(self):
         first = self.save(self.owner())
         raw = Path(first["path"]).read_bytes()
@@ -382,7 +393,9 @@ class UtilityTensorLifecycleTests(unittest.TestCase):
                 source.model.output_bias[0].add_(0.125)
         for label, mutate in (("model", change_model),
                               ("sampler", lambda source: source.sampler.update(cursor=2)),
-                              ("cost", lambda source: source.cost.update(samples=9))):
+                              ("cost", lambda source: source.cost.update(samples=9)),
+                              ("ancestor cost", lambda source: source.ancestor_cost.update(samples=1)),
+                              ("cost observation", lambda source: source.source_cost_observation.update(scope="changed"))):
             source = self.resume(pin)
             mutate(source)
             rng = capture_rng(())

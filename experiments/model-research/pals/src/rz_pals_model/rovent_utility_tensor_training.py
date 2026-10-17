@@ -15,7 +15,7 @@ from pathlib import Path
 import tempfile
 import threading
 
-from .generation_data import fields, sha, uint
+from .generation_data import digest as metadata_digest, fields, sha, uint
 from .generation_export import COST_FIELDS
 from .generation_training import _typed_equal
 from .rovent_utility_training import (PARAMETER_FIELDS, PREPARATION_DOMAIN, COHORT_PREPARATION_DOMAIN,
@@ -31,6 +31,7 @@ MAX_PROJECTION_BYTES = 16 * 1024**2
 MAX_UPDATES = 131072
 _LOCK = threading.RLock()
 _FORK_FROM_PINNED_SOURCE = object()
+_RESUME_COST_STATE_DOMAIN = "rz-rovent-utility-resume-cost-state/1"
 
 
 def _runtime(execute):
@@ -164,6 +165,10 @@ class UtilityTensorOwner:
     source_snapshot_cost_observation: dict | None = None
     source_snapshot_cost: dict | None = None
     source_snapshot_ancestor_cost: dict | None = None
+    # A local staged-load observation, not serialized checkpoint data or a
+    # substitute for the live parent's cost/closure authority. It seals the
+    # actual admitted delta separately from the unchanged snapshot preimage.
+    source_admitted_cost_state_sha256: str | None = None
     # Post-snapshot original parent costs are separately admitted. An unknown
     # tail remains unknown and is never converted to a numeric zero delta.
     source_cost_observation: dict | None = None
@@ -206,6 +211,12 @@ def _counts(owner):
         seen.add(value)
     if owner.parent_checkpoint_sha256 is not None:
         sha(owner.parent_checkpoint_sha256)
+
+
+def _resume_cost_state_sha256(owner):
+    return metadata_digest(_RESUME_COST_STATE_DOMAIN, {
+        "cost": _plain(owner.cost), "ancestor_cost": _plain(owner.ancestor_cost),
+        "source_cost_observation": _plain(owner.source_cost_observation)})
 
 
 def _optimizer_state(owner, torch, clone):
@@ -428,14 +439,15 @@ def save_utility_checkpoint(owner, path, *, sampler_validator,
         projection = _tensor_projection(payload, _runtime(True))
         projection_pin = _write_projection(projection_path, projection,
             maximum=min(MAX_PROJECTION_BYTES, maximum - size), read_accounting=read_accounting)
+        snapshot_cost = dict(owner.cost)
+        published_output_bytes = uint(owner.cost["output_bytes"] + size + projection_pin["bytes"])
     except BaseException:
         # The partial or published output belongs to the failed run and is
         # retained. A caller may not continue from an uncertain clean owner.
         owner.quarantined = True
         owner.physical_completion = "unknown"
         raise
-    snapshot_cost = dict(owner.cost)
-    owner.cost["output_bytes"] = uint(owner.cost["output_bytes"] + size + projection_pin["bytes"])
+    owner.cost["output_bytes"] = published_output_bytes
     return {"path": str(target), "sha256": digest, "bytes": size,
             "tensor_projection": projection_pin,
             "completed_updates": owner.completed_updates, "state_sha256": payload["state_sha256"],
@@ -567,6 +579,7 @@ def _stage_utility_resume(path, expected_sha256, template, preparation, *,
                     raise ValueError("utility original checkpoint cost scope differs from scratch snapshot")
                 owner.cost = {name: uint(cost["known_lower_bound"][name] - owner.ancestor_cost[name])
                     for name in COST_FIELDS}
+            owner.source_admitted_cost_state_sha256 = _resume_cost_state_sha256(owner)
             return owner
         finally:
             restore_rng(caller_rng, devices)
@@ -599,6 +612,8 @@ def stage_utility_fork(source, *, recipe, registration, membership, sampler,
     _counts(source)
     if source.source_checkpoint_sha256 is None:
         raise ValueError("utility fork requires an exact pinned checkpoint source")
+    if source.source_admitted_cost_state_sha256 != _resume_cost_state_sha256(source):
+        raise ValueError("utility fork source changed after its exact pinned cost admission")
     source_payload = utility_tensor_payload(source, sampler_validator=source_sampler_validator, execute=True)
     # Parent source must still be precisely the tensor/journal snapshot that
     # was loaded. A later update cannot claim that older checkpoint as parent.
