@@ -43,20 +43,66 @@ pub struct UtilityInterventionTargetDigestPreimage {
     pub record_scope_digest: ContractDigest,
     pub source_snapshot_digests: Vec<ContractDigest>,
 }
+
+/// Pure historical byte codec only. It neither validates a submitted View nor
+/// reconstructs its Store pin, Ready source, Request or execution authority.
+pub fn utility_intervention_historical_snapshot_digest(
+    snapshot: &PositionSnapshot,
+) -> Result<ContractDigest, PalsError> {
+    Ok(ContractDigest(
+        crate::pals::review_context::snapshot_digest(snapshot)?,
+    ))
+}
+
+/// Borrowed, already decoded historical content. Callers remain responsible
+/// for strict Rules replay, source/record relations, original reference bytes
+/// and registered model identity; a resulting digest grants no live rights.
+pub struct UtilityInterventionHistoricalTargetContent<'a> {
+    pub root_snapshot: &'a PositionSnapshot,
+    pub record_scope_digest: ContractDigest,
+    pub target_record: u16,
+    pub original_first_move: ContractMove16,
+    pub reference_json: &'a [u8],
+    pub model_identity: &'a crate::cpu_value::CpuValueIdentity,
+    pub source_snapshots: &'a [PositionSnapshot],
+}
+
+/// Shared hash framing for actual capture and detached historical content.
+/// No owner, generation, clock, Request, actor, or worker can be issued here.
+pub fn utility_intervention_historical_target_digest(
+    content: UtilityInterventionHistoricalTargetContent<'_>,
+) -> Result<ContractDigest, PalsError> {
+    let mut hash = Sha256::new();
+    hash.update(UTILITY_INTERVENTION_TARGET_DOMAIN.as_bytes());
+    hash.update([0]);
+    hash.update(utility_intervention_historical_snapshot_digest(content.root_snapshot)?.0);
+    hash.update(content.record_scope_digest.0);
+    hash.update(content.target_record.to_le_bytes());
+    hash.update(content.original_first_move.bits().to_le_bytes());
+    utility_route_bytes(&mut hash, content.reference_json);
+    utility_route_bytes(
+        &mut hash,
+        &serde_json::to_vec(content.model_identity).map_err(|_| RoleError::InvalidOutput)?,
+    );
+    hash.update((content.source_snapshots.len() as u64).to_le_bytes());
+    for snapshot in content.source_snapshots {
+        hash.update(utility_intervention_historical_snapshot_digest(snapshot)?.0);
+    }
+    Ok(ContractDigest(hash.finalize().into()))
+}
+
 pub fn utility_intervention_target_digest_preimage(
     input: &NnuecUtilityInputCapture,
 ) -> Result<UtilityInterventionTargetDigestPreimage, PalsError> {
     Ok(UtilityInterventionTargetDigestPreimage {
-        root_snapshot_digest: ContractDigest(crate::pals::review_context::snapshot_digest(
+        root_snapshot_digest: utility_intervention_historical_snapshot_digest(
             input.root_snapshot(),
-        )?),
+        )?,
         record_scope_digest: ContractDigest(input.provenance().record_scope_digest),
         source_snapshot_digests: input
             .source_snapshots()
             .iter()
-            .map(|snapshot| {
-                crate::pals::review_context::snapshot_digest(snapshot).map(ContractDigest)
-            })
+            .map(utility_intervention_historical_snapshot_digest)
             .collect::<Result<_, _>>()?,
     })
 }
@@ -66,28 +112,18 @@ pub fn utility_intervention_target_digest_preimage(
 pub fn utility_intervention_target_digest(
     input: &NnuecUtilityInputCapture,
 ) -> Result<ContractDigest, PalsError> {
-    let preimage = utility_intervention_target_digest_preimage(input)?;
-    let mut hash = Sha256::new();
-    hash.update(UTILITY_INTERVENTION_TARGET_DOMAIN.as_bytes());
-    hash.update([0]);
-    hash.update(preimage.root_snapshot_digest.0);
-    hash.update(preimage.record_scope_digest.0);
-    hash.update(input.target_record().to_le_bytes());
-    hash.update(
-        Move16::pack(input.original_first_move())?
-            .bits()
-            .to_le_bytes(),
-    );
-    utility_route_bytes(&mut hash, input.input_bytes());
-    utility_route_bytes(
-        &mut hash,
-        &serde_json::to_vec(input.model_identity()).map_err(|_| RoleError::InvalidOutput)?,
-    );
-    hash.update((input.source_snapshots().len() as u64).to_le_bytes());
-    for digest in preimage.source_snapshot_digests {
-        hash.update(digest.0);
-    }
-    Ok(ContractDigest(hash.finalize().into()))
+    utility_intervention_historical_target_digest(UtilityInterventionHistoricalTargetContent {
+        root_snapshot: input.root_snapshot(),
+        record_scope_digest: ContractDigest(input.provenance().record_scope_digest),
+        target_record: input.target_record(),
+        original_first_move: ContractMove16::encode(
+            rz_contracts::Move::try_from(input.original_first_move())
+                .map_err(|_| RoleError::InvalidOutput)?,
+        ),
+        reference_json: input.input_bytes(),
+        model_identity: input.model_identity(),
+        source_snapshots: input.source_snapshots(),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +172,11 @@ impl<Q> UtilityInterventionTarget<Q> {
     }
     pub fn budget(&self) -> FrameBudget {
         self.source.work().budget
+    }
+    /// Original bounded witness set, including superseded owner publications.
+    /// Iteration order is unspecified; compare the set, not HashSet traversal.
+    pub fn baseline_witnesses(&self) -> impl Iterator<Item = &ContractDigest> {
+        self.preparation.baseline.iter()
     }
     pub fn original_deadline(&self) -> Deadline {
         self.source.work().original_deadline
@@ -920,11 +961,17 @@ mod tests {
     // component tests run neither P/C neural inference nor an R search and
     // do not attest a manager's native role/installed-owner acceptance.
     use super::*;
+    use crate::contract_time::InstantClock;
     use crate::cpu_value::nnuec::v2::review::{BoundNnuecReviewContext, PreparationActor};
+    use crate::cpu_worker::CpuCreditLedger;
     use crate::pals::coordinator::{CoordinatorError, RefinementMachine};
+    use crate::pals::rovent_engine::RootMoveDomain;
+    use crate::pals::rovent_frontier::{FrontierLimits, FrontierRegistration};
     use rz_contracts::MonotonicTick;
+    use rz_contracts::rovent::{ExecutionMode, SearchGoal};
+    use std::num::NonZeroU16;
 
-    type Port = AdaptiveEnginePort<LegalOrderRoleMock>;
+    type Port = AdaptiveEnginePort<AdaptivePortModel>;
     type Work = CoordinatorWork<ReviewView, AdaptivePortQuestion>;
     type Machine = RefinementMachine<ReviewView, AdaptivePortQuestion>;
 
@@ -936,11 +983,72 @@ mod tests {
         Arc<BoundNnuecReviewContext>,
         PreparationActor,
     ) {
-        let mut port = super::super::super::port_tests::setup(Position::startpos(), 4);
-        port.engine.semantic.rovent_frontier = Some(Box::new(
-            super::super::super::frontier_port::tests::controller(&port),
-        ));
-        port.prepare_root_rules().unwrap();
+        let value = LegalOrderRoleMock.value_identity().unwrap().clone();
+        let namespace = AdaptiveModelNamespace::new(
+            value.clone(),
+            ContractDigest([5; 32]),
+            ContractDigest([6; 32]),
+            rz_contracts::PrecisionProfile::Fp32,
+            1,
+        )
+        .unwrap();
+        let model =
+            AdaptivePortModel::new_with_namespace(value.model.clone(), Some(value), namespace)
+                .unwrap();
+        let mut port = super::super::super::port_tests::setup_with_model(
+            Position::startpos(),
+            4,
+            ResolverPolicy::OwnRawRestricted,
+            model,
+        );
+        let clock = port.deadline.clock;
+        let root_moves = Arc::new(RootMoveDomain::new(&port.rules, None).unwrap());
+        let ledger = CpuCreditLedger::new(
+            port.authority,
+            port.limits.max_cpu_nodes,
+            InstantClock::new(clock, Instant::now()),
+        )
+        .unwrap();
+        let native_ledger = ledger.identity();
+        let root_budget = ContractDigest([10; 32]);
+        let registration = FrontierRegistration {
+            authority: port.authority,
+            mode: ExecutionMode::CpuPcr,
+            original_deadline: port.deadline,
+            root_budget,
+            goal: SearchGoal {
+                depth_plies: NonZeroU16::new(2),
+                mate_moves: None,
+            },
+            nodes: Some(port.limits.max_cpu_nodes),
+            selective_policy: ContractDigest([11; 32]),
+            root_rules: Arc::clone(&port.rules),
+            root_moves: Arc::clone(&root_moves),
+            root_state: port.root_state_id(),
+            model_namespace: Arc::new(port.model_namespace().unwrap().clone()),
+            native_ledger: Some(native_ledger.clone()),
+        };
+        port.attach_rovent_frontier(
+            registration,
+            FrontierLimits {
+                maximum_goal_plies: NonZeroU16::new(16).unwrap(),
+                maximum_frames: 16,
+                maximum_paths: 64,
+                maximum_mate_nodes: 64,
+                maximum_native_receipts: 16,
+            },
+            AdaptiveFrontierStartup {
+                mode: ExecutionMode::CpuPcr,
+                root_budget,
+                root_moves: &root_moves,
+                native_ledger: Some(&native_ledger),
+            },
+            clock,
+            MonotonicTick(0),
+        )
+        .unwrap();
+        port.prepare_rovent_root_rules(clock, MonotonicTick(0))
+            .unwrap();
         let line = ["e2e4", "e7e5"].map(|text| BoardMove::from_uci(text).unwrap());
         port.replay_node(&line).unwrap();
         port.record_hot(RecordKind::Proposal, &line, None).unwrap();
@@ -1020,6 +1128,57 @@ mod tests {
             .bind_utility_intervention_target(preparation, source, input)
             .unwrap_or_else(|_| panic!("actual same-Request target"));
         (port, machine, work, target, bound, actor)
+    }
+
+    #[test]
+    fn historical_target_codec_matches_actual_capture_without_new_authority_or_pins() {
+        let (port, mut machine, work, target, _bound, actor) = fixture();
+        let capture = target.input_capture();
+        let before_pins = port.engine.semantic.stores.review_pin_count().unwrap();
+        let metadata = utility_intervention_target_digest_preimage(capture).unwrap();
+        assert_eq!(
+            metadata.root_snapshot_digest,
+            utility_intervention_historical_snapshot_digest(capture.root_snapshot()).unwrap()
+        );
+        let content = || UtilityInterventionHistoricalTargetContent {
+            root_snapshot: capture.root_snapshot(),
+            record_scope_digest: metadata.record_scope_digest,
+            target_record: capture.target_record(),
+            original_first_move: work.original_first_move,
+            reference_json: capture.input_bytes(),
+            model_identity: capture.model_identity(),
+            source_snapshots: capture.source_snapshots(),
+        };
+        let historical = utility_intervention_historical_target_digest(content()).unwrap();
+        assert_eq!(historical, target.neutral_target_digest());
+        assert_eq!(
+            historical,
+            utility_intervention_target_digest(capture).unwrap()
+        );
+        let mut changed = content();
+        changed.target_record += 1;
+        assert_ne!(
+            utility_intervention_historical_target_digest(changed).unwrap(),
+            historical
+        );
+        let mut changed_bytes = capture.input_bytes().to_vec();
+        changed_bytes.push(b' ');
+        let mut changed = content();
+        changed.reference_json = &changed_bytes;
+        assert_ne!(
+            utility_intervention_historical_target_digest(changed).unwrap(),
+            historical,
+            "raw reference bytes are never silently canonicalized"
+        );
+        assert_eq!(
+            port.engine.semantic.stores.review_pin_count().unwrap(),
+            before_pins
+        );
+        assert_eq!(machine.frames().count(), 1);
+        assert_eq!(machine.intervention_source_count(), 0);
+        machine.revoke();
+        actor.shutdown().unwrap();
+        machine.retired_after_worker_join();
     }
 
     #[test]

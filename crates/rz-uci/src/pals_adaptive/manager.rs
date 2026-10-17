@@ -91,6 +91,8 @@ mod collection;
 mod cpu_semantic;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 mod utility_cohort;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod utility_intervention;
 mod utility_route;
 pub use cpu_semantic::{
     AdaptiveCpuCaptureCustody, AdaptiveCpuCapturePlan, AdaptiveCpuSemanticObserver,
@@ -101,6 +103,10 @@ pub use cpu_semantic::{
 pub use utility_cohort::{
     UtilityCohortReadyDisposition, UtilityCohortReadyObserver, UtilityCohortReadyOffer,
     UtilityCohortReadyRejection, UtilityCohortReadySnapshot, UtilityCohortTrialCustody,
+};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use utility_intervention::{
+    UtilityInterventionSourceDisposition, UtilityInterventionSourceObserver,
 };
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub use utility_route::UtilityCohortRootClosureProof;
@@ -360,6 +366,118 @@ pub trait AdaptiveSearchDriver<Q> {
     > {
         Err(AdaptiveManagerError::Invalid(
             "driver has no actual utility source",
+        ))
+    }
+    #[allow(clippy::result_large_err)]
+    fn bind_utility_intervention_target(
+        &self,
+        preparation: rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        source: rz_search::pals::coordinator::UtilityInterventionReadySource<Q>,
+        input: Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionTarget<Q>,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+            rz_search::pals::coordinator::UtilityInterventionReadySource<Q>,
+            Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+        ),
+    > {
+        Err((
+            AdaptiveManagerError::Invalid("intervention target factory unsupported"),
+            preparation,
+            source,
+            input,
+        ))
+    }
+    #[allow(clippy::result_large_err)]
+    fn prepare_utility_intervention(
+        &mut self,
+        target: rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionTarget<Q>,
+        _: rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteRecipient,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionCandidate<Q>,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionTarget<Q>,
+        ),
+    > {
+        Err((
+            AdaptiveManagerError::Invalid("intervention query factory unsupported"),
+            target,
+        ))
+    }
+    #[allow(clippy::result_large_err)]
+    fn bind_utility_intervention_route(
+        &self,
+        admission:rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionAdmission<Q>,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionAdmission<Q>,
+        ),
+    > {
+        Err((
+            AdaptiveManagerError::Invalid("intervention action factory unsupported"),
+            admission,
+        ))
+    }
+    fn prepare_utility_intervention_arm_request(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::cpu_value::nnuec::v2::Model,
+        _: Arc<AtomicBool>,
+    ) -> Result<rz_search::cpu_value::nnuec::v2::review::Request, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "intervention arm Request unsupported",
+        ))
+    }
+    #[allow(clippy::result_large_err)]
+    fn attach_utility_intervention_arm_request(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+        request: rz_search::cpu_value::nnuec::v2::review::Request,
+    ) -> Result<
+        rz_search::cpu_value::nnuec::v2::review::Request,
+        (
+            AdaptiveManagerError,
+            rz_search::cpu_value::nnuec::v2::review::Request,
+        ),
+    > {
+        Err((
+            AdaptiveManagerError::Invalid("intervention original arm Request unsupported"),
+            request,
+        ))
+    }
+    #[allow(clippy::result_large_err)]
+    fn bind_utility_intervention_arm_capture(
+        &self,
+        _: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+        input: Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+    ) -> Result<
+        (),
+        (
+            AdaptiveManagerError,
+            Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+        ),
+    > {
+        Err((
+            AdaptiveManagerError::Invalid("intervention arm capture unsupported"),
+            input,
+        ))
+    }
+    fn utility_intervention_arm_metadata(
+        &self,
+        _: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<serde_json::Value, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "intervention arm metadata unsupported",
         ))
     }
     fn prepare_utility_route_input_request(
@@ -1960,6 +2078,8 @@ where
     utility_route: Option<utility_route::UtilityRouteState<Q>>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     utility_cohort: Option<utility_cohort::UtilityCohortState<Q>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    utility_intervention: Option<utility_intervention::UtilityInterventionState<Q>>,
     utility_route_sequence: u64,
     // Failed unique prepared-job cleanup retains the same job and grant. No
     // unverified rejection can refund credit or discard its capture custody.
@@ -5985,7 +6105,8 @@ where
         };
         let native_worker_limit = advice.map_or(0, |advice| usize::from(advice.workers));
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-        let cohort_changed = self.maybe_admit_utility_cohort()?;
+        let cohort_changed =
+            self.maybe_admit_utility_cohort()? | self.maybe_admit_utility_intervention()?;
         #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
         let cohort_changed = false;
         let mut changed = peers_changed || reciprocal_changed || cohort_changed;
@@ -6255,7 +6376,11 @@ where
                 }
                 Err(error) => return Err(error),
             };
-            if utility_started && work.input.stage.role().is_some() {
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            let preparing_intervention = self.utility_intervention.is_some();
+            #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+            let preparing_intervention = false;
+            if utility_started && (work.input.stage.role().is_some() || preparing_intervention) {
                 self.ready.admit(selected.job).map_err(|_| {
                     AdaptiveManagerError::Capacity("original utility ready descriptor")
                 })?;
@@ -7805,7 +7930,6 @@ where
             self.acknowledgements.clear();
             self.retained_native_permits.clear();
             self.retained_native_receipts.clear();
-            self.machine.retired_after_worker_join();
             self.ready_ids.clear();
             self.validator_waiting.clear();
             self.root_ranking_proof = None;
@@ -7816,6 +7940,9 @@ where
             {
                 self.phase = ManagerPhase::Quarantined;
             } else {
+                // Retain the original intervention source if final credit or
+                // CPU custody checks quarantine this otherwise drained root.
+                self.machine.retired_after_worker_join();
                 self.phase = ManagerPhase::Finished;
                 self.finished_at.get_or_insert_with(Instant::now);
             }

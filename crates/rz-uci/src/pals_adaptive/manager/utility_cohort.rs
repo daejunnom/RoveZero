@@ -129,6 +129,23 @@ pub struct UtilityCohortReadyOffer<Q> {
     semantic: UtilityCohortOfferSemanticSource<Q>,
 }
 impl<Q> UtilityCohortReadyOffer<Q> {
+    /// Read-only source eligibility, not an alternative recipient offer.
+    pub(in crate::pals_adaptive) fn intervention_target_matches(&self, target: u16) -> bool {
+        self.selected.upgrade().is_some_and(|view| {
+            view.records().get(usize::from(target)).is_some_and(|r| {
+                r.kind == rz_search::pals::engine::RecordKind::Proposal && !r.line.is_empty()
+            }) && view
+                .records_metadata()
+                .get(usize::from(target))
+                .is_some_and(|m| {
+                    m.anchor == 0
+                        && m.original_first_move.is_some_and(|movement| {
+                            rz_contracts::Move::try_from(movement)
+                                .is_ok_and(|movement| Move16::encode(movement) == self.first)
+                        })
+                })
+        })
+    }
     pub fn semantic_source(&self) -> Option<&UtilityCohortOfferSemanticSource<Q>> {
         Some(&self.semantic)
     }
@@ -302,6 +319,7 @@ where
             self.check_running()?;
             if self.root_started
                 || self.utility_cohort.is_some()
+                || self.utility_intervention.is_some()
                 || self.utility_route.is_some()
                 || self.exclusive_requested
                 || self.registration.endpoints.load_v
@@ -386,17 +404,20 @@ where
             .is_none_or(|trial| trial.matches_ready_work(work) || self.utility_scope_open())
     }
     pub(super) fn cohort_action_expired(&self, now: Instant) -> bool {
-        self.utility_cohort.as_ref().is_some_and(|state| {
-            now >= state
-                .window
-                .map_or(state.prelude_cutoff, |window| window.action_cutoff())
-        })
+        self.intervention_action_expired(now)
+            || self.utility_cohort.as_ref().is_some_and(|state| {
+                now >= state
+                    .window
+                    .map_or(state.prelude_cutoff, |window| window.action_cutoff())
+            })
     }
     pub(super) fn cohort_cleanup_ceiling(&self) -> Option<Instant> {
-        self.utility_cohort.as_ref().map(|state| {
-            state
-                .window
-                .map_or(state.maximum_cleanup, |window| window.cleanup_cutoff())
+        self.intervention_cleanup_ceiling().or_else(|| {
+            self.utility_cohort.as_ref().map(|state| {
+                state
+                    .window
+                    .map_or(state.maximum_cleanup, |window| window.cleanup_cutoff())
+            })
         })
     }
     /// A trial narrows future work only. All original submitted deadlines,
@@ -643,6 +664,23 @@ where
     pub fn capture_utility_cohort_ready_snapshot(
         &mut self,
     ) -> Result<UtilityCohortReadySnapshot<Q>, AdaptiveManagerError> {
+        let state = self
+            .utility_cohort
+            .as_ref()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "cohort original profile absent",
+            ))?;
+        let bounds = (state.profile, state.prelude_cutoff, state.maximum_cleanup);
+        self.capture_utility_source_snapshot(bounds.0, bounds.1, bounds.2)
+    }
+    // Same original sampler, with a distinct caller-owned declaration. It
+    // records actual source offers; alternative intervention arms are absent.
+    pub(super) fn capture_utility_source_snapshot(
+        &mut self,
+        profile: Digest,
+        prelude_cutoff: Instant,
+        maximum_cleanup: Instant,
+    ) -> Result<UtilityCohortReadySnapshot<Q>, AdaptiveManagerError> {
         let now = self.check_running()?;
         if !self.root_started
             || self.registration.endpoints.execution_use != CpuExecutionUse::Collection
@@ -802,19 +840,9 @@ where
             hard_deadline: self.registration.hard_deadline,
             cleanup_deadline: cleanup,
             captured_at: Instant::now(),
-            profile: self
-                .utility_cohort
-                .as_ref()
-                .ok_or(AdaptiveManagerError::Invalid(
-                    "cohort original profile absent",
-                ))?
-                .profile,
-            prelude_cutoff: self.utility_cohort.as_ref().expect("cohort").prelude_cutoff,
-            maximum_cleanup: self
-                .utility_cohort
-                .as_ref()
-                .expect("cohort")
-                .maximum_cleanup,
+            profile,
+            prelude_cutoff,
+            maximum_cleanup,
             counters: self.counters,
             native_credit,
             native_ledger: self.native_ledger()?.identity(),

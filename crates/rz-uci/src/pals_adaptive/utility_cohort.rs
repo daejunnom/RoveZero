@@ -680,7 +680,7 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
     }
 }
 
-fn actual_offer_group<Q>(
+pub(super) fn actual_offer_group<Q>(
     snapshot: &UtilityCohortReadySnapshot<Q>,
 ) -> Result<Digest, AdaptiveManagerError> {
     let mut offers = Vec::new();
@@ -1334,7 +1334,7 @@ fn bytes_digest(domain: &str, bytes: &[u8]) -> Digest {
     h.update(bytes);
     Digest(h.finalize().into())
 }
-fn resource_observations_known<Q>(snapshot: &UtilityCohortReadySnapshot<Q>) -> bool {
+pub(super) fn resource_observations_known<Q>(snapshot: &UtilityCohortReadySnapshot<Q>) -> bool {
     let known = |r: Option<
         &Result<rz_runtime::adaptive::CpuThreadReadback, rz_runtime::adaptive::CpuResourceError>,
     >| {
@@ -1670,7 +1670,7 @@ impl<Q> UtilityTrialAdmission<Q> {
 
 /// Projection is issued only after the actual same-owner release and pin-zero
 /// checks above. Scalar historical observations do not recreate those caps.
-fn physical_closure_value<Q, M: rz_search::pals::engine::RoleModel>(
+pub(super) fn physical_closure_value<Q, M: rz_search::pals::engine::RoleModel>(
     snapshot: &UtilityCohortReadySnapshot<Q>,
     proof: &UtilityCohortRootClosureProof,
     original: &rz_search::pals::engine::preparing_root::RetiredResearcherOwner<M>,
@@ -1732,7 +1732,7 @@ pub(super) fn common_node_value(work: rz_search::pals::rovent_frontier::Frontier
     "outstanding_native_executions":work.outstanding_native_executions,"native_usage_known":work.native_usage_known})
 }
 
-fn checked_trial_window(
+pub(super) fn checked_trial_window(
     started: Instant,
     action_ns: u64,
     cleanup_ns: u64,

@@ -90,6 +90,8 @@ pub struct UtilityRoutePendingClosure<Q> {
     cohort_materialized: Option<crate::pals_adaptive::UtilityTrialMaterializedSource>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     cohort_materialization_error: Option<AdaptiveManagerError>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    intervention: Option<crate::pals_adaptive::UtilityInterventionTrialAdmission<Q>>,
 }
 struct ExpectedUtilityEngineRelease {
     profile: CpuWorkerProfile,
@@ -183,6 +185,10 @@ impl UtilityCohortRootClosureProof {
     }
 }
 impl<Q> UtilityRoutePendingClosure<Q> {
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn is_intervention(&self) -> bool {
+        self.intervention.is_some()
+    }
     pub fn is_cohort(&self) -> bool {
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         {
@@ -193,6 +199,15 @@ impl<Q> UtilityRoutePendingClosure<Q> {
     }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub fn cohort_cleanup_deadline(&self) -> Option<Instant> {
+        if let Some(trial) = &self.intervention {
+            return Some(
+                trial
+                    .window()
+                    .map_or(trial.snapshot.declared_cleanup_ceiling(), |w| {
+                        w.cleanup_cutoff()
+                    }),
+            );
+        }
         self.cohort.as_ref().map(|owner| {
             owner.trial().window().map_or(
                 owner.trial().snapshot().declared_cleanup_ceiling(),
@@ -224,6 +239,108 @@ impl<Q> UtilityRoutePendingClosure<Q> {
                     .count()
                     == 1
             })
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn finish_intervention_with_nnuec_release(
+        mut self,
+        source: &rz_search::cpu_worker::DeferredNnuecRSource,
+        releases: &[rz_search::cpu_worker::NnuecEngineReleaseAck],
+        cache: &rz_search::cpu_value::nnuec::v2::retirement::NnuecCacheReleaseAck,
+    ) -> Result<
+        (
+            crate::pals_adaptive::UtilityInterventionTrialAdmission<Q>,
+            UtilityCohortRootClosureProof,
+        ),
+        UtilityRouteFinalizationRejection<Q>,
+    > {
+        let captures_match = self.state.outcome.as_ref().is_none_or(|o| {
+            o.physical_input_captures()
+                .all(|i| i.matches_context_cache_release(cache))
+        }) && self.state.unresolved.as_ref().is_none_or(|o| {
+            o.physical_input_captures()
+                .all(|i| i.matches_context_cache_release(cache))
+        }) && self
+            .state
+            .historical_input
+            .as_ref()
+            .is_none_or(|i| i.matches_context_cache_release(cache));
+        if self.intervention.is_none()
+            || self.cohort.is_some()
+            || !self.actual_release_matches(source, releases, cache)
+            || !captures_match
+            || self
+                .state
+                .terminal_ack
+                .as_ref()
+                .is_some_and(|a| !a.matches_cache_release(cache))
+        {
+            return Err(UtilityRouteFinalizationRejection {
+                pending: self,
+                error: AdaptiveManagerError::Invalid(
+                    "intervention actual engine/cache/capture release mismatch",
+                ),
+            });
+        }
+        let release_finished = Instant::now();
+        if release_finished < self.root_finished {
+            return Err(UtilityRouteFinalizationRejection {
+                pending: self,
+                error: AdaptiveManagerError::Invalid(
+                    "intervention release precedes actual root fence",
+                ),
+            });
+        }
+        let trial = self
+            .intervention
+            .take()
+            .expect("validated original /2 trial");
+        let reason = if let Some(reason) = trial.unavailable_reason() {
+            Some(reason)
+        } else if self.state.started.is_none() {
+            Some("missing_actual_gate")
+        } else if trial.materialization_error.is_some() {
+            Some("historical_materialization_failed")
+        } else if self.state.failed {
+            Some("semantic_failure")
+        } else if self.state.outcome.is_none() && self.state.preparation_interrupted {
+            Some("preparation_interrupted")
+        } else if self.state.outcome.is_none() {
+            Some("missing_semantic_consumption")
+        } else {
+            None
+        };
+        let snapshot = &trial.snapshot.actual;
+        let proof = UtilityCohortRootClosureProof {
+            cohort: trial.cohort_id(),
+            trial: trial.sequence(),
+            receipt: self.receipt,
+            started: self.state.started.unwrap_or(snapshot.captured_at()),
+            root_finished: self.root_finished,
+            release_finished,
+            baseline: if self.state.started.is_some() {
+                self.state.baseline
+            } else {
+                snapshot.counters()
+            },
+            final_counters: self.final_counters,
+            native_baseline: if self.state.started.is_some() {
+                self.state.native_baseline
+            } else {
+                (
+                    snapshot.native_credit().spent_native_nodes,
+                    snapshot.native_credit().reserved_native_nodes,
+                )
+            },
+            native_final: self.native_final,
+            outcome: self.state.outcome.take(),
+            unresolved: self.state.unresolved.take(),
+            historical_input: self.state.historical_input.take(),
+            reason,
+            materialized: None,
+            materialization_error: None,
+        };
+        Ok((trial, proof))
     }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     #[allow(clippy::result_large_err)]
@@ -378,6 +495,16 @@ impl<Q> UtilityRoutePendingClosure<Q> {
         UtilityRouteFinalizationRejection<Q>,
     > {
         let valid = !self.is_cohort()
+            && {
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                {
+                    !self.is_intervention()
+                }
+                #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+                {
+                    true
+                }
+            }
             && self.actual_release_matches(source, releases, cache)
             && !self.state.failed
             && self.state.semantics_closed
@@ -455,34 +582,34 @@ impl<Q> UtilityRoutePendingClosure<Q> {
 }
 
 pub(super) struct UtilityRouteState<Q> {
-    target: u16,
-    recipient: UtilityRouteRecipient,
-    sequence: u64,
-    started: Option<Instant>,
-    baseline: AdaptiveManagerCounters,
-    native_baseline: (u64, u64),
-    resource_profile: Digest,
-    cost_epoch: Digest,
-    original: Option<CoordinatorWork<ReviewView, Q>>,
-    preparation: Option<UtilityRoutePreparation>,
-    request: Option<Request>,
-    expected: Option<Provenance>,
-    actor_outstanding: bool,
-    bound: Option<Arc<BoundNnuecReviewContext>>,
-    terminal_ack: Option<NnuecPreparationTerminalAck>,
-    preparation_observation: Option<PreparationObservation>,
-    unmatched_completion: Option<Completion>,
-    historical_input: Option<Arc<NnuecUtilityInputCapture>>,
-    request_submitted: bool,
-    action: Option<UtilityRouteAction>,
-    outcome: Option<UtilityRouteSemanticOutcome>,
-    unresolved: Option<UtilityRouteUnresolvedAction>,
-    guards: HashMap<StepExecution, UtilityRouteCommitGuard>,
-    committed: Vec<StepExecution>,
-    failed: bool,
-    preparation_interrupted: bool,
-    semantics_closed: bool,
-    cancel: Arc<AtomicBool>,
+    pub(super) target: u16,
+    pub(super) recipient: UtilityRouteRecipient,
+    pub(super) sequence: u64,
+    pub(super) started: Option<Instant>,
+    pub(super) baseline: AdaptiveManagerCounters,
+    pub(super) native_baseline: (u64, u64),
+    pub(super) resource_profile: Digest,
+    pub(super) cost_epoch: Digest,
+    pub(super) original: Option<CoordinatorWork<ReviewView, Q>>,
+    pub(super) preparation: Option<UtilityRoutePreparation>,
+    pub(super) request: Option<Request>,
+    pub(super) expected: Option<Provenance>,
+    pub(super) actor_outstanding: bool,
+    pub(super) bound: Option<Arc<BoundNnuecReviewContext>>,
+    pub(super) terminal_ack: Option<NnuecPreparationTerminalAck>,
+    pub(super) preparation_observation: Option<PreparationObservation>,
+    pub(super) unmatched_completion: Option<Completion>,
+    pub(super) historical_input: Option<Arc<NnuecUtilityInputCapture>>,
+    pub(super) request_submitted: bool,
+    pub(super) action: Option<UtilityRouteAction>,
+    pub(super) outcome: Option<UtilityRouteSemanticOutcome>,
+    pub(super) unresolved: Option<UtilityRouteUnresolvedAction>,
+    pub(super) guards: HashMap<StepExecution, UtilityRouteCommitGuard>,
+    pub(super) committed: Vec<StepExecution>,
+    pub(super) failed: bool,
+    pub(super) preparation_interrupted: bool,
+    pub(super) semantics_closed: bool,
+    pub(super) cancel: Arc<AtomicBool>,
 }
 impl<Q> UtilityRouteState<Q> {
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -563,7 +690,7 @@ where
         recipient: UtilityRouteRecipient,
     ) -> Result<(), AdaptiveManagerError> {
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-        if self.utility_cohort.is_some() {
+        if self.utility_cohort.is_some() || self.utility_intervention.is_some() {
             return Err(AdaptiveManagerError::Invalid(
                 "cohort cannot relabel root-local utility route",
             ));
@@ -626,6 +753,10 @@ where
         }
     }
     pub(super) fn utility_allows_frame(&self, frame: FrameId) -> bool {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if !self.intervention_allows_frame(frame) {
+            return false;
+        }
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if self.utility_cohort.is_some() {
             let Some(entry) = self.machine.frame(frame) else {
@@ -712,6 +843,8 @@ where
         let started = Instant::now();
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         self.arm_utility_cohort(work, started)?;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        self.arm_utility_intervention(work, started)?;
         let native_baseline = self.native_ledger()?.global_usage()?;
         let mut profile = Sha256::new();
         profile.update(b"rz-rovent-utility-original-resource-owner/1\0");
@@ -756,7 +889,16 @@ where
         // Preserve the opened interval even if source admission fails.
         let preparation = self.driver.prepare_utility_route(work, state.target)?;
         state.preparation = Some(preparation);
-        if recipient != UtilityRouteRecipient::Researcher {
+        if recipient != UtilityRouteRecipient::Researcher || {
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            {
+                self.utility_intervention.is_some()
+            }
+            #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+            {
+                false
+            }
+        } {
             let model = &self.nnuec.as_ref().expect("checked NNUEC root").model;
             let request = self.driver.prepare_utility_route_input_request(
                 state.preparation.as_mut().expect("source preparation"),
@@ -775,6 +917,30 @@ where
         work: &CoordinatorWork<ReviewView, Q>,
         request: Request,
     ) -> Result<Request, AdaptiveManagerError> {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self.utility_intervention.is_some() {
+            if let Some(state) = self
+                .utility_route
+                .as_mut()
+                .filter(|s| s.action.is_some() && s.recipient == UtilityRouteRecipient::Researcher)
+            {
+                let action = state.action.as_mut().expect("actual intervention action");
+                return match self
+                    .driver
+                    .attach_utility_intervention_arm_request(action, work, request)
+                {
+                    Ok(request) => {
+                        state.expected = Some(request.provenance().clone());
+                        Ok(request)
+                    }
+                    Err((error, request)) => {
+                        state.request = Some(request);
+                        state.failed = true;
+                        Err(error)
+                    }
+                };
+            }
+        }
         let Some(state) = self.utility_route.as_mut().filter(|state| {
             state.is_open()
                 && state.action.is_none()
@@ -814,6 +980,10 @@ where
         &mut self,
         bound: Arc<BoundNnuecReviewContext>,
     ) -> Result<bool, AdaptiveManagerError> {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self.utility_intervention.is_some() {
+            return self.bind_intervention_neutral_bound(bound);
+        }
         let Some(state) = self
             .utility_route
             .as_mut()
@@ -892,6 +1062,13 @@ where
     ) -> Result<bool, AdaptiveManagerError> {
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         {
+            let (changed, ready) = self.pump_intervention_cache_prelude(actor)?;
+            if !ready {
+                return Ok(changed);
+            }
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        {
             let (changed, ready) = self.pump_cohort_cache_prelude(actor)?;
             if !ready {
                 return Ok(changed);
@@ -934,8 +1111,17 @@ where
         if let Some(bound) = retry_bound {
             return self.utility_bind_bound(bound);
         }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let neutral_intervention = self.utility_intervention.is_some()
+            && self
+                .utility_route
+                .as_ref()
+                .is_some_and(|s| s.action.is_none());
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        let neutral_intervention = false;
         let Some(state) = self.utility_route.as_mut().filter(|state| {
-            state.is_open() && state.recipient != UtilityRouteRecipient::Researcher
+            state.is_open()
+                && (state.recipient != UtilityRouteRecipient::Researcher || neutral_intervention)
         }) else {
             return Ok(false);
         };
@@ -1282,6 +1468,18 @@ where
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         self.materialize_utility_cohort_trial()?;
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        self.materialize_utility_intervention_trial()?;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if self
+            .utility_intervention
+            .as_ref()
+            .is_some_and(|s| s.observer.is_some())
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "intervention original source observer must be recovered",
+            ));
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if self
             .utility_cohort
             .as_ref()
@@ -1342,6 +1540,11 @@ where
             .utility_cohort
             .take()
             .map_or((None, None, None), |state| state.into_trial());
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let intervention = self
+            .utility_intervention
+            .take()
+            .and_then(|mut state| state.trial.take());
         Ok(Some(UtilityRoutePendingClosure {
             state,
             receipt,
@@ -1356,6 +1559,8 @@ where
             cohort_materialized,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             cohort_materialization_error,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            intervention,
         }))
     }
 }

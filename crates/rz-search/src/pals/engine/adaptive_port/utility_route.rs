@@ -32,9 +32,11 @@ pub use conditional_witness::{
 };
 pub use intervention::{
     UTILITY_INTERVENTION_TARGET_DOMAIN, UtilityInterventionAdmission,
-    UtilityInterventionBindRejection, UtilityInterventionCandidate, UtilityInterventionTarget,
+    UtilityInterventionBindRejection, UtilityInterventionCandidate,
+    UtilityInterventionHistoricalTargetContent, UtilityInterventionTarget,
     UtilityInterventionTargetBindRejection, UtilityInterventionTargetDigestPreimage,
     UtilityInterventionUnavailable, utility_intervention_arm_question_preimage,
+    utility_intervention_historical_snapshot_digest, utility_intervention_historical_target_digest,
     utility_intervention_target_digest, utility_intervention_target_digest_preimage,
 };
 

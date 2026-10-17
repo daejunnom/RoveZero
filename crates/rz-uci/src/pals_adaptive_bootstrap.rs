@@ -780,6 +780,8 @@ fn prepare_actual(
                         utility_route_completed: None,
                         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                         utility_trial_retired: None,
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        utility_intervention_trial_retired: None,
                         external_teacher: Some(hooks.teacher_observer),
                         cooperative: None,
                     },

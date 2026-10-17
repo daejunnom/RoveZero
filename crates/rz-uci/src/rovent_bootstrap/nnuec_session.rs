@@ -1786,12 +1786,54 @@ impl RoventNnuecSessionDriver {
             );
         };
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-        if retired.utility_route.is_some() && retired.utility_cohort.is_some() {
+        if usize::from(retired.utility_route.is_some())
+            + usize::from(retired.utility_cohort.is_some())
+            + usize::from(retired.utility_intervention.is_some())
+            > 1
+        {
             return Err(self.retain(
                 (parts.native, retired, receipt),
                 "RoventNnuecUtilityRetirementKind",
                 "one original retirement returned both root-local and cohort outputs",
             ));
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let Some(trial) = retired.utility_intervention.take() {
+            if !collection_admitted
+                || trial.authority() != context.authority
+                || !trial.matches_root_admission(&receipt.root_admission)
+            {
+                return Err(self.retain(
+                    (parts.native, retired, trial, receipt),
+                    "RoventNnuecInterventionTrialScope",
+                    "/2 retirement differs from original Collection root",
+                ));
+            }
+            let Some(observer) = &self.collection_hooks.utility_intervention_trial_retired else {
+                return Err(self.retain(
+                    (parts.native, retired, trial, receipt),
+                    "RoventNnuecInterventionTrialObserverMissing",
+                    "actual /2 retirement has no original final consumer",
+                ));
+            };
+            match catch_unwind(AssertUnwindSafe(|| observer(&trial))) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let detail = error.to_string();
+                    return Err(self.retain(
+                        (parts.native, retired, trial, receipt, error),
+                        "RoventNnuecInterventionTrialPublication",
+                        &detail,
+                    ));
+                }
+                Err(payload) => {
+                    return Err(self.retain(
+                        (parts.native, retired, trial, receipt, payload),
+                        "RoventNnuecInterventionTrialPublicationPanic",
+                        "/2 consumer panicked; original cap and actual owners retained",
+                    ));
+                }
+            }
         }
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         if let Some(trial) = retired.utility_cohort.take() {

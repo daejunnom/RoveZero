@@ -127,6 +127,14 @@ pub type AdaptiveUtilityTrialRetirementObserver = Arc<
         + Send
         + Sync,
 >;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub type AdaptiveUtilityInterventionTrialRetirementObserver = Arc<
+    dyn Fn(
+            &Arc<super::UtilityInterventionTrialPhysicalRetirement>,
+        ) -> Result<(), AdaptiveManagerError>
+        + Send
+        + Sync,
+>;
 
 // Declare after taking the session state lock: failure closes admission before
 // that lock is released, including unwinding and an already waiting next go.
@@ -159,6 +167,9 @@ where
     /// supplied by relabeling a historical root-local Completed action.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub utility_trial_retired: Option<AdaptiveUtilityTrialRetirementObserver>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub utility_intervention_trial_retired:
+        Option<AdaptiveUtilityInterventionTrialRetirementObserver>,
     pub external_teacher: Option<AdaptiveExternalTeacherObserver>,
     /// Nonblocking outer-session pump. It does not run inside a native/CPU
     /// worker and cannot change the manager's original execution authority.
@@ -176,6 +187,8 @@ where
             utility_route_completed: None,
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             utility_trial_retired: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            utility_intervention_trial_retired: None,
             external_teacher: None,
             cooperative: None,
         }

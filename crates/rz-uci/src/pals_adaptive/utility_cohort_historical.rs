@@ -136,27 +136,93 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
             ));
         }
         let trial = self.trial();
-        let original = std::str::from_utf8(input.input_bytes())
-            .map_err(|_| invalid("utility submitted original input is not UTF8"))?;
-        let metadata = input
-            .records_metadata()
-            .iter()
-            .map(|m| {
-                let first = m
-                    .original_first_move
-                    .map(|v| rz_contracts::Move::try_from(v).map(|v| Move16::encode(v).bits()))
-                    .transpose()
-                    .map_err(|e| super::AdaptiveManagerError::Semantic(e.to_string()))?;
-                Ok(
-                    json!({"anchor":m.anchor,"parent":m.parent,"supersedes":m.supersedes,
+        let wire = project_utility_semantics(
+            semantic,
+            bodies,
+            trial.cohort_id(),
+            trial.sequence(),
+            trial.recipient(),
+            trial.profile_digest(),
+            trial.source_pins(),
+            trial.original_root(),
+            trial.ready_prelude(),
+            self.cost_epoch(),
+        )?;
+        let bytes = bounded_json(&wire)?;
+        let mut h = Sha256::new();
+        h.update(UTILITY_COHORT_MATERIALIZATION.as_bytes());
+        h.update([0]);
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(&bytes);
+        Ok(UtilityTrialMaterializedSource {
+            wire,
+            bytes,
+            sha256: rz_contracts::Digest(h.finalize().into()),
+            cohort: trial.cohort_id(),
+            sequence: trial.sequence(),
+            action: self.action().clone(),
+            created_at,
+            finished_at: Instant::now(),
+        })
+    }
+}
+/// Byte-preserving input projection shared by the two detached wire domains.
+/// Provenance fields are observations; this data never supplies a live Request.
+pub(super) fn project_utility_input(
+    input: &rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture,
+) -> Result<Value, super::AdaptiveManagerError> {
+    let original = std::str::from_utf8(input.input_bytes())
+        .map_err(|_| invalid("utility submitted original input is not UTF8"))?;
+    let metadata = input
+        .records_metadata()
+        .iter()
+        .map(|m| {
+            let first = m
+                .original_first_move
+                .map(|v| rz_contracts::Move::try_from(v).map(|v| Move16::encode(v).bits()))
+                .transpose()
+                .map_err(|e| super::AdaptiveManagerError::Semantic(e.to_string()))?;
+            Ok(
+                json!({"anchor":m.anchor,"parent":m.parent,"supersedes":m.supersedes,
                 "source_state":m.source_state.0,"source_revision":m.source_revision,
                 "source_line_offset":m.source_line_offset,"original_first_move":first}),
-                )
-            })
-            .collect::<Result<Vec<_>, super::AdaptiveManagerError>>()?;
-        let mut baseline: Vec<_> = semantic.baseline_witnesses().map(|d| hex(*d)).collect();
-        baseline.sort();
-        let witnesses = semantic
+            )
+        })
+        .collect::<Result<Vec<_>, super::AdaptiveManagerError>>()?;
+    let p = input.provenance();
+    Ok(
+        json!({"reference_json":original,"bytes":input.input_bytes().len(),
+                "input_sha256":input.input_sha256(),"target_sha256":input.target_sha256(),
+                "submission_target_sha256":input.submission_target_sha256(),"context_sha256":input.context_sha256(),
+                "target_record":input.target_record(),"target_record_ids":input.target_record_ids(),
+                "base_identity":input.model_identity(),"root_rules":rules(input.root_snapshot())?,
+                "records_metadata":metadata,"source_rules":input.source_snapshots().iter().map(rules).collect::<Result<Vec<_>,super::AdaptiveManagerError>>()?,
+                "provenance":{"root_state":p.root.0,"generation":p.generation,"sequence":p.sequence,
+                    "view_seal_sha256":hex(rz_contracts::Digest(p.view_seal)),"full_view_sha256":hex(rz_contracts::Digest(p.full_view_digest)),
+                    "record_scope_sha256":hex(rz_contracts::Digest(p.record_scope_digest)),"policy_sha256":hex(rz_contracts::Digest(p.policy_digest)),"model":p.model}}),
+    )
+}
+
+/// Detached projection of the original semantic source. This helper issues no
+/// admission, Ready offer, action, physical closure or current publication ACK.
+/// Both wire domains reuse the exact witness/ticket/input projection below.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn project_utility_semantics(
+    semantic: &UtilityRouteSemanticOutcome,
+    bodies: Option<&UtilityConditionalWitnessBodies>,
+    cohort: rz_contracts::Digest,
+    sequence: u64,
+    recipient: rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteRecipient,
+    profile: rz_contracts::Digest,
+    source: &UtilityCohortSourcePins,
+    original_root: &Value,
+    prelude: &Value,
+    cost_epoch: rz_contracts::Digest,
+) -> Result<UtilityTrialMaterializedWire, super::AdaptiveManagerError> {
+    let input = semantic.input();
+    let mut baseline: Vec<_> = semantic.baseline_witnesses().map(|d| hex(*d)).collect();
+    baseline.sort();
+    let witnesses = semantic
             .witnesses()
             .iter()
             .map(|w| {
@@ -168,7 +234,7 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
                 )
             })
             .collect::<Result<Vec<_>, super::AdaptiveManagerError>>()?;
-        let witness_preimages = bodies.map(|bodies| bodies.entries().iter().map(|body| {
+    let witness_preimages = bodies.map(|bodies| bodies.entries().iter().map(|body| {
             let bytes=body.preimage();
             if rz_contracts::Digest(Sha256::digest(bytes).into())!=body.raw_evidence() {
                 return Err(invalid("original conditional witness preimage digest differs"));
@@ -178,7 +244,7 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
                 "source_frame_sequence":body.source_frame().sequence,"raw_evidence_sha256":hex(body.raw_evidence()),
                 "preimage_bytes":bytes.len(),"preimage_hex":bytes.iter().map(|b|format!("{b:02x}")).collect::<String>()}))
         }).collect::<Result<Vec<_>,super::AdaptiveManagerError>>()).transpose()?;
-        let witness_basis = bodies.map(|bodies| bodies.entries().iter().map(|body| {
+    let witness_basis = bodies.map(|bodies| bodies.entries().iter().map(|body| {
             let basis = body.basis().map(|basis| {
                 let bytes = basis.original_bytes();
                 let text = std::str::from_utf8(bytes).map_err(|_|invalid("original conditional basis is not UTF8"))?;
@@ -190,20 +256,20 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
                 "source_frame_sequence":body.source_frame().sequence,"raw_evidence_sha256":hex(body.raw_evidence()),
                 "basis":basis,"unavailable_reason":body.basis_unavailable_reason().map(|r|r.as_str())}))
         }).collect::<Result<Vec<_>,super::AdaptiveManagerError>>()).transpose()?;
-        let pc: Vec<_> = semantic
-            .pc_consumption()
-            .iter()
-            .map(|p| {
-                json!({
+    let pc: Vec<_> = semantic
+        .pc_consumption()
+        .iter()
+        .map(|p| {
+            json!({
             "origin":origin(p.origin()),"question_sha256":hex(p.question()),
             "view":view(p.view()),"full_view_sha256":hex(p.full_view())})
-            })
-            .collect();
-        let dependencies: Vec<_> = semantic
-            .dependencies()
-            .iter()
-            .map(|d| {
-                json!({
+        })
+        .collect();
+    let dependencies: Vec<_> = semantic
+        .dependencies()
+        .iter()
+        .map(|d| {
+            json!({
             "frame_sequence":d.frame().sequence,"question_sha256":hex(d.question()),
             "view":view(d.view()),"full_view_sha256":hex(d.full_view()),
             "parent_frame_sequence":d.coordinator_parent().map(|f|f.sequence),
@@ -215,9 +281,9 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
             "cpu_cause":d.continuation().and_then(|c|c.cpu_source()).map(|(j,e,f,q,o)|json!({
                 "job_sequence":j.sequence,"native_epoch":e.epoch.0,"native_sequence":e.sequence,
                 "frame_sequence":f.sequence,"question_sha256":hex(q),"observation":o.0}))})
-            })
-            .collect();
-        let r:Vec<_>=semantic.r_pc_consumption().iter().map(|w| {
+        })
+        .collect();
+    let r:Vec<_>=semantic.r_pc_consumption().iter().map(|w| {
             let job=w.job(); let lineage=w.capture_lineage(); let work=w.attested_slice_work();
             json!({"stage":format!("{:?}",w.stage()),"authority":authority(w.authority()),
                 "frame_sequence":w.frame().sequence,"question_sha256":hex(w.question()),
@@ -237,54 +303,30 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
                 "selected_record":w.selected_record().map(|(r,s)|json!({"revision":r,"origin_state":s.0})),
                 "selected_full_view_sha256":w.selected_full_view_digest().map(hex)})
         }).collect();
-        let p = input.provenance();
-        let wire = UtilityTrialMaterializedWire {
-            schema: UTILITY_COHORT_MATERIALIZATION,
-            cohort_id: hex(trial.cohort_id()),
-            trial_sequence: trial.sequence(),
-            recipient: trial.recipient().as_str(),
-            profile_sha256: hex(trial.profile_digest()),
-            source: trial.source_pins().clone(),
-            original_root: trial.original_root().clone(),
-            prelude: trial.ready_prelude().clone(),
-            input: json!({"reference_json":original,"bytes":input.input_bytes().len(),
-                "input_sha256":input.input_sha256(),"target_sha256":input.target_sha256(),
-                "submission_target_sha256":input.submission_target_sha256(),"context_sha256":input.context_sha256(),
-                "target_record":input.target_record(),"target_record_ids":input.target_record_ids(),
-                "base_identity":input.model_identity(),"root_rules":rules(input.root_snapshot())?,
-                "records_metadata":metadata,"source_rules":input.source_snapshots().iter().map(rules).collect::<Result<Vec<_>,super::AdaptiveManagerError>>()?,
-                "provenance":{"root_state":p.root.0,"generation":p.generation,"sequence":p.sequence,
-                    "view_seal_sha256":hex(rz_contracts::Digest(p.view_seal)),"full_view_sha256":hex(rz_contracts::Digest(p.full_view_digest)),
-                    "record_scope_sha256":hex(rz_contracts::Digest(p.record_scope_digest)),"policy_sha256":hex(rz_contracts::Digest(p.policy_digest)),"model":p.model}}),
-            action: json!({"authority":authority(semantic.id().authority()),"frame_sequence":semantic.id().frame().sequence,
+    let wire = UtilityTrialMaterializedWire {
+        schema: UTILITY_COHORT_MATERIALIZATION,
+        cohort_id: hex(cohort),
+        trial_sequence: sequence,
+        recipient: recipient.as_str(),
+        profile_sha256: hex(profile),
+        source: source.clone(),
+        original_root: original_root.clone(),
+        prelude: prelude.clone(),
+        input: project_utility_input(input)?,
+        action: json!({"authority":authority(semantic.id().authority()),"frame_sequence":semantic.id().frame().sequence,
                 "question_sha256":hex(semantic.id().question()),"root_budget_sha256":hex(semantic.root_budget()),
                 "original_first_move":Move16::encode(rz_contracts::Move::try_from(semantic.original_first_move()).map_err(|e|super::AdaptiveManagerError::Semantic(e.to_string()))?).bits(),
                 "deadline_clock":semantic.original_deadline().clock.0.0,"deadline_tick":semantic.original_deadline().at.0,
-                "frozen_context_sha256":hex(semantic.frozen_context_digest()),"cost_epoch_sha256":hex(self.cost_epoch()),
+                "frozen_context_sha256":hex(semantic.frozen_context_digest()),"cost_epoch_sha256":hex(cost_epoch),
                 "cost_scope":UTILITY_COHORT_COST_SCOPE}),
-            semantic: json!({"baseline_witnesses":baseline,"new_witnesses":witnesses,
+        semantic: json!({"baseline_witnesses":baseline,"new_witnesses":witnesses,
                 "witness_preimages":witness_preimages,"witness_basis":witness_basis,"pc_consumption":pc,
                 "dependencies":dependencies,"r_selected_pc_consumption":r,
                 "native_executions":semantic.native_executions().map(|e|json!({"epoch":e.epoch.0,"sequence":e.sequence})).collect::<Vec<_>>() }),
-        };
-        let bytes = bounded_json(&wire)?;
-        let mut h = Sha256::new();
-        h.update(UTILITY_COHORT_MATERIALIZATION.as_bytes());
-        h.update([0]);
-        h.update((bytes.len() as u64).to_le_bytes());
-        h.update(&bytes);
-        Ok(UtilityTrialMaterializedSource {
-            wire,
-            bytes,
-            sha256: rz_contracts::Digest(h.finalize().into()),
-            cohort: trial.cohort_id(),
-            sequence: trial.sequence(),
-            action: self.action().clone(),
-            created_at,
-            finished_at: Instant::now(),
-        })
-    }
+    };
+    Ok(wire)
 }
+
 pub(super) fn freeze_ready_prelude<Q>(
     snapshot: &super::UtilityCohortReadySnapshot<Q>,
     ready_group: rz_contracts::Digest,
@@ -359,7 +401,9 @@ fn authority(a: rz_contracts::pals::SearchAuthority) -> Value {
     json!({"process_epoch":a.epoch.0,"game_generation":a.game.0,
     "root_generation":a.root.0,"implementation_sha256":hex(a.implementation)})
 }
-fn rules(p: &rz_position::PositionSnapshot) -> Result<Value, super::AdaptiveManagerError> {
+pub(super) fn rules(
+    p: &rz_position::PositionSnapshot,
+) -> Result<Value, super::AdaptiveManagerError> {
     let replay = p
         .uci_replay(16_384)
         .map_err(|e| super::AdaptiveManagerError::Semantic(e.to_string()))?;
@@ -374,7 +418,7 @@ fn rules(p: &rz_position::PositionSnapshot) -> Result<Value, super::AdaptiveMana
         "start_fen":replay.start_fen,"moves":moves(&replay.moves)?}}),
     )
 }
-fn moves(v: &[rz_position::BoardMove]) -> Result<Vec<u16>, super::AdaptiveManagerError> {
+pub(super) fn moves(v: &[rz_position::BoardMove]) -> Result<Vec<u16>, super::AdaptiveManagerError> {
     v.iter()
         .map(|m| {
             rz_contracts::Move::try_from(*m)
@@ -395,7 +439,7 @@ fn ticket(t: &rz_contracts::pals_adaptive::RoleTicketEnvelope) -> Value {
                 rz_contracts::pals::Role::Proposer=>"proposer",rz_contracts::pals::Role::Critic=>"critic",
                 rz_contracts::pals::Role::Validator=>"validator"}},"deadline_clock":t.original_deadline.clock.0.0,"deadline_tick":t.original_deadline.at.0})
 }
-fn view(v: ReviewViewSeal) -> Value {
+pub(super) fn view(v: ReviewViewSeal) -> Value {
     json!({"authority":authority(v.authority),"sequence":v.view_sequence,
     "context_policy_sha256":hex(v.context_policy),"view_digest":hex(v.view_digest),
     "root_state":{"owner":v.root_state.owner.0,"revision":v.root_state.revision.0,"semantic_sha256":hex(v.root_state.semantic)},
@@ -423,6 +467,64 @@ fn peer(p: rz_contracts::rovent::QuestionEnvelope) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_projection_keeps_legacy_materialization_roster_and_exact_bytes() {
+        let source = UtilityCohortSourcePins {
+            input_lock_sha256: "1".repeat(64),
+            source_sha256: "2".repeat(64),
+            frozen_nnuec_model_sha256: "3".repeat(64),
+            frozen_nnuec_namespace_sha256: "4".repeat(64),
+            frozen_pc_model_sha256: "5".repeat(64),
+            frozen_pc_namespace_sha256: "6".repeat(64),
+            resource_plan_sha256: "7".repeat(64),
+            logical_budget_sha256: "8".repeat(64),
+        };
+        let wire = UtilityTrialMaterializedWire {
+            schema: UTILITY_COHORT_MATERIALIZATION,
+            cohort_id: "9".repeat(64),
+            trial_sequence: 1,
+            recipient: "route_p",
+            profile_sha256: "a".repeat(64),
+            source: source.clone(),
+            original_root: json!({"source":"original"}),
+            prelude: json!({"source":"ready"}),
+            input: json!({"reference_json":"{\"precise\":1}","bytes":13}),
+            action: json!({"source":"actual"}),
+            semantic: json!({"source":"original witnesses"}),
+        };
+        // serde struct field order is the original /1 order. Replacing this
+        // with a sorted Value, /2 tag or new field would change these bytes.
+        let expected = format!(
+            "{{\"schema\":\"{}\",\"cohort_id\":\"{}\",\"trial_sequence\":1,\"recipient\":\"route_p\",\"profile_sha256\":\"{}\",\"source\":{},\"original_root\":{{\"source\":\"original\"}},\"prelude\":{{\"source\":\"ready\"}},\"input\":{{\"bytes\":13,\"reference_json\":\"{{\\\"precise\\\":1}}\"}},\"action\":{{\"source\":\"actual\"}},\"semantic\":{{\"source\":\"original witnesses\"}}}}",
+            UTILITY_COHORT_MATERIALIZATION,
+            "9".repeat(64),
+            "a".repeat(64),
+            serde_json::to_string(&source).unwrap()
+        );
+        let bytes = bounded_json(&wire).unwrap();
+        assert_eq!(bytes, expected.as_bytes());
+        let mut legacy = Sha256::new();
+        legacy.update(UTILITY_COHORT_MATERIALIZATION.as_bytes());
+        legacy.update([0]);
+        legacy.update((bytes.len() as u64).to_le_bytes());
+        legacy.update(&bytes);
+        let old = rz_contracts::Digest(legacy.finalize().into());
+        assert_ne!(
+            old,
+            super::super::utility_intervention::framed(
+                "rz-rovent-utility-cohort-materialization/2",
+                &bytes
+            )
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            11
+        );
+    }
     #[test]
     fn historical_writer_enforces_total_backing_limit_and_keeps_the_last_valid_bytes() {
         let mut writer = BoundedBytes(Vec::new());

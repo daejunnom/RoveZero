@@ -45,6 +45,7 @@ use rz_search::pals::rovent_frontier::{
 use rz_search::pals::store::{ForeignAppendPermit, ObservationId, StoreError, StorePins};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 mod profiled_external;
 use profiled_external::ProfiledDriverState;
@@ -704,6 +705,126 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
             .ok_or(AdaptiveManagerError::AuxiliaryPending)?
             .prepare_utility_route_input_request(prep, work, model, canceled)
             .map_err(|error| AdaptiveManagerError::Semantic(format!("{error:?}")))
+    }
+    fn bind_utility_intervention_target(
+        &self,
+        prep: rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        source: rz_search::pals::coordinator::UtilityInterventionReadySource<AdaptivePortQuestion>,
+        input: Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionTarget,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+            rz_search::pals::coordinator::UtilityInterventionReadySource<AdaptivePortQuestion>,
+            Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+        ),
+    > {
+        let Some(port) = self.port.as_deref() else {
+            return Err((AdaptiveManagerError::AuxiliaryPending, prep, source, input));
+        };
+        port.bind_utility_intervention_target(prep, source, input)
+            .map_err(|r| (semantic(r.error), r.preparation, r.source, r.input))
+    }
+    fn prepare_utility_intervention(
+        &mut self,
+        target: rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionTarget,
+        recipient: rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteRecipient,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionCandidate,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionTarget,
+        ),
+    > {
+        let Some(port) = self.port.as_deref_mut() else {
+            return Err((AdaptiveManagerError::AuxiliaryPending, target));
+        };
+        port.prepare_utility_intervention(target, recipient)
+            .map_err(|(e, t)| (semantic(e), t))
+    }
+    fn bind_utility_intervention_route(
+        &self,
+        admission:rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionAdmission,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        (
+            AdaptiveManagerError,
+            rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionAdmission,
+        ),
+    > {
+        let Some(port) = self.port.as_deref() else {
+            return Err((AdaptiveManagerError::AuxiliaryPending, admission));
+        };
+        port.bind_utility_intervention_route(admission, work)
+            .map_err(|r| (semantic(r.error), r.admission))
+    }
+    fn prepare_utility_intervention_arm_request(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        model: &rz_search::cpu_value::nnuec::v2::Model,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<rz_search::cpu_value::nnuec::v2::review::Request, AdaptiveManagerError> {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .prepare_utility_intervention_arm_request(action, work, model, cancel)
+            .map_err(|e| AdaptiveManagerError::Semantic(format!("{e:?}")))
+    }
+    fn attach_utility_intervention_arm_request(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        request: rz_search::cpu_value::nnuec::v2::review::Request,
+    ) -> Result<
+        rz_search::cpu_value::nnuec::v2::review::Request,
+        (
+            AdaptiveManagerError,
+            rz_search::cpu_value::nnuec::v2::review::Request,
+        ),
+    > {
+        let Some(port) = self.port.as_deref() else {
+            return Err((AdaptiveManagerError::AuxiliaryPending, request));
+        };
+        port.attach_utility_intervention_arm_request(action, work, request)
+            .map_err(|(e, r)| (AdaptiveManagerError::Semantic(format!("{e:?}")), r))
+    }
+    fn bind_utility_intervention_arm_capture(
+        &self,
+        action: &mut rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        input: Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+    ) -> Result<
+        (),
+        (
+            AdaptiveManagerError,
+            Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+        ),
+    > {
+        let Some(port) = self.port.as_deref() else {
+            return Err((AdaptiveManagerError::AuxiliaryPending, input));
+        };
+        port.bind_utility_intervention_arm_capture(action, work, input)
+            .map_err(|(e, i)| (semantic(e), i))
+    }
+    fn utility_intervention_arm_metadata(
+        &self,
+        action: &rz_search::pals::engine::adaptive_port::utility_route::UtilityRouteAction,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<serde_json::Value, AdaptiveManagerError> {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        {
+            super::utility_intervention_historical::arm_query(action, work)
+        }
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        {
+            let _ = (action, work);
+            Err(AdaptiveManagerError::Invalid(
+                "intervention needs CPU native path",
+            ))
+        }
     }
     fn bind_utility_route_input(
         &self,
