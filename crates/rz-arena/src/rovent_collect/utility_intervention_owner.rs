@@ -38,6 +38,35 @@ pub const ROVENT_UTILITY_INTERVENTION_METADATA_MAX: usize = 64 << 10;
 pub const ROVENT_UTILITY_INTERVENTION_PAYLOAD_MAX: u64 = 256 << 20;
 pub const ROVENT_UTILITY_INTERVENTION_MATERIALIZATION_MAX: u64 = 32 << 20;
 
+/// The new family is accepted only in the /2 source boundary. The existing
+/// /1 descriptor validator and its callers retain their original allowlist.
+fn validate_intervention_ancestor(
+    value: &RoventUtilityCohortAncestorSource,
+) -> Result<(), ArenaError> {
+    if value.kind != "utility_intervention" {
+        return value.validate();
+    }
+    let keys = [
+        "dataset_sha256",
+        "pool_sha256",
+        "preparation_sha256",
+        "context_sha256",
+    ];
+    check(
+        generation_sha(&value.publication_sha256)
+            && value.metadata.as_object().is_some_and(|metadata| {
+                metadata.len() == keys.len()
+                    && keys.iter().all(|key| {
+                        metadata
+                            .get(*key)
+                            .and_then(Value::as_str)
+                            .is_some_and(generation_sha)
+                    })
+            }),
+        "/2 exact original intervention ancestor descriptor",
+    )
+}
+
 /// Historical evidence returned after the original raw payloads, Rules,
 /// source namespace, independent trials and pair proofs all agree. This is
 /// detached data; the parent separately owns original FDs and learner intake.
@@ -640,5 +669,26 @@ mod tests {
         let (mut publication, _, _) = synthetic_io_fixture();
         publication.neutral_target.path = "frozen-context.json".into();
         assert!(publication.validate().is_err());
+    }
+    #[test]
+    fn intervention_ancestor_family_is_closed_and_never_added_to_v1() {
+        let ancestor = RoventUtilityCohortAncestorSource {
+            kind: "utility_intervention".into(),
+            publication_sha256: "1".repeat(64),
+            metadata: serde_json::json!({"dataset_sha256":"2".repeat(64),"pool_sha256":"3".repeat(64),
+                "preparation_sha256":"4".repeat(64),"context_sha256":"5".repeat(64)}),
+        };
+        validate_intervention_ancestor(&ancestor).unwrap();
+        assert!(ancestor.validate().is_err());
+        let mut extra = ancestor.clone();
+        extra.metadata["execution_authorized"] = serde_json::json!(true);
+        assert!(validate_intervention_ancestor(&extra).is_err());
+        let mut missing = ancestor;
+        missing
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("preparation_sha256");
+        assert!(validate_intervention_ancestor(&missing).is_err());
     }
 }

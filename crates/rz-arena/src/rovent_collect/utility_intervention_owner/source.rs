@@ -55,7 +55,7 @@ impl RoventUtilityInterventionCollectionSource {
         )?;
         let mut ancestors = BTreeSet::new();
         for descriptor in &ancestor_datasets {
-            descriptor.validate()?;
+            validate_intervention_ancestor(descriptor)?;
             check(
                 ancestors.insert(descriptor.publication_sha256.clone()),
                 "utility cohort duplicate original ancestor",

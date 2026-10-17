@@ -291,6 +291,23 @@ pub(super) fn verify_arm(
         "/2 frozen-proposal arm sequences",
     )?;
     let endpoint = replay(root_rules, &prefix)?;
+    if recipient != 5 {
+        ensure(
+            matches!(
+                endpoint.classify_position().map_err(error)?.play_status,
+                rz_position::PlayStatus::Ongoing
+            ),
+            "/2 issued P/R arm cannot start at a Rules terminal endpoint",
+        )?;
+    }
+    ensure(
+        if recipient == 6 {
+            number(&arm["budget"], "original_cpu_credit")? > 0
+        } else {
+            number(&arm["budget"], "role_submissions_remaining")? > 0
+        },
+        "/2 issued arm requires its original declared credit",
+    )?;
     ensure(
         shared::restore_rules_snapshot(&query["endpoint_rules"])?
             .snapshot()
@@ -327,6 +344,10 @@ pub(super) fn verify_arm(
     ensure(
         query["divergences"] == serde_json::json!(divergences),
         "/2 arm real opponent divergence indices",
+    )?;
+    ensure(
+        recipient != 5 || !divergences.is_empty(),
+        "/2 issued C arm requires an actual opponent divergence",
     )?;
     let p = &query["question_preimage"];
     fields(

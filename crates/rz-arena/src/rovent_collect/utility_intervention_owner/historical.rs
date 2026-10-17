@@ -315,7 +315,7 @@ fn verify_source(
     }
     let mut ancestors = BTreeSet::new();
     for ancestor in &source.ancestor_datasets {
-        ancestor.validate()?;
+        validate_intervention_ancestor(ancestor)?;
         ensure(
             ancestors.insert(ancestor.publication_sha256.clone()),
             "duplicate original ancestor",

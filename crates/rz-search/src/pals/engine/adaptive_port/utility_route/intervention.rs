@@ -1277,9 +1277,14 @@ mod tests {
             assert_eq!(candidate.budget(), work.budget);
             assert_eq!(candidate.original_deadline(), work.original_deadline);
             assert!(candidate.validates_source(&work));
-            let mut changed = work.clone();
-            changed.budget.role_submissions_remaining += 1;
-            assert!(!candidate.validates_source(&changed));
+            {
+                // This never-submitted tamper copy tests the budget guard;
+                // its fixture-only Arc owners must not outlive that check.
+                // Actual machine/Bound/actor custody is unchanged below.
+                let mut changed = work.clone();
+                changed.budget.role_submissions_remaining += 1;
+                assert!(!candidate.validates_source(&changed));
+            }
             let (frame, admission) = machine
                 .admit_intervention(candidate, port.deadline.clock, MonotonicTick(0))
                 .unwrap_or_else(|_| panic!("actual source replacement"));
