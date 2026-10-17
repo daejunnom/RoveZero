@@ -27,6 +27,11 @@ path = "src/bin/rovent-trainer.rs"
 required-features = ["pals-collection-onnx"]
 
 [[bin]]
+name = "rz-rovent-utility-trainer"
+path = "src/bin/rovent-utility-trainer.rs"
+required-features = ["pals-collection-onnx"]
+
+[[bin]]
 name = "rz-pals-generation-game-worker"
 path = "src/bin/pals-generation-game-worker.rs"
 required-features = ["pals-collection-onnx"]

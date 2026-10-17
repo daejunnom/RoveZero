@@ -26,6 +26,24 @@ const MAX_METADATA_BYTES: u64 = 16 << 20;
 mod corpus_family;
 use corpus_family::*;
 
+/// Borrowed lineage of an already admitted original row; no replay or learner
+/// authority can be created from this projection.
+pub(super) struct HistoricalDatasetLineage<'a> {
+    pub(super) split: GenerationSplitV3,
+    pub(super) opening_id: &'a str,
+    pub(super) game_id: &'a str,
+    pub(super) line_genealogy_id: &'a str,
+    pub(super) rules_state_sha256: &'a str,
+    pub(super) transposition_sha256: &'a str,
+}
+
+pub(super) fn probe_utility_pc_source(
+    registration: &RoventHistoricalDatasetRegistration,
+    budget: &RoventRecoveryReadBudget,
+) -> Result<(RoventPcRecordFamily, String, Vec<String>), ArenaError> {
+    probe_registered_pc_dataset(registration, budget)
+}
+
 pub struct RoventRecoveryReadBudget {
     maximum: u64,
     charged: AtomicU64,
@@ -513,6 +531,18 @@ impl VerifiedRoventDataset {
     pub fn family(&self) -> RoventPcRecordFamily {
         self.original.publication.family()
     }
+    pub(super) fn utility_lineage(&self) -> impl Iterator<Item = HistoricalDatasetLineage<'_>> {
+        self.lineage_rows
+            .iter()
+            .map(|row| HistoricalDatasetLineage {
+                split: row.origin.split,
+                opening_id: &row.origin.opening_id,
+                game_id: &row.origin.game_id,
+                line_genealogy_id: &row.origin.line_genealogy_id,
+                rules_state_sha256: &row.rules_state_sha256,
+                transposition_sha256: &row.origin.transposition_sha256,
+            })
+    }
     pub fn manifest_sha256(&self) -> &str {
         &self.publication.canonical_manifest_sha256
     }
@@ -647,6 +677,7 @@ pub use checkpoint::*;
 mod registration;
 pub use registration::*;
 mod reclamation;
+pub(in crate::rovent_training_process) use reclamation::VerifiedHistoricalUnresolvedScopes;
 pub use reclamation::*;
 pub mod cli;
 mod runtime;
@@ -654,14 +685,14 @@ pub use runtime::*;
 mod entry;
 pub use entry::*;
 mod checkpoint_publication;
+pub(in crate::rovent_training_process) use checkpoint_publication::CheckpointArchiveIo;
 pub use checkpoint_publication::*;
 mod r_auxiliary;
 pub use r_auxiliary::*;
 mod r_dataset;
 pub use r_dataset::*;
-mod r_auxiliary_ledger;
-use r_auxiliary_ledger::*;
 #[cfg(test)]
 pub(crate) mod metadata_wire_tests;
+mod r_auxiliary_ledger;
 #[cfg(test)]
 mod submitted_wire_tests;

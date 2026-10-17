@@ -4,14 +4,29 @@
 fn main() -> std::process::ExitCode {
     use rz_arena::rovent_collect::launch::{
         ROVENT_COLLECTION_USAGE, RoventCollectionCliParse, parse_rovent_collection_cli,
-        run_rovent_collection_from_cli,
+        run_rovent_collection_from_cli, run_rovent_utility_cohort_from_cli,
     };
     use std::io::Write;
     let run = || -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
         match parse_rovent_collection_cli(std::env::args().skip(1).collect())? {
             RoventCollectionCliParse::Help => {
                 writeln!(std::io::stdout().lock(), "{ROVENT_COLLECTION_USAGE}")?;
+                writeln!(
+                    std::io::stdout().lock(),
+                    "선택형 cohort: --utility-cohort-plan=inputs/<plan.json> --utility-cohort-plan-sha256=<SHA> --utility-cohort-plan-bytes=<bytes> <원 source/config 인수>"
+                )?;
                 Ok(None)
+            }
+            RoventCollectionCliParse::Cohort { plan, arguments } => {
+                let receipt = run_rovent_utility_cohort_from_cli(&plan, arguments)?;
+                let resources = receipt.resource_observations()?;
+                let collection = receipt.collection_observations()?;
+                Ok(Some(
+                    serde_json::json!({"schema":"rz-rovent-utility-cohort-launch-result/1",
+                    "publication":receipt.publication,"durable_ack":receipt.durable_ack,
+                    "root":receipt.output_directory,"trials":receipt.trials,"pairs":receipt.pairs,
+                    "resource":resources,"collection":collection,"training_executed":false}),
+                ))
             }
             RoventCollectionCliParse::Run { plan, arguments } => {
                 let receipt = run_rovent_collection_from_cli(&plan, arguments)?;

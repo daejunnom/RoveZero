@@ -1875,6 +1875,25 @@ impl TaskTable {
     pub fn consumer_count(&self) -> usize {
         self.consumers.len()
     }
+    /// Read an already recorded use of this exact original consumer. This
+    /// historical projection never admits work, reopens a deadline or makes
+    /// a cancelled consumer live again.
+    pub(crate) fn historical_consumer_was_consumed(
+        &self,
+        execution: ExecutionId,
+        original: TaskConsumer,
+    ) -> Result<bool, StoreError> {
+        let task = self.get(execution)?;
+        let record = task
+            .consumers
+            .iter()
+            .find(|record| record.consumer.id == original.id)
+            .ok_or(StoreError::InvalidHandle("consumer"))?;
+        if record.consumer != original {
+            return Err(StoreError::StaleConsumer);
+        }
+        Ok(record.consumed)
+    }
     pub fn paused_executions_for_state(
         &self,
         state: StateId,

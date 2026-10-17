@@ -36,14 +36,26 @@ use std::{
 };
 
 pub const ROVENT_COLLECTION_LAUNCH_PLAN: &str = "rz-rovent-collection-launch/1";
+mod cohort;
+mod cohort_audit;
+mod cohort_driver;
 mod r_stream;
 mod resources;
 mod utility_stream;
+pub use cohort::{
+    RoventUtilityCohortLaunchFailure, RoventUtilityCohortLaunchPlan,
+    RoventUtilityCohortLaunchReceipt, run_rovent_utility_cohort,
+    run_rovent_utility_cohort_from_cli,
+};
 pub use r_stream::{RoventRCollectionAncestor, RoventRCollectionPlan};
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
 
 pub enum RoventCollectionCliParse {
     Help,
+    Cohort {
+        plan: RoventPublicationFile,
+        arguments: Vec<String>,
+    },
     Run {
         plan: RoventPublicationFile,
         arguments: Vec<String>,
@@ -56,6 +68,12 @@ pub fn parse_rovent_collection_cli(
 ) -> Result<RoventCollectionCliParse, ArenaError> {
     if arguments == ["--help"] {
         return Ok(RoventCollectionCliParse::Help);
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument.starts_with("--utility-cohort-plan"))
+    {
+        return parse_cohort_cli(arguments);
     }
     let mut plan = None;
     let mut sha256 = None;
@@ -95,6 +113,57 @@ pub fn parse_rovent_collection_cli(
         "Collection plan must be a bounded original private input",
     )?;
     Ok(RoventCollectionCliParse::Run {
+        plan,
+        arguments: original,
+    })
+}
+
+fn parse_cohort_cli(arguments: Vec<String>) -> Result<RoventCollectionCliParse, ArenaError> {
+    let mut path = None;
+    let mut sha256 = None;
+    let mut bytes = None;
+    let mut original = Vec::new();
+    for argument in arguments {
+        if let Some(value) = argument.strip_prefix("--utility-cohort-plan=") {
+            check(
+                path.replace(value.to_string()).is_none(),
+                "duplicate cohort plan",
+            )?;
+        } else if let Some(value) = argument.strip_prefix("--utility-cohort-plan-sha256=") {
+            check(
+                sha256.replace(value.to_string()).is_none(),
+                "duplicate cohort plan SHA",
+            )?;
+        } else if let Some(value) = argument.strip_prefix("--utility-cohort-plan-bytes=") {
+            check(
+                bytes
+                    .replace(
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| invalid("cohort plan bytes"))?,
+                    )
+                    .is_none(),
+                "duplicate cohort plan bytes",
+            )?;
+        } else {
+            check(
+                !argument.starts_with("--collection-plan"),
+                "Collection/cohort plan families cannot be mixed",
+            )?;
+            original.push(argument);
+        }
+    }
+    let plan = RoventPublicationFile {
+        path: path.ok_or_else(|| invalid("explicit cohort plan required"))?,
+        sha256: sha256.ok_or_else(|| invalid("explicit cohort plan SHA required"))?,
+        bytes: bytes.ok_or_else(|| invalid("explicit cohort plan bytes required"))?,
+    };
+    plan.validate()?;
+    check(
+        plan.path.starts_with("inputs/") && valid_relative(&plan.path) && plan.bytes <= 256 << 10,
+        "bounded original cohort plan required",
+    )?;
+    Ok(RoventCollectionCliParse::Cohort {
         plan,
         arguments: original,
     })
@@ -1229,5 +1298,28 @@ mod tests {
         let mut repeated = make("inputs/plan.json");
         repeated.push("--collection-plan-bytes=2".into());
         assert!(parse_rovent_collection_cli(repeated).is_err());
+    }
+    #[test]
+    fn cohort_cli_has_an_explicit_family_and_preserves_original_bootstrap_options() {
+        let args = vec![
+            "--utility-cohort-plan=inputs/cohort.json".into(),
+            format!("--utility-cohort-plan-sha256={}", "b".repeat(64)),
+            "--utility-cohort-plan-bytes=91".into(),
+            "--process-epoch=700".into(),
+            "--input-lock=inputs/lock.json".into(),
+        ];
+        let RoventCollectionCliParse::Cohort { plan, arguments } =
+            parse_rovent_collection_cli(args.clone()).unwrap()
+        else {
+            panic!("explicit cohort")
+        };
+        assert_eq!(plan.bytes, 91);
+        assert_eq!(
+            arguments,
+            ["--process-epoch=700", "--input-lock=inputs/lock.json"]
+        );
+        let mut mixed = args;
+        mixed.push("--collection-plan=inputs/old.json".into());
+        assert!(parse_rovent_collection_cli(mixed).is_err());
     }
 }

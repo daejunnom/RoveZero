@@ -20,6 +20,7 @@ pub(in crate::pals::engine) struct CpuEvidenceContextSeal {
     job: CpuJobEnvelope,
     owner: CpuWorkerId,
     profile: CpuWorkerProfile,
+    original_consumer: TaskConsumer,
 }
 
 /// Live installation admission is checked before the Store consumes anything.
@@ -75,6 +76,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let owner = admission.owner.ok_or(StoreError::InvalidEvidence(
             "consumed CPU context has no owner",
         ))?;
+        let original_consumer = admission
+            .original_consumer
+            .ok_or(StoreError::InvalidEvidence(
+                "consumed CPU context has no original consumer",
+            ))?;
         if stored.consumed_observation != Some(observation)
             || stored
                 .committed_execution
@@ -82,6 +88,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     original != execution || observed != observation
                 })
             || admission.execution != Some(execution)
+            || stored.original_consumer != Some(original_consumer)
             || profile.owner != owner
             || admission.profiles.as_slice() != [profile]
             || profile.evaluation_namespace != admission.evaluation_namespace
@@ -118,7 +125,108 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             job,
             owner,
             profile,
+            original_consumer,
         })))
+    }
+
+    /// Project only the exact source already consumed by this Node. It adds
+    /// no authority to a raw Task row and stays usable for history after a
+    /// deadline or cancellation. Missing old provenance remains unknown.
+    pub(super) fn utility_conditional_cpu_metadata(
+        &self,
+        node: usize,
+        observation: ObservationId,
+        execution: ExecutionId,
+    ) -> Result<Option<super::utility_conditional_basis::UtilityCpuAcceptedMetadata>, PalsError>
+    {
+        use super::utility_conditional_basis::{
+            UtilityCpuAcceptedMetadata, UtilityCpuContextMetadata,
+        };
+        let endpoint = self
+            .engine
+            .semantic
+            .nodes
+            .get(node)
+            .ok_or(RoleError::InvalidOutput)?;
+        let Some(evidence) = &endpoint.evidence else {
+            return Ok(None);
+        };
+        let task = self.engine.semantic.stores.tasks.get(execution)?;
+        if evidence.provenance != Some((observation, execution))
+            || !matches!(task.status, TaskStatus::Completed(id) if id == observation)
+            || !self.conditional_cpu_task_condition_matches(
+                evidence,
+                &task.key,
+                execution,
+                observation,
+            )
+        {
+            return Ok(None);
+        }
+        if let Some(context) = &evidence.context {
+            if !self
+                .engine
+                .semantic
+                .stores
+                .tasks
+                .historical_consumer_was_consumed(execution, context.original_consumer)?
+            {
+                return Ok(None);
+            }
+            return Ok(Some(UtilityCpuAcceptedMetadata {
+                original_consumer: context.original_consumer,
+                contextual: Some(UtilityCpuContextMetadata {
+                    generation: context.generation,
+                    root: context.root,
+                    authority: context.authority,
+                    frame: context.frame,
+                    question: context.question,
+                    task: context.task.clone(),
+                    execution: context.execution,
+                    observation: context.observation,
+                    job: context.job,
+                    owner: context.owner,
+                    profile: context.profile,
+                    original_consumer: context.original_consumer,
+                }),
+                legacy_condition: None,
+            }));
+        }
+        let mut originals = self.cpu_admissions.values().filter(|admission| {
+            admission.node == node
+                && admission.execution == Some(execution)
+                && admission.consumed_observation == Some(observation)
+                && admission
+                    .committed_execution
+                    .is_some_and(|(_, actual, observed)| {
+                        actual == execution && observed == observation
+                    })
+                && admission.generation == self.engine.semantic.stores.generation()
+                && admission.task_key == task.key
+        });
+        let Some(admission) = originals.next() else {
+            return Ok(None);
+        };
+        if originals.next().is_some() {
+            return Err(StoreError::InvalidEvidence("ambiguous original CPU consumer").into());
+        }
+        let Some(original_consumer) = admission.original_consumer else {
+            return Ok(None);
+        };
+        if !self
+            .engine
+            .semantic
+            .stores
+            .tasks
+            .historical_consumer_was_consumed(execution, original_consumer)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(UtilityCpuAcceptedMetadata {
+            original_consumer,
+            contextual: None,
+            legacy_condition: Some(self.engine.cpu_condition()),
+        }))
     }
 
     pub(super) fn conditional_cpu_task_condition_matches(
@@ -151,7 +259,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::conditional_evidence::tests::{accepted_raw, port as contract_port};
+    use super::super::conditional_evidence::tests::{accepted_raw_source, port as contract_port};
     use super::*;
     use rz_contracts::pals_adaptive::CpuJobId;
 
@@ -160,6 +268,7 @@ mod tests {
     fn consumed_context(
         port: &AdaptiveEnginePort<LegalOrderRoleMock>,
         node: usize,
+        original_consumer: TaskConsumer,
     ) -> CpuEvidenceContextSeal {
         let evidence = port.engine.semantic.nodes[node].evidence.as_ref().unwrap();
         let (observation, execution) = evidence.provenance.unwrap();
@@ -206,6 +315,7 @@ mod tests {
             },
             owner: profile.owner,
             profile,
+            original_consumer,
         }
     }
 
@@ -213,9 +323,9 @@ mod tests {
     fn retained_consumed_context_does_not_depend_on_active_admission() {
         let mut port = contract_port(Position::startpos());
         let movement = BoardMove::from_uci("e2e4").unwrap();
-        accepted_raw(&mut port, &[movement], 14, 2);
+        let (_, consumer) = accepted_raw_source(&mut port, &[movement], 14, 2);
         let node = port.replay_node(&[movement]).unwrap();
-        let seal = consumed_context(&port, node);
+        let seal = consumed_context(&port, node, consumer);
         let task = seal.task.clone();
         let execution = seal.execution;
         let observation = seal.observation;
@@ -232,6 +342,12 @@ mod tests {
             execution,
             observation
         ));
+        let metadata = port
+            .utility_conditional_cpu_metadata(node, observation, execution)
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.original_consumer, consumer);
+        assert!(metadata.contextual.is_some());
         let foreign = contract_port(Position::startpos());
         assert!(!foreign.conditional_cpu_task_condition_matches(
             evidence,

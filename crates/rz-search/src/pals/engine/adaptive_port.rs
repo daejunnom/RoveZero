@@ -41,6 +41,7 @@ mod preparing_port;
 mod profiled_external_port;
 mod reciprocal_port;
 mod role_commit;
+mod utility_conditional_basis;
 mod utility_dependencies;
 pub use reciprocal_port::{
     AdaptiveAcceptedReciprocalAnswer, AdaptiveCpuReciprocalQuestion, AdaptivePeerQuestion,
@@ -492,7 +493,14 @@ pub struct AdaptiveEnginePort<M: RoleModel> {
     external_admissions: HashMap<ContractDigest, external_commit::ExternalPortAdmission>,
     profiled_external: profiled_external_port::ProfiledExternalPortState,
     supported_counters: HashMap<ContractDigest, conditional_evidence::SupportedCounter>,
-    conditional_witnesses: HashMap<ObservationId, (ObservationKind, Vec<BoardMove>)>,
+    conditional_witnesses: HashMap<
+        ObservationId,
+        (
+            ObservationKind,
+            Vec<BoardMove>,
+            Option<utility_conditional_basis::ConditionalComparisonSource>,
+        ),
+    >,
     pending_counters: HashMap<BoardMove, VecDeque<branch_queue::PendingCounter>>,
     deferred_rechecks: VecDeque<branch_queue::DeferredRecheck>,
     /// Exact consumed queue admissions, not a certificate that their parent

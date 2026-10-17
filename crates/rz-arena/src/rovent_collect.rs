@@ -1101,6 +1101,18 @@ mod r_unsubmitted;
 #[cfg(feature = "pals-collection-onnx")]
 pub use r_unsubmitted::*;
 #[cfg(feature = "pals-collection-onnx")]
+mod r_semantic_materialized;
+#[cfg(feature = "pals-collection-onnx")]
+pub use r_semantic_materialized::*;
+#[cfg(feature = "pals-collection-onnx")]
+mod r_cohort_materialized;
+#[cfg(feature = "pals-collection-onnx")]
+pub use r_cohort_materialized::*;
+#[cfg(feature = "pals-collection-onnx")]
+mod utility_cohort_owner;
+#[cfg(feature = "pals-collection-onnx")]
+pub use utility_cohort_owner::*;
+#[cfg(feature = "pals-collection-onnx")]
 mod utility_owner;
 #[cfg(feature = "pals-collection-onnx")]
 pub use utility_owner::*;

@@ -420,6 +420,67 @@ impl FinishedRoventRCorpus {
     pub fn index(&self) -> &RoventRReadoutIndex {
         &self.index
     }
+    /// Pure declaration of the original memory-sink packets. No file is
+    /// written, synced or acknowledged, and no live/physical authority is
+    /// minted. The eventual publisher verifies these same raw pins again.
+    pub fn planned_publication(&self) -> Result<RoventRCorpusPublication, ArenaError> {
+        let manifest_raw =
+            serde_json::to_vec(&self.manifest).map_err(|error| invalid(error.to_string()))?;
+        let index_raw =
+            serde_json::to_vec(&self.index).map_err(|error| invalid(error.to_string()))?;
+        check(
+            manifest_raw.len() <= 16 << 20 && index_raw.len() <= 16 << 20,
+            "R planned final metadata cap",
+        )?;
+        let pin = |path: &str, raw: &[u8]| RoventPublicationFile {
+            path: path.into(),
+            sha256: hex(Digest(Sha256::digest(raw).into())),
+            bytes: raw.len() as u64,
+        };
+        let manifest = pin("r-corpus-manifest.json", &manifest_raw);
+        let index = pin("r-corpus-index.json", &index_raw);
+        let total = self
+            .payloads
+            .values()
+            .try_fold(manifest.bytes + index.bytes, |sum, item| {
+                sum.checked_add(item.bytes)
+            })
+            .ok_or_else(|| invalid("R planned payload overflow"))?;
+        self.publication_declaration(manifest, index, total)
+    }
+    fn publication_declaration(
+        &self,
+        manifest: RoventPublicationFile,
+        index: RoventPublicationFile,
+        total_payload_bytes: u64,
+    ) -> Result<RoventRCorpusPublication, ArenaError> {
+        let publication = RoventRCorpusPublication {
+            schema: ROVENT_R_PUBLICATION_DOMAIN.into(),
+            manifest,
+            index,
+            chunks: self
+                .index
+                .chunks
+                .iter()
+                .map(|chunk| RoventPublicationFile {
+                    path: chunk.path.clone(),
+                    sha256: chunk.sha256.clone(),
+                    bytes: chunk.bytes,
+                })
+                .collect(),
+            retirements: self.retirements.clone(),
+            canonical_manifest_sha256: self.manifest.sha256()?,
+            canonical_index_sha256: self.index.sha256()?,
+            source_commit: self.manifest.collection.source_commit.clone(),
+            source_sha256: self.manifest.collection.source_sha256.clone(),
+            runtime_sha256: self.manifest.collection.runtime_sha256.clone(),
+            record_count: self.index.record_count,
+            total_payload_bytes,
+            admissions: self.admissions.clone(),
+        };
+        publication.validate()?;
+        Ok(publication)
+    }
     #[cfg(target_os = "linux")]
     pub fn publish_allocation_supplement(
         &self,
@@ -513,31 +574,7 @@ impl FinishedRoventRCorpus {
             .values()
             .try_fold(0u64, |n, p| n.checked_add(p.bytes))
             .ok_or_else(|| invalid("R payload overflow"))?;
-        let publication = RoventRCorpusPublication {
-            schema: ROVENT_R_PUBLICATION_DOMAIN.into(),
-            manifest,
-            index,
-            chunks: self
-                .index
-                .chunks
-                .iter()
-                .map(|c| RoventPublicationFile {
-                    path: c.path.clone(),
-                    sha256: c.sha256.clone(),
-                    bytes: c.bytes,
-                })
-                .collect(),
-            retirements: self.retirements.clone(),
-            canonical_manifest_sha256: self.manifest.sha256()?,
-            canonical_index_sha256: self.index.sha256()?,
-            source_commit: self.manifest.collection.source_commit.clone(),
-            source_sha256: self.manifest.collection.source_sha256.clone(),
-            runtime_sha256: self.manifest.collection.runtime_sha256.clone(),
-            record_count: self.index.record_count,
-            total_payload_bytes: total,
-            admissions: self.admissions.clone(),
-        };
-        publication.validate()?;
+        let publication = self.publication_declaration(manifest, index, total)?;
         let raw = serde_json::to_vec(&publication).map_err(|e| invalid(e.to_string()))?;
         check(raw.len() <= 16 * 1024 * 1024, "R final commit cap")?;
         put("r-publication.pending.json", &raw)?;

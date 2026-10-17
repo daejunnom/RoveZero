@@ -88,6 +88,15 @@ pub(super) mod tests {
         score: i32,
         depth: u16,
     ) -> ObservationId {
+        raw_fixture(port, moves, score, depth, false).0
+    }
+
+    pub(in crate::pals::engine::adaptive_port) fn accepted_raw_source(
+        port: &mut Port,
+        moves: &[BoardMove],
+        score: i32,
+        depth: u16,
+    ) -> (ObservationId, TaskConsumer) {
         raw_fixture(port, moves, score, depth, false)
     }
 
@@ -97,7 +106,7 @@ pub(super) mod tests {
         score: i32,
         depth: u16,
         paused: bool,
-    ) -> ObservationId {
+    ) -> (ObservationId, TaskConsumer) {
         let node = port.replay_node(moves).unwrap();
         let state = port.engine.semantic.nodes[node].state;
         let situation = port.engine.semantic.nodes[node].situation;
@@ -207,7 +216,7 @@ pub(super) mod tests {
             provenance: Some((observation, execution)),
             context: None,
         });
-        observation
+        (observation, consumer)
     }
 
     fn question(
@@ -528,7 +537,7 @@ pub(super) mod tests {
         let mut port = port(Position::startpos());
         let (proposal, counter, _) = branches();
         accepted_raw(&mut port, &proposal, 100, 2);
-        let observation = raw_fixture(&mut port, &counter, -100, 2, true);
+        let observation = raw_fixture(&mut port, &counter, -100, 2, true).0;
         let query = question(
             &mut port,
             RefinementStage::CounterValidation,
@@ -717,13 +726,13 @@ pub(super) mod tests {
 }
 
 #[derive(Clone)]
-struct ConditionalEndpoint {
-    root_value: i32,
-    basis: EndpointBasis,
+pub(super) struct ConditionalEndpoint {
+    pub(super) root_value: i32,
+    pub(super) basis: EndpointBasis,
 }
 
 #[derive(Clone)]
-enum EndpointBasis {
+pub(super) enum EndpointBasis {
     Rules,
     OwnCpu {
         depth: u16,
@@ -809,6 +818,19 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if self.conditional_witnesses.len() >= SUPPORTED_COUNTER_LIMIT {
             return Err(StoreError::PinSaturated("adaptive conditional witness registry").into());
         }
+        // Preserve only original, already checked comparison sources when an
+        // actual utility owner requested history. This creates no conclusion.
+        let comparison = if self.utility_continuations.enabled() {
+            Some(self.capture_utility_conditional_comparison(
+                &query.proposal,
+                &old,
+                counter,
+                &new,
+                None,
+            )?)
+        } else {
+            None
+        };
         // All source references are accepted hot observations. Pin them before
         // publication; neither this operation nor the conclusion invokes I/O.
         self.pin_conditional_endpoint(&old)?;
@@ -833,8 +855,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .semantic
             .stores
             .hot_refute_continuation(root, proposal_line, refutation)?;
-        self.conditional_witnesses
-            .insert(refutation, (ObservationKind::Refutation, counter.to_vec()));
+        self.conditional_witnesses.insert(
+            refutation,
+            (ObservationKind::Refutation, counter.to_vec(), comparison),
+        );
         self.supported_counters.insert(
             key,
             SupportedCounter {
@@ -896,10 +920,21 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Ok(false);
         }
-        self.pin_conditional_endpoint(&previous.counter_value)?;
         if self.conditional_witnesses.len() >= SUPPORTED_COUNTER_LIMIT {
             return Err(StoreError::PinSaturated("adaptive conditional witness registry").into());
         }
+        let comparison = if self.utility_continuations.enabled() {
+            Some(self.capture_utility_conditional_comparison(
+                query.counter.as_deref().ok_or(RoleError::InvalidOutput)?,
+                &previous.counter_value,
+                repaired,
+                &after,
+                Some(previous.refutation),
+            )?)
+        } else {
+            None
+        };
+        self.pin_conditional_endpoint(&previous.counter_value)?;
         self.pin_conditional_endpoint(&after)?;
         let focus = self.engine.semantic.stores.situations.get(root)?.focus;
         let repaired_line = self
@@ -925,8 +960,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             repaired_line,
             evidence,
         )?;
-        self.conditional_witnesses
-            .insert(evidence, (ObservationKind::Repair, repaired.to_vec()));
+        self.conditional_witnesses.insert(
+            evidence,
+            (ObservationKind::Repair, repaired.to_vec(), comparison),
+        );
         self.supported_counters.remove(&key);
         self.counters.supported_repairs += 1;
         Ok(true)
@@ -940,7 +977,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     ) -> Option<ObservationKind> {
         self.conditional_witnesses
             .get(&observation)
-            .map(|(kind, _)| *kind)
+            .map(|(kind, _, _)| *kind)
     }
 
     /// The line is the actual successful counter or revised own continuation,
@@ -951,7 +988,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     ) -> Option<&[BoardMove]> {
         self.conditional_witnesses
             .get(&observation)
-            .map(|(_, line)| line.as_slice())
+            .map(|(_, line, _)| line.as_slice())
     }
 
     /// The digest is acceptance metadata, never a numeric model feature. It

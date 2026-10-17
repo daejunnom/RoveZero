@@ -854,6 +854,11 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
                     .is_some_and(|m| !m.has_original_witness_bodies())
                 {
                     Some("missing_original_conditional_witness_bodies")
+                } else if materialized
+                    .as_ref()
+                    .is_some_and(|m| !m.has_original_witness_basis())
+                {
+                    Some("missing_original_conditional_witness_basis")
                 } else if finished > window.cleanup {
                     Some("cohort_cleanup_cutoff")
                 } else if !snapshot.admission().is_first_product_root() {

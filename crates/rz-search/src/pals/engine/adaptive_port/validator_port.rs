@@ -1232,7 +1232,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         // Keep the bounded owner's publication history, including superseded
         // counters. Rediscovering a formerly supported line is not a new
         // witness merely because a later Repair changed its active status.
-        for (kind, moves) in self.conditional_witnesses.values() {
+        for (kind, moves, _) in self.conditional_witnesses.values() {
             // This private owner registry was populated only after the hot
             // commit. Its checked line survives archival; baseline selection
             // never tries to load a now-cold observation on the manager.

@@ -1406,7 +1406,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .hot_refute_continuation(root, line, evidence)?;
         self.conditional_witnesses.insert(
             evidence,
-            (ObservationKind::Refutation, query.context.prefix.clone()),
+            (
+                ObservationKind::Refutation,
+                query.context.prefix.clone(),
+                None,
+            ),
         );
         self.counters.supported_refutations += 1;
         Ok(true)

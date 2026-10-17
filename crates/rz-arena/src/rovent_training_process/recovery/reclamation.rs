@@ -12,6 +12,57 @@ struct LocalOldScope {
     identity: RoventHistoricalChildIdentity,
     directory: Dir,
 }
+
+/// Current OS observations for explicitly unresolved historical scopes only.
+/// Callers must classify fully pinned completed closures before choosing this
+/// list; a completed closure does not need its old host or cgroup to survive.
+/// This owner grants no numeric PID signal/reap or old physical capability.
+pub(in crate::rovent_training_process) struct VerifiedHistoricalUnresolvedScopes {
+    scopes: Vec<LocalOldScope>,
+    budget: Arc<RoventRecoveryReadBudget>,
+}
+impl VerifiedHistoricalUnresolvedScopes {
+    pub(in crate::rovent_training_process) fn admit(
+        identities: &[RoventHistoricalChildIdentity],
+        budget: Arc<RoventRecoveryReadBudget>,
+    ) -> Result<Self, ArenaError> {
+        check(
+            identities.len() <= 64,
+            "bounded unresolved historical scope list",
+        )?;
+        budget.reserve(0)?;
+        let mut seen = BTreeSet::new();
+        let mut scopes = Vec::with_capacity(identities.len());
+        for identity in identities {
+            check(
+                seen.insert((
+                    identity.boot_id.as_str(),
+                    identity.pid,
+                    identity.start_ticks,
+                    identity.cgroup_path.as_str(),
+                    identity.cgroup_device,
+                    identity.cgroup_inode,
+                )),
+                "duplicate original unresolved scope identity",
+            )?;
+            let scope = LocalOldScope {
+                identity: identity.clone(),
+                directory: open_absolute(Path::new(&identity.cgroup_path))?,
+            };
+            observe_old_scope(&scope, &budget)?;
+            scopes.push(scope);
+        }
+        Ok(Self { scopes, budget })
+    }
+
+    pub(in crate::rovent_training_process) fn revalidate(&self) -> Result<(), ArenaError> {
+        self.budget.reserve(0)?;
+        for scope in &self.scopes {
+            observe_old_scope(scope, &self.budget)?;
+        }
+        Ok(())
+    }
+}
 pub struct VerifiedRoventOldRunReclamation {
     checkpoint: Arc<VerifiedRoventCheckpointSource>,
     original_external_closure: HeldHistoricalFile,

@@ -48,6 +48,105 @@ struct ArchiveBuilder {
     committed_ns: Option<u64>,
     finished_ns: Option<u64>,
 }
+
+/// Format-independent destination I/O only. The caller must supply its own
+/// original typed live boundary before selecting source files. No method here
+/// accepts a training-domain declaration or manufactures a completion ACK.
+pub(in crate::rovent_training_process) struct CheckpointArchiveIo(ArchiveBuilder);
+impl CheckpointArchiveIo {
+    pub(in crate::rovent_training_process) fn new(target: RoventCheckpointArchiveTarget) -> Self {
+        Self(ArchiveBuilder {
+            root: target.parent_path.join(&target.leaf_name),
+            target,
+            leaf_created: false,
+            directories: BTreeMap::new(),
+            files: Vec::new(),
+            output_reserved: 0,
+            output_written: 0,
+            output_accounting_unknown: false,
+            publication_linked: false,
+            started: Instant::now(),
+            copied_ns: None,
+            readback_ns: None,
+            committed_ns: None,
+            finished_ns: None,
+        })
+    }
+    pub(in crate::rovent_training_process) fn prepare(&mut self) -> Result<(), ArenaError> {
+        self.0.prepare()
+    }
+    pub(in crate::rovent_training_process) fn root(&self) -> &Path {
+        &self.0.root
+    }
+    pub(in crate::rovent_training_process) fn read_budget(&self) -> &Arc<RoventRecoveryReadBudget> {
+        &self.0.target.read_budget
+    }
+    pub(in crate::rovent_training_process) fn reserved_output_bytes(&self) -> u64 {
+        self.0.output_reserved
+    }
+    pub(in crate::rovent_training_process) fn copy_file(
+        &mut self,
+        relative: &str,
+        pin: &RoventTrainingFilePin,
+        file: &File,
+    ) -> Result<RoventPublicationFile, ArenaError> {
+        self.0.copy_file(relative, pin, file)
+    }
+    pub(in crate::rovent_training_process) fn write_bytes(
+        &mut self,
+        relative: &str,
+        raw: &[u8],
+    ) -> Result<RoventPublicationFile, ArenaError> {
+        self.0.write_bytes(relative, raw)
+    }
+    pub(in crate::rovent_training_process) fn absolute(
+        &self,
+        reference: &RoventPublicationFile,
+    ) -> Result<RoventTrainingFilePin, ArenaError> {
+        self.0.absolute(reference)
+    }
+    pub(in crate::rovent_training_process) fn commit_publication(
+        &mut self,
+        pending: &RoventPublicationFile,
+    ) -> Result<RoventTrainingFilePin, ArenaError> {
+        self.0.commit_publication(pending)
+    }
+    pub(in crate::rovent_training_process) fn named_root(&self) -> Result<(), ArenaError> {
+        self.0.named_root()
+    }
+    pub(in crate::rovent_training_process) fn observation(&self, committed: bool) -> Value {
+        json!({"schema":"rz-rovent-checkpoint-archive-io-observation/1",
+            "root":self.0.root,"leaf_created":self.0.leaf_created,
+            "output_reserved_bytes":self.0.output_reserved,"output_written_bytes":self.0.output_written,
+            "output_accounting_unknown":self.0.output_accounting_unknown,
+            "read_accounting":self.0.target.read_budget.observation(),
+            "publication_linked":self.0.publication_linked,"publication_committed":committed,
+            "maximum_files":MAX_ARCHIVE_FILES,"maximum_directories":MAX_ARCHIVE_DIRECTORIES,
+            "held_files":self.0.files.len(),"held_directories":self.0.directories.len(),
+            "scope":"bounded_destination_io_only_not_source_or_tensor_authority",
+            "read_credit_refunded":false,"output_reservations_refunded":false,"execution_authorized":false})
+    }
+    pub(in crate::rovent_training_process) fn revalidate(
+        &self,
+        budget: &RoventRecoveryReadBudget,
+    ) -> Result<(), ArenaError> {
+        budget.reserve(0)?;
+        self.0.named_root()?;
+        for held in &self.0.files {
+            let pin = held
+                .pin
+                .as_ref()
+                .ok_or_else(|| invalid("archive I/O retains an unfinished file"))?;
+            check(
+                pin.path == self.0.root.join(&held.relative),
+                "archive I/O retained original name differs",
+            )?;
+            budget.verify_held(&held.file, pin, false)?;
+        }
+        self.0.named_root()?;
+        budget.reserve(0)
+    }
+}
 /// Failure retains the original target FD, created directory/file FDs and
 /// partial bytes. No Drop cleanup, retry, deletion or old process action runs.
 pub struct RoventCheckpointArchiveFailure {

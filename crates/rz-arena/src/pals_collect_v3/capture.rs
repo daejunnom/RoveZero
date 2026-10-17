@@ -8,6 +8,27 @@ use rz_search::cpu::CpuScoreScope;
 use rz_search::pals::engine::RecordKind;
 use rz_search::pals::review_context::ReviewView;
 
+/// 원 Rules repetition identity의 기존 generation grouping domain이다.
+/// 모델/평가 캐시 또는 Rules semantic state digest와 혼용하지 않는다.
+pub(crate) fn generation_transposition_sha256(position: &Position) -> String {
+    struct IdentityHash(Sha256);
+    impl Hasher for IdentityHash {
+        fn finish(&self) -> u64 {
+            u64::from_le_bytes(self.0.clone().finalize()[..8].try_into().unwrap())
+        }
+        fn write(&mut self, b: &[u8]) {
+            self.0.update(b);
+        }
+    }
+    let mut transposition = IdentityHash(Sha256::new());
+    transposition.write(b"rz-pals-generation-transposition/1\0");
+    position
+        .snapshot()
+        .repetition_identity()
+        .hash(&mut transposition);
+    format!("{:x}", transposition.0.finalize())
+}
+
 #[derive(Clone, Debug)]
 enum CaptureWorkScope {
     Native(rz_contracts::RequestId),
@@ -407,29 +428,12 @@ pub(crate) fn capture_submitted_review_common_fields(
         token_budget: input.token_budget,
         length_bucket: view.length_bucket(),
     };
-    // Same Rules-owned repetition identity as the historical leakage grouping,
-    // in a new hash domain; this is not an evaluation cache key.
-    struct IdentityHash(Sha256);
-    impl Hasher for IdentityHash {
-        fn finish(&self) -> u64 {
-            u64::from_le_bytes(self.0.clone().finalize()[..8].try_into().unwrap())
-        }
-        fn write(&mut self, b: &[u8]) {
-            self.0.update(b);
-        }
-    }
-    let mut transposition = IdentityHash(Sha256::new());
-    transposition.write(b"rz-pals-generation-transposition/1\0");
-    query_position
-        .snapshot()
-        .repetition_identity()
-        .hash(&mut transposition);
     let (worker_id, job_id, slice_id) = context.work_scope.identifiers(ticket)?;
     let captured = GenerationInputV3 {
         game_id: context.game_id.clone(),
         opening_id: context.opening_id.clone(),
         line_genealogy_id: context.line_genealogy_id.clone(),
-        transposition_sha256: format!("{:x}", transposition.0.finalize()),
+        transposition_sha256: generation_transposition_sha256(&query_position),
         role,
         model_epoch: context.model_epoch,
         context_epoch: context.context_epoch,

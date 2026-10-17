@@ -13,7 +13,22 @@ use std::sync::Weak;
 use validator_port::{ActionWitnessKind, MAX_ACTION_WITNESSES};
 
 mod conditional_witness;
+pub use super::utility_conditional_basis::{
+    UtilityConditionalWitnessBasis, UtilityConditionalWitnessBasisUnavailable,
+    UtilityWitnessBasisError, UtilityWitnessBasisExpectation, UtilityWitnessBasisMetadata,
+    UtilityWitnessCpuMetadata, UtilityWitnessEndpointMetadata, UtilityWitnessPcMetadata,
+    validate_utility_witness_basis,
+};
+pub(super) use conditional_witness::MAX_UTILITY_WITNESS_BODY_BYTES;
+pub(in crate::pals::engine::adaptive_port) use conditional_witness::{
+    HistoricalWitnessObservation, HistoricalWitnessRawScore,
+    parse_validated_utility_witness_preimage,
+};
 pub use conditional_witness::{UtilityConditionalWitnessBodies, UtilityConditionalWitnessBody};
+pub use conditional_witness::{
+    UtilityWitnessPreimageError, UtilityWitnessPreimageExpectation,
+    validate_utility_witness_preimage,
+};
 
 /// Array indices belong to NNUEC utility, not the legacy seven V tasks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -516,7 +531,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             started,
             request: None,
         };
-        self.utility_continuations.enable();
+        self.utility_continuations
+            .enable_bounded_payload(work.budget.original_store_byte_limit);
         Ok(preparation)
     }
 }

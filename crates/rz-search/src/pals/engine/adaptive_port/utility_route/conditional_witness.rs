@@ -1,8 +1,21 @@
 //! Historical bodies of the actual action owner's conditional witnesses.
 //! Raw bytes cannot construct this capability or mint a semantic outcome.
 use super::*;
+use crate::pals::engine::adaptive_port::utility_conditional_basis::{
+    UtilityConditionalWitnessBasis, UtilityConditionalWitnessBasisUnavailable,
+};
 use crate::pals::engine::adaptive_port::validator_port::{
     BoundedObservationPreimage, ObservationSink,
+};
+
+mod historical;
+pub(in crate::pals::engine::adaptive_port) use historical::{
+    HistoricalWitnessObservation, HistoricalWitnessRawScore,
+    parse_validated_utility_witness_preimage,
+};
+pub use historical::{
+    UtilityWitnessPreimageError, UtilityWitnessPreimageExpectation,
+    validate_utility_witness_preimage,
 };
 
 /// Payload limit only; it creates no new role, CPU or Store execution credit.
@@ -16,6 +29,8 @@ pub struct UtilityConditionalWitnessBody {
     source_frame: FrameId,
     raw_evidence: ContractDigest,
     preimage: Vec<u8>,
+    basis: Option<UtilityConditionalWitnessBasis>,
+    basis_unavailable_reason: Option<UtilityConditionalWitnessBasisUnavailable>,
 }
 impl UtilityConditionalWitnessBody {
     pub fn observation(&self) -> ObservationId {
@@ -38,6 +53,12 @@ impl UtilityConditionalWitnessBody {
     }
     pub fn preimage(&self) -> &[u8] {
         &self.preimage
+    }
+    pub fn basis(&self) -> Option<&UtilityConditionalWitnessBasis> {
+        self.basis.as_ref()
+    }
+    pub fn basis_unavailable_reason(&self) -> Option<UtilityConditionalWitnessBasisUnavailable> {
+        self.basis_unavailable_reason
     }
 }
 
@@ -92,6 +113,9 @@ impl UtilityConditionalWitnessBodies {
         )?;
         for entry in &self.entries {
             bytes = bytes.checked_add(entry.preimage.capacity())?;
+            if let Some(basis) = &entry.basis {
+                bytes = bytes.checked_add(usize::try_from(basis.owned_host_bytes()?).ok()?)?;
+            }
         }
         u64::try_from(bytes).ok()
     }
@@ -171,6 +195,19 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             remaining = remaining
                 .checked_sub(preimage.len())
                 .ok_or(PalsError::Capacity)?;
+            // Basis bytes use the same declared payload allowance as the raw
+            // preimage. A missing source keeps the row and an explicit reason.
+            let (basis, basis_unavailable_reason) = match self
+                .freeze_utility_conditional_basis(outcome, witness, remaining, &preimage)
+            {
+                Ok(basis) => {
+                    remaining = remaining
+                        .checked_sub(basis.original_bytes().len())
+                        .ok_or(PalsError::Capacity)?;
+                    (Some(basis), None)
+                }
+                Err(reason) => (None, Some(reason)),
+            };
             entries.push(UtilityConditionalWitnessBody {
                 observation: witness.observation,
                 kind: witness.kind,
@@ -179,6 +216,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 source_frame: witness.source_frame,
                 raw_evidence: witness.raw_evidence,
                 preimage,
+                basis,
+                basis_unavailable_reason,
             });
         }
         Ok(UtilityConditionalWitnessBodies {

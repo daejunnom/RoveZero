@@ -479,6 +479,18 @@ impl VerifiedRoventRAuxiliaryDataset {
     pub fn registration(&self) -> &RoventHistoricalRAuxiliaryDatasetRegistration {
         &self.registration
     }
+    pub(in crate::rovent_training_process) fn utility_lineage(
+        &self,
+    ) -> impl Iterator<Item = HistoricalDatasetLineage<'_>> {
+        self.lineage.iter().map(|row| HistoricalDatasetLineage {
+            split: row.split,
+            opening_id: &row.opening_id,
+            game_id: &row.game_id,
+            line_genealogy_id: &row.genealogy_id,
+            rules_state_sha256: &row.rules_state_sha256,
+            transposition_sha256: &row.transposition_sha256,
+        })
+    }
     pub fn publication_pin(&self) -> &RoventTrainingFilePin {
         &self.registration.publication
     }
@@ -487,6 +499,12 @@ impl VerifiedRoventRAuxiliaryDataset {
     }
     pub fn index_file_sha256(&self) -> &str {
         &self.publication.index.sha256
+    }
+    pub(in crate::rovent_training_process) fn canonical_manifest_sha256(&self) -> &str {
+        &self.publication.canonical_manifest_sha256
+    }
+    pub(in crate::rovent_training_process) fn canonical_index_sha256(&self) -> &str {
+        &self.publication.canonical_index_sha256
     }
     pub fn ancestors(&self) -> &[Arc<Self>] {
         &self.ancestors
@@ -740,9 +758,6 @@ impl VerifiedRoventRAuxiliaryDataset {
             )?;
         }
         Ok(())
-    }
-    pub(super) fn held_files(&self) -> impl Iterator<Item = (&RoventTrainingFilePin, &File)> {
-        self.held.iter().map(|h| (&h.pin, &h.file))
     }
 }
 

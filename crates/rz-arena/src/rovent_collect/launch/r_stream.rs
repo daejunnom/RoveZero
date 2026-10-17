@@ -81,6 +81,44 @@ fn select_r(
         .collect()
 }
 impl RStream {
+    pub(super) fn ancestor_source_descriptors(
+        &self,
+    ) -> Result<Vec<RoventUtilityCohortAncestorSource>, ArenaError> {
+        let mut descriptors = Vec::new();
+        for owner in &self.pc {
+            descriptors.push(RoventUtilityCohortAncestorSource {
+                kind: match owner.family() {
+                    crate::rovent_training_process::RoventPcRecordFamily::LegacyRecordV1 => {
+                        "pc_legacy"
+                    }
+                    crate::rovent_training_process::RoventPcRecordFamily::SubmittedInputV1 => {
+                        "pc_submitted_input_v1"
+                    }
+                }
+                .into(),
+                publication_sha256: owner.registration().publication.sha256.clone(),
+                metadata: json!({"manifest_file_sha256":owner.manifest_file_sha256(),
+                    "index_file_sha256":owner.index_file_sha256(),
+                    "canonical_manifest_sha256":owner.manifest_sha256(),
+                    "canonical_index_sha256":owner.index_sha256()}),
+            });
+        }
+        for owner in &self.ancestors {
+            let observation = owner.observation();
+            descriptors.push(RoventUtilityCohortAncestorSource {
+                kind: "r_auxiliary".into(),
+                publication_sha256: owner.publication_pin().sha256.clone(),
+                metadata: json!({"manifest_file_sha256":owner.manifest_file_sha256(),
+                    "index_file_sha256":owner.index_file_sha256(),
+                    "canonical_manifest_sha256":observation["canonical_manifest_sha256"],
+                    "canonical_index_sha256":observation["canonical_index_sha256"]}),
+            });
+        }
+        for descriptor in &descriptors {
+            descriptor.validate()?;
+        }
+        Ok(descriptors)
+    }
     pub(super) fn prepare(
         directory: &Dir,
         plan: RoventRCollectionPlan,
@@ -424,7 +462,7 @@ impl RStream {
             .collect()
     }
 }
-fn publish_semantic(
+pub(super) fn publish_semantic(
     directory: &Dir,
     raw: &[u8],
     publication: &RoventRCorpusPublication,
@@ -447,7 +485,7 @@ fn publish_semantic(
         },
     )
 }
-fn publish_sidecar(
+pub(super) fn publish_sidecar(
     directory: &Dir,
     raw: &[u8],
     stem: &str,
@@ -492,7 +530,7 @@ fn publish_sidecar(
         ..file_pin
     })
 }
-fn put_packet(
+pub(super) fn put_packet(
     directory: &Dir,
     pending: &mut Option<RoventRPublicationPacket>,
     packet: RoventRPublicationPacket,

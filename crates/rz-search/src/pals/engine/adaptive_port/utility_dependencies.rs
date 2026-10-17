@@ -189,11 +189,26 @@ impl UtilityReciprocalAwaitSource {
 #[derive(Default)]
 pub(super) struct UtilityContinuationRegistry {
     enabled: bool,
+    witness_payload_limit: Option<usize>,
     entries: HashMap<ContractDigest, UtilityContinuationSource>,
 }
 impl UtilityContinuationRegistry {
+    #[cfg(test)]
     pub(super) fn enable(&mut self) {
+        self.enable_bounded_payload(super::utility_route::MAX_UTILITY_WITNESS_BODY_BYTES as u64);
+    }
+    pub(super) fn enable_bounded_payload(&mut self, original_store_limit: u64) {
+        let requested = usize::try_from(original_store_limit)
+            .unwrap_or(usize::MAX)
+            .min(super::utility_route::MAX_UTILITY_WITNESS_BODY_BYTES);
+        self.witness_payload_limit = Some(
+            self.witness_payload_limit
+                .map_or(requested, |original| original.min(requested)),
+        );
         self.enabled = true;
+    }
+    pub(super) fn witness_payload_limit(&self) -> usize {
+        self.witness_payload_limit.unwrap_or(0)
     }
     pub(super) fn enabled(&self) -> bool {
         self.enabled
@@ -249,7 +264,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         }
         let q = &work.input.question;
         let mut hash = Sha256::new();
-        hash.update(b"rz-rovent-utility-cohort-ready-offer/1\0");
+        hash.update(b"rz-rovent-utility-cohort-ready-offer/2\0");
         hash.update(self.rules.snapshot().identity().semantic.0);
         hash.update(
             rz_position::contracts::rules_snapshot_semantic_digest(&q.position.snapshot()).0,
@@ -377,6 +392,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             hash.update((text.len() as u64).to_le_bytes());
             hash.update(text.as_bytes());
         }
+        // An empty selected context still depends on the actual registered R
+        // weights and training identity, not only its condition namespace.
+        let cpu_identity = serde_json::to_vec(self.engine.owned_identity()?)
+            .map_err(|_| PalsError::InvalidConfig)?;
+        hash.update((cpu_identity.len() as u64).to_le_bytes());
+        hash.update(cpu_identity);
         self.check_live()?;
         Ok(UtilityCohortOfferSemanticSource {
             semantic: ContractDigest(hash.finalize().into()),

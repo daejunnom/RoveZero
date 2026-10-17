@@ -55,6 +55,26 @@ impl UtilityTrialMaterializedSource {
             })
     }
 
+    /// The separate cohort-only basis carries comparison fields absent from
+    /// the legacy raw preimage. Presence is checked only on owner-issued data.
+    pub fn has_original_witness_basis(&self) -> bool {
+        self.wire
+            .semantic
+            .get("witness_basis")
+            .and_then(Value::as_array)
+            .is_some_and(|basis| {
+                self.wire.semantic["new_witnesses"]
+                    .as_array()
+                    .is_some_and(|witnesses| {
+                        basis.len() == witnesses.len()
+                            && basis.iter().all(|row| {
+                                row["basis"].as_object().is_some()
+                                    && row["unavailable_reason"].is_null()
+                            })
+                    })
+            })
+    }
+
     pub fn original_bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -116,7 +136,6 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
             ));
         }
         let trial = self.trial();
-        let snapshot = trial.snapshot();
         let original = std::str::from_utf8(input.input_bytes())
             .map_err(|_| invalid("utility submitted original input is not UTF8"))?;
         let metadata = input
@@ -158,6 +177,18 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
                 "identity_sha256":hex(body.identity()),"source_question_sha256":hex(body.source_question()),
                 "source_frame_sequence":body.source_frame().sequence,"raw_evidence_sha256":hex(body.raw_evidence()),
                 "preimage_bytes":bytes.len(),"preimage_hex":bytes.iter().map(|b|format!("{b:02x}")).collect::<String>()}))
+        }).collect::<Result<Vec<_>,super::AdaptiveManagerError>>()).transpose()?;
+        let witness_basis = bodies.map(|bodies| bodies.entries().iter().map(|body| {
+            let basis = body.basis().map(|basis| {
+                let bytes = basis.original_bytes();
+                let text = std::str::from_utf8(bytes).map_err(|_|invalid("original conditional basis is not UTF8"))?;
+                Ok::<Value,super::AdaptiveManagerError>(json!({"domain":basis.domain(),"sha256":hex(basis.sha256()),
+                    "bytes":bytes.len(),"original_json":text}))
+            }).transpose()?;
+            Ok(json!({"observation":body.observation().0,"kind":format!("{:?}",body.kind()),
+                "identity_sha256":hex(body.identity()),"source_question_sha256":hex(body.source_question()),
+                "source_frame_sequence":body.source_frame().sequence,"raw_evidence_sha256":hex(body.raw_evidence()),
+                "basis":basis,"unavailable_reason":body.basis_unavailable_reason().map(|r|r.as_str())}))
         }).collect::<Result<Vec<_>,super::AdaptiveManagerError>>()).transpose()?;
         let pc: Vec<_> = semantic
             .pc_consumption()
@@ -232,7 +263,7 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
                 "frozen_context_sha256":hex(semantic.frozen_context_digest()),"cost_epoch_sha256":hex(self.cost_epoch()),
                 "cost_scope":UTILITY_COHORT_COST_SCOPE}),
             semantic: json!({"baseline_witnesses":baseline,"new_witnesses":witnesses,
-                "witness_preimages":witness_preimages,"pc_consumption":pc,
+                "witness_preimages":witness_preimages,"witness_basis":witness_basis,"pc_consumption":pc,
                 "dependencies":dependencies,"r_selected_pc_consumption":r,
                 "native_executions":semantic.native_executions().map(|e|json!({"epoch":e.epoch.0,"sequence":e.sequence})).collect::<Vec<_>>() }),
         };
