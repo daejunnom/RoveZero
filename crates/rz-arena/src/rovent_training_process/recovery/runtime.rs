@@ -291,6 +291,10 @@ fn source_bundle() -> Result<BTreeMap<&'static str, &'static [u8]>, ArenaError> 
         source!("rovent_r_ancestry.py"),
         source!("rovent_collection_teacher.py"),
         source!("rovent_root_descriptor.py"),
+        source!("rovent_submitted_input.py"),
+        source!("rovent_corpus_codec.py"),
+        source!("rovent_native_v3.py"),
+        source!("rovent_divergence.py"),
     ] {
         files.insert(path, bytes);
     }
@@ -366,6 +370,10 @@ fn new_ledger(
     ancestors: BTreeMap<String, u64>,
     checkpoint: Option<&VerifiedRoventCheckpointSource>,
 ) -> Result<TrainerLedger, ArenaError> {
+    check(
+        dataset.family() != RoventPcRecordFamily::SubmittedInputV1 || window.phase == "pc",
+        "submitted-input corpus family is V-free; legacy V corpus remains a distinct source",
+    )?;
     if let Some(auxiliary) = window.nnuec_r_auxiliary.enabled() {
         let owners = &recipe["parameter_ownership"];
         fields(
@@ -417,7 +425,7 @@ fn new_ledger(
         membership_sha256,
         profile_sha256: window.profile_sha256()?,
         stage_limits,
-        corpus_sha256: dataset.publication.manifest.sha256.clone(),
+        corpus_sha256: dataset.manifest_file_sha256().to_owned(),
         rows: dataset.rows.clone(),
         completed: initial.clone(),
         initial,

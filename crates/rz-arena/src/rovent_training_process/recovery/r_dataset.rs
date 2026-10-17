@@ -9,10 +9,7 @@ use crate::rovent_collect::{
     ROVENT_R_RETIREMENT_OBSERVATION_DOMAIN, RoventNativeOriginEvidence, RoventRCorpusPublication,
     RoventRPublicationAdmission, RoventRootAdmissionEvidence, verify_historical_r_readout,
 };
-use rz_experiments::rovent_corpus::{
-    MAX_CORPUS_BYTES, MAX_CORPUS_ROWS, RECORD_DOMAIN as PC_SOURCE, RoventCorpusOrigin,
-    RoventTrainingRecord,
-};
+use rz_experiments::rovent_corpus::{MAX_CORPUS_BYTES, MAX_CORPUS_ROWS};
 use rz_experiments::rovent_r_readout::*;
 use rz_search::cpu_value::{
     CpuTrainingState,
@@ -1450,6 +1447,9 @@ impl RecipeGraph {
             .ok_or_else(|| invalid("R row/collection stage absent from original recipe"))
     }
     fn collection(&self, c: &RoventCorpusManifest) -> Result<(), ArenaError> {
+        self.collection_metadata(&HistoricalCollectionMetadata::legacy(c))
+    }
+    fn collection_metadata(&self, c: &HistoricalCollectionMetadata) -> Result<(), ArenaError> {
         let s = self.stage(&c.stage_id)?;
         check(
             c.recipe_sha256 == self.sha
@@ -1556,15 +1556,16 @@ impl LineageEntry {
         }
     }
     fn from_pc(
-        r: &RoventTrainingRecord,
-        c: &RoventCorpusManifest,
+        r: &HistoricalPcLineageRow,
+        c: &HistoricalCollectionMetadata,
         producer_manifest_sha256: &str,
     ) -> Self {
+        let origin = &r.origin;
         Self {
-            source: PC_SOURCE,
-            record_sha256: r.record_sha256.clone(),
-            origin_sha256: r.origin_sha256.clone(),
-            input_sha256: r.input_sha256.clone(),
+            source: r.family.record_domain(),
+            record_sha256: origin.record_sha256.clone(),
+            origin_sha256: origin.origin_sha256.clone(),
+            input_sha256: origin.input_sha256.clone(),
             // The P/C record has no manifest field. F's original lineage
             // projection uses the owner's canonical manifest seal, not the
             // distinct native source aggregate. The caller supplies the exact
@@ -1572,15 +1573,15 @@ impl LineageEntry {
             producer_sha256: producer_manifest_sha256.to_owned(),
             stage_id: c.stage_id.clone(),
             round_id: c.round_id.clone(),
-            teacher_actor_id: r.lineage.teacher_actor_id.clone(),
-            actor_id: r.lineage.actor_id.clone(),
-            opening_id: r.input.opening_id.clone(),
-            game_id: r.input.game_id.clone(),
-            genealogy_id: r.input.line_genealogy_id.clone(),
-            rules_state_sha256: r.input.rules_anchor.rules_state_sha256.clone(),
-            transposition_sha256: r.input.transposition_sha256.clone(),
-            split: r.split,
-            ancestor_origin_sha256: r.lineage.ancestor_origin_sha256.clone(),
+            teacher_actor_id: origin.teacher_actor_id.clone(),
+            actor_id: origin.actor_id.clone(),
+            opening_id: origin.opening_id.clone(),
+            game_id: origin.game_id.clone(),
+            genealogy_id: origin.line_genealogy_id.clone(),
+            rules_state_sha256: r.rules_state_sha256.clone(),
+            transposition_sha256: origin.transposition_sha256.clone(),
+            split: origin.split,
+            ancestor_origin_sha256: origin.ancestor_origin_sha256.clone(),
             pc_genealogy: None,
         }
     }
@@ -1627,10 +1628,11 @@ fn global_training_rows(
         entries.push(entry);
         Ok(())
     };
-    let mut declarations = Vec::new();
+    let mut declarations: Vec<HistoricalCollectionMetadata> = Vec::new();
     for owner in pc {
-        graph.collection(&owner.manifest)?;
-        declarations.push(&owner.manifest);
+        graph.collection_metadata(&owner.manifest)?;
+        declarations.push(owner.manifest.clone());
+        owner.revalidate(budget)?;
         let indexed = owner
             .index
             .origins
@@ -1638,41 +1640,24 @@ fn global_training_rows(
             .map(|o| (o.record_sha256.as_str(), o))
             .collect::<BTreeMap<_, _>>();
         let mut seen = BTreeSet::new();
-        for chunk in &owner.index.chunks {
-            let pin = owner
-                .held
-                .iter()
-                .find(|h| h.pin.path == owner.registration.root.join(&chunk.path))
-                .ok_or_else(|| invalid("R PC source chunk original held FD missing"))?;
-            let raw = budget.verify_held(&pin.file, &pin.pin, true)?;
-            let text =
-                std::str::from_utf8(&raw).map_err(|_| invalid("R PC lineage source UTF8"))?;
-            let mut count = 0u64;
-            for line in text.lines() {
-                budget.reserve(0)?;
-                check(
-                    !line.is_empty() && line.len() <= MAX_CHUNK_BYTES && count < chunk.records,
-                    "R PC original lineage row bound",
-                )?;
-                let row: RoventTrainingRecord =
-                    rz_experiments::decode_json(line).map_err(|e| invalid(e.to_string()))?;
-                row.validate_rules_replay_v2(&owner.manifest)
-                    .map_err(|e| invalid(e.to_string()))?;
-                check(
-                    indexed
-                        .get(row.record_sha256.as_str())
-                        .is_some_and(|o| **o == RoventCorpusOrigin::from_record(&row))
-                        && seen.insert(row.record_sha256.clone()),
-                    "R PC original row/index occurrence mismatch",
-                )?;
-                push(LineageEntry::from_pc(
-                    &row,
-                    &owner.manifest,
-                    &owner.publication.canonical_manifest_sha256,
-                ))?;
-                count += 1;
-            }
-            check(count == chunk.records, "R PC original lineage chunk count")?;
+        // This metadata was built only after the owner's original typed row,
+        // raw native evidence and Rules replay passed. Its held chunk bytes
+        // were just revalidated; never re-decode record/2 as record/1 here.
+        for row in &owner.lineage_rows {
+            budget.reserve(0)?;
+            check(
+                row.family == owner.family()
+                    && indexed
+                        .get(row.origin.record_sha256.as_str())
+                        .is_some_and(|o| **o == row.origin)
+                    && seen.insert(row.origin.record_sha256.clone()),
+                "R PC original typed lineage/index occurrence mismatch",
+            )?;
+            push(LineageEntry::from_pc(
+                row,
+                &owner.manifest,
+                owner.manifest_sha256(),
+            ))?;
         }
         check(
             seen.len() == owner.index.origins.len(),
@@ -1681,13 +1666,15 @@ fn global_training_rows(
     }
     for owner in r {
         graph.collection(&owner.manifest.collection)?;
-        declarations.push(&owner.manifest.collection);
+        declarations.push(HistoricalCollectionMetadata::legacy(
+            &owner.manifest.collection,
+        ));
         for entry in owner.lineage.iter() {
             push(entry.clone())?;
         }
     }
     graph.collection(&manifest.collection)?;
-    declarations.push(&manifest.collection);
+    declarations.push(HistoricalCollectionMetadata::legacy(&manifest.collection));
     for entry in current {
         push(entry.clone())?;
     }
@@ -1736,9 +1723,19 @@ fn global_training_rows(
             refs.insert(matches[0]);
         }
         if let Some(link) = &e.pc_genealogy {
-            let index = *by_source
-                .get(&(PC_SOURCE, link.origin_sha256.as_str()))
+            let candidates = by_origin
+                .get(link.origin_sha256.as_str())
                 .ok_or_else(|| invalid("R causal PC genealogy lacks original PC source"))?;
+            let candidates = candidates
+                .iter()
+                .copied()
+                .filter(|index| is_pc_source(entries[*index].source))
+                .collect::<Vec<_>>();
+            check(
+                candidates.len() == 1,
+                "R causal PC genealogy source family is absent/ambiguous",
+            )?;
+            let index = candidates[0];
             let original = &entries[index];
             check(
                 original.record_sha256 == link.record_sha256
@@ -1843,7 +1840,7 @@ fn global_training_rows(
         .get(&manifest.collection.stage_id)
         .ok_or_else(|| invalid("joint current stage scope absent"))?;
     let pc_entries = entries.iter().enumerate().filter(|(i, e)| {
-        e.source == PC_SOURCE
+        is_pc_source(e.source)
             && e.split == GenerationSplitV3::Train
             && !excluded.contains(i)
             && scope.contains(&e.stage_id)
@@ -1906,6 +1903,10 @@ fn split_name(split: GenerationSplitV3) -> &'static str {
         GenerationSplitV3::Validation => "validation",
         GenerationSplitV3::Holdout => "holdout",
     }
+}
+fn is_pc_source(source: &str) -> bool {
+    source == RoventPcRecordFamily::LegacyRecordV1.record_domain()
+        || source == RoventPcRecordFamily::SubmittedInputV1.record_domain()
 }
 
 #[cfg(test)]

@@ -99,6 +99,14 @@ fn documents() -> (RoventCheckpointPublication, Value, Value, Value) {
 fn ledger() -> TrainerLedger {
     let (p, recipe, _, window) = documents();
     let row = NativeRowAuthority {
+        family: RoventPcRecordFamily::LegacyRecordV1,
+        input_descriptor: json!({
+            "schema":"rz-rovent-training-input-source-descriptor/1",
+            "source_domain":rz_experiments::rovent_corpus::RECORD_DOMAIN,
+            "input_domain":rz_experiments::pals_data_v3::GENERATION_INPUT_DOMAIN,
+            "native_raw_domain":rz_experiments::rovent_corpus::NATIVE_RAW_DOMAIN,
+            "input_sha256":h('2')
+        }),
         origin: RoventCorpusOrigin {
             record_sha256: h('1'),
             input_sha256: h('2'),
@@ -132,6 +140,28 @@ fn ledger() -> TrainerLedger {
     result.begun = true;
     result
 }
+
+#[test]
+fn checkpoint_row_join_preserves_original_input_family() {
+    // This deliberately authored private collision fixture is neither a
+    // parsed corpus nor authority. A matching opaque seal cannot erase the
+    // original source domain when joining two retained row owners.
+    let source = ledger();
+    let legacy = source.rows.values().next().unwrap();
+    let mut submitted = legacy.clone();
+    submitted.family = RoventPcRecordFamily::SubmittedInputV1;
+    submitted.input_descriptor = json!({
+        "schema":"rz-rovent-training-input-source-descriptor/1",
+        "source_domain":rz_experiments::rovent_submitted_input::ROVENT_TRAINING_RECORD_V2_DOMAIN,
+        "input_domain":rz_experiments::rovent_submitted_input::ROVENT_SUBMITTED_INPUT_DOMAIN,
+        "native_raw_domain":rz_experiments::rovent_submitted_input::ROVENT_NATIVE_RAW_V3_DOMAIN,
+        "input_sha256":legacy.origin.input_sha256,
+        "attack_mapping":[]
+    });
+    assert!(!same_row(legacy, &submitted));
+    assert!(same_row(legacy, &legacy.clone()));
+}
+
 fn update_receipt(l: &TrainerLedger, index: usize, n: u64) -> Value {
     let update = json!({"schema":"rz-rovent-trainer-update/1","event":{"schema":"rz-rovent-original-learner-update/1",
         "window_id":"window-1","stage_id":"common","role":"proposer","completed_role_updates":l.completed["proposer"]+1,

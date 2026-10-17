@@ -955,7 +955,7 @@ fn collect_datasets(
     let pin = &owner.registration.publication.sha256;
     if let Some(previous) = all.get(pin) {
         check(
-            previous.manifest == owner.manifest && previous.index == owner.index,
+            previous.same_original_metadata(owner),
             "same publication pin has conflicting dataset owners",
         )?;
         return Ok(());
@@ -968,7 +968,9 @@ fn collect_datasets(
     Ok(())
 }
 fn same_row(a: &NativeRowAuthority, b: &NativeRowAuthority) -> bool {
-    a.origin == b.origin
+    a.family == b.family
+        && a.input_descriptor == b.input_descriptor
+        && a.origin == b.origin
         && a.role == b.role
         && a.retirement_sha256 == b.retirement_sha256
         && a.head_raw_sha256 == b.head_raw_sha256

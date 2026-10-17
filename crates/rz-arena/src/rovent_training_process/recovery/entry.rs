@@ -494,6 +494,7 @@ fn join_cli_scope(
 
 struct DatasetProbe {
     registration: RoventHistoricalDatasetRegistration,
+    family: RoventPcRecordFamily,
     index_sha256: String,
     ancestor_indices: Vec<String>,
 }
@@ -632,7 +633,7 @@ impl RegisteredRAuxiliaryDatasetGraph {
             .map(|sha| {
                 std::iter::once(&pc.current)
                     .chain(&pc.ancestors)
-                    .find(|owner| owner.index.sha256().ok().as_deref() == Some(sha.as_str()))
+                    .find(|owner| owner.index_sha256() == sha.as_str())
                     .cloned()
                     .ok_or_else(|| invalid("R manifest references unregistered P/C ancestor index"))
             })
@@ -674,21 +675,10 @@ impl RegisteredDatasetGraph {
         let mut probes = BTreeMap::new();
         let mut current_index = None;
         for item in all {
-            let (_, raw) = budget.read(&item.publication, MAX_METADATA_BYTES, true)?;
-            let publication: RoventCorpusPublication = decode(&raw)?;
-            publication.validate()?;
-            let (_, raw) = budget.read(
-                &archive_pin(&item.root, &publication.manifest)?,
-                MAX_METADATA_BYTES,
-                true,
-            )?;
-            let manifest: RoventCorpusManifest = decode(&raw)?;
-            check(
-                manifest.sha256().map_err(|e| invalid(e.to_string()))?
-                    == publication.canonical_manifest_sha256,
-                "historical dataset graph manifest pin changed",
-            )?;
-            let key = publication.canonical_index_sha256.clone();
+            // A family is selected only by the exact externally pinned
+            // publication domain. The probe runs that family's strict parser
+            // and canonical manifest join; it never re-tags closed bytes.
+            let (family, key, ancestor_indices) = probe_registered_pc_dataset(item, budget)?;
             if item.publication == registration.current_dataset.publication {
                 current_index = Some(key.clone());
             }
@@ -698,8 +688,9 @@ impl RegisteredDatasetGraph {
                         key.clone(),
                         DatasetProbe {
                             registration: item.clone(),
+                            family,
                             index_sha256: key,
-                            ancestor_indices: manifest.ancestor_index_sha256,
+                            ancestor_indices,
                         },
                     )
                     .is_none(),
@@ -777,11 +768,22 @@ impl RegisteredDatasetGraph {
             .iter()
             .map(|parent| Self::open(parent, probes, done, active, budget))
             .collect::<Result<Vec<_>, _>>()?;
-        let owner = Arc::new(VerifiedRoventDataset::open(
-            probe.registration.clone(),
-            ancestors,
-            budget,
-        )?);
+        let owner = Arc::new(match probe.family {
+            RoventPcRecordFamily::LegacyRecordV1 => {
+                VerifiedRoventDataset::open(probe.registration.clone(), ancestors, budget)?
+            }
+            RoventPcRecordFamily::SubmittedInputV1 => {
+                VerifiedRoventDataset::open_submitted_input_v1(
+                    probe.registration.clone(),
+                    ancestors,
+                    budget,
+                )?
+            }
+        });
+        check(
+            owner.family() == probe.family && owner.index_sha256() == key,
+            "historical dataset family or canonical index changed after probing",
+        )?;
         active.remove(key);
         done.insert(key.into(), Arc::clone(&owner));
         Ok(owner)

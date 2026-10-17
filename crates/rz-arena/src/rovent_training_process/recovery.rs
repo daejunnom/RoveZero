@@ -9,8 +9,9 @@ use crate::pals_collect_v3::training_process::{
 };
 use crate::rovent_collect::{
     RoventCorpusPublication, RoventPublicationFile, verify_historical_record_evidence,
+    verify_historical_submitted_record_evidence,
 };
-use rz_experiments::rovent_corpus::{MAX_CHUNK_BYTES, RoventCorpusReader};
+use rz_experiments::rovent_corpus::MAX_CHUNK_BYTES;
 use std::{
     path::{Component, Path},
     sync::atomic::{AtomicU64, Ordering},
@@ -22,6 +23,8 @@ pub const ROVENT_RECOVERY_STARTUP: &str = "rz-rovent-recovered-training-startup/
 pub const ROVENT_RECOVERED_CHECKPOINT: &str = "rz-rovent-recovered-checkpoint-admission/1";
 pub const ROVENT_RECOVERY_SOURCE_KIND: &str = "historical_exact_pins";
 const MAX_METADATA_BYTES: u64 = 16 << 20;
+mod corpus_family;
+use corpus_family::*;
 
 pub struct RoventRecoveryReadBudget {
     maximum: u64,
@@ -200,10 +203,12 @@ pub struct RoventHistoricalDatasetRegistration {
 /// These rows are training data, never a reconstruction of native authority.
 pub struct VerifiedRoventDataset {
     registration: RoventHistoricalDatasetRegistration,
-    publication: RoventCorpusPublication,
-    manifest: RoventCorpusManifest,
-    index: RoventCorpusIndex,
+    original: OriginalPcCorpus,
+    publication: HistoricalPublicationMetadata,
+    manifest: HistoricalCollectionMetadata,
+    index: HistoricalIndexMetadata,
     rows: BTreeMap<String, NativeRowAuthority>,
+    lineage_rows: Vec<HistoricalPcLineageRow>,
     held: Vec<HeldHistoricalFile>,
     ancestors: Vec<Arc<Self>>,
 }
@@ -212,6 +217,33 @@ impl VerifiedRoventDataset {
         registration: RoventHistoricalDatasetRegistration,
         ancestors: Vec<Arc<Self>>,
         budget: &RoventRecoveryReadBudget,
+    ) -> Result<Self, ArenaError> {
+        Self::open_family(
+            registration,
+            ancestors,
+            budget,
+            RoventPcRecordFamily::LegacyRecordV1,
+        )
+    }
+    /// The submitted-input/1, record/2, raw/3 family is explicitly selected.
+    /// The legacy constructor never decodes it or converts its canonical seals.
+    pub fn open_submitted_input_v1(
+        registration: RoventHistoricalDatasetRegistration,
+        ancestors: Vec<Arc<Self>>,
+        budget: &RoventRecoveryReadBudget,
+    ) -> Result<Self, ArenaError> {
+        Self::open_family(
+            registration,
+            ancestors,
+            budget,
+            RoventPcRecordFamily::SubmittedInputV1,
+        )
+    }
+    fn open_family(
+        registration: RoventHistoricalDatasetRegistration,
+        ancestors: Vec<Arc<Self>>,
+        budget: &RoventRecoveryReadBudget,
+        expected_family: RoventPcRecordFamily,
     ) -> Result<Self, ArenaError> {
         check(
             ancestors.len() <= 256
@@ -242,8 +274,12 @@ impl VerifiedRoventDataset {
         let (mut held, published_raw) = budget
             .read(&registration.publication, MAX_METADATA_BYTES, true)
             .map(|(f, r)| (vec![f], r))?;
-        let publication: RoventCorpusPublication = decode(&published_raw)?;
-        publication.validate()?;
+        let original_publication = OriginalPublication::decode(&published_raw)?;
+        check(
+            original_publication.family() == expected_family,
+            "PC corpus requires the explicitly selected original family constructor",
+        )?;
+        let publication = original_publication.metadata();
         check(
             publication.source_commit == registration.collection_source_commit
                 && publication.source_sha256 == registration.collection_source_sha256
@@ -262,13 +298,13 @@ impl VerifiedRoventDataset {
             true,
         )?;
         held.push(index_file);
-        let manifest: RoventCorpusManifest = decode(&manifest_raw)?;
-        let index: RoventCorpusIndex = decode(&index_raw)?;
+        let original_manifest = OriginalManifest::decode(&manifest_raw, expected_family)?;
+        let original_index = OriginalIndex::decode(&index_raw, &original_manifest)?;
+        let manifest = original_manifest.metadata();
+        let index = original_index.metadata()?;
         check(
-            manifest.sha256().map_err(|e| invalid(e.to_string()))?
-                == publication.canonical_manifest_sha256
-                && index.sha256().map_err(|e| invalid(e.to_string()))?
-                    == publication.canonical_index_sha256
+            original_manifest.sha256()? == publication.canonical_manifest_sha256
+                && original_index.sha256()? == publication.canonical_index_sha256
                 && manifest.source_commit == registration.collection_source_commit
                 && manifest.source_sha256 == registration.collection_source_sha256
                 && manifest.runtime_sha256 == registration.collection_runtime_library_sha256
@@ -281,17 +317,19 @@ impl VerifiedRoventDataset {
                 && index.chunks.len() == publication.chunks.len(),
             "historical publication/manifest/index source and canonical seals differ",
         )?;
-        let ancestor_indices = ancestors
-            .iter()
-            .map(|owner| owner.index.clone())
-            .collect::<Vec<_>>();
-        let reader = RoventCorpusReader::new_rules_replay_v2(
-            manifest.clone(),
-            index.clone(),
-            &ancestor_indices,
-        )
-        .map_err(|e| invalid(e.to_string()))?;
+        validate_original_ancestry(&manifest, &index, &ancestors)?;
         let mut rows = BTreeMap::new();
+        let mut lineage_rows = Vec::new();
+        let indexed = index
+            .origins
+            .iter()
+            .map(|o| (o.record_sha256.as_str(), o))
+            .collect::<BTreeMap<_, _>>();
+        check(
+            indexed.len() == index.origins.len(),
+            "duplicate PC original record index occurrence",
+        )?;
+        let mut seen_records = BTreeSet::new();
         let mut admissions = BTreeSet::new();
         let mut total = publication
             .manifest
@@ -357,7 +395,7 @@ impl VerifiedRoventDataset {
             };
             admission_locks.insert(admitted.native_admission_sha256.clone(), (lock, bundle));
         }
-        for (slot, (declared, pin)) in index.chunks.iter().zip(&publication.chunks).enumerate() {
+        for (declared, pin) in index.chunks.iter().zip(&publication.chunks) {
             check(
                 declared.path == pin.path
                     && declared.sha256 == pin.sha256
@@ -373,12 +411,28 @@ impl VerifiedRoventDataset {
                 true,
             )?;
             held.push(file);
-            for row in reader
-                .read_chunk(slot, &bytes)
-                .map_err(|e| invalid(e.to_string()))?
-            {
-                let evidence = verify_historical_record_evidence(&row, &manifest)?;
-                let role = role_name(row.role);
+            let text =
+                std::str::from_utf8(&bytes).map_err(|_| invalid("PC original chunk UTF8"))?;
+            let mut chunk_count = 0u64;
+            for line in text.lines() {
+                budget.reserve(0)?;
+                check(
+                    !line.is_empty()
+                        && line.len() <= rz_experiments::pals_data_v3::GENERATION_MAX_ROW_BYTES
+                        && chunk_count < declared.records,
+                    "bounded original PC JSONL row",
+                )?;
+                let row = OriginalPcRow::decode(line, &original_manifest)?;
+                let evidence = match (&row, &original_manifest) {
+                    (OriginalPcRow::Legacy(row), OriginalManifest::Legacy(manifest)) => {
+                        verify_historical_record_evidence(row, manifest)?
+                    }
+                    (OriginalPcRow::Submitted(row), OriginalManifest::Submitted(manifest)) => {
+                        verify_historical_submitted_record_evidence(row, manifest)?
+                    }
+                    _ => return Err(invalid("PC original row/manifest typed family mismatch")),
+                };
+                let role = role_name(row.role());
                 let binding = registration
                     .role_bindings
                     .get(role)
@@ -407,33 +461,75 @@ impl VerifiedRoventDataset {
                     &evidence,
                 )?;
                 admissions.insert(evidence.native_admission_sha256);
-                let data = row_authority(&row)?;
+                let data = row.authority(&original_manifest)?;
                 check(
-                    rows.insert(row.origin_sha256.clone(), data).is_none(),
+                    indexed
+                        .get(data.origin.record_sha256.as_str())
+                        .is_some_and(|origin| **origin == data.origin)
+                        && seen_records.insert(data.origin.record_sha256.clone()),
+                    "PC original chunk changed/duplicated its exact index occurrence",
+                )?;
+                lineage_rows.push(row.lineage(&data));
+                let origin = data.origin.origin_sha256.clone();
+                check(
+                    rows.insert(origin, data).is_none(),
                     "duplicate historical origin",
                 )?;
+                chunk_count += 1;
             }
+            check(
+                chunk_count == declared.records,
+                "PC original chunk row count",
+            )?;
         }
         check(
             total == publication.total_payload_bytes
                 && total <= MAX_TRAINER_OUTPUT_BYTES
                 && rows.len() as u64 == publication.record_count
+                && seen_records.len() == index.origins.len()
                 && admissions.into_iter().collect::<Vec<_>>()
                     == publication.native_admission_sha256,
             "historical full payload/row/admission set did not close",
         )?;
         Ok(Self {
             registration,
+            original: OriginalPcCorpus {
+                publication: original_publication,
+                manifest: original_manifest,
+                index: original_index,
+            },
             publication,
             manifest,
             index,
             rows,
+            lineage_rows,
             held,
             ancestors,
         })
     }
     pub fn registration(&self) -> &RoventHistoricalDatasetRegistration {
         &self.registration
+    }
+    pub fn family(&self) -> RoventPcRecordFamily {
+        self.original.publication.family()
+    }
+    pub fn manifest_sha256(&self) -> &str {
+        &self.publication.canonical_manifest_sha256
+    }
+    pub fn index_sha256(&self) -> &str {
+        &self.publication.canonical_index_sha256
+    }
+    pub fn manifest_file_sha256(&self) -> &str {
+        &self.publication.manifest.sha256
+    }
+    pub fn index_file_sha256(&self) -> &str {
+        &self.publication.index.sha256
+    }
+    pub fn same_original_metadata(&self, other: &Self) -> bool {
+        self.original == other.original
+    }
+    pub fn original_metadata_json(&self) -> Result<Value, ArenaError> {
+        self.original.json()
     }
     pub fn observation(&self) -> Value {
         json!({"schema":ROVENT_HISTORICAL_DATASET,"source_kind":ROVENT_RECOVERY_SOURCE_KIND,
@@ -457,7 +553,7 @@ fn join_historical_input_lock(
         &RoventPublicationFile,
         &rz_eval::runtime_pin::CudaRuntimeBundleSpec,
     )>,
-    row: &rz_experiments::rovent_corpus::RoventTrainingRecord,
+    row: &OriginalPcRow,
     evidence: &crate::rovent_collect::RoventHistoricalRecordEvidence,
 ) -> Result<(), ArenaError> {
     evidence
@@ -466,7 +562,7 @@ fn join_historical_input_lock(
         .map_err(|error| invalid(error.to_string()))?;
     let manifest = &lock.manifest;
     let engine = &manifest.engine;
-    let model = match row.role {
+    let model = match row.role() {
         GenerationRoleV3::Proposer => &engine.pc.proposer,
         GenerationRoleV3::Critic => &engine.pc.critic,
         GenerationRoleV3::Validator => engine
@@ -475,7 +571,7 @@ fn join_historical_input_lock(
             .as_ref()
             .ok_or_else(|| invalid("historical V row is absent from the full loaded lock"))?,
     };
-    let origin = &row.native.raw_retirement["root_admission"]["native_origin"];
+    let origin = &row.native().raw_retirement["root_admission"]["native_origin"];
     check(
         manifest.purpose == rz_experiments::RoventPurpose::Collection
             && lock.canonical_sha256 == evidence.collection_input_lock_sha256
@@ -545,42 +641,6 @@ fn join_historical_input_lock(
         )),
     }
 }
-fn row_authority(
-    row: &rz_experiments::rovent_corpus::RoventTrainingRecord,
-) -> Result<NativeRowAuthority, ArenaError> {
-    let mut valid = BTreeMap::from(HEADS.map(|name| (name.to_owned(), 0)));
-    if row.role == GenerationRoleV3::Validator {
-        if let Some(task) = &row.targets.task {
-            valid.insert(
-                "task".into(),
-                generation_derive_tasks(&row.input, &task.outcomes)
-                    .map_err(|e| invalid(e.to_string()))?
-                    .pairs
-                    .len() as u64,
-            );
-        }
-    } else {
-        valid.insert("policy".into(), u64::from(row.targets.policy.is_some()));
-        valid.insert("wdl".into(), u64::from(row.targets.wdl.is_some()));
-        valid.insert(
-            "divergence".into(),
-            u64::from(row.role == GenerationRoleV3::Critic && row.targets.divergence.is_some()),
-        );
-        valid.insert("nnuec_wdl".into(), u64::from(row.nnuec_wdl.is_some()));
-    }
-    Ok(NativeRowAuthority {
-        origin: RoventCorpusOrigin::from_record(row),
-        role: role_name(row.role).into(),
-        retirement_sha256: row.native.raw_retirement_sha256.clone(),
-        head_raw_sha256: row
-            .head_sources
-            .iter()
-            .map(|(name, source)| (name.clone(), source.raw_receipt_sha256.clone()))
-            .collect(),
-        valid_heads: valid,
-    })
-}
-
 mod checkpoint;
 pub use checkpoint::*;
 mod registration;
@@ -602,3 +662,5 @@ mod r_auxiliary_ledger;
 use r_auxiliary_ledger::*;
 #[cfg(test)]
 pub(crate) mod metadata_wire_tests;
+#[cfg(test)]
+mod submitted_wire_tests;

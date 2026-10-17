@@ -5,13 +5,16 @@
 //! process closure stay with the original owner on success and failure.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-use crate::rovent_collect::PublishedRoventRecord;
+use crate::rovent_collect::{PublishedRoventRecord, PublishedRoventRecordV2};
 use crate::{ArenaError, OriginalProcessOutput, ProcessLimits};
 use rz_experiments::pals_data_v3::{
     GenerationRoleV3, GenerationSplitV3, generation_derive_tasks, generation_digest,
     generation_identifier, generation_sha,
 };
 use rz_experiments::rovent_corpus::{RoventCorpusIndex, RoventCorpusManifest, RoventCorpusOrigin};
+use rz_experiments::rovent_corpus_v2::{
+    RoventCorpusIndexV2, RoventCorpusManifestV2, RoventTrainingRecordV2,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -105,19 +108,182 @@ fn validate_cost(value: &Value) -> Result<(), ArenaError> {
 
 /// Small immutable authority derived from the producer's original private row.
 /// It retains no tensor, board clone or generated checkpoint payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoventPcRecordFamily {
+    LegacyRecordV1,
+    SubmittedInputV1,
+}
+impl RoventPcRecordFamily {
+    pub fn record_domain(self) -> &'static str {
+        match self {
+            Self::LegacyRecordV1 => rz_experiments::rovent_corpus::RECORD_DOMAIN,
+            Self::SubmittedInputV1 => {
+                rz_experiments::rovent_submitted_input::ROVENT_TRAINING_RECORD_V2_DOMAIN
+            }
+        }
+    }
+    pub fn input_domain(self) -> &'static str {
+        match self {
+            Self::LegacyRecordV1 => rz_experiments::pals_data_v3::GENERATION_INPUT_DOMAIN,
+            Self::SubmittedInputV1 => {
+                rz_experiments::rovent_submitted_input::ROVENT_SUBMITTED_INPUT_DOMAIN
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct NativeRowAuthority {
+    family: RoventPcRecordFamily,
+    /// Bounded source descriptor only. Full submitted bytes/tensor remain in
+    /// the actual PublishedRecord or the historical held chunk, never here.
+    input_descriptor: Value,
     origin: RoventCorpusOrigin,
     role: String,
     retirement_sha256: String,
     head_raw_sha256: BTreeMap<String, String>,
     valid_heads: BTreeMap<String, u64>,
 }
+impl NativeRowAuthority {
+    fn validate_source_descriptor(&self) -> Result<(), ArenaError> {
+        let mut expected = vec![
+            "schema",
+            "source_domain",
+            "input_domain",
+            "native_raw_domain",
+            "input_sha256",
+        ];
+        if self.family == RoventPcRecordFamily::SubmittedInputV1 {
+            expected.push("attack_mapping");
+        }
+        fields(&self.input_descriptor, &expected)?;
+        check(
+            self.input_descriptor["schema"] == "rz-rovent-training-input-source-descriptor/1"
+                && self.input_descriptor["source_domain"] == self.family.record_domain()
+                && self.input_descriptor["input_domain"] == self.family.input_domain()
+                && self.input_descriptor["input_sha256"] == self.origin.input_sha256,
+            "opaque sample changed its original record/input family descriptor",
+        )?;
+        match self.family {
+            RoventPcRecordFamily::LegacyRecordV1 => check(
+                matches!(
+                    self.input_descriptor["native_raw_domain"].as_str(),
+                    Some(
+                        rz_experiments::rovent_corpus::NATIVE_RAW_DOMAIN
+                            | rz_experiments::rovent_corpus::NATIVE_RAW_RULES_V2_DOMAIN
+                    )
+                ),
+                "legacy source descriptor requires its original raw domain",
+            ),
+            RoventPcRecordFamily::SubmittedInputV1 => check(
+                self.input_descriptor["native_raw_domain"]
+                    == rz_experiments::rovent_submitted_input::ROVENT_NATIVE_RAW_V3_DOMAIN
+                    && self.input_descriptor["attack_mapping"]
+                        .as_array()
+                        .is_some_and(|rows| rows.len() <= 128),
+                "submitted source descriptor requires original bounded raw3 attack slots",
+            ),
+        }
+    }
+}
+
+fn native_row_authority_legacy(
+    row: &rz_experiments::rovent_corpus::RoventTrainingRecord,
+) -> Result<NativeRowAuthority, ArenaError> {
+    let mut valid_heads = BTreeMap::from(HEADS.map(|name| (name.to_owned(), 0)));
+    if row.role == GenerationRoleV3::Validator {
+        if let Some(task) = &row.targets.task {
+            valid_heads.insert(
+                "task".into(),
+                generation_derive_tasks(&row.input, &task.outcomes)
+                    .map_err(|error| invalid(error.to_string()))?
+                    .pairs
+                    .len() as u64,
+            );
+        }
+    } else {
+        valid_heads.insert("policy".into(), u64::from(row.targets.policy.is_some()));
+        valid_heads.insert("wdl".into(), u64::from(row.targets.wdl.is_some()));
+        valid_heads.insert(
+            "divergence".into(),
+            u64::from(row.role == GenerationRoleV3::Critic && row.targets.divergence.is_some()),
+        );
+        valid_heads.insert("nnuec_wdl".into(), u64::from(row.nnuec_wdl.is_some()));
+    }
+    let authority = NativeRowAuthority {
+        family: RoventPcRecordFamily::LegacyRecordV1,
+        input_descriptor: json!({"schema":"rz-rovent-training-input-source-descriptor/1",
+            "source_domain":rz_experiments::rovent_corpus::RECORD_DOMAIN,
+            "input_domain":rz_experiments::pals_data_v3::GENERATION_INPUT_DOMAIN,
+            "native_raw_domain":row.native.raw_submission["schema"],"input_sha256":row.input_sha256}),
+        origin: RoventCorpusOrigin::from_record(row),
+        role: role_name(row.role).into(),
+        retirement_sha256: row.native.raw_retirement_sha256.clone(),
+        head_raw_sha256: row
+            .head_sources
+            .iter()
+            .map(|(name, source)| (name.clone(), source.raw_receipt_sha256.clone()))
+            .collect(),
+        valid_heads,
+    };
+    authority.validate_source_descriptor()?;
+    Ok(authority)
+}
+
+fn native_row_authority_v2(
+    row: &RoventTrainingRecordV2,
+    manifest: &RoventCorpusManifestV2,
+) -> Result<NativeRowAuthority, ArenaError> {
+    row.validate(manifest)
+        .map_err(|error| invalid(error.to_string()))?;
+    check(
+        row.role != GenerationRoleV3::Validator,
+        "submitted-input family is V-free",
+    )?;
+    let mut valid_heads = BTreeMap::from(HEADS.map(|name| (name.to_owned(), 0)));
+    valid_heads.insert("policy".into(), u64::from(row.targets.policy.is_some()));
+    valid_heads.insert("wdl".into(), u64::from(row.targets.wdl.is_some()));
+    valid_heads.insert(
+        "divergence".into(),
+        u64::from(row.role == GenerationRoleV3::Critic && row.targets.divergence.is_some()),
+    );
+    let authority = NativeRowAuthority {
+        family: RoventPcRecordFamily::SubmittedInputV1,
+        input_descriptor: json!({"schema":"rz-rovent-training-input-source-descriptor/1",
+            "source_domain":rz_experiments::rovent_submitted_input::ROVENT_TRAINING_RECORD_V2_DOMAIN,
+            "input_domain":rz_experiments::rovent_submitted_input::ROVENT_SUBMITTED_INPUT_DOMAIN,
+            "native_raw_domain":row.native.raw_submission["schema"],"input_sha256":row.input_sha256,"attack_mapping":row.input.attack_mapping}),
+        origin: RoventCorpusOrigin {
+            record_sha256: row.record_sha256.clone(),
+            input_sha256: row.input_sha256.clone(),
+            origin_sha256: row.origin_sha256.clone(),
+            split: row.split,
+            game_id: row.input.game_id.clone(),
+            opening_id: row.input.opening_id.clone(),
+            line_genealogy_id: row.input.line_genealogy_id.clone(),
+            transposition_sha256: row.input.transposition_sha256.clone(),
+            actor_id: row.lineage.actor_id.clone(),
+            teacher_actor_id: row.lineage.teacher_actor_id.clone(),
+            ancestor_origin_sha256: row.lineage.ancestor_origin_sha256.clone(),
+        },
+        role: role_name(row.role).into(),
+        retirement_sha256: row.native.raw_retirement_sha256.clone(),
+        head_raw_sha256: row
+            .head_sources
+            .iter()
+            .map(|(name, source)| (name.clone(), source.raw_receipt_sha256.clone()))
+            .collect(),
+        valid_heads,
+    };
+    authority.validate_source_descriptor()?;
+    Ok(authority)
+}
 
 /// Original producer custody. No Deserialize, wire constructor or boolean
 /// admission exists. Recovering corpus files cannot reconstruct this type.
 pub struct OriginalRoventCorpusCustody {
     manifest: RoventCorpusManifest,
+    submitted_manifest: Option<RoventCorpusManifestV2>,
     manifest_sha256: String,
     rows: BTreeMap<String, NativeRowAuthority>,
     ancestors: Vec<Arc<OriginalRoventCorpusCustody>>,
@@ -145,6 +311,7 @@ impl OriginalRoventCorpusCustody {
         }
         Ok(Self {
             manifest,
+            submitted_manifest: None,
             manifest_sha256,
             rows: BTreeMap::new(),
             ancestors,
@@ -152,6 +319,87 @@ impl OriginalRoventCorpusCustody {
     }
     pub fn retain_published(&mut self, original: &PublishedRoventRecord) -> Result<(), ArenaError> {
         self.retain_published_explicit(original, false)
+    }
+    /// An empty sink for the distinct submitted-input/1 corpus family. Only an
+    /// actual PublishedRecordV2 can add rows; old /1 launch parsers stay closed.
+    pub fn new_submitted_v3(
+        manifest: RoventCorpusManifestV2,
+        ancestors: Vec<Arc<Self>>,
+    ) -> Result<Self, ArenaError> {
+        manifest
+            .validate()
+            .map_err(|error| invalid(error.to_string()))?;
+        check(
+            ancestors.len() <= 256,
+            "submitted ancestor custody capacity",
+        )?;
+        let manifest_sha256 = manifest
+            .sha256()
+            .map_err(|error| invalid(error.to_string()))?;
+        let mut seen = BTreeSet::new();
+        for ancestor in &ancestors {
+            check(
+                seen.insert(&ancestor.manifest_sha256)
+                    && ancestor.manifest.recipe_sha256 == manifest.recipe_sha256
+                    && ancestor.manifest.student == manifest.student
+                    && ancestor.manifest.learner == manifest.learner
+                    && ancestor.manifest.opening_splits == manifest.opening_splits,
+                "duplicate or foreign original submitted ancestor",
+            )?;
+        }
+        Ok(Self {
+            manifest: manifest.common_registration_projection(),
+            submitted_manifest: Some(manifest),
+            manifest_sha256,
+            rows: BTreeMap::new(),
+            ancestors,
+        })
+    }
+    pub fn retain_published_submitted_v3(
+        &mut self,
+        original: &PublishedRoventRecordV2,
+    ) -> Result<(), ArenaError> {
+        let manifest = self.submitted_manifest.as_ref().ok_or_else(|| {
+            invalid("submitted published row requires its explicit manifest2 custody")
+        })?;
+        let row = original.record();
+        let authority = native_row_authority_v2(row, manifest)?;
+        check(
+            original.manifest_sha256() == self.manifest_sha256
+                && self.rows.len() < MAX_TRAINER_ROWS
+                && !self.rows.contains_key(&row.origin_sha256),
+            "submitted original row manifest/duplicate/capacity",
+        )?;
+        self.rows.insert(row.origin_sha256.clone(), authority);
+        Ok(())
+    }
+    pub fn pc_record_family(&self) -> RoventPcRecordFamily {
+        if self.submitted_manifest.is_some() {
+            RoventPcRecordFamily::SubmittedInputV1
+        } else {
+            RoventPcRecordFamily::LegacyRecordV1
+        }
+    }
+    pub fn join_index_submitted_v3(&self, index: &RoventCorpusIndexV2) -> Result<(), ArenaError> {
+        let manifest = self
+            .submitted_manifest
+            .as_ref()
+            .ok_or_else(|| invalid("submitted index requires actual manifest2 custody"))?;
+        index
+            .validate(manifest)
+            .map_err(|error| invalid(error.to_string()))?;
+        check(
+            !self.rows.is_empty()
+                && index.manifest_sha256 == self.manifest_sha256
+                && index.origins.len() == self.rows.len()
+                && index.origins.iter().all(|origin| {
+                    self.rows.get(&origin.origin_sha256).is_some_and(|row| {
+                        row.family == RoventPcRecordFamily::SubmittedInputV1
+                            && row.origin == *origin
+                    })
+                }),
+            "submitted index must cover its complete actual published2 custody",
+        )
     }
     /// New exact Rules-replay format is selected explicitly. The original
     /// /1 intake above is preserved and never automatically retags old rows.
@@ -166,6 +414,10 @@ impl OriginalRoventCorpusCustody {
         original: &PublishedRoventRecord,
         rules_replay_v2: bool,
     ) -> Result<(), ArenaError> {
+        check(
+            self.submitted_manifest.is_none(),
+            "legacy published row cannot enter submitted manifest2 custody",
+        )?;
         let row = original.record();
         (if rules_replay_v2 {
             row.validate_rules_replay_v2(&self.manifest)
@@ -179,37 +431,7 @@ impl OriginalRoventCorpusCustody {
                 && !self.rows.contains_key(&row.origin_sha256),
             "retained original row manifest/duplicate/capacity",
         )?;
-        let mut valid_heads = BTreeMap::from(HEADS.map(|name| (name.to_owned(), 0)));
-        if row.role == GenerationRoleV3::Validator {
-            if let Some(task) = &row.targets.task {
-                valid_heads.insert(
-                    "task".into(),
-                    generation_derive_tasks(&row.input, &task.outcomes)
-                        .map_err(|e| invalid(e.to_string()))?
-                        .pairs
-                        .len() as u64,
-                );
-            }
-        } else {
-            valid_heads.insert("policy".into(), u64::from(row.targets.policy.is_some()));
-            valid_heads.insert("wdl".into(), u64::from(row.targets.wdl.is_some()));
-            valid_heads.insert(
-                "divergence".into(),
-                u64::from(row.role == GenerationRoleV3::Critic && row.targets.divergence.is_some()),
-            );
-            valid_heads.insert("nnuec_wdl".into(), u64::from(row.nnuec_wdl.is_some()));
-        }
-        let authority = NativeRowAuthority {
-            origin: RoventCorpusOrigin::from_record(row),
-            role: role_name(row.role).into(),
-            retirement_sha256: row.native.raw_retirement_sha256.clone(),
-            head_raw_sha256: row
-                .head_sources
-                .iter()
-                .map(|(k, v)| (k.clone(), v.raw_receipt_sha256.clone()))
-                .collect(),
-            valid_heads,
-        };
+        let authority = native_row_authority_legacy(row)?;
         self.rows.insert(row.origin_sha256.clone(), authority);
         Ok(())
     }
@@ -220,6 +442,10 @@ impl OriginalRoventCorpusCustody {
         self.rows.len()
     }
     fn join_index(&self, index: &RoventCorpusIndex) -> Result<(), ArenaError> {
+        check(
+            self.submitted_manifest.is_none(),
+            "original /1 launch cannot admit submitted manifest2/index2 custody",
+        )?;
         index.validate().map_err(|e| invalid(e.to_string()))?;
         check(
             !self.rows.is_empty()
@@ -576,6 +802,7 @@ impl TrainerLedger {
             .rows
             .get(origin)
             .ok_or_else(|| invalid("sample has no original native retirement owner"))?;
+        row.validate_source_descriptor()?;
         check(
             row.origin.split == GenerationSplitV3::Train
                 && p["split"] == "train"

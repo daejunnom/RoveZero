@@ -14,6 +14,10 @@ fn ledger(masked: bool) -> TrainerLedger {
         "loss_weights":{"policy":1,"wdl":1,"divergence":1,"task":1},"nnuec_loss":{"weight":1}});
     let recipe = json!({"stages":[{"stage_id":"common","parent_stage_id":null,"teacher_actor_ids":["sf","reckless"],"role_updates":{"proposer":2,"critic":2,"validator":1}}]});
     let row = NativeRowAuthority {
+        family: RoventPcRecordFamily::LegacyRecordV1,
+        input_descriptor: json!({"schema":"rz-rovent-training-input-source-descriptor/1",
+            "source_domain":rz_experiments::rovent_corpus::RECORD_DOMAIN,"input_domain":rz_experiments::pals_data_v3::GENERATION_INPUT_DOMAIN,
+            "native_raw_domain":rz_experiments::rovent_corpus::NATIVE_RAW_DOMAIN,"input_sha256":h('2')}),
         origin: RoventCorpusOrigin {
             record_sha256: h('1'),
             input_sha256: h('2'),
@@ -44,6 +48,49 @@ fn ledger(masked: bool) -> TrainerLedger {
         counts(),
     )
     .unwrap()
+}
+
+#[test]
+fn submitted_family_admission_keeps_original_sha_and_all_128_attack_descriptors() {
+    // Private metadata fixture only: no PublishedRecord/corpus/native/process
+    // capability or numerical input is constructed by this ledger test.
+    let mut l = ledger(false);
+    let attacks = (0..128)
+        .map(|slot| {
+            json!({"slot":slot,"attack_ply":slot,
+        "selected_counter_local_index":null,"selected_counter_revision":null})
+        })
+        .collect::<Vec<_>>();
+    let row = l.rows.get_mut(&h('3')).unwrap();
+    row.family = RoventPcRecordFamily::SubmittedInputV1;
+    row.input_descriptor = json!({"schema":"rz-rovent-training-input-source-descriptor/1",
+        "source_domain":rz_experiments::rovent_submitted_input::ROVENT_TRAINING_RECORD_V2_DOMAIN,
+        "input_domain":rz_experiments::rovent_submitted_input::ROVENT_SUBMITTED_INPUT_DOMAIN,
+        "native_raw_domain":rz_experiments::rovent_submitted_input::ROVENT_NATIVE_RAW_V3_DOMAIN,
+        "input_sha256":h('2'),"attack_mapping":attacks});
+    row.validate_source_descriptor().unwrap();
+    let begin = begin(&l);
+    l.begin(&begin).unwrap();
+    let mut request = consume();
+    request["schema"] = json!("rz-rovent-trainer-consume/2");
+    let original = request.clone();
+    l.consume_with_schema(&request, "rz-rovent-trainer-consume/2")
+        .unwrap();
+    assert_eq!(request, original);
+    assert_eq!(request.as_object().unwrap().len(), 8);
+    assert_eq!(
+        l.rows[&h('3')].input_descriptor["attack_mapping"]
+            .as_array()
+            .unwrap()
+            .len(),
+        128
+    );
+    l.rows.get_mut(&h('3')).unwrap().input_descriptor["input_domain"] =
+        json!(rz_experiments::pals_data_v3::GENERATION_INPUT_DOMAIN);
+    assert!(
+        l.consume_with_schema(&request, "rz-rovent-trainer-consume/2")
+            .is_err()
+    );
 }
 fn begin(l: &TrainerLedger) -> Value {
     json!({"schema":"rz-rovent-trainer-begin/1","recipe_sha256":l.window["recipe_sha256"],"stage_id":"common",
