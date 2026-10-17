@@ -3929,6 +3929,8 @@ where
             let Some(event) = self.deferred.pop_front() else {
                 break;
             };
+            let changed_before_event = changed;
+            let consumed_before_event = self.counters.consumed_role_outputs;
             changed = true;
             let result = match &event {
                 DeferredCommit::Role { ticket, accepted } => self.retire_role(*ticket, *accepted),
@@ -3970,6 +3972,13 @@ where
                 // A failed hot commit cannot erase the original worker receipt.
                 // Shutdown may still settle it without restoring consumption.
                 self.deferred.push_front(event);
+                if self.semantic_replay_can_wait(&error)? {
+                    // Native terminals are drained/settled before this queue.
+                    // Keep the exact accepted head and make no synthetic tick
+                    // progress while waiting for its actual owner receipt.
+                    return Ok(changed_before_event
+                        || self.counters.consumed_role_outputs != consumed_before_event);
+                }
                 return Err(error);
             }
         }

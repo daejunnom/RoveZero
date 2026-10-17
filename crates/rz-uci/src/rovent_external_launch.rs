@@ -31,6 +31,8 @@ use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+mod actual_root;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RoventExternalSlot {
@@ -87,6 +89,9 @@ impl VerifiedRoventExternalStartup {
 pub struct RoventExternalOwner {
     launch: PreparedRoventExternalLaunch,
     worker: ProfiledExternalWorker,
+    initial_root: SearchAuthority,
+    legacy_dispatched: bool,
+    active_root: Option<actual_root::ActualExternalRoot>,
 }
 
 impl PreparedRoventExternalLaunch {
@@ -246,6 +251,9 @@ impl PreparedRoventExternalLaunch {
             Ok(RoventExternalOwner {
                 launch: self,
                 worker,
+                initial_root,
+                legacy_dispatched: false,
+                active_root: None,
             })
         }
     }
@@ -350,6 +358,11 @@ impl RoventExternalOwner {
         &mut self,
         job: ProfiledExternalJob,
     ) -> Result<ProfiledExternalDispatch, CheckerError> {
+        if self.active_root.is_some() {
+            return Err(CheckerError::Unsupported(
+                "use actual-root external submission after live-root admission",
+            ));
+        }
         if Some(job.mode) != self.launch.mode
             || Some(job.question.root_budget) != self.launch.root_budget
         {
@@ -359,13 +372,33 @@ impl RoventExternalOwner {
         }
         self.launch
             .require_query(job.constraint, job.root_moves.is_some())?;
-        self.worker.submit(job)
+        let dispatch = self.worker.submit(job)?;
+        self.legacy_dispatched = true;
+        Ok(dispatch)
     }
 
     pub fn validate_completion(
         &self,
         completion: &ProfiledExternalCompletion,
         dispatch: &ProfiledExternalDispatch,
+    ) -> Result<(), CheckerError> {
+        if self.active_root.is_some() {
+            return Err(CheckerError::Unsupported(
+                "use actual-root completion validation after live-root admission",
+            ));
+        }
+        let budget = self
+            .launch
+            .root_budget
+            .ok_or(invalid("external exact root budget missing"))?;
+        self.validate_completion_for_budget(completion, dispatch, budget)
+    }
+
+    fn validate_completion_for_budget(
+        &self,
+        completion: &ProfiledExternalCompletion,
+        dispatch: &ProfiledExternalDispatch,
+        root_budget: Digest,
     ) -> Result<(), CheckerError> {
         let actual_startup = self.verified_startup()?.ok_or(invalid(
             "actual external startup missing for completion validation",
@@ -375,7 +408,7 @@ impl RoventExternalOwner {
             dispatch.process_identity(),
         )?;
         if !completion.matches_submission(dispatch)
-            || Some(completion.question().root_budget) != self.launch.root_budget
+            || completion.question().root_budget != root_budget
         {
             return Err(invalid(
                 "external completion does not match original dispatch/ledger",

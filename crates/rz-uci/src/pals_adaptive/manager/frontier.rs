@@ -137,6 +137,49 @@ where
             .any(|event| event.grant().job == job)
     }
 
+    /// A semantic replay may wait only on actual, still-owned native credit.
+    /// A reservation snapshot alone is not a future settlement guarantee: its
+    /// original worker/binding must still be present and its usage known.
+    pub(super) fn semantic_replay_can_wait(
+        &self,
+        error: &AdaptiveManagerError,
+    ) -> Result<bool, AdaptiveManagerError> {
+        if !matches!(
+            error,
+            AdaptiveManagerError::Frontier(FrontierError::NodesReserved)
+        ) || self.phase != ManagerPhase::Running
+            || !self.quarantined_cpu_receipts.is_empty()
+            || self
+                .native_frontier_events
+                .iter()
+                .any(|event| matches!(event, NativeFrontierEvent::Unknown { .. }))
+        {
+            return Ok(false);
+        }
+        let actual = self.ledger.registration_observation()?;
+        if actual.reserved_native_nodes == 0 || actual.quarantined_jobs != 0 {
+            return Ok(false);
+        }
+        for slot in &self.own {
+            let Some(binding) = slot.binding.as_ref() else {
+                continue;
+            };
+            if slot.joined
+                || slot.panicked
+                || slot.worker.is_none()
+                || binding.native_frontier.is_none()
+                || binding.resume_pending
+            {
+                continue;
+            }
+            let (_, reserved, unknown) = self.ledger.usage(binding.envelope.id)?;
+            if reserved != 0 && !unknown {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) fn native_admission_result(
         &mut self,
         result: Result<(), AdaptiveManagerError>,

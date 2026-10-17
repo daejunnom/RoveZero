@@ -1,3 +1,4 @@
+use rz_uci::bridge::NodeBudgetSemantics;
 use rz_uci::{
     CancelReason, Effect, EngineIdentity, OptionKind, OptionSpec, OptionValue, ParserLimits,
     PositionBase, PositionPort, PositionSpec, PreparedPosition, SearchCompletion, SearchTicket,
@@ -159,6 +160,43 @@ fn root_restriction_is_deduplicated_once_in_rules_order() {
     let outside = session.progress(&ticket, "g1f3");
     assert!(!outside.accepted && has_code(&outside, "IllegalBestMove"));
     assert_eq!(session.handle_line("stop").protocol, ["bestmove d2d4"]);
+}
+
+#[test]
+fn node_budget_unit_registration_is_idle_only_and_legacy_remains_the_default() {
+    let mut session = session(FixturePort::default());
+    assert_eq!(
+        session.node_budget_semantics(),
+        NodeBudgetSemantics::LegacySimulations
+    );
+    let legacy_zero = session.handle_line("go nodes 0");
+    assert!(!legacy_zero.accepted && has_code(&legacy_zero, "InvalidCommand"));
+    session
+        .set_node_budget_semantics(NodeBudgetSemantics::RoventPositionVisits)
+        .unwrap();
+    let (ticket, limits) = start_line(&mut session, "go nodes 0 searchmoves e2e4");
+    assert_eq!(limits.nodes, Some(0));
+    assert!(
+        session
+            .set_node_budget_semantics(NodeBudgetSemantics::LegacySimulations)
+            .is_err()
+    );
+    assert_eq!(session.active_ticket(), Some(ticket));
+    assert_eq!(
+        session.node_budget_semantics(),
+        NodeBudgetSemantics::RoventPositionVisits
+    );
+    assert_eq!(session.handle_line("stop").protocol, ["bestmove e2e4"]);
+    session
+        .set_node_budget_semantics(NodeBudgetSemantics::LegacySimulations)
+        .unwrap();
+    assert!(!session.handle_line("go nodes 0").accepted);
+    assert!(session.handle_line("quit").accepted);
+    assert!(
+        session
+            .set_node_budget_semantics(NodeBudgetSemantics::RoventPositionVisits)
+            .is_err()
+    );
 }
 
 #[test]

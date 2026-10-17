@@ -205,6 +205,9 @@ impl<M: RoleModel + 'static> RoventSessionDriver<M> {
 }
 
 impl<M: RoleModel + 'static> SearchSessionDriver for RoventSessionDriver<M> {
+    fn node_budget_semantics(&self) -> crate::bridge::NodeBudgetSemantics {
+        crate::bridge::NodeBudgetSemantics::RoventPositionVisits
+    }
     fn search_goal_capability(&self) -> Option<NonZeroU16> {
         Some(self.goal_capability)
     }

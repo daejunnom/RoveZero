@@ -701,6 +701,7 @@ struct Owner {
     ponder: Option<(crate::contracts::SessionScope, Option<u64>)>,
     held_ponder_bestmove: Option<HeldPonderBestMove>,
     admitted_ponder_report: Option<AdmittedPonderReport>,
+    pending_original_go: Option<(SearchTicket, Arc<crate::parser::GoLimits>)>,
     pending_close: Option<Event>,
     fence_failure: Option<EngineError>,
     diagnostics: Arc<Mutex<Vec<(WorkerDiagnosticReceipt, u64)>>>,
@@ -732,7 +733,35 @@ impl Owner {
         session: &mut Session<RulesUciPort>,
         line: &str,
     ) -> (SessionResult<RulesSearchPosition>, bool) {
-        let parsed = parse(line, session.parser_limits());
+        let parsed = crate::parser::parse_with_zero_node_limit(
+            line,
+            session.parser_limits(),
+            match session.node_budget_semantics() {
+                crate::bridge::NodeBudgetSemantics::LegacySimulations => {
+                    crate::parser::ZeroNodeLimit::Reject
+                }
+                crate::bridge::NodeBudgetSemantics::RoventPositionVisits => {
+                    crate::parser::ZeroNodeLimit::Allow
+                }
+            },
+        );
+        // Capture once, before ponder normalization and Rules canonicalization.
+        let original_go = match &parsed {
+            Ok(Command::Go(limits)) => Some(Arc::new(limits.clone())),
+            _ => None,
+        };
+        if let (Some(driver), Some(original_go)) = (&self.driver, &original_go) {
+            if let Err(error) = driver.validate_go(session.snapshot().rules_position(), original_go)
+            {
+                let mut rejected = SessionResult::default();
+                rejected.accepted = false;
+                rejected.diagnostics.push(Diagnostic {
+                    code: "DriverGoRejected",
+                    message: error.to_string(),
+                });
+                return (rejected, false);
+            }
+        }
         let enabled = matches!(
             session.option_values().get("Ponder"),
             Some(OptionValue::Check(true))
@@ -741,7 +770,11 @@ impl Owner {
         let mut from_driver_report = false;
         match &parsed {
             Ok(Command::Go(limits)) if limits.ponder => {
-                if !enabled || limits.nodes.is_some_and(|n| n > 4096) {
+                if !enabled
+                    || session.node_budget_semantics()
+                        == crate::bridge::NodeBudgetSemantics::LegacySimulations
+                        && limits.nodes.is_some_and(|n| n > 4096)
+                {
                     out.accepted = false;
                     out.diagnostics.push(Diagnostic {
                         code: "PonderRejected",
@@ -833,6 +866,14 @@ impl Owner {
                     self.held_ponder_bestmove = None;
                     self.admitted_ponder_report = None;
                 }
+            }
+        }
+        if out.accepted {
+            if let Some(original_go) = original_go {
+                self.pending_original_go = out.effects.iter().find_map(|effect| match effect {
+                    Effect::Start { ticket, .. } => Some((ticket.clone(), original_go.clone())),
+                    _ => None,
+                });
             }
         }
         (out, from_driver_report)
@@ -1410,6 +1451,10 @@ impl Owner {
                 limits,
                 ..
             } => {
+                let original_go = self
+                    .pending_original_go
+                    .take()
+                    .and_then(|(original_ticket, go)| (original_ticket == ticket).then_some(go));
                 self.reap()?;
                 if self.workers.len() >= self.settings.max_workers {
                     self.pending_failure(
@@ -1429,7 +1474,12 @@ impl Owner {
                     )
                 })?;
                 if let Some((_, Some(nodes))) = self.ponder {
-                    control.max_simulations = control.max_simulations.min(nodes);
+                    if self.driver.as_ref().is_none_or(|driver| {
+                        driver.node_budget_semantics()
+                            == crate::bridge::NodeBudgetSemantics::LegacySimulations
+                    }) {
+                        control.max_simulations = control.max_simulations.min(nodes);
+                    }
                 }
                 let token = self
                     .session_owner
@@ -1473,6 +1523,7 @@ impl Owner {
                         })?;
                     let context = crate::search_driver::SearchSessionContext {
                         authority: search_authority,
+                        original_go,
                         root_moves: limits
                             .searchmoves
                             .as_ref()
@@ -2211,6 +2262,10 @@ pub fn serve<O: Write, D: Write>(
     let goal_capability = driver
         .as_ref()
         .and_then(|driver| driver.search_goal_capability());
+    let node_budget_semantics = driver.as_ref().map_or(
+        crate::bridge::NodeBudgetSemantics::LegacySimulations,
+        |driver| driver.node_budget_semantics(),
+    );
     let owner = Arc::new(Mutex::new(Owner {
         session_owner,
         active: None,
@@ -2227,6 +2282,7 @@ pub fn serve<O: Write, D: Write>(
         ponder: None,
         held_ponder_bestmove: None,
         admitted_ponder_report: None,
+        pending_original_go: None,
         pending_close: None,
         fence_failure: None,
         diagnostics: Arc::new(Mutex::new(Vec::new())),
@@ -2243,6 +2299,9 @@ pub fn serve<O: Write, D: Write>(
     .map_err(EngineError::Session)?;
     session
         .set_search_goal_capability(goal_capability)
+        .map_err(EngineError::Session)?;
+    session
+        .set_node_budget_semantics(node_budget_semantics)
         .map_err(EngineError::Session)?;
     let timer_owner = Arc::clone(&owner);
     let timer_events = sender.clone();
@@ -2971,6 +3030,7 @@ mod tests {
             ponder: None,
             held_ponder_bestmove: None,
             admitted_ponder_report: None,
+            pending_original_go: None,
             pending_close: None,
             fence_failure: None,
             diagnostics: Arc::new(Mutex::new(Vec::new())),
@@ -3003,6 +3063,70 @@ mod tests {
             )
             .unwrap();
         (owner, session)
+    }
+
+    #[test]
+    fn driver_preadmission_rejection_preserves_the_active_ticket_and_control() {
+        struct RejectGo;
+        impl crate::search_driver::SearchSessionDriver for RejectGo {
+            fn kind(&self) -> crate::search_driver::SearchKind {
+                crate::search_driver::SearchKind::Rovent
+            }
+            fn implementation(&self) -> contract::Digest {
+                contract::Digest([31; 32])
+            }
+            fn identity(&self) -> EngineIdentity {
+                EngineIdentity {
+                    name: "pure rejection fixture".into(),
+                    author: "test".into(),
+                }
+            }
+            fn validate_go(
+                &self,
+                _: &Position,
+                _: &crate::parser::GoLimits,
+            ) -> Result<(), contract::ContractError> {
+                Err(contract::ContractError::new(
+                    contract::ErrorCode::InvalidInput,
+                    contract::Stage::Admission,
+                    "exact workload differs",
+                ))
+            }
+            fn run(
+                &self,
+                _: &Position,
+                _: &crate::search_driver::SearchSessionContext,
+                _: &mut dyn FnMut(BoardMove),
+            ) -> Result<
+                crate::search_driver::SearchSessionReport,
+                crate::search_driver::SearchSessionFailure,
+            > {
+                panic!("pure rejected go cannot dispatch a worker")
+            }
+        }
+        let (mut owner, mut session) = fixture();
+        assert!(
+            owner
+                .handle(&mut session, Event::Line("go infinite".into()))
+                .accepted
+        );
+        let ticket = session.active_ticket().unwrap();
+        let scope = owner.session_owner.lifecycle_scope();
+        let control = owner.session_owner.control().unwrap().clone();
+        owner.driver = Some(Arc::new(RejectGo));
+        let rejected = owner.handle(&mut session, Event::Line("go nodes 7".into()));
+        assert!(!rejected.accepted);
+        assert!(rejected.effects.is_empty() && rejected.protocol.is_empty());
+        assert!(
+            rejected
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "DriverGoRejected"
+                    && d.message.contains("exact workload differs"))
+        );
+        assert_eq!(session.active_ticket(), Some(ticket));
+        assert_eq!(owner.session_owner.lifecycle_scope(), scope);
+        assert!(!control.cancellation.load(Ordering::Acquire));
     }
 
     fn assert_canceled_result_ignored(out: &SessionResult<RulesSearchPosition>) {
@@ -4539,6 +4663,17 @@ mod tests {
         assert_eq!(limits.white_increment_ms, None);
         assert_eq!(limits.black_increment_ms, None);
         assert_eq!(limits.moves_to_go, None);
+        let (original_ticket, original_go) = owner.pending_original_go.as_ref().unwrap();
+        let Effect::Start { ticket, .. } = &started.effects[0] else {
+            unreachable!();
+        };
+        assert_eq!(original_ticket, ticket);
+        assert!(original_go.ponder && !original_go.infinite);
+        assert_eq!(original_go.white_time_ms, Some(1000));
+        assert_eq!(original_go.black_time_ms, Some(2000));
+        assert_eq!(original_go.white_increment_ms, Some(1));
+        assert_eq!(original_go.black_increment_ms, Some(2));
+        assert_eq!(original_go.moves_to_go, Some(8));
         assert_eq!(
             owner.session_owner.active_binding().unwrap().goal(),
             contract::rovent::SearchGoal {

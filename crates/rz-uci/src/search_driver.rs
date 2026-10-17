@@ -40,6 +40,9 @@ pub enum SearchKind {
 #[derive(Clone, Debug)]
 pub struct SearchSessionContext {
     pub authority: rz_contracts::pals::SearchAuthority,
+    /// The received go, before ponder normalization or Rules subset sealing.
+    /// Legacy callers may omit it; native Rovent admission requires it.
+    pub original_go: Option<Arc<crate::parser::GoLimits>>,
     /// Canonical root-only subset. Child legal/policy order remains Rules-owned.
     pub root_moves: Option<Arc<[BoardMove]>>,
     pub goal: rz_contracts::rovent::SearchGoal,
@@ -1856,6 +1859,20 @@ impl std::error::Error for SearchSessionFailure {}
 /// from `run` acknowledges bounded completion/drain, not just logical cancel.
 /// Progress is advisory: UCI checks its exact root legal set and authority.
 pub trait SearchSessionDriver: Send + Sync + 'static {
+    /// The node unit is explicit. Legacy simulation limits are not reused as
+    /// Rovent position-visit limits or converted into role/NN call counts.
+    fn node_budget_semantics(&self) -> crate::bridge::NodeBudgetSemantics {
+        crate::bridge::NodeBudgetSemantics::LegacySimulations
+    }
+    /// Pure preadmission, before replacing/canceling an existing UCI search.
+    /// It must not create a root, clock, worker, native call or live capability.
+    fn validate_go(
+        &self,
+        _position: &Position,
+        _go: &crate::parser::GoLimits,
+    ) -> Result<(), ContractError> {
+        Ok(())
+    }
     /// Advertise only a driver that consumes the root-relative depth and
     /// Rules mate goals. Legacy drivers keep admission disabled.
     fn search_goal_capability(&self) -> Option<std::num::NonZeroU16> {
@@ -2285,6 +2302,7 @@ mod tests {
                 authority,
                 root_moves: None,
                 goal: rz_contracts::rovent::SearchGoal::default(),
+                original_go: None,
                 requested_nodes: None,
                 control,
                 cancellation: CancelToken::new(),
@@ -2540,6 +2558,7 @@ mod tests {
             authority,
             root_moves: None,
             goal: rz_contracts::rovent::SearchGoal::default(),
+            original_go: None,
             requested_nodes: None,
             control,
             cancellation: CancelToken::new(),

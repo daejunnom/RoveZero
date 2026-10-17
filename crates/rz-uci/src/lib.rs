@@ -42,6 +42,8 @@ pub mod rovent_bootstrap;
 pub mod rovent_driver;
 #[cfg(feature = "pals-adaptive")]
 pub mod rovent_external_launch;
+#[cfg(feature = "pals-adaptive")]
+pub mod rovent_root_admission;
 pub mod runner;
 pub mod search_driver;
 pub mod session;

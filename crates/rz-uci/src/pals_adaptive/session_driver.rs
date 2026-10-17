@@ -6,12 +6,16 @@
 mod checker_metadata;
 pub use checker_metadata::*;
 mod completion_observation;
+mod root_admission;
 mod rovent;
 use completion_observation::CompletionJournal;
 pub use completion_observation::{
     AdaptiveCompletionDiagnostic, AdaptiveCompletionFailure, AdaptiveCompletionObservation,
     AdaptiveCompletionReasonCounts, AdaptiveCompletionReturn,
 };
+use root_admission::RoventPcrRootAdmission;
+#[cfg(feature = "pals-adaptive")]
+use root_admission::RoventPcrRootPolicy;
 pub use rovent::{ROVENT_NATIVE_ROOT_DOMAIN, RoventNativeRootReceipt, RoventPcrSessionProfile};
 
 use super::{
@@ -321,6 +325,8 @@ where
     continuation_diagnostic: std::sync::OnceLock<super::ContinuationDiagnostic>,
     latest_root: Mutex<Option<AdaptiveShutdownReceipt>>,
     rovent: Option<RoventPcrSessionProfile>,
+    #[cfg(feature = "pals-adaptive")]
+    rovent_root_policy: Option<RoventPcrRootPolicy>,
     rovent_collection_origin: Option<super::RoventNativeCollectionOrigin>,
     latest_rovent_root: Mutex<Option<Arc<RoventNativeRootReceipt>>>,
     archive_receipts: Mutex<VecDeque<ArchiveWorkReceipt>>,
@@ -628,6 +634,8 @@ where
             continuation_diagnostic: std::sync::OnceLock::new(),
             latest_root: Mutex::new(None),
             rovent: None,
+            #[cfg(feature = "pals-adaptive")]
+            rovent_root_policy: None,
             rovent_collection_origin: None,
             latest_rovent_root: Mutex::new(None),
             archive_receipts: Mutex::new(VecDeque::with_capacity(64)),
@@ -1073,6 +1081,7 @@ where
             ));
         }
         let rovent_root_legal = self.rovent_root_legal(position, context)?;
+        let root_admission = self.admit_rovent_go(position, context)?;
         let mut state = loop {
             match self.state.try_lock() {
                 Ok(state) => break state,
@@ -1365,6 +1374,11 @@ where
                     context,
                     &self.clock,
                     self.rovent_collection_origin.as_ref(),
+                    root_admission
+                        .as_ref()
+                        .ok_or(AdaptiveManagerError::Invalid(
+                            "Rovent root admission absent",
+                        ))?,
                 )?;
             }
             #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -1463,7 +1477,7 @@ where
                 let _ = manager.begin_root_quiesce(context.shutdown_deadline);
                 let _ = drain_root(&mut manager, context.shutdown_deadline);
             }));
-            let _ = self.observe_rovent_root(&manager, context);
+            let _ = self.observe_rovent_root(&manager, context, root_admission.as_ref());
             // Even cleanup panic retains the whole actual manager before any
             // caller-visible failure; a local owner must not unwind and drop.
             #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -1488,7 +1502,7 @@ where
             // Preserve the first original failure before retaining the complete
             // manager. Its cause does not confirm a fence or relax quarantine.
             let failure = failed_root_closure(manager.failures().next());
-            let _ = self.observe_rovent_root(&manager, context);
+            let _ = self.observe_rovent_root(&manager, context, root_admission.as_ref());
             *state = SessionState::Manager(manager);
             return Err(failure);
         }
@@ -1549,13 +1563,14 @@ where
                 }
             };
         let retained_failure = manager.failures().next().cloned();
-        let rovent_receipt = match self.observe_rovent_root(&manager, context) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                *state = SessionState::Manager(manager);
-                return Err(error.unknown_if_unclosed());
-            }
-        };
+        let rovent_receipt =
+            match self.observe_rovent_root(&manager, context, root_admission.as_ref()) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    *state = SessionState::Manager(manager);
+                    return Err(error.unknown_if_unclosed());
+                }
+            };
         if self.rovent.is_some() {
             match manager.driver_mut().retire_rovent_frontier() {
                 Ok(Some(_)) => {}
@@ -1988,6 +2003,39 @@ where
         } else {
             SearchKind::Pals
         }
+    }
+    fn node_budget_semantics(&self) -> crate::bridge::NodeBudgetSemantics {
+        if self.rovent.is_some() {
+            crate::bridge::NodeBudgetSemantics::RoventPositionVisits
+        } else {
+            crate::bridge::NodeBudgetSemantics::LegacySimulations
+        }
+    }
+    fn validate_go(
+        &self,
+        position: &Position,
+        go: &crate::parser::GoLimits,
+    ) -> Result<(), ContractError> {
+        #[cfg(feature = "pals-adaptive")]
+        if let Some(registered) = &self.rovent_root_policy {
+            let profile = self
+                .rovent
+                .as_ref()
+                .ok_or_else(|| poisoned("Rovent startup profile absent"))?;
+            crate::rovent_root_admission::preadmission::validate_go(
+                position,
+                go,
+                &registered.lock,
+                registered.policy,
+                profile.maximum_goal_plies,
+            )
+            .map_err(|error| {
+                ContractError::new(ErrorCode::InvalidInput, Stage::Admission, error.detail)
+            })?;
+        }
+        #[cfg(not(feature = "pals-adaptive"))]
+        let _ = (position, go);
+        Ok(())
     }
     fn search_goal_capability(&self) -> Option<std::num::NonZeroU16> {
         self.rovent

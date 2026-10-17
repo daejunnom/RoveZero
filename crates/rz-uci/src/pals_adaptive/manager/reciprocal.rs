@@ -139,6 +139,7 @@ where
                 continue;
             }
             let mut held = self.accepted_roles.remove(index);
+            let consumed_before = self.counters.consumed_role_outputs;
             let result = self.advance_accepted_role_parent(&mut held);
             match result {
                 Ok(true) => {
@@ -151,6 +152,11 @@ where
                 }
                 Err(error) => {
                     self.accepted_roles.insert(index, held);
+                    if self.semantic_replay_can_wait(&error)? {
+                        return Ok(
+                            changed || self.counters.consumed_role_outputs != consumed_before
+                        );
+                    }
                     return Err(error);
                 }
             }

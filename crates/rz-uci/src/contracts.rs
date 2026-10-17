@@ -14,10 +14,14 @@ use rz_search::contract_time::{
 use rz_search::driver::SearchControl;
 use rz_search::time::TimeBudgetError;
 
-use crate::bridge::{BudgetKind, BuildSearchError, BuildSearchSettings, SearchBinding, SideToMove};
+use crate::bridge::{
+    BudgetKind, BuildSearchError, BuildSearchSettings, NodeBudgetSemantics, PreparedSearchBinding,
+    SearchBinding, SideToMove,
+};
+use crate::parser::{ZeroNodeLimit, parse_with_zero_node_limit};
 use crate::{
     CancelReason, Command, Diagnostic, Effect, Event, GoLimits, PositionPort, SearchCompletion,
-    SearchTicket, Session, SessionResult, handle_event, parse,
+    SearchTicket, Session, SessionResult, handle_event,
 };
 
 /// UCI publication authority is independent of the selected search algorithm.
@@ -277,7 +281,11 @@ impl ContractSessionOwner {
         if let Err(err) = self.ensure_session(session) {
             return rejected(err);
         }
-        let command = match parse(line, session.parser_limits()) {
+        let zero_nodes = match session.node_budget_semantics() {
+            NodeBudgetSemantics::LegacySimulations => ZeroNodeLimit::Reject,
+            NodeBudgetSemantics::RoventPositionVisits => ZeroNodeLimit::Allow,
+        };
+        let command = match parse_with_zero_node_limit(line, session.parser_limits(), zero_nodes) {
             Ok(command) => command,
             Err(_) => return session.handle_line(line).into(),
         };
@@ -328,6 +336,49 @@ impl ContractSessionOwner {
         } else {
             None
         };
+        // Rovent's UCI nodes are position visits, not the transport's simulation
+        // bound. Validate and construct its original time/control once, before
+        // Session can cancel the prior search or mint a replacement ticket.
+        // The legacy path keeps its existing post-Start admission behavior.
+        let mut prepared = None;
+        if let Command::Go(limits) = &command {
+            if session.node_budget_semantics() == NodeBudgetSemantics::RoventPositionVisits {
+                let mut build_detail = None;
+                let built = side(session.snapshot()).and_then(|color| {
+                    let color = match color {
+                        Color::White => SideToMove::White,
+                        Color::Black => SideToMove::Black,
+                    };
+                    let binding = PreparedSearchBinding::prepare(
+                        limits,
+                        color,
+                        start,
+                        self.settings,
+                        session.search_goal_capability(),
+                        session.node_budget_semantics(),
+                    )
+                    .map_err(|err| {
+                        build_detail = Some(err.to_string());
+                        map_build_error(err)
+                    })?;
+                    let deadlines = ContractDeadlines::from_budget(&self.clock, binding.budget())?;
+                    Ok((binding, deadlines))
+                });
+                match built {
+                    Ok(binding) => prepared = Some(binding),
+                    Err(err) => {
+                        let mut out = rejected(err);
+                        if let Some(message) = build_detail {
+                            out.session.diagnostics.push(Diagnostic {
+                                code: "SearchConfigurationFailed",
+                                message,
+                            });
+                        }
+                        return out;
+                    }
+                }
+            }
+        }
         let previous_ticket = self.current.as_ref().map(|c| c.binding.ticket().clone());
         let mut out = ContractSessionOutcome::from(session.handle_command(command));
         if !out.session.accepted {
@@ -350,29 +401,8 @@ impl ContractSessionOwner {
             } = effect
             {
                 let mut build_detail = None;
-                let built = side(&snapshot).and_then(|color| {
-                    let color = match color {
-                        Color::White => SideToMove::White,
-                        Color::Black => SideToMove::Black,
-                    };
-                    let binding = match session.search_goal_capability() {
-                        Some(max_plies) => SearchBinding::new_with_goal_capability(
-                            ticket.clone(),
-                            &limits,
-                            color,
-                            start,
-                            self.settings,
-                            max_plies,
-                        ),
-                        None => {
-                            SearchBinding::new(ticket.clone(), &limits, color, start, self.settings)
-                        }
-                    }
-                    .map_err(|err| {
-                        build_detail = Some(err.to_string());
-                        map_build_error(err)
-                    })?;
-                    let deadlines = ContractDeadlines::from_budget(&self.clock, binding.budget())?;
+                let built = if let Some((binding, deadlines)) = prepared.take() {
+                    let binding = binding.bind(ticket.clone());
                     let cancellation = ContractCancellation::from_control(binding.control());
                     Ok(CurrentSearch {
                         binding,
@@ -382,7 +412,46 @@ impl ContractSessionOwner {
                         infinite: limits.infinite,
                         work_completed: false,
                     })
-                });
+                } else {
+                    side(&snapshot).and_then(|color| {
+                        let color = match color {
+                            Color::White => SideToMove::White,
+                            Color::Black => SideToMove::Black,
+                        };
+                        let binding = match session.search_goal_capability() {
+                            Some(max_plies) => SearchBinding::new_with_goal_capability(
+                                ticket.clone(),
+                                &limits,
+                                color,
+                                start,
+                                self.settings,
+                                max_plies,
+                            ),
+                            None => SearchBinding::new(
+                                ticket.clone(),
+                                &limits,
+                                color,
+                                start,
+                                self.settings,
+                            ),
+                        }
+                        .map_err(|err| {
+                            build_detail = Some(err.to_string());
+                            map_build_error(err)
+                        })?;
+                        let deadlines =
+                            ContractDeadlines::from_budget(&self.clock, binding.budget())?;
+                        let cancellation = ContractCancellation::from_control(binding.control());
+                        Ok(CurrentSearch {
+                            binding,
+                            deadlines,
+                            cancellation,
+                            scope: self.scope,
+                            infinite: limits.infinite,
+                            work_completed: false,
+                        })
+                    })
+                };
                 match built {
                     Ok(current) => {
                         self.current = Some(current);

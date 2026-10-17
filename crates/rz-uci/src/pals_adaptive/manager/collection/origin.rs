@@ -205,6 +205,8 @@ pub struct RoventCollectionRootAdmission {
     root_budget: Digest,
     selective_policy: Digest,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    root_admission: Arc<crate::rovent_root_admission::RoventRootAdmission>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     raw: Arc<Value>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     raw_sha256: Arc<str>,
@@ -219,6 +221,7 @@ impl RoventCollectionRootAdmission {
         input_lock: Digest,
         root_budget: Digest,
         selective_policy: Digest,
+        root_admission: Arc<crate::rovent_root_admission::RoventRootAdmission>,
     ) -> Result<Self, AdaptiveCollectionError> {
         let registration = frontier.registration();
         let root_state = registration.root_rules.snapshot().identity();
@@ -232,11 +235,31 @@ impl RoventCollectionRootAdmission {
             || registration.root_rules.snapshot().identity()
                 != registration.root_moves.root_identity()
             || registration.mode.has_native_r() != registration.native_ledger.is_some()
+            || !root_admission
+                .original_context()
+                .accepts()
+                .map_err(|error| reject(error.to_string()))?
+            || root_admission.startup_lock_digest() != input_lock
+            || root_admission.authority() != registration.authority
+            || root_admission.root_budget_digest() != root_budget
+            || root_admission.hard_deadline() != registration.original_deadline
+            || root_admission.goal() != registration.goal
+            || root_admission.requested_nodes() != registration.nodes
+            || root_admission.state_and_history_digest() != root_state.semantic
+            || root_admission.root_snapshot().revision() != root_state.revision.0
+            || !root_admission
+                .root_snapshot()
+                .same_state(&registration.root_rules.rules().snapshot())
+            || root_admission.allowed_root_moves().as_ref() != registration.root_moves.allowed().as_ref()
         {
             return Err(reject(
                 "actual attached frontier differs from original loaded collection scope",
             ));
         }
+        root_admission
+            .descriptor()
+            .verify_against(original.original_input_lock())
+            .map_err(|error| reject(error.to_string()))?;
         let raw = json!({
             "schema":ROVENT_COLLECTION_ROOT_ADMISSION,
             "native_origin":original.raw_receipt(),
@@ -256,6 +279,8 @@ impl RoventCollectionRootAdmission {
             "depth_plies":registration.goal.depth_plies.map(|value|value.get()),
             "mate_moves":registration.goal.mate_moves.map(|value|value.get()),
             "requested_nodes":registration.nodes,
+            "root_descriptor":root_admission.descriptor(),
+            "root_descriptor_sha256":text_sha(root_admission.digest()),
         });
         let raw_sha256 =
             rz_experiments::pals_data_v3::generation_digest(ROVENT_COLLECTION_ROOT_ADMISSION, &raw)
@@ -269,6 +294,7 @@ impl RoventCollectionRootAdmission {
             root_state,
             root_budget,
             selective_policy,
+            root_admission,
             raw: Arc::new(raw),
             raw_sha256: raw_sha256.into(),
         })
@@ -313,6 +339,10 @@ impl RoventCollectionRootAdmission {
     }
     pub fn native_origin(&self) -> &RoventNativeCollectionOrigin {
         &self.original
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn root_admission(&self) -> &Arc<crate::rovent_root_admission::RoventRootAdmission> {
+        &self.root_admission
     }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub fn raw_receipt(&self) -> &Value {

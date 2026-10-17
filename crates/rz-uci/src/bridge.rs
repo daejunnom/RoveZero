@@ -6,9 +6,10 @@
 //! 호출자는 stop/root 교체의 Cancel effect를 처리할 때 해당 binding의 `cancel()`을
 //! 먼저 호출한 뒤 SessionResult의 protocol을 출력해야 한다.
 //!
-//! nodes는 최초 B 기준선에서 완료된 simulation의 상한으로 해석한다. root prior
-//! 초기화는 simulation이 아니다. 실제 UCI nodes 정의와 공통 계약은 총괄과 통일해야
-//! 한다. `max_simulations`를 넘는 nodes 요청은 값을 조용히 줄이지 않고 거부한다.
+//! 기존 생성자는 nodes를 완료된 simulation의 상한으로 해석한다. root prior 초기화는
+//! simulation이 아니다. Rovent는 명시한 별도 의미에서 원래 nodes를 position visit
+//! 예산으로 남기고 transport simulation 상한과 결합하지 않는다. 기존 의미에서는
+//! `max_simulations`를 넘는 nodes 요청을 값을 조용히 줄이지 않고 거부한다.
 //! 시간 없는 nodes/infinite 검색도 호출자가 명시한 유한 resource wall 한도를 둔다.
 //! 이것은 UCI movetime/clock 의미가 아니며, 한도 도달은 진단되는 자원 실패이다.
 
@@ -46,6 +47,30 @@ pub enum BudgetKind {
     ResourceWall,
 }
 
+/// The selected engine, rather than the transport simulation loop, owns Rovent's
+/// original position-visit budget. This choice does not issue search authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeBudgetSemantics {
+    LegacySimulations,
+    RoventPositionVisits,
+}
+
+/// Validated time and transport settings before `Session` issues a Start ticket.
+///
+/// Preparing does not mutate a session, grant result admission, or become the
+/// cancellation owner of an existing search. `bind` consumes this preparation
+/// without resampling time or renewing its original deadlines. The caller still
+/// owns original Go limits and must bind only the corresponding Start ticket.
+#[derive(Debug)]
+pub struct PreparedSearchBinding {
+    control: SearchControl,
+    budget: TimeBudget,
+    kind: BudgetKind,
+    goal: SearchGoal,
+    infinite: bool,
+    node_budget_semantics: NodeBudgetSemantics,
+}
+
 #[derive(Debug)]
 pub struct SearchBinding {
     ticket: SearchTicket,
@@ -54,6 +79,7 @@ pub struct SearchBinding {
     kind: BudgetKind,
     goal: SearchGoal,
     infinite: bool,
+    node_budget_semantics: NodeBudgetSemantics,
     work_completed: AtomicBool,
 }
 
@@ -65,7 +91,15 @@ impl SearchBinding {
         start: Instant,
         settings: BuildSearchSettings,
     ) -> Result<Self, BuildSearchError> {
-        Self::build(ticket, limits, side, start, settings, None)
+        Self::prepare(
+            limits,
+            side,
+            start,
+            settings,
+            None,
+            NodeBudgetSemantics::LegacySimulations,
+        )
+        .map(|prepared| prepared.bind(ticket))
     }
 
     /// Explicit admission for a driver that implements the registered goals.
@@ -78,90 +112,34 @@ impl SearchBinding {
         settings: BuildSearchSettings,
         registered_max_plies: NonZeroU16,
     ) -> Result<Self, BuildSearchError> {
-        Self::build(
-            ticket,
+        Self::prepare(
             limits,
             side,
             start,
             settings,
             Some(registered_max_plies),
+            NodeBudgetSemantics::LegacySimulations,
         )
+        .map(|prepared| prepared.bind(ticket))
     }
 
-    fn build(
-        ticket: SearchTicket,
+    /// Pure preparation for engines whose node units differ from simulations.
+    pub fn prepare(
         limits: &GoLimits,
         side: SideToMove,
         start: Instant,
         settings: BuildSearchSettings,
         goal_capability: Option<NonZeroU16>,
-    ) -> Result<Self, BuildSearchError> {
-        validate_limits(limits)?;
-        let goal = SearchGoal {
-            depth_plies: limits.depth_plies,
-            mate_moves: limits.mate_moves,
-        };
-        if goal.has_goal() {
-            let max_plies = goal_capability.ok_or(BuildSearchError::UnsupportedSearchGoal)?;
-            goal.validate(max_plies)
-                .map_err(|error| BuildSearchError::InvalidGo(error.detail))?;
-        }
-        if settings.max_simulations == 0 {
-            return Err(BuildSearchError::ZeroSimulationLimit);
-        }
-        if settings.untimed_limit.is_zero() {
-            return Err(BuildSearchError::ZeroUntimedLimit);
-        }
-        // Validate even when unused by the selected mode: settings must be a finite,
-        // reusable configuration rather than a latent failure for the next request.
-        start
-            .checked_add(settings.untimed_limit)
-            .ok_or(BuildSearchError::UntimedDeadlineOverflow)?;
-        let max_simulations = limits.nodes.unwrap_or(settings.max_simulations);
-        if max_simulations > settings.max_simulations {
-            return Err(BuildSearchError::SimulationLimitExceeded {
-                requested: max_simulations,
-                configured: settings.max_simulations,
-            });
-        }
-
-        let (time_control, kind) = if let Some(movetime) = limits.movetime_ms {
-            (
-                TimeControl::MoveTime(Duration::from_millis(movetime)),
-                BudgetKind::UciTime,
-            )
-        } else if let (Some(white), Some(black)) = (limits.white_time_ms, limits.black_time_ms) {
-            // validate_limits established that both side clocks exist.
-            let (remaining, increment) = match side {
-                SideToMove::White => (white, limits.white_increment_ms.unwrap_or(0)),
-                SideToMove::Black => (black, limits.black_increment_ms.unwrap_or(0)),
-            };
-            (
-                TimeControl::Clock {
-                    remaining: Duration::from_millis(remaining),
-                    increment: Duration::from_millis(increment),
-                    moves_to_go: limits.moves_to_go,
-                },
-                BudgetKind::UciTime,
-            )
-        } else {
-            (
-                TimeControl::MoveTime(settings.untimed_limit),
-                BudgetKind::ResourceWall,
-            )
-        };
-        let budget = TimeBudget::new(start, time_control, settings.time_config)
-            .map_err(BuildSearchError::TimeBudget)?;
-        let control = SearchControl::from_budget(&budget, max_simulations);
-        Ok(Self {
-            ticket,
-            control,
-            budget,
-            kind,
-            goal,
-            infinite: limits.infinite,
-            work_completed: AtomicBool::new(false),
-        })
+        node_budget_semantics: NodeBudgetSemantics,
+    ) -> Result<PreparedSearchBinding, BuildSearchError> {
+        PreparedSearchBinding::prepare(
+            limits,
+            side,
+            start,
+            settings,
+            goal_capability,
+            node_budget_semantics,
+        )
     }
 
     pub fn ticket(&self) -> &SearchTicket {
@@ -182,6 +160,10 @@ impl SearchBinding {
 
     pub fn goal(&self) -> SearchGoal {
         self.goal
+    }
+
+    pub fn node_budget_semantics(&self) -> NodeBudgetSemantics {
+        self.node_budget_semantics
     }
 
     /// Close tree/evaluator result admission before emitting stop/expiry output.
@@ -380,6 +362,123 @@ impl SearchBinding {
     }
 }
 
+impl PreparedSearchBinding {
+    pub fn prepare(
+        limits: &GoLimits,
+        side: SideToMove,
+        start: Instant,
+        settings: BuildSearchSettings,
+        goal_capability: Option<NonZeroU16>,
+        node_budget_semantics: NodeBudgetSemantics,
+    ) -> Result<Self, BuildSearchError> {
+        validate_limits(limits, node_budget_semantics)?;
+        let goal = SearchGoal {
+            depth_plies: limits.depth_plies,
+            mate_moves: limits.mate_moves,
+        };
+        if goal.has_goal() {
+            let max_plies = goal_capability.ok_or(BuildSearchError::UnsupportedSearchGoal)?;
+            goal.validate(max_plies)
+                .map_err(|error| BuildSearchError::InvalidGo(error.detail))?;
+        }
+        if settings.max_simulations == 0 {
+            return Err(BuildSearchError::ZeroSimulationLimit);
+        }
+        if settings.untimed_limit.is_zero() {
+            return Err(BuildSearchError::ZeroUntimedLimit);
+        }
+        // Validate even when unused by the selected mode: settings must be a finite,
+        // reusable configuration rather than a latent failure for the next request.
+        start
+            .checked_add(settings.untimed_limit)
+            .ok_or(BuildSearchError::UntimedDeadlineOverflow)?;
+        let max_simulations = match node_budget_semantics {
+            NodeBudgetSemantics::LegacySimulations => {
+                let requested = limits.nodes.unwrap_or(settings.max_simulations);
+                if requested > settings.max_simulations {
+                    return Err(BuildSearchError::SimulationLimitExceeded {
+                        requested,
+                        configured: settings.max_simulations,
+                    });
+                }
+                requested
+            }
+            NodeBudgetSemantics::RoventPositionVisits => settings.max_simulations,
+        };
+
+        let (time_control, kind) = if let Some(movetime) = limits.movetime_ms {
+            (
+                TimeControl::MoveTime(Duration::from_millis(movetime)),
+                BudgetKind::UciTime,
+            )
+        } else if let (Some(white), Some(black)) = (limits.white_time_ms, limits.black_time_ms) {
+            // validate_limits established that both side clocks exist.
+            let (remaining, increment) = match side {
+                SideToMove::White => (white, limits.white_increment_ms.unwrap_or(0)),
+                SideToMove::Black => (black, limits.black_increment_ms.unwrap_or(0)),
+            };
+            (
+                TimeControl::Clock {
+                    remaining: Duration::from_millis(remaining),
+                    increment: Duration::from_millis(increment),
+                    moves_to_go: limits.moves_to_go,
+                },
+                BudgetKind::UciTime,
+            )
+        } else {
+            (
+                TimeControl::MoveTime(settings.untimed_limit),
+                BudgetKind::ResourceWall,
+            )
+        };
+        let budget = TimeBudget::new(start, time_control, settings.time_config)
+            .map_err(BuildSearchError::TimeBudget)?;
+        let control = SearchControl::from_budget(&budget, max_simulations);
+        Ok(Self {
+            control,
+            budget,
+            kind,
+            goal,
+            infinite: limits.infinite,
+            node_budget_semantics,
+        })
+    }
+
+    /// Attach only the Session-issued output ticket; no new clock is sampled.
+    pub fn bind(self, ticket: SearchTicket) -> SearchBinding {
+        SearchBinding {
+            ticket,
+            control: self.control,
+            budget: self.budget,
+            kind: self.kind,
+            goal: self.goal,
+            infinite: self.infinite,
+            node_budget_semantics: self.node_budget_semantics,
+            work_completed: AtomicBool::new(false),
+        }
+    }
+
+    pub fn control(&self) -> &SearchControl {
+        &self.control
+    }
+
+    pub fn budget(&self) -> &TimeBudget {
+        &self.budget
+    }
+
+    pub fn budget_kind(&self) -> BudgetKind {
+        self.kind
+    }
+
+    pub fn goal(&self) -> SearchGoal {
+        self.goal
+    }
+
+    pub fn node_budget_semantics(&self) -> NodeBudgetSemantics {
+        self.node_budget_semantics
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuildSearchError {
     InvalidGo(&'static str),
@@ -426,7 +525,10 @@ impl std::error::Error for BuildSearchError {
     }
 }
 
-fn validate_limits(limits: &GoLimits) -> Result<(), BuildSearchError> {
+fn validate_limits(
+    limits: &GoLimits,
+    node_budget_semantics: NodeBudgetSemantics,
+) -> Result<(), BuildSearchError> {
     if limits.searchmoves.as_ref().is_some_and(|moves| {
         moves.is_empty()
             || moves
@@ -437,7 +539,7 @@ fn validate_limits(limits: &GoLimits) -> Result<(), BuildSearchError> {
             "searchmoves requires a nonempty list of move text",
         ));
     }
-    if limits.nodes == Some(0) {
+    if node_budget_semantics == NodeBudgetSemantics::LegacySimulations && limits.nodes == Some(0) {
         return Err(BuildSearchError::InvalidGo("nodes must be positive"));
     }
     if limits.moves_to_go == Some(0) {
@@ -590,6 +692,241 @@ mod tests {
         assert_eq!(binding.budget().allocation, Duration::from_secs(1));
         assert_eq!(binding.control().max_simulations, 7);
         assert_eq!(binding.control().deadline, now + Duration::from_millis(990));
+    }
+
+    #[test]
+    fn preparation_neither_issues_nor_replaces_a_session_ticket() {
+        let now = Instant::now();
+        let mut session = session();
+        let limits = GoLimits {
+            nodes: Some(1),
+            ..GoLimits::default()
+        };
+        let prepared = PreparedSearchBinding::prepare(
+            &limits,
+            SideToMove::White,
+            now,
+            settings(),
+            None,
+            NodeBudgetSemantics::RoventPositionVisits,
+        )
+        .unwrap();
+        assert!(session.active_ticket().is_none());
+        let (ticket, _) = start(&mut session, "go nodes 1");
+        let active = session.active_ticket();
+        let invalid = PreparedSearchBinding::prepare(
+            &GoLimits::default(),
+            SideToMove::White,
+            now,
+            settings(),
+            None,
+            NodeBudgetSemantics::RoventPositionVisits,
+        );
+        assert!(matches!(invalid, Err(BuildSearchError::InvalidGo(_))));
+        assert_eq!(session.active_ticket(), active);
+        let binding = prepared.bind(ticket.clone());
+        assert_eq!(binding.ticket(), &ticket);
+        assert_eq!(session.active_ticket().as_ref(), Some(&ticket));
+        assert!(!binding.control().cancellation.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn binding_prepared_settings_preserves_original_deadlines_and_control_gate() {
+        let now = Instant::now();
+        let limits = GoLimits {
+            movetime_ms: Some(1000),
+            nodes: Some(7),
+            ..GoLimits::default()
+        };
+        let prepared = SearchBinding::prepare(
+            &limits,
+            SideToMove::White,
+            now,
+            settings(),
+            None,
+            NodeBudgetSemantics::LegacySimulations,
+        )
+        .unwrap();
+        let original_control = prepared.control().clone();
+        let original_allocation = prepared.budget().allocation;
+        let (ticket, _) = start(&mut session(), "go movetime 1000 nodes 7");
+        let binding = prepared.bind(ticket);
+        assert_eq!(binding.control().deadline, original_control.deadline);
+        assert_eq!(
+            binding.control().soft_deadline,
+            original_control.soft_deadline
+        );
+        assert_eq!(
+            binding.control().admission_deadline,
+            original_control.admission_deadline
+        );
+        assert_eq!(binding.budget().allocation, original_allocation);
+        assert_eq!(binding.control().max_simulations, 7);
+        assert_eq!(
+            binding.node_budget_semantics(),
+            NodeBudgetSemantics::LegacySimulations
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &binding.control().cancellation,
+            &original_control.cancellation
+        ));
+        binding.cancel();
+        assert!(original_control.cancellation.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn rovent_position_visits_never_become_transport_simulations_or_mutate_go() {
+        let now = Instant::now();
+        for nodes in [Some(0), Some(1), Some(101), Some(u64::MAX), None] {
+            let limits = GoLimits {
+                nodes,
+                movetime_ms: Some(1000),
+                ..GoLimits::default()
+            };
+            let prepared = PreparedSearchBinding::prepare(
+                &limits,
+                SideToMove::White,
+                now,
+                settings(),
+                None,
+                NodeBudgetSemantics::RoventPositionVisits,
+            )
+            .unwrap();
+            assert_eq!(limits.nodes, nodes);
+            assert_eq!(prepared.control().max_simulations, 100);
+            assert_eq!(prepared.budget_kind(), BudgetKind::UciTime);
+            assert_eq!(
+                prepared.control().deadline,
+                now + Duration::from_millis(990)
+            );
+            assert_eq!(
+                prepared.node_budget_semantics(),
+                NodeBudgetSemantics::RoventPositionVisits
+            );
+        }
+        let prepared = PreparedSearchBinding::prepare(
+            &GoLimits {
+                nodes: Some(0),
+                ..GoLimits::default()
+            },
+            SideToMove::White,
+            now,
+            settings(),
+            None,
+            NodeBudgetSemantics::RoventPositionVisits,
+        )
+        .unwrap();
+        assert_eq!(prepared.budget_kind(), BudgetKind::ResourceWall);
+        assert_eq!(prepared.budget().allocation, settings().untimed_limit);
+    }
+
+    #[test]
+    fn prepared_legacy_nodes_retain_zero_rejection_and_exact_simulation_guard() {
+        let now = Instant::now();
+        for nodes in [0, 1, 100, 101, u64::MAX] {
+            let result = PreparedSearchBinding::prepare(
+                &GoLimits {
+                    nodes: Some(nodes),
+                    ..GoLimits::default()
+                },
+                SideToMove::White,
+                now,
+                settings(),
+                None,
+                NodeBudgetSemantics::LegacySimulations,
+            );
+            match nodes {
+                0 => assert!(matches!(result, Err(BuildSearchError::InvalidGo(_)))),
+                1 | 100 => assert_eq!(result.unwrap().control().max_simulations, nodes),
+                _ => assert!(matches!(
+                    result,
+                    Err(BuildSearchError::SimulationLimitExceeded {
+                        requested,
+                        configured: 100
+                    }) if requested == nodes
+                )),
+            }
+        }
+    }
+
+    #[test]
+    fn rovent_preparation_still_requires_registered_goals_and_finite_settings() {
+        let now = Instant::now();
+        let limits = GoLimits {
+            nodes: Some(0),
+            depth_plies: NonZeroU16::new(6),
+            mate_moves: NonZeroU16::new(3),
+            ..GoLimits::default()
+        };
+        assert!(matches!(
+            PreparedSearchBinding::prepare(
+                &limits,
+                SideToMove::White,
+                now,
+                settings(),
+                None,
+                NodeBudgetSemantics::RoventPositionVisits,
+            ),
+            Err(BuildSearchError::UnsupportedSearchGoal)
+        ));
+        let prepared = PreparedSearchBinding::prepare(
+            &limits,
+            SideToMove::White,
+            now,
+            settings(),
+            NonZeroU16::new(8),
+            NodeBudgetSemantics::RoventPositionVisits,
+        )
+        .unwrap();
+        assert_eq!(prepared.goal().depth_plies, limits.depth_plies);
+        assert_eq!(prepared.goal().mate_moves, limits.mate_moves);
+        assert!(matches!(
+            PreparedSearchBinding::prepare(
+                &limits,
+                SideToMove::White,
+                now,
+                settings(),
+                NonZeroU16::new(4),
+                NodeBudgetSemantics::RoventPositionVisits,
+            ),
+            Err(BuildSearchError::InvalidGo(_))
+        ));
+        for (configured, expected) in [
+            (
+                BuildSearchSettings {
+                    max_simulations: 0,
+                    ..settings()
+                },
+                BuildSearchError::ZeroSimulationLimit,
+            ),
+            (
+                BuildSearchSettings {
+                    untimed_limit: Duration::ZERO,
+                    ..settings()
+                },
+                BuildSearchError::ZeroUntimedLimit,
+            ),
+            (
+                BuildSearchSettings {
+                    untimed_limit: Duration::MAX,
+                    ..settings()
+                },
+                BuildSearchError::UntimedDeadlineOverflow,
+            ),
+        ] {
+            assert_eq!(
+                PreparedSearchBinding::prepare(
+                    &limits,
+                    SideToMove::White,
+                    now,
+                    configured,
+                    NonZeroU16::new(8),
+                    NodeBudgetSemantics::RoventPositionVisits,
+                )
+                .unwrap_err(),
+                expected
+            );
+        }
     }
 
     #[test]

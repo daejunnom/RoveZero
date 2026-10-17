@@ -68,6 +68,7 @@ impl RoventPcrSessionProfile {
         context: &SearchSessionContext,
         clock: &ProcessClock,
         collection_origin: Option<&crate::pals_adaptive::RoventNativeCollectionOrigin>,
+        admission: &RoventPcrRootAdmission,
     ) -> Result<(), AdaptiveManagerError>
     where
         B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
@@ -101,7 +102,7 @@ impl RoventPcrSessionProfile {
             authority: context.authority,
             mode: self.mode,
             original_deadline: clock.deadline(context.control.deadline)?,
-            root_budget: self.root_budget,
+            root_budget: admission.budget,
             goal: context.goal,
             nodes: context.requested_nodes,
             selective_policy: self.selective_policy,
@@ -116,32 +117,50 @@ impl RoventPcrSessionProfile {
             self.frontier_limits.clone(),
             AdaptiveFrontierStartup {
                 mode: self.mode,
-                root_budget: self.root_budget,
+                root_budget: admission.budget,
                 root_moves: &root_moves,
                 native_ledger: Some(&ledger),
             },
             clock.domain(),
             clock.now()?,
         )?;
-        manager.configure_rovent_reciprocal(self.reciprocal)?;
+        manager.configure_rovent_reciprocal(RoventReciprocalPolicy {
+            root_budget: admission.budget,
+            ..self.reciprocal
+        })?;
         manager.configure_rovent_peer_followups(self.peers)?;
         if let Some(origin) = collection_origin {
-            let frontier = manager
-                .driver()
-                .port()
-                .and_then(|port| port.rovent_frontier())
-                .ok_or(AdaptiveManagerError::Invalid(
-                    "actual Rovent collection frontier absent",
-                ))?;
-            let admission =
-                crate::pals_adaptive::RoventCollectionRootAdmission::from_attached_frontier(
-                    origin,
-                    frontier,
-                    self.input_lock,
-                    self.root_budget,
-                    self.selective_policy,
-                )?;
-            manager.admit_collection_root(admission)?;
+            #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+            {
+                let _ = origin;
+                return Err(AdaptiveManagerError::Invalid(
+                    "actual native collection is unavailable in this build",
+                ));
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            {
+                let frontier = manager
+                    .driver()
+                    .port()
+                    .and_then(|port| port.rovent_frontier())
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "actual Rovent collection frontier absent",
+                    ))?;
+                let admission =
+                    crate::pals_adaptive::RoventCollectionRootAdmission::from_attached_frontier(
+                        origin,
+                        frontier,
+                        self.input_lock,
+                        admission.budget,
+                        self.selective_policy,
+                        Arc::clone(admission.original.as_ref().ok_or(
+                            AdaptiveManagerError::Invalid(
+                                "collection requires the original per-go root capability",
+                            ),
+                        )?),
+                    )?;
+                manager.admit_collection_root(admission)?;
+            }
         }
         Ok(())
     }
@@ -156,6 +175,8 @@ pub struct RoventNativeRootReceipt {
     pub mode: ExecutionMode,
     pub input_lock: Digest,
     pub root_budget: Digest,
+    #[cfg(feature = "pals-adaptive")]
+    pub root_admission: Option<Arc<crate::rovent_root_admission::RoventRootAdmission>>,
     pub frontier: Option<FrontierSnapshot>,
     pub counters: AdaptiveManagerCounters,
     pub native_accounting: Option<AdaptiveNativeAccountingSnapshot>,
@@ -341,10 +362,13 @@ where
         &self,
         manager: &SessionManager<B>,
         context: &SearchSessionContext,
+        admission: Option<&RoventPcrRootAdmission>,
     ) -> Result<Option<Arc<RoventNativeRootReceipt>>, SearchSessionFailure> {
         let Some(profile) = &self.rovent else {
             return Ok(None);
         };
+        let admission = admission
+            .ok_or_else(|| failure("RoventRootObservation", "original root admission absent"))?;
         let actual = manager
             .driver()
             .rovent_frontier_receipt()
@@ -354,7 +378,9 @@ where
             authority: context.authority,
             mode: profile.mode,
             input_lock: profile.input_lock,
-            root_budget: profile.root_budget,
+            root_budget: admission.budget,
+            #[cfg(feature = "pals-adaptive")]
+            root_admission: admission.original.clone(),
             frontier: actual.map(|receipt| receipt.snapshot),
             counters: manager.counters(),
             native_accounting: manager

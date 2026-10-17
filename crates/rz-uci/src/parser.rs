@@ -114,6 +114,22 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 pub fn parse(line: &str, limits: ParserLimits) -> Result<Command, ParseError> {
+    parse_with_zero_node_limit(line, limits, ZeroNodeLimit::Reject)
+}
+
+/// Syntax selection for an explicitly registered node domain. This does not
+/// grant search capability or turn a zero-node request into completed work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ZeroNodeLimit {
+    Reject,
+    Allow,
+}
+
+pub(crate) fn parse_with_zero_node_limit(
+    line: &str,
+    limits: ParserLimits,
+    zero_nodes: ZeroNodeLimit,
+) -> Result<Command, ParseError> {
     if line.len() > limits.max_line_bytes {
         return Err(ParseError::LineTooLong);
     }
@@ -136,7 +152,7 @@ pub fn parse(line: &str, limits: ParserLimits) -> Result<Command, ParseError> {
         "ucinewgame" => no_args(tail, Command::NewGame),
         "setoption" => parse_option(line, limits),
         "position" => parse_position(tail, limits),
-        "go" => parse_go(tail, limits),
+        "go" => parse_go(tail, limits, zero_nodes),
         "ponderhit" => no_args(tail, Command::PonderHit),
         _ => Ok(Command::Unknown(head.to_owned())),
     }
@@ -326,7 +342,11 @@ fn is_go_keyword(field: &str) -> bool {
     )
 }
 
-fn parse_go(fields: &[&str], parser_limits: ParserLimits) -> Result<Command, ParseError> {
+fn parse_go(
+    fields: &[&str],
+    parser_limits: ParserLimits,
+    zero_nodes: ZeroNodeLimit,
+) -> Result<Command, ParseError> {
     let mut limits = GoLimits::default();
     let mut i = 0;
     while i < fields.len() {
@@ -423,7 +443,9 @@ fn parse_go(fields: &[&str], parser_limits: ParserLimits) -> Result<Command, Par
             "btime" => set_once(&mut limits.black_time_ms, number)?,
             "winc" => set_once(&mut limits.white_increment_ms, number)?,
             "binc" => set_once(&mut limits.black_increment_ms, number)?,
-            "nodes" if number > 0 => set_once(&mut limits.nodes, number)?,
+            "nodes" if number > 0 || zero_nodes == ZeroNodeLimit::Allow => {
+                set_once(&mut limits.nodes, number)?
+            }
             "nodes" => return Err(ParseError::Malformed("nodes must be positive")),
             "movestogo" => {
                 let value = u32::try_from(number)

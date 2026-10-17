@@ -5,6 +5,8 @@
 mod fixed_trace;
 #[path = "reciprocal_tests.rs"]
 mod reciprocal;
+#[path = "reserved_replay_tests.rs"]
+mod reserved_replay;
 #[path = "role_only_tests.rs"]
 mod role_only;
 
@@ -247,6 +249,9 @@ struct DriverFixture {
     peer_opinions: usize,
     peer_cpu_answers: usize,
     peer_repeat_question: bool,
+    replay_frontier: Option<rz_search::pals::rovent_frontier::RoventFrontier>,
+    block_replay_while_reserved: bool,
+    blocked_replays: usize,
 }
 impl DriverFixture {
     fn input(
@@ -340,6 +345,70 @@ impl DriverFixture {
     }
 }
 impl AdaptiveSearchDriver<u64> for DriverFixture {
+    fn frontier_native_capacity(
+        &mut self,
+        requested: u64,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<Option<u64>, AdaptiveManagerError> {
+        self.replay_frontier
+            .as_mut()
+            .map(|frontier| frontier.native_capacity(requested, clock, now))
+            .transpose()
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn frontier_native_reserve(
+        &mut self,
+        job: &CpuJobEnvelope,
+        grant: SliceGrant,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<Option<NativeReservation>, AdaptiveManagerError> {
+        self.replay_frontier
+            .as_mut()
+            .map(|frontier| frontier.reserve_native(job, grant, clock, now))
+            .transpose()
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn frontier_native_settled(
+        &mut self,
+        reservation: &NativeReservation,
+        report: &CpuSliceReport,
+        accepted: &SettledCpuSlice,
+    ) -> Result<NativeCloseReason, AdaptiveManagerError> {
+        self.replay_frontier
+            .as_mut()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "fixture native frontier absent",
+            ))?
+            .settle_native(reservation, report, accepted)
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn frontier_native_released(
+        &mut self,
+        reservation: &NativeReservation,
+        accepted: &ReleasedCpuReservation,
+    ) -> Result<NativeCloseReason, AdaptiveManagerError> {
+        self.replay_frontier
+            .as_mut()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "fixture native frontier absent",
+            ))?
+            .release_unqueued(reservation, accepted)
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn frontier_native_unknown(
+        &mut self,
+        reservation: &NativeReservation,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.replay_frontier
+            .as_mut()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "fixture native frontier absent",
+            ))?
+            .native_usage_unknown(reservation)
+            .map_err(AdaptiveManagerError::Frontier)
+    }
     fn accept_accepted_role_source(
         &mut self,
         work: &CoordinatorWork<ReviewView, u64>,
@@ -539,6 +608,15 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
         _: Option<TicketExecutionEvidence>,
     ) -> Result<CheckedStep<u64>, AdaptiveManagerError> {
         self.validate_role(work, ticket, output)?;
+        if self.block_replay_while_reserved
+            && self
+                .replay_frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.snapshot().work.reserved_native_nodes != 0)
+        {
+            self.blocked_replays += 1;
+            return Err(AdaptiveManagerError::Frontier(FrontierError::NodesReserved));
+        }
         if self.fail_role_once {
             self.fail_role_once = false;
             return Err(AdaptiveManagerError::Semantic(
@@ -837,6 +915,9 @@ fn fixture_with_registered_role_limit(
         peer_opinions: 0,
         peer_cpu_answers: 0,
         peer_repeat_question: false,
+        replay_frontier: None,
+        block_replay_while_reserved: false,
+        blocked_replays: 0,
     };
     let root_input = driver.input(RefinementStage::ProposerRanking, None);
     let facts = Arc::new(NativeFacts::default());
@@ -2158,6 +2239,9 @@ mod adaptive_partial_feedback {
                 peer_opinions: 0,
                 peer_cpu_answers: 0,
                 peer_repeat_question: false,
+                replay_frontier: None,
+                block_replay_while_reserved: false,
+                blocked_replays: 0,
             },
             admissions: Vec::new(),
             partial_commits: Vec::new(),

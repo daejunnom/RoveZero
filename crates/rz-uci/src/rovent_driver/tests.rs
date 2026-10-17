@@ -71,6 +71,7 @@ fn context<M: RoleModel + 'static>(driver: &RoventSessionDriver<M>) -> SearchSes
             depth_plies: NonZeroU16::new(3),
             mate_moves: None,
         },
+        original_go: None,
         requested_nodes: None,
         control: SearchControl::new(deadline, 4096),
         cancellation: CancelToken::new(),

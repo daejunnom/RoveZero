@@ -1,4 +1,8 @@
-use crate::parser::{Command, GoLimits, ParserLimits, PositionSpec, is_move_text, parse};
+use crate::bridge::NodeBudgetSemantics;
+use crate::parser::{
+    Command, GoLimits, ParserLimits, PositionSpec, ZeroNodeLimit, is_move_text,
+    parse_with_zero_node_limit,
+};
 use rz_contracts::rovent::SearchGoal;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -200,6 +204,7 @@ pub struct Session<P: PositionPort> {
     position: PreparedPosition<P::Snapshot>,
     active: Option<ActiveSearch>,
     goal_capability: Option<NonZeroU16>,
+    node_budget_semantics: NodeBudgetSemantics,
     closed: bool,
 }
 
@@ -242,6 +247,7 @@ impl<P: PositionPort> Session<P> {
             position,
             active: None,
             goal_capability: None,
+            node_budget_semantics: NodeBudgetSemantics::LegacySimulations,
             closed: false,
         })
     }
@@ -278,6 +284,25 @@ impl<P: PositionPort> Session<P> {
     pub fn search_goal_capability(&self) -> Option<NonZeroU16> {
         self.goal_capability
     }
+
+    /// The selected driver registers its node unit before a search starts.
+    /// Changing the unit cannot reinterpret an already admitted request.
+    pub fn set_node_budget_semantics(
+        &mut self,
+        semantics: NodeBudgetSemantics,
+    ) -> Result<(), SessionError> {
+        if self.closed || self.active.is_some() {
+            return Err(SessionError(
+                "node budget semantics require an idle open session".into(),
+            ));
+        }
+        self.node_budget_semantics = semantics;
+        Ok(())
+    }
+
+    pub fn node_budget_semantics(&self) -> NodeBudgetSemantics {
+        self.node_budget_semantics
+    }
     pub fn active_ticket(&self) -> Option<SearchTicket> {
         self.active.as_ref().map(|a| a.ticket.clone())
     }
@@ -286,7 +311,11 @@ impl<P: PositionPort> Session<P> {
         if self.closed {
             return SessionResult::reject("SessionClosed", "UCI session is closed");
         }
-        match parse(line, self.parser_limits) {
+        let zero_nodes = match self.node_budget_semantics {
+            NodeBudgetSemantics::LegacySimulations => ZeroNodeLimit::Reject,
+            NodeBudgetSemantics::RoventPositionVisits => ZeroNodeLimit::Allow,
+        };
+        match parse_with_zero_node_limit(line, self.parser_limits, zero_nodes) {
             Ok(command) => self.handle_command(command),
             Err(err) => SessionResult::reject("InvalidCommand", err.to_string()),
         }
