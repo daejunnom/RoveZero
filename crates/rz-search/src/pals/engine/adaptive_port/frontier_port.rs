@@ -1072,7 +1072,11 @@ mod tests {
 
     #[test]
     fn manager_hooks_keep_original_lane_and_exact_fresh_completion_on_retry() {
-        let mut port = super::super::port_tests::setup(Position::startpos(), 4);
+        let mut port = super::super::port_tests::setup_with_resolver(
+            Position::startpos(),
+            4,
+            ResolverPolicy::ModelWdlRestricted,
+        );
         let work = super::super::port_tests::work(
             &mut port,
             "e2e4",

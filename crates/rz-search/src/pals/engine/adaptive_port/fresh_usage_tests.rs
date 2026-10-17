@@ -2,7 +2,11 @@
 
 #[test]
 fn fresh_goal_use_preserves_once_consumption_and_failed_protection_tombstone() {
-    let mut port = super::super::port_tests::setup(Position::startpos(), 4);
+    let mut port = super::super::port_tests::setup_with_resolver(
+        Position::startpos(),
+        4,
+        ResolverPolicy::ModelWdlRestricted,
+    );
     let source =
         super::super::port_tests::work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
     port.engine.semantic.rovent_frontier = Some(Box::new(controller(&port)));

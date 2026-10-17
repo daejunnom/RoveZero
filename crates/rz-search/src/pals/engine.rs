@@ -158,6 +158,10 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 include_str!("engine/preparing_root/handoff.rs"),
             ),
             (
+                "pals/engine/preparing_root/initial_cleanup.rs",
+                include_str!("engine/preparing_root/initial_cleanup.rs"),
+            ),
+            (
                 "pals/engine/preparing_root/lifecycle.rs",
                 include_str!("engine/preparing_root/lifecycle.rs"),
             ),
@@ -2997,13 +3001,14 @@ impl<M: RoleModel> PalsEngine<M> {
             if let Some(root) = self.semantic.stores.root() {
                 self.archive_add_dependency(observation, root, limits, cancel)?;
             }
-            self.record_checked(
+            self.record_with_cpu_checked(
                 RecordKind::CpuVerification,
                 line,
                 Some(report.score),
                 report.completed_depth,
                 Some(report.score_scope),
                 Some(self.semantic.nodes[node].position.side_to_move()),
+                Some(observation),
                 limits,
                 cancel,
             )?;

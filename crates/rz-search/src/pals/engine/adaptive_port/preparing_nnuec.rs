@@ -6,7 +6,9 @@
 use super::super::preparing_root::{PreparingRootReviewSource, ResearcherPreparingRoot};
 use super::*;
 use crate::cpu_value::CpuValueIdentity;
-use crate::cpu_value::nnuec::v2::review::{BoundNnuecReviewContext, Request};
+use crate::cpu_value::nnuec::v2::review::{
+    BoundNnuecReviewContext, NnuecPreparationTerminalAck, Request, RequestIdentity,
+};
 use crate::cpu_worker::MaterializationRequest;
 use std::sync::atomic::AtomicBool;
 
@@ -22,6 +24,7 @@ pub struct PreparingRootViewSeal {
     view: Arc<ReviewView>,
     model: CpuValueIdentity,
     cancellation: Arc<AtomicBool>,
+    preparation_request: RequestIdentity,
 }
 impl PreparingRootViewSeal {
     pub fn authority(&self) -> SearchAuthority {
@@ -32,6 +35,21 @@ impl PreparingRootViewSeal {
     }
     pub fn view_seal(&self) -> [u8; 32] {
         self.view.seal_digest()
+    }
+
+    pub(crate) fn matches_preparation_request(&self, request: &Request) -> bool {
+        self.preparation_request.same_request(&request.identity())
+    }
+
+    pub(crate) fn preparation_request_identity(&self) -> &RequestIdentity {
+        &self.preparation_request
+    }
+
+    pub(crate) fn matches_preparation_terminal(
+        &self,
+        terminal: &NnuecPreparationTerminalAck,
+    ) -> bool {
+        terminal.matches_request(&self.preparation_request)
     }
 
     /// The borrowed source is minted by the same actual PreparingRoot, and
@@ -65,7 +83,8 @@ impl PreparingRootViewSeal {
     ) -> Result<(), AdaptiveNnuecPreparationError> {
         self.validate_root_source(actual)?;
         let provenance = bound.provenance();
-        if provenance.model != self.model
+        if !bound.matches_request(&self.preparation_request)
+            || provenance.model != self.model
             || provenance.root != self.root
             || provenance.generation != self.authority.root.0
             || provenance.sequence != self.view.sequence()
@@ -123,6 +142,7 @@ impl<M: RoleModel> ResearcherPreparingRoot<M> {
             view: Arc::clone(actual.view()),
             model: actual.source().model().identity().clone(),
             cancellation: Arc::clone(actual.cancellation()),
+            preparation_request: request.identity(),
         };
         Ok(PreparingRootNnuecRequest { request, seal })
     }
