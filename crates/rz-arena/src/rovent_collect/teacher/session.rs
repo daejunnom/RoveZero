@@ -139,6 +139,21 @@ impl RoventCollectionTeacherSession {
             domain: root.hard_deadline().clock,
             origin: root.runtime_clock().origin(),
         };
+        // 두 원 소유자의 정리 상한 중 더 이른 값을 사용한다. root의 여유를
+        // 교사 profile의 shutdown_grace 확장으로 해석하지 않는다.
+        let profile = launch
+            .configuration()
+            .map_err(|error| invalid(error.to_string()))?;
+        let profile_cleanup = clock
+            .origin
+            .checked_add(Duration::from_nanos(root.hard_deadline().at.0))
+            .and_then(|hard| hard.checked_add(profile.shutdown_grace))
+            .ok_or_else(|| invalid("Collection teacher original cleanup ceiling overflow"))?;
+        let root_cleanup = clock
+            .origin
+            .checked_add(Duration::from_nanos(root.cleanup_deadline().at.0))
+            .ok_or_else(|| invalid("Collection root original cleanup ceiling overflow"))?;
+        let cleanup_ceiling = cleanup_ceiling.min(root_cleanup).min(profile_cleanup);
         let owner = launch
             .spawn_collection_teacher_pinned(
                 executable,

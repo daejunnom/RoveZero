@@ -277,6 +277,8 @@ impl PcDivergenceSource {
             hash.update(b"rz-rovent-pc-divergence-source-with-attack/1\0");
             hash.update(self.visible_source_digest.0);
             hash.update(attack.digest().0);
+            hash.update(self.source.sequence.to_le_bytes());
+            hash.update(attack.source_sequence().to_le_bytes());
             self.digest = ContractDigest(hash.finalize().into());
             self.attack_ranked_source = Some(attack);
         }
@@ -288,6 +290,10 @@ impl PcDivergenceSource {
     /// The original visible-counter source seal, without an optional causal link.
     pub fn visible_source_digest(&self) -> ContractDigest {
         self.visible_source_digest
+    }
+    /// 질문 owner가 실제 발급한 순번이다. frame/RequestId/collector 시계와 다르다.
+    pub fn source_sequence(&self) -> u64 {
+        self.source.sequence
     }
     pub fn accepted(&self) -> &AcceptedRoleOrigin {
         &self.accepted

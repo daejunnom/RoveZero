@@ -120,6 +120,48 @@ def validate_native_v3(manifest, record):
     from .rovent_corpus_codec import SUBMITTED_CODEC, validate_record_codec
     if validate_record_codec(manifest, record) is not SUBMITTED_CODEC:
         raise ValueError("raw /3 validator requires the explicit submitted corpus family")
+    return _validate_native_v3_body(manifest, record)
+
+
+def validate_native_v3_evidence(manifest, value):
+    """Check a bounded future invocation projection without creating a row.
+
+    The projection contains only the original input and native lifecycle. It
+    neither imports future labels into an earlier input nor reconstructs an
+    accepted owner. Rust separately verifies legal replay and original custody.
+    """
+    fields(value, ("input_json", "input_sha256", "native"), "raw /3 future invocation evidence")
+    from .rovent_corpus_codec import SUBMITTED_CODEC, codec_from_manifest
+    from .rovent_submitted_input import seal_input
+    from .rovent_corpus import _decode_json
+    if codec_from_manifest(manifest) is not SUBMITTED_CODEC:
+        raise ValueError("raw /3 future evidence requires the submitted corpus family")
+    if (type(value["native"]) is not dict
+            or not {"raw_submission", "raw_completion", "raw_retirement"} <= set(value["native"])):
+        raise ValueError("raw /3 future invocation requires its original native lifecycle object")
+    # Keep the producer's original JSON spelling inside the outer raw seal.
+    # In particular nested f32 values must not be canonicalized a second time
+    # using another language's exponent/integral-float formatting rules.
+    if type(value["input_json"]) is not str:
+        raise ValueError("raw /3 future invocation input requires its original UTF-8 JSON string")
+    try:
+        raw = value["input_json"].encode("utf-8")
+    except UnicodeError as error:
+        raise ValueError("raw /3 future invocation input requires strict UTF-8") from error
+    if not 1 <= len(raw) <= 1024 * 1024:
+        raise ValueError("raw /3 future invocation input exceeds its original row bound")
+    snapshot = validate_input(_decode_json(raw))
+    if seal_input(snapshot) != sha(value["input_sha256"]):
+        raise ValueError("raw /3 future evidence changed its original sealed input")
+    # An ephemeral input-only adapter for shared pure lifecycle checks; this
+    # object is never serialized, admitted as a training record, or published.
+    projection = {"input": snapshot, "input_sha256": value["input_sha256"],
+                  "native": value["native"], "role": snapshot["role"]}
+    _validate_native_v3_body(manifest, projection)
+    return projection
+
+
+def _validate_native_v3_body(manifest, record):
     validate_input(record["input"])
     native = record["native"]
     extra = {

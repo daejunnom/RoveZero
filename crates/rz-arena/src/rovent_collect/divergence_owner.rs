@@ -1,22 +1,64 @@
 //! 실제 opaque P/C witness의 보존과 역사적 무결성 검사다.
 //! JSON·해시 재계산은 과거 native/Store/physical 권한을 발급하지 않는다.
-//! counter가 없던 과거 입력에 미래 source를 연결하는 capability는 지원하지 않는다.
+//! 미래 counter는 원 초기 AttackRanking capability와 실제 두 retired row가
+//! 함께 보존된 별도 variant에서만 연결하며 과거 입력에는 삽입하지 않는다.
 use super::*;
 use rz_contracts::pals::SearchAuthority;
 use rz_contracts::pals_adaptive::ReviewViewSeal;
 use rz_contracts::rovent::{QuestionEnvelope, ReciprocalQuestionId};
 use rz_experiments::rovent_corpus_v2::{
     ROVENT_DIVERGENCE_TARGET_DOMAIN, RoventCorpusManifestV2, RoventDivergenceTargetV1,
-    RoventTrainingRecordV2,
+    RoventTrainingRecordV2, parse_rovent_visible_input_json,
 };
 use rz_search::pals::coordinator::{AcceptedRoleOrigin, AcceptedRoleOriginKind, FreshPairSeal};
 use rz_search::pals::engine::pc_port::{
-    PcAcceptedFreshEndpoint, PcDivergenceResolution, PcDivergenceWitness, PcRepairAcceptedLine,
+    PcAcceptedFreshEndpoint, PcAttackRankedSource, PcDivergenceResolution, PcDivergenceWitness,
+    PcRepairAcceptedLine,
 };
+use serde::Deserialize;
 
 const WITNESS_DOMAIN: &str = "rz-rovent-pc-divergence-witness/1";
 const ACTUAL_SOURCE: &str = "rovent_actual_pc_divergence";
 const TARGET_SOURCE: &str = "rovent_resolved_pc_divergence";
+const ATTACK_DOMAIN: &str = "rz-rovent-pc-attack-ranked-source/1";
+const WITH_ATTACK_DOMAIN: &str = "rz-rovent-pc-divergence-source-with-attack/1";
+
+/// 원 future input/native만 보존한다. Head/target/teacher나 재귀 row는 없다.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VisibleRecordEvidence {
+    input_json: String,
+    input_sha256: String,
+    native: RoventNativeLifecycle,
+}
+
+struct ParsedVisibleRecordEvidence {
+    wire: VisibleRecordEvidence,
+    input: rz_experiments::rovent_submitted_input::RoventSubmittedInputV1,
+}
+
+/// Borrowed input/native fields only; no training-row/target/origin capability.
+struct SubmittedSourceFields<'a> {
+    input: &'a rz_experiments::rovent_submitted_input::RoventSubmittedInputV1,
+    input_sha256: &'a str,
+    native: &'a RoventNativeLifecycle,
+}
+impl<'a> SubmittedSourceFields<'a> {
+    fn from_record(record: &'a RoventTrainingRecordV2) -> Self {
+        Self {
+            input: &record.input,
+            input_sha256: &record.input_sha256,
+            native: &record.native,
+        }
+    }
+    fn from_visible(evidence: &'a ParsedVisibleRecordEvidence) -> Self {
+        Self {
+            input: &evidence.input,
+            input_sha256: &evidence.wire.input_sha256,
+            native: &evidence.wire.native,
+        }
+    }
+}
 
 fn authority_json(a: SearchAuthority) -> Value {
     json!({"process_epoch":a.epoch.0,"game_generation":a.game.0,
@@ -101,8 +143,44 @@ fn endpoint_json(e: &PcAcceptedFreshEndpoint) -> Result<Value, ArenaError> {
             "physical_fresh":physical.physical_fresh}}),
     )
 }
-fn witness_json(w: &PcDivergenceWitness, budget: &str) -> Result<Value, ArenaError> {
+fn attack_json(attack: &PcAttackRankedSource) -> Result<Value, ArenaError> {
+    Ok(
+        json!({"schema":ATTACK_DOMAIN,"native_attack_sha256":hex(attack.digest()),
+        "accepted":origin_json(attack.accepted()),"root_budget_sha256":hex(attack.root_budget()),
+        "source_sequence":attack.source_sequence(),
+        "divergence_index":attack.divergence_index(),"divergence_ply":attack.divergence_ply(),
+        "first_move":Move16::pack(attack.original_first_move()).map_err(|e|invalid(e.to_string()))?.bits(),
+        "proposal":packed(attack.proposal())?,
+        "perspective":color_name(attack.perspective()==rz_position::Color::White)}),
+    )
+}
+fn witness_json(
+    w: &PcDivergenceWitness,
+    budget: &str,
+    visible: Option<&RoventTrainingRecordV2>,
+) -> Result<Value, ArenaError> {
     let source = w.source();
+    let visible_source = json!({"native_source_sha256":hex(source.visible_source_digest()),
+        "accepted":origin_json(source.accepted()),"root_budget_sha256":budget,
+        "counter_local_index":source.counter_local_index(),"counter_revision":source.counter_revision(),
+        "divergence_index":source.divergence_index(),"divergence_ply":source.divergence_ply(),
+        "first_move":Move16::pack(source.first_move()).map_err(|e|invalid(e.to_string()))?.bits(),
+        "proposal":packed(source.proposal())?,"counter":packed(source.counter())?,
+        "perspective":color_name(source.perspective()==rz_position::Color::White)});
+    let source_raw = match (source.attack_ranked_source(), visible) {
+        (None, None) => visible_source,
+        (Some(attack), Some(visible)) => json!({"schema":WITH_ATTACK_DOMAIN,
+            "native_source_sha256":hex(source.digest()),"visible_source":visible_source,
+            "visible_source_sequence":source.source_sequence(),
+            "attack_ranked_source":attack_json(attack)?,
+            "visible_record_evidence":{"input_json":serde_json::to_string(&visible.input).map_err(|e|invalid(e.to_string()))?,"input_sha256":visible.input_sha256,
+                "native":visible.native}}),
+        _ => {
+            return Err(invalid(
+                "initial attack source and original visible retired row must be supplied together",
+            ));
+        }
+    };
     let resolution = match w.resolution() {
         PcDivergenceResolution::Supported => "supported",
         PcDivergenceResolution::Refuted => "refuted",
@@ -112,13 +190,7 @@ fn witness_json(w: &PcDivergenceWitness, budget: &str) -> Result<Value, ArenaErr
     let mut raw = json!({"schema":WITNESS_DOMAIN,"native_witness_sha256":hex(w.digest()),
         "native_hash_kind":"unresolved","event_sequence":w.event_sequence(),"reason":w.reason(),
         "resolution":resolution,"target_known":w.target_known(),
-        "source":{"native_source_sha256":hex(source.digest()),"accepted":origin_json(source.accepted()),
-            "root_budget_sha256":budget,"counter_local_index":source.counter_local_index(),
-            "counter_revision":source.counter_revision(),"divergence_index":source.divergence_index(),
-            "divergence_ply":source.divergence_ply(),
-            "first_move":Move16::pack(source.first_move()).map_err(|e|invalid(e.to_string()))?.bits(),
-            "proposal":packed(source.proposal())?,"counter":packed(source.counter())?,
-            "perspective":color_name(source.perspective()==rz_position::Color::White)},
+        "source":source_raw,
         "repair":w.repair().map(line_json).transpose()?,"recheck":w.recheck().map(line_json).transpose()?,
         "repaired_endpoint":w.repaired_endpoint().map(endpoint_json).transpose()?,
         "counter_endpoint":w.counter_endpoint().map(endpoint_json).transpose()?});
@@ -142,13 +214,59 @@ pub(super) fn attach_actual_pc_divergence(
     witness: &PcDivergenceWitness,
     observed_sequence: u64,
 ) -> Result<(), ArenaError> {
-    row.admission
-        .validate_ticket(&row.ticket)
-        .map_err(|e| invalid(e.to_string()))?;
+    check(
+        witness.source().attack_ranked_source().is_none(),
+        "InitialAttackEvidenceRequired: use both original retired rows for an initial attack witness",
+    )?;
     check(
         witness.source().accepted().ticket() == &row.ticket,
         "MissingOriginalAttackSource: actual source ticket is not this submitted input",
     )?;
+    attach_actual_pc_divergence_inner(row, witness, None, observed_sequence)
+}
+
+/// The optional native attack capability is joined only with its original row
+/// and the independent future visible-counter row. Neither row is deserialized
+/// into execution custody, and the initial immutable input is never changed.
+pub(super) fn attach_actual_pc_divergence_from_visible(
+    row: &mut submitted_v3::RoventRetiredRecordV2,
+    witness: &PcDivergenceWitness,
+    visible: &submitted_v3::RoventRetiredRecordV2,
+    observed_sequence: u64,
+) -> Result<(), ArenaError> {
+    let attack = witness
+        .source()
+        .attack_ranked_source()
+        .ok_or_else(|| invalid("initial attack native capability is absent"))?;
+    check(
+        attack.accepted().ticket() == &row.ticket
+            && witness.source().accepted().ticket() == &visible.ticket,
+        "initial and future visible sources must match their original retired tickets",
+    )?;
+    visible
+        .admission
+        .validate_ticket(&visible.ticket)
+        .map_err(|e| invalid(e.to_string()))?;
+    check(
+        row.manifest_sha256 == visible.manifest_sha256
+            && row.admission.raw_receipt() == visible.admission.raw_receipt()
+            && visible.record.native.raw_retirement["root_admission"]
+                == *visible.admission.raw_receipt()
+            && row.record.lineage.actor_id == visible.record.lineage.actor_id,
+        "initial/future visible original manifest, admission and actor differ",
+    )?;
+    attach_actual_pc_divergence_inner(row, witness, Some(&visible.record), observed_sequence)
+}
+
+fn attach_actual_pc_divergence_inner(
+    row: &mut submitted_v3::RoventRetiredRecordV2,
+    witness: &PcDivergenceWitness,
+    visible: Option<&RoventTrainingRecordV2>,
+    observed_sequence: u64,
+) -> Result<(), ArenaError> {
+    row.admission
+        .validate_ticket(&row.ticket)
+        .map_err(|e| invalid(e.to_string()))?;
     check(
         row.record.native.raw_retirement["root_admission"] == *row.admission.raw_receipt(),
         "divergence original live root admission differs",
@@ -161,7 +279,7 @@ pub(super) fn attach_actual_pc_divergence(
     let budget = text(&row.record.native.raw_retirement["root_admission"]["root_budget_sha256"])?;
     let raw = json!({"schema":HEAD_DOMAIN,"kind":"pc_divergence","input_sha256":row.record.input_sha256,
         "anchor":row.record.input.rules_anchor,"observed_sequence":observed_sequence,
-        "witness":witness_json(witness,budget)?});
+        "witness":witness_json(witness,budget,visible)?});
     let sha = generation_digest(HEAD_DOMAIN, &raw)?;
     let head = RoventHeadSource {
         actor_id: row.record.lineage.actor_id.clone(),
@@ -175,13 +293,20 @@ pub(super) fn attach_actual_pc_divergence(
     };
     verify_raw(&row.record, &head)?;
     let source = witness.source();
+    let slot = source
+        .attack_ranked_source()
+        .map_or(source.divergence_index(), |attack| {
+            attack.divergence_index()
+        });
     let mapping = row
         .record
         .input
         .attack_mapping
-        .get(usize::from(source.divergence_index()))
+        .get(usize::from(slot))
         .ok_or_else(|| invalid("actual divergence slot missing"))?;
-    let target = if mapping.selected_counter_local_index.is_some() && witness.target_known() {
+    let target = if (visible.is_some() || mapping.selected_counter_local_index.is_some())
+        && witness.target_known()
+    {
         Some(RoventDivergenceTargetV1 {
             schema: ROVENT_DIVERGENCE_TARGET_DOMAIN.into(),
             observed_sequence,
@@ -189,7 +314,7 @@ pub(super) fn attach_actual_pc_divergence(
             view_sha256: row.record.input.view_sha256.clone(),
             raw_evidence_sha256: sha,
             source: TARGET_SOURCE.into(),
-            slot: source.divergence_index(),
+            slot,
             attack_ply: u16::try_from(source.divergence_ply())
                 .map_err(|_| invalid("attack ply overflow"))?,
             counter_question_id: hex(source.accepted().ticket().question),
@@ -216,9 +341,22 @@ pub(super) fn attach_actual_pc_divergence(
     if let Some(target) = &target {
         verify_target(&row.record, &head, target)?;
     }
-    row.record.divergence_index = target.as_ref().map(|t| t.slot);
-    row.record.targets.divergence = target;
-    row.record.head_sources.insert("divergence".into(), head);
+    // A future native projection is bounded by the same final row cap, not an
+    // unbounded recursive record. Refuse before changing the original row.
+    let mut candidate = row.record.clone();
+    candidate.divergence_index = target.as_ref().map(|t| t.slot);
+    candidate.targets.divergence = target;
+    candidate.head_sources.insert("divergence".into(), head);
+    if serde_json::to_vec(&candidate)
+        .map_err(|e| invalid(e.to_string()))?
+        .len()
+        > GENERATION_MAX_ROW_BYTES
+    {
+        return Err(ArenaError::Budget(
+            "PcDivergenceEvidenceCapacity: original row retained; final row exceeds 1MiB".into(),
+        ));
+    }
+    row.record = candidate;
     Ok(())
 }
 
@@ -231,6 +369,11 @@ pub fn verify_historical_pc_divergence(
     record.validate(manifest)?;
     if let Some(head) = record.head_sources.get("divergence") {
         verify_raw(record, head)?;
+        if let Some(visible) =
+            visible_record_evidence(record, &head.raw_receipt["witness"]["source"])?
+        {
+            verify_visible_history(&visible, manifest)?;
+        }
         if let Some(target) = &record.targets.divergence {
             verify_target(record, head, target)?;
         }
@@ -951,7 +1094,254 @@ fn witness_digest(w: &Value, pair: bool) -> Result<String, ArenaError> {
     Ok(digest_text(h))
 }
 
-fn original_source(record: &RoventTrainingRecordV2, s: &Value) -> Result<(), ArenaError> {
+fn visible_source(source: &Value) -> &Value {
+    if source["schema"] == WITH_ATTACK_DOMAIN {
+        &source["visible_source"]
+    } else {
+        source
+    }
+}
+
+fn initial_attack(source: &Value) -> Option<&Value> {
+    if source["schema"] == WITH_ATTACK_DOMAIN {
+        Some(&source["attack_ranked_source"])
+    } else {
+        None
+    }
+}
+
+fn visible_record_evidence(
+    original: &RoventTrainingRecordV2,
+    source: &Value,
+) -> Result<Option<ParsedVisibleRecordEvidence>, ArenaError> {
+    if source["schema"].is_null() {
+        return Ok(None);
+    }
+    fields(
+        source,
+        &[
+            "schema",
+            "native_source_sha256",
+            "visible_source",
+            "visible_source_sequence",
+            "attack_ranked_source",
+            "visible_record_evidence",
+        ],
+    )?;
+    check(
+        source["schema"] == WITH_ATTACK_DOMAIN,
+        "unknown explicit divergence source variant",
+    )?;
+    let raw = &source["visible_record_evidence"];
+    fields(raw, &["input_json", "input_sha256", "native"])?;
+    let wire: VisibleRecordEvidence =
+        serde_json::from_value(raw.clone()).map_err(|e| invalid(e.to_string()))?;
+    let input = parse_rovent_visible_input_json(&wire.input_json)?;
+    let future = ParsedVisibleRecordEvidence { wire, input };
+    future.input.validate()?;
+    check(
+        future.input.sha256()? == future.wire.input_sha256
+            && future.wire.native.raw_submission["input_sha256"] == future.wire.input_sha256
+            && future.wire.native.raw_completion["input_sha256"] == future.wire.input_sha256
+            && future.wire.native.raw_retirement["input_sha256"] == future.wire.input_sha256
+            && future.input.role == GenerationRoleV3::Critic
+            && future.wire.native.head == "critic"
+            && future.wire.native.submitted_sequence == future.input.capture_sequence
+            && original.input.capture_sequence < future.input.capture_sequence
+            && future.wire.native.raw_submission["ticket"]["question_digest"]
+                == future.input.question_id
+            && future.input.game_id == original.input.game_id
+            && future.input.opening_id == original.input.opening_id
+            && future.input.model_epoch == original.input.model_epoch
+            && future.input.context_epoch == original.input.context_epoch
+            && future.input.actual_history == original.input.actual_history
+            && future.input.rules_anchor == original.input.rules_anchor
+            && future.wire.native.source_sha256 == original.native.source_sha256
+            && future.wire.native.raw_retirement["root_admission"]
+                == original.native.raw_retirement["root_admission"],
+        "future visible original submitted input seal and exact source/root/history scope",
+    )?;
+    Ok(Some(future))
+}
+
+fn verify_visible_history(
+    future: &ParsedVisibleRecordEvidence,
+    manifest: &RoventCorpusManifestV2,
+) -> Result<(), ArenaError> {
+    future
+        .wire
+        .native
+        .validate_submitted_input_v3(&manifest.common_registration_projection())?;
+    let input = future.input.common_validation_projection();
+    let replay: rules_replay::RoventSubmittedRulesReplay =
+        serde_json::from_value(future.wire.native.raw_submission["rules_replay"].clone())
+            .map_err(|e| invalid(e.to_string()))?;
+    let attacks = future
+        .input
+        .attack_mapping
+        .iter()
+        .map(|slot| usize::from(slot.attack_ply))
+        .collect::<Vec<_>>();
+    rules_replay::verify_historical_rules_fields(&input, &future.wire.native, &replay, &attacks)?;
+    submitted_review_historical::verify_historical_submitted_review_fields(
+        &future.input,
+        &future.wire.input_sha256,
+        &future.wire.native,
+    )?;
+    historical_scope::verify_historical_native_fields(
+        &input,
+        &future.wire.native,
+        &manifest.common_registration_projection(),
+    )?;
+    Ok(())
+}
+
+fn attack_digest(attack: &Value) -> Result<String, ArenaError> {
+    let mut h = Sha256::new();
+    h.update(b"rz-rovent-pc-attack-ranked-source/1\0");
+    hash_sha(&mut h, &attack["accepted"]["seal_sha256"])?;
+    hash_sha(&mut h, &attack["root_budget_sha256"])?;
+    h.update(
+        u16::try_from(number(&attack["divergence_index"])?)
+            .map_err(|_| invalid("initial attack slot overflow"))?
+            .to_le_bytes(),
+    );
+    hash_u64(&mut h, &attack["divergence_ply"])?;
+    h.update(
+        u16::try_from(number(&attack["first_move"])?)
+            .map_err(|_| invalid("initial first move overflow"))?
+            .to_le_bytes(),
+    );
+    hash_line(&mut h, &attack["proposal"])?;
+    Ok(digest_text(h))
+}
+
+fn combined_source_digest(source: &Value) -> Result<String, ArenaError> {
+    let mut h = Sha256::new();
+    h.update(b"rz-rovent-pc-divergence-source-with-attack/1\0");
+    hash_sha(&mut h, &source["visible_source"]["native_source_sha256"])?;
+    hash_sha(
+        &mut h,
+        &source["attack_ranked_source"]["native_attack_sha256"],
+    )?;
+    hash_u64(&mut h, &source["visible_source_sequence"])?;
+    hash_u64(&mut h, &source["attack_ranked_source"]["source_sequence"])?;
+    Ok(digest_text(h))
+}
+
+fn ranked_attack(
+    record: &RoventTrainingRecordV2,
+    attack: &Value,
+    visible: &Value,
+) -> Result<(), ArenaError> {
+    fields(
+        attack,
+        &[
+            "schema",
+            "native_attack_sha256",
+            "accepted",
+            "root_budget_sha256",
+            "source_sequence",
+            "divergence_index",
+            "divergence_ply",
+            "first_move",
+            "proposal",
+            "perspective",
+        ],
+    )?;
+    check(
+        attack["schema"] == ATTACK_DOMAIN,
+        "initial ranked attack exact domain",
+    )?;
+    let original = &record.native.raw_submission["ticket"];
+    let budget = &record.native.raw_retirement["root_admission"]["root_budget_sha256"];
+    origin(&attack["accepted"], original, budget, "critic")?;
+    check(
+        record.role == GenerationRoleV3::Critic
+            && record.input.sha256()? == record.input_sha256
+            && attack["accepted"]["ticket"] == *original
+            && attack["accepted"]["output_digest"] == record.native.output_digest
+            && attack["accepted"]["output_digest"] == record.native.raw_completion["output_digest"]
+            && record.native.raw_completion["ticket"] == *original
+            && record.native.raw_retirement["ticket"] == *original
+            && attack["root_budget_sha256"] == *budget,
+        "initial attack original retired C input/output/budget",
+    )?;
+    let query = &record.input.selected_view.query;
+    let proposal = moves(&attack["proposal"])?;
+    let slot = usize::try_from(number(&attack["divergence_index"])?)
+        .map_err(|_| invalid("initial attack slot"))?;
+    let ply = usize::try_from(number(&attack["divergence_ply"])?)
+        .map_err(|_| invalid("initial attack ply"))?;
+    let mapping = record
+        .input
+        .attack_mapping
+        .get(slot)
+        .ok_or_else(|| invalid("initial attack original slot absent"))?;
+    check(
+        query.purpose == "divergence_policy"
+            && query.prefix.is_empty()
+            && !query.counter_present
+            && query.counter.is_empty()
+            && query.proposal == proposal
+            && ply > 0
+            && ply < proposal.len()
+            && usize::from(mapping.slot) == slot
+            && usize::from(mapping.attack_ply) == ply
+            && mapping.selected_counter_local_index.is_none()
+            && mapping.selected_counter_revision.is_none()
+            && proposal.first().copied().map(u64::from) == attack["first_move"].as_u64()
+            && attack["perspective"] == color_name(record.input.rules_anchor.white_to_move),
+        "initial attack must preserve the original no-counter question, slot and Rules perspective",
+    )?;
+    let bits = record.native.raw_completion["output"]["payload"]["divergence_logits_bits"]
+        .as_array()
+        .ok_or_else(|| invalid("initial attack original D logits absent"))?;
+    check(
+        bits.len() == record.input.attack_mapping.len(),
+        "initial attack original D coverage",
+    )?;
+    let logits = bits
+        .iter()
+        .map(|word| {
+            let value = f32::from_bits(
+                u32::try_from(number(word)?).map_err(|_| invalid("initial D word overflow"))?,
+            );
+            check(value.is_finite(), "initial attack finite D logits")?;
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, ArenaError>>()?;
+    check(
+        selected_slot(&logits) == Some(slot),
+        "initial attack differs from original D argmax",
+    )?;
+    check(
+        attack_digest(attack)? == text(&attack["native_attack_sha256"])?,
+        "initial ranked attack native seal",
+    )?;
+    // The two slot indices intentionally need not match. Both are sealed in
+    // their original immutable queries; only the selected attack ply is shared.
+    origin(&visible["accepted"], original, budget, "critic")?;
+    let counter = moves(&visible["counter"])?;
+    check(
+        counter.get(..ply) == proposal.get(..ply)
+            && counter.get(ply).is_some()
+            && counter.get(ply) != proposal.get(ply),
+        "initial attack counter must preserve the proposal prefix and change the original attack move",
+    )?;
+    check(
+        number(&original["request_sequence"])?
+            < number(&visible["accepted"]["ticket"]["request_sequence"])?
+            && attack["divergence_ply"] == visible["divergence_ply"]
+            && attack["proposal"] == visible["proposal"]
+            && attack["first_move"] == visible["first_move"]
+            && attack["perspective"] == visible["perspective"]
+            && attack["root_budget_sha256"] == visible["root_budget_sha256"],
+        "initial attack and later visible source changed original root/model/deadline/attack or chronology",
+    )
+}
+
+fn original_source(record: &SubmittedSourceFields<'_>, s: &Value) -> Result<(), ArenaError> {
     fields(
         s,
         &[
@@ -975,7 +1365,9 @@ fn original_source(record: &RoventTrainingRecordV2, s: &Value) -> Result<(), Are
     sha(budget)?;
     origin(&s["accepted"], original, budget, "critic")?;
     check(
-        record.role == GenerationRoleV3::Critic
+        record.input.role == GenerationRoleV3::Critic
+            && input.sha256()? == record.input_sha256
+            && record.native.raw_submission["input_sha256"] == record.input_sha256
             && s["accepted"]["ticket"] == *original
             && s["accepted"]["output_digest"] == record.native.output_digest
             && s["accepted"]["output_digest"] == record.native.raw_completion["output_digest"]
@@ -1078,8 +1470,7 @@ fn selected_slot(logits: &[f32]) -> Option<usize> {
         .max_by(|(a, x), (b, y)| x.total_cmp(y).then_with(|| b.cmp(a)))
         .map(|(i, _)| i)
 }
-fn frozen_chain(w: &Value) -> Result<(), ArenaError> {
-    let s = &w["source"];
+fn frozen_chain(w: &Value, s: &Value) -> Result<(), ArenaError> {
     let repair = &w["repair"];
     let recheck = &w["recheck"];
     let left = &w["repaired_endpoint"];
@@ -1154,7 +1545,11 @@ fn conditional_resolution(left: [f32; 3], right: [f32; 3]) -> &'static str {
         "unknown"
     }
 }
-fn replay_lines(record: &RoventTrainingRecordV2, w: &Value) -> Result<(), ArenaError> {
+fn replay_lines(
+    record: &SubmittedSourceFields<'_>,
+    w: &Value,
+    source: &Value,
+) -> Result<(), ArenaError> {
     let replay: rules_replay::RoventSubmittedRulesReplay =
         serde_json::from_value(record.native.raw_submission["rules_replay"].clone())
             .map_err(|e| invalid(e.to_string()))?;
@@ -1163,7 +1558,7 @@ fn replay_lines(record: &RoventTrainingRecordV2, w: &Value) -> Result<(), ArenaE
         exact_rules_anchor(&position)? == record.input.rules_anchor,
         "divergence source exact Rules query anchor",
     )?;
-    let mut lines = vec![&w["source"]["proposal"], &w["source"]["counter"]];
+    let mut lines = vec![&source["proposal"], &source["counter"]];
     for key in ["repair", "recheck"] {
         if !w[key].is_null() {
             lines.push(&w[key]["moves"]);
@@ -1249,24 +1644,43 @@ fn verify_raw(record: &RoventTrainingRecordV2, head: &RoventHeadSource) -> Resul
         !reason.is_empty() && reason.len() <= 4096 && !reason.chars().any(char::is_control),
         "bounded original witness reason",
     )?;
-    original_source(record, &w["source"])?;
-    let original = &record.native.raw_submission["ticket"];
-    let budget = &w["source"]["root_budget_sha256"];
+    let future = visible_record_evidence(record, &w["source"])?;
+    if let Some(visible) = &future {
+        check(
+            head.observed_sequence >= visible.wire.native.retired_sequence,
+            "collector observed divergence before original future visible retirement",
+        )?;
+    }
+    let source_record = future
+        .as_ref()
+        .map(SubmittedSourceFields::from_visible)
+        .unwrap_or_else(|| SubmittedSourceFields::from_record(record));
+    let source = visible_source(&w["source"]);
+    original_source(&source_record, source)?;
+    if let Some(attack) = initial_attack(&w["source"]) {
+        ranked_attack(record, attack, source)?;
+        check(
+            number(&attack["source_sequence"])? > 0
+                && number(&attack["source_sequence"])?
+                    < number(&w["source"]["visible_source_sequence"])?,
+            "initial and visible private source sequence chronology",
+        )?;
+        check(
+            combined_source_digest(&w["source"])? == text(&w["source"]["native_source_sha256"])?,
+            "initial/visible combined native source seal",
+        )?;
+    }
+    let original = &source_record.native.raw_submission["ticket"];
+    let budget = &source["root_budget_sha256"];
     for (key, kind) in [("repair", "repair"), ("recheck", "counterexample")] {
         if !w[key].is_null() {
             accepted_line(&w[key], original, budget, kind)?;
         }
     }
-    let native = &record.native.raw_retirement["root_admission"]["native_origin"];
+    let native = &source_record.native.raw_retirement["root_admission"]["native_origin"];
     for key in ["repaired_endpoint", "counter_endpoint"] {
         if !w[key].is_null() {
-            endpoint(
-                &w[key],
-                original,
-                budget,
-                native,
-                &w["source"]["perspective"],
-            )?;
+            endpoint(&w[key], original, budget, native, &source["perspective"])?;
         }
     }
     let pair = match text(&w["native_hash_kind"])? {
@@ -1275,7 +1689,7 @@ fn verify_raw(record: &RoventTrainingRecordV2, head: &RoventHeadSource) -> Resul
                 number(&w["event_sequence"])? > 0,
                 "completed pair manager event sequence",
             )?;
-            frozen_chain(w)?;
+            frozen_chain(w, source)?;
             true
         }
         "unresolved" => {
@@ -1291,7 +1705,7 @@ fn verify_raw(record: &RoventTrainingRecordV2, head: &RoventHeadSource) -> Resul
         witness_digest(w, pair)? == text(&w["native_witness_sha256"])?,
         "original composite witness native seal",
     )?;
-    replay_lines(record, w)
+    replay_lines(&source_record, w, source)
 }
 fn verify_target(
     record: &RoventTrainingRecordV2,
@@ -1300,8 +1714,10 @@ fn verify_target(
 ) -> Result<(), ArenaError> {
     target.value(&record.input)?;
     let w = &head.raw_receipt["witness"];
-    let s = &w["source"];
-    let slot = usize::try_from(number(&s["divergence_index"])?)
+    let s = visible_source(&w["source"]);
+    let attack = initial_attack(&w["source"]);
+    let slot_source = attack.unwrap_or(s);
+    let slot = usize::try_from(number(&slot_source["divergence_index"])?)
         .map_err(|_| invalid("original slot overflow"))?;
     let mapping = record
         .input
@@ -1310,7 +1726,7 @@ fn verify_target(
         .ok_or_else(|| invalid("original slot absent"))?;
     check(
         w["target_known"] == true
-            && mapping.selected_counter_local_index.is_some()
+            && (attack.is_some() || mapping.selected_counter_local_index.is_some())
             && target.raw_evidence_sha256 == head.raw_receipt_sha256
             && target.observed_sequence == head.observed_sequence
             && usize::from(target.slot) == slot
@@ -1334,6 +1750,43 @@ fn verify_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranked_attack_uses_its_original_slot_and_explicit_first_move_framing() {
+        // e2e4=12|(28<<6), e7e5=52|(36<<6), independent of Store helpers.
+        let raw = json!({"accepted":{"seal_sha256":"03".repeat(32)},
+            "root_budget_sha256":"07".repeat(32),"divergence_index":2,"divergence_ply":1,
+            "first_move":1804,"proposal":[1804,2356]});
+        let mut bytes = b"rz-rovent-pc-attack-ranked-source/1\0".to_vec();
+        bytes.extend([3u8; 32]);
+        bytes.extend([7u8; 32]);
+        bytes.extend(2u16.to_le_bytes());
+        bytes.extend(1u64.to_le_bytes());
+        bytes.extend(1804u16.to_le_bytes());
+        bytes.extend(2u64.to_le_bytes());
+        bytes.extend(1804u16.to_le_bytes());
+        bytes.extend(2356u16.to_le_bytes());
+        assert_eq!(
+            attack_digest(&raw).unwrap(),
+            hex(Digest(Sha256::digest(bytes).into()))
+        );
+    }
+    #[test]
+    fn linked_source_seals_both_original_private_sequences_in_order() {
+        let mut raw = json!({"visible_source":{"native_source_sha256":"0b".repeat(32)},
+            "attack_ranked_source":{"native_attack_sha256":"0d".repeat(32),"source_sequence":17},
+            "visible_source_sequence":29});
+        let mut bytes = b"rz-rovent-pc-divergence-source-with-attack/1\0".to_vec();
+        bytes.extend([11u8; 32]);
+        bytes.extend([13u8; 32]);
+        bytes.extend(29u64.to_le_bytes());
+        bytes.extend(17u64.to_le_bytes());
+        let expected = hex(Digest(Sha256::digest(bytes).into()));
+        assert_eq!(combined_source_digest(&raw).unwrap(), expected);
+        raw["visible_source_sequence"] = json!(17);
+        raw["attack_ranked_source"]["source_sequence"] = json!(29);
+        assert_ne!(combined_source_digest(&raw).unwrap(), expected);
+    }
 
     #[test]
     fn origin_binary_framing_and_full_ticket_join_are_separate() {

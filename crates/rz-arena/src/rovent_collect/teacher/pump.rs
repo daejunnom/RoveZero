@@ -142,6 +142,14 @@ impl RoventCollectionTeacherPump {
             _ => unreachable!("checked submitted-input"),
         })
     }
+    pub(crate) fn next_ready_submitted_input_is_divergence(&self) -> Option<bool> {
+        self.ready.front().and_then(|row| match row {
+            PumpRow::SubmittedV1(row) => {
+                Some(row.input().selected_view.query.purpose == "divergence_policy")
+            }
+            _ => None,
+        })
+    }
     pub fn take_quarantined_submitted_input_v1(&mut self) -> Option<RoventRetiredRecordV2> {
         if !matches!(self.quarantined_rows.front(), Some(PumpRow::SubmittedV1(_))) {
             return None;
@@ -309,6 +317,28 @@ impl RoventCollectionTeacherPump {
     pub fn request_shutdown(&mut self, until: Instant) {
         self.closed = true;
         self.session.request_shutdown(until);
+    }
+    /// 실제 root fence 뒤 더 이상 교사 질문을 제출하지 않는다. 아직 제출하지
+    /// 않은 row는 unknown으로 그대로 돌려주며, 이미 제출한 질문의 terminal은
+    /// poll이 원 completion을 회수할 때까지 waiting custody에 남는다.
+    pub fn close_input_admission(&mut self) -> Result<(), ArenaError> {
+        self.closed = true;
+        let unissued = self
+            .waiting
+            .iter()
+            .filter(|(_, row)| !row.issued)
+            .map(|(sha, _)| sha.clone())
+            .collect::<Vec<_>>();
+        check(
+            self.ready.len() + unissued.len() <= 16,
+            "Collection shutdown ready outbox full; original rows retained",
+        )?;
+        for sha in unissued {
+            if let Some(waiting) = self.waiting.remove(&sha) {
+                self.ready.push_back(waiting.row);
+            }
+        }
+        Ok(())
     }
     pub fn poll_shutdown(&mut self) -> Vec<RoventCollectionTeacherShutdown> {
         self.session.poll_shutdown()

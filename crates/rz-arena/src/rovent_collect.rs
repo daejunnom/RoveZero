@@ -1091,6 +1091,8 @@ pub use r_writer::*;
 mod r_historical;
 pub use r_historical::*;
 mod allocation;
+#[cfg(target_os = "linux")]
+pub mod launch;
 pub use allocation::{
     ROVENT_ALLOCATION_SUPPLEMENT, ROVENT_R_ALLOCATION_SUPPLEMENT, RoventAllocationSupplement,
     RoventAllocationSupplementEntry,

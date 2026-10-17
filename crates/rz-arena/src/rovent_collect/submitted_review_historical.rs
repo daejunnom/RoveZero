@@ -68,13 +68,26 @@ fn sha(value: &[u8; 32]) -> String {
 pub(super) fn verify_historical_submitted_review(
     record: &RoventTrainingRecordV2,
 ) -> Result<(), ArenaError> {
-    record.input.validate()?;
-    let raw = &record.native.raw_submission;
     check(
-        record.schema == ROVENT_TRAINING_RECORD_V2_DOMAIN
-            && raw["schema"] == ROVENT_NATIVE_RAW_V3_DOMAIN
-            && record.input_sha256 == record.input.sha256()?
-            && raw["input_sha256"] == record.input_sha256,
+        record.schema == ROVENT_TRAINING_RECORD_V2_DOMAIN,
+        "historical submitted record family",
+    )?;
+    verify_historical_submitted_review_fields(&record.input, &record.input_sha256, &record.native)
+}
+
+/// 원 input/native 필드만 검증하는 공통 계산이다. 미래 증거를 가짜 전체
+/// record/target/lineage로 감싸거나 새 publication으로 봉인하지 않는다.
+pub(super) fn verify_historical_submitted_review_fields(
+    input: &rz_experiments::rovent_submitted_input::RoventSubmittedInputV1,
+    input_sha256: &str,
+    native: &RoventNativeLifecycle,
+) -> Result<(), ArenaError> {
+    input.validate()?;
+    let raw = &native.raw_submission;
+    check(
+        raw["schema"] == ROVENT_NATIVE_RAW_V3_DOMAIN
+            && input_sha256 == input.sha256()?
+            && raw["input_sha256"] == input_sha256,
         "submitted review requires original raw3/submitted-input family and seal",
     )?;
     let raw_review = &raw["submitted_review"];
@@ -108,9 +121,9 @@ pub(super) fn verify_historical_submitted_review(
     )?;
     let review: submitted_v3::RoventSubmittedReviewEvidence =
         serde_json::from_value(raw_review.clone()).map_err(|error| invalid(error.to_string()))?;
-    let selected = &record.input.selected_view;
+    let selected = &input.selected_view;
     let ticket = &raw["ticket"];
-    let root = &record.native.raw_retirement["root_admission"];
+    let root = &native.raw_retirement["root_admission"];
     let raw_metadata = raw_review["record_metadata"]
         .as_array()
         .ok_or_else(|| invalid("submitted review original record metadata"))?;
@@ -118,10 +131,10 @@ pub(super) fn verify_historical_submitted_review(
         review.schema == submitted_v3::ROVENT_SUBMITTED_REVIEW_EVIDENCE
             && review.sequence > 0
             && ticket["view_sequence"].as_u64() == Some(review.sequence)
-            && review.generation == record.native.root_generation
+            && review.generation == native.root_generation
             && raw["root_generation"].as_u64() == Some(review.generation)
             && root["store_root_state"].as_u64() == Some(review.root_state)
-            && review.view_seal_sha256 == record.native.view_digest
+            && review.view_seal_sha256 == native.view_digest
             && ticket["view_digest"] == review.view_seal_sha256
             && raw["view_digest"] == review.view_seal_sha256
             && !review.anchor_states.is_empty()
@@ -175,7 +188,7 @@ pub(super) fn verify_historical_submitted_review(
         .map(rules_replay::RoventRulesPositionReplay::restore)
         .collect::<Result<Vec<_>, _>>()?;
     check(
-        replay.actual_root.moves == record.input.actual_history
+        replay.actual_root.moves == input.actual_history
             && actual_root.snapshot().same_state(&positions[0].snapshot()),
         "submitted review exact actual Rules root/history",
     )?;
@@ -228,7 +241,7 @@ pub(super) fn verify_historical_submitted_review(
                 && original.origin_state == anchor.state.0 as u64
                 && row.record_id
                     == format!("record-{}-{}", review.generation, original.source_revision)
-                && row.observed_sequence == record.input.capture_sequence
+                && row.observed_sequence == input.capture_sequence
                 && row.completed_iteration
                     == (original_scope == Some(CpuScoreScope::CompletedIteration)),
             "submitted review original record identity/revision/scope projection",
@@ -268,7 +281,7 @@ pub(super) fn verify_historical_submitted_review(
             original_first_move: original.original_first_move.map(movement).transpose()?,
         });
     }
-    for mapping in &record.input.attack_mapping {
+    for mapping in &input.attack_mapping {
         if let (Some(index), Some(revision)) = (
             mapping.selected_counter_local_index,
             mapping.selected_counter_revision,
@@ -292,9 +305,8 @@ pub(super) fn verify_historical_submitted_review(
         prefix: moves(&q.prefix)?,
         proposal: moves(&q.proposal)?,
         counterexample: q.counter_present.then(|| moves(&q.counter)).transpose()?,
-        legal: moves(&record.input.legal_moves)?,
-        divergences: record
-            .input
+        legal: moves(&input.legal_moves)?,
+        divergences: input
             .attack_mapping
             .iter()
             .map(|slot| usize::from(slot.attack_ply))

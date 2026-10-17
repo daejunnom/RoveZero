@@ -100,7 +100,17 @@ pub(super) fn verify_historical_native_scope(
     record: &RoventTrainingRecord,
     manifest: &RoventCorpusManifest,
 ) -> Result<RoventHistoricalRecordEvidence, ArenaError> {
-    let retirement = &record.native.raw_retirement;
+    verify_historical_native_fields(&record.input, &record.native, manifest)
+}
+
+/// 형식별 validator 뒤에 원 input/native 필드만 대조한다. 임시 전체 row나
+/// target/lineage를 만들지 않으며 metadata에서 실행 권한을 복구하지 않는다.
+pub(super) fn verify_historical_native_fields(
+    generation_input: &GenerationInputV3,
+    native: &RoventNativeLifecycle,
+    manifest: &RoventCorpusManifest,
+) -> Result<RoventHistoricalRecordEvidence, ArenaError> {
+    let retirement = &native.raw_retirement;
     let raw = &retirement["root_admission"];
     let root: RoventRootAdmissionEvidence = serde_json::from_value(raw.clone())
         .map_err(|_| invalid("missing/malformed explicit Rovent root admission evidence"))?;
@@ -109,7 +119,7 @@ pub(super) fn verify_historical_native_scope(
     let origin_domain = "rz-rovent-collection-native-origin/1";
     let root_domain = "rz-rovent-collection-root-admission/1";
     let root_sha = generation_digest(root_domain, raw)?;
-    let ticket = &record.native.raw_submission["ticket"];
+    let ticket = &native.raw_submission["ticket"];
     let source = rz_experiments::rovent_source_aggregate_sha256(
         &origin.source_commit,
         &origin.source_components,
@@ -128,10 +138,10 @@ pub(super) fn verify_historical_native_scope(
             && origin.purpose == "collection"
             && generation_digest(origin_domain, origin_raw)? == root.native_origin_sha256
             && retirement["root_admission_sha256"] == root_sha
-            && root.process_epoch == record.native.process_epoch
+            && root.process_epoch == native.process_epoch
             && origin.process_epoch == root.process_epoch
-            && root.game_generation == record.native.game_generation
-            && root.root_generation == record.native.root_generation
+            && root.game_generation == native.game_generation
+            && root.root_generation == native.root_generation
             && ticket["implementation_sha256"] == root.implementation_sha256
             && ticket["deadline_clock"].as_u64() == Some(root.deadline_clock)
             && ticket["deadline_tick"].as_u64() == Some(root.deadline_tick)
@@ -149,13 +159,13 @@ pub(super) fn verify_historical_native_scope(
             && semantics == manifest.model_semantics_sha256
             && origin.encoding == rz_eval::pals_model::virtual_review::ENCODING
             && origin.encoding_sha256 == encoding
-            && encoding == record.native.encoding_sha256
+            && encoding == native.encoding_sha256
             && origin.encoding_registry_sha256
                 == hex(Digest(
                     rz_eval::pals_model::virtual_review::registered_encoding_sha256(),
                 ))
             && origin.representation_model_domain == "loaded_checkpoint_sha256"
-            && origin.weights_sha256 == record.native.model_sha256
+            && origin.weights_sha256 == native.model_sha256
             && origin.frozen_epoch
                 == ticket["representation"]["frozen_epoch"]
                     .as_u64()
@@ -205,7 +215,7 @@ pub(super) fn verify_historical_native_scope(
         "historical collection execution mode/root restriction",
     )?;
     let submission: super::rules_replay::RoventSubmittedRulesReplay =
-        serde_json::from_value(record.native.raw_submission["rules_replay"].clone())
+        serde_json::from_value(native.raw_submission["rules_replay"].clone())
             .map_err(|_| invalid("missing Rules submission replay"))?;
     let actual = submission.actual_root.restore()?;
     let root_moves = root
@@ -248,7 +258,7 @@ pub(super) fn verify_historical_native_scope(
             "historical corpus teacher is absent from original loaded lock",
         )?;
     }
-    verify_original_native_key(record, &submission, &origin)?;
+    verify_original_native_key(generation_input, native, &submission, &origin)?;
     Ok(RoventHistoricalRecordEvidence {
         native_admission_sha256: root_sha,
         collection_source_commit: origin.source_commit.clone(),
@@ -260,7 +270,7 @@ pub(super) fn verify_historical_native_scope(
         collection_native_configuration_sha256: origin.native_configuration_sha256.clone(),
         collection_input_lock_sha256: origin.input_lock_sha256.clone(),
         model_semantics_sha256: semantics,
-        model_identity_sha256: record.native.model_sha256.clone(),
+        model_identity_sha256: native.model_sha256.clone(),
         weights_sha256: origin.weights_sha256.clone(),
         encoding_sha256: encoding,
         root_descriptor: root.root_descriptor.clone(),
@@ -300,11 +310,12 @@ fn typed_virtual_input(value: &Value) -> Result<PalsVirtualReviewInput, ArenaErr
     Ok(typed)
 }
 fn verify_original_native_key(
-    record: &RoventTrainingRecord,
+    generation_input: &GenerationInputV3,
+    native: &RoventNativeLifecycle,
     replay: &super::rules_replay::RoventSubmittedRulesReplay,
     origin: &RoventNativeOriginEvidence,
 ) -> Result<(), ArenaError> {
-    let input = typed_virtual_input(&record.input.encoded_model_input)?;
+    let input = typed_virtual_input(&generation_input.encoded_model_input)?;
     let anchors = replay
         .selected_anchors
         .iter()
@@ -326,7 +337,7 @@ fn verify_original_native_key(
         anchor_history_seals: history,
         fp32: true,
     };
-    let query = &record.input.selected_view.query;
+    let query = &generation_input.selected_view.query;
     let mut endpoint = anchors
         .get(query.anchors[0] as usize)
         .ok_or_else(|| invalid("query root absent"))?
@@ -344,7 +355,7 @@ fn verify_original_native_key(
     }
     let history = rz_uci::pals_native::pals_history_digest(&endpoint)
         .map_err(|error| invalid(error.to_string()))?;
-    let original = &record.native.raw_submission["ticket"]["representation"];
+    let original = &native.raw_submission["ticket"]["representation"];
     let revision = original["record_revision"]
         .as_u64()
         .ok_or_else(|| invalid("original native record revision absent"))?;
@@ -356,7 +367,7 @@ fn verify_original_native_key(
         "mask_positions":hex(key.mask_positions),"model":hex(key.model),"encoding":hex(key.encoding),
         "precision":format!("{:?}",key.precision),"frozen_epoch":key.frozen_epoch,"record_revision":key.record_revision,"role":role_name(key.role)});
     check(
-        *original == expected && hex(key.input) == record.native.input_digest,
+        *original == expected && hex(key.input) == native.input_digest,
         "historical model fields/masks/Fresh input seal differ from original native representation",
     )
 }

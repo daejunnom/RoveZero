@@ -9,6 +9,10 @@ pub struct RoventCorpusWriterV2 {
     manifest: RoventCorpusManifestV2,
     original: RoventCorpusWriter,
 }
+pub(super) struct RoventWriterFinishFailureV2 {
+    pub failure: ArenaError,
+    pub writer: RoventCorpusWriterV2,
+}
 impl RoventCorpusWriterV2 {
     pub fn new(manifest: &RoventCorpusManifestV2) -> Result<Self, ArenaError> {
         let mut original = RoventCorpusWriter::new(&manifest.common_registration_projection())?;
@@ -19,6 +23,14 @@ impl RoventCorpusWriterV2 {
         })
     }
     pub fn append(&mut self, row: PublishedRoventRecordV2) -> Result<(), ArenaError> {
+        self.append_original(&row)
+    }
+    /// Caller는 실패한 원 PublishedRecord를 보존한다. 성공 뒤에만 caller가
+    /// 버리며 중복 게시 검사는 같은 writer의 원 record seal 집합이 수행한다.
+    pub(super) fn append_original(
+        &mut self,
+        row: &PublishedRoventRecordV2,
+    ) -> Result<(), ArenaError> {
         check(
             row.manifest_sha256 == self.original.index.manifest_sha256,
             "raw3 writer original manifest mismatch",
@@ -75,6 +87,29 @@ impl RoventCorpusWriterV2 {
         Ok(index)
     }
     pub fn finish_publication(self) -> Result<FinishedRoventCorpusV2, ArenaError> {
+        self.finish_publication_retaining()
+            .map_err(|rejected| rejected.failure)
+    }
+    pub(super) fn finish_publication_retaining(
+        self,
+    ) -> Result<FinishedRoventCorpusV2, Box<RoventWriterFinishFailureV2>> {
+        let index = match self.prepare_publication() {
+            Ok(index) => index,
+            Err(failure) => {
+                return Err(Box::new(RoventWriterFinishFailureV2 {
+                    failure,
+                    writer: self,
+                }));
+            }
+        };
+        Ok(FinishedRoventCorpusV2 {
+            manifest: self.manifest,
+            index,
+            admissions: self.original.admissions,
+            allocations: self.original.allocations,
+        })
+    }
+    fn prepare_publication(&self) -> Result<RoventCorpusIndexV2, ArenaError> {
         check(
             self.original.buffer.is_empty()
                 && !self.original.admissions.is_empty()
@@ -93,12 +128,7 @@ impl RoventCorpusWriterV2 {
                 "raw3 finished metadata cap",
             )?;
         }
-        Ok(FinishedRoventCorpusV2 {
-            manifest: self.manifest,
-            index,
-            admissions: self.original.admissions,
-            allocations: self.original.allocations,
-        })
+        Ok(index)
     }
 }
 

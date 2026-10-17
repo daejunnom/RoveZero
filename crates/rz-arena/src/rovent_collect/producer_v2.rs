@@ -102,6 +102,34 @@ impl RoventCorpusProducerV2 {
         let observed_sequence = self.original.next()?;
         divergence_owner::attach_actual_pc_divergence(row, witness, observed_sequence)
     }
+    /// 원 초기 입력과 미래 visible 입력의 실제 퇴역 custody를 함께 받는다.
+    /// 최초 입력의 counter=None과 당시 slot은 그대로 두고 target 출처만 잇는다.
+    pub fn attach_pc_divergence_from_visible(
+        &mut self,
+        row: &mut RoventRetiredRecordV2,
+        witness: &rz_search::pals::engine::pc_port::PcDivergenceWitness,
+        visible: &RoventRetiredRecordV2,
+    ) -> Result<(), ArenaError> {
+        check(
+            row.manifest_sha256 == self.original.manifest_sha256
+                && visible.manifest_sha256 == self.original.manifest_sha256
+                && row.admission.raw_sha256() == visible.admission.raw_sha256()
+                && std::sync::Arc::ptr_eq(
+                    row.admission.root_admission(),
+                    visible.admission.root_admission(),
+                ),
+            "future divergence rows belong to another original corpus/root owner",
+        )?;
+        self.validate_admission(&row.admission)?;
+        self.validate_admission(&visible.admission)?;
+        let observed_sequence = self.original.next()?;
+        divergence_owner::attach_actual_pc_divergence_from_visible(
+            row,
+            witness,
+            visible,
+            observed_sequence,
+        )
+    }
     #[cfg(feature = "pals-collection-onnx")]
     pub(super) fn original_teacher_producer(&self) -> &RoventCorpusProducer {
         &self.original
@@ -258,6 +286,16 @@ impl RoventCorpusProducerV2 {
         &self,
         mut row: RoventRetiredRecordV2,
     ) -> Result<PublishedRoventRecordV2, ArenaError> {
+        self.seal_retired(&mut row)?;
+        Ok(PublishedRoventRecordV2 {
+            record: row.record,
+            manifest_sha256: row.manifest_sha256,
+            admission: row.admission,
+        })
+    }
+    /// 실제 caller가 원 row를 보관한 상태로 게시 전 검증을 수행한다.
+    /// 이 계산만으로 PublishedRecord 또는 native 권한을 발급하지 않는다.
+    pub(super) fn seal_retired(&self, row: &mut RoventRetiredRecordV2) -> Result<(), ArenaError> {
         check(
             row.manifest_sha256 == self.original.manifest_sha256,
             "raw3 retired row belongs to another owner",
@@ -269,12 +307,7 @@ impl RoventCorpusProducerV2 {
                     == *row.admission.raw_receipt(),
             "raw3 row lost original admission",
         )?;
-        row.record.seal(&self.manifest)?;
-        Ok(PublishedRoventRecordV2 {
-            record: row.record,
-            manifest_sha256: row.manifest_sha256,
-            admission: row.admission,
-        })
+        row.record.seal(&self.manifest)
     }
     pub fn attach_actual_wdl(
         &mut self,

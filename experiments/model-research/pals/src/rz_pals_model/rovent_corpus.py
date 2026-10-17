@@ -603,7 +603,7 @@ def _head_sources(manifest, record, labels):
             # shape and causal chain. Do not skip those checks just because
             # it intentionally supplies no optimizer target.
             from .rovent_divergence_owner import validate_pc_divergence_head
-            validate_pc_divergence_head(record, source, label)
+            validate_pc_divergence_head(record, source, label, manifest=manifest)
         if label is None:
             continue
         if (source["raw_receipt_sha256"] != label["raw_evidence_sha256"]

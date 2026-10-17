@@ -1,12 +1,12 @@
 //! 새 submitted-input/1과 raw/3만 소비하는 명시 Rovent 자료 형식이다.
 //! 기존 manifest/index/record /1을 자동 변환하거나 재라벨하지 않는다.
+use crate::ManifestError;
 use crate::pals_data_v3::*;
 use crate::rovent_corpus::{
-    RoventCorpusChunk, RoventCorpusManifest, RoventCorpusOrigin, RoventHeadSource, RoventLineage,
-    RoventNativeLifecycle, RoventTeacherPin, HEAD_DOMAIN, MAX_CORPUS_ROWS, ORIGIN_DOMAIN,
+    HEAD_DOMAIN, MAX_CORPUS_ROWS, ORIGIN_DOMAIN, RoventCorpusChunk, RoventCorpusManifest,
+    RoventCorpusOrigin, RoventHeadSource, RoventLineage, RoventNativeLifecycle, RoventTeacherPin,
 };
 use crate::rovent_submitted_input::*;
-use crate::ManifestError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,6 +14,146 @@ fn exact_fields(value: &serde_json::Value, names: &[&str]) -> bool {
     value.as_object().is_some_and(|object| {
         object.len() == names.len() && names.iter().all(|name| object.contains_key(*name))
     })
+}
+
+/// Raw JSON spelling is sealed as a string outside the submitted-input f32
+/// domain. Decode once without silently overwriting duplicate nested keys.
+struct UniqueVisibleInputJson(serde_json::Value);
+impl<'de> Deserialize<'de> for UniqueVisibleInputJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueVisibleInputJson;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("bounded JSON without duplicate object keys")
+            }
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(UniqueVisibleInputJson(serde_json::Value::Bool(value)))
+            }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(UniqueVisibleInputJson(serde_json::Value::Number(
+                    value.into(),
+                )))
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(UniqueVisibleInputJson(serde_json::Value::Number(
+                    value.into(),
+                )))
+            }
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                let number = serde_json::Number::from_f64(value)
+                    .ok_or_else(|| E::custom("non-finite original visible JSON number"))?;
+                Ok(UniqueVisibleInputJson(serde_json::Value::Number(number)))
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(UniqueVisibleInputJson(serde_json::Value::String(
+                    value.into(),
+                )))
+            }
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(UniqueVisibleInputJson(serde_json::Value::String(value)))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(UniqueVisibleInputJson(serde_json::Value::Null))
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(value) = seq.next_element::<UniqueVisibleInputJson>()? {
+                    out.push(value.0);
+                }
+                Ok(UniqueVisibleInputJson(serde_json::Value::Array(out)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if out.contains_key(&key) {
+                        return Err(serde::de::Error::custom(
+                            "duplicate original visible input JSON key",
+                        ));
+                    }
+                    let value = map.next_value::<UniqueVisibleInputJson>()?;
+                    out.insert(key, value.0);
+                }
+                Ok(UniqueVisibleInputJson(serde_json::Value::Object(out)))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// The returned input is a pure decoded value. The caller keeps the unchanged
+/// original UTF-8 string in its outer receipt; this function issues no authority.
+pub fn parse_rovent_visible_input_json(
+    value: &str,
+) -> Result<RoventSubmittedInputV1, ManifestError> {
+    ensure(
+        !value.is_empty() && value.len() <= GENERATION_MAX_ROW_BYTES,
+        "bounded original visible input JSON string",
+    )?;
+    let decoded: UniqueVisibleInputJson = serde_json::from_str(value)
+        .map_err(|e| ManifestError::Integrity(format!("original visible input JSON: {e}")))?;
+    let input: RoventSubmittedInputV1 =
+        serde_json::from_value(decoded.0).map_err(|e| ManifestError::Integrity(e.to_string()))?;
+    input.validate()?;
+    Ok(input)
+}
+
+#[cfg(test)]
+mod visible_input_json_tests {
+    use super::*;
+
+    #[test]
+    fn nested_and_escaped_duplicate_keys_are_not_overwritten() {
+        for raw in [
+            r#"{"encoded":{"metadata":[{"x":1,"x":2}]}}"#,
+            r#"{"encoded":{"\u0078":1,"x":2}}"#,
+        ] {
+            let error = serde_json::from_str::<UniqueVisibleInputJson>(raw)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("duplicate original visible input JSON key"));
+        }
+    }
+    #[test]
+    fn original_json_decoder_rejects_trailing_documents_and_nonfinite_numbers() {
+        for raw in [r#"{"x":1}{"x":2}"#, r#"{"x":NaN}"#, r#"{"x":1e9999}"#] {
+            assert!(serde_json::from_str::<UniqueVisibleInputJson>(raw).is_err());
+        }
+    }
+    #[test]
+    fn original_json_decoder_keeps_utf8_integer_and_negative_zero_values() {
+        let decoded: UniqueVisibleInputJson =
+            serde_json::from_str(r#"{"text":"검토","integer":18446744073709551615,"value":-0.0}"#)
+                .unwrap();
+        assert_eq!(decoded.0["text"], "검토");
+        assert_eq!(decoded.0["integer"].as_u64(), Some(u64::MAX));
+        assert_eq!(
+            decoded.0["value"].as_f64().unwrap().to_bits(),
+            (-0.0f64).to_bits()
+        );
+    }
+    #[test]
+    fn visible_input_json_is_bounded_before_decode() {
+        for raw in [String::new(), " ".repeat(GENERATION_MAX_ROW_BYTES + 1)] {
+            assert!(
+                parse_rovent_visible_input_json(&raw)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("bounded original visible input JSON string")
+            );
+        }
+    }
 }
 
 impl RoventNativeLifecycle {
@@ -679,13 +819,144 @@ fn wdl_expectation(endpoint: &serde_json::Value) -> Result<f32, ManifestError> {
     Ok(wdl[0] - wdl[2])
 }
 
+fn divergence_visible_source(source: &serde_json::Value) -> &serde_json::Value {
+    if source["schema"] == "rz-rovent-pc-divergence-source-with-attack/1" {
+        &source["visible_source"]
+    } else {
+        source
+    }
+}
+
+fn validate_divergence_source_roster<'a>(
+    row: &RoventTrainingRecordV2,
+    raw: &'a serde_json::Value,
+    observed_sequence: u64,
+) -> Result<&'a serde_json::Value, ManifestError> {
+    let source = divergence_visible_source(raw);
+    let expected_native = if raw["schema"] == "rz-rovent-pc-divergence-source-with-attack/1" {
+        let attack = &raw["attack_ranked_source"];
+        let evidence = &raw["visible_record_evidence"];
+        ensure(
+            exact_fields(
+                raw,
+                &[
+                    "schema",
+                    "native_source_sha256",
+                    "visible_source",
+                    "visible_source_sequence",
+                    "attack_ranked_source",
+                    "visible_record_evidence",
+                ],
+            ) && raw["native_source_sha256"]
+                .as_str()
+                .is_some_and(generation_sha)
+                && exact_fields(
+                    attack,
+                    &[
+                        "schema",
+                        "native_attack_sha256",
+                        "accepted",
+                        "root_budget_sha256",
+                        "source_sequence",
+                        "divergence_index",
+                        "divergence_ply",
+                        "first_move",
+                        "proposal",
+                        "perspective",
+                    ],
+                )
+                && attack["schema"] == "rz-rovent-pc-attack-ranked-source/1"
+                && attack["native_attack_sha256"]
+                    .as_str()
+                    .is_some_and(generation_sha)
+                && attack["source_sequence"].as_u64().is_some_and(|v| v > 0)
+                && raw["visible_source_sequence"]
+                    .as_u64()
+                    .zip(attack["source_sequence"].as_u64())
+                    .is_some_and(|(visible, initial)| initial < visible)
+                && attack["accepted"]["ticket"] == row.native.raw_submission["ticket"]
+                && attack["accepted"]["output_digest"] == row.native.output_digest
+                && exact_fields(evidence, &["input_json", "input_sha256", "native"]),
+            "new initial attack explicit original/future source projection roster",
+        )?;
+        let input =
+            parse_rovent_visible_input_json(evidence["input_json"].as_str().ok_or_else(|| {
+                ManifestError::Integrity("original visible input JSON string required".into())
+            })?)?;
+        let native: RoventNativeLifecycle = serde_json::from_value(evidence["native"].clone())
+            .map_err(|e| ManifestError::Integrity(e.to_string()))?;
+        input.validate()?;
+        ensure(
+            evidence["input_sha256"] == input.sha256()?
+                && input.role == GenerationRoleV3::Critic
+                && native.head == "critic"
+                && native.submitted_sequence == input.capture_sequence
+                && row.input.capture_sequence < input.capture_sequence
+                && observed_sequence >= native.retired_sequence
+                && native.raw_submission["ticket"]["question_digest"] == input.question_id
+                && input.game_id == row.input.game_id
+                && input.opening_id == row.input.opening_id
+                && input.actual_history == row.input.actual_history
+                && input.rules_anchor == row.input.rules_anchor
+                && input.model_epoch == row.input.model_epoch
+                && input.context_epoch == row.input.context_epoch
+                && native.raw_retirement["root_admission"]
+                    == row.native.raw_retirement["root_admission"],
+            "new future visible original submitted seal/root scope",
+        )?;
+        Some(&evidence["native"])
+    } else {
+        // The absent-attack source has no schema discriminator and retains its
+        // original exact roster and native source digest unchanged.
+        None
+    };
+    let (ticket, output) = if let Some(expected_native) = expected_native {
+        (
+            &expected_native["raw_submission"]["ticket"],
+            expected_native["output_digest"].clone(),
+        )
+    } else {
+        (
+            &row.native.raw_submission["ticket"],
+            serde_json::Value::String(row.native.output_digest.clone()),
+        )
+    };
+    ensure(
+        exact_fields(
+            source,
+            &[
+                "native_source_sha256",
+                "accepted",
+                "root_budget_sha256",
+                "counter_local_index",
+                "counter_revision",
+                "divergence_index",
+                "divergence_ply",
+                "first_move",
+                "proposal",
+                "counter",
+                "perspective",
+            ],
+        ) && source["native_source_sha256"]
+            .as_str()
+            .is_some_and(generation_sha)
+            && source["root_budget_sha256"]
+                == row.native.raw_retirement["root_admission"]["root_budget_sha256"]
+            && source["accepted"]["ticket"] == *ticket
+            && source["accepted"]["output_digest"] == output,
+        "new divergence original visible source exact roster/input/output scope",
+    )?;
+    Ok(source)
+}
+
 fn validate_divergence_roster(
     row: &RoventTrainingRecordV2,
     head: &RoventHeadSource,
 ) -> Result<(), ManifestError> {
     let raw = &head.raw_receipt;
     let witness = &raw["witness"];
-    let source = &witness["source"];
+    let source =
+        validate_divergence_source_roster(row, &witness["source"], head.observed_sequence)?;
     ensure(
         exact_fields(
             raw,
@@ -734,30 +1005,7 @@ fn validate_divergence_roster(
             && witness["reason"].as_str().is_some_and(|value| {
                 !value.is_empty() && value.len() <= 4096 && !value.chars().any(char::is_control)
             })
-            && witness["target_known"].is_boolean()
-            && exact_fields(
-                source,
-                &[
-                    "native_source_sha256",
-                    "accepted",
-                    "root_budget_sha256",
-                    "counter_local_index",
-                    "counter_revision",
-                    "divergence_index",
-                    "divergence_ply",
-                    "first_move",
-                    "proposal",
-                    "counter",
-                    "perspective",
-                ],
-            )
-            && source["native_source_sha256"]
-                .as_str()
-                .is_some_and(generation_sha)
-            && source["root_budget_sha256"]
-                == row.native.raw_retirement["root_admission"]["root_budget_sha256"]
-            && source["accepted"]["ticket"] == row.native.raw_submission["ticket"]
-            && source["accepted"]["output_digest"] == row.native.output_digest,
+            && witness["target_known"].is_boolean(),
         "new divergence exact original raw owner roster/input/output scope",
     )?;
     for (key, endpoint) in [
@@ -801,6 +1049,7 @@ fn validate_divergence_roster(
     }
     for fact in [
         &source["accepted"],
+        &witness["source"]["attack_ranked_source"]["accepted"],
         &witness["repair"]["accepted"],
         &witness["recheck"]["accepted"],
         &witness["repaired_endpoint"]["accepted"],
@@ -840,7 +1089,12 @@ pub fn validate_divergence_raw(
     validate_divergence_roster(row, head)?;
     let raw = &head.raw_receipt;
     let witness = &raw["witness"];
-    let source = &witness["source"];
+    let source = divergence_visible_source(&witness["source"]);
+    let attack = if witness["source"]["schema"] == "rz-rovent-pc-divergence-source-with-attack/1" {
+        Some(&witness["source"]["attack_ranked_source"])
+    } else {
+        None
+    };
     let counter_ticket = &source["accepted"]["ticket"];
     ensure(
         exact_fields(
@@ -876,14 +1130,31 @@ pub fn validate_divergence_raw(
         "actual divergence source counter namespace and accepted Repair",
     )?;
     let original = &row.native.raw_submission["ticket"];
-    ensure(
-        counter_ticket == original
-            && source["divergence_index"].as_u64() == Some(u64::from(target.slot))
-            && row.input.attack_mapping[usize::from(target.slot)]
-                .selected_counter_local_index
-                .is_some(),
-        "MissingOriginalAttackSource: no capability may insert a future counter into a past input",
-    )?;
+    if let Some(attack) = attack {
+        ensure(
+            attack["accepted"]["ticket"] == *original
+                && attack["divergence_index"].as_u64() == Some(u64::from(target.slot))
+                && attack["divergence_ply"].as_u64() == Some(u64::from(target.attack_ply))
+                && row.input.attack_mapping[usize::from(target.slot)]
+                    .selected_counter_local_index
+                    .is_none()
+                && !row.input.selected_view.query.counter_present
+                && original["request_sequence"]
+                    .as_u64()
+                    .zip(counter_ticket["request_sequence"].as_u64())
+                    .is_some_and(|(initial, visible)| initial < visible),
+            "known initial attack requires its original no-counter slot and future visible owner",
+        )?;
+    } else {
+        ensure(
+            counter_ticket == original
+                && source["divergence_index"].as_u64() == Some(u64::from(target.slot))
+                && row.input.attack_mapping[usize::from(target.slot)]
+                    .selected_counter_local_index
+                    .is_some(),
+            "MissingOriginalAttackSource: no capability may insert a future counter into a past input",
+        )?;
+    }
     let repair = &witness["repaired_endpoint"];
     let counter = &witness["counter_endpoint"];
     ensure(
@@ -921,7 +1192,9 @@ pub fn validate_divergence_raw(
             && pair["perspective"] == source["perspective"],
         "complete frozen pair seal fields",
     )?;
-    let mut previous = row.native.request_sequence;
+    let mut previous = counter_ticket["request_sequence"].as_u64().ok_or_else(|| {
+        ManifestError::Integrity("original visible source request sequence".into())
+    })?;
     for (fact, role) in [
         (&witness["repair"], "proposer"),
         (&witness["recheck"], "critic"),

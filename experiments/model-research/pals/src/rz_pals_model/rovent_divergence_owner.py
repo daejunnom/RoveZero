@@ -16,6 +16,8 @@ from .generation_data import fields, sha, uint, _moves
 
 HEAD_DOMAIN = "rz-rovent-head-source/1"
 WITNESS_DOMAIN = "rz-rovent-pc-divergence-witness/1"
+ATTACK_DOMAIN = "rz-rovent-pc-attack-ranked-source/1"
+ATTACK_SOURCE_DOMAIN = "rz-rovent-pc-divergence-source-with-attack/1"
 SOURCE_NAME = "rovent_actual_pc_divergence"
 _TICKET_FIELDS = ("process_epoch", "game_generation", "root_generation", "request_sequence", "implementation_sha256",
     "question_digest", "view_sequence", "view_digest", "context_policy", "actual_tokens", "selected_records", "anchors",
@@ -293,6 +295,80 @@ def _source(record, value):
     return ticket
 
 
+def _attack_source(record, value, visible, visible_ticket):
+    fields(value, ("schema", "native_attack_sha256", "accepted", "source_sequence", "root_budget_sha256", "divergence_index",
+        "divergence_ply", "first_move", "proposal", "perspective"), "P/C witness original attack ranking")
+    snapshot, native = record["input"], record["native"]
+    original = native["raw_submission"]["ticket"]
+    budget = native["raw_retirement"]["root_admission"]["root_budget_sha256"]
+    ticket = _check_origin(value["accepted"], original, role="critic", root_budget=budget)
+    _positive(value["source_sequence"])
+    slot, attack = uint(value["divergence_index"], 65535), uint(value["divergence_ply"], 255)
+    _moves([value["first_move"]], 1)
+    proposal = value["proposal"]
+    framed_line = _line(proposal)
+    query = snapshot["selected_view"]["query"]
+    if (value["schema"] != ATTACK_DOMAIN or ticket != original or record["role"] != "critic"
+            or value["accepted"]["output_digest"] != native["output_digest"]
+            or value["root_budget_sha256"] != budget or budget != visible["root_budget_sha256"]
+            or not _same_scope(ticket, visible_ticket) or not _same_model(ticket, visible_ticket)
+            or ticket["request_sequence"] >= visible_ticket["request_sequence"]
+            or slot >= len(snapshot["attack_mapping"]) or not 0 < attack < len(proposal)
+            or query["purpose"] != "divergence_policy" or query["prefix"]
+            or query["counter_present"] is not False or query["counter"]
+            or query["proposal"] != proposal or proposal[0] != value["first_move"]
+            or proposal != visible["proposal"] or attack != visible["divergence_ply"]
+            or visible["counter"][:attack] != proposal[:attack] or visible["counter"][attack] == proposal[attack]
+            or value["first_move"] != visible["first_move"] or value["perspective"] != visible["perspective"]
+            or value["perspective"] != ("white" if snapshot["rules_anchor"]["white_to_move"] else "black")):
+        raise ValueError("P/C witness initial attack changed its original input or future visible chronology/scope")
+    mapping = snapshot["attack_mapping"][slot]
+    if (mapping["slot"] != slot or mapping["attack_ply"] != attack
+            or mapping["selected_counter_local_index"] is not None or mapping["selected_counter_revision"] is not None):
+        raise ValueError("P/C witness initial attack cannot contain a future selected counter")
+    bits = native["raw_completion"]["output"]["payload"]["divergence_logits_bits"]
+    _float_bits(bits, len(snapshot["attack_mapping"]))
+    if not bits or max(range(len(bits)), key=lambda index: (_total_f32_key(bits[index]), -index)) != slot:
+        raise ValueError("P/C witness initial attack slot is not the original finite FP32 selected head")
+    framed = _bytes(value["accepted"]["seal_sha256"]) + _bytes(budget)
+    framed += _u(slot, 2) + _u(attack) + _u(value["first_move"], 2) + framed_line
+    _seal(ATTACK_DOMAIN, framed, value["native_attack_sha256"])
+    return ticket
+
+
+def _source_context(record, value, manifest):
+    if type(value) is not dict or "schema" not in value:
+        return _source(record, value), value
+    fields(value, ("schema", "native_source_sha256", "visible_source", "visible_source_sequence", "attack_ranked_source", "visible_record_evidence"),
+           "P/C witness source with original attack ranking")
+    if value["schema"] != ATTACK_SOURCE_DOMAIN or manifest is None:
+        raise ValueError("P/C witness original attack source requires its explicit corpus and future invocation evidence")
+    from .rovent_native_v3 import validate_native_v3_evidence
+    evidence = value["visible_record_evidence"]
+    future = validate_native_v3_evidence(manifest, evidence)
+    visible = value["visible_source"]
+    visible_ticket = _source(future, visible)
+    initial, later = record["input"], future["input"]
+    if (any(initial[key] != later[key] for key in ("game_id", "opening_id", "model_epoch", "context_epoch",
+                                                  "rules_anchor", "actual_history"))
+            or initial["capture_sequence"] >= later["capture_sequence"]
+            or record["native"]["source_sha256"] != evidence["native"]["source_sha256"]
+            or record["native"]["raw_retirement"]["root_admission"] !=
+                evidence["native"]["raw_retirement"]["root_admission"]):
+        raise ValueError("P/C witness future visible evidence crossed its original root/source/input chronology")
+    attack = value["attack_ranked_source"]
+    _attack_source(record, attack, visible, visible_ticket)
+    if _positive(attack["source_sequence"]) >= _positive(value["visible_source_sequence"]):
+        raise ValueError("P/C witness original question-source issuance chronology differs")
+    framed = _bytes(visible["native_source_sha256"]) + _bytes(attack["native_attack_sha256"])
+    framed += _u(value["visible_source_sequence"]) + _u(attack["source_sequence"])
+    _seal(ATTACK_SOURCE_DOMAIN, framed,
+          value["native_source_sha256"])
+    # Repair/C/Fresh scope and conditional comparison use the visible question.
+    # Only the witness source digest gains the original attack causal binding.
+    return visible_ticket, {**visible, "native_source_sha256": value["native_source_sha256"]}
+
+
 def _accepted_line(value, original, budget, kind):
     fields(value, ("native_line_sha256", "accepted", "line_id", "observation_id", "revision", "kind", "moves"),
            "P/C witness actual accepted line")
@@ -370,7 +446,7 @@ def _endpoint(value, original, budget, source, loaded):
     return ticket
 
 
-def _witness(record, value):
+def _witness(record, value, manifest=None):
     fields(value, ("schema", "native_witness_sha256", "native_hash_kind", "event_sequence", "reason", "resolution",
         "target_known", "source", "repair", "recheck", "repaired_endpoint", "counter_endpoint"),
         "P/C witness original causal evidence")
@@ -380,8 +456,7 @@ def _witness(record, value):
         raise ValueError("P/C witness typed resolution/known mask differs")
     sequence = uint(value["event_sequence"])
     reason = _text(value["reason"], 4096).encode("utf-8")
-    source = value["source"]
-    original = _source(record, source)
+    original, source = _source_context(record, value["source"], manifest)
     budget = source["root_budget_sha256"]
     facts = ("repair", "recheck", "repaired_endpoint", "counter_endpoint")
     for key, kind in (("repair", "repair"), ("recheck", "counterexample")):
@@ -436,7 +511,7 @@ def _witness(record, value):
     return value
 
 
-def validate_pc_divergence_head(record, source, label):
+def validate_pc_divergence_head(record, source, label, *, manifest=None):
     """Validate exact persisted evidence; returns no live or Rules capability."""
     from .rovent_divergence import divergence_target
     from .rovent_submitted_input import INPUT_DOMAIN, validate_input
@@ -459,16 +534,20 @@ def validate_pc_divergence_head(record, source, label):
             or raw["observed_sequence"] < snapshot["capture_sequence"]
             or sha(source["raw_receipt_sha256"]) != digest(HEAD_DOMAIN, raw)):
         raise ValueError("P/C divergence source changed original input/anchor/collector chronology or raw seal")
-    witness = _witness(record, raw["witness"])
+    witness = _witness(record, raw["witness"], manifest)
+    wrapped = witness["source"].get("schema") == ATTACK_SOURCE_DOMAIN
+    if wrapped and raw["observed_sequence"] < witness["source"]["visible_record_evidence"]["native"]["retired_sequence"]:
+        raise ValueError("P/C divergence collector receipt precedes its future visible retirement")
     if label is None:
         return witness
     divergence_target(snapshot, label)
-    counter = witness["source"]
-    mapping = snapshot["attack_mapping"][counter["divergence_index"]]
-    if (not witness["target_known"] or mapping["selected_counter_local_index"] is None
+    counter = witness["source"]["visible_source"] if wrapped else witness["source"]
+    attack = witness["source"]["attack_ranked_source"] if wrapped else counter
+    mapping = snapshot["attack_mapping"][attack["divergence_index"]]
+    if (not witness["target_known"] or not wrapped and mapping["selected_counter_local_index"] is None
             or label["raw_evidence_sha256"] != source["raw_receipt_sha256"]
             or label["observed_sequence"] != raw["observed_sequence"]
-            or label["slot"] != counter["divergence_index"] or label["attack_ply"] != counter["divergence_ply"]
+            or label["slot"] != attack["divergence_index"] or label["attack_ply"] != attack["divergence_ply"]
             or label["counter_question_id"] != counter["accepted"]["ticket"]["question_digest"]
             or label["counter_native_view_sha256"] != counter["accepted"]["ticket"]["view_digest"]
             or label["counter_local_index"] != counter["counter_local_index"]

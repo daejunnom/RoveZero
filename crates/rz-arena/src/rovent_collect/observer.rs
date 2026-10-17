@@ -127,7 +127,8 @@ impl CollectionProducerFamily {
 
 /// 실제 수집 실행에서 사전 등록한 식별자다. 이 값만으로 native·교사·학습
 /// 권한을 발급하지 않으며, 원 root admission과 실제 ticket을 추가로 요구한다.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoventCollectionMetadata {
     pub game_id: String,
     pub opening_id: String,
@@ -230,6 +231,28 @@ impl RoventCollectionOwnerV2 {
     }
     pub fn failure(&self) -> Result<Option<AdaptiveCollectionError>, ArenaError> {
         self.original.failure()
+    }
+    /// 실제 observer.admitted가 보존한 같은 cap을 빌린다. 원 cap이 아직
+    /// 없는 경우 metadata에서 admission을 만들지 않고 None을 반환한다.
+    pub fn current_admission(&self) -> Result<Option<RoventCollectionRootAdmission>, ArenaError> {
+        Ok(self
+            .original
+            .state
+            .lock()
+            .map_err(|_| invalid("submitted-input collection owner poisoned"))?
+            .admission
+            .clone())
+    }
+    /// 원 manager outbox의 남은 실제 row 수다. 이 값은 퇴역/수락이나 빈
+    /// 성공 row를 만들지 않으며 caller의 종료 전 전수 회수 검사에만 쓴다.
+    pub fn pending_retired_count(&self) -> Result<usize, ArenaError> {
+        Ok(self
+            .original
+            .state
+            .lock()
+            .map_err(|_| invalid("submitted-input collection owner poisoned"))?
+            .retired
+            .len())
     }
 }
 
