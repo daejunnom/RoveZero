@@ -125,7 +125,7 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
             .map(|m| {
                 let first = m
                     .original_first_move
-                    .map(|v| Move16::pack(v).map(|v| v.bits()))
+                    .map(|v| rz_contracts::Move::try_from(v).map(|v| Move16::encode(v).bits()))
                     .transpose()
                     .map_err(|e| super::AdaptiveManagerError::Semantic(e.to_string()))?;
                 Ok(
@@ -252,7 +252,7 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
                     "record_scope_sha256":hex(rz_contracts::Digest(p.record_scope_digest)),"policy_sha256":hex(rz_contracts::Digest(p.policy_digest)),"model":p.model}}),
             action: json!({"authority":authority(semantic.id().authority()),"frame_sequence":semantic.id().frame().sequence,
                 "question_sha256":hex(semantic.id().question()),"root_budget_sha256":hex(semantic.root_budget()),
-                "original_first_move":Move16::pack(semantic.original_first_move()).map_err(|e|super::AdaptiveManagerError::Semantic(e.to_string()))?.bits(),
+                "original_first_move":Move16::encode(rz_contracts::Move::try_from(semantic.original_first_move()).map_err(|e|super::AdaptiveManagerError::Semantic(e.to_string()))?).bits(),
                 "deadline_clock":semantic.original_deadline().clock.0.0,"deadline_tick":semantic.original_deadline().at.0,
                 "frozen_context_sha256":hex(semantic.frozen_context_digest()),"cost_epoch_sha256":hex(self.cost_epoch()),
                 "cost_scope":UTILITY_COHORT_COST_SCOPE}),
@@ -335,8 +335,8 @@ fn rules(p: &rz_position::PositionSnapshot) -> Result<Value, super::AdaptiveMana
 fn moves(v: &[rz_position::BoardMove]) -> Result<Vec<u16>, super::AdaptiveManagerError> {
     v.iter()
         .map(|m| {
-            Move16::pack(*m)
-                .map(|v| v.bits())
+            rz_contracts::Move::try_from(*m)
+                .map(|v| Move16::encode(v).bits())
                 .map_err(|e| super::AdaptiveManagerError::Semantic(e.to_string()))
         })
         .collect()

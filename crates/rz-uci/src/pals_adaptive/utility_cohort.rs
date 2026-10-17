@@ -465,9 +465,11 @@ impl<Q> UtilityTrialAdmission<Q> {
                 root_rules_sha256: hex(rz_position::contracts::rules_snapshot_semantic_digest(
                     input.root_snapshot(),
                 )),
-                original_first_move: rz_contracts::pals::Move16::pack(input.original_first_move())
-                    .map_err(|e| AdaptiveManagerError::Semantic(e.to_string()))?
-                    .bits(),
+                original_first_move: rz_contracts::pals::Move16::encode(
+                    rz_contracts::Move::try_from(input.original_first_move())
+                        .map_err(|e| AdaptiveManagerError::Semantic(e.to_string()))?,
+                )
+                .bits(),
                 first_trial_sequence: self.sequence,
             };
             let mut state = self

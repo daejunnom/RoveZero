@@ -90,7 +90,7 @@ mod cleanup;
 mod collection;
 mod cpu_semantic;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-pub mod utility_cohort;
+mod utility_cohort;
 mod utility_route;
 pub use cpu_semantic::{
     AdaptiveCpuCaptureCustody, AdaptiveCpuCapturePlan, AdaptiveCpuSemanticObserver,
