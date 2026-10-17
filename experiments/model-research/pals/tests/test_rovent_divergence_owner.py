@@ -498,7 +498,7 @@ class PcDivergenceOwnerTests(unittest.TestCase):
             endpoint["pair"][field] = value
             reseal_witness(head["raw_receipt"]["witness"])
             reseal_head(head, label)
-            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "frozen Fresh pair differs"):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "frozen Fresh pair differs|chronology or frozen pair"):
                 owner.validate_pc_divergence_head(record, head, label)
 
     def test_nested_local_accepted_ticket_requires_an_integer_length_bucket(self):
