@@ -75,6 +75,9 @@ impl RetainedProfiledCommit {
 fn profile_error(error: PalsError) -> AdaptiveManagerError {
     match error {
         PalsError::Checker(error) => AdaptiveManagerError::ProfiledExternal(error),
+        PalsError::Capacity => {
+            AdaptiveManagerError::Capacity("profiled external retained questions")
+        }
         other => semantic(other),
     }
 }

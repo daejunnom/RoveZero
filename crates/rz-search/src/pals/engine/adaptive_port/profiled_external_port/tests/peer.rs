@@ -467,3 +467,160 @@ fn authored_worker_optional_peer_r_returns_to_original_accepted_parent() {
         .unwrap();
     assert_eq!(retirement.retained_questions(), 2);
 }
+
+#[test]
+fn authored_worker_published_closed_source_survives_next_preparation_until_retirement() {
+    let _serial = EXTERNAL_FIXTURE_LOCK.lock().unwrap();
+    let mut fixture = AuthoredWorkerFixture::new(Duration::from_secs(20), false);
+    let original = fixture.work(1);
+    let (admitted, packet) = fixture.dispatch(&original, 1);
+    let published = fixture
+        .port
+        .commit_profiled_external(
+            &original,
+            &fixture.source,
+            admitted.reservation,
+            &packet,
+            false,
+        )
+        .unwrap();
+    assert!(!published.consumed);
+    let question = original.input.question_digest;
+    let retained = &fixture.port.profiled_external.entries[&question];
+    assert!(retained.terminal && retained.accounted);
+    assert_eq!(retained.published, Some(published.observation));
+    assert!(retained.consumed.is_none());
+    assert!(Arc::ptr_eq(retained.completion.as_ref().unwrap(), &packet));
+    let execution = retained.execution;
+    let original_dispatch = retained.dispatch.as_ref().unwrap().clone();
+
+    // Semantic branch closure is not a durable packet/view retirement ACK.
+    // An explicit Unknown closes the branch without inventing P/C acceptance,
+    // completed native depth, a mate proof, or a refinement completion scope.
+    fixture
+        .port
+        .publish_closed(&crate::pals::coordinator::ClosedFrame {
+            id: original.frame,
+            original_first_move: original.original_first_move,
+            evidence: Vec::new(),
+            unknown: Some("authored fixture branch closure without refinement proof"),
+            completion_scope: None,
+        })
+        .unwrap();
+    assert!(fixture.port.closed.contains(&original.frame));
+    assert!(!fixture.port.profiled_external.retirement_issued);
+
+    // One actual worker packet suffices: the next question is prepared only,
+    // not submitted. No additional worker run or synthetic admission rows are
+    // needed to expose the old terminal+published+closed retain predicate.
+    let next = fixture.work(2);
+    assert_ne!(next.input.question_digest, question);
+    let prepared = fixture
+        .port
+        .prepare_profiled_external(
+            &next,
+            &fixture.config,
+            &fixture.source,
+            ReciprocalQuestionId {
+                authority: fixture.port.authority,
+                sequence: 2,
+            },
+            rz_contracts::ExecutionId::new(fixture.port.authority.epoch, 2),
+            ExternalGoConstraint::Nodes { reported_nodes: 16 },
+            Duration::from_millis(100),
+            CompletionSignal::default(),
+            fixture.clock.domain(),
+            fixture.clock.now().unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        prepared,
+        AdaptiveProfiledExternalPreparation::Ready(_)
+    ));
+    assert_eq!(fixture.port.profiled_external.entries.len(), 2);
+    let retained = &fixture.port.profiled_external.entries[&question];
+    assert!(retained.matches(&original));
+    assert!(retained.source.same_source(&fixture.source));
+    assert!(Arc::ptr_eq(
+        &retained.work.input.question,
+        &original.input.question
+    ));
+    assert!(Arc::ptr_eq(&retained.work.input.view, &original.input.view));
+    assert!(Arc::ptr_eq(retained.completion.as_ref().unwrap(), &packet));
+    assert_eq!(retained.execution, execution);
+    assert_eq!(retained.reservation, Some(admitted.reservation));
+    assert_eq!(retained.published, Some(published.observation));
+    let dispatch = retained.dispatch.as_ref().unwrap();
+    assert!(packet.matches_submission(dispatch));
+    assert_eq!(dispatch.question(), original_dispatch.question());
+    assert_eq!(dispatch.scope(), original_dispatch.scope());
+    assert_eq!(
+        dispatch.process_identity(),
+        original_dispatch.process_identity()
+    );
+    assert_eq!(dispatch.constraint(), original_dispatch.constraint());
+    assert_eq!(
+        dispatch.root_restriction(),
+        original_dispatch.root_restriction()
+    );
+    assert_eq!(
+        fixture
+            .port
+            .engine
+            .semantic
+            .stores
+            .tasks
+            .get(execution)
+            .unwrap()
+            .status,
+        TaskStatus::Failed
+    );
+    assert!(
+        fixture
+            .port
+            .engine
+            .semantic
+            .stores
+            .observations
+            .get(published.observation)
+            .is_ok()
+    );
+    assert_eq!(fixture.port.counters.external_checker_tasks, 1);
+    assert_eq!(fixture.port.counters.external_checker_reports, 1);
+    assert_eq!(fixture.port.counters.consumed_external_checker_tasks, 0);
+    assert_eq!(fixture.port.counters.cpu_nodes, 0);
+    assert_eq!(fixture.port.counters.role_calls, 0);
+
+    // A definite rejection settles the unsubmitted task without fabricating a
+    // second completion. The actual root drain then transfers both original
+    // rows into move-only retirement custody rather than dropping the first.
+    fixture.port.reject_profiled_external(&next).unwrap();
+    let fence = fixture.quiesce();
+    let retirement = fixture
+        .port
+        .release_profiled_external_root(&fixture.source, &fence)
+        .unwrap();
+    assert_eq!(retirement.retained_questions(), 2);
+    let retired = retirement
+        .packets()
+        .find(|retired| retired.work().frame == original.frame)
+        .unwrap();
+    assert!(Arc::ptr_eq(retired.completion().unwrap(), &packet));
+    assert!(Arc::ptr_eq(
+        &retired.work().input.question,
+        &original.input.question
+    ));
+    assert!(Arc::ptr_eq(
+        &retired.work().input.view,
+        &original.input.view
+    ));
+    assert_eq!(retired.observation(), Some(published.observation));
+    assert!(!retired.search_consumed());
+    assert!(
+        retirement
+            .protected_pins()
+            .unwrap()
+            .executions
+            .contains(&execution)
+    );
+}

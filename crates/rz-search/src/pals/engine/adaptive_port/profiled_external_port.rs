@@ -21,6 +21,15 @@ use rz_contracts::{ClockDomain, MonotonicTick};
 use rz_runtime::{CompletionSignal, adaptive::ControlMailbox};
 
 const PROFILED_QUESTION_CAPACITY: usize = 64;
+fn reserve_profiled_question_slot<T>(
+    entries: &mut HashMap<ContractDigest, T>,
+) -> Result<(), PalsError> {
+    if entries.len() >= PROFILED_QUESTION_CAPACITY {
+        return Err(PalsError::Capacity);
+    }
+    entries.try_reserve(1).map_err(|_| PalsError::Capacity)
+}
+
 fn profiled_question_hex(digest: ContractDigest) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(64);
@@ -558,19 +567,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 original.job.clone(),
             ));
         }
-        self.profiled_external.entries.retain(|question, old| {
-            !old.terminal
-                || (old.dispatch.is_some() && old.published.is_none())
-                || (!self.closed.contains(&old.work.frame)
-                    && (old.work.frame != work.frame || *question == work.input.question_digest))
-        });
-        if self.profiled_external.entries.len() >= PROFILED_QUESTION_CAPACITY {
-            return Err(PalsError::Capacity);
-        }
-        self.profiled_external
-            .entries
-            .try_reserve(1)
-            .map_err(|_| PalsError::Capacity)?;
+        // A hot observation and a closed semantic frame do not acknowledge
+        // durable retirement of the original Work/view/dispatch/packet. Keep
+        // every row until the whole-root retirement reaches its actual sink
+        // acknowledgement. A long root exhausts this finite bound instead of
+        // silently dropping evidence or renewing its allowance.
+        reserve_profiled_question_slot(&mut self.profiled_external.entries)?;
         self.with_rovent_frontier(|frontier, _| {
             frontier.preflight_external_dispatch(source, clock, now)
         })?

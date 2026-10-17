@@ -10,9 +10,11 @@ use crate::cpu_checker::{
 };
 use crate::external_cpu::worker::ExternalWorkerClock;
 use crate::external_cpu::{
-    EXTERNAL_FIXTURE_LOCK, ExternalEngineProfile, ExternalEngineResources, ProfiledExternalWorker,
+    EXTERNAL_FIXTURE_LOCK, ExternalEngineProfile, ExternalEngineResources, ExternalUciCpuChecker,
+    ProfiledExternalWorker,
 };
 use crate::pals::coordinator::{FrameId, FrameTransition};
+use crate::pals::engine::{PostRepairRecheckPolicy, ResearcherSemanticProfile, ResolverPolicy};
 use crate::pals::review_context::{ReviewIndexLimits, ReviewSelectionPolicy};
 use crate::pals::rovent_engine::RootMoveDomain;
 use crate::pals::rovent_frontier::{FrontierLimits, FrontierRegistration};
@@ -304,24 +306,20 @@ fn first_two_allowed_cpus() -> String {
 }
 
 /// Metadata only: any accidental manager-side CPU execution fails immediately.
-struct MetadataChecker(CheckerIdentity);
+struct MetadataChecker {
+    identity: CheckerIdentity,
+    conditions: String,
+    capabilities: CheckerCapabilities,
+}
 impl CpuChecker for MetadataChecker {
     fn identity(&self) -> &CheckerIdentity {
-        &self.0
+        &self.identity
     }
     fn conditions(&self) -> &str {
-        "authored-profiled-worker-only/1"
+        &self.conditions
     }
     fn capabilities(&self) -> CheckerCapabilities {
-        CheckerCapabilities {
-            max_depth: 8,
-            max_prefix_plies: 64,
-            max_root_moves: 256,
-            root_moves: false,
-            divergence: true,
-            resume: false,
-            selective_search: None,
-        }
+        self.capabilities
     }
     fn last_attempt(&self) -> Option<&CheckerAttempt> {
         None
@@ -403,17 +401,39 @@ impl AuthoredWorkerFixture {
             namespace.clone(),
         )
         .unwrap();
-        let mut engine = PalsEngine::new_with_checker(
-            PalsConfig {
-                max_nodes: 257,
-                max_records: 16,
-                beam_width: 1,
-                line_plies: 2,
-                cpu_nodes_per_task: 32,
-                ..PalsConfig::default()
+        // Obtain the actual profiled declaration without starting a second
+        // process. The metadata mirror preserves its exact identity, condition
+        // and capability contract; legacy searchmoves admission stays strict.
+        let declared_checker = ExternalUciCpuChecker::create_profiled(
+            config.clone(),
+            ExternalEngineProfile::Reckless090EmbeddedNnue,
+            ExternalEnginePurpose::ResearchChecker,
+        )
+        .unwrap();
+        let declared = declared_checker.profiled_researcher_admission().unwrap();
+        let metadata = MetadataChecker {
+            identity: declared.identity().clone(),
+            conditions: declared.conditions().to_owned(),
+            capabilities: declared.capabilities(),
+        };
+        drop(declared_checker);
+        let mut engine = PalsEngine::new_with_boxed_profiled_researcher_and_rovent_profile(
+            ResearcherSemanticProfile {
+                config: PalsConfig {
+                    max_nodes: 257,
+                    max_records: 16,
+                    beam_width: 1,
+                    line_plies: 2,
+                    cpu_nodes_per_task: 32,
+                    ..PalsConfig::default()
+                },
+                maximum_root_prefix_plies: 64,
             },
             model,
-            MetadataChecker(CheckerIdentity::ExternalUci(config.identity.clone())),
+            Box::new(metadata),
+            ResolverPolicy::ModelWdlRestricted,
+            PostRepairRecheckPolicy::Disabled,
+            &declared,
         )
         .unwrap()
         .with_selected_review_context(
@@ -665,6 +685,29 @@ impl Drop for AuthoredWorkerFixture {
         // model, report, source-tree artifact or foreign temp root is removed.
         let _ = &self.elf;
     }
+}
+
+#[test]
+fn retained_question_capacity_keeps_every_slot_until_root_retirement() {
+    // Scalar values exercise the production allocation guard without forging
+    // 64 worker submissions, source capabilities, Store tasks or view leases.
+    let mut retained = HashMap::<ContractDigest, u8>::new();
+    for sequence in 0..PROFILED_QUESTION_CAPACITY {
+        reserve_profiled_question_slot(&mut retained).unwrap();
+        assert_eq!(retained.len(), sequence);
+        let mut key = [0; 32];
+        key[..8].copy_from_slice(&(sequence as u64).to_le_bytes());
+        retained.insert(ContractDigest(key), sequence as u8);
+    }
+    let original = retained.clone();
+    for _ in 0..2 {
+        assert!(matches!(
+            reserve_profiled_question_slot(&mut retained),
+            Err(PalsError::Capacity)
+        ));
+        assert_eq!(retained, original);
+    }
+    assert_eq!(PROFILED_QUESTION_CAPACITY, 64);
 }
 
 #[test]
