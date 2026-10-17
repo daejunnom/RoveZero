@@ -920,6 +920,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     pub(super) fn record_cpu_verification_hot(
         &mut self,
         line: &[BoardMove],
+        observation: ObservationId,
         score: i32,
         depth: u16,
         scope: CpuScoreScope,
@@ -928,7 +929,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         self.record_hot_with_cpu_value(
             RecordKind::CpuVerification,
             line,
-            None,
+            Some(observation),
             Some((score, depth, scope, perspective)),
             None,
         )?;

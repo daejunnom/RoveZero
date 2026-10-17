@@ -21,6 +21,8 @@ mod continuation_blueprint;
 mod cpu_commit;
 mod cpu_evidence_context;
 pub(in crate::pals::engine) use cpu_evidence_context::CpuEvidenceContextSeal;
+mod cpu_semantic_witness;
+pub use cpu_semantic_witness::{CpuSemanticStage, CpuSemanticWitness};
 mod external_commit;
 #[cfg(test)]
 mod fixed_trace_tests;

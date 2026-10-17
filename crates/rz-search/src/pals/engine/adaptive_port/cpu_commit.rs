@@ -1486,6 +1486,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             if work.input.stage != RefinementStage::CpuDiscovery {
                 self.record_cpu_verification_hot(
                     &admission.context.prefix,
+                    observation,
                     report.score,
                     report.completed_depth,
                     report.score_scope,
