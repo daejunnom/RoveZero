@@ -11,11 +11,16 @@ use rz_contracts::pals::SearchAuthority;
 
 mod controls;
 mod handoff;
+mod initial_cleanup;
 mod lifecycle;
 mod retirement;
 pub use controls::{ResearcherPreparingError, ResearcherRootStartup, RetiredPreparingRoot};
 pub(super) use handoff::PreparingRegistrationSeal;
 pub use handoff::{PreparingRootFinishRejection, PreparingRootHandoff};
+pub use initial_cleanup::{
+    InitialPreparingReleaseCustody, InitialPreparingRetirementRejection, InitialResearcherRelease,
+    InitialResearcherReleaseReceipt, InitialUnsubmittedRequestReceipt, RetiredInitialPreparingRoot,
+};
 pub(super) use retirement::DeferredResearcherInitialReadback;
 pub use retirement::{
     ReleasedResearcherReadback, ResearcherRetirementRejection, RetiredResearcherOwner,

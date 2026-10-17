@@ -162,6 +162,10 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 include_str!("engine/preparing_root/initial_cleanup.rs"),
             ),
             (
+                "pals/engine/preparing_root/initial_cleanup_tests.rs",
+                include_str!("engine/preparing_root/initial_cleanup_tests.rs"),
+            ),
+            (
                 "pals/engine/preparing_root/lifecycle.rs",
                 include_str!("engine/preparing_root/lifecycle.rs"),
             ),
