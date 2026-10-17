@@ -6,13 +6,13 @@
 //! receipts. Missing mate defenses are questions for that same manager queue.
 
 use super::coordinator::{AcceptedRoleStep, CoordinatorWork, FrameId, FrameInput, RefinementStage};
-use super::engine::RoleQueryPurpose;
 use super::engine::adaptive_port::{
     AdaptiveModelNamespace, AdaptivePortQuestion, AdaptivePortRoleEvidence,
 };
 use super::engine::pc_port::{PcPortQuestion, PcResponsibilitySource};
+use super::engine::RoleQueryPurpose;
 use super::review_context::ReviewView;
-use super::rovent_engine::{AdmittedRoleQuestion, ROVENT_NODE_UNIT, RootMoveDomain};
+use super::rovent_engine::{AdmittedRoleQuestion, RootMoveDomain, ROVENT_NODE_UNIT};
 use super::rovent_goals::{
     HorizonBoundary, HorizonError, HorizonInterruption, HorizonObligationId, HorizonObligationKind,
     HorizonSnapshot, RootPlyAnchor, SelectiveHorizon,
@@ -40,7 +40,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+mod external;
 mod horizon_questions;
+pub use external::{FrontierExternalAcceptance, FrontierExternalReservation, FrontierExternalWork};
 mod question;
 pub use super::rovent_solved::RootMateStrategy as FrontierMateStrategy;
 pub use horizon_questions::{
@@ -72,7 +74,8 @@ pub struct FrontierRegistration {
     pub root_moves: Arc<RootMoveDomain>,
     pub root_state: StateId,
     pub model_namespace: Arc<AdaptiveModelNamespace>,
-    /// The actual native ledger instance, absent in P/C-only assembly.
+    /// The actual native ledger instance. Absent in P/C-only assembly, or in
+    /// the separate opaque-source constructor for profiled external R.
     pub native_ledger: Option<CpuLedgerIdentity>,
 }
 
@@ -404,6 +407,8 @@ pub struct FrontierSnapshot {
     pub node_unit: &'static str,
     pub requested_nodes: Option<u64>,
     pub work: FrontierNodeWork,
+    /// Engine-reported foreign work, never calibrated to position visits.
+    pub external_work: Option<FrontierExternalWork>,
     pub horizon: HorizonSnapshot,
     pub mate: [Option<RootMateConclusion>; 2],
     pub mate_strategy: Option<FrontierMateStrategy>,
@@ -501,6 +506,8 @@ pub struct RoventFrontier {
     frames: Vec<FrameEntry>,
     mate: [Option<MateLane>; 2],
     native: Vec<NativeAccount>,
+    external_source: Option<crate::external_cpu::ProfiledExternalRootSource>,
+    external: external::ExternalFrontierJournal,
     work: FrontierNodeWork,
     selection_sealed: bool,
     stop: Option<FrontierStop>,
@@ -520,6 +527,37 @@ impl RoventFrontier {
         registration: FrontierRegistration,
         limits: FrontierLimits,
         stores: &PalsStores,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<Self, FrontierError> {
+        Self::new_inner(registration, limits, stores, None, clock, now)
+    }
+
+    /// Separate assembly for an actual profiled external ResearchChecker.
+    /// The existing own-R and R-free constructor keeps its original guard.
+    pub fn new_external(
+        registration: FrontierRegistration,
+        limits: FrontierLimits,
+        stores: &PalsStores,
+        source: &crate::external_cpu::ProfiledExternalRootSource,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<Self, FrontierError> {
+        Self::new_inner(
+            registration,
+            limits,
+            stores,
+            Some(source.clone()),
+            clock,
+            now,
+        )
+    }
+
+    fn new_inner(
+        registration: FrontierRegistration,
+        limits: FrontierLimits,
+        stores: &PalsStores,
+        external_source: Option<crate::external_cpu::ProfiledExternalRootSource>,
         clock: ClockDomain,
         now: MonotonicTick,
     ) -> Result<Self, FrontierError> {
@@ -546,9 +584,13 @@ impl RoventFrontier {
                 .get(registration.root_state)?
                 .same_state(registration.root_rules.rules().snapshot())
             || stores.generation() != registration.authority.root.0
-            || registration.mode.has_native_r() != registration.native_ledger.is_some()
+            || (external_source.is_none()
+                && registration.mode.has_native_r() != registration.native_ledger.is_some())
         {
             return Err(FrontierError::ForeignRoot);
+        }
+        if let Some(source) = &external_source {
+            external::validate_external_registration(&registration, source, clock)?;
         }
         let root = Position::from_snapshot(
             registration.root_rules.rules().snapshot(),
@@ -629,6 +671,8 @@ impl RoventFrontier {
             frames: Vec::new(),
             mate,
             native: Vec::new(),
+            external_source,
+            external: external::ExternalFrontierJournal::default(),
             work: FrontierNodeWork {
                 root_entries: u64::from(stop.is_none()),
                 native_usage_known: true,
@@ -728,6 +772,34 @@ impl RoventFrontier {
         &self.registration
     }
     pub fn validate_attachment(
+        &self,
+        actual: FrontierAttachment<'_>,
+        stores: &PalsStores,
+    ) -> Result<(), FrontierError> {
+        if self.external_source.is_some() {
+            return Err(FrontierError::MissingAcceptance);
+        }
+        self.validate_attachment_fields(actual, stores)
+    }
+
+    pub fn validate_external_attachment(
+        &self,
+        actual: FrontierAttachment<'_>,
+        stores: &PalsStores,
+        source: &crate::external_cpu::ProfiledExternalRootSource,
+    ) -> Result<(), FrontierError> {
+        external::validate_external_registration(&self.registration, source, self.original_clock)?;
+        if !self
+            .external_source
+            .as_ref()
+            .is_some_and(|original| original.same_source(source))
+        {
+            return Err(FrontierError::ForeignRoot);
+        }
+        self.validate_attachment_fields(actual, stores)
+    }
+
+    fn validate_attachment_fields(
         &self,
         actual: FrontierAttachment<'_>,
         stores: &PalsStores,
@@ -1655,6 +1727,7 @@ impl RoventFrontier {
         self.check_control(clock, now)?;
         grant.validate(job, clock, now)?;
         if !self.registration.mode.has_native_r()
+            || self.external_source.is_some()
             || job.id.authority != self.registration.authority
             || job.hard_deadline != self.registration.original_deadline
         {
@@ -1975,7 +2048,9 @@ impl RoventFrontier {
             FrontierGoalStatus::Stopped(stop)
         } else if exhausted {
             FrontierGoalStatus::Stopped(FrontierStop::WorkBudget)
-        } else if self.work.outstanding_native_executions != 0 {
+        } else if self.work.outstanding_native_executions != 0
+            || self.external.snapshot().outstanding_questions != 0
+        {
             FrontierGoalStatus::Pending
         } else if mate.iter().flatten().any(|proof| proof.goal_satisfied()) {
             FrontierGoalStatus::MateSatisfied
@@ -1995,6 +2070,10 @@ impl RoventFrontier {
             node_unit: ROVENT_NODE_UNIT,
             requested_nodes: self.registration.nodes,
             work: self.work,
+            external_work: self
+                .external_source
+                .as_ref()
+                .map(|_| self.external.snapshot()),
             horizon,
             mate,
             mate_strategy: self.mate_strategy(),

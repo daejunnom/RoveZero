@@ -512,6 +512,16 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let Some(receipt) = self.rovent_frontier_receipt() else {
             return Ok(None);
         };
+        if receipt
+            .snapshot
+            .external_work
+            .is_some_and(|work| work.outstanding_questions != 0)
+        {
+            // The profiled worker's original terminal packets are separate
+            // from own-R native credit. Keep this controller/Store owner until
+            // they are recovered; even then the caller needs its real fence.
+            return Err(FrontierError::MissingAcceptance);
+        }
         if !receipt.snapshot.work.native_usage_known
             || receipt.snapshot.work.outstanding_native_executions != 0
             || receipt.snapshot.work.reserved_native_nodes != 0

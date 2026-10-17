@@ -4,7 +4,7 @@ use crate::contract_time::{ContractClock, InstantClock};
 use crate::cpu::{CpuError, CpuWork};
 use crate::cpu_worker::CpuCreditLedger;
 use crate::pals::store::{SituationId, StoreLimits};
-use crate::pals::value::{MODEL_WDL_VALUE_SEMANTICS, ModelValueIdentity};
+use crate::pals::value::{ModelValueIdentity, MODEL_WDL_VALUE_SEMANTICS};
 use rz_contracts::pals_adaptive::{CpuJobId, CpuWorkerId};
 use rz_contracts::{
     ExecutionId, GameGeneration, OwnerId, PrecisionProfile, ProcessEpoch, RootGeneration,
@@ -14,6 +14,44 @@ use std::time::{Duration, Instant};
 
 fn mv(text: &str) -> BoardMove {
     BoardMove::from_uci(text).unwrap()
+}
+
+#[test]
+fn ordinary_constructor_still_requires_own_ledger_for_pcr_and_no_r_source_for_pc() {
+    let fixture = Fixture::new(Position::startpos(), SearchGoal::default(), None, false);
+    let copied = |mode, native_ledger| FrontierRegistration {
+        authority: fixture.frontier.registration.authority,
+        mode,
+        original_deadline: fixture.frontier.registration.original_deadline,
+        root_budget: fixture.frontier.registration.root_budget,
+        goal: fixture.frontier.registration.goal,
+        nodes: fixture.frontier.registration.nodes,
+        selective_policy: fixture.frontier.registration.selective_policy,
+        root_rules: Arc::clone(&fixture.frontier.registration.root_rules),
+        root_moves: Arc::clone(&fixture.frontier.registration.root_moves),
+        root_state: fixture.frontier.registration.root_state,
+        model_namespace: Arc::clone(&fixture.frontier.registration.model_namespace),
+        native_ledger,
+    };
+    let ledger =
+        CpuCreditLedger::new(fixture.frontier.registration.authority, 100, fixture.clock).unwrap();
+    for registration in [
+        copied(ExecutionMode::CpuPcr, None),
+        copied(ExecutionMode::CpuPc, Some(ledger.identity())),
+    ] {
+        assert!(matches!(
+            RoventFrontier::new(
+                registration,
+                fixture.frontier.limits.clone(),
+                &fixture.stores,
+                fixture.clock.domain(),
+                fixture.clock.now().unwrap(),
+            ),
+            Err(FrontierError::ForeignRoot)
+        ));
+    }
+    assert!(fixture.frontier.external_source().is_none());
+    assert!(fixture.frontier.snapshot().external_work.is_none());
 }
 
 struct Fixture {
@@ -158,13 +196,11 @@ fn passive_mate_uses_only_paid_rules_edges_and_never_issues_missing_questions() 
             fixture.frontier.root_moves().allowed(),
         ));
         assert_eq!(snapshot.goal, FrontierGoalStatus::MateSatisfied);
-        assert!(
-            fixture
-                .frontier
-                .missing_mate_questions(64, fixture.clock.domain(), fixture.clock.now().unwrap())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(fixture
+            .frontier
+            .missing_mate_questions(64, fixture.clock.domain(), fixture.clock.now().unwrap())
+            .unwrap()
+            .is_empty());
         fixture.observe(&[mv(movement)]).unwrap();
         assert_eq!(fixture.frontier.snapshot().work.checked_transitions, 1);
     }
@@ -186,13 +222,11 @@ fn passive_cooperative_terminal_does_not_close_unvisited_defenses() {
         MateConclusion::Unknown
     );
     assert_eq!(snapshot.goal, FrontierGoalStatus::Pending);
-    assert!(
-        fixture
-            .frontier
-            .missing_mate_questions(64, fixture.clock.domain(), fixture.clock.now().unwrap())
-            .unwrap()
-            .is_empty()
-    );
+    assert!(fixture
+        .frontier
+        .missing_mate_questions(64, fixture.clock.domain(), fixture.clock.now().unwrap())
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -243,13 +277,11 @@ fn passive_nonterminal_cutoff_stays_unknown_and_one_edge_cannot_exceed_root_cap(
 #[test]
 fn readonly_prefix_lookup_requires_original_paid_path_without_creating_work() {
     let mut fixture = Fixture::new(Position::startpos(), SearchGoal::default(), None, false);
-    assert!(
-        fixture
-            .frontier
-            .existing_rules_prefix(&[mv("e2e4")], &fixture.stores)
-            .unwrap()
-            .is_none()
-    );
+    assert!(fixture
+        .frontier
+        .existing_rules_prefix(&[mv("e2e4")], &fixture.stores)
+        .unwrap()
+        .is_none());
     assert_eq!(fixture.frontier.snapshot().work.checked_transitions, 0);
     fixture.observe(&[mv("e2e4")]).unwrap();
     let checked = fixture
@@ -258,13 +290,11 @@ fn readonly_prefix_lookup_requires_original_paid_path_without_creating_work() {
         .unwrap()
         .unwrap();
     assert!(checked.matches(&fixture.frontier, &fixture.stores));
-    assert!(
-        fixture
-            .frontier
-            .existing_rules_prefix(&[mv("e2e4"), mv("e7e5")], &fixture.stores)
-            .unwrap()
-            .is_none()
-    );
+    assert!(fixture
+        .frontier
+        .existing_rules_prefix(&[mv("e2e4"), mv("e7e5")], &fixture.stores)
+        .unwrap()
+        .is_none());
     let other = Fixture::new(Position::startpos(), SearchGoal::default(), None, false);
     assert!(matches!(
         fixture
@@ -304,12 +334,10 @@ fn checked_snapshot_reducer_rejects_foreign_root_and_wrong_step_without_advancin
     let child = proof
         .observe_checked_child(proof_root, &checked, 0)
         .unwrap();
-    assert!(
-        proof
-            .snapshot(child)
-            .unwrap()
-            .same_state(checked.endpoint_snapshot())
-    );
+    assert!(proof
+        .snapshot(child)
+        .unwrap()
+        .same_state(checked.endpoint_snapshot()));
     assert_eq!(
         proof
             .observe_checked_child(proof_root, &checked, 0)
@@ -386,15 +414,12 @@ fn checked_line_keeps_paid_snapshot_after_budget_closes_and_cannot_change_owner(
     assert_eq!(line.prefix(), [mv("e2e4")]);
     assert_eq!(line.steps().len(), 1);
     assert_eq!(line.steps()[0].movement(), mv("e2e4"));
-    assert!(
-        line.root_snapshot()
-            .same_state(fixture.frontier.registration.root_rules.rules().snapshot())
-    );
-    assert!(
-        line.steps()[0]
-            .snapshot()
-            .same_state(line.endpoint_snapshot())
-    );
+    assert!(line
+        .root_snapshot()
+        .same_state(fixture.frontier.registration.root_rules.rules().snapshot()));
+    assert!(line.steps()[0]
+        .snapshot()
+        .same_state(line.endpoint_snapshot()));
     assert_eq!(
         fixture
             .frontier
@@ -421,12 +446,12 @@ fn original_clock_bridge_keeps_constructor_entry_across_owner_move() {
     let original_tick = fixture.frontier.original_entry_tick;
     let before = fixture.frontier.observed_original_tick().unwrap();
     assert_eq!(before.0, fixture.clock.domain());
-    assert!(before.1.0 >= original_tick.0);
+    assert!(before.1 .0 >= original_tick.0);
     let moved = Box::new(fixture.frontier);
     assert_eq!(moved.original_entry_instant, entry);
     let after = moved.observed_original_tick().unwrap();
     assert_eq!(before.0, after.0);
-    assert!(after.1.0 >= before.1.0);
+    assert!(after.1 .0 >= before.1 .0);
     assert_eq!(moved.snapshot().work.total_node_visits(), Some(1));
 }
 
@@ -498,16 +523,12 @@ fn unexamined_mate_defenses_are_returned_as_questions_and_depth_does_not_shrink_
         .frontier
         .missing_mate_questions(64, fixture.clock.domain(), fixture.clock.now().unwrap())
         .unwrap();
-    assert!(
-        questions
-            .iter()
-            .all(|q| fixture.frontier.path_ply(q.anchor()).unwrap() == ChessPly(0))
-    );
-    assert!(
-        questions
-            .iter()
-            .any(|q| q.kind() == MateQuestionKind::RequiredDefense)
-    );
+    assert!(questions
+        .iter()
+        .all(|q| fixture.frontier.path_ply(q.anchor()).unwrap() == ChessPly(0)));
+    assert!(questions
+        .iter()
+        .any(|q| q.kind() == MateQuestionKind::RequiredDefense));
     for lane in fixture.frontier.mate.iter().flatten() {
         assert_eq!(
             lane.proof.root_conclusion().conclusion,
