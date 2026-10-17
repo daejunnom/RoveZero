@@ -135,6 +135,9 @@ impl UtilityRoutePreparation {
     }
     /// Attach only to the exact original global-view Request. Retaining error
     /// returns that same Request; metadata equality is not a new admission.
+    // Rejection returns the same move-only Request/preparation/action owner;
+    // boxing here would require a new allocation while preserving old pins.
+    #[allow(clippy::result_large_err)]
     pub fn attach_input_capture(
         &mut self,
         request: Request,
@@ -555,6 +558,9 @@ impl UtilityRouteAction {
     }
 }
 impl<M: RoleModel> AdaptiveEnginePort<M> {
+    // Rejection returns the same move-only Request/preparation/action owner;
+    // boxing here would require a new allocation while preserving old pins.
+    #[allow(clippy::result_large_err)]
     pub fn bind_utility_route_input(
         &self,
         preparation: UtilityRoutePreparation,
@@ -1230,6 +1236,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         Ok(())
     }
 
+    // Rejection returns the same move-only Request/preparation/action owner;
+    // boxing here would require a new allocation while preserving old pins.
+    #[allow(clippy::result_large_err)]
     pub fn finish_utility_route_semantics(
         &self,
         action: UtilityRouteAction,

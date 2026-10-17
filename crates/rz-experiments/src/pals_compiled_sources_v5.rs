@@ -929,6 +929,12 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_r_unsubmitted.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_root_descriptor.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_submitted_input.py"),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_cohort_files.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_root_local.py"
+            ),
         ],
     ),
     (
@@ -1006,6 +1012,12 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_r_unsubmitted.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_root_descriptor.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_submitted_input.py"),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_cohort_files.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_root_local.py"
+            ),
         ],
     ),
     (

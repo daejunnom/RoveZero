@@ -783,7 +783,9 @@
       "experiments/model-research/pals/src/rz_pals_model/rovent_r_semantic.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_r_unsubmitted.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_root_descriptor.py",
-      "experiments/model-research/pals/src/rz_pals_model/rovent_submitted_input.py"
+      "experiments/model-research/pals/src/rz_pals_model/rovent_submitted_input.py",
+      "experiments/model-research/pals/src/rz_pals_model/rovent_utility_cohort_files.py",
+      "experiments/model-research/pals/src/rz_pals_model/rovent_utility_root_local.py"
     ],
     "data_v3": [
       "crates/rz-arena/Cargo.toml",
@@ -851,7 +853,9 @@
       "experiments/model-research/pals/src/rz_pals_model/rovent_r_semantic.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_r_unsubmitted.py",
       "experiments/model-research/pals/src/rz_pals_model/rovent_root_descriptor.py",
-      "experiments/model-research/pals/src/rz_pals_model/rovent_submitted_input.py"
+      "experiments/model-research/pals/src/rz_pals_model/rovent_submitted_input.py",
+      "experiments/model-research/pals/src/rz_pals_model/rovent_utility_cohort_files.py",
+      "experiments/model-research/pals/src/rz_pals_model/rovent_utility_root_local.py"
     ],
     "trainer": [
       "crates/rz-arena/src/bin/rovent-trainer.rs",
