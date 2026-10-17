@@ -392,7 +392,7 @@ where
         &self,
         mode: ExecutionMode,
     ) -> Result<Option<PeerFollowupDisposition>, AdaptiveManagerError> {
-        let (spent, reserved) = self.ledger.global_usage()?;
+        let (spent, reserved) = self.native_ledger()?.global_usage()?;
         Ok(if !mode.has_native_r() {
             Some(PeerFollowupDisposition::ModeUnsupported)
         } else if !self

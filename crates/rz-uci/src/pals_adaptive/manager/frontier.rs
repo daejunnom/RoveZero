@@ -156,7 +156,7 @@ where
         {
             return Ok(false);
         }
-        let actual = self.ledger.registration_observation()?;
+        let actual = self.native_ledger()?.registration_observation()?;
         if actual.reserved_native_nodes == 0 || actual.quarantined_jobs != 0 {
             return Ok(false);
         }
@@ -172,7 +172,7 @@ where
             {
                 continue;
             }
-            let (_, reserved, unknown) = self.ledger.usage(binding.envelope.id)?;
+            let (_, reserved, unknown) = self.native_ledger()?.usage(binding.envelope.id)?;
             if reserved != 0 && !unknown {
                 return Ok(true);
             }
@@ -239,7 +239,10 @@ where
         reservation: Option<NativeReservation>,
         rejected: &CpuAdmissionRejection,
     ) -> Result<(), AdaptiveManagerError> {
-        let accepted = match self.ledger.release_unadmitted_attested(rejected) {
+        let accepted = match self
+            .native_ledger_mut()?
+            .release_unadmitted_attested(rejected)
+        {
             Ok(accepted) => accepted,
             Err(error) => {
                 if let Some(reservation) = reservation {

@@ -871,7 +871,7 @@ where
         }) else {
             return Ok(());
         };
-        let (_, reserved, unknown) = self.ledger.usage(job)?;
+        let (_, reserved, unknown) = self.native_ledger()?.usage(job)?;
         if reserved != 0 || unknown {
             return Err(AdaptiveManagerError::PhysicalUnknown);
         }

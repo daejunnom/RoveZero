@@ -85,9 +85,25 @@ use std::time::{Duration, Instant};
 const MAX_EVENT_DRAIN: usize = 256;
 const MAX_ROLE_PENDING: usize = 16;
 
+mod admitted;
 mod cleanup;
 mod collection;
 mod effective_clock;
+mod researcher_resources;
+pub use researcher_resources::AdaptiveResearcherSourceKind;
+use researcher_resources::{NativeResearcherResources, ResearcherResources};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod profiled_external_source;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use profiled_external_source::{
+    ProfiledExternalManagerSource, ProfiledExternalSourceRejection,
+};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod profiled_external_receipt;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use profiled_external_receipt::{
+    ProfiledExternalPersistentParts, ProfiledExternalShutdownReceipt,
+};
 mod frontier;
 mod goal_local;
 mod goals;
@@ -1559,13 +1575,12 @@ where
     own: Vec<OwnSlot<Q>>,
     external: Option<ExternalManagerWorker>,
     foreign: Option<ForeignBinding<Q>>,
-    ledger: CpuCreditLedger,
+    researcher: ResearcherResources,
     cpu_slice_diagnostic: OnceLock<AdaptiveCpuSliceDiagnostic>,
     #[cfg(feature = "pals-adaptive-diagnostics")]
     continuation_diagnostic: Option<ContinuationDiagnostic>,
     ready: ReadySelector<FrameId, Move16, Digest>,
     costs: CostEstimator,
-    controller: AdaptiveController,
     advised_yield: Option<YieldSelection>,
     /// Actual completed role namespaces retained only for this root. A lookup
     /// for the next Critic is a prospective S scope, not a submitted role or
@@ -1940,104 +1955,31 @@ where
             };
             (ledger, 1, 1, None)
         };
-        let AdaptiveManagerSources {
-            native,
-            own_workers,
-            external,
-            driver,
-        } = sources;
-        Ok(Self {
+        Ok(Self::assemble(
             registration,
-            limits,
             clock,
-            cpu_clock,
-            deadline,
-            native,
-            registry,
-            machine,
-            driver,
-            role_call_limit,
-            collection_observer: None,
-            collection_admission: None,
-            roles: Vec::with_capacity(limits.role_tickets_max),
-            acknowledgements: VecDeque::with_capacity(limits.role_tickets_max),
-            own: own_workers
-                .into_iter()
-                .map(|worker| OwnSlot {
-                    worker: Some(worker),
-                    binding: None,
-                    joined: false,
-                    panicked: false,
-                    settled_execution: None,
-                    recovered_engine: None,
-                    ready_readback: None,
-                    last_value_installation: None,
-                    nnuec_retirement: None,
-                })
-                .collect(),
-            external,
-            foreign: None,
-            ledger,
-            cpu_slice_diagnostic: OnceLock::new(),
-            #[cfg(feature = "pals-adaptive-diagnostics")]
-            continuation_diagnostic: None,
-            ready,
-            costs,
-            controller,
-            advised_yield: None,
-            observed_role_classes: Vec::with_capacity(64),
-            observation_sequence: 0,
-            next_job,
-            next_execution,
-            next_control: 1,
-            phase: ManagerPhase::Running,
-            native_finished: None,
-            native_joined: false,
-            native_root_fence: None,
-            close_mode: AdaptiveCloseMode::ProcessShutdown,
-            external_finished: None,
-            external_root_fence: None,
-            external_startup_observed: false,
-            counters: AdaptiveManagerCounters::default(),
-            native_accounting: AdaptiveNativeAccountingSnapshot::default(),
-            shutdown_until: None,
-            cleanup_boundary,
-            effective_clock: None,
-            native_ready,
-            native_verifier_registered,
-            retained_native_permits: Vec::with_capacity(limits.role_tickets_max),
-            retained_native_receipts: Vec::with_capacity(limits.role_tickets_max),
-            failures: VecDeque::with_capacity(64),
-            quarantine_rejections: Vec::with_capacity(16),
-            retained_native_completions: Vec::with_capacity(limits.role_tickets_max),
-            quarantined_cpu_receipts: Vec::with_capacity(8),
-            quarantined_foreign_receipts: Vec::with_capacity(1),
-            ready_ids: Vec::with_capacity(limits.waiting_jobs_max),
-            deferred: VecDeque::with_capacity(128),
-            native_frontier_events: VecDeque::with_capacity(32),
-            review_leases: RoventReviewLeaseObservation::new(limits.role_tickets_max),
-            validator_waiting: Vec::with_capacity(limits.waiting_jobs_max),
-            root_started: false,
-            cpu_node_limit_reached: false,
-            root_ranking_proof: None,
-            exclusive_requested: false,
-            registered_action: None,
-            exclusive_scope: None,
-            finished_at: None,
-            reciprocal_policy: None,
-            next_reciprocal_question: 1,
-            peer_policy: None,
-            accepted_roles: Vec::with_capacity(MAX_ROLE_PENDING),
-            peer_sources_admitted: 0,
-            peer_observations: Vec::with_capacity(128),
-            goal_prepared: None,
-            goal_continuation_pending: false,
-            nnuec: None,
-            nnuec_pending: None,
-            nnuec_jobs: Vec::with_capacity(CPU_JOB_CAPACITY),
-            nnuec_observations: Vec::with_capacity(CPU_JOB_CAPACITY),
-            nnuec_observations_omitted: 0,
-        })
+            limits,
+            sources,
+            admitted::ManagerAssembly {
+                cpu_clock,
+                deadline,
+                native_ready,
+                registry,
+                native_verifier_registered,
+                machine,
+                ready,
+                costs,
+                researcher: ResearcherResources::Native(NativeResearcherResources {
+                    ledger,
+                    controller,
+                }),
+                role_call_limit,
+                next_job,
+                next_execution,
+                next_control: 1,
+                cleanup_boundary,
+            },
+        ))
     }
     pub fn new_continued(
         registration: AdaptiveManagerRegistration,
@@ -2352,7 +2294,7 @@ where
                 "root observations require actual settled owner closure",
             ));
         }
-        let (cpu_spent, cpu_reserved) = self.ledger.global_usage()?;
+        let (cpu_spent, cpu_reserved) = self.native_ledger()?.global_usage()?;
         Ok(AdaptiveRootObservationSnapshot {
             authority: self.registration.authority,
             close_mode: self.close_mode,
@@ -2530,12 +2472,16 @@ where
         &self.retained_native_completions
     }
     pub fn native_cpu_usage(&self) -> Result<(u64, u64), AdaptiveManagerError> {
-        Ok(self.ledger.global_usage()?)
+        Ok(self.native_ledger()?.global_usage()?)
     }
     /// Actual single-writer identity for opt-in root-controller attachment.
     /// A digest or a freshly constructed ledger cannot replace this owner.
     pub fn cpu_ledger_identity(&self) -> CpuLedgerIdentity {
-        self.ledger.identity()
+        self.try_cpu_ledger_identity()
+            .expect("native manager facade owns its original ledger")
+    }
+    pub fn try_cpu_ledger_identity(&self) -> Result<CpuLedgerIdentity, AdaptiveManagerError> {
+        Ok(self.native_ledger()?.identity())
     }
     pub fn cpu_node_limit_reached(&self) -> bool {
         self.cpu_node_limit_reached
@@ -4559,7 +4505,7 @@ where
         match event {
             CpuWorkerEvent::Slice(report) => {
                 self.counters.cpu_slice_receipts += 1;
-                let settled = match self.ledger.settle_attested(&report) {
+                let settled = match self.native_ledger_mut()?.settle_attested(&report) {
                     Ok(settled) => settled,
                     Err(error) => {
                         self.quarantine_frontier_slot(slot);
@@ -4621,10 +4567,10 @@ where
                 // those paths may still fail with their original errors.
                 if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
                     let accounting = self
-                        .ledger
+                        .native_ledger()?
                         .global_usage()
                         .ok()
-                        .zip(self.ledger.usage(report.grant.job).ok())
+                        .zip(self.native_ledger()?.usage(report.grant.job).ok())
                         .map(
                             |(
                                 (global_spent, global_reserved),
@@ -4940,7 +4886,10 @@ where
                 }
             }
             CpuWorkerEvent::JobTerminated(termination) => {
-                if let Err(error) = self.ledger.accept_job_termination(&termination) {
+                if let Err(error) = self
+                    .native_ledger_mut()?
+                    .accept_job_termination(&termination)
+                {
                     self.quarantine_frontier_slot(slot);
                     self.quarantined_cpu_receipts
                         .push(CpuWorkerEvent::JobTerminated(termination));
@@ -5798,7 +5747,7 @@ where
                         || self.foreign.is_some()
                         || !self.deferred.is_empty()
                         || self.registry.occupancy() != 0
-                        || self.ledger.global_usage()?.1 != 0
+                        || self.native_ledger()?.global_usage()?.1 != 0
                     {
                         return Err(AdaptiveManagerError::Invalid(
                             "exclusive scope requires idle physical owners",
@@ -5888,7 +5837,7 @@ where
                     Err(error) => return Err(error),
                 }
             } else {
-                let (spent, reserved) = self.ledger.global_usage()?;
+                let (spent, reserved) = self.native_ledger()?.global_usage()?;
                 let total = spent
                     .checked_add(reserved)
                     .ok_or(AdaptiveManagerError::Invalid(
@@ -5997,7 +5946,7 @@ where
                     )
                     .map_err(|error| match error {
                         AdaptiveManagerError::Semantic(detail) => {
-                            let usage = self.ledger.global_usage();
+                            let usage = self.native_ledger()?.global_usage();
                             AdaptiveManagerError::Semantic(format!(
                                 "CPU question dispatch manager_spent_reserved={usage:?}; {detail}"
                             ))
@@ -6274,24 +6223,27 @@ where
                     .find_map(|slot| slot.binding.as_ref())
                     .and_then(|binding| self.costs.estimate(binding.class, CostStage::YieldLatency))
             });
-        self.controller
-            .advise(ControllerInput {
-                observation_sequence: self.observation_sequence,
-                now: Duration::from_nanos(now.0),
-                deadline_remaining: Duration::from_nanos(self.deadline.at.0.saturating_sub(now.0)),
-                role_service,
-                yield_overhead,
-                backlog,
-                waiting_cpu_jobs: self
-                    .ready
-                    .len()
-                    .saturating_add(usize::from(self.nnuec_pending.is_some())),
-                // Typed S forecast is distinct from realized benefit/witness.
-                selected_progress: selected.map(|selection| WorkerProgress {
-                    has_new_consistent_progress: true,
-                    expected_feedback_gain: Some(selection.gain()),
-                }),
-            })
+        let input = ControllerInput {
+            observation_sequence: self.observation_sequence,
+            now: Duration::from_nanos(now.0),
+            deadline_remaining: Duration::from_nanos(self.deadline.at.0.saturating_sub(now.0)),
+            role_service,
+            yield_overhead,
+            backlog,
+            waiting_cpu_jobs: self
+                .ready
+                .len()
+                .saturating_add(usize::from(self.nnuec_pending.is_some())),
+            // Typed S forecast is distinct from realized benefit/witness.
+            selected_progress: selected.map(|selection| WorkerProgress {
+                has_new_consistent_progress: true,
+                expected_feedback_gain: Some(selection.gain()),
+            }),
+        };
+        self.researcher
+            .native_mut()?
+            .controller
+            .advise(input)
             .map_err(|_| AdaptiveManagerError::Invalid("adaptive advice"))
     }
     fn begin_cpu(
@@ -6376,12 +6328,12 @@ where
                 node_interval: policy.node_interval,
             })?;
         }
-        self.ledger.register(envelope)?;
+        self.native_ledger_mut()?.register(envelope)?;
         let grant =
             match self.next_grant(envelope, profile.owner, requested_credit, requested_lease) {
                 Ok(grant) => grant,
                 Err(error) => {
-                    self.ledger.retire_unstarted(envelope.id)?;
+                    self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
                     return Err(error);
                 }
             };
@@ -6394,12 +6346,12 @@ where
         let admitted_at = match self.check_running() {
             Ok(now) => now,
             Err(error) => {
-                self.ledger.retire_unstarted(envelope.id)?;
+                self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
                 return Err(error);
             }
         };
-        if let Err(error) = self.ledger.reserve(grant) {
-            self.ledger.retire_unstarted(envelope.id)?;
+        if let Err(error) = self.native_ledger_mut()?.reserve(grant) {
+            self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
             return Err(error.into());
         }
         let native_frontier = match self.driver.frontier_native_reserve(
@@ -6416,7 +6368,7 @@ where
                     .expect("checked owner")
                     .reject_prepared(prepared, grant)?;
                 self.release_frontier_before_enqueue(None, rejected.proof())?;
-                self.ledger.retire_unstarted(envelope.id)?;
+                self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
                 return Err(error);
             }
         };
@@ -6436,7 +6388,7 @@ where
                 }
             };
             self.release_frontier_before_enqueue(native_frontier, rejected.proof())?;
-            self.ledger.retire_unstarted(envelope.id)?;
+            self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
             return Err(error);
         }
         match self.own[index]
@@ -6448,7 +6400,7 @@ where
             Ok(()) => {}
             Err(rejected) => {
                 self.release_frontier_before_enqueue(native_frontier, rejected.proof())?;
-                self.ledger.retire_unstarted(envelope.id)?;
+                self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
                 self.driver
                     .cpu_rejected(&work, &envelope, rejected.proof())?;
                 return Err(AdaptiveManagerError::Cpu(rejected.reason().clone()));
@@ -6540,7 +6492,7 @@ where
                 return Err(error);
             }
         };
-        if let Err(error) = self.ledger.reserve(grant) {
+        if let Err(error) = self.native_ledger_mut()?.reserve(grant) {
             self.own[index].binding = Some(binding);
             return Err(error.into());
         }
@@ -6672,8 +6624,8 @@ where
         credit: u64,
         lease: Duration,
     ) -> Result<SliceGrant, AdaptiveManagerError> {
-        let (spent, reserved, quarantined) = self.ledger.usage(envelope.id)?;
-        let (global_spent, global_reserved) = self.ledger.global_usage()?;
+        let (spent, reserved, quarantined) = self.native_ledger()?.usage(envelope.id)?;
+        let (global_spent, global_reserved) = self.native_ledger()?.global_usage()?;
         if quarantined || reserved != 0 {
             return Err(AdaptiveManagerError::PhysicalUnknown);
         }
@@ -7041,8 +6993,12 @@ where
             }
             if receipt.thread_panicked {
                 self.quarantine_frontier_slot(index);
-                if let Some(binding) = &self.own[index].binding {
-                    self.ledger.quarantine(binding.envelope.id)?;
+                if let Some(job) = self.own[index]
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.envelope.id)
+                {
+                    self.native_ledger_mut()?.quarantine(job)?;
                 }
                 self.phase = ManagerPhase::Quarantined;
             }
@@ -7170,7 +7126,7 @@ where
             self.ready_ids.clear();
             self.validator_waiting.clear();
             self.root_ranking_proof = None;
-            let (_, reserved) = self.ledger.global_usage()?;
+            let (_, reserved) = self.native_ledger()?.global_usage()?;
             if reserved != 0
                 || self.own.iter().any(|slot| slot.binding.is_some())
                 || self.foreign.is_some()
@@ -7184,7 +7140,7 @@ where
         Ok(changed)
     }
     pub fn shutdown_receipt(&self) -> Result<AdaptiveShutdownReceipt, AdaptiveManagerError> {
-        let (spent, reserved) = self.ledger.global_usage()?;
+        let (spent, reserved) = self.native_ledger()?.global_usage()?;
         Ok(AdaptiveShutdownReceipt {
             authority: self.registration.authority,
             native_owner_joined: self.native_joined,
