@@ -63,6 +63,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
         "review_view",
         &[
             source!("crates/rz-search/Cargo.toml"),
+            source!("crates/rz-search/src/pals/coordinator/accepted_peer.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/archive_worker.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/branch_queue.rs"),
@@ -72,6 +73,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/pals/engine/adaptive_port/cpu_commit.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/external_commit.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/frontier_port.rs"),
+            source!("crates/rz-search/src/pals/engine/adaptive_port/goal_hooks.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/legacy_full_context.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/model_namespace.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/reciprocal_port.rs"),
@@ -82,11 +84,14 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/pals/engine/cpu_lifecycle.rs"),
             source!("crates/rz-search/src/pals/engine/followup_execution.rs"),
             source!("crates/rz-search/src/pals/engine/frozen_recheck.rs"),
+            source!("crates/rz-search/src/pals/engine/no_researcher_lifecycle.rs"),
             source!("crates/rz-search/src/pals/engine/pc_port.rs"),
             source!("crates/rz-search/src/pals/engine/pc_port/frontier_port.rs"),
             source!("crates/rz-search/src/pals/engine/pc_port/goal_local.rs"),
             source!("crates/rz-search/src/pals/engine/replay.rs"),
             source!("crates/rz-search/src/pals/engine/replay/opponent_recheck.rs"),
+            source!("crates/rz-search/src/pals/engine/researcher_admission.rs"),
+            source!("crates/rz-search/src/pals/engine/researcher_profile.rs"),
             source!("crates/rz-search/src/pals/engine/review_lifecycle.rs"),
             source!("crates/rz-search/src/pals/engine/semantic_state.rs"),
             source!("crates/rz-search/src/pals/review_context.rs"),
@@ -103,6 +108,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/cpu_value.rs"),
             source!("crates/rz-search/src/cpu_value/nnuec.rs"),
             source!("crates/rz-search/src/cpu_value/nnuec_v2.rs"),
+            source!("crates/rz-search/src/cpu_value/nnuec_v2_capture.rs"),
             source!("crates/rz-search/src/cpu_value/nnuec_v2_cpu.rs"),
             source!("crates/rz-search/src/cpu_value/nnuec_v2_review.rs"),
             source!("crates/rz-search/src/cpu_value/nnuec_v2_utility.rs"),
@@ -115,6 +121,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/contract_time.rs"),
             source!("crates/rz-search/src/cpu_worker.rs"),
             source!("crates/rz-search/src/cpu_worker/deferred_value.rs"),
+            source!("crates/rz-search/src/cpu_worker/ledger_registration.rs"),
             source!("crates/rz-search/src/cpu_worker/prepared_value.rs"),
         ],
     ),
@@ -126,6 +133,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/Cargo.toml"),
             source!("crates/rz-search/src/contract_time.rs"),
             source!("crates/rz-search/src/cpu_worker.rs"),
+            source!("crates/rz-search/src/cpu_worker/ledger_registration.rs"),
         ],
     ),
     (
@@ -134,6 +142,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-contracts/src/rovent.rs"),
             source!("crates/rz-search/Cargo.toml"),
             source!("crates/rz-search/src/pals/coordinator.rs"),
+            source!("crates/rz-search/src/pals/coordinator/accepted_peer.rs"),
             source!("crates/rz-search/src/pals/coordinator/external_binding.rs"),
             source!("crates/rz-search/src/pals/coordinator/machine.rs"),
             source!("crates/rz-search/src/pals/coordinator/native_acceptance.rs"),
@@ -151,6 +160,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/pals/engine/adaptive_port/continuation_blueprint.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/cpu_commit.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/external_commit.rs"),
+            source!("crates/rz-search/src/pals/engine/adaptive_port/goal_hooks.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/legacy_full_context.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/model_namespace.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/nnuec_port.rs"),
@@ -161,11 +171,14 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/pals/engine/cpu_lifecycle.rs"),
             source!("crates/rz-search/src/pals/engine/followup_execution.rs"),
             source!("crates/rz-search/src/pals/engine/frozen_recheck.rs"),
+            source!("crates/rz-search/src/pals/engine/no_researcher_lifecycle.rs"),
             source!("crates/rz-search/src/pals/engine/pc_port.rs"),
             source!("crates/rz-search/src/pals/engine/pc_port/frontier_port.rs"),
             source!("crates/rz-search/src/pals/engine/pc_port/goal_local.rs"),
             source!("crates/rz-search/src/pals/engine/replay.rs"),
             source!("crates/rz-search/src/pals/engine/replay/opponent_recheck.rs"),
+            source!("crates/rz-search/src/pals/engine/researcher_admission.rs"),
+            source!("crates/rz-search/src/pals/engine/researcher_profile.rs"),
             source!("crates/rz-search/src/pals/engine/review_lifecycle.rs"),
             source!("crates/rz-search/src/pals/rovent_engine.rs"),
             source!("crates/rz-search/src/pals/rovent_frontier.rs"),
@@ -184,7 +197,9 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_adaptive/manager/collection.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/collection/origin.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/frontier.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/manager/goals.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/reciprocal.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/manager/registered_ledger.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/role_only.rs"),
             source!("crates/rz-uci/src/pals_adaptive/native_accounting.rs"),
             source!("crates/rz-uci/src/pals_adaptive/projection.rs"),
@@ -245,6 +260,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_adaptive_bootstrap/resource_plan.rs"),
             source!("crates/rz-uci/src/pals_adaptive_bootstrap/resource_readback.rs"),
             source!("crates/rz-uci/src/pals_attestation/checker/resource.rs"),
+            source!("crates/rz-uci/src/rovent_bootstrap/process_boundary.rs"),
         ],
     ),
     (
@@ -278,7 +294,9 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_adaptive/manager/collection.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/collection/origin.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/frontier.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/manager/goals.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/reciprocal.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/manager/registered_ledger.rs"),
             source!("crates/rz-uci/src/pals_adaptive/manager/role_only.rs"),
             source!("crates/rz-uci/src/pals_adaptive/native_accounting.rs"),
             source!("crates/rz-uci/src/pals_adaptive/projection.rs"),
@@ -339,7 +357,9 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/parser.rs"),
             source!("crates/rz-uci/src/process_receipts.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap.rs"),
+            source!("crates/rz-uci/src/rovent_bootstrap/configuration.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/pinned.rs"),
+            source!("crates/rz-uci/src/rovent_bootstrap/process_boundary.rs"),
             source!("crates/rz-uci/src/rovent_driver.rs"),
             source!("crates/rz-uci/src/rovent_external_launch.rs"),
             source!("crates/rz-uci/src/runner.rs"),
@@ -652,6 +672,8 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/pals_collect_v3/writer_worker.rs"),
             source!("crates/rz-arena/src/rovent_collect.rs"),
             source!("crates/rz-arena/src/rovent_collect/native_capture.rs"),
+            source!("crates/rz-arena/src/rovent_collect/observer.rs"),
+            source!("crates/rz-arena/src/rovent_collect/rules_replay.rs"),
             source!("crates/rz-arena/src/rovent_collect/teacher.rs"),
             source!("crates/rz-experiments/Cargo.toml"),
             source!("crates/rz-experiments/src/pals_data_v3.rs"),
@@ -663,6 +685,10 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_adaptive/validator.rs"),
             source!("crates/rz-uci/src/pals_native/ticketed/virtual_bridge.rs"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_corpus.py"),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_historical_corpus.py"
+            ),
+            source!("experiments/model-research/pals/src/rz_pals_model/rovent_native_v2.py"),
         ],
     ),
     (
@@ -695,6 +721,8 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/pals_collect_v3/training_process.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/writer.rs"),
             source!("crates/rz-arena/src/pals_collect_v3/writer_worker.rs"),
+            source!("crates/rz-arena/src/rovent_collect/observer.rs"),
+            source!("crates/rz-arena/src/rovent_collect/rules_replay.rs"),
             source!("crates/rz-experiments/Cargo.toml"),
             source!("crates/rz-experiments/src/pals_data_v3.rs"),
             source!("crates/rz-experiments/src/pals_data_v3/frozen_action.rs"),
@@ -703,6 +731,10 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("experiments/model-research/pals/src/rz_pals_model/generation_chunks.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/generation_data.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_corpus.py"),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_historical_corpus.py"
+            ),
+            source!("experiments/model-research/pals/src/rz_pals_model/rovent_native_v2.py"),
         ],
     ),
     (
@@ -727,7 +759,23 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("experiments/model-research/pals/src/rz_pals_model/model.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/nnuec_trainable.py"),
             source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_historical_checkpoint.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_historical_corpus.py"
+            ),
+            source!("experiments/model-research/pals/src/rz_pals_model/rovent_native_v2.py"),
+            source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_nnuec_training_state.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_recovered_training_authority.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_recovered_training_child.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_recovered_training_window.py"
             ),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_tensor_training.py"),
             source!(
@@ -737,7 +785,13 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
                 "experiments/model-research/pals/src/rz_pals_model/rovent_training_bootstrap.py"
             ),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_training_child.py"),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_training_recovery.py"
+            ),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_training_window.py"),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_training_window_v2.py"
+            ),
             source!("experiments/model-research/pals/src/rz_pals_model/training.py"),
         ],
     ),
@@ -759,11 +813,30 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("experiments/model-research/pals/src/rz_pals_model/generation_training_cli.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/initialization_evidence.py"),
             source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_historical_checkpoint.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_historical_corpus.py"
+            ),
+            source!("experiments/model-research/pals/src/rz_pals_model/rovent_native_v2.py"),
+            source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_nnuec_training_state.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_recovered_training_authority.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_recovered_training_child.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_recovered_training_window.py"
             ),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_tensor_training.py"),
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_training_authority.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_training_recovery.py"
             ),
         ],
     ),

@@ -221,9 +221,9 @@ NNUEC R 준비, 원 수집 cap과 trainer parent, 외부 UCI 실제 실행이다
 CPU/비학습 Tensor·목표 GPU 수치·물리 수명을 확인한다. 실제 학습은 이번 목표에서
 제외하며 Draft PR의 병합도 이 checkpoint에 포함하지 않는다.
 
-학습 도구의 추가 소스 감사에서는 같은 부모가 보유한 live corpus/window custody로만
-재개할 수 있고, 부모 재시작 뒤 durable dataset/checkpoint를 소비하는 제품 경로가
-없음을 확인했다. 이를 T04 미완료로 보존한다. 후속은 caller가 exact pin한 원
+이 checkpoint 당시 학습 도구의 추가 소스 감사에서는 같은 부모가 보유한 live
+corpus/window custody로만 재개할 수 있고, 부모 재시작 뒤 durable dataset/checkpoint를
+소비하는 제품 경로가 없음을 확인했다. 당시 T04 미완료 기록은 보존한다. 후속은 caller가 exact pin한 원
 publication과 전체 rows/Rules/target/계보를 재검증하는 historical dataset 자격,
 checkpoint 복구 자격과 새 trainer 호출부를 연결한다. 과거 native 실행·물리 완료
 권한은 재발급하지 않으며, 미회수 실행과 checkpoint 이후의 비용 unknown도 유지한다.
@@ -240,3 +240,56 @@ Store에 채택해야 하며, 그 이전 Rules 전이를 허용하지 않도록 
 window의 기존 단일 runtime 필드는 collection ORT library와 trainer Python
 executable을 같은 값으로 요구하므로 새 명시 codec에서 분리한다. 같은 가짜 SHA를
 쓴 fixture 통과를 실제 실행 가능성으로 해석하지 않는다.
+
+## 네 번째 통합 체크포인트
+
+collection의 실제 ORT library 식별과 trainer의 Python executable·Torch endpoint
+식별을 나눈 명시적인 학습 window `/2`를 추가했다. 이전 `/1` parser·canonical
+bytes·digest는 보존한다. 새 profile은 optimizer·loss의 부동소수 계수를
+`coefficient-f64-bits-v1`로 봉인하여 Python과 Rust의 JSON 지수 표기 차이를 피한다.
+source와 모델 의미, weights와 raw 파일 hash, collection epoch와 training epoch도
+서로 대체하지 않는다.
+
+historical corpus/checkpoint·unknown 비용 보존·새 child authority·resume/fork/export
+소비자를 연결하고, Rust trainer CLI와 원자적 publication 경로를 작성 중이다.
+저장된 자료의 검증은 과거 native 실행 권한을 재발급하지 않는다. 원 프로세스가
+미회수 상태이면 실제 OS 회수 증거를 요구하며, 완료 이후의 unknown 비용을 0으로
+바꾸지 않는다. 순수 metadata 검사 **35개 통과**를 `f7aabf4`로 공유했고, 후속 소비자
+계약 검사는 Windows **87개 통과·Linux 전용 8개 미실행**, WSL Ubuntu **95개 모두
+통과**했다. 실제 모델·Torch tensor 복원·optimizer·학습의 인수가 아니다.
+
+기본·`onnx-cpu` 단독·`pals-adaptive` 단독 UCI 라이브러리의 세 컴파일 조합이
+통과했다. 앞선 원격 `215442d`의 네 CPU/bindings/model job 실패는 optional
+dependency를 기본 feature에서 참조한 동일 오류였다. 소스에서 feature 경계를
+수정했으며 원 실패 로그를 보존한다. 이 로컬 컴파일 결과를 새 HEAD의 CI 성공으로
+표시하지 않는다.
+
+실제 Candidate/Counter/Repair admission, retired Fresh, Rules terminal과 명시적
+round 종료를 공통 Frontier에 전달하는 manager hook을 등록했다. 첫 탐색 재검사에서
+**824개 통과·1개 실패·기존 선택 실행 2개 미실행**을 관측했다. 실패는 selection
+seal 전에 전체 완료 depth를 기대한 새 fixture였다. terminal 의무와 전체 선택
+완료를 구분하도록 fixture를 수정하고 재검사하며, 제품 완료 조건을 완화하지 않는다.
+
+같은 등록 단위를 수정 뒤 재실행하여 search **825개 통과·기존 선택 실행 2개
+미실행**, `pals-adaptive,onnx-cpu` UCI **617개 통과**, experiments **236개 통과**를
+확인했다. 관리 빌드의 자식 종료·임시 경로 정리도 확인했다. 기존 준비·corpus의
+9개 Python 모듈은 현재 소스에서 Windows **93개 통과·Linux 전용 9개 미실행**,
+WSL **102개 통과**다. 앞의 95개 소비자 묶음과 겹치는 검사가 있어 두 수를 독립
+검사 총수로 합산하지 않는다. 이는 작업 중인 소스의 CPU 계약 검사이며, 새 제품
+entry·실제 NNUEC R·GPU·학습의 인수로 확대하지 않는다.
+
+남은 실제 조립은 다음과 같다.
+
+- 네 모드 제품 UCI entry, 실제 `go`별 root admission, 초기화·새 게임·ponder·정리.
+- 원 node quota를 먼저 청구한 PCR 전이와 GoalLocal 후속 작업. 일반 검색의 passive
+  mate 전파, 명시 mate의 PCR missing defense, 정확 거리의 UCI 출력도 연결한다.
+- 최초 준비 전후 동일 semantic·ledger·actor·Ready worker를 이동하고, 후속 질문마다
+  실제 view-bound NNUEC 설치·namespace·R 결과의 P/C 소비를 연결한다.
+- actual collection 목적의 명시 startup, 원 Rules replay·teacher·R readout·divergence
+  출처와 durable publication을 연결한다. V-free profile의 task는 미지원/unknown을
+  보존하고 별도 PCV 실행을 추가하지 않는다.
+- trainer CLI와 실제 부모·child, 비학습 tensor 복원·export, 네 모드 신경망·로컬
+  GPU 수치·물리 수명과 최종 SHA CI를 각각 인수한다.
+
+성능·기력 비교와 실제 학습은 이 checkpoint에 포함하지 않는다. O01~O04의 조건부
+후속 연구를 기반 구현의 선행 조건으로 추가하지 않는다.
