@@ -218,24 +218,24 @@ impl UtilityInterventionSourceObserver<AdaptivePortQuestion> for SourceObserver 
         snapshot: UtilityInterventionSourceSnapshot<AdaptivePortQuestion>,
     ) -> UtilityInterventionSourceDisposition<AdaptivePortQuestion> {
         let Some(owner) = self.shared.upgrade() else {
-            return UtilityInterventionSourceDisposition::Rejected(
+            return UtilityInterventionSourceDisposition::Rejected(Box::new(
                 UtilityInterventionTrialAdmissionRejection {
                     snapshot,
                     loaded: Arc::clone(&self.loaded),
                     error: AdaptiveManagerError::Invalid("cohort original owner unavailable"),
                 },
-            );
+            ));
         };
         let mut state = match owner.try_lock() {
             Ok(state) => state,
             Err(_) => {
-                return UtilityInterventionSourceDisposition::Rejected(
+                return UtilityInterventionSourceDisposition::Rejected(Box::new(
                     UtilityInterventionTrialAdmissionRejection {
                         snapshot,
                         loaded: Arc::clone(&self.loaded),
                         error: AdaptiveManagerError::Invalid("cohort owner unavailable"),
                     },
-                );
+                ));
             }
         };
         if !snapshot.has_target(state.profile.target_record) {
@@ -252,13 +252,13 @@ impl UtilityInterventionSourceObserver<AdaptivePortQuestion> for SourceObserver 
                     state.owner = Some(owner);
                 }
                 Err(error) => {
-                    return UtilityInterventionSourceDisposition::Rejected(
+                    return UtilityInterventionSourceDisposition::Rejected(Box::new(
                         UtilityInterventionTrialAdmissionRejection {
                             snapshot,
                             loaded: Arc::clone(&self.loaded),
                             error,
                         },
-                    );
+                    ));
                 }
             }
         }
@@ -268,8 +268,8 @@ impl UtilityInterventionSourceObserver<AdaptivePortQuestion> for SourceObserver 
             return UtilityInterventionSourceDisposition::ContinuePrelude;
         };
         match owner.admit_trial(snapshot, recipient, Arc::clone(&self.loaded)) {
-            Ok(trial) => UtilityInterventionSourceDisposition::Trial(trial),
-            Err(rejected) => UtilityInterventionSourceDisposition::Rejected(rejected),
+            Ok(trial) => UtilityInterventionSourceDisposition::Trial(Box::new(trial)),
+            Err(rejected) => UtilityInterventionSourceDisposition::Rejected(Box::new(rejected)),
         }
     }
 }

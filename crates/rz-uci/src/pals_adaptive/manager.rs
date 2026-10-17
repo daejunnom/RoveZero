@@ -319,6 +319,17 @@ pub struct CandidateFrame<Q> {
 /// Rules lines and commit hot facts; they MUST NOT run a model, CPU search,
 /// archive I/O, an external pipe drain, or wait for a worker. Archive effects
 /// remain with the independent archive owner and finish after worker fences.
+/// A failed target bind returns every original owner to the caller.
+pub type UtilityInterventionTargetBinding<Q> = Result<
+    rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionTarget<Q>,
+    (
+        AdaptiveManagerError,
+        rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
+        rz_search::pals::coordinator::UtilityInterventionReadySource<Q>,
+        Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
+    ),
+>;
+
 pub trait AdaptiveSearchDriver<Q> {
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn utility_cohort_common_work(
@@ -374,15 +385,7 @@ pub trait AdaptiveSearchDriver<Q> {
         preparation: rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
         source: rz_search::pals::coordinator::UtilityInterventionReadySource<Q>,
         input: Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
-    ) -> Result<
-        rz_search::pals::engine::adaptive_port::utility_route::UtilityInterventionTarget<Q>,
-        (
-            AdaptiveManagerError,
-            rz_search::pals::engine::adaptive_port::utility_route::UtilityRoutePreparation,
-            rz_search::pals::coordinator::UtilityInterventionReadySource<Q>,
-            Arc<rz_search::cpu_value::nnuec::v2::utility_capture::NnuecUtilityInputCapture>,
-        ),
-    > {
+    ) -> UtilityInterventionTargetBinding<Q> {
         Err((
             AdaptiveManagerError::Invalid("intervention target factory unsupported"),
             preparation,

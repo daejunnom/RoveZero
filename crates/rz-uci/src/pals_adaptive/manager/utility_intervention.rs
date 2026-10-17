@@ -17,8 +17,8 @@ pub trait UtilityInterventionSourceObserver<Q>: Send {
 }
 pub enum UtilityInterventionSourceDisposition<Q> {
     ContinuePrelude,
-    Trial(UtilityInterventionTrialAdmission<Q>),
-    Rejected(UtilityInterventionTrialAdmissionRejection<Q>),
+    Trial(Box<UtilityInterventionTrialAdmission<Q>>),
+    Rejected(Box<UtilityInterventionTrialAdmissionRejection<Q>>),
 }
 pub(super) struct UtilityInterventionState<Q> {
     pub(super) profile: Digest,
@@ -207,6 +207,7 @@ where
         match result {
             UtilityInterventionSourceDisposition::ContinuePrelude => Ok(false),
             UtilityInterventionSourceDisposition::Rejected(r) => {
+                let r = *r;
                 let error = r.error.clone();
                 self.utility_intervention
                     .as_mut()
@@ -215,6 +216,7 @@ where
                 Err(error)
             }
             UtilityInterventionSourceDisposition::Trial(trial) => {
+                let trial = *trial;
                 let valid = trial.profile_digest() == bounds.0
                     && trial.snapshot.authority() == self.registration.authority
                     && trial.snapshot.root_budget()
