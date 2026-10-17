@@ -299,7 +299,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             hash.update([
                 pair.anchors,
                 pair.role as u8,
-                u8::from(pair.perspective == Color::Black),
+                u8::from(pair.perspective == rz_contracts::Color::Black),
             ]);
             hash.update(pair.model.0);
             hash.update(pair.encoding.0);
