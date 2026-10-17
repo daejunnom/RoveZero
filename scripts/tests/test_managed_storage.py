@@ -43,6 +43,28 @@ class StorageTests(unittest.TestCase):
         second.finish(exit_code=0, tree_gone=True)
         self.assertEqual(self.model.read_bytes(), b"retained-original")
 
+    @unittest.skipUnless(os.name == "nt", "Windows CreateProcessW start boundary")
+    def test_definite_windows_non_start_releases_only_its_owned_lease_and_scratch(self):
+        owner = self.acquire()
+        invalid_program = self.source / "invalid-managed-program.exe"
+        invalid_program.write_bytes(b"not a Windows executable\n")
+        (owner.target / "retained-cache").write_bytes(b"cache")
+        (owner.scratch / "unstarted-remnant").write_bytes(b"owned temporary")
+        with patch.dict(os.environ, {"CARGO_TARGET_DIR": str(owner.target)}):
+            environment = owner.environment()
+        code, gone, failure = run_group(
+            [str(invalid_program)], self.source, environment, 5, lambda: None)
+        self.assertEqual((code, gone), (125, True))
+        self.assertEqual(failure["kind"], "windows_process_not_started")
+        self.assertEqual(failure["winerror"], 193)
+        receipt = owner.finish(exit_code=code, tree_gone=gone, supervisor_error=failure)
+        self.assertTrue(receipt["temporary_removed"])
+        self.assertFalse(owner.scratch.exists())
+        self.assertFalse(owner.lock.exists())
+        self.assertEqual(receipt["supervisor_error"], failure)
+        self.assertEqual((owner.target / "retained-cache").read_bytes(), b"cache")
+        self.assertEqual(self.model.read_bytes(), b"retained-original")
+
     def test_post_run_budget_reset_preserves_source(self):
         owner = self.acquire(slot_limit=16_384, total_limit=49_152)
         (owner.target / "too-large").write_bytes(b"x" * 20_000)
@@ -286,6 +308,39 @@ class StorageTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows CreateProcessW start boundary")
+    def test_invalid_windows_executable_is_definitely_not_started(self):
+        with tempfile.TemporaryDirectory(prefix="rovezero-invalid-process-") as directory:
+            program = Path(directory) / "invalid.exe"
+            program.write_bytes(b"not a Windows executable\n")
+            admitted = []
+            code, gone, failure = run_group(
+                [str(program)], directory, os.environ.copy(), 5,
+                lambda: admitted.append(True))
+            self.assertEqual(code, 125)
+            self.assertIs(gone, True)
+            self.assertEqual(admitted, [])
+            self.assertIsInstance(failure, dict)
+            self.assertEqual(failure["kind"], "windows_process_not_started")
+            self.assertEqual(failure["stage"], "CreateProcessW")
+            self.assertIs(failure["process_created"], False)
+            self.assertEqual(failure["winerror"], 193)
+            self.assertIn("193", failure["message"])
+            self.assertEqual(json.loads(json.dumps(failure)), failure)
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job-owned stdlib child")
+    def test_windows_stdlib_child_runs_and_keeps_success_result_unchanged(self):
+        with tempfile.TemporaryDirectory(prefix="rovezero-stdlib-process-") as directory:
+            marker = Path(directory) / "completed"
+            program = f"from pathlib import Path; Path({str(marker)!r}).write_text('ran',encoding='utf-8')"
+            code, gone, failure = run_group(
+                [sys.executable, "-I", "-S", "-c", program],
+                directory, os.environ.copy(), 5, lambda: None)
+            self.assertEqual(code, 0)
+            self.assertIs(gone, True)
+            self.assertIsNone(failure)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "ran")
+
     def test_normal_exit_and_orphan_descendant_are_drained(self):
         with tempfile.TemporaryDirectory(prefix="rovezero-owned-process-") as directory:
             marker = Path(directory) / "late-write"
