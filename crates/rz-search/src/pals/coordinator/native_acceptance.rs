@@ -365,6 +365,32 @@ impl<V, O: super::ProposerRankingOutput> RoleTicketRegistry<V, O> {
 }
 
 impl<V, O> RoleTicketRegistry<V, O> {
+    /// Check custody of an original reciprocal acceptance permit after this
+    /// registry revoked its delivered ticket. This grants neither acceptance
+    /// nor release: the caller must retain the permit/output until the actual
+    /// native fence, and must independently verify its own cancellation ACK.
+    pub fn validate_revoked_reciprocal_native_permit(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        permit: &NativeAcceptancePermit,
+    ) -> Result<(), CoordinatorError> {
+        let held = self.match_ticket_mut(ticket)?;
+        if permit.ticket() != ticket
+            || held.phase != TicketPhase::Delivered
+            || !held.revoked
+            || !held.successful_payload
+            || held.native_acceptance_issued != Some(permit.seal)
+            || held.native_acceptance_confirmed
+            || !permit.seal.reciprocal
+            || held.reciprocal_output_digest != Some(permit.output_digest())
+        {
+            return Err(CoordinatorError::IdentityMismatch(
+                "revoked reciprocal original ticket/head/permit",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn issue_reciprocal_native_acceptance(
         &mut self,
         ticket: &RoleTicketEnvelope,

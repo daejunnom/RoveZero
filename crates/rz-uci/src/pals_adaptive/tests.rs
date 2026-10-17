@@ -66,6 +66,13 @@ struct NativeFacts {
     started: Mutex<Vec<RoleTicketEnvelope>>,
     accepted: Mutex<Vec<RoleTicketEnvelope>>,
     child_gate: AtomicBool,
+    /// Fixture-only scheduling barrier for a queued first acceptance ACK:
+    /// let its run finish, then hold the second run on the native owner.
+    block_after_first_run: AtomicBool,
+    release_first_run: AtomicBool,
+    reject_acceptance: AtomicBool,
+    prepared: std::sync::atomic::AtomicU64,
+    quiesce_called: AtomicBool,
     finish_called: AtomicBool,
     factories: std::sync::atomic::AtomicU64,
 }
@@ -105,6 +112,7 @@ impl<Q: Clone + Send + Sync + 'static> TicketNativeBackend<ReviewView, Q> for Na
             record_revision: 0,
             role: question.role,
         };
+        self.facts.prepared.fetch_add(1, Ordering::Release);
         Ok((key, key))
     }
     fn prepared_host_bytes(&self, _: &Self::Prepared) -> u64 {
@@ -117,10 +125,19 @@ impl<Q: Clone + Send + Sync + 'static> TicketNativeBackend<ReviewView, Q> for Na
         _: &Self::Prepared,
         canceled: &AtomicBool,
     ) -> TicketPhysicalResult<Self::Output> {
-        self.facts.started.lock().unwrap().push(*ticket);
+        let started_number = {
+            let mut started = self.facts.started.lock().unwrap();
+            started.push(*ticket);
+            started.len()
+        };
         let until = Instant::now() + Duration::from_secs(2);
-        while !question.view.query().prefix.is_empty()
-            && !self.facts.child_gate.load(Ordering::Acquire)
+        let block_after_first = self.facts.block_after_first_run.load(Ordering::Acquire);
+        let blocked_run =
+            !question.view.query().prefix.is_empty() && (!block_after_first || started_number > 1);
+        while (block_after_first
+            && started_number == 1
+            && !self.facts.release_first_run.load(Ordering::Acquire))
+            || (blocked_run && !self.facts.child_gate.load(Ordering::Acquire))
         {
             if canceled.load(Ordering::Acquire) || Instant::now() >= until {
                 return TicketPhysicalResult {
@@ -202,6 +219,7 @@ impl<Q: Clone + Send + Sync + 'static> TicketNativeBackend<ReviewView, Q> for Na
             || output.authority != ticket.authority
             || output.key != ticket.representation
             || ticket.view.view_digest.0 != question.view.seal_digest()
+            || self.facts.reject_acceptance.load(Ordering::Acquire)
         {
             return Err(RoleFailure::InvalidOutput);
         }
@@ -218,6 +236,7 @@ impl<Q: Clone + Send + Sync + 'static> TicketNativeBackend<ReviewView, Q> for Na
     fn quiesce(&mut self, _: Instant) -> bool {
         // This authored CPU backend has no pending physical buffers after
         // service.run returns. It is not GPU completion evidence.
+        self.facts.quiesce_called.store(true, Ordering::Release);
         self.finish_ok
     }
 }

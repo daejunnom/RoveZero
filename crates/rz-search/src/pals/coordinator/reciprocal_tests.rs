@@ -215,6 +215,109 @@ fn accepted_policy_at(
 }
 
 #[test]
+fn revoked_reciprocal_permit_check_never_grants_acceptance_or_releases_credit() {
+    use crate::pals::coordinator::{
+        NativeAcceptanceIssuer, PhysicalRoleCompletion, RoleCompletion, RoleTicketRegistry,
+    };
+    use rz_contracts::pals::{RoleOutput, RolePayload};
+    let mut registry = RoleTicketRegistry::<u64, RoleOutput>::new(
+        authority(),
+        512,
+        rz_runtime::adaptive::CoordinatorPolicy::Fixed,
+        1,
+    )
+    .unwrap();
+    let (issuer, verifier) = NativeAcceptanceIssuer::new_pair();
+    registry
+        .register_native_acceptance_verifier(verifier)
+        .unwrap();
+    let mut issued = Vec::new();
+    for sequence in 1..=2 {
+        let ticket = registry
+            .admit(
+                submission(sequence),
+                Arc::new(sequence),
+                deadline().clock,
+                MonotonicTick(0),
+            )
+            .unwrap();
+        registry.take_dispatch().unwrap();
+        registry
+            .complete_reciprocal_role(RoleCompletion {
+                ticket,
+                physical: PhysicalRoleCompletion::Confirmed,
+                result: Ok(RoleOutput {
+                    id: ticket.id,
+                    authority: ticket.authority,
+                    key: ticket.representation,
+                    payload: RolePayload::Proposal {
+                        candidate_logits: vec![sequence as f32],
+                        wdl: rz_contracts::Wdl::try_new(0.25, 0.5, 0.25, 0.0).unwrap(),
+                    },
+                    private_latent: vec![0.0; 16 * 384],
+                }),
+            })
+            .unwrap();
+        registry
+            .take_ready(deadline().clock, MonotonicTick(0))
+            .unwrap();
+        let permit = registry
+            .issue_reciprocal_native_acceptance(&ticket, deadline().clock, MonotonicTick(0))
+            .unwrap();
+        issued.push((ticket, permit));
+    }
+    let (first, first_permit) = &issued[0];
+    assert!(
+        registry
+            .validate_revoked_reciprocal_native_permit(first, first_permit)
+            .is_err()
+    );
+    registry.revoke_all();
+    let before = registry.cumulative_observation();
+    registry
+        .validate_revoked_reciprocal_native_permit(first, first_permit)
+        .unwrap();
+    assert_eq!(registry.cumulative_observation(), before);
+    assert_eq!(registry.occupancy(), 2);
+    assert_eq!(registry.phase(first.id), Some(TicketPhase::Delivered));
+    let mut foreign = *first;
+    foreign.authority.root.0 += 1;
+    assert!(
+        registry
+            .validate_revoked_reciprocal_native_permit(&foreign, first_permit)
+            .is_err()
+    );
+    let mut changed = *first;
+    changed.question = Digest([99; 32]);
+    assert!(
+        registry
+            .validate_revoked_reciprocal_native_permit(&changed, first_permit)
+            .is_err()
+    );
+    assert!(
+        registry
+            .validate_revoked_reciprocal_native_permit(first, &issued[1].1)
+            .is_err()
+    );
+    assert_eq!(registry.cumulative_observation(), before);
+    // A custody match cannot restore logical permission, even with an actual
+    // issuer's success receipt for the original permit.
+    let (ticket, permit) = issued.remove(0);
+    assert!(
+        registry
+            .accept_reciprocal_native(
+                issuer.issue_success(permit),
+                deadline().clock,
+                MonotonicTick(0)
+            )
+            .is_err()
+    );
+    assert_eq!(registry.phase(ticket.id), Some(TicketPhase::Delivered));
+    assert_eq!(registry.occupancy(), 2);
+    assert_eq!(registry.cumulative_observation(), before);
+}
+
+#[test]
 fn accepted_role_checkpoint_keeps_original_execution_until_child_returns() {
     let mut machine = machine(ExecutionMode::CpuPcr);
     let parent = parent(&mut machine, RefinementStage::ProposalContinuation);

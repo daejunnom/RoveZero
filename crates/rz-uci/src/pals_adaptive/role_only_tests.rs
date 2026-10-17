@@ -473,3 +473,154 @@ fn role_only_stop_drains_pending_native_inputs_without_consuming_late_heads() {
     assert_eq!(receipt.counters.cpu_slice_receipts, 0);
     assert_eq!(receipt.pending_tickets, 0);
 }
+
+#[test]
+fn role_only_close_consumes_original_prepared_after_native_controls_retire() {
+    let (mut manager, facts, until) = role_only_fixture(false);
+    // Stop polling after both original preparations were queued. Neither is
+    // admitted to a role ticket, and neither native run can start yet.
+    while manager.counters().native_preparations < 2 {
+        assert!(Instant::now() < until);
+        manager.tick().unwrap();
+        thread::sleep(Duration::from_millis(1));
+    }
+    while facts.prepared.load(Ordering::Acquire) < 2 {
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(manager.pending_tickets(), 0);
+    let cleanup_until = Instant::now() + WINDOW;
+    manager.begin_root_quiesce(cleanup_until).unwrap();
+    // The actual owner removes canceled unsubmitted controls before calling
+    // backend.quiesce. Its original Prepared events are still waiting for the
+    // manager, so re-canceling those IDs here would return UnknownPreparation.
+    while !facts.quiesce_called.load(Ordering::Acquire) {
+        assert!(Instant::now() < cleanup_until);
+        thread::sleep(Duration::from_millis(1));
+    }
+    let receipt = manager
+        .run_root_until(cleanup_until, &AtomicBool::new(false))
+        .unwrap();
+    assert!(receipt.permits_semantic_closure(), "{receipt:?}");
+    assert!(
+        manager.failures().next().is_none(),
+        "{:?}",
+        manager.failures().collect::<Vec<_>>()
+    );
+    assert_eq!(receipt.counters.canceled_preparations, 2);
+    assert_eq!(receipt.counters.submitted_role_tickets, 0);
+    assert_eq!(receipt.counters.physical_role_completions, 0);
+    assert_eq!(receipt.counters.consumed_role_outputs, 0);
+    assert_eq!(receipt.retained_outputs, 0);
+    let mut sources = manager
+        .into_sources()
+        .unwrap_or_else(|(_, error)| panic!("NoR prepared cancellation physical closure: {error}"));
+    assert_eq!(sources.driver.discarded, 2);
+    assert_eq!(sources.driver.stores.review_pin_count().unwrap(), 0);
+    sources.native.begin_shutdown(cleanup_until);
+    while !sources.native.try_join().unwrap() {
+        assert!(Instant::now() < cleanup_until);
+        sources.native.poll();
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn role_only_stop_keeps_canceled_issued_acceptance_until_the_actual_fence() {
+    for process_shutdown in [false, true] {
+        let (mut manager, facts, until) = role_only_fixture(true);
+        facts.block_after_first_run.store(true, Ordering::Release);
+        // Dispatch both native runs without delivering the first completion.
+        // The second run then occupies the actual owner while the first ACK
+        // is enqueued. No fabricated Retired event or copied permit is used.
+        while manager.pending_tickets() < 2 {
+            assert!(Instant::now() < until);
+            manager.tick().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        facts.release_first_run.store(true, Ordering::Release);
+        while facts.started.lock().unwrap().len() < 2 {
+            assert!(
+                Instant::now() < until,
+                "second native fixture run did not start"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        manager.tick().unwrap();
+        assert_eq!(manager.driver().consumed.len(), 0);
+        assert_eq!(facts.accepted.lock().unwrap().len(), 0);
+        assert_eq!(
+            manager
+                .shutdown_receipt()
+                .unwrap()
+                .counters
+                .physical_role_completions,
+            1
+        );
+
+        let cleanup_until = Instant::now() + WINDOW;
+        if process_shutdown {
+            manager.begin_shutdown(cleanup_until).unwrap();
+        } else {
+            manager.begin_root_quiesce(cleanup_until).unwrap();
+        }
+        let receipt = manager
+            .run_root_until(cleanup_until, &AtomicBool::new(false))
+            .unwrap();
+        assert!(receipt.permits_semantic_closure(), "{receipt:?}");
+        assert!(
+            manager.failures().next().is_none(),
+            "{:?}",
+            manager.failures().collect::<Vec<_>>()
+        );
+        assert_eq!(receipt.canceled_acceptance_acks, 1);
+        assert_eq!(receipt.expired_acceptance_acks, 0);
+        assert_eq!(receipt.counters.submitted_role_tickets, 2);
+        assert_eq!(receipt.counters.accepted_nn_inputs, 0);
+        assert_eq!(receipt.counters.consumed_role_outputs, 0);
+        assert_eq!(receipt.counters.unused_role_results, 2);
+        assert_eq!(receipt.pending_tickets, 0);
+        assert_eq!(receipt.retained_outputs, 0);
+        assert_eq!(manager.driver().consumed.len(), 0);
+        assert_eq!(facts.accepted.lock().unwrap().len(), 0);
+        let mut sources = manager
+            .into_sources()
+            .unwrap_or_else(|(_, error)| panic!("NoR canceled ACK physical closure: {error}"));
+        assert_eq!(sources.driver.discarded, 2);
+        assert_eq!(sources.driver.stores.review_pin_count().unwrap(), 0);
+        sources.native.begin_shutdown(cleanup_until);
+        while !sources.native.try_join().unwrap() {
+            assert!(Instant::now() < cleanup_until);
+            sources.native.poll();
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+#[test]
+fn role_only_non_cancel_acceptance_rejection_is_not_hidden_by_cleanup() {
+    let (mut manager, facts, until) = role_only_fixture(false);
+    facts.reject_acceptance.store(true, Ordering::Release);
+    let receipt = manager
+        .run_root_until(until, &AtomicBool::new(false))
+        .unwrap();
+    assert!(receipt.permits_semantic_closure(), "{receipt:?}");
+    assert!(manager.failures().any(|failure| matches!(
+        failure,
+        AdaptiveManagerError::Invalid("P/C native retirement/ack differs")
+    )));
+    assert_eq!(receipt.counters.accepted_nn_inputs, 0);
+    assert_eq!(receipt.counters.consumed_role_outputs, 0);
+    assert_eq!(manager.driver().consumed.len(), 0);
+    assert_eq!(facts.accepted.lock().unwrap().len(), 0);
+    let mut sources = manager
+        .into_sources()
+        .unwrap_or_else(|(_, error)| panic!("NoR rejected ACK physical closure: {error}"));
+    assert_eq!(sources.driver.stores.review_pin_count().unwrap(), 0);
+    sources.native.begin_shutdown(until);
+    while !sources.native.try_join().unwrap() {
+        assert!(Instant::now() < until);
+        sources.native.poll();
+        thread::sleep(Duration::from_millis(1));
+    }
+}

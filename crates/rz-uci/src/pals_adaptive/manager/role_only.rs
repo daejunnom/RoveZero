@@ -82,6 +82,7 @@ struct RoleOnlyBinding<Q, O> {
     preparation: PreparationId,
     input: FrameInput<ReviewView, Q>,
     ticket: Option<RoleTicketEnvelope>,
+    prepared_observed: bool,
     dispatch_pending: bool,
     dispatched: bool,
     owner_run_started: bool,
@@ -89,6 +90,9 @@ struct RoleOnlyBinding<Q, O> {
     physical: Option<TicketExecutionEvidence>,
     delivered: Option<Arc<O>>,
     ack_accepted: Option<bool>,
+    ack_dispatched: bool,
+    cancellation_requested: bool,
+    revoked_acceptance: Option<RoleFailure>,
     retired: bool,
     accepted: Option<AcceptedRoleStep>,
     collection_dispatched: bool,
@@ -125,6 +129,10 @@ pub struct RoleOnlyShutdownReceipt {
     pub quarantined: bool,
     pub request_sequence_high_water: u64,
     pub counters: AdaptiveManagerCounters,
+    /// Actual owner ACK rejections after this root revoked an issued permit.
+    /// These are unused results, never accepted NN inputs or search work.
+    pub canceled_acceptance_acks: u64,
+    pub expired_acceptance_acks: u64,
     pub review_leases: RoventReviewLeaseObservation,
     native_root_fence: Option<NativeRootFence>,
     close_mode: AdaptiveCloseMode,
@@ -175,6 +183,8 @@ where
     cleanup_boundary: Option<CleanupBoundary>,
     effective_clock: Option<crate::rovent_ponder::RoventPonderClockHandle>,
     counters: AdaptiveManagerCounters,
+    canceled_acceptance_acks: u64,
+    expired_acceptance_acks: u64,
     accounting: AdaptiveNativeAccountingSnapshot,
     review_leases: RoventReviewLeaseObservation,
     failures: VecDeque<AdaptiveManagerError>,
@@ -274,6 +284,8 @@ where
             cleanup_boundary: None,
             effective_clock: None,
             counters: AdaptiveManagerCounters::default(),
+            canceled_acceptance_acks: 0,
+            expired_acceptance_acks: 0,
             accounting: AdaptiveNativeAccountingSnapshot::default(),
             review_leases: RoventReviewLeaseObservation::new(registration.role_tickets_max),
             failures: VecDeque::with_capacity(64),
@@ -547,6 +559,7 @@ where
                 preparation,
                 input: self.pending_input.take().expect("same pending input"),
                 ticket: None,
+                prepared_observed: false,
                 dispatch_pending: false,
                 dispatched: false,
                 owner_run_started: false,
@@ -554,6 +567,9 @@ where
                 physical: None,
                 delivered: None,
                 ack_accepted: None,
+                ack_dispatched: false,
+                cancellation_requested: false,
+                revoked_acceptance: None,
                 retired: false,
                 accepted: None,
                 collection_dispatched: false,
@@ -657,6 +673,13 @@ where
         Ok(changed)
     }
     fn flush_acks(&mut self) -> Result<(), AdaptiveManagerError> {
+        // Root/process close already asks the actual native owner to dispose
+        // of every held ticket. Keep unsent ACKs and their original permits
+        // here until that fence instead of enqueueing new commands that could
+        // race the owner's completed root cleanup.
+        if self.phase != ManagerPhase::Running {
+            return Ok(());
+        }
         while let Some(mut ack) = self.acks.pop_front() {
             let result = if let Some(permit) = ack.permit.take() {
                 match self
@@ -680,6 +703,8 @@ where
                     Err(error.into())
                 };
             }
+            let index = self.index(ack.ticket)?;
+            self.bindings[index].ack_dispatched = true;
         }
         Ok(())
     }
@@ -687,7 +712,7 @@ where
         let mut changed = false;
         let mut index = 0;
         while index < self.bindings.len() {
-            if !self.bindings[index].retired {
+            if !self.bindings[index].retired || self.bindings[index].revoked_acceptance.is_some() {
                 index += 1;
                 continue;
             }
@@ -750,6 +775,53 @@ where
         }
         Ok(changed)
     }
+    fn is_revoked_acceptance_ack(
+        &mut self,
+        index: usize,
+        ticket: &RoleTicketEnvelope,
+        accepted: bool,
+        result: &Result<(), RoleFailure>,
+        permit: &NativeAcceptancePermit,
+        has_native_receipt: bool,
+    ) -> bool {
+        let binding = &self.bindings[index];
+        let actual_expiry = self.clock.try_now().ok().is_some_and(|now| {
+            self.clock.domain() == ticket.original_deadline.clock
+                && now.0 >= ticket.original_deadline.at.0
+        });
+        let cancellation_failure = match result {
+            Err(RoleFailure::Canceled) => true,
+            Err(RoleFailure::Expired) => actual_expiry,
+            _ => false,
+        };
+        if self.phase != ManagerPhase::Draining
+            || self.shutdown_until.is_none()
+            || ticket.authority != self.registration.authority
+            || ticket.original_deadline != self.deadline
+            || accepted
+            || has_native_receipt
+            || !binding.cancellation_requested
+            || !binding.ack_dispatched
+            || binding.ack_accepted != Some(true)
+            || binding.retired
+            || binding.revoked_acceptance.is_some()
+            || binding.accepted.is_some()
+            || !binding.service_completed
+            || !cancellation_failure
+            || binding.delivered.as_ref().and_then(|output| {
+                rz_search::pals::coordinator::native_acceptance_output_digest(
+                    output.proposer_ranking_output(),
+                )
+                .ok()
+            }) != Some(permit.output_digest())
+        {
+            return false;
+        }
+        self.registry
+            .validate_revoked_reciprocal_native_permit(ticket, permit)
+            .is_ok()
+    }
+
     fn mark_consumed(&mut self, index: usize) -> Result<(), AdaptiveManagerError> {
         let binding = &self.bindings[index];
         if binding.consumption_recorded {
@@ -827,6 +899,7 @@ where
                     ))?;
                 let input = &self.bindings[index].input;
                 if self.bindings[index].ticket.is_some()
+                    || self.bindings[index].prepared_observed
                     || input.question_digest != prepared.question
                     || input.view_seal != prepared.view
                     || input.stage.role() != Some(prepared.role)
@@ -836,8 +909,18 @@ where
                         "P/C native prepared immutable echo",
                     ));
                 }
+                self.bindings[index].prepared_observed = true;
                 if self.phase != ManagerPhase::Running || self.now().is_err() {
-                    self.native.cancel(prepared.preparation)?;
+                    // Close may already have canceled this exact original
+                    // preparation. The worker can then dispose of it and
+                    // publish PreparationFailed before this older Prepared
+                    // echo is consumed. Do not issue a redundant cancel after
+                    // its control has retired; an unproven/missing original
+                    // preparation still takes the strict native error path.
+                    if !self.bindings[index].cancellation_requested {
+                        self.native.cancel(prepared.preparation)?;
+                        self.bindings[index].cancellation_requested = true;
+                    }
                     self.counters.canceled_preparations += 1;
                     return Ok(());
                 }
@@ -981,19 +1064,55 @@ where
                 native_receipt,
                 rejected_permit,
             } => {
-                if let Some(permit) = rejected_permit {
-                    self.retained_permits.push(permit);
-                }
                 let index = match self.index(ticket) {
                     Ok(index) => index,
                     Err(error) => {
+                        if let Some(permit) = rejected_permit {
+                            self.retained_permits.push(permit);
+                        }
                         if let Some(receipt) = native_receipt {
                             self.retained_receipts.push(receipt);
                         }
                         return Err(error);
                     }
                 };
+                let revoked_ack = rejected_permit.as_ref().is_some_and(|permit| {
+                    self.is_revoked_acceptance_ack(
+                        index,
+                        &ticket,
+                        accepted,
+                        &result,
+                        permit,
+                        native_receipt.is_some(),
+                    )
+                });
+                let had_rejected_permit = rejected_permit.is_some();
+                if let Some(permit) = rejected_permit {
+                    self.retained_permits.push(permit);
+                }
+                if revoked_ack {
+                    let failure = result.expect_err("validated canceled/expired native ACK");
+                    let counter = if failure == RoleFailure::Canceled {
+                        &mut self.canceled_acceptance_acks
+                    } else {
+                        &mut self.expired_acceptance_acks
+                    };
+                    *counter = counter
+                        .checked_add(1)
+                        .ok_or(AdaptiveManagerError::Capacity(
+                            "P/C revoked native acceptance acknowledgement counter",
+                        ))?;
+                    // backend.accept did not succeed and the native owner
+                    // still holds this original output. Neither a cancel nor
+                    // this error ACK releases its view or permit. Only the
+                    // actual root/process fence below may retire this binding.
+                    self.bindings[index].revoked_acceptance = Some(failure);
+                    self.bindings[index].retired = true;
+                    return Ok(());
+                }
                 if result.is_err()
+                    || had_rejected_permit
+                    || !self.bindings[index].ack_dispatched
                     || self.bindings[index].ack_accepted != Some(accepted)
                     || self.bindings[index].retired
                 {
@@ -1163,8 +1282,8 @@ where
         // prepare's returned question proves this owner never admitted its
         // physical lease. Keep it through semantic discard, then release it.
         self.pending_preparation = None;
-        for binding in &self.bindings {
-            self.native.cancel(binding.preparation).ok();
+        for binding in &mut self.bindings {
+            binding.cancellation_requested |= self.native.cancel(binding.preparation).is_ok();
         }
         match mode {
             AdaptiveCloseMode::RootQuiesce => {
@@ -1315,6 +1434,8 @@ where
             quarantined: self.phase == ManagerPhase::Quarantined || self.native.is_quarantined(),
             request_sequence_high_water: self.registry.next_request_sequence().saturating_sub(1),
             counters: self.counters,
+            canceled_acceptance_acks: self.canceled_acceptance_acks,
+            expired_acceptance_acks: self.expired_acceptance_acks,
             review_leases: leases,
             native_root_fence: self.native_root_fence,
             close_mode: self.close_mode,
