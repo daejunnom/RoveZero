@@ -96,6 +96,7 @@ struct Delivered {
 struct ProbeState {
     runs: usize,
     delivered: Option<Delivered>,
+    failure: Option<SearchSessionFailure>,
     release: bool,
     observed_hit: bool,
     returned: bool,
@@ -110,9 +111,21 @@ impl ProbeGate {
         let state = self.state.lock().unwrap();
         let (state, _) = self
             .changed
-            .wait_timeout_while(state, Duration::from_secs(5), |state| !predicate(state))
+            .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                !predicate(state) && state.failure.is_none()
+            })
             .unwrap();
+        assert!(
+            state.failure.is_none(),
+            "actual probe worker failed before the requested observation: {:?}",
+            state.failure
+        );
         assert!(predicate(&state), "bounded actual worker observation");
+    }
+    fn retain_failure(&self, failure: SearchSessionFailure) -> SearchSessionFailure {
+        self.state.lock().unwrap().failure = Some(failure.clone());
+        self.changed.notify_all();
+        failure
     }
     fn delivered(&self) -> Delivered {
         self.wait_for(|state| state.delivered.is_some());
@@ -195,7 +208,12 @@ impl SearchSessionDriver for SourceAdmissionProbe {
             .original_start
             .as_ref()
             .expect("actual dispatch must issue private Start custody");
-        source.verify(position, context, &self.clock).unwrap();
+        source
+            .verify(position, context, &self.clock)
+            .map_err(|error| {
+                self.gate
+                    .retain_failure(SearchSessionFailure::debug("PonderStartSource", &error))
+            })?;
         let root = RoventRootAdmission::admit(
             &source_lock(position, context),
             RoventRootAdmissionPolicy::DynamicGo,
@@ -203,10 +221,16 @@ impl SearchSessionDriver for SourceAdmissionProbe {
             context,
             &self.clock,
         )
-        .map_err(|error| SearchSessionFailure::debug("PonderSourceAdmission", &error))?;
+        .map_err(|error| {
+            self.gate
+                .retain_failure(SearchSessionFailure::debug("PonderSourceAdmission", &error))
+        })?;
         // The report is produced by the pre-existing CPU fixture. No synthetic
         // report or report Arc is injected into the actual output envelope.
-        let report = self.inner.run(position, context, progress)?;
+        let report = self
+            .inner
+            .run(position, context, progress)
+            .map_err(|failure| self.gate.retain_failure(failure))?;
         let clock = context
             .effective_clock
             .as_ref()
@@ -251,6 +275,20 @@ impl SearchSessionDriver for SourceAdmissionProbe {
 
 fn install_probe(owner: &mut Owner, session: &mut Session<RulesUciPort>) -> Arc<ProbeGate> {
     assert!(session.active_ticket().is_none());
+    assert!(owner.active.is_none() && owner.workers.is_empty());
+    // This idle registration matches the wrapped CPU fixture's existing limit
+    // of 8. It is not a root replacement: scope/current Arc/implementation stay
+    // unchanged, and no Go, binding or private Start has been issued yet.
+    let scope = owner.session_owner.lifecycle_scope();
+    owner.settings.search.max_simulations = 8;
+    owner.session_owner = crate::contracts::ContractSessionOwner::new_scope(
+        scope,
+        owner.clock.epoch(),
+        owner.clock.b_clock(),
+        owner.settings.search,
+    )
+    .unwrap();
+    assert_eq!(*owner.scope.lock().unwrap(), scope);
     session
         .set_node_budget_semantics(NodeBudgetSemantics::RoventPositionVisits)
         .unwrap();
@@ -398,6 +436,11 @@ fn actual_start_hit_keeps_worker_and_root_caps_then_publishes_its_report_once() 
     );
     assert!(envelope.report_for(&ticket, scope).unwrap().is_none());
     assert_eq!(delivered.root.requested_nodes(), Some(7));
+    assert_eq!(delivered.context.control.max_simulations, 8);
+    assert_eq!(
+        delivered.context.original_go.as_ref().unwrap().nodes,
+        Some(7)
+    );
     assert_eq!(delivered.root.allowed_root_moves().len(), 2);
     assert_eq!(delivered.root.declared_ceilings().cpu_credit_limit, 0);
     let original = delivered.context.original_time_budget.unwrap();

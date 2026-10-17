@@ -918,7 +918,7 @@ impl RoventNnuecSessionDriver {
             worker,
             actor,
             metadata,
-        } = ready;
+        } = *ready;
         // The declaration is captured only from this actual materialized
         // engine's metadata and accepted Ready, never at deferred startup.
         let registration = PalsCheckerRegistration {

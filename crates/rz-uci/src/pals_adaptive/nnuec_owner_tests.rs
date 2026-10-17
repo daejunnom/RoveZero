@@ -43,7 +43,10 @@ const OWNER_NODES: u64 = 100_000;
 /// stack limits or entering the neural/native execution fixture.
 #[test]
 fn nnuec_owner_inline_layout_observation() {
-    use crate::rovent_bootstrap::nnuec_preparing::{InitialNnuecCleanupOwners, InitialNnuecReady};
+    use crate::rovent_bootstrap::nnuec_preparing::{
+        InitialNnuecCleanup, InitialNnuecCleanupOwners, InitialNnuecReady,
+        InitialNnuecRetainedFailure,
+    };
     use rz_search::pals::engine::PalsEngine;
     use rz_search::pals::engine::adaptive_port::AdaptiveEnginePort;
     use rz_search::pals::engine::preparing_root::{
@@ -81,6 +84,11 @@ fn nnuec_owner_inline_layout_observation() {
             size_of::<InitialNnuecCleanupOwners>(),
         ),
         ("InitialNnuecPreparing", size_of::<InitialNnuecPreparing>()),
+        ("InitialNnuecCleanup", size_of::<InitialNnuecCleanup>()),
+        (
+            "InitialNnuecRetainedFailure",
+            size_of::<InitialNnuecRetainedFailure>(),
+        ),
         ("InitialNnuecReady", size_of::<InitialNnuecReady>()),
         ("InitialNnuecStep", size_of::<InitialNnuecStep>()),
         (
@@ -99,6 +107,19 @@ fn nnuec_owner_inline_layout_observation() {
         ),
     ] {
         eprintln!("NNUEC_OWNER_INLINE {name} {bytes}");
+    }
+    // The actual bundle and final Ready owner may be large on the heap; each
+    // repeated step/failure/cleanup transport must stay small on the stack.
+    for (name, bytes) in [
+        ("Preparing", size_of::<InitialNnuecPreparing>()),
+        ("Cleanup", size_of::<InitialNnuecCleanup>()),
+        ("RetainedFailure", size_of::<InitialNnuecRetainedFailure>()),
+        ("Step", size_of::<InitialNnuecStep>()),
+    ] {
+        assert!(
+            bytes <= 1024,
+            "{name} embeds {bytes} bytes of lifecycle custody inline"
+        );
     }
 }
 
@@ -161,6 +182,7 @@ fn authored_untrained_model() -> Arc<Model> {
 
 #[test]
 fn same_preparing_owner_installs_each_question_and_releases_all_view_pins() {
+    eprintln!("NNUEC_OWNER_STAGE fixture-entered");
     let clock = ContractSystemClock::new(ProcessEpoch(321));
     let until = clock.origin() + OWNER_WINDOW;
     let cleanup_until = until + OWNER_CLEANUP;
@@ -271,6 +293,7 @@ fn same_preparing_owner_installs_each_question_and_releases_all_view_pins() {
         )
         .unwrap();
     preparing.prepare_original_root_rules().unwrap();
+    eprintln!("NNUEC_OWNER_STAGE original-root-prepared");
     assert!(original_store.matches(preparing.stores()));
     assert_eq!(
         preparing
@@ -320,7 +343,8 @@ fn same_preparing_owner_installs_each_question_and_releases_all_view_pins() {
         worker,
         actor,
         metadata,
-    } = ready;
+    } = *ready;
+    eprintln!("NNUEC_OWNER_STAGE actual-initial-ready");
     let AdaptivePreparingRootCustody {
         ledger,
         root_budget,
@@ -385,6 +409,7 @@ fn same_preparing_owner_installs_each_question_and_releases_all_view_pins() {
             Ok(())
         })
         .unwrap();
+    eprintln!("NNUEC_OWNER_STAGE actual-root-completed");
     assert_eq!(manager.phase(), ManagerPhase::Finished);
     assert!(receipt.permits_root_reuse(), "{receipt:?}");
     assert!(
@@ -538,4 +563,5 @@ fn same_preparing_owner_installs_each_question_and_releases_all_view_pins() {
         thread::yield_now();
     }
     assert!(facts.finish_called.load(Ordering::Acquire));
+    eprintln!("NNUEC_OWNER_STAGE actual-owner-released");
 }

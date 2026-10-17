@@ -100,7 +100,7 @@ pub struct InitialNnuecCleanupOwners {
 pub struct InitialNnuecCleanup {
     phase: InitialNnuecPhase,
     failure: Option<InitialNnuecFailure>,
-    owners: InitialNnuecCleanupOwners,
+    owners: Box<InitialNnuecCleanupOwners>,
 }
 impl InitialNnuecCleanup {
     pub fn phase(&self) -> InitialNnuecPhase {
@@ -118,7 +118,7 @@ impl InitialNnuecCleanup {
         Option<InitialNnuecFailure>,
         InitialNnuecCleanupOwners,
     ) {
-        (self.phase, self.failure, self.owners)
+        (self.phase, self.failure, *self.owners)
     }
 }
 
@@ -126,7 +126,7 @@ impl InitialNnuecCleanup {
 pub struct InitialNnuecRetainedFailure {
     phase: InitialNnuecPhase,
     error: InitialNnuecFailure,
-    owners: InitialNnuecCleanupOwners,
+    owners: Box<InitialNnuecCleanupOwners>,
 }
 impl InitialNnuecRetainedFailure {
     pub fn phase(&self) -> InitialNnuecPhase {
@@ -157,14 +157,17 @@ pub struct InitialNnuecReady {
 #[must_use = "pending/failure variants retain real owners and cannot be discarded"]
 pub enum InitialNnuecStep {
     Pending(InitialNnuecPreparing),
-    Ready(InitialNnuecReady),
+    Ready(Box<InitialNnuecReady>),
     RetainedFailure(InitialNnuecRetainedFailure),
 }
 
 #[must_use = "retain this move-only preparation or explicitly transfer cleanup custody"]
 pub struct InitialNnuecPreparing {
     phase: InitialNnuecPhase,
-    owners: InitialNnuecCleanupOwners,
+    // One physical custody allocation survives every Pending/failure/cleanup
+    // transport. Empty Option slots still have the largest owner's inline
+    // layout, so moving the whole bundle at every step is not stack-bounded.
+    owners: Box<InitialNnuecCleanupOwners>,
     worker_owner: CpuWorkerId,
     signal: CompletionSignal,
 }
@@ -179,7 +182,7 @@ impl InitialNnuecPreparing {
     ) -> Self {
         Self {
             phase: InitialNnuecPhase::PrepareReview,
-            owners: InitialNnuecCleanupOwners {
+            owners: Box::new(InitialNnuecCleanupOwners {
                 root: Some(root),
                 actor,
                 original_request: None,
@@ -200,7 +203,7 @@ impl InitialNnuecPreparing {
                 unmatched_materialization: None,
                 preparation_outstanding: false,
                 materialization_outstanding: false,
-            },
+            }),
             worker_owner: owner,
             signal,
         }
@@ -481,13 +484,13 @@ impl InitialNnuecPreparing {
                     (Some(handoff), Some(worker), Some(metadata)) => {
                         let (port, custody) =
                             AdaptiveEnginePort::from_preparing_handoff(handoff).into_parts();
-                        return InitialNnuecStep::Ready(InitialNnuecReady {
+                        return InitialNnuecStep::Ready(Box::new(InitialNnuecReady {
                             port,
                             custody,
                             worker,
                             actor: self.owners.actor,
                             metadata,
-                        });
+                        }));
                     }
                     (handoff, worker, metadata) => {
                         self.owners.root_handoff = handoff;
