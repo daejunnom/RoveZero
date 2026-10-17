@@ -293,3 +293,38 @@ entry·실제 NNUEC R·GPU·학습의 인수로 확대하지 않는다.
 
 성능·기력 비교와 실제 학습은 이 checkpoint에 포함하지 않는다. O01~O04의 조건부
 후속 연구를 기반 구현의 선행 조건으로 추가하지 않는다.
+
+## 다섯 번째 통합 체크포인트
+
+원 `go`를 ponder 정규화 전에 보존하고, startup 자산·설정과 매 검색의 실제
+Rules/history·허용 수·시계·예산을 구분하는 typed root admission을 등록했다.
+기존 simulation 단위와 새 position-visits 단위를 명시적으로 나누며, Rovent
+capability를 등록한 실제 입구만 `nodes 0`을 허용한다. 잘못된 새 `go`는 기존
+검색을 취소하기 전에 거절한다. 과거 root descriptor의 검증은 새 live 권한을
+발급하지 않는다.
+
+PCR의 P/C 선택은 실제 head를 소비하거나 graph를 변경하기 전에 원 controller에서
+Rules 경로를 청구한다. 이미 지불한 snapshot은 재생 없이 채택하며, 원 native
+예약이 살아 있는 `NodesReserved`만 같은 accepted head를 보존한 채 기다린다.
+PreparingRoot는 같은 semantic Store·ledger·Frontier·Source·최초 view/seal·실제
+Ready를 move한다. 일반 검색의 passive mate는 이미 검사한 Rules 증거만 읽는다.
+typed mate 전략과 실제 최종 착수의 연결 및 PCR GoalLocal 발주는 후속이다.
+
+Rust `rz-rovent-trainer` entry, 원자적 corpus publication, historical dataset과
+checkpoint 재검증, 실제 parent/child 호출·boundary publication 소비자를 등록했다.
+이는 실행 가능한 제품 경로의 소스 등록이며, 실제 trainer·tensor 복원·optimizer
+실행 성공은 아직 아니다. 별도 R readout과 auxiliary 자료·teacher worker의 초안은
+이 단위에 섞지 않았으며 원 P/C 자료로 다시 이름 붙이지 않는다.
+
+현재 Python 순수 계약 묶음 189개는 Windows에서 **180개 통과·Linux 전용 9개
+미실행**, WSL Ubuntu에서 **189개 모두 통과**했다. 실제 신경망 import와 optimizer
+실행을 차단했다. 원 producer의 dependency directory·training epoch 0·명시 runtime
+bundle 필드 및 read-budget을 함께 검사한다. 이전의 겹치는 묶음과 합산하지 않는다.
+
+새 Linux 교차 컴파일 첫 두 실행에서는 UCI 연결의 타입 오류 세 건과 Arena의
+RoleFailure 표현·새 PalsError 분기 누락 두 건을 확인했다. 원 실패와 정리 영수증을
+보존하고 좁게 수정했으며, 전체 target·새 회귀 검사 결과는 다음에 별도로 기록한다.
+원격 `95e7a83` CI의 누락된 process-boundary fixture, fdopen 테스트 인수 불일치와
+독립 source pin 거부도 각각 구분한다. 누락 파일과 fixture는 보완했고, 고정 pin은
+최종 소스 감사 후 정확한 literal 조합으로 갱신한다. 이를 exact-HEAD CI 성공으로
+표시하지 않는다.
