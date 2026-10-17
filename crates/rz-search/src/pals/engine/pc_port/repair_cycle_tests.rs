@@ -184,9 +184,9 @@ fn actual_pc_repair_recheck_freezes_two_endpoints_and_emits_conditional_witness(
             query.legal.first().copied()
         };
         let probabilities = if cycle && is_fresh && query.prefix == repaired {
-            [0.75, 0.20, 0.05]
+            [0.75, 0.125, 0.125]
         } else if cycle && is_fresh && query.prefix == rechecked {
-            [0.10, 0.20, 0.70]
+            [0.125, 0.125, 0.75]
         } else {
             [0.25, 0.50, 0.25]
         };
