@@ -19,6 +19,7 @@ use rz_search::pals::coordinator::{
 };
 use rz_search::pals::review_context::ReviewView;
 use rz_search::pals::store::Move16;
+use rz_uci::pals_adaptive::{RoventCollectionRootAdmission, RoventRootRankingAcceptance};
 use rz_uci::pals_native::ticketed::TicketNativeEvent;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -175,12 +176,14 @@ impl RoventInputCaptureReservation {
         )?;
         let captured = capture_submitted_review_v3(&ticket, view, input, &self.context)?;
         let input_sha256 = captured.sha256()?;
-        let raw = json!({"schema":NATIVE_RAW_DOMAIN,"kind":"submitted","sequence":self.context.capture_sequence,
+        let replay =
+            rules_replay::RoventSubmittedRulesReplay::capture(&self.context.actual_position, view)?;
+        let raw = json!({"schema":NATIVE_RAW_RULES_V2_DOMAIN,"kind":"submitted","sequence":self.context.capture_sequence,
             "process_epoch":ticket.id.epoch.0,"game_generation":ticket.authority.game.0,"root_generation":ticket.authority.root.0,
             "request_sequence":ticket.id.sequence,"head":role_name(ticket.role),"source_sha256":self.source_sha256,
             "model_sha256":hex(ticket.representation.model),"encoding_sha256":hex(ticket.representation.encoding),
             "input_digest":hex(ticket.representation.input),"view_digest":hex(ticket.view.view_digest),
-            "input_sha256":input_sha256,"ticket":ticket_json(&ticket)});
+            "input_sha256":input_sha256,"ticket":ticket_json(&ticket),"rules_replay":replay});
         Ok(RoventCapturedInput {
             manifest_sha256: self.manifest_sha256,
             pending: Pending {
@@ -201,6 +204,7 @@ pub struct RoventRetiredRecord {
     record: RoventTrainingRecord,
     manifest_sha256: String,
     ticket: RoleTicketEnvelope,
+    admission: RoventCollectionRootAdmission,
 }
 impl RoventRetiredRecord {
     pub fn input(&self) -> &GenerationInputV3 {
@@ -222,6 +226,7 @@ impl RoventRetiredRecord {
 pub struct PublishedRoventRecord {
     record: RoventTrainingRecord,
     manifest_sha256: String,
+    admission: RoventCollectionRootAdmission,
 }
 impl PublishedRoventRecord {
     pub fn record(&self) -> &RoventTrainingRecord {
@@ -229,6 +234,9 @@ impl PublishedRoventRecord {
     }
     pub fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
+    }
+    pub fn admission(&self) -> &RoventCollectionRootAdmission {
+        &self.admission
     }
 }
 /// Single-writer collector. It neither runs engines nor initiates collection.
@@ -242,6 +250,24 @@ pub struct RoventCorpusProducer {
     retired: BTreeSet<(u64, u64)>,
 }
 impl RoventCorpusProducer {
+    fn validate_admission(
+        &self,
+        admission: &RoventCollectionRootAdmission,
+    ) -> Result<(), ArenaError> {
+        let original = admission.native_origin().raw_receipt();
+        check(
+            original["source_commit"] == self.manifest.source_commit
+                && original["source_sha256"] == self.manifest.source_sha256
+                && original["runtime_sha256_domain"] == "loaded_runtime_library_file_sha256"
+                && original["runtime_library_sha256"] == self.manifest.runtime_sha256
+                && self.manifest.model_semantics_sha256
+                    == hex(Digest(
+                        rz_eval::pals_model::PalsModelProfile::VirtualReviewV1
+                            .registered_semantics_sha256(),
+                    )),
+            "corpus manifest does not join the original loaded Rovent admission",
+        )
+    }
     pub fn new(manifest: RoventCorpusManifest) -> Result<Self, ArenaError> {
         let manifest_sha256 = manifest.sha256()?;
         Ok(Self {
@@ -432,8 +458,9 @@ impl RoventCorpusProducer {
             hex(native_acceptance_output_digest(output).map_err(|e| invalid(format!("{e:?}")))?);
         let completed = self.next()?;
         let pending = self.pending.get_mut(&key).expect("checked pending");
-        let submission_sha = generation_digest(NATIVE_RAW_DOMAIN, &pending.raw_submission)?;
-        let raw = json!({"schema":NATIVE_RAW_DOMAIN,"kind":"completed","sequence":completed,
+        let submission_sha =
+            generation_digest(NATIVE_RAW_RULES_V2_DOMAIN, &pending.raw_submission)?;
+        let raw = json!({"schema":NATIVE_RAW_RULES_V2_DOMAIN,"kind":"completed","sequence":completed,
             "process_epoch":t.id.epoch.0,"game_generation":t.authority.game.0,"root_generation":t.authority.root.0,
             "request_sequence":t.id.sequence,"source_sha256":self.manifest.source_sha256,"head":role_name(t.role),
             "input_sha256":pending.input_sha256,"submitted_sha256":submission_sha,
@@ -465,7 +492,7 @@ impl RoventCorpusProducer {
             accepted_retired: false,
             raw_submission: pending.raw_submission.clone(),
             raw_submission_sha256: submission_sha,
-            raw_completion_sha256: generation_digest(NATIVE_RAW_DOMAIN, &raw)?,
+            raw_completion_sha256: generation_digest(NATIVE_RAW_RULES_V2_DOMAIN, &raw)?,
             raw_completion: raw,
             raw_retirement: Value::Null,
             raw_retirement_sha256: String::new(),
@@ -476,10 +503,53 @@ impl RoventCorpusProducer {
     /// retirement. Rejected/late/quarantined events never publish a training row.
     pub fn retire_accepted(
         &mut self,
+        admission: &RoventCollectionRootAdmission,
         accepted: &AcceptedRoleStep,
         output: &RoleOutput,
     ) -> Result<RoventRetiredRecord, ArenaError> {
         let t = *accepted.ticket();
+        admission
+            .validate_output(&t, output)
+            .map_err(|error| invalid(error.to_string()))?;
+        check(
+            accepted.validates_output(output),
+            "original accepted step/output mismatch",
+        )?;
+        self.retire_original(admission, t, accepted.output_digest(), "accepted_role_step")
+    }
+    /// PCR 최초 P의 원 publication을 별도 실제 proof로 소비한다. 이를
+    /// reciprocal AcceptedRoleStep으로 재발급하거나 변환하지 않는다.
+    pub fn retire_root_ranking(
+        &mut self,
+        accepted: &RoventRootRankingAcceptance,
+        output: &RoleOutput,
+    ) -> Result<RoventRetiredRecord, ArenaError> {
+        let ranking = accepted.ranking();
+        let source = ranking.source();
+        accepted
+            .admission()
+            .validate_output(&source.ticket, output)
+            .map_err(|error| invalid(error.to_string()))?;
+        check(
+            native_acceptance_output_digest(output).map_err(|error| invalid(error.to_string()))?
+                == source.output_digest,
+            "original P publication/output digest mismatch",
+        )?;
+        self.retire_original(
+            accepted.admission(),
+            source.ticket,
+            source.output_digest,
+            "root_ranking_published",
+        )
+    }
+    fn retire_original(
+        &mut self,
+        admission: &RoventCollectionRootAdmission,
+        t: RoleTicketEnvelope,
+        output_digest: Digest,
+        acceptance_kind: &str,
+    ) -> Result<RoventRetiredRecord, ArenaError> {
+        self.validate_admission(admission)?;
         let key = (t.id.epoch.0, t.id.sequence);
         let pending = self
             .pending
@@ -490,9 +560,7 @@ impl RoventCorpusProducer {
             .as_ref()
             .ok_or_else(|| invalid("retirement before physical completion"))?;
         check(
-            pending.ticket == t
-                && accepted.validates_output(output)
-                && completed.output_digest == hex(accepted.output_digest()),
+            pending.ticket == t && completed.output_digest == hex(output_digest),
             "registry retirement/output does not match owner completion",
         )?;
         check(
@@ -502,13 +570,14 @@ impl RoventCorpusProducer {
         let retired = self.next()?;
         let pending = self.pending.remove(&key).expect("checked pending");
         let mut native = pending.completed.expect("checked completed");
-        let raw = json!({"schema":NATIVE_RAW_DOMAIN,"kind":"retired","sequence":retired,
+        let raw = json!({"schema":NATIVE_RAW_RULES_V2_DOMAIN,"kind":"retired","sequence":retired,
             "process_epoch":t.id.epoch.0,"game_generation":t.authority.game.0,"root_generation":t.authority.root.0,
             "request_sequence":t.id.sequence,"head":role_name(t.role),"source_sha256":self.manifest.source_sha256,
             "input_sha256":pending.input_sha256,"submitted_sha256":native.raw_submission_sha256,
             "completed_sha256":native.raw_completion_sha256,"output_digest":native.output_digest,
-            "accepted_retired":true,"ticket":ticket_json(&t)});
-        native.raw_retirement_sha256 = generation_digest(NATIVE_RAW_DOMAIN, &raw)?;
+            "accepted_retired":true,"ticket":ticket_json(&t),"acceptance_kind":acceptance_kind,
+            "root_admission":admission.raw_receipt(),"root_admission_sha256":admission.raw_sha256()});
+        native.raw_retirement_sha256 = generation_digest(NATIVE_RAW_RULES_V2_DOMAIN, &raw)?;
         native.raw_retirement = raw;
         native.retired_sequence = retired;
         native.accepted_retired = true;
@@ -521,6 +590,7 @@ impl RoventCorpusProducer {
         Ok(RoventRetiredRecord {
             manifest_sha256: self.manifest_sha256.clone(),
             ticket: t,
+            admission: admission.clone(),
             record: RoventTrainingRecord {
                 schema: RECORD_DOMAIN.into(),
                 role: pending.input.role,
@@ -555,36 +625,28 @@ impl RoventCorpusProducer {
             row.manifest_sha256 == self.manifest_sha256,
             "retired row belongs to a different corpus/stage owner",
         )?;
-        row.record.seal(&self.manifest)?;
+        self.validate_admission(&row.admission)?;
+        check(
+            row.record.native.raw_retirement["root_admission_sha256"] == row.admission.raw_sha256()
+                && row.record.native.raw_retirement["root_admission"]
+                    == *row.admission.raw_receipt(),
+            "retired row lost its original Rovent root admission",
+        )?;
+        row.record.seal_rules_replay_v2(&self.manifest)?;
         Ok(PublishedRoventRecord {
             record: row.record,
             manifest_sha256: row.manifest_sha256,
+            admission: row.admission,
         })
     }
     pub fn attach_rust_nnuec(
         &self,
-        row: &mut RoventRetiredRecord,
-        input: RustNnuecReference,
+        _row: &mut RoventRetiredRecord,
+        _input: RustNnuecReference,
     ) -> Result<(), ArenaError> {
-        check(
-            input.anchor == row.record.input.rules_anchor && row.record.nnuec_input.is_none(),
-            "NNUEC Rust reference must use the exact submitted Rules anchor",
-        )?;
-        row.record.nnuec_input_sha256 = Some(generation_digest(NNUEC_INPUT_DOMAIN, &input.value)?);
-        row.record.nnuec_model_sha256 = Some(input.model_sha256);
-        row.record.nnuec_semantics = Some(input.semantics);
-        row.record.nnuec_input = Some(input.value);
-        if let Some(target) = &row.record.targets.wdl {
-            row.record.nnuec_wdl = Some(target.clone());
-            let source = row
-                .record
-                .head_sources
-                .get("wdl")
-                .expect("typed WDL attachment owns source")
-                .clone();
-            row.record.head_sources.insert("nnuec_wdl".into(), source);
-        }
-        Ok(())
+        Err(invalid(
+            "MissingOriginalNnuecCapture: research numeric reference is not an original submitted CPU Job/readout/retirement capability",
+        ))
     }
     pub fn attach_actual_wdl(
         &mut self,
@@ -600,7 +662,8 @@ impl RoventCorpusProducer {
         )?;
         let sequence = self.next()?;
         let raw = json!({"schema":HEAD_DOMAIN,"kind":"rules_wdl","input_sha256":row.record.input_sha256,
-            "anchor":input.rules_anchor,"trajectory":outcome.authority,"rules_receipt":outcome.receipt});
+            "anchor":input.rules_anchor,"trajectory":outcome.authority,"rules_receipt":outcome.receipt,
+            "rules_replay":outcome.replay});
         let raw_sha = generation_digest(HEAD_DOMAIN, &raw)?;
         let target = GenerationWdlTargetV3 {
             observed_sequence: sequence,
@@ -627,11 +690,7 @@ impl RoventCorpusProducer {
             anchor: input.rules_anchor.clone(),
         };
         row.record.targets.wdl = Some(target.clone());
-        row.record.head_sources.insert("wdl".into(), source.clone());
-        if row.record.nnuec_input.is_some() {
-            row.record.nnuec_wdl = Some(target);
-            row.record.head_sources.insert("nnuec_wdl".into(), source);
-        }
+        row.record.head_sources.insert("wdl".into(), source);
         Ok(())
     }
 }
@@ -641,34 +700,79 @@ impl RoventCorpusProducer {
 pub struct RoventRulesOutcome {
     authority: GenerationTrajectoryAuthorityV3,
     receipt: Value,
+    replay: RoventActualTrajectoryReplay,
 }
 pub struct RoventGameTrajectory {
     inner: ActualGameTrajectoryV3,
+    initial: RoventRulesPositionReplay,
+    selected_moves: Vec<u16>,
 }
 impl RoventGameTrajectory {
     pub fn begin(game_id: String, initial: Position) -> Result<Self, ArenaError> {
+        let replay = RoventRulesPositionReplay::capture(&initial)?;
         Ok(Self {
             inner: ActualGameTrajectoryV3::begin(game_id, initial)?,
+            initial: replay,
+            selected_moves: Vec::new(),
         })
     }
     pub fn position(&self) -> &Position {
         self.inner.position()
     }
     pub fn play_selected_move(&mut self, movement: BoardMove) -> Result<(), ArenaError> {
-        self.inner.play_pals_move(movement)
+        let packed = Move16::pack(movement)
+            .map_err(|error| invalid(error.to_string()))?
+            .bits();
+        self.inner.play_pals_move(movement)?;
+        self.selected_moves.push(packed);
+        Ok(())
     }
     pub fn finish_rules(&mut self) -> Result<RoventRulesOutcome, ArenaError> {
+        let replay = self.outcome_replay(RoventRulesCompletion::Automatic, None)?;
         let (authority, receipt) = self.inner.terminate_rules()?;
-        Ok(RoventRulesOutcome { authority, receipt })
+        Ok(RoventRulesOutcome {
+            authority,
+            receipt,
+            replay,
+        })
     }
     pub fn claim_rules_draw(
         &mut self,
         reason: rz_position::ClaimReason,
     ) -> Result<RoventRulesOutcome, ArenaError> {
+        let claim = match reason {
+            rz_position::ClaimReason::ThreefoldRepetition => RoventRulesClaim::ThreefoldRepetition,
+            rz_position::ClaimReason::FiftyMove => RoventRulesClaim::FiftyMove,
+        };
+        let replay = self.outcome_replay(RoventRulesCompletion::CurrentClaim, Some(claim))?;
         let (authority, receipt) = self.inner.claim_rules_draw(reason)?;
-        Ok(RoventRulesOutcome { authority, receipt })
+        Ok(RoventRulesOutcome {
+            authority,
+            receipt,
+            replay,
+        })
+    }
+    fn outcome_replay(
+        &self,
+        completion: RoventRulesCompletion,
+        claim: Option<RoventRulesClaim>,
+    ) -> Result<RoventActualTrajectoryReplay, ArenaError> {
+        check(
+            self.selected_moves.len() <= 512,
+            "actual Rules trajectory ply capacity",
+        )?;
+        Ok(RoventActualTrajectoryReplay {
+            schema: ROVENT_ACTUAL_TRAJECTORY_REPLAY.into(),
+            initial: self.initial.clone(),
+            actual_selected_moves: self.selected_moves.clone(),
+            final_position: RoventRulesPositionReplay::capture(self.inner.position())?,
+            completion,
+            claim,
+        })
     }
 }
+/// 연구용 수치 reference다. 원 CPU 질문/입력 시점·worker readout·퇴역
+/// 권한이 없으므로 실제 수집 row의 입력이나 WDL target에 붙일 수 없다.
 pub struct RustNnuecReference {
     anchor: GenerationRulesAnchorV3,
     value: Value,
@@ -676,6 +780,18 @@ pub struct RustNnuecReference {
     semantics: String,
 }
 impl RustNnuecReference {
+    pub fn anchor(&self) -> &GenerationRulesAnchorV3 {
+        &self.anchor
+    }
+    pub fn reference_input(&self) -> &Value {
+        &self.value
+    }
+    pub fn model_sha256(&self) -> &str {
+        &self.model_sha256
+    }
+    pub fn semantics(&self) -> &str {
+        &self.semantics
+    }
     pub fn v1(
         model: &rz_search::cpu_value::nnuec::NnuecModel,
         context: &rz_search::cpu_value::nnuec::NnuecContext,
@@ -760,7 +876,7 @@ impl RoventCorpusWriter {
             row.manifest_sha256 == self.index.manifest_sha256,
             "published row belongs to another corpus writer",
         )?;
-        row.record.validate(&self.manifest)?;
+        row.record.validate_rules_replay_v2(&self.manifest)?;
         let mut bytes = serde_json::to_vec(&row.record).map_err(|e| invalid(e.to_string()))?;
         bytes.push(b'\n');
         let origin = RoventCorpusOrigin::from_record(&row.record);
@@ -836,6 +952,12 @@ pub use teacher::{RoventRegisteredTeacher, RoventTeacherBinding};
 mod native_capture;
 #[cfg(feature = "pals-collection-onnx")]
 pub use native_capture::*;
+#[cfg(feature = "pals-collection-onnx")]
+mod observer;
+#[cfg(feature = "pals-collection-onnx")]
+pub use observer::*;
+mod rules_replay;
+pub use rules_replay::*;
 
 #[cfg(test)]
 mod tests {

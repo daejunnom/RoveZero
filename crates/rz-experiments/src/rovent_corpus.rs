@@ -13,6 +13,9 @@ pub const INDEX_DOMAIN: &str = "rz-rovent-corpus-index/1";
 pub const ORIGIN_DOMAIN: &str = "rz-rovent-training-origin/1";
 pub const HEAD_DOMAIN: &str = "rz-rovent-head-source/1";
 pub const NATIVE_RAW_DOMAIN: &str = "rz-rovent-native-owner-event/1";
+/// Explicit original Rules replay/root-admission evidence. Legacy /1 readers
+/// continue to reject this domain and never upgrade a record implicitly.
+pub const NATIVE_RAW_RULES_V2_DOMAIN: &str = "rz-rovent-native-owner-event/2";
 pub const NNUEC_INPUT_DOMAIN: &str = "rz-rovent-nnuec-reference-input/1";
 pub const MAX_CORPUS_ROWS: usize = 262_144;
 pub const MAX_CHUNK_BYTES: usize = 32 * 1024 * 1024;
@@ -257,6 +260,121 @@ pub struct RoventNativeLifecycle {
 }
 impl RoventNativeLifecycle {
     pub fn validate(&self, manifest: &RoventCorpusManifest) -> Result<(), ManifestError> {
+        self.validate_domain(manifest, NATIVE_RAW_DOMAIN)
+    }
+    pub fn validate_rules_replay_v2(
+        &self,
+        manifest: &RoventCorpusManifest,
+    ) -> Result<(), ManifestError> {
+        self.validate_domain(manifest, NATIVE_RAW_RULES_V2_DOMAIN)?;
+        for (raw, fields) in [
+            (
+                &self.raw_submission,
+                &[
+                    "schema",
+                    "kind",
+                    "sequence",
+                    "process_epoch",
+                    "game_generation",
+                    "root_generation",
+                    "request_sequence",
+                    "head",
+                    "source_sha256",
+                    "model_sha256",
+                    "encoding_sha256",
+                    "input_digest",
+                    "view_digest",
+                    "input_sha256",
+                    "ticket",
+                    "rules_replay",
+                ][..],
+            ),
+            (
+                &self.raw_completion,
+                &[
+                    "schema",
+                    "kind",
+                    "sequence",
+                    "process_epoch",
+                    "game_generation",
+                    "root_generation",
+                    "request_sequence",
+                    "head",
+                    "source_sha256",
+                    "input_sha256",
+                    "submitted_sha256",
+                    "execution_epoch",
+                    "execution_sequence",
+                    "completed_nn_inputs",
+                    "physical_confirmed",
+                    "owner_run_invoked",
+                    "measurement_complete",
+                    "physical_fresh",
+                    "output_digest",
+                    "owner_service_elapsed_ns",
+                    "ticket",
+                    "output",
+                ][..],
+            ),
+            (
+                &self.raw_retirement,
+                &[
+                    "schema",
+                    "kind",
+                    "sequence",
+                    "process_epoch",
+                    "game_generation",
+                    "root_generation",
+                    "request_sequence",
+                    "head",
+                    "source_sha256",
+                    "input_sha256",
+                    "submitted_sha256",
+                    "completed_sha256",
+                    "output_digest",
+                    "accepted_retired",
+                    "ticket",
+                    "acceptance_kind",
+                    "root_admission",
+                    "root_admission_sha256",
+                ][..],
+            ),
+        ] {
+            check(
+                raw.as_object().is_some_and(|object| {
+                    object.len() == fields.len()
+                        && fields.iter().all(|field| object.contains_key(*field))
+                }),
+                "explicit /2 raw field set",
+            )?;
+        }
+        let retirement = &self.raw_retirement;
+        check(
+            matches!(self.head.as_str(), "proposer" | "critic")
+                && self.raw_submission["rules_replay"]["schema"]
+                    == "rz-rovent-submitted-rules-replay/1"
+                && matches!(
+                    retirement["acceptance_kind"].as_str(),
+                    Some("accepted_role_step" | "root_ranking_published")
+                )
+                && (retirement["acceptance_kind"] != "root_ranking_published"
+                    || self.head == "proposer")
+                && retirement["root_admission"]["schema"]
+                    == "rz-rovent-collection-root-admission/1"
+                && retirement["root_admission_sha256"]
+                    == generation_digest(
+                        "rz-rovent-collection-root-admission/1",
+                        &retirement["root_admission"],
+                    )?
+                && retirement["root_admission"]["native_origin"]["purpose"] == "collection",
+            "explicit /2 actual admission and Rules replay body/seal",
+        )
+    }
+    fn validate_domain(
+        &self,
+        manifest: &RoventCorpusManifest,
+        domain: &str,
+    ) -> Result<(), ManifestError> {
         check(
             self.source_sha256 == manifest.source_sha256
                 && self.owner_run_invoked
@@ -296,7 +414,7 @@ impl RoventNativeLifecycle {
             (&self.raw_retirement, &self.raw_retirement_sha256, "retired"),
         ] {
             check(
-                raw["schema"] == NATIVE_RAW_DOMAIN
+                raw["schema"] == domain
                     && raw["kind"] == kind
                     && raw["process_epoch"].as_u64() == Some(self.process_epoch)
                     && raw["game_generation"].as_u64() == Some(self.game_generation)
@@ -304,7 +422,7 @@ impl RoventNativeLifecycle {
                     && raw["request_sequence"].as_u64() == Some(self.request_sequence)
                     && raw["source_sha256"] == self.source_sha256
                     && raw["head"] == self.head
-                    && generation_digest(NATIVE_RAW_DOMAIN, raw)? == *expected,
+                    && generation_digest(domain, raw)? == *expected,
                 "native raw owner receipt body/seal/request",
             )?;
         }
@@ -411,10 +529,30 @@ impl RoventTrainingRecord {
         self.record_sha256 = self.sha256()?;
         self.validate(m)
     }
+    pub fn seal_rules_replay_v2(&mut self, m: &RoventCorpusManifest) -> Result<(), ManifestError> {
+        self.input_sha256 = self.input.sha256()?;
+        self.origin_sha256 = self.origin(m)?;
+        self.record_sha256 = self.sha256()?;
+        self.validate_rules_replay_v2(m)
+    }
     pub fn validate(&self, m: &RoventCorpusManifest) -> Result<(), ManifestError> {
+        self.validate_native_format(m, false)
+    }
+    pub fn validate_rules_replay_v2(&self, m: &RoventCorpusManifest) -> Result<(), ManifestError> {
+        self.validate_native_format(m, true)
+    }
+    fn validate_native_format(
+        &self,
+        m: &RoventCorpusManifest,
+        rules_v2: bool,
+    ) -> Result<(), ManifestError> {
         m.validate()?;
         self.input.validate()?;
-        self.native.validate(m)?;
+        if rules_v2 {
+            self.native.validate_rules_replay_v2(m)?;
+        } else {
+            self.native.validate(m)?;
+        }
         check(
             self.schema == RECORD_DOMAIN
                 && self.role == self.input.role
@@ -713,6 +851,7 @@ impl RoventCorpusIndex {
 pub struct RoventCorpusReader {
     manifest: RoventCorpusManifest,
     index: RoventCorpusIndex,
+    rules_replay_v2: bool,
 }
 impl RoventCorpusReader {
     pub fn new(
@@ -779,7 +918,22 @@ impl RoventCorpusReader {
                 }),
             "unresolved inherited/global ancestor origin",
         )?;
-        Ok(Self { manifest, index })
+        Ok(Self {
+            manifest,
+            index,
+            rules_replay_v2: false,
+        })
+    }
+    /// Explicit /2 data decoder. This does not create a current native,
+    /// physical, Rules-owner or optimizer capability from historical bytes.
+    pub fn new_rules_replay_v2(
+        manifest: RoventCorpusManifest,
+        index: RoventCorpusIndex,
+        ancestors: &[RoventCorpusIndex],
+    ) -> Result<Self, ManifestError> {
+        let mut reader = Self::new(manifest, index, ancestors)?;
+        reader.rules_replay_v2 = true;
+        Ok(reader)
     }
     pub fn manifest(&self) -> &RoventCorpusManifest {
         &self.manifest
@@ -814,7 +968,11 @@ impl RoventCorpusReader {
                 "bounded JSONL row",
             )?;
             let row: RoventTrainingRecord = decode_json(line)?;
-            row.validate(&self.manifest)?;
+            if self.rules_replay_v2 {
+                row.validate_rules_replay_v2(&self.manifest)?;
+            } else {
+                row.validate(&self.manifest)?;
+            }
             check(
                 seen.insert(row.record_sha256.clone())
                     && self
