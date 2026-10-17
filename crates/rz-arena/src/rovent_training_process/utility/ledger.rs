@@ -457,9 +457,11 @@ pub(super) struct UtilityCheckpointBoundary<'a> {
     ledger: &'a UtilityLedger,
     original_tensor_pin: RoventTrainingFilePin,
     original_tensor_projection_pin: RoventTrainingFilePin,
-    states: UtilityStateSeals,
     snapshot_cost: RoventUtilityRecordedCost,
     post_snapshot_cost: RoventUtilityRecordedCost,
+    // checkpoint_projection already checked all five states, the sampler,
+    // original file pins and costs. Keep that exact sealed projection instead
+    // of maintaining a second state copy that publication does not consume.
     projection: Value,
 }
 impl UtilityCheckpointBoundary<'_> {
@@ -469,28 +471,11 @@ impl UtilityCheckpointBoundary<'_> {
     pub(super) fn original_tensor_projection_pin(&self) -> &RoventTrainingFilePin {
         &self.original_tensor_projection_pin
     }
-    pub(super) fn states(&self) -> &UtilityStateSeals {
-        &self.states
-    }
     pub(super) fn completion_receipts(&self) -> &[RoventTrainingFilePin] {
         &self.ledger.completion_receipts
     }
     pub(super) fn ancestor_completion_sha256(&self) -> &[String] {
         &self.ledger.restored.ancestor_completion_sha256
-    }
-    pub(super) fn derived_training_state(&self) -> Result<Value, ArenaError> {
-        self.ledger.derived_state()
-    }
-    pub(super) fn sampler_projection(&self) -> Value {
-        self.ledger
-            .sampler
-            .projection(self.ledger.dataset.context_ids())
-    }
-    pub(super) fn window(&self) -> &RoventUtilityTrainWindow {
-        &self.ledger.window
-    }
-    pub(super) fn preparation(&self) -> &Value {
-        &self.ledger.preparation
     }
     pub(super) fn snapshot_cost(&self) -> RoventUtilityRecordedCost {
         self.snapshot_cost
@@ -501,29 +486,8 @@ impl UtilityCheckpointBoundary<'_> {
     pub(super) fn ancestor_cost(&self) -> RoventUtilityRecordedCost {
         self.ledger.restored.ancestor_cost
     }
-    pub(super) fn completed_updates(&self) -> u64 {
-        self.ledger.completed_updates
-    }
-    pub(super) fn dispatched_updates(&self) -> u64 {
-        self.ledger.dispatched_updates
-    }
-    pub(super) fn ancestor_updates(&self) -> u64 {
-        self.ledger.restored.ancestor_updates
-    }
-    pub(super) fn initial_source_declaration(&self) -> &Value {
-        &self.ledger.restored.initial_source_declaration
-    }
-    pub(super) fn frozen_base_weights_sha256(&self) -> &str {
-        &self.ledger.restored.frozen_base_weights_sha256
-    }
-    pub(super) fn frozen_base_mapping_sha256(&self) -> &str {
-        &self.ledger.restored.frozen_base_mapping_sha256
-    }
     pub(super) fn initial_ledger_projection(&self) -> Value {
         self.ledger.initial_ledger_projection()
-    }
-    pub(super) fn original_begin_payload(&self) -> Option<&Value> {
-        self.ledger.begin_payload.as_ref()
     }
     pub(super) fn projection(&self) -> &Value {
         &self.projection
@@ -1104,9 +1068,6 @@ impl UtilityLedger {
         });
         Ok(&self.pending_update.as_ref().expect("just prepared").body)
     }
-    pub(super) fn pending_receipt_body(&self) -> Option<&Value> {
-        self.pending_update.as_ref().map(|pending| &pending.body)
-    }
     pub(super) fn pending_receipt_bytes(&self) -> Option<&[u8]> {
         self.pending_update
             .as_ref()
@@ -1281,7 +1242,6 @@ impl UtilityLedger {
             ledger: self,
             original_tensor_pin: original_checkpoint.clone(),
             original_tensor_projection_pin: original_tensor_projection.clone(),
-            states: UtilityStateSeals::from_payload(payload)?,
             snapshot_cost: cost(&payload["snapshot_cost"])?,
             post_snapshot_cost: cost(&payload["post_snapshot_cost"])?,
             projection,

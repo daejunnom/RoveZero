@@ -2436,7 +2436,9 @@ pub(super) fn publish_closed_utility_checkpoint(
                 && original.publication.execution_id == source.registration().execution_id
                 && original.window.canonical_sha256()? == source.window().canonical_sha256()?
                 && original.preparation == *source.preparation()
-                && original.dataset.reference() == source.dataset().reference(),
+                && original.dataset.reference() == source.dataset().reference()
+                && original.ancestors.publication_sha256s()
+                    == source.ancestors().publication_sha256s(),
             "normal-close borrow differs from its actual latest running archive",
         )?;
         source.process().checked_timing()?;

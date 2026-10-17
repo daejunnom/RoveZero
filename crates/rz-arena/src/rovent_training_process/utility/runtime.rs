@@ -403,9 +403,6 @@ impl ActualUtilityCheckpointBoundary<'_> {
     pub(super) fn window(&self) -> &RoventUtilityTrainWindow {
         &self.ctx.window
     }
-    pub(super) fn preparation(&self) -> &Value {
-        &self.ctx.preparation
-    }
     pub(super) fn ledger_boundary(&self) -> &UtilityCheckpointBoundary<'_> {
         &self.boundary
     }
