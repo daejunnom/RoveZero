@@ -267,16 +267,25 @@ def _trials(files, profile):
         for name in ("resolved", "comparable"):
             proof._boolean(trial[name], name)
         known, support = trial["target_known_mask"], trial["support_mask"]
-        expected_support = [index >= 4 and ROUTES[index - 4] in routes for index in range(7)]
+        declared_support = [index >= 4 and ROUTES[index - 4] in routes for index in range(7)]
         if (type(known) is not list or len(known) != 7 or any(type(bit) is not bool or bit for bit in known)
                 or type(support) is not list or len(support) != 7
-                or any(type(bit) is not bool for bit in support) or support != expected_support):
-            raise ValueError("intervention original planned support/trial-unknown masks differ")
+                or any(type(bit) is not bool for bit in support)
+                or any(bit and not declared_support[index] for index, bit in enumerate(support))):
+            raise ValueError("intervention original actual support/trial-unknown masks differ")
         reason = trial["unknown_reason"]
         if reason is not None:
             proof._text(reason, 256)
         if trial["comparable"] != (reason is None):
             raise ValueError("intervention original comparable/unknown observation differs")
+        selected_supported = support[4 + ROUTES.index(trial["recipient"])]
+        if ((trial["resolved"] or trial["comparable"] or trial["arm_query"] is not None)
+                and (sum(support) < 2 or not selected_supported)):
+            raise ValueError("intervention actual arm lacks two original eligible declared actions or selected support")
+        if reason == "InsufficientEligibleActions" and (sum(support) >= 2 or trial["arm_query"] is not None):
+            raise ValueError("intervention insufficient eligible actions cannot synthesize a supported arm")
+        if reason == "UnsupportedInterventionArm" and (sum(support) < 2 or selected_supported or trial["arm_query"] is not None):
+            raise ValueError("intervention unsupported original arm cannot become supported")
         proof._cost(trial["cost"], profile)
         if trial["historical_unbound_input"] is not None:
             raise ValueError("intervention/2 cannot import a legacy unbound input projection")
@@ -386,6 +395,8 @@ def _arm(arm, *, trial, original, neutral, source, config):
         if offer["frame_sequence"] == arm["source_frame_sequence"]]
     if len(origins) != 1 or budget != origins[0]["budget"]:
         raise ValueError("intervention arm lacks its original neutral source frame/budget")
+    if origins[0] != _source_offer(trial):
+        raise ValueError("intervention actual arm changed its original fair neutral source")
     origin = origins[0]
     if (origin["original_first_move"] != arm["original_first_move"]
             or origin["deadline_clock"] != arm["deadline_clock"] or origin["deadline_tick"] != arm["deadline_tick"]
@@ -487,7 +498,7 @@ def _materialized_scope(trial, original, neutral, source, config, profile, cohor
 
 def _pairs(files, trials, scopes, physical):
     publication = files.publication()
-    fields_pair = ("schema", "cohort_id", "left_trial_sequence", "right_trial_sequence", "left_trial_sha256",
+    fields_pair = ("schema", "cohort_id", "neutral_target_sha256", "left_trial_sequence", "right_trial_sequence", "left_trial_sha256",
         "right_trial_sha256", "left_recipient", "right_recipient", "preferred", "unknown_reason", "support_mask",
         "target_known_mask", "left_new_witnesses", "right_new_witnesses", "left_whole_wall_ns", "right_whole_wall_ns",
         "cost_scope", "objective")
@@ -505,6 +516,26 @@ def _pairs(files, trials, scopes, physical):
             raise ValueError("intervention duplicate unordered actual trial comparison")
         seen.add(key)
         left, right = trials[left_num - 1], trials[right_num - 1]
+        if (left_num == right_num or physical[left_num]["authority"] == physical[right_num]["authority"]
+                or left["cost"]["clock_epoch"] == right["cost"]["clock_epoch"]
+                or pair["left_trial_sha256"] == pair["right_trial_sha256"]
+                or left["recipient"] == right["recipient"]):
+            raise ValueError("intervention pair repeats an original trial/authority/clock/recipient")
+        neutral_left, neutral_right = left["neutral_target_sha256"], right["neutral_target_sha256"]
+        if neutral_left is not None and neutral_right is not None and neutral_left != neutral_right:
+            raise ValueError("intervention pair original neutral content differs")
+        if pair["neutral_target_sha256"] != (neutral_left if neutral_left is not None else neutral_right):
+            raise ValueError("intervention pair lost its original optional neutral content seal")
+        if pair["neutral_target_sha256"] is not None:
+            sha(pair["neutral_target_sha256"])
+        left_offer, right_offer = _source_offer(left), _source_offer(right)
+        if left_offer["budget"] != right_offer["budget"]:
+            raise ValueError("intervention pair changed original neutral source FrameBudget")
+        if left_num in scopes and right_num in scopes:
+            left_baseline = set(scopes[left_num]["materialization"]["semantic"]["baseline_witnesses"])
+            right_baseline = set(scopes[right_num]["materialization"]["semantic"]["baseline_witnesses"])
+            if left_baseline != right_baseline:
+                raise ValueError("intervention pair changed original semantic baseline witness set")
         for side, number, trial in (("left", left_num, left), ("right", right_num, right)):
             if (sha(pair[side + "_trial_sha256"]) != proof._native_digest(TRIAL_DOMAIN,
                         files.raw_file(publication["trials"][number - 1]["path"]))
@@ -516,12 +547,8 @@ def _pairs(files, trials, scopes, physical):
                 raise ValueError("intervention pair changed actual conditional witness source set")
         a, b = set(pair["left_new_witnesses"]), set(pair["right_new_witnesses"])
         preferred, reason = None, None
-        if (left_num == right_num or pair["left_trial_sha256"] == pair["right_trial_sha256"]
-                or physical[left_num]["authority"] == physical[right_num]["authority"]):
-            reason = "duplicate_independent_trial"
-        elif left["recipient"] == right["recipient"]:
-            reason = "same_recipient"
-        elif not left["comparable"] or not right["comparable"]:
+        if (not left["comparable"] or not right["comparable"]
+                or neutral_left is None or neutral_right is None):
             reason = "unresolved_or_masked_trial"
         elif not a and not b:
             reason = "no_new_valid_witness"
@@ -556,6 +583,18 @@ def _pairs(files, trials, scopes, physical):
     return known, known_sha, all_sha
 
 
+def _source_offer(trial):
+    """The producer's original fair neutral source, never an arm offer."""
+    offers = trial["preparation"]["offers"]
+    for route in ("route_p", "route_r", "route_c"):
+        selected = [offer for offer in offers if offer["recipient"] == route]
+        if selected:
+            if trial["arm_query"] is not None and trial["arm_query"]["source_frame_sequence"] != selected[0]["frame_sequence"]:
+                raise ValueError("intervention actual arm lost its original fair neutral source offer")
+            return selected[0]
+    raise ValueError("intervention original neutral source offer unavailable")
+
+
 def validate_intervention_payloads(files, *, registration):
     """Return saved data candidates only; current Rust authority stays closed."""
     if type(files) is not HistoricalInterventionFiles:
@@ -587,6 +626,7 @@ def validate_intervention_payloads(files, *, registration):
     if final_neutral["target_record"] != profile["target_record"]:
         raise ValueError("intervention common original target differs from registered record")
     originals, scopes, physical, role_queries = {}, {}, {}, []
+    original_support = None
     for trial, ack in zip(trials, acknowledgements, strict=True):
         number = trial["trial_sequence"]
         original = originals[number] = _original_scope(trial, source, profile)
@@ -597,6 +637,10 @@ def validate_intervention_payloads(files, *, registration):
                     or own_input.input_bytes != captured.input_bytes
                     or neutral["model_identity"] != final_neutral["model_identity"]):
                 raise ValueError("intervention independent trials changed common neutral input/Rules/target/model")
+            if original_support is None:
+                original_support = trial["support_mask"]
+            elif trial["support_mask"] != original_support:
+                raise ValueError("intervention same neutral content changed actual supported declared actions")
         elif (trial["neutral_target_sha256"] is not None or trial["arm_query"] is not None
                 or trial["materialized_json"] is not None or trial["resolved"] or trial["comparable"]):
             raise ValueError("intervention unbound trial cannot synthesize an original neutral cap")

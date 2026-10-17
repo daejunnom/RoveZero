@@ -113,7 +113,7 @@ mod tests {
                 {"trial_sequence":1,"recipient":"route_p","question_sha256":"9".repeat(64),"view_sha256":"a".repeat(64),"full_view_sha256":"b".repeat(64)},
                 {"trial_sequence":2,"recipient":"route_c","question_sha256":"c".repeat(64),"view_sha256":"d".repeat(64),"full_view_sha256":"e".repeat(64)}],
             "frozen_pc_sources":[pc("proposer"),pc("critic")],"ancestor_datasets":[],
-            "known_pair_sha256":"f".repeat(64),"all_pair_sha256":"0".repeat(64)
+            "known_pair_sha256":["f".repeat(64)],"all_pair_sha256":["f".repeat(64)]
         })).unwrap();
         prepare_utility_intervention_training(&recipe, &registration, &spec, source).unwrap()
     }

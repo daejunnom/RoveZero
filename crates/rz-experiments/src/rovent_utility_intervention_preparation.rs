@@ -220,8 +220,8 @@ pub struct RoventUtilityInterventionSource {
     pub role_queries: Vec<RoventInterventionRoleQuery>,
     pub frozen_pc_sources: Vec<RoventInterventionFrozenPcSource>,
     pub ancestor_datasets: Vec<RoventInterventionAncestorSource>,
-    pub known_pair_sha256: String,
-    pub all_pair_sha256: String,
+    pub known_pair_sha256: Vec<String>,
+    pub all_pair_sha256: Vec<String>,
 }
 }
 impl RoventUtilityInterventionSource {
@@ -234,8 +234,6 @@ impl RoventUtilityInterventionSource {
                 &self.neutral_target_sha256,
                 &self.neutral_context_sha256,
                 &self.root_rules_sha256,
-                &self.known_pair_sha256,
-                &self.all_pair_sha256,
             ]
             .into_iter()
             .all(|s| generation_sha(s)),
@@ -290,10 +288,29 @@ impl RoventUtilityInterventionSource {
         for source in &self.ancestor_datasets {
             source.validate()?;
             require(
-                publications.insert(source.publication_sha256()),
-                "duplicate original ancestor publication",
+                source.publication_sha256() != self.publication.sha256
+                    && publications.insert(source.publication_sha256()),
+                "duplicate or current original ancestor publication",
             )?;
         }
+        // Keep original publication order: these are complete pair-seal
+        // rosters, not aggregate hashes or sorted replacement lists.
+        for seals in [&self.known_pair_sha256, &self.all_pair_sha256] {
+            require(
+                seals.len() <= 3
+                    && seals.iter().all(|seal| generation_sha(seal))
+                    && seals.iter().collect::<BTreeSet<_>>().len() == seals.len(),
+                "bounded unique original pair-seal lists required",
+            )?;
+        }
+        require(
+            self.known_pair_sha256
+                .iter()
+                .all(|seal| self.all_pair_sha256.contains(seal))
+                && self.all_pair_sha256.len()
+                    <= self.role_queries.len() * (self.role_queries.len() - 1) / 2,
+            "known pair seals must retain their original complete pair coverage",
+        )?;
         Ok(())
     }
 }
@@ -523,7 +540,7 @@ mod tests {
             "ancestor_datasets": [{"kind": "r_auxiliary", "publication_sha256": "a".repeat(64),
                 "metadata": {"manifest_file_sha256": "b".repeat(64), "index_file_sha256": "c".repeat(64),
                     "canonical_manifest_sha256": "d".repeat(64), "canonical_index_sha256": "e".repeat(64)}}],
-            "known_pair_sha256": "f".repeat(64), "all_pair_sha256": "0".repeat(64),
+            "known_pair_sha256": ["f".repeat(64)], "all_pair_sha256": ["f".repeat(64)],
         })).unwrap()
     }
     fn prepared() -> Preparation {
@@ -667,5 +684,46 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn pair_rosters_are_exact_unique_lists_and_known_is_an_original_subset() {
+        let original = source();
+        original.validate().unwrap();
+        for mutation in 0..4 {
+            let mut changed = original.clone();
+            match mutation {
+                0 => changed
+                    .known_pair_sha256
+                    .push(changed.known_pair_sha256[0].clone()),
+                1 => changed
+                    .all_pair_sha256
+                    .push(changed.all_pair_sha256[0].clone()),
+                2 => changed.known_pair_sha256[0] = "0".repeat(64),
+                3 => changed.all_pair_sha256.push("0".repeat(64)),
+                _ => unreachable!(),
+            }
+            assert!(
+                changed.validate().is_err(),
+                "pair roster mutation {mutation}"
+            );
+        }
+        let mut raw = serde_json::to_value(prepared()).unwrap();
+        raw["intervention_source"]["known_pair_sha256"] = json!("f".repeat(64));
+        assert!(Preparation::from_json(&raw.to_string()).is_err());
+    }
+
+    #[test]
+    fn current_intervention_publication_cannot_be_its_own_ancestor() {
+        let mut changed = source();
+        let publication = changed.publication.sha256.clone();
+        let RoventInterventionAncestorSource::RAuxiliary {
+            publication_sha256, ..
+        } = &mut changed.ancestor_datasets[0]
+        else {
+            unreachable!()
+        };
+        *publication_sha256 = publication;
+        assert!(changed.validate().is_err());
     }
 }
