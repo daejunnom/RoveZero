@@ -14,6 +14,7 @@ mod cost;
 mod dataset;
 mod execution;
 mod execution_v2;
+mod intervention;
 mod ledger;
 mod registration_cohort;
 pub mod runtime;
@@ -33,6 +34,7 @@ pub use dataset::{
 };
 pub use execution::*;
 pub use execution_v2::*;
+pub use intervention::*;
 pub use registration::*;
 pub use registration_cohort::*;
 pub use runtime::{
