@@ -513,6 +513,7 @@ def _materialization_input(body, trial, source, config):
     projected_input = {**original_input, "root_rules": _rules_projection(original_input.get("root_rules")),
         "source_rules": [_rules_projection(item) for item in _array(original_input.get("source_rules"), 64)]}
     captured = structure._input(projected_input, root, config)
+    _input_submission_seal(original_input)
     if captured.base_weights_sha256 != source["source_pins"]["frozen_nnuec_model_sha256"]:
         raise ValueError("utility cohort input changed original frozen NNUEC parameters")
     frozen = trial["frozen_context"]
@@ -528,6 +529,21 @@ def _materialization_input(body, trial, source, config):
     if frozen["root_rules_sha256"] != source["rules_root"]["anchor"]["rules_state_sha256"]:
         raise ValueError("utility cohort exact original Rules root differs from source replay")
     return captured, root, authority
+
+
+def _input_submission_seal(value):
+    """Match the producer's immutable view framing, not numerical NN input."""
+    provenance = value["provenance"]
+    seal = hashlib.sha256(b"rz-pals-review-view-seal/1\0")
+    seal.update(bytes.fromhex(sha(provenance["full_view_sha256"])))
+    for name in ("sequence", "generation", "root_state"):
+        seal.update(uint(provenance[name]).to_bytes(8, "little"))
+    for record in _array(value["records_metadata"], 64):
+        seal.update(uint(record["source_revision"]).to_bytes(8, "little"))
+        seal.update(uint(record["source_state"]).to_bytes(8, "little"))
+        seal.update(uint(record["source_line_offset"], 65535).to_bytes(2, "little"))
+    if seal.hexdigest() != sha(provenance["view_seal_sha256"]):
+        raise ValueError("utility cohort original submitted view seal/source revision framing differs")
 
 
 def _rules_projection(value):

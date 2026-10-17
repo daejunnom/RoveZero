@@ -200,6 +200,20 @@ def wire_artifact(path, body):
     return {**file_pin(path, body), "source": "synthetic parser fixture; no loaded source owner", "license": "fixture-only"}
 
 
+def seal_fixture_submitted_view(value):
+    """Independent original producer frame for a NEW synthetic submission."""
+    provenance = value["provenance"]
+    frame = b"rz-pals-review-view-seal/1\0" + bytes.fromhex(provenance["full_view_sha256"])
+    frame += b"".join(provenance[key].to_bytes(8, "little") for key in ("sequence", "generation", "root_state"))
+    for record in value["records_metadata"]:
+        frame += record["source_revision"].to_bytes(8, "little")
+        frame += record["source_state"].to_bytes(8, "little")
+        frame += record["source_line_offset"].to_bytes(2, "little")
+    provenance["view_seal_sha256"] = hashlib.sha256(frame).hexdigest()
+    value["submission_target_sha256"] = hashlib.sha256(b"rz-nnuec-submitted-utility-submission-target/1\0"
+        + bytes.fromhex(provenance["view_seal_sha256"]) + value["target_sha256"].encode("ascii")).hexdigest()
+
+
 def full_cpu_plan():
     # Independently declared full CPU_PC plan; no external fixture's partial
     # lock/resources object is treated as a valid full execution manifest.
@@ -345,6 +359,7 @@ def full_cohort_case(*, resource_known=True, materialized=True, change_trial=Non
         # its materialized capture and original selected Ready view must name
         # that same policy before either the trial or source is registered.
         inp["provenance"]["policy_sha256"] = legacy["context_policy"]
+        seal_fixture_submitted_view(inp)
         legacy.update(process_epoch=epoch, deadline_clock=epoch, question_digest=h("synthetic cohort question " + str(ordinal)),
             view_digest=inp["provenance"]["view_seal_sha256"], view_sequence=inp["provenance"]["sequence"])
         legacy["representation"].update(model=pc_artifact["sha256"], encoding=origin["encoding_sha256"], frozen_epoch=origin["frozen_epoch"])
@@ -885,11 +900,31 @@ class UtilityCohortPayloadStrictTests(unittest.TestCase):
                 if ordinal == 0:
                     provenance = materialization["input"]["provenance"]
                     provenance[key] = provenance[key] + 1 if key == "sequence" else h("different " + key)
+                    seal_fixture_submitted_view(materialization["input"])
             with self.subTest(key=key), full_cohort_files(change_trial=alter) as (files, prepared, _expected):
                 # The fixture recomputes enclosing file/native/ACK seals. The
                 # input remains distinct from the original immutable offer.
                 with self.assertRaisesRegex(ValueError, "input provenance differs from its original root/selected ready view"):
                     reader.validate_cohort_payloads(files, preparation=prepared)
+
+    def test_original_view_seal_preserves_source_revision_state_and_u16_offset(self):
+        for key in ("source_revision", "source_state", "source_line_offset"):
+            def alter(_trial, materialization, ordinal):
+                if ordinal == 0:
+                    # Keep target/source grouping intact while altering the
+                    # original metadata covered by the unchanged view seal.
+                    for record in materialization["input"]["records_metadata"]:
+                        record[key] += 1
+            with self.subTest(key=key), full_cohort_files(change_trial=alter) as (files, prepared, _expected):
+                with self.assertRaisesRegex(ValueError, "submitted view seal/source revision framing"):
+                    reader.validate_cohort_payloads(files, preparation=prepared)
+
+        def overflow_offset(_trial, materialization, ordinal):
+            if ordinal == 0:
+                materialization["input"]["records_metadata"][0]["source_line_offset"] = 65536
+        with full_cohort_files(change_trial=overflow_offset) as (files, prepared, _expected):
+            with self.assertRaises(ValueError):
+                reader.validate_cohort_payloads(files, preparation=prepared)
 
     def test_full_cohort_without_materializations_preserves_original_frozen_capture_as_unknown(self):
         with full_cohort_files(materialized=False) as (files, prepared, expected):
