@@ -307,7 +307,8 @@ impl RoventCorpusProducerV2 {
                     == *row.admission.raw_receipt(),
             "raw3 row lost original admission",
         )?;
-        row.record.seal(&self.manifest)
+        row.record.seal(&self.manifest)?;
+        Ok(())
     }
     pub fn attach_actual_wdl(
         &mut self,
