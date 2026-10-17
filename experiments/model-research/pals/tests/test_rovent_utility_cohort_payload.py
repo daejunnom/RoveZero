@@ -1,8 +1,8 @@
 """Strict cohort profile/ACK observations, never a fabricated trial/target.
 
 The file owner below comes from actual tiny temporary-file pin readback. All
-payloads remain synthetic test data; the unimplemented source/witness/final
-closure boundaries must not become known targets merely by recomputing hashes.
+payloads remain synthetic test data; historical source/witness/final closure
+metadata cannot issue live authority merely by recomputing hashes.
 Profile, native byte framing and typed ACK expectations follow the Rust source
 independently of the new payload reader's helpers. No model is initialized.
 """
@@ -435,7 +435,7 @@ def full_cohort_case(*, resource_known=True, materialized=True, change_trial=Non
                 "original_first_move": 64, "deadline_clock": epoch, "deadline_tick": root["deadline_tick"],
                 "frozen_context_sha256": h("synthetic original common frozen semantic scope"), "cost_epoch_sha256": cost_epoch,
                 "cost_scope": COHORT_SCOPE},
-            "semantic": {"baseline_witnesses": [], "new_witnesses": [], "witness_preimages": [],
+            "semantic": {"baseline_witnesses": [], "new_witnesses": [], "witness_preimages": [], "witness_basis": [],
                 "pc_consumption": [{"origin": accepted_origin, "question_sha256": accepted_origin["ticket"]["question_sha256"],
                     "view": copy.deepcopy(view), "full_view_sha256": inp["provenance"]["full_view_sha256"]}],
                 "dependencies": [], "r_selected_pc_consumption": [], "native_executions": []}}
@@ -499,6 +499,11 @@ def full_cohort_case(*, resource_known=True, materialized=True, change_trial=Non
     ack = typed_ack(publication, publication_body, blobs)
     for ordinal, item in enumerate(ack["trial_acknowledgements"]):
         item["collection_io"].update(clock_epoch=ordinal + 1, started_tick_ns=230, finished_tick_ns=232)
+    # Only the full entry joins the final publisher to the last trial clock.
+    # The independent ACK-only fixtures retain their separate clock epochs.
+    final_start = ack["trial_acknowledgements"][-1]["collection_io"]["finished_tick_ns"] + 1
+    ack["collection_io"].update(clock_epoch=trials[-1]["cost"]["clock_epoch"],
+        started_tick_ns=final_start, finished_tick_ns=final_start + ack["collection_io"]["elapsed_ns"])
     config = copy.deepcopy(weights["base"]["config"])
     spec = {"hidden_width": 2, "input_width": 5,
         "wire_to_parameter": {name: "utility." + name for name in ("hidden_weights", "hidden_bias", "output_weights", "output_bias")},
@@ -794,6 +799,81 @@ class UtilityCohortPayloadStrictTests(unittest.TestCase):
             self.assertEqual(result["input"].input_json, expected["input"]["reference_json"])
             self.assertIs(result["input"].observation()["training_target_authorized"], False)
             self.assertIs(files.observation()["physical_completion_verified"], False)
+
+        def missing_original_bodies(trial, materialization, _ordinal):
+            materialization["semantic"]["witness_preimages"] = None
+            materialization["semantic"]["witness_basis"] = None
+            trial["comparable"] = False
+            trial["unknown_reason"] = "missing_original_conditional_witness_bodies"
+
+        with self.subTest(case="missing_original_witness_bodies"), full_cohort_files(
+                resource_known=False, change_trial=missing_original_bodies) as (files, prepared, expected):
+            # The original bodies were not captured. Re-sealing all enclosing
+            # files and causal ACKs does not turn this absence into a target.
+            result = reader.validate_cohort_payloads(files, preparation=prepared)
+            self.assertEqual(result["report"]["known_pairs"], [])
+            self.assertEqual(result["report"]["known_pair_sha256"], [])
+            self.assertEqual(result["report"]["all_pair_sha256"], [expected["pair_sha256"]])
+            self.assertIsNone(expected["pair"]["preferred"])
+            self.assertEqual(expected["pair"]["unknown_reason"], "unresolved_or_masked_trial")
+            self.assertEqual(expected["pair"]["target_known_mask"], [False] * 7)
+            for trial in expected["trials"]:
+                self.assertIs(trial["resolved"], True)
+                self.assertIs(trial["comparable"], False)
+                self.assertEqual(trial["unknown_reason"], "missing_original_conditional_witness_bodies")
+                semantic = json.loads(trial["materialized_json"])["semantic"]
+                self.assertEqual(semantic["new_witnesses"], [])
+                self.assertIsNone(semantic["witness_preimages"])
+                self.assertIsNone(semantic["witness_basis"])
+            self.assertEqual(result["input"].input_json, expected["input"]["reference_json"])
+            self.assertIs(result["input"].observation()["training_target_authorized"], False)
+            self.assertIs(files.observation()["physical_completion_verified"], False)
+
+    def test_original_conditional_basis_absence_and_raw_corruption_never_become_complete(self):
+        # Isolate the byte/metadata adapter. These synthetic bytes are not a
+        # Core comparison certificate, a live witness or a known learner pair.
+        witness = {"observation": 7, "kind": "Counter", "identity_sha256": h("synthetic witness"),
+            "source_question_sha256": h("synthetic question"), "source_frame_sequence": 2,
+            "raw_evidence_sha256": h("synthetic raw evidence"), "line": [64]}
+        row = {name: copy.deepcopy(value) for name, value in witness.items() if name != "line"}
+        row.update(basis=None, unavailable_reason="missing_original_comparison")
+        scope = {"trial": {"recipient": "route_p"}, "materialization": {
+            "prelude": {"offers": [{"recipient": "route_p", "budget": {"original_store_byte_limit": 1024}}]},
+            "semantic": {"new_witnesses": [witness], "witness_preimages": [{"preimage_bytes": 1}],
+                "witness_basis": [row]}}}
+        self.assertIs(reader._witness_basis(scope), False)
+        for reason in (None, "", "accepted", True):
+            altered = copy.deepcopy(scope)
+            altered["materialization"]["semantic"]["witness_basis"][0]["unavailable_reason"] = reason
+            with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, "unavailable basis reason"):
+                reader._witness_basis(altered)
+        altered = copy.deepcopy(scope)
+        altered["materialization"]["semantic"]["witness_basis"][0]["observation"] = 8
+        with self.assertRaisesRegex(ValueError, "witness/basis metadata"):
+            reader._witness_basis(altered)
+        for change, message in ((lambda basis: basis.update(bytes=3), "byte count"),
+                (lambda basis: basis.update(sha256=h("different raw bytes")), "raw byte SHA"),
+                (lambda basis: basis.update(domain="rz-rovent-utility-actual-conditional-witness/1"), "domain"),
+                (lambda basis: basis.update(original_json=chr(0xD800)), "UTF8 JSON string")):
+            altered = copy.deepcopy(scope)
+            target = altered["materialization"]["semantic"]["witness_basis"][0]
+            target.update(basis={"domain": reader.BASIS_DOMAIN, "sha256": hashlib.sha256(b"{}").hexdigest(),
+                "bytes": 2, "original_json": "{}"}, unavailable_reason=None)
+            change(target["basis"])
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                reader._witness_basis(altered)
+
+    def test_materialized_input_cannot_rebind_its_selected_ready_view_provenance(self):
+        for key in ("sequence", "full_view_sha256", "policy_sha256"):
+            def alter(_trial, materialization, ordinal):
+                if ordinal == 0:
+                    provenance = materialization["input"]["provenance"]
+                    provenance[key] = provenance[key] + 1 if key == "sequence" else h("different " + key)
+            with self.subTest(key=key), full_cohort_files(change_trial=alter) as (files, prepared, _expected):
+                # The fixture recomputes enclosing file/native/ACK seals. The
+                # input remains distinct from the original immutable offer.
+                with self.assertRaisesRegex(ValueError, "input provenance differs from its original root/selected ready view"):
+                    reader.validate_cohort_payloads(files, preparation=prepared)
 
     def test_full_cohort_without_materializations_preserves_original_frozen_capture_as_unknown(self):
         with full_cohort_files(materialized=False) as (files, prepared, expected):

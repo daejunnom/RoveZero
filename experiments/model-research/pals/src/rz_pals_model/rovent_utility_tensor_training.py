@@ -280,6 +280,13 @@ def _create_utility_owner(model, preparation, *, sampler,
     with _LOCK:
         caller_rng = capture_rng(cuda_devices)
         try:
+            # Parameter deepcopy creates fresh storages and does not preserve
+            # an existing .grad. Inspect the caller's original ownership first
+            # so cloning cannot conceal aliases or discard unfinished work.
+            original_parameters, _ = _validate_actual(model, preparation, torch)
+            _device_roster(original_parameters, cuda_devices)
+            if any(value.grad is not None for value in original_parameters.values()):
+                raise ValueError("utility initialization cannot discard existing gradients")
             scratch = copy.deepcopy(model)
             parameters, metadata = _validate_actual(scratch, preparation, torch)
             _device_roster(parameters, cuda_devices)

@@ -37,6 +37,7 @@ PROFILE_DOMAIN = "rz-rovent-utility-comparison-cohort/1"
 TRIAL_DOMAIN = "rz-rovent-utility-cohort-trial/1"
 MATERIALIZATION_DOMAIN = "rz-rovent-utility-cohort-materialization/1"
 PAIR_DOMAIN = "rz-rovent-utility-cohort-pair/1"
+BASIS_DOMAIN = "rz-rovent-utility-cohort-conditional-basis/1"
 COST_DOMAIN = "rz-rovent-utility-cohort-cost/1"
 MAX_PROFILE_BYTES = 64 << 10
 MAX_WINDOW_NS = 86_400_000_000_000
@@ -593,6 +594,14 @@ def _materialization_scope(body, trial, source, config, profile, *, cohort_id):
     if len(selected) != 1 or any(selected[0][key] != action[key] for key in (
             "frame_sequence", "question_sha256", "original_first_move", "deadline_clock", "deadline_tick")):
         raise ValueError("utility cohort action differs from its original selected ready offer")
+    offer, provenance = selected[0], body["input"]["provenance"]
+    if (provenance["root_state"] != root["store_root_state"]
+            or provenance["generation"] != root["root_generation"]
+            or provenance["sequence"] != offer["view"]["sequence"]
+            or provenance["view_seal_sha256"] != offer["view"]["view_digest"]
+            or provenance["full_view_sha256"] != offer["full_view_sha256"]
+            or provenance["policy_sha256"] != offer["view"]["context_policy_sha256"]):
+        raise ValueError("utility cohort input provenance differs from its original root/selected ready view")
     return {"input": captured, "root": root, "authority": authority, "resource_known": resource_known,
         "materialization": body, "trial": trial}
 
@@ -676,9 +685,9 @@ def _accepted(value, authority, root):
 def _semantic_core(scope):
     body, trial, root, authority = (scope[name] for name in ("materialization", "trial", "root", "authority"))
     value, action = body["semantic"], body["action"]
-    keys = ("baseline_witnesses", "new_witnesses", "pc_consumption", "dependencies", "r_selected_pc_consumption", "native_executions")
-    extra = ("witness_preimages",) if type(value) is dict and "witness_preimages" in value else ()
-    fields(value, (*keys, *extra), "utility cohort original semantic consumption")
+    fields(value, ("baseline_witnesses", "new_witnesses", "witness_preimages", "witness_basis",
+        "pc_consumption", "dependencies", "r_selected_pc_consumption", "native_executions"),
+        "utility cohort original semantic consumption")
     baseline = corpus._sha_list(value["baseline_witnesses"], 65536, "cohort baseline witness set")
     identities = set()
     for witness in _array(value["new_witnesses"], 64):
@@ -843,6 +852,233 @@ def _witness_bodies(scope):
     # The Rust parent alone consumes the remaining observation traversal and
     # replays its conditional Rules certificate before admitting a learner.
     return True
+
+
+def _basis_digest_bytes(value):
+    values = _array(value, 32)
+    if len(values) != 32:
+        raise ValueError("utility cohort original basis digest bytes required")
+    return bytes(uint(item, 255) for item in values).hex()
+
+
+def _basis_snapshot(value):
+    """Check replay operands only; Rust alone replays their Rules meaning."""
+    fields(value, ("origin", "start_fen", "endpoint_fen", "moves", "revision"),
+        "utility cohort original basis Rules snapshot")
+    uint(value["origin"], 1)
+    _text(value["start_fen"], 4096)
+    _text(value["endpoint_fen"], 4096)
+    _moves(value["moves"], 16384)
+    uint(value["revision"])
+    return value
+
+
+def _basis_observation(value):
+    return fields(value, ("id", "state_id", "state", "line", "source", "epoch", "value", "checker", "work", "external",
+        "model", "input", "condition", "cpu_pv", "scope", "score", "budget", "kind", "supersedes", "execution"),
+        "utility cohort original basis observation")
+
+
+def _basis_pc_origin(value, observation, scope, authority):
+    """Join the original endpoint projection to an already checked P/C ticket."""
+    fields(value, ("authority", "frame_sequence", "request_epoch", "request_sequence", "question", "view", "view_sequence",
+        "full_view", "input", "history", "candidates", "mask_positions", "model", "encoding", "precision", "frozen_epoch",
+        "revision", "role", "deadline_clock", "deadline_at", "peer", "output", "origin_seal", "namespace"),
+        "utility cohort original basis endpoint P/C origin")
+    original = [entry for entry in scope["materialization"]["semantic"]["pc_consumption"]
+        if entry["origin"]["ticket"]["request_epoch"] == value["request_epoch"]
+        and entry["origin"]["ticket"]["request_sequence"] == value["request_sequence"]]
+    if len(original) != 1:
+        raise ValueError("utility cohort basis endpoint lacks its original consumed P/C ticket")
+    consumed = original[0]
+    accepted, ticket = consumed["origin"], consumed["origin"]["ticket"]
+    representation = ticket["representation"]
+    integers = {"frame_sequence": accepted["frame_sequence"], "request_epoch": ticket["request_epoch"],
+        "request_sequence": ticket["request_sequence"], "view_sequence": ticket["view"]["sequence"],
+        "frozen_epoch": representation["frozen_epoch"], "revision": representation["record_revision"],
+        "role": 0 if ticket["role"] == "Proposer" else 1, "deadline_clock": ticket["deadline_clock"],
+        "deadline_at": ticket["deadline_tick"]}
+    if (value["authority"] != authority or value["precision"] != "fp32"
+            or representation["precision"] != "Fp32"
+            or any(uint(value[name]) != expected for name, expected in integers.items())):
+        raise ValueError("utility cohort basis endpoint changed original P/C authority/context/precision")
+    pins = {"question": ticket["question_sha256"], "view": ticket["view"]["view_digest"],
+        "full_view": consumed["full_view_sha256"], "output": accepted["output_sha256"], "origin_seal": accepted["seal_sha256"],
+        **{name: representation[name] for name in ("input", "history", "candidates", "mask_positions", "model", "encoding")}}
+    if any(_basis_digest_bytes(value[name]) != expected for name, expected in pins.items()):
+        raise ValueError("utility cohort basis endpoint changed original P/C source/representation/output")
+    declared_namespace = _basis_digest_bytes(value["namespace"])
+    if value["peer"] is None:
+        if accepted["peer"] is not None:
+            raise ValueError("utility cohort basis endpoint lost its original reciprocal source")
+    else:
+        peer = _array(value["peer"], 2)
+        if (len(peer) != 2 or accepted["peer"] is None or uint(peer[0]) != accepted["peer"]["id"]
+                or _basis_digest_bytes(peer[1]) != accepted["peer"]["question_sha256"]):
+            raise ValueError("utility cohort basis endpoint changed original reciprocal source")
+    observation = _basis_observation(observation)
+    _basis_snapshot(observation["state"])
+    model = fields(observation["model"], ("semantics", "model", "encoding", "precision", "epoch"),
+        "utility cohort original basis endpoint model")
+    for name in ("semantics", "model", "encoding", "precision"):
+        _text(model[name])
+    model_epoch = _basis_digest_bytes(model["epoch"])
+    if (model["precision"] not in ("fp32", "fp32_tf32_off")
+            or _basis_digest_bytes(observation["input"]) != representation["input"]):
+        raise ValueError("utility cohort basis endpoint changed original model/input namespace")
+    # Display value-identity strings and representation digest keys are
+    # separate original operands. The explicit native namespace bridge
+    # binds both; neither is inferred by hashing or comparing the other.
+    namespace = hashlib.sha256(b"rz-rovent-utility-cohort-model-namespace/1\0")
+    for name in ("semantics", "model", "encoding", "precision"):
+        text = model[name].encode("utf-8")
+        namespace.update(len(text).to_bytes(8, "little"))
+        namespace.update(text)
+    namespace.update(bytes.fromhex(model_epoch))
+    namespace.update(bytes.fromhex(representation["model"]))
+    namespace.update(bytes.fromhex(representation["encoding"]))
+    namespace.update(b"\0")
+    namespace.update(representation["frozen_epoch"].to_bytes(8, "little"))
+    if namespace.hexdigest() != declared_namespace:
+        raise ValueError("utility cohort original explicit model representation namespace differs")
+    score = fields(observation["score"], ("kind", "bits", "side", "revision"),
+        "utility cohort original basis endpoint ContextWDL")
+    bits = _array(score["bits"], 3)
+    if len(bits) != 3 or score["kind"] != "ContextWdl" or uint(score["revision"]) != representation["record_revision"]:
+        raise ValueError("utility cohort basis endpoint changed original ContextWDL revision")
+    for bits_value in bits:
+        uint(bits_value, 2**32 - 1)
+    uint(score["side"], 1)
+    # Numerical WDL validity, exact native namespace framing and conditional
+    # score meaning remain Core checks against these original endpoint bytes.
+    return model
+
+
+def _basis_metadata(value, scope, witness):
+    """Join original metadata, not the Core conditional comparison proof.
+
+    The original JSON remains sealed as bytes. Nested observation scores,
+    accepted endpoint namespaces, task completion and comparison lineage
+    still require Core's complete pure validator and the Rust parent's held
+    original source projection before any learner authority can open.
+    """
+    fields(value, ("schema", "domain", "root", "authority", "root_state", "kind", "line",
+        "source_question", "source_frame_sequence", "identity", "raw_evidence", "root_budget",
+        "original_store_byte_limit", "observation", "comparison"), "utility cohort original basis")
+    if value["schema"] != BASIS_DOMAIN or value["domain"] != BASIS_DOMAIN:
+        raise ValueError("utility cohort original basis schema/domain differs")
+    authority = fields(value["authority"], ("epoch", "game", "root", "implementation"),
+        "utility cohort original basis authority")
+    if (uint(authority["epoch"]) != scope["authority"]["process_epoch"]
+            or uint(authority["game"]) != scope["authority"]["game_generation"]
+            or uint(authority["root"]) != scope["authority"]["root_generation"]
+            or _basis_digest_bytes(authority["implementation"]) != scope["authority"]["implementation_sha256"]
+            or uint(value["root_state"]) != scope["root"]["store_root_state"]
+            or uint(value["kind"], 1) != (0 if witness["kind"] == "Counter" else 1)
+            or uint(value["source_frame_sequence"]) != witness["source_frame_sequence"]):
+        raise ValueError("utility cohort original basis authority/root/kind/source differs")
+    for name, expected in (("source_question", witness["source_question_sha256"]),
+            ("identity", witness["identity_sha256"]), ("raw_evidence", witness["raw_evidence_sha256"]),
+            ("root_budget", scope["root"]["root_budget_sha256"])):
+        if _basis_digest_bytes(value[name]) != expected:
+            raise ValueError("utility cohort original basis source/witness/budget digest differs")
+    _moves(value["line"], 256)
+    if value["line"] != witness["line"]:
+        raise ValueError("utility cohort original basis witness line differs")
+    selected = next(offer for offer in scope["materialization"]["prelude"]["offers"]
+        if offer["recipient"] == scope["trial"]["recipient"])
+    if uint(value["original_store_byte_limit"]) != selected["budget"]["original_store_byte_limit"]:
+        raise ValueError("utility cohort original basis Store byte limit differs")
+    snapshot = _basis_snapshot(value["root"])
+    rules = scope["materialization"]["input"]["root_rules"]
+    replay = rules["uci_replay"]
+    if (snapshot["origin"] != (0 if replay["origin"] == "start_position" else 1)
+            or snapshot["start_fen"] != replay["start_fen"] or snapshot["endpoint_fen"] != rules["fen"]
+            or snapshot["moves"] != replay["moves"]):
+        raise ValueError("utility cohort original basis Rules replay metadata differs")
+    # Observer revisions remain original operands. Core compares restored
+    # Rules state/history; equal Rules states do not imply equal revisions.
+    observation = _basis_observation(value["observation"])
+    if uint(observation["id"]) != witness["observation"] or uint(observation["state_id"]) != value["root_state"]:
+        raise ValueError("utility cohort original basis observation/root identity differs")
+    _basis_snapshot(observation["state"])
+    comparison = value["comparison"]
+    if type(comparison) is not dict:
+        raise ValueError("utility cohort original basis comparison object required")
+    if comparison.get("kind") == "Model":
+        fields(comparison, ("kind", "before", "after", "origins", "superseded"),
+            "utility cohort original model comparison")
+        origins = _array(comparison["origins"], 2)
+        if len(origins) != 2 or any(type(origin) is not dict for origin in origins):
+            raise ValueError("utility cohort original model endpoint origins required")
+        models = [_basis_pc_origin(origin, endpoint, scope, authority) for origin, endpoint
+            in zip(origins, (comparison["before"], comparison["after"]), strict=True)]
+        if models[0] != models[1]:
+            raise ValueError("utility cohort original model endpoint namespaces differ")
+    elif comparison.get("kind") == "Finite":
+        fields(comparison, ("kind", "recipe"), "utility cohort original finite comparison")
+        fields(comparison["recipe"], ("root", "before", "after", "superseded", "previous"),
+            "utility cohort original finite comparison recipe")
+        _basis_snapshot(comparison["recipe"]["root"])
+    else:
+        raise UnsupportedCohortPayload("cohort_original_conditional_basis_variant_not_registered")
+
+
+def _witness_basis(scope):
+    """Check original raw basis seals/metadata; unavailable stays masked."""
+    semantic = scope["materialization"]["semantic"]
+    rows = semantic["witness_basis"]
+    if rows is None:
+        if semantic["witness_preimages"] is not None:
+            raise ValueError("utility cohort original witness/basis availability differs")
+        return False
+    if semantic["witness_preimages"] is None:
+        raise ValueError("utility cohort original witness/basis availability differs")
+    rows = _array(rows, 64)
+    if len(rows) != len(semantic["new_witnesses"]):
+        raise ValueError("utility cohort original conditional basis coverage differs")
+    unavailable = ("missing_original_comparison", "missing_resident_evidence", "incomplete_context",
+        "namespace_mismatch", "capacity", "invalid_original_basis")
+    complete = True
+    total = sum(body["preimage_bytes"] for body in semantic["witness_preimages"])
+    for row, witness in zip(rows, semantic["new_witnesses"], strict=True):
+        fields(row, ("observation", "kind", "identity_sha256", "source_question_sha256", "source_frame_sequence",
+            "raw_evidence_sha256", "basis", "unavailable_reason"), "utility cohort original conditional basis")
+        for name in ("observation", "kind", "identity_sha256", "source_question_sha256", "source_frame_sequence",
+                "raw_evidence_sha256"):
+            if row[name] != witness[name]:
+                raise ValueError("utility cohort original witness/basis metadata differs")
+        basis, reason = row["basis"], row["unavailable_reason"]
+        if basis is None:
+            if type(reason) is not str or reason not in unavailable:
+                raise ValueError("utility cohort original unavailable basis reason required")
+            complete = False
+            continue
+        fields(basis, ("domain", "sha256", "bytes", "original_json"), "utility cohort original basis bytes")
+        if basis["domain"] != BASIS_DOMAIN or reason is not None:
+            raise ValueError("utility cohort original basis domain/unavailable reason differs")
+        sha(basis["sha256"])
+        expected_bytes = _positive(basis["bytes"], 16 << 20)
+        if type(basis["original_json"]) is not str:
+            raise ValueError("utility cohort original basis UTF8 JSON string required")
+        try:
+            raw = basis["original_json"].encode("utf-8", "strict")
+        except UnicodeEncodeError as error:
+            raise ValueError("utility cohort original basis UTF8 JSON string required") from error
+        if len(raw) != expected_bytes:
+            raise ValueError("utility cohort original basis byte count differs")
+        # The actual issuer hashes the complete original JSON bytes directly.
+        # This is neither the native domain/length seal nor generation_digest;
+        # do not reserialize parsed FP spellings before this comparison.
+        if hashlib.sha256(raw).hexdigest() != basis["sha256"]:
+            raise ValueError("utility cohort original basis raw byte SHA differs")
+        _basis_metadata(_decode(raw, 16 << 20, source_operands=True), scope, witness)
+        total += len(raw)
+    selected = next(offer for offer in scope["materialization"]["prelude"]["offers"]
+        if offer["recipient"] == scope["trial"]["recipient"])
+    if total > min(selected["budget"]["original_store_byte_limit"], 16 << 20):
+        raise ValueError("utility cohort original shared witness/basis body budget exceeded")
+    return complete
 
 
 def _physical_closure(trial, source, *, root, authority):
@@ -1465,6 +1701,7 @@ def validate_cohort_payloads(files, *, preparation):
             cohort_id=files.publication()["cohort_id"])
         scope["witnesses"] = _semantic_core(scope)
         scope["witness_bodies_complete"] = _witness_bodies(scope)
+        scope["witness_basis_complete"] = _witness_basis(scope)
         scopes[trial["trial_sequence"]] = scope
     first_prelude = trials[0]["ready_prelude"]
     ready = {offer["recipient"] for offer in first_prelude["offers"]}
@@ -1506,11 +1743,17 @@ def validate_cohort_payloads(files, *, preparation):
                 "consumed_nn_input_count_unknown", "rejected_events")
             if (profile["input"]["usage"] != "collection_candidate" or not trial["resolved"] or scope is None
                     or not cost["complete_scope"] or not scope["witness_bodies_complete"]
+                    or not scope["witness_basis_complete"]
                     or not scope["resource_known"] or not physical[number]["cache_known"]
                     or not physical[number]["fresh_product"]
                     or cost["physical_pin_zero_tick"] > cost["cohort_cleanup_cutoff_tick"]
                     or any(cost["final_counters"][name] != cost["baseline_counters"][name] for name in unknown_counters)):
                 raise ValueError("utility cohort comparable trial lacks its original complete known scope")
+    final_interval = _io(files.durable_ack()["collection_io"])
+    last_interval = acknowledgements[-1]["collection_io"]
+    if (final_interval["clock_epoch"] != trials[-1]["cost"]["clock_epoch"]
+            or final_interval["started_tick_ns"] < last_interval["finished_tick_ns"]):
+        raise ValueError("utility cohort final durable I/O did not follow its last original trial ACK")
     authorities = [tuple(physical[number]["authority"][name] for name in (
         "process_epoch", "game_generation", "root_generation", "implementation_sha256")) for number in physical]
     if len(set(authorities)) != len(authorities):

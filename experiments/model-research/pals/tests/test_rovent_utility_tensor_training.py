@@ -196,8 +196,20 @@ class UtilityTensorLifecycleTests(unittest.TestCase):
         shared = torch.zeros(9, dtype=torch.float32)
         candidate.hidden_bias = torch.nn.Parameter(shared[:2])
         candidate.output_bias = torch.nn.Parameter(shared[2:])
-        with self.assertRaisesRegex(ValueError, "alias"):
-            self.owner(model=candidate)
+        with mock.patch.object(tensors, "_fresh_optimizer", side_effect=AssertionError("optimizer must remain uncreated")):
+            with self.assertRaisesRegex(ValueError, "alias"):
+                self.owner(model=candidate)
+
+    def test_existing_caller_gradient_cannot_be_hidden_by_parameter_deepcopy(self):
+        candidate = copy.deepcopy(self.model)
+        candidate.hidden_bias.grad = torch.ones_like(candidate.hidden_bias)
+        before, rng = _clone_state(candidate.state_dict()), capture_rng(())
+        with mock.patch.object(tensors, "_fresh_optimizer", side_effect=AssertionError("optimizer must remain uncreated")):
+            with self.assertRaisesRegex(ValueError, "cannot discard existing gradients"):
+                self.owner(model=candidate)
+        self.assertTrue(state_equal(before, _clone_state(candidate.state_dict())))
+        self.assertTrue(torch.equal(candidate.hidden_bias.grad, torch.ones_like(candidate.hidden_bias)))
+        self.assertTrue(state_equal(rng, capture_rng(())))
 
     def test_actual_device_and_cuda_rng_roster_must_match_without_cuda_materialization(self):
         tensors._device_roster({"one": SimpleNamespace(device=torch.device("cpu"))}, ())
