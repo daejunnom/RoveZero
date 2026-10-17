@@ -28,6 +28,8 @@ use std::{
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+mod numerical_child;
+#[cfg(target_os = "linux")]
 pub mod recovery;
 #[cfg(target_os = "linux")]
 mod resources;

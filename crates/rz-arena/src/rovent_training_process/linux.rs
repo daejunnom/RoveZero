@@ -1,3 +1,7 @@
+use super::numerical_child::{
+    UnixFrameReadErrors, UnixFrameReadScope, is_direct_parent_group_leader, prepare_unix_ack,
+    read_unix_frame, unix_peer_credentials, write_unix_ack,
+};
 use super::*;
 use crate::pals_collect_v3::training_process::{
     FileIdentity, GenerationTrainingFilePinV3, ReadAccounting, ReadCredit, directory_file,
@@ -12,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 use std::{
     ffi::OsString,
     fs::{self},
-    io::{Read, Write},
+    io::Write,
     os::unix::{
         fs::{MetadataExt, PermissionsExt},
         net::{UnixListener, UnixStream},
@@ -609,63 +613,32 @@ fn read_frame(
     ctx: &BrokerContext,
     total: &mut u64,
 ) -> Result<Option<Vec<u8>>, ArenaError> {
-    let mut bytes = Vec::new();
-    let mut block = [0u8; 1024];
-    loop {
-        if ctx.stop.load(Ordering::Acquire) {
-            return if bytes.is_empty() {
-                Ok(None)
-            } else {
-                Err(invalid("partial RPC frame at owner stop"))
-            };
-        }
-        check(
-            Instant::now() < ctx.whole_until && !ctx.cancel.load(Ordering::Acquire),
-            "original RPC deadline/cancel",
-        )?;
-        match stream.read(&mut block) {
-            Ok(0) => {
-                return if bytes.is_empty() {
-                    Ok(None)
-                } else {
-                    Err(invalid("partial RPC frame EOF"))
-                };
-            }
-            Ok(n) => {
-                *total = total
-                    .checked_add(n as u64)
-                    .ok_or_else(|| invalid("RPC byte overflow"))?;
-                check(
-                    *total <= ctx.max_bytes && bytes.len() + n <= MAX_TRAINER_RPC_BYTES,
-                    "RPC byte/frame budget",
-                )?;
-                bytes.extend_from_slice(&block[..n]);
-                if let Some(at) = bytes.iter().position(|b| *b == b'\n') {
-                    check(
-                        at + 1 == bytes.len(),
-                        "pipelined/trailing RPC frames are unsupported",
-                    )?;
-                    bytes.pop();
-                    return Ok(Some(bytes));
-                }
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::Interrupted
-                ) => {}
-            Err(_) => return Err(invalid("RPC read failed")),
-        }
-    }
+    read_unix_frame(
+        stream,
+        UnixFrameReadScope {
+            stop: &ctx.stop,
+            cancel: &ctx.cancel,
+            whole_until: ctx.whole_until,
+            max_total_bytes: ctx.max_bytes,
+            max_frame_bytes: MAX_TRAINER_RPC_BYTES,
+            errors: UnixFrameReadErrors {
+                partial_stop: "partial RPC frame at owner stop",
+                deadline_cancel: "original RPC deadline/cancel",
+                partial_eof: "partial RPC frame EOF",
+                byte_overflow: "RPC byte overflow",
+                byte_frame_bound: "RPC byte/frame budget",
+                pipelined: "pipelined/trailing RPC frames are unsupported",
+                read: "RPC read failed",
+            },
+        },
+        total,
+    )
 }
 fn peer_admit(stream: &UnixStream, ctx: &BrokerContext) -> Result<u32, ArenaError> {
-    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-    let peer = getsockopt(stream, PeerCredentials).map_err(|_| invalid("RPC SO_PEERCRED"))?;
-    let pid = u32::try_from(peer.pid()).map_err(|_| invalid("RPC peer PID"))?;
+    let peer = unix_peer_credentials(stream, "RPC SO_PEERCRED", "RPC peer PID")?;
+    let pid = peer.pid;
     check(
-        peer.uid() == nix::unistd::geteuid().as_raw()
+        peer.uid == nix::unistd::geteuid().as_raw()
             && ctx.image_verified.load(Ordering::Acquire)
             && proc_start(ctx.parent_pid)? == ctx.parent_start,
         "RPC original parent/image/UID",
@@ -673,14 +646,7 @@ fn peer_admit(stream: &UnixStream, ctx: &BrokerContext) -> Result<u32, ArenaErro
     let status = fs::read_to_string(format!("/proc/{pid}/status"))
         .map_err(|_| invalid("RPC child status"))?;
     check(
-        status
-            .lines()
-            .find_map(|l| l.strip_prefix("PPid:"))
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            == Some(ctx.parent_pid)
-            && nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid as i32)))
-                .map(|p| p.as_raw() == pid as i32)
-                .unwrap_or(false),
+        is_direct_parent_group_leader(pid, ctx.parent_pid, &status),
         "RPC peer is not the original direct process-group leader",
     )?;
     let image = File::open(format!("/proc/{pid}/exe")).map_err(|_| invalid("RPC child image"))?;
@@ -748,13 +714,14 @@ fn serve(ctx: BrokerContext) -> Result<(), ArenaError> {
             .checked_add(1)
             .ok_or_else(|| invalid("RPC sequence overflow"))?;
         ledger.bytes_spent = total;
-        let mut ack=serde_json::to_vec(&json!({"schema":ROVENT_TRAINER_ACK,"window_id":ctx.window_id,"sequence":request.sequence,
+        let ack=serde_json::to_vec(&json!({"schema":ROVENT_TRAINER_ACK,"window_id":ctx.window_id,"sequence":request.sequence,
             "operation":request.operation,"accepted":true,"payload":payload})).map_err(|e|invalid(e.to_string()))?;
-        check(ack.len() < MAX_TRAINER_RPC_BYTES, "RPC ack frame bound")?;
-        ack.push(b'\n');
-        stream
-            .write_all(&ack)
-            .map_err(|_| invalid("RPC ack write failed; original work remains charged"))?;
+        let ack = prepare_unix_ack(ack, MAX_TRAINER_RPC_BYTES, "RPC ack frame bound")?;
+        write_unix_ack(
+            &mut stream,
+            &ack,
+            "RPC ack write failed; original work remains charged",
+        )?;
     }
     Ok(())
 }

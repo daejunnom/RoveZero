@@ -1001,6 +1001,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/rovent_collect/teacher/session.rs"),
             source!("crates/rz-arena/src/rovent_training_process.rs"),
             source!("crates/rz-arena/src/rovent_training_process/linux.rs"),
+            source!("crates/rz-arena/src/rovent_training_process/numerical_child.rs"),
             source!("crates/rz-arena/src/rovent_training_process/recovery.rs"),
             source!("crates/rz-arena/src/rovent_training_process/recovery/checkpoint.rs"),
             source!(
@@ -1087,6 +1088,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/pals_collect_v3/training_process.rs"),
             source!("crates/rz-arena/src/rovent_training_process.rs"),
             source!("crates/rz-arena/src/rovent_training_process/linux.rs"),
+            source!("crates/rz-arena/src/rovent_training_process/numerical_child.rs"),
             source!("crates/rz-arena/src/rovent_training_process/recovery.rs"),
             source!("crates/rz-arena/src/rovent_training_process/recovery/checkpoint.rs"),
             source!(
@@ -1287,6 +1289,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/rovent_resource_scope/launch.rs"),
             source!("crates/rz-arena/src/rovent_training_process.rs"),
             source!("crates/rz-arena/src/rovent_training_process/linux.rs"),
+            source!("crates/rz-arena/src/rovent_training_process/numerical_child.rs"),
             source!("crates/rz-arena/src/rovent_training_process/recovery.rs"),
             source!("crates/rz-arena/src/rovent_training_process/recovery/checkpoint.rs"),
             source!(

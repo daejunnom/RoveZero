@@ -1,6 +1,10 @@
 //! A new process owner for exact historical data. Historical byte evidence is
 //! never cast into original native custody. Only this current peer, supervisor,
 //! resource scope and FD owner can admit current work or current completion.
+use super::super::numerical_child::{
+    UnixFrameReadErrors, UnixFrameReadScope, charge_unix_ack, is_direct_parent_group_leader,
+    prepare_unix_ack, read_unix_frame, unix_peer_credentials, write_unix_ack,
+};
 use super::super::{TrainerLedger, linux};
 use super::r_auxiliary_ledger::{RoventAuxiliaryLedger, valid_pc_rows};
 use super::*;
@@ -13,7 +17,7 @@ use sha2::{Digest as _, Sha256};
 use std::{
     ffi::OsString,
     fs,
-    io::{Read, Write},
+    io::Read,
     os::unix::{
         fs::MetadataExt,
         net::{UnixListener, UnixStream},
@@ -762,11 +766,10 @@ fn process_start(pid: u32, budget: &RoventRecoveryReadBudget) -> Result<u64, Are
         .ok_or_else(|| invalid("bounded current process start ticks"))
 }
 fn peer_admit(stream: &UnixStream, ctx: &Broker) -> Result<(u32, u64), ArenaError> {
-    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-    let peer = getsockopt(stream, PeerCredentials).map_err(|_| invalid("recovered SO_PEERCRED"))?;
-    let pid = u32::try_from(peer.pid()).map_err(|_| invalid("peer PID"))?;
+    let peer = unix_peer_credentials(stream, "recovered SO_PEERCRED", "peer PID")?;
+    let pid = peer.pid;
     check(
-        peer.uid() == nix::unistd::geteuid().as_raw()
+        peer.uid == nix::unistd::geteuid().as_raw()
             && ctx.image_verified.load(Ordering::Acquire)
             && process_start(ctx.parent_pid, &ctx.budget)? == ctx.parent_start,
         "current parent/image/UID mismatch",
@@ -777,13 +780,7 @@ fn peer_admit(stream: &UnixStream, ctx: &Broker) -> Result<(u32, u64), ArenaErro
         &ctx.budget,
     )?;
     check(
-        status
-            .lines()
-            .find_map(|l| l.strip_prefix("PPid:"))
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            == Some(ctx.parent_pid)
-            && nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid as i32)))
-                .is_ok_and(|p| p.as_raw() == pid as i32),
+        is_direct_parent_group_leader(pid, ctx.parent_pid, &status),
         "peer is not the current direct group leader",
     )?;
     let image =
@@ -817,54 +814,26 @@ fn read_frame(
     ctx: &Broker,
     total: &mut u64,
 ) -> Result<Option<Vec<u8>>, ArenaError> {
-    let mut raw = Vec::new();
-    let mut block = [0; 1024];
-    loop {
-        if ctx.stop.load(Ordering::Acquire) {
-            return if raw.is_empty() {
-                Ok(None)
-            } else {
-                Err(invalid("partial RPC at stop"))
-            };
-        }
-        check(
-            Instant::now() < ctx.whole_until && !ctx.cancel.load(Ordering::Acquire),
-            "RPC original whole deadline/cancel",
-        )?;
-        match stream.read(&mut block) {
-            Ok(0) => {
-                return if raw.is_empty() {
-                    Ok(None)
-                } else {
-                    Err(invalid("partial RPC EOF"))
-                };
-            }
-            Ok(n) => {
-                *total = total
-                    .checked_add(n as u64)
-                    .ok_or_else(|| invalid("RPC overflow"))?;
-                check(
-                    *total <= ctx.registration.max_rpc_bytes
-                        && raw.len() + n <= MAX_TRAINER_RPC_BYTES,
-                    "RPC shared byte/frame credit",
-                )?;
-                raw.extend_from_slice(&block[..n]);
-                if let Some(at) = raw.iter().position(|b| *b == b'\n') {
-                    check(at + 1 == raw.len(), "pipelined RPC unsupported")?;
-                    raw.pop();
-                    return Ok(Some(raw));
-                }
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::Interrupted
-                ) => {}
-            Err(_) => return Err(invalid("current peer RPC read")),
-        }
-    }
+    read_unix_frame(
+        stream,
+        UnixFrameReadScope {
+            stop: &ctx.stop,
+            cancel: &ctx.cancel,
+            whole_until: ctx.whole_until,
+            max_total_bytes: ctx.registration.max_rpc_bytes,
+            max_frame_bytes: MAX_TRAINER_RPC_BYTES,
+            errors: UnixFrameReadErrors {
+                partial_stop: "partial RPC at stop",
+                deadline_cancel: "RPC original whole deadline/cancel",
+                partial_eof: "partial RPC EOF",
+                byte_overflow: "RPC overflow",
+                byte_frame_bound: "RPC shared byte/frame credit",
+                pipelined: "pipelined RPC unsupported",
+                read: "current peer RPC read",
+            },
+        },
+        total,
+    )
 }
 fn serve(ctx: Broker) -> Result<(), ArenaError> {
     ctx.listener
@@ -917,23 +886,20 @@ fn serve(ctx: Broker) -> Result<(), ArenaError> {
             .next_sequence
             .checked_add(1)
             .ok_or_else(|| invalid("sequence overflow"))?;
-        let mut ack=serde_json::to_vec(&json!({"schema":ROVENT_RECOVERED_ACK,"window_id":ctx.window.window_id,
+        let ack=serde_json::to_vec(&json!({"schema":ROVENT_RECOVERED_ACK,"window_id":ctx.window.window_id,
             "sequence":request.sequence,"operation":request.operation,"accepted":true,"payload":payload})).map_err(|e|invalid(e.to_string()))?;
-        check(ack.len() < MAX_TRAINER_RPC_BYTES, "ack frame credit")?;
-        ack.push(b'\n');
-        total = total
-            .checked_add(ack.len() as u64)
-            .ok_or_else(|| invalid("RPC outbound byte overflow"))?;
-        check(
-            total <= ctx.registration.max_rpc_bytes,
+        let ack = prepare_unix_ack(ack, MAX_TRAINER_RPC_BYTES, "ack frame credit")?;
+        charge_unix_ack(
+            &mut total,
+            &ack,
+            ctx.registration.max_rpc_bytes,
+            "RPC outbound byte overflow",
             "combined inbound/outbound RPC byte lease exhausted",
         )?;
         // Charge the full write before issuing it. Partial/lost ACKs never
         // refund bytes or the update that already completed.
         ledger.bytes_spent = total;
-        stream
-            .write_all(&ack)
-            .map_err(|_| invalid("ack lost; actual work remains charged"))?;
+        write_unix_ack(&mut stream, &ack, "ack lost; actual work remains charged")?;
     }
     Ok(())
 }
