@@ -255,6 +255,58 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 include_str!("engine/adaptive_port/role_commit.rs"),
             ),
             (
+                "pals/engine/adaptive_port/checked_replay.rs",
+                include_str!("engine/adaptive_port/checked_replay.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/cpu_evidence_context.rs",
+                include_str!("engine/adaptive_port/cpu_evidence_context.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/cpu_semantic_witness.rs",
+                include_str!("engine/adaptive_port/cpu_semantic_witness.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/goal_local.rs",
+                include_str!("engine/adaptive_port/goal_local.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/legacy_full_context.rs",
+                include_str!("engine/adaptive_port/legacy_full_context.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/mate_strategy.rs",
+                include_str!("engine/adaptive_port/mate_strategy.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/nnuec_installation.rs",
+                include_str!("engine/adaptive_port/nnuec_installation.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/nnuec_port.rs",
+                include_str!("engine/adaptive_port/nnuec_port.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/profiled_external_port.rs",
+                include_str!("engine/adaptive_port/profiled_external_port.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/profiled_retirement_archive.rs",
+                include_str!("engine/adaptive_port/profiled_retirement_archive.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/profiled_retirement_archive/codec.rs",
+                include_str!("engine/adaptive_port/profiled_retirement_archive/codec.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/profiled_retirement_archive/io.rs",
+                include_str!("engine/adaptive_port/profiled_retirement_archive/io.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/reciprocal_port/fresh_usage.rs",
+                include_str!("engine/adaptive_port/reciprocal_port/fresh_usage.rs"),
+            ),
+            (
                 "pals/engine/adaptive_port/reciprocal_port.rs",
                 include_str!("engine/adaptive_port/reciprocal_port.rs"),
             ),
