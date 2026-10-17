@@ -26,6 +26,10 @@ impl RoventRecoveredTrainingInspection {
     }
 }
 
+// One execution returns one outcome retaining its original verified owner and
+// descriptors. Preserve this public by-value custody API on success and failure;
+// enum sizing alone must not change how callers receive the original owner.
+#[allow(clippy::large_enum_variant)]
 pub enum RoventRecoveredTrainingOutcome {
     Inspected(RoventRecoveredTrainingInspection),
     Completed {
@@ -224,24 +228,24 @@ fn run_after_resource_preparation(
         .transpose()?;
     // This publication's separated identities are required for actual new
     // windows; ambiguous old /1 reports remain inspectable historical bytes.
-    if command.action == RoventTrainerCliAction::Execute {
-        if let Some(source) = &checkpoint {
-            check(
-                source.original_window_schema() == ROVENT_TRAIN_WINDOW_V2,
-                "legacy unseparated checkpoint identities are metadata-only; explicit source recovery is required",
-            )?;
-            let previous = source.publication();
-            check(
-                previous.trainer_source_sha256 == registration.trainer_source_sha256
-                    && previous.trainer_python_executable_sha256
-                        == registration.trainer_python_executable.sha256
-                    && previous.trainer_dependency_set_sha256
-                        == registration.trainer_dependency_set_sha256
-                    && previous.training_model_semantics_sha256
-                        == window.training_model_semantics_sha256,
-                "checkpoint changed the explicit trainer/runtime/model profile",
-            )?;
-        }
+    if command.action == RoventTrainerCliAction::Execute
+        && let Some(source) = &checkpoint
+    {
+        check(
+            source.original_window_schema() == ROVENT_TRAIN_WINDOW_V2,
+            "legacy unseparated checkpoint identities are metadata-only; explicit source recovery is required",
+        )?;
+        let previous = source.publication();
+        check(
+            previous.trainer_source_sha256 == registration.trainer_source_sha256
+                && previous.trainer_python_executable_sha256
+                    == registration.trainer_python_executable.sha256
+                && previous.trainer_dependency_set_sha256
+                    == registration.trainer_dependency_set_sha256
+                && previous.training_model_semantics_sha256
+                    == window.training_model_semantics_sha256,
+            "checkpoint changed the explicit trainer/runtime/model profile",
+        )?;
     }
     request.ensure_admission_open()?;
     if command.action == RoventTrainerCliAction::Inspect {
@@ -535,7 +539,7 @@ impl RegisteredRAuxiliaryDatasetGraph {
         }
         let mut probes = BTreeMap::new();
         let mut current_index = None;
-        for request in ancestors.iter().chain(current.into_iter()) {
+        for request in ancestors.iter().chain(current) {
             request.validate()?;
             let (_, raw) = budget.read(&request.publication, MAX_METADATA_BYTES, true)?;
             let publication: crate::rovent_collect::RoventRCorpusPublication = decode(&raw)?;
@@ -728,8 +732,8 @@ impl RegisteredDatasetGraph {
             "extra unreachable historical dataset registration",
         )?;
         let mut ancestors = done
-            .into_iter()
-            .filter_map(|(_, owner)| {
+            .into_values()
+            .filter_map(|owner| {
                 (owner.registration.publication != current.registration.publication)
                     .then_some(owner)
             })

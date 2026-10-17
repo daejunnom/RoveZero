@@ -105,6 +105,9 @@ pub struct RoventRecoveredTrainingFailure {
     _retained_broker: Option<PendingBroker>,
     _retained_shared_held: Arc<Mutex<Option<linux::LinuxHeld>>>,
     boundary_archives: Arc<Mutex<Vec<PublishedRoventCheckpointArchive>>>,
+    // Retain each publisher-returned failure owner, including its original
+    // descriptors and partial archive custody, without unpacking that owner.
+    #[allow(clippy::vec_box)]
     boundary_archive_failures: Arc<Mutex<Vec<Box<RoventCheckpointArchiveFailure>>>>,
     r_auxiliary_ledger: Arc<Mutex<Option<RoventAuxiliaryLedger>>>,
     _retained_r_dataset: Option<Arc<VerifiedRoventRAuxiliaryDataset>>,
@@ -126,10 +129,10 @@ impl RoventRecoveredTrainingFailure {
         "past_native_authority_reissued":false,"past_physical_completion_reissued":false,
         "boundary_archives":self.boundary_archives.try_lock().ok().map(|owners|owners.iter().map(|owner|owner.observation()).collect::<Vec<_>>()),
         "boundary_archive_failures":self.boundary_archive_failures.try_lock().ok().map(|owners|owners.iter().map(|owner|owner.observation()).collect::<Vec<_>>())});
-        if let Ok(auxiliary) = self.r_auxiliary_ledger.try_lock() {
-            if let Some(auxiliary) = auxiliary.as_ref() {
-                value["r_auxiliary"] = auxiliary.observation();
-            }
+        if let Ok(auxiliary) = self.r_auxiliary_ledger.try_lock()
+            && let Some(auxiliary) = auxiliary.as_ref()
+        {
+            value["r_auxiliary"] = auxiliary.observation();
         }
         value
     }
@@ -677,6 +680,9 @@ struct Broker {
     reclamation: Option<Value>,
     dataset: Arc<VerifiedRoventDataset>,
     boundary_archives: Arc<Mutex<Vec<PublishedRoventCheckpointArchive>>>,
+    // Share custody of the original boxed publication failures with the
+    // returned failure owner; logical failure does not release their FDs.
+    #[allow(clippy::vec_box)]
     boundary_archive_failures: Arc<Mutex<Vec<Box<RoventCheckpointArchiveFailure>>>>,
     _retained_r_dataset: Option<Arc<VerifiedRoventRAuxiliaryDataset>>,
     r_auxiliary_ledger: Arc<Mutex<Option<RoventAuxiliaryLedger>>>,
@@ -1156,10 +1162,8 @@ fn dispatch(
                 "rz-rovent-trainer-update/2",
                 "rz-rovent-recovered-learner-update/1",
             )?;
-            if is_pc {
-                if let Some(auxiliary) = auxiliary.as_mut() {
-                    auxiliary.commit_update()?;
-                }
+            if is_pc && let Some(auxiliary) = auxiliary.as_mut() {
+                auxiliary.commit_update()?;
             }
             if let Some(auxiliary) = auxiliary.as_ref() {
                 auxiliary.validate_joint_retained(ledger)?;

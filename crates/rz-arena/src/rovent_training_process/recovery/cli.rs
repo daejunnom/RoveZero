@@ -87,6 +87,9 @@ pub struct RoventTrainerCliCommand {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+// Parsing returns one command-or-help decision. Keep the public by-value
+// command API rather than changing its ownership contract for enum sizing.
+#[allow(clippy::large_enum_variant)]
 pub enum RoventTrainerCliParse {
     Help,
     Command(RoventTrainerCliCommand),

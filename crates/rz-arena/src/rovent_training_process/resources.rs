@@ -1146,7 +1146,7 @@ mod tests {
             Path::new("/owner/job")
         );
         assert!(membership_for_path(mounts, Path::new("/sys/fs/cgroup-other/job")).is_err());
-        assert_eq!(populated("populated 0\nfrozen 0\n").unwrap(), false);
+        assert!(!populated("populated 0\nfrozen 0\n").unwrap());
         assert!(populated("populated 0\npopulated 0\n").is_err());
         assert!(canonical_u64("00").is_err());
         assert!(canonical_u64("max").is_err());

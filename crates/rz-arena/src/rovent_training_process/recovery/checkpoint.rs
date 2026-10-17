@@ -597,10 +597,10 @@ impl VerifiedRoventCheckpointSource {
                     .ok_or_else(|| invalid("historical NNUEC update overflow"))?;
             }
             if prefix.is_none() {
-                if ledger.completed == publication.boundary.completed_updates {
-                    if let Some(auxiliary) = &auxiliary {
-                        auxiliary.validate_joint_retained(&ledger)?;
-                    }
+                if ledger.completed == publication.boundary.completed_updates
+                    && let Some(auxiliary) = &auxiliary
+                {
+                    auxiliary.validate_joint_retained(&ledger)?;
                 }
                 prefix = boundary_snapshot(&mut ledger, &publication.boundary)?;
                 if prefix.is_some() {
@@ -1255,11 +1255,14 @@ fn validate_documents(
     )?;
     Ok(profile)
 }
+/// Completed updates in the current stage and inherited ancestor updates.
+type InitialRoleCounts = (BTreeMap<String, u64>, BTreeMap<String, u64>);
+
 fn initial_counts(
     p: &RoventCheckpointPublication,
     recipe: &Value,
     parent: Option<&VerifiedRoventCheckpointSource>,
-) -> Result<(BTreeMap<String, u64>, BTreeMap<String, u64>), ArenaError> {
+) -> Result<InitialRoleCounts, ArenaError> {
     let zero = || {
         ROLES
             .map(|r| (r.into(), 0))
@@ -1501,10 +1504,10 @@ pub(super) fn replay_update_body(
         }
     }
     ledger.update_with_schema(update, update_schema, event_schema)?;
-    if update["event"]["role"] != "validator" {
-        if let Some(auxiliary) = auxiliary.as_deref_mut() {
-            auxiliary.commit_update()?;
-        }
+    if update["event"]["role"] != "validator"
+        && let Some(auxiliary) = auxiliary.as_deref_mut()
+    {
+        auxiliary.commit_update()?;
     }
     if let Some(auxiliary) = auxiliary {
         auxiliary.validate_joint_retained(ledger)?;

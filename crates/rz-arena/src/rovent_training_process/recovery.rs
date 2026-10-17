@@ -146,7 +146,7 @@ impl RoventRecoveryReadBudget {
             cancel: &self.cancel,
             account: Arc::clone(&account),
         };
-        let result = verify_bytes(&file, &legacy, retain, &mut credit);
+        let result = verify_bytes(file, &legacy, retain, &mut credit);
         if result.is_err() || account.uncertain.load(Ordering::Acquire) {
             self.uncertain.store(true, Ordering::Release);
         }

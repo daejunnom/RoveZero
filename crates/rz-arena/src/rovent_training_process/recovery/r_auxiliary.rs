@@ -24,16 +24,12 @@ pub const MAX_R_AUXILIARY_ROWS_PER_PC_UPDATE: u16 = 64;
 /// `#[serde(skip_serializing_if = "RoventRAuxiliaryPresence::is_absent")]`.
 /// Serializing a standalone Absent fails rather than silently changing it to
 /// null. Null serializes as JSON null and Enabled delegates to its exact DTO.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum RoventRAuxiliaryPresence<T> {
+    #[default]
     Absent,
     Null,
     Enabled(T),
-}
-impl<T> Default for RoventRAuxiliaryPresence<T> {
-    fn default() -> Self {
-        Self::Absent
-    }
 }
 impl<T> RoventRAuxiliaryPresence<T> {
     pub fn is_absent(&self) -> bool {
