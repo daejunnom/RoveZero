@@ -15,6 +15,8 @@ use super::store::{
     StorePins, StoreReadOwner, StoreReadPin,
 };
 
+pub mod historical;
+
 pub const REVIEW_CONTEXT_VERSION: &str = "rz-pals-selected-review/1";
 const MAX_LINE: usize = 256;
 
@@ -193,6 +195,11 @@ impl ReviewView {
     pub fn anchor_mode(&self) -> ReviewAnchorMode {
         self.policy.mode
     }
+    /// 원 선택 정책의 읽기 전용 메타데이터다. 이 값은 source·Store 소유권이나
+    /// required bundle의 현재 제출 권한을 발급하지 않는다.
+    pub fn selection_policy(&self) -> ReviewSelectionPolicy {
+        self.policy
+    }
     pub fn length_bucket(&self) -> u16 {
         self.bucket
     }
@@ -269,31 +276,8 @@ impl ReviewView {
     /// scope must still be identical. No private endpoint/query is erased from
     /// the actual full input digest exposed by digest().
     pub fn record_scope_digest(&self) -> [u8; 32] {
-        let query = ReviewQueryInput {
-            purpose: RoleQueryPurpose::ProposePolicy,
-            prefix: Vec::new(),
-            proposal: Vec::new(),
-            counterexample: None,
-            legal: Vec::new(),
-            divergences: Vec::new(),
-        };
-        let input = input_digest(
-            &self.anchors,
-            &self.records,
-            &self.metadata,
-            &query,
-            self.policy,
-            self.records
-                .iter()
-                .map(|record| record.line.len() as u16)
-                .sum(),
-            256,
-        )
-        .expect("sealed validated immutable record scope");
-        let mut hash = Sha256::new();
-        hash.update(b"rz-pals-frozen-public-review-scope/1\0");
-        hash.update(input);
-        hash.finalize().into()
+        record_scope_digest(&self.anchors, &self.records, &self.metadata, self.policy)
+            .expect("sealed validated immutable record scope")
     }
 }
 
@@ -839,17 +823,7 @@ impl ReviewContextIndex {
             tokens as u16,
             bucket,
         )?;
-        let mut seal = Sha256::new();
-        seal.update(b"rz-pals-review-view-seal/1\0");
-        seal.update(digest);
-        seal.update(sequence.to_le_bytes());
-        seal.update(stores.generation().to_le_bytes());
-        seal.update((root.0 as u64).to_le_bytes());
-        for record in &metadata {
-            seal.update(record.source_revision.to_le_bytes());
-            seal.update((record.source_state.0 as u64).to_le_bytes());
-            seal.update(record.source_line_offset.to_le_bytes());
-        }
+        let seal = view_seal_digest(digest, sequence, stores.generation(), root, &metadata);
         let pin = stores.pin_review(pins)?;
         Ok(ReviewView {
             index_owner: Arc::downgrade(&self.identity),
@@ -865,7 +839,7 @@ impl ReviewContextIndex {
             tokens: tokens as u16,
             bucket,
             digest,
-            seal: seal.finalize().into(),
+            seal,
             pin,
             consumed: AtomicBool::new(false),
         })
@@ -1023,17 +997,13 @@ impl ReviewContextIndex {
             tokens as u16,
             bucket,
         )?;
-        let mut seal = Sha256::new();
-        seal.update(b"rz-pals-review-view-seal/1\0");
-        seal.update(digest);
-        seal.update(sequence.to_le_bytes());
-        seal.update(stores.generation().to_le_bytes());
-        seal.update((source.root_state.0 as u64).to_le_bytes());
-        for record in &source.metadata {
-            seal.update(record.source_revision.to_le_bytes());
-            seal.update((record.source_state.0 as u64).to_le_bytes());
-            seal.update(record.source_line_offset.to_le_bytes());
-        }
+        let seal = view_seal_digest(
+            digest,
+            sequence,
+            stores.generation(),
+            source.root_state,
+            &source.metadata,
+        );
         Ok(ReviewView {
             index_owner: Arc::downgrade(&self.identity),
             sequence,
@@ -1048,7 +1018,7 @@ impl ReviewContextIndex {
             tokens: tokens as u16,
             bucket,
             digest,
-            seal: seal.finalize().into(),
+            seal,
             pin: source.pin.reborrow(stores)?,
             consumed: AtomicBool::new(false),
         })
@@ -1129,6 +1099,59 @@ fn snapshot_digest(snapshot: &PositionSnapshot) -> Result<[u8; 32], ReviewError>
     hash.update(snapshot.to_fen().as_bytes());
     Ok(hash.finalize().into())
 }
+
+/// 같은 입력의 별도 제출을 구별하는 기존 seal framing이다. 현재 owner나 pin은
+/// 발급하지 않으며 live view와 historical metadata가 같은 계산을 사용한다.
+fn view_seal_digest(
+    input: [u8; 32],
+    sequence: u64,
+    generation: u64,
+    root: StateId,
+    metadata: &[ReviewRecordMetadata],
+) -> [u8; 32] {
+    let mut seal = Sha256::new();
+    seal.update(b"rz-pals-review-view-seal/1\0");
+    seal.update(input);
+    seal.update(sequence.to_le_bytes());
+    seal.update(generation.to_le_bytes());
+    seal.update((root.0 as u64).to_le_bytes());
+    for record in metadata {
+        seal.update(record.source_revision.to_le_bytes());
+        seal.update((record.source_state.0 as u64).to_le_bytes());
+        seal.update(record.source_line_offset.to_le_bytes());
+    }
+    seal.finalize().into()
+}
+
+fn record_scope_digest(
+    anchors: &[ReviewAnchor],
+    records: &[RoleRecord],
+    metadata: &[ReviewRecordMetadata],
+    policy: ReviewSelectionPolicy,
+) -> Result<[u8; 32], ReviewError> {
+    let query = ReviewQueryInput {
+        purpose: RoleQueryPurpose::ProposePolicy,
+        prefix: Vec::new(),
+        proposal: Vec::new(),
+        counterexample: None,
+        legal: Vec::new(),
+        divergences: Vec::new(),
+    };
+    let input = input_digest(
+        anchors,
+        records,
+        metadata,
+        &query,
+        policy,
+        records.iter().map(|record| record.line.len() as u16).sum(),
+        256,
+    )?;
+    let mut hash = Sha256::new();
+    hash.update(b"rz-pals-frozen-public-review-scope/1\0");
+    hash.update(input);
+    Ok(hash.finalize().into())
+}
+
 fn input_digest(
     anchors: &[ReviewAnchor],
     records: &[RoleRecord],
