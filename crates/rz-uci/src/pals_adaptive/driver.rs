@@ -580,6 +580,24 @@ fn semantic(error: PalsError) -> AdaptiveManagerError {
         other => AdaptiveManagerError::Semantic(other.to_string()),
     }
 }
+fn nnuec_preparation(
+    error: rz_search::pals::engine::adaptive_port::AdaptiveNnuecPreparationError,
+) -> AdaptiveManagerError {
+    use rz_search::pals::engine::adaptive_port::AdaptiveNnuecPreparationError as Error;
+    match error {
+        Error::Semantic(error) => semantic(error),
+        Error::Preparation(error) => {
+            AdaptiveManagerError::NnuecPreparation(NnuecWorkError::Preparation(error))
+        }
+        Error::Worker(error) => AdaptiveManagerError::Cpu(error),
+        Error::StateMismatch => AdaptiveManagerError::NnuecPreparation(NnuecWorkError::Invalid(
+            "NNUEC original question/model/owner mismatch",
+        )),
+        Error::Neural(error) => {
+            AdaptiveManagerError::Semantic(format!("NNUEC preparation: {error:?}"))
+        }
+    }
+}
 fn checked(step: AdaptivePortMaterializedStep) -> CheckedStep<AdaptivePortQuestion> {
     CheckedStep {
         evidence: step.evidence,
@@ -808,6 +826,141 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
     fn root_rules(&self) -> Arc<ContractState> {
         Arc::clone(&self.rules)
     }
+    fn validate_cpu_nnuec_model(
+        &self,
+        model: &rz_search::cpu_value::nnuec::v2::Model,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .validate_cpu_nnuec_model(model)
+            .map_err(nnuec_preparation)
+    }
+    fn prepare_cpu_nnuec_review(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        model: &rz_search::cpu_value::nnuec::v2::Model,
+        canceled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewRequest,
+        AdaptiveManagerError,
+    > {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .prepare_cpu_nnuec_review(work, model, canceled)
+            .map_err(nnuec_preparation)
+    }
+    fn install_cpu_nnuec_review(
+        &self,
+        seal: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+        model: Arc<rz_search::cpu_value::nnuec::v2::Model>,
+        bound: Arc<rz_search::cpu_value::nnuec::v2::review::BoundNnuecReviewContext>,
+    ) -> Result<rz_search::cpu_worker::PreparedValueInstallation, AdaptiveManagerError> {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .install_cpu_nnuec_review(seal, model, bound)
+            .map_err(nnuec_preparation)
+    }
+    fn accept_cpu_nnuec_installation(
+        &mut self,
+        seal: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+        model: Arc<rz_search::cpu_value::nnuec::v2::Model>,
+        bound: Arc<rz_search::cpu_value::nnuec::v2::review::BoundNnuecReviewContext>,
+        receipt: &rz_search::cpu_worker::ValueInstallReceipt,
+        worker: &rz_search::cpu_worker::CpuWorker,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .accept_cpu_nnuec_installation(seal, model, bound, receipt, worker)
+            .map_err(nnuec_preparation)
+    }
+    fn release_cpu_nnuec_installation(
+        &mut self,
+        seal: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .release_cpu_nnuec_installation(seal)
+            .map_err(nnuec_preparation)
+    }
+    fn next_rovent_goal_input(
+        &mut self,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveGoalLocalAdmission,
+        AdaptiveManagerError,
+    > {
+        self.hot()?
+            .next_rovent_goal_input(clock, now)
+            .map_err(semantic)
+    }
+    fn validate_rovent_goal_input(
+        &self,
+        input: &rz_search::pals::engine::adaptive_port::GoalLocalInput,
+        ticket: &RoleTicketEnvelope,
+        output: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .validate_rovent_goal_input(input, ticket, output)
+            .map_err(semantic)
+    }
+    fn consume_rovent_goal_input(
+        &mut self,
+        input: &rz_search::pals::engine::adaptive_port::GoalLocalInput,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        physical: Option<TicketExecutionEvidence>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<rz_search::pals::engine::adaptive_port::GoalLocalStep, AdaptiveManagerError> {
+        let evidence = physical.ok_or(AdaptiveManagerError::Invalid(
+            "GoalLocal native execution evidence absent",
+        ))?;
+        let physical = AdaptivePortRoleEvidence {
+            execution: evidence.execution,
+            completed_nn_inputs: evidence.completed_nn_inputs,
+            measurement_complete: evidence.measurement_complete,
+            physical_fresh: evidence.physical_fresh,
+        };
+        self.hot()?
+            .consume_rovent_goal_input(input, accepted, output, physical, clock, now)
+            .map_err(semantic)
+    }
+    fn discard_rovent_goal_input(
+        &mut self,
+        input: &rz_search::pals::engine::adaptive_port::GoalLocalInput,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .discard_rovent_goal_input(input)
+            .map_err(semantic)
+    }
+    fn rovent_goal_has_pending(&self) -> Result<bool, AdaptiveManagerError> {
+        Ok(self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .rovent_goal_has_pending())
+    }
+    fn close_rovent_goal_admission(&mut self) -> Result<(), AdaptiveManagerError> {
+        self.hot()?.close_rovent_goal_admission().map_err(semantic)
+    }
+    fn release_rovent_goal_state(&mut self) -> Result<(), AdaptiveManagerError> {
+        self.hot()?.release_rovent_goal_state().map_err(semantic)
+    }
+    fn rovent_goal_consumption_recorded(
+        &self,
+        ticket: &RoleTicketEnvelope,
+        view: &ReviewView,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .rovent_goal_consumption_recorded(ticket, view))
+    }
     fn validate_collection_admission(
         &self,
         admission: &RoventCollectionRootAdmission,
@@ -874,7 +1027,7 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         };
         self.hot()?
             .rovent_fresh_accepted(work, accepted, output, physical, clock, now)
-            .map_err(AdaptiveManagerError::Frontier)
+            .map_err(semantic)
     }
     fn rovent_rules_endpoint(
         &mut self,

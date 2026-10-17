@@ -122,6 +122,7 @@ pub struct PalsSemanticState<M: RoleModel> {
     /// moves. Only explicit terminal retirement may reclaim it. Declare before
     /// Store so its pins are released before that Store on ordinary destruction.
     pub(super) rovent_frontier: Option<Box<crate::pals::rovent_frontier::RoventFrontier>>,
+    pub(super) retired_goal_local: Option<Box<adaptive_port::goal_local::GoalLocalRetiredCustody>>,
     pub(super) stores: PalsStores,
     pub(super) clock_origin: Instant,
     pub(super) consumer_id: u64,
@@ -191,6 +192,7 @@ impl<M: RoleModel> PalsSemanticState<M> {
             game_generation: Some(0),
             adaptive_root_registry: adaptive_root::AdaptiveRootRegistry::default(),
             rovent_frontier: None,
+            retired_goal_local: None,
             stores,
             clock_origin: Instant::now(),
             consumer_id: 0,
@@ -375,7 +377,7 @@ impl<M: RoleModel> PalsSemanticState<M> {
     }
 
     pub(super) fn ensure_frontier_retired(&self) -> Result<(), PalsError> {
-        if self.rovent_frontier.is_some() {
+        if self.rovent_frontier.is_some() || self.retired_goal_local.is_some() {
             return Err(StoreError::InvalidConditions(
                 "Rovent frontier owner must be explicitly retired before root or game reset",
             )

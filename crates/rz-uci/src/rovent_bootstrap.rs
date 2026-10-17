@@ -5,9 +5,18 @@
 //! model is not a complete engine, first inference, resource or numeric proof.
 
 pub mod configuration;
+pub mod launch;
+pub mod nnuec_preparing;
+pub mod nnuec_source;
+pub mod pc_session;
 mod pinned;
 pub mod process_boundary;
+pub mod product;
 
+pub use pinned::{
+    RoventCollectionPreloadSources, RoventCollectionTeacherSourceCustody,
+    RoventCollectionTeacherSources, RoventTeacherAssetSelection, RoventTeacherSourceSelection,
+};
 pub use pinned::{RoventNativeAssetSelection, RoventNativeGraphAsset, RoventPinnedNativeSources};
 
 use crate::pals_adaptive::{NativeQuestionProjection, ProjectedNativeBackend};
@@ -244,6 +253,12 @@ fn prepare_native_with_optional_observer<Q: NativeQuestionProjection>(
         control.check()?;
         sources.validate_lock()?;
         validate_native_resources(&sources, &resources)?;
+        if sources.collection_preload_sources().is_some() && observer.is_none() {
+            return Err(fail(
+                K::UnsupportedModel,
+                "explicit Collection startup requires its original input observer",
+            ));
+        }
         if clock.domain().0.0 == 0
             || control.cleanup_until < control.until
             || control
@@ -607,14 +622,36 @@ pub fn configuration_digest(
 pub(crate) fn admitted_topology(
     lock: &RoventInputLock,
 ) -> Result<RoventStartupTopology, BackendError> {
+    admitted_native_topology(lock, None)
+}
+pub(crate) fn admitted_collection_topology(
+    lock: &RoventInputLock,
+    original: &RoventCollectionPreloadSources,
+) -> Result<RoventStartupTopology, BackendError> {
+    admitted_native_topology(lock, Some(original))
+}
+fn admitted_native_topology(
+    lock: &RoventInputLock,
+    collection: Option<&RoventCollectionPreloadSources>,
+) -> Result<RoventStartupTopology, BackendError> {
     lock.validate()
         .map_err(|_| fail(K::IdentityMismatch, "Rovent lock validation failed"))?;
     let engine = &lock.manifest.engine;
-    if !matches!(
-        lock.manifest.purpose,
-        RoventPurpose::Validation | RoventPurpose::Deployment
-    ) || engine.pc.validator.is_some()
-        || !engine.teachers.is_empty()
+    let explicit_purpose = match collection {
+        None => {
+            matches!(
+                lock.manifest.purpose,
+                RoventPurpose::Validation | RoventPurpose::Deployment
+            ) && engine.teachers.is_empty()
+        }
+        Some(original) => {
+            lock.manifest.purpose == RoventPurpose::Collection
+                && original.matches_input_lock(lock)
+                && original.teacher_count() == engine.teachers.len()
+        }
+    };
+    if !explicit_purpose
+        || engine.pc.validator.is_some()
         || !matches!(
             engine.pc.backend,
             RoventBackend::OrtCpu | RoventBackend::OrtCuda
@@ -661,6 +698,13 @@ pub fn compiled_bootstrap_source_digest() -> [u8; 32] {
         include_str!("rovent_bootstrap.rs"),
         include_str!("rovent_bootstrap/pinned.rs"),
         include_str!("rovent_bootstrap/configuration.rs"),
+        include_str!("rovent_bootstrap/pc_session.rs"),
+        include_str!("rovent_bootstrap/product.rs"),
+        include_str!("rovent_bootstrap/launch.rs"),
+        include_str!("rovent_bootstrap/nnuec_source.rs"),
+        include_str!("rovent_bootstrap/nnuec_preparing.rs"),
+        include_str!("rovent_bootstrap/pinned/nnuec.rs"),
+        include_str!("rovent_bootstrap/pinned/collection.rs"),
         include_str!("pals_adaptive_bootstrap/runtime_assets.rs"),
     ] {
         hash.update((source.len() as u64).to_le_bytes());

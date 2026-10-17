@@ -68,8 +68,9 @@ use rz_search::pals::engine::adaptive_port::validator_port::{
     AdaptiveValidatorAction, AdaptiveValidatorActionPlan, ValidatorActionId, ValidatorActionOutcome,
 };
 use rz_search::pals::engine::adaptive_port::{
-    AdaptiveDeferredRepair, AdaptiveQueuedRecheck, AdaptiveReviewLeaseAdmission,
-    AdaptiveRulesPairProof, CheckedRootCandidate, DeferredRootCandidate,
+    AdaptiveDeferredRepair, AdaptiveGoalLocalAdmission, AdaptiveQueuedRecheck,
+    AdaptiveReviewLeaseAdmission, AdaptiveRulesPairProof, CheckedRootCandidate,
+    DeferredRootCandidate, GoalLocalBlockReason, GoalLocalInput, GoalLocalStep,
 };
 use rz_search::pals::review_context::ReviewView;
 use rz_search::pals::rovent_frontier::{
@@ -87,13 +88,16 @@ const MAX_ROLE_PENDING: usize = 16;
 mod cleanup;
 mod collection;
 mod frontier;
+mod goal_local;
 mod goals;
+mod nnuec;
 mod reciprocal;
 mod registered_ledger;
 mod role_only;
 use cleanup::{CleanupBoundary, automatic_cleanup_deadline};
 pub use collection::*;
 pub use frontier::{RoventNativeAccountingObservation, RoventReviewLeaseObservation};
+pub use nnuec::{AdaptiveNnuecRetiredOwner, AdaptiveNnuecRootParts, NnuecWorkError};
 pub use reciprocal::{
     PeerFollowupDisposition, PeerFollowupObservation, RoventPeerFollowupPolicy,
     RoventReciprocalPolicy,
@@ -159,6 +163,8 @@ pub enum AdaptiveManagerError {
     Native(TicketServiceError),
     Cpu(CpuWorkerError),
     Frontier(FrontierError),
+    GoalLocalBlocked(GoalLocalBlockReason),
+    NnuecPreparation(NnuecWorkError),
     ReviewLeaseBackpressure {
         current: usize,
         capacity: usize,
@@ -257,6 +263,111 @@ pub struct CandidateFrame<Q> {
 /// remain with the independent archive owner and finish after worker fences.
 pub trait AdaptiveSearchDriver<Q> {
     fn root_rules(&self) -> Arc<ContractState>;
+    fn validate_cpu_nnuec_model(
+        &self,
+        _: &rz_search::cpu_value::nnuec::v2::Model,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual NNUEC researcher",
+        ))
+    }
+    fn prepare_cpu_nnuec_review(
+        &self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::cpu_value::nnuec::v2::Model,
+        _: Arc<AtomicBool>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewRequest,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no original NNUEC question",
+        ))
+    }
+    fn install_cpu_nnuec_review(
+        &self,
+        _: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+        _: Arc<rz_search::cpu_value::nnuec::v2::Model>,
+        _: Arc<rz_search::cpu_value::nnuec::v2::review::BoundNnuecReviewContext>,
+    ) -> Result<rz_search::cpu_worker::PreparedValueInstallation, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no original NNUEC installation",
+        ))
+    }
+    fn accept_cpu_nnuec_installation(
+        &mut self,
+        _: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+        _: Arc<rz_search::cpu_value::nnuec::v2::Model>,
+        _: Arc<rz_search::cpu_value::nnuec::v2::review::BoundNnuecReviewContext>,
+        _: &rz_search::cpu_worker::ValueInstallReceipt,
+        _: &CpuWorker,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual NNUEC install acknowledgement",
+        ))
+    }
+    fn release_cpu_nnuec_installation(
+        &mut self,
+        _: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual NNUEC installation cleanup",
+        ))
+    }
+    fn next_rovent_goal_input(
+        &mut self,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<AdaptiveGoalLocalAdmission<Q>, AdaptiveManagerError> {
+        Ok(AdaptiveGoalLocalAdmission::NoQuestion)
+    }
+    fn validate_rovent_goal_input(
+        &self,
+        _: &GoalLocalInput<Q>,
+        _: &RoleTicketEnvelope,
+        _: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual GoalLocal source",
+        ))
+    }
+    fn consume_rovent_goal_input(
+        &mut self,
+        _: &GoalLocalInput<Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+        _: Option<TicketExecutionEvidence>,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<GoalLocalStep, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual GoalLocal consumer",
+        ))
+    }
+    fn discard_rovent_goal_input(
+        &mut self,
+        _: &GoalLocalInput<Q>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual GoalLocal cleanup",
+        ))
+    }
+    fn rovent_goal_has_pending(&self) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    fn close_rovent_goal_admission(&mut self) -> Result<(), AdaptiveManagerError> {
+        Ok(())
+    }
+    fn release_rovent_goal_state(&mut self) -> Result<(), AdaptiveManagerError> {
+        Ok(())
+    }
+    fn rovent_goal_consumption_recorded(
+        &self,
+        _: &RoleTicketEnvelope,
+        _: &ReviewView,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
     fn validate_collection_admission(
         &self,
         _: &RoventCollectionRootAdmission,
@@ -1185,6 +1296,7 @@ struct RoleBinding<Q, O> {
     consumption_recorded: bool,
     purpose: RolePurpose,
     reciprocal_acceptance: Option<rz_search::pals::coordinator::AcceptedRoleStep>,
+    goal_local: Option<GoalLocalInput<Q>>,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RolePurpose {
@@ -1194,6 +1306,7 @@ enum RolePurpose {
     Reciprocal,
     RoventRefinement,
     RoventFresh,
+    RoventGoalLocal,
 }
 struct NativeAck {
     preparation: PreparationId,
@@ -1224,6 +1337,7 @@ struct OwnBinding<Q> {
     // Its accepted native-ledger receipt is kept until the semantic owner
     // returns; a cold Store never turns a reservation into zero work.
     native_frontier: Option<NativeReservation>,
+    nnuec: Option<Arc<nnuec::NnuecJobCustody>>,
 }
 struct OwnSlot<Q> {
     worker: Option<CpuWorker>,
@@ -1235,6 +1349,8 @@ struct OwnSlot<Q> {
     ready_readback: Option<
         Result<rz_runtime::adaptive::CpuThreadReadback, rz_runtime::adaptive::CpuResourceError>,
     >,
+    last_value_installation: Option<rz_search::cpu_worker::ValueInstallReceipt>,
+    nnuec_retirement: Option<rz_search::cpu_worker::RecoveredNnuecEngine>,
 }
 struct ForeignBinding<Q> {
     work: CoordinatorWork<ReviewView, Q>,
@@ -1494,6 +1610,13 @@ where
     accepted_roles: Vec<reciprocal::AcceptedRoleCustody<Q, B::Output>>,
     peer_sources_admitted: u16,
     peer_observations: Vec<PeerFollowupObservation>,
+    // A local duty is never represented by an invented refinement frame.
+    // Keep the exact private source until native retirement or known cleanup.
+    goal_prepared: Option<GoalLocalInput<Q>>,
+    goal_continuation_pending: bool,
+    nnuec: Option<nnuec::NnuecRootPreparation>,
+    nnuec_pending: Option<nnuec::NnuecWorkPreparation<Q>>,
+    nnuec_jobs: Vec<Arc<nnuec::NnuecJobCustody>>,
 }
 
 impl<Q, B, D> AdaptiveExecutionManager<Q, B, D>
@@ -1841,6 +1964,8 @@ where
                     settled_execution: None,
                     recovered_engine: None,
                     ready_readback: None,
+                    last_value_installation: None,
+                    nnuec_retirement: None,
                 })
                 .collect(),
             external,
@@ -1897,6 +2022,11 @@ where
             accepted_roles: Vec::with_capacity(MAX_ROLE_PENDING),
             peer_sources_admitted: 0,
             peer_observations: Vec::with_capacity(128),
+            goal_prepared: None,
+            goal_continuation_pending: false,
+            nnuec: None,
+            nnuec_pending: None,
+            nnuec_jobs: Vec::with_capacity(CPU_JOB_CAPACITY),
         })
     }
     pub fn new_continued(
@@ -2022,6 +2152,14 @@ where
         mut self,
         mode: AdaptiveCloseMode,
     ) -> Result<AdaptivePersistentParts<Q, B, D>, AdaptivePersistentRejection<Q, B, D>> {
+        if self.nnuec.is_some() || self.own.iter().any(|slot| slot.nnuec_retirement.is_some()) {
+            return Err(AdaptivePersistentRejection {
+                error: AdaptiveManagerError::Invalid(
+                    "NNUEC requires actual actor retirement transfer",
+                ),
+                manager: self,
+            });
+        }
         let receipt = match self.shutdown_receipt() {
             Ok(receipt)
                 if self.phase == ManagerPhase::Finished
@@ -2417,6 +2555,11 @@ where
             .is_none_or(|limit| spent.saturating_add(reserved) < limit)
     }
     pub fn has_pending_work(&self) -> bool {
+        self.ordinary_pending_work()
+            || self.goal_prepared.is_some()
+            || self.goal_continuation_pending
+    }
+    fn ordinary_pending_work(&self) -> bool {
         !self.roles.is_empty()
             || !self.accepted_roles.is_empty()
             || self.machine.frames().next().is_some()
@@ -2605,21 +2748,24 @@ where
     /// A started paused owner waiting for V feedback is not a new queued Job;
     /// charging it again can deadlock a one-seat queue behind an idle worker.
     fn waiting_jobs_occupancy(&self) -> usize {
-        self.ready.len().saturating_add(
-            self.validator_waiting
-                .iter()
-                .filter(|frame| {
-                    !self.own.iter().any(|slot| {
-                        slot.binding
+        self.ready
+            .len()
+            .saturating_add(usize::from(self.nnuec_pending.is_some()))
+            .saturating_add(
+                self.validator_waiting
+                    .iter()
+                    .filter(|frame| {
+                        !self.own.iter().any(|slot| {
+                            slot.binding
+                                .as_ref()
+                                .is_some_and(|binding| binding.work.frame == **frame)
+                        }) && !self
+                            .foreign
                             .as_ref()
                             .is_some_and(|binding| binding.work.frame == **frame)
-                    }) && !self
-                        .foreign
-                        .as_ref()
-                        .is_some_and(|binding| binding.work.frame == **frame)
-                })
-                .count(),
-        )
+                    })
+                    .count(),
+            )
     }
     fn validator_waiting_limit(&self) -> usize {
         self.limits
@@ -2636,7 +2782,7 @@ where
     ) -> Result<PreparationId, AdaptiveManagerError> {
         if let Some(scope) = &self.exclusive_scope {
             let allowed = match purpose {
-                RolePurpose::RootRanking => false,
+                RolePurpose::RootRanking | RolePurpose::RoventGoalLocal => false,
                 RolePurpose::Validator => scope.action.is_none(),
                 RolePurpose::Refinement
                 | RolePurpose::Reciprocal
@@ -2711,6 +2857,7 @@ where
             consumption_recorded: false,
             purpose,
             reciprocal_acceptance: None,
+            goal_local: None,
         });
         self.counters.native_preparations += 1;
         Ok(preparation)
@@ -2876,7 +3023,7 @@ where
     }
     fn schedule_root_round(&mut self) -> Result<bool, AdaptiveManagerError> {
         if !self.root_started
-            || self.has_pending_work()
+            || self.ordinary_pending_work()
             || !self.failures.is_empty()
             || self.exclusive_scope.is_some()
             || !self.role_call_admission_available()
@@ -2933,7 +3080,7 @@ where
         self.root_ranking_proof = None;
         let Some(input) = self.driver.next_root_round_input()? else {
             self.rovent_seal_root_round()?;
-            return Ok(false);
+            return self.drive_goal_local();
         };
         self.prepare_root_ranking(input)?;
         Ok(true)
@@ -2976,6 +3123,14 @@ where
             self.failures.pop_front();
         }
         let unsafe_completion = matches!(error, AdaptiveManagerError::PhysicalUnknown)
+            || (matches!(error, AdaptiveManagerError::NnuecPreparation(_))
+                && !self.nnuec_cleanup_settled())
+            || matches!(
+                error,
+                AdaptiveManagerError::GoalLocalBlocked(GoalLocalBlockReason::Frontier(
+                    FrontierError::NativeUnknown
+                ))
+            )
             || matches!(
                 error,
                 AdaptiveManagerError::Frontier(FrontierError::NativeUnknown)
@@ -3305,7 +3460,9 @@ where
                             RolePurpose::Reciprocal => {
                                 self.registry.complete_reciprocal_role(completion)
                             }
-                            RolePurpose::RoventRefinement | RolePurpose::RoventFresh => {
+                            RolePurpose::RoventRefinement
+                            | RolePurpose::RoventFresh
+                            | RolePurpose::RoventGoalLocal => {
                                 self.registry.complete_reciprocal_role(completion)
                             }
                         };
@@ -3353,7 +3510,9 @@ where
                         .iter()
                         .position(|binding| binding.preparation == preparation)
                     {
-                        if self.roles[index].ticket.is_none() {
+                        if self.roles[index].ticket.is_none()
+                            && self.roles[index].goal_local.is_none()
+                        {
                             self.roles.remove(index);
                         } else {
                             return Err(AdaptiveManagerError::Invalid(
@@ -3370,7 +3529,9 @@ where
                 TicketNativeEvent::Rejected { preparation, error } => {
                     if self.phase != ManagerPhase::Running {
                         if let Some(index) = self.roles.iter().position(|binding| {
-                            binding.preparation == preparation && binding.ticket.is_none()
+                            binding.preparation == preparation
+                                && binding.ticket.is_none()
+                                && binding.goal_local.is_none()
                         }) {
                             self.roles.remove(index);
                         }
@@ -3456,6 +3617,7 @@ where
                             RolePurpose::Reciprocal
                                 | RolePurpose::RoventRefinement
                                 | RolePurpose::RoventFresh
+                                | RolePurpose::RoventGoalLocal
                         )
                     {
                         let receipt = native_receipt.ok_or(AdaptiveManagerError::Invalid(
@@ -3623,7 +3785,14 @@ where
                         "accepted native ack has no output",
                     ))?;
             let attempted = (|| -> Result<(), AdaptiveManagerError> {
-                if purpose == RolePurpose::Reciprocal {
+                if purpose == RolePurpose::RoventGoalLocal {
+                    self.consume_goal_local_role(
+                        index,
+                        &ticket,
+                        output.proposer_ranking_output(),
+                        physical,
+                    )?;
+                } else if purpose == RolePurpose::Reciprocal {
                     let work = work.ok_or(AdaptiveManagerError::Invalid(
                         "reciprocal role lost its exact child frame",
                     ))?;
@@ -3819,7 +3988,13 @@ where
                 // Store consumption precedes next-view materialization. A
                 // later failure must retain both the semantic error and the
                 // actual source consumption, without retrying its commit.
-                match self.driver.role_consumption_recorded(&ticket, &input.view) {
+                let consumed = if purpose == RolePurpose::RoventGoalLocal {
+                    self.driver
+                        .rovent_goal_consumption_recorded(&ticket, &input.view)
+                } else {
+                    self.driver.role_consumption_recorded(&ticket, &input.view)
+                };
+                match consumed {
                     Ok(true) if !self.roles[index].consumption_recorded => {
                         if let Err(observation) = self.mark_role_consumed(index) {
                             self.record_failure(observation);
@@ -3839,6 +4014,9 @@ where
                 self.registry.discard_delivered(&ticket)?;
             }
             let consumed = self.roles[index].consumption_recorded;
+            if let Some(original) = &self.roles[index].goal_local {
+                self.driver.discard_rovent_goal_input(original)?;
+            }
             self.roles.remove(index);
             if !consumed {
                 self.counters.unused_role_results += 1;
@@ -3938,7 +4116,9 @@ where
                     if self.phase == ManagerPhase::Running {
                         self.commit_own(binding, report)
                     } else {
-                        self.driver.cpu_slice_observed(&binding.work, report)
+                        self.driver
+                            .cpu_slice_observed(&binding.work, report)
+                            .and_then(|_| self.release_nnuec_report(&binding.work, report))
                     }
                 }
                 DeferredCommit::External { binding, report } => {
@@ -3949,15 +4129,18 @@ where
                     }
                 }
                 DeferredCommit::Closed(closed) => self.publish_closed_frame(closed),
-                DeferredCommit::OwnRaw { work, report } => {
-                    self.driver.cpu_slice_observed(work, report)
-                }
-                DeferredCommit::DetachedOwn { work, report } => {
-                    self.driver.cpu_detached_slice_observed(work, report)
-                }
-                DeferredCommit::TokenDiscard { work, termination } => {
-                    self.driver.cpu_token_discarded(work, termination)
-                }
+                DeferredCommit::OwnRaw { work, report } => self
+                    .driver
+                    .cpu_slice_observed(work, report)
+                    .and_then(|_| self.release_nnuec_report(work, report)),
+                DeferredCommit::DetachedOwn { work, report } => self
+                    .driver
+                    .cpu_detached_slice_observed(work, report)
+                    .and_then(|_| self.release_nnuec_report(work, report)),
+                DeferredCommit::TokenDiscard { work, termination } => self
+                    .driver
+                    .cpu_token_discarded(work, termination)
+                    .and_then(|_| self.release_nnuec_terminal(work, termination.job)),
                 DeferredCommit::ReciprocalWait { work, report } => {
                     self.driver.cpu_reciprocal_wait(work, report)
                 }
@@ -4092,6 +4275,15 @@ where
                             &ticket,
                             output.proposer_ranking_output(),
                         )?;
+                    } else if self.roles[index].purpose == RolePurpose::RoventGoalLocal {
+                        let original = self.roles[index].goal_local.as_ref().ok_or(
+                            AdaptiveManagerError::Invalid("GoalLocal original input missing"),
+                        )?;
+                        self.driver.validate_rovent_goal_input(
+                            original,
+                            &ticket,
+                            output.proposer_ranking_output(),
+                        )?;
                     } else if self.roles[index].purpose == RolePurpose::RootRanking {
                         validate_root_ranking_view(&ready.view, self.driver.root_rules().as_ref())?;
                     } else {
@@ -4120,6 +4312,7 @@ where
                     RolePurpose::Reciprocal
                         | RolePurpose::RoventRefinement
                         | RolePurpose::RoventFresh
+                        | RolePurpose::RoventGoalLocal
                 ) {
                 Some(self.registry.issue_reciprocal_native_acceptance(
                     &ticket,
@@ -5011,12 +5204,29 @@ where
         binding: &OwnBinding<Q>,
         report: &CpuSliceReport,
     ) -> Result<(), AdaptiveManagerError> {
+        if let Some(original) = &binding.nnuec {
+            if original.seal.frame() != binding.work.frame
+                || original.seal.question_digest() != binding.envelope.question
+                || !Arc::ptr_eq(original.seal.view(), &binding.work.input.view)
+                || original.receipt.binding_digest() != binding.envelope.evaluation_namespace
+                || !original.receipt.matches_bound(&original.bound)
+                || !original.receipt.installed_profile().is_some_and(|profile| {
+                    profile.owner == binding.grant.owner
+                        && profile.search_conditions == binding.envelope.search_conditions
+                })
+            {
+                return Err(AdaptiveManagerError::Invalid(
+                    "CPU result lost original installed NNUEC custody",
+                ));
+            }
+        }
         if self
             .accepted_roles
             .iter()
             .any(|held| held.child == Some(binding.work.frame))
         {
             let digest = self.driver.consume_reciprocal_cpu(&binding.work, report)?;
+            self.release_nnuec_report(&binding.work, report)?;
             self.machine.resolve_reciprocal_cpu_response(
                 StepEvidence {
                     frame: binding.work.frame,
@@ -5037,6 +5247,7 @@ where
             return Ok(());
         }
         let checked = self.driver.commit_cpu(&binding.work, report)?;
+        self.release_nnuec_report(&binding.work, report)?;
         self.resolve(
             binding.work.clone(),
             StepExecution::Cpu {
@@ -5198,6 +5409,10 @@ where
                         .as_ref()
                         .is_none_or(|scope| scope.allows(frame.id))
                     && !self.ready_ids.contains(&frame.id)
+                    && self
+                        .nnuec_pending
+                        .as_ref()
+                        .is_none_or(|pending| pending.work.frame != frame.id)
                     && !self.validator_waiting.contains(&frame.id)
                     && !self.roles.iter().any(|role| {
                         role.work
@@ -5454,7 +5669,8 @@ where
                                 self.role_call_admission_available()
                                     && self.roles.len() < self.role_pending_limit()
                             } else {
-                                own_available || (self.external.is_some() && self.foreign.is_none())
+                                (own_available && self.nnuec_work_eligible(frame.id))
+                                    || (self.external.is_some() && self.foreign.is_none())
                             }) && self
                                 .exclusive_scope
                                 .as_ref()
@@ -5468,11 +5684,18 @@ where
                     .set_dependencies_ready(&id, eligible)
                     .map_err(|_| AdaptiveManagerError::Invalid("ready dependency update"))?;
             }
-            let Some(selected) = self
-                .ready
-                .select(now_duration, None)
-                .map_err(|_| AdaptiveManagerError::Invalid("ready fairness selector"))?
-            else {
+            let selected = if let Some(pending) = self
+                .nnuec_pending
+                .as_ref()
+                .filter(|pending| pending.job_ready())
+            {
+                Some(pending.selection.clone())
+            } else {
+                self.ready
+                    .select(now_duration, None)
+                    .map_err(|_| AdaptiveManagerError::Invalid("ready fairness selector"))?
+            };
+            let Some(selected) = selected else {
                 break;
             };
             self.ready_ids.retain(|id| *id != selected.job.job);
@@ -5643,11 +5866,6 @@ where
                     Err(error) => return Err(error),
                 }
             } else {
-                let profiles: Vec<_> = self
-                    .own
-                    .iter()
-                    .filter_map(|slot| slot.worker.as_ref().map(CpuWorker::profile))
-                    .collect();
                 let (spent, reserved) = self.ledger.global_usage()?;
                 let total = spent
                     .checked_add(reserved)
@@ -5676,6 +5894,76 @@ where
                 let physical_budget_exhausted = endpoint == CpuEndpoint::Own
                     && spent == self.registration.native_cpu_node_limit
                     && reserved == 0;
+                if self.nnuec.is_some()
+                    && endpoint == CpuEndpoint::Own
+                    && !physical_budget_exhausted
+                    && self.nnuec_pending.is_none()
+                {
+                    let Some(slot) = self
+                        .own
+                        .iter()
+                        .take(usize::from(advice.workers))
+                        .position(|slot| slot.binding.is_none() && !slot.joined && !slot.panicked)
+                    else {
+                        break;
+                    };
+                    // Common quota is checked before C preparation or TT work.
+                    // No native reservation or new Job exists at this point.
+                    let capacity = self.driver.frontier_native_capacity(
+                        1,
+                        self.clock.domain(),
+                        self.check_running()?,
+                    );
+                    match capacity {
+                        Ok(Some(0)) => {
+                            changed |= self.native_admission_result(Err(
+                                AdaptiveManagerError::Frontier(FrontierError::NodeBudget),
+                            ))?;
+                            return Ok(changed);
+                        }
+                        Ok(_) => {}
+                        Err(error) if self.semantic_replay_can_wait(&error)? => {
+                            self.ready.admit(selected.job).map_err(|_| {
+                                AdaptiveManagerError::Capacity("original NNUEC ready descriptor")
+                            })?;
+                            self.ready_ids.push(work.frame);
+                            return Ok(changed);
+                        }
+                        Err(error) => {
+                            changed |= self.native_admission_result(Err(error))?;
+                            return Ok(changed);
+                        }
+                    }
+                    self.start_nnuec_work(&work, slot, selected)?;
+                    return Ok(true);
+                }
+                let profiles: Vec<_> = if self.nnuec.is_some() && !physical_budget_exhausted {
+                    let pending =
+                        self.nnuec_pending
+                            .as_ref()
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "NNUEC exact work preparation missing",
+                            ))?;
+                    if pending.work.frame != work.frame || !pending.job_ready() {
+                        return Err(AdaptiveManagerError::Invalid(
+                            "NNUEC work is not acknowledged by original owner",
+                        ));
+                    }
+                    vec![
+                        self.own[pending.slot]
+                            .worker
+                            .as_ref()
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "NNUEC original worker missing",
+                            ))?
+                            .acknowledged_profile()?,
+                    ]
+                } else {
+                    self.own
+                        .iter()
+                        .filter_map(|slot| slot.worker.as_ref().map(CpuWorker::profile))
+                        .collect()
+                };
                 let question = self
                     .driver
                     .cpu_question(
@@ -5714,12 +6002,15 @@ where
                         return Ok(true);
                     }
                     CpuQuestion::Own(question) => {
-                        let Some(slot) = self
-                            .own
-                            .iter()
-                            .take(usize::from(advice.workers))
-                            .position(|slot| slot.binding.is_none() && !slot.joined)
-                        else {
+                        let slot = if self.nnuec.is_some() {
+                            self.nnuec_pending.as_ref().map(|pending| pending.slot)
+                        } else {
+                            self.own
+                                .iter()
+                                .take(usize::from(advice.workers))
+                                .position(|slot| slot.binding.is_none() && !slot.joined)
+                        };
+                        let Some(slot) = slot else {
                             break;
                         };
                         let Some(slice) = advice.slice else {
@@ -5991,6 +6282,7 @@ where
             .as_ref()
             .ok_or(AdaptiveManagerError::Invalid("CPU owner joined"))?
             .profile();
+        let nnuec = self.claim_nnuec_job(&work, index)?;
         let state = question
             .position
             .export()
@@ -6157,6 +6449,7 @@ where
             validator_reviewed_execution: None,
             reciprocal: None,
             native_frontier,
+            nnuec,
         });
         self.machine
             .bind_cpu(frame, &envelope, &grant, self.clock.domain(), admitted_at)?;
@@ -6614,6 +6907,17 @@ where
         }
         self.registry.revoke_all();
         self.machine.revoke();
+        // The same semantic owner closes its non-submitted local duties now.
+        // If an archive transfer owns it, manager admission is already closed
+        // and the exact owner close is retried before post-fence retirement.
+        if self.driver.semantic_owner_available() {
+            if let Err(error) = self.driver.close_rovent_goal_admission() {
+                self.record_failure(error);
+            }
+        }
+        if let Some(preparation) = &self.nnuec {
+            preparation.canceled.store(true, Ordering::Release);
+        }
         // First revoke question authority, then cancel each same-owner task.
         for index in 0..self.own.len() {
             let sequence = self.issue_control()?;
@@ -6671,6 +6975,22 @@ where
             let Some(receipt) = joined else {
                 continue;
             };
+            let nnuec_readback_error = if let Some(pending) = &mut self.nnuec_pending {
+                if pending.slot == index {
+                    pending.observe_shutdown(&receipt).err()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(actual) = receipt
+                .value_installation_receipt
+                .as_ref()
+                .filter(|actual| actual.is_installed())
+            {
+                self.own[index].last_value_installation = Some(actual.clone());
+            }
             changed = true;
             // Receipts retained at owner shutdown MUST settle before dropping
             // the worker and before archive close; progress never settles them.
@@ -6682,6 +7002,9 @@ where
             self.own[index].joined = receipt.thread_joined;
             self.own[index].panicked = receipt.thread_panicked;
             self.own[index].ready_readback = receipt.ready_readback;
+            if let Some(error) = nnuec_readback_error {
+                self.record_failure(AdaptiveManagerError::NnuecPreparation(error));
+            }
             if receipt.thread_panicked {
                 self.quarantine_frontier_slot(index);
                 if let Some(binding) = &self.own[index].binding {
@@ -6743,6 +7066,7 @@ where
             && self.own.iter().all(|slot| slot.joined)
             && self.external_owner_closed()
             && self.deferred.is_empty()
+            && self.nnuec_cleanup_settled()
             && self.native_frontier_events.is_empty()
             && self.own.iter().all(|slot| {
                 slot.binding
@@ -6750,6 +7074,15 @@ where
                     .is_none_or(|binding| binding.pending_slice.is_none())
             })
         {
+            self.release_nnuec_custody()?;
+            self.driver.close_rovent_goal_admission()?;
+            self.discard_goal_local_custody()?;
+            if self.driver.rovent_goal_has_pending()? {
+                return Err(AdaptiveManagerError::Invalid(
+                    "GoalLocal owner did not retire after native fence",
+                ));
+            }
+            self.driver.release_rovent_goal_state()?;
             self.driver.finish_auxiliary_shutdown()?;
         }
         if native_closed
@@ -6757,6 +7090,7 @@ where
             && self.external_owner_closed()
             && self.driver.auxiliary_shutdown_confirmed()
             && self.deferred.is_empty()
+            && self.nnuec_cleanup_settled()
             && self.native_frontier_events.is_empty()
             && self.own.iter().all(|slot| {
                 slot.binding
@@ -6832,7 +7166,12 @@ where
                 self.external_root_fence
                     .is_some_and(|fence| fence.permits_reuse())
             }),
-            auxiliary_shutdown_confirmed: self.driver.auxiliary_shutdown_confirmed(),
+            auxiliary_shutdown_confirmed: self.driver.auxiliary_shutdown_confirmed()
+                && self.nnuec_cleanup_settled()
+                && self.nnuec_pending.is_none()
+                && self.nnuec_jobs.is_empty()
+                && self.goal_prepared.is_none()
+                && !self.goal_continuation_pending,
             native_cpu_spent: spent,
             native_cpu_reserved: reserved,
             pending_tickets: self.registry.occupancy(),

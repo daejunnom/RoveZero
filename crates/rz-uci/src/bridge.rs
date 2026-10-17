@@ -433,6 +433,16 @@ impl PreparedSearchBinding {
         };
         let budget = TimeBudget::new(start, time_control, settings.time_config)
             .map_err(BuildSearchError::TimeBudget)?;
+        // A Rovent process registers the complete per-go wall allocation,
+        // including output reserve. Legacy simulation bindings keep their
+        // existing clock policy; only the explicit node-domain opts in.
+        if node_budget_semantics == NodeBudgetSemantics::RoventPositionVisits
+            && budget.allocation > settings.untimed_limit
+        {
+            return Err(BuildSearchError::InvalidGo(
+                "actual go allocation exceeds the registered Rovent wall ceiling",
+            ));
+        }
         let control = SearchControl::from_budget(&budget, max_simulations);
         Ok(Self {
             control,
@@ -1256,6 +1266,55 @@ mod tests {
                 configured: 100
             })
         ));
+    }
+
+    #[test]
+    fn rovent_wall_ceiling_covers_actual_allocation_without_changing_legacy_clocks() {
+        let start = Instant::now();
+        let configured = BuildSearchSettings {
+            untimed_limit: Duration::from_secs(1),
+            ..settings()
+        };
+        let limits = GoLimits {
+            movetime_ms: Some(1001),
+            ..GoLimits::default()
+        };
+        assert!(matches!(
+            PreparedSearchBinding::prepare(
+                &limits,
+                SideToMove::White,
+                start,
+                configured,
+                None,
+                NodeBudgetSemantics::RoventPositionVisits
+            ),
+            Err(BuildSearchError::InvalidGo(
+                "actual go allocation exceeds the registered Rovent wall ceiling"
+            ))
+        ));
+        let legacy = PreparedSearchBinding::prepare(
+            &limits,
+            SideToMove::White,
+            start,
+            configured,
+            None,
+            NodeBudgetSemantics::LegacySimulations,
+        )
+        .unwrap();
+        assert_eq!(legacy.budget().allocation, Duration::from_millis(1001));
+        let exact = PreparedSearchBinding::prepare(
+            &GoLimits {
+                movetime_ms: Some(1000),
+                ..limits
+            },
+            SideToMove::White,
+            start,
+            configured,
+            None,
+            NodeBudgetSemantics::RoventPositionVisits,
+        )
+        .unwrap();
+        assert_eq!(exact.budget().allocation, configured.untimed_limit);
     }
 
     #[test]

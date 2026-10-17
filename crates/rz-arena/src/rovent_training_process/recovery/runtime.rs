@@ -2,6 +2,7 @@
 //! never cast into original native custody. Only this current peer, supervisor,
 //! resource scope and FD owner can admit current work or current completion.
 use super::super::{TrainerLedger, linux};
+use super::r_auxiliary_ledger::{RoventAuxiliaryLedger, valid_pc_rows};
 use super::*;
 use crate::pals_collect_v3::training_process::{directory_file, open_directory};
 use crate::process::{
@@ -59,6 +60,8 @@ pub struct VerifiedRoventRecoveredTrainingWindow {
     pub(super) held: linux::LinuxHeld,
     pub(super) child_identity: RoventHistoricalChildIdentity,
     pub(super) _retained_boundary_archives: Vec<PublishedRoventCheckpointArchive>,
+    pub(super) r_auxiliary_ledger: Option<RoventAuxiliaryLedger>,
+    _retained_r_dataset: Option<Arc<VerifiedRoventRAuxiliaryDataset>>,
 }
 impl VerifiedRoventRecoveredTrainingWindow {
     pub fn summary(&self) -> &Value {
@@ -99,6 +102,8 @@ pub struct RoventRecoveredTrainingFailure {
     _retained_shared_held: Arc<Mutex<Option<linux::LinuxHeld>>>,
     boundary_archives: Arc<Mutex<Vec<PublishedRoventCheckpointArchive>>>,
     boundary_archive_failures: Arc<Mutex<Vec<Box<RoventCheckpointArchiveFailure>>>>,
+    r_auxiliary_ledger: Arc<Mutex<Option<RoventAuxiliaryLedger>>>,
+    _retained_r_dataset: Option<Arc<VerifiedRoventRAuxiliaryDataset>>,
 }
 impl std::fmt::Debug for RoventRecoveredTrainingFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -110,13 +115,19 @@ impl std::fmt::Debug for RoventRecoveredTrainingFailure {
 }
 impl RoventRecoveredTrainingFailure {
     pub fn observation(&self) -> Value {
-        json!({"schema":"rz-rovent-recovered-trainer-failure/1",
+        let mut value = json!({"schema":"rz-rovent-recovered-trainer-failure/1",
         "status":"failed","read_accounting":self.launch.read_budget.observation(),
         "rpc_journal":self.rpc_journal,"summary":self.summary,
         "old_cost_refunded":false,"retry_authorized":false,"physical_completion":"unknown",
         "past_native_authority_reissued":false,"past_physical_completion_reissued":false,
         "boundary_archives":self.boundary_archives.try_lock().ok().map(|owners|owners.iter().map(|owner|owner.observation()).collect::<Vec<_>>()),
-        "boundary_archive_failures":self.boundary_archive_failures.try_lock().ok().map(|owners|owners.iter().map(|owner|owner.observation()).collect::<Vec<_>>())})
+        "boundary_archive_failures":self.boundary_archive_failures.try_lock().ok().map(|owners|owners.iter().map(|owner|owner.observation()).collect::<Vec<_>>())});
+        if let Ok(auxiliary) = self.r_auxiliary_ledger.try_lock() {
+            if let Some(auxiliary) = auxiliary.as_ref() {
+                value["r_auxiliary"] = auxiliary.observation();
+            }
+        }
+        value
     }
 }
 
@@ -173,6 +184,81 @@ fn dataset_ancestors(
     )?;
     Ok(out)
 }
+
+/// Original R publications can reference PC evidence outside the current PC
+/// dataset's own ancestry. Retain and join those owners too, without changing
+/// the separate collection-admission projection for the current PC closure.
+fn all_dataset_inputs<'a>(
+    current: &'a VerifiedRoventDataset,
+    r_dataset: Option<&'a VerifiedRoventRAuxiliaryDataset>,
+    historical: &'a [Arc<VerifiedRoventDataset>],
+) -> Result<BTreeMap<String, &'a VerifiedRoventDataset>, ArenaError> {
+    fn add_pc<'a>(
+        current: &VerifiedRoventDataset,
+        source: &'a VerifiedRoventDataset,
+        out: &mut BTreeMap<String, &'a VerifiedRoventDataset>,
+    ) -> Result<(), ArenaError> {
+        if source.registration.publication.sha256 == current.registration.publication.sha256 {
+            check(
+                source.registration == current.registration,
+                "same current PC publication has conflicting original registration",
+            )?;
+        } else if let Some(old) = out.insert(source.registration.publication.sha256.clone(), source)
+        {
+            check(
+                old.registration == source.registration,
+                "same PC source publication has conflicting retained owners",
+            )?;
+        }
+        for (_, ancestor) in dataset_ancestors(source)? {
+            if ancestor.registration.publication.sha256 == current.registration.publication.sha256 {
+                check(
+                    ancestor.registration == current.registration,
+                    "R-referenced PC ancestry changed current registration",
+                )?;
+            } else if let Some(old) =
+                out.insert(ancestor.registration.publication.sha256.clone(), ancestor)
+            {
+                check(
+                    old.registration == ancestor.registration,
+                    "R-referenced PC ancestry has conflicting retained owners",
+                )?;
+            }
+        }
+        check(out.len() <= 256, "combined original PC source capacity")
+    }
+    fn add_r<'a>(
+        current: &VerifiedRoventDataset,
+        source: &'a VerifiedRoventRAuxiliaryDataset,
+        out: &mut BTreeMap<String, &'a VerifiedRoventDataset>,
+        seen: &mut BTreeSet<String>,
+        depth: usize,
+    ) -> Result<(), ArenaError> {
+        check(depth <= 256, "R-referenced original PC ancestry depth")?;
+        if !seen.insert(source.publication_pin().sha256.clone()) {
+            return Ok(());
+        }
+        check(seen.len() <= 257, "R-referenced original dataset capacity")?;
+        for pc in source.pc_datasets() {
+            add_pc(current, pc, out)?;
+        }
+        for pc in source.joint_pc_datasets() {
+            add_pc(current, pc, out)?;
+        }
+        for ancestor in source.ancestors() {
+            add_r(current, ancestor, out, seen, depth + 1)?;
+        }
+        Ok(())
+    }
+    let mut out = dataset_ancestors(current)?;
+    if let Some(source) = r_dataset {
+        add_r(current, source, &mut out, &mut BTreeSet::new(), 0)?;
+    }
+    for source in historical {
+        add_pc(current, source, &mut out)?;
+    }
+    Ok(out)
+}
 fn source_bundle() -> Result<BTreeMap<&'static str, &'static [u8]>, ArenaError> {
     let mut files = linux::source_bundle()?;
     macro_rules! source {
@@ -196,6 +282,15 @@ fn source_bundle() -> Result<BTreeMap<&'static str, &'static [u8]>, ArenaError> 
         source!("rovent_recovered_training_window.py"),
         source!("rovent_training_window_v2.py"),
         source!("rovent_historical_corpus.py"),
+        source!("rovent_r_auxiliary.py"),
+        source!("rovent_r_corpus.py"),
+        source!("rovent_historical_r_corpus.py"),
+        source!("rovent_r_readout.py"),
+        source!("rovent_lineage_union.py"),
+        source!("rovent_joint_corpus.py"),
+        source!("rovent_r_ancestry.py"),
+        source!("rovent_collection_teacher.py"),
+        source!("rovent_root_descriptor.py"),
     ] {
         files.insert(path, bytes);
     }
@@ -271,6 +366,32 @@ fn new_ledger(
     ancestors: BTreeMap<String, u64>,
     checkpoint: Option<&VerifiedRoventCheckpointSource>,
 ) -> Result<TrainerLedger, ArenaError> {
+    if let Some(auxiliary) = window.nnuec_r_auxiliary.enabled() {
+        let owners = &recipe["parameter_ownership"];
+        fields(
+            owners,
+            &[
+                "pc_shared",
+                "p_private",
+                "c_private",
+                "v_private",
+                "nnuec",
+                "membership_sha256",
+            ],
+        )?;
+        check(
+            owners["membership_sha256"] == membership_sha256
+                && owners["nnuec"] == auxiliary.optimizer_owner
+                && ["pc_shared", "p_private", "c_private", "v_private"]
+                    .iter()
+                    .all(|key| {
+                        owners[*key].as_str().is_some_and(|owner| {
+                            generation_identifier(owner) && owner != auxiliary.optimizer_owner
+                        })
+                    }),
+            "R auxiliary needs its actual pinned membership and exclusive NNUEC optimizer owner",
+        )?;
+    }
     let stage = recipe["stages"]
         .as_array()
         .and_then(|stages| stages.iter().find(|s| s["stage_id"] == window.stage_id))
@@ -342,6 +463,175 @@ fn new_ledger(
     Ok(ledger)
 }
 
+fn new_auxiliary_ledger(
+    registration: &RoventRecoveredTrainingRegistration,
+    window: &RoventTrainWindowV2,
+    dataset: Option<Arc<VerifiedRoventRAuxiliaryDataset>>,
+    checkpoint: Option<&VerifiedRoventCheckpointSource>,
+) -> Result<Option<RoventAuxiliaryLedger>, ArenaError> {
+    let Some(recipe) = window.nnuec_r_auxiliary.enabled() else {
+        check(
+            dataset.is_none(),
+            "disabled/null R auxiliary cannot carry an opaque dataset owner",
+        )?;
+        return Ok(None);
+    };
+    let dataset = dataset
+        .ok_or_else(|| invalid("enabled R auxiliary needs its original opaque dataset owner"))?;
+    check(
+        dataset.manifest_file_sha256() == recipe.manifest_file_sha256
+            && dataset.index_file_sha256() == recipe.index_file_sha256,
+        "R auxiliary recipe changed exact manifest/index file pins",
+    )?;
+    let mut result = match &registration.initialization_source {
+        RoventTrainingInputSource::Initialize { .. } => {
+            RoventAuxiliaryLedger::new(dataset, recipe.clone(), BTreeSet::new(), BTreeSet::new(), 0)
+                .map(Some)
+        }
+        RoventTrainingInputSource::Resume { .. } => {
+            let mut previous = checkpoint
+                .and_then(|source| source.r_auxiliary_ledger())
+                .cloned()
+                .ok_or_else(|| {
+                    invalid("enabled R resume has no replayed original prefix ledger")
+                })?;
+            previous.bind_current_dataset(dataset, recipe)?;
+            Ok(Some(previous))
+        }
+        RoventTrainingInputSource::Fork { .. } => {
+            let source = checkpoint
+                .ok_or_else(|| invalid("fork lacks its original historical checkpoint source"))?;
+            match source.r_auxiliary_ledger() {
+                Some(previous) => previous.fork(dataset, recipe.clone()).map(Some),
+                None => RoventAuxiliaryLedger::from_non_auxiliary_checkpoint(
+                    dataset,
+                    recipe.clone(),
+                    source,
+                )
+                .map(Some),
+            }
+        }
+    }?;
+    if let Some(ledger) = result.as_mut() {
+        let preserved = if matches!(
+            registration.initialization_source,
+            RoventTrainingInputSource::Resume { .. }
+        ) {
+            checkpoint
+        } else {
+            None
+        };
+        ledger.set_execution_phase(&window.phase, preserved)?;
+    }
+    Ok(result)
+}
+
+fn validate_auxiliary_fields(
+    p: &Value,
+    base: &[&str],
+    auxiliary: Option<&RoventAuxiliaryLedger>,
+) -> Result<(), ArenaError> {
+    let mut expected = base.to_vec();
+    if auxiliary.is_some() {
+        expected.push("r_auxiliary");
+    }
+    fields(p, &expected)?;
+    if let Some(auxiliary) = auxiliary {
+        auxiliary.validate_checkpoint_projection(&p["r_auxiliary"])?;
+    }
+    Ok(())
+}
+
+fn auxiliary_admission(dataset: &VerifiedRoventRAuxiliaryDataset) -> Result<Value, ArenaError> {
+    fn visit(
+        dataset: &VerifiedRoventRAuxiliaryDataset,
+        out: &mut BTreeSet<String>,
+        depth: usize,
+    ) -> Result<(), ArenaError> {
+        check(depth <= 256, "R auxiliary ancestry depth")?;
+        for ancestor in dataset.ancestors() {
+            if out.insert(ancestor.publication_pin().sha256.clone()) {
+                visit(ancestor, out, depth + 1)?;
+            }
+        }
+        check(out.len() <= 256, "R auxiliary ancestor capacity")
+    }
+    let mut ancestors = BTreeSet::new();
+    visit(dataset, &mut ancestors, 0)?;
+    check(
+        !ancestors.contains(&dataset.publication_pin().sha256),
+        "R auxiliary ancestry cycle",
+    )?;
+    Ok(json!({"schema":"rz-rovent-recovered-r-dataset-set/1",
+        "current_publication_sha256":dataset.publication_pin().sha256,"ancestor_publication_sha256":ancestors,
+        "manifest_file_sha256":dataset.manifest_file_sha256(),"index_file_sha256":dataset.index_file_sha256(),
+        "nnuec_parameter_sha256":dataset.registration().nnuec_parameter_sha256,"record_count":dataset.observation()["record_count"],
+        "past_native_authority_reissued":false,"past_physical_completion_reissued":false,
+        "historical_evidence_only":true,"execution_authorized":false}))
+}
+
+/// The parent joins declared ownership to its pinned descriptor inventory. The
+/// child separately checks these descriptors against the real model before any
+/// optimizer construction; this metadata check does not claim a model forward.
+fn validate_auxiliary_membership(
+    window: &RoventTrainWindowV2,
+    recipe: &Value,
+    membership: &Value,
+    membership_sha256: &str,
+) -> Result<(), ArenaError> {
+    let Some(auxiliary) = window.nnuec_r_auxiliary.enabled() else {
+        return Ok(());
+    };
+    check(
+        recipe["parameter_ownership"]["membership_sha256"] == membership_sha256
+            && recipe["parameter_ownership"]["nnuec"] == auxiliary.optimizer_owner
+            && membership["model_semantics_sha256"] == window.training_model_semantics_sha256,
+        "R optimizer inventory differs from exact recipe/model membership",
+    )?;
+    let parameters = membership["parameters"]
+        .as_array()
+        .filter(|p| !p.is_empty() && p.len() <= 4096)
+        .ok_or_else(|| invalid("bounded actual parameter membership required"))?;
+    let mut names = BTreeSet::new();
+    let mut has_nnuec = false;
+    for parameter in parameters {
+        let name = parameter["name"]
+            .as_str()
+            .filter(|name| generation_identifier(name))
+            .ok_or_else(|| invalid("actual parameter name"))?;
+        check(
+            names.insert(name) && parameter["dtype"] == "float32" && parameter["trainable"] == true,
+            "duplicate or nontrainable FP32 actual parameter",
+        )?;
+        let component = if name.starts_with("nnuec.") {
+            has_nnuec = true;
+            "nnuec"
+        } else if name.starts_with("public_encoder.")
+            || name.starts_with("reader_blocks.")
+            || name.starts_with("move_embedding.")
+        {
+            "pc_shared"
+        } else if name.starts_with("experts.proposer.") {
+            "p_private"
+        } else if name.starts_with("experts.critic.") {
+            "c_private"
+        } else if name.starts_with("experts.validator.") {
+            "v_private"
+        } else {
+            return Err(invalid("unmapped actual parameter component"));
+        };
+        check(
+            (component == "nnuec")
+                == (recipe["parameter_ownership"][component] == auxiliary.optimizer_owner),
+            "R optimizer may own NNUEC parameters only",
+        )?;
+    }
+    check(
+        has_nnuec,
+        "enabled R auxiliary has no actual NNUEC parameter membership",
+    )
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -375,6 +665,8 @@ struct Broker {
     dataset: Arc<VerifiedRoventDataset>,
     boundary_archives: Arc<Mutex<Vec<PublishedRoventCheckpointArchive>>>,
     boundary_archive_failures: Arc<Mutex<Vec<Box<RoventCheckpointArchiveFailure>>>>,
+    _retained_r_dataset: Option<Arc<VerifiedRoventRAuxiliaryDataset>>,
+    r_auxiliary_ledger: Arc<Mutex<Option<RoventAuxiliaryLedger>>>,
 }
 
 /// Borrowed only inside the current authenticated checkpoint RPC after the
@@ -408,6 +700,14 @@ impl ActualRoventCheckpointBoundary<'_> {
     }
     pub(super) fn checkpoint_index(&self) -> usize {
         self.checkpoint_index
+    }
+    pub(super) fn r_auxiliary_ledger(&self) -> Result<Option<RoventAuxiliaryLedger>, ArenaError> {
+        Ok(self
+            .ctx
+            .r_auxiliary_ledger
+            .lock()
+            .map_err(|_| invalid("R auxiliary custody poisoned"))?
+            .clone())
     }
     pub(super) fn child_identity(&self) -> Result<RoventHistoricalChildIdentity, ArenaError> {
         self.ctx
@@ -754,7 +1054,11 @@ fn dispatch(
     )?;
     match operation {
         "begin_window" => {
-            fields(
+            let auxiliary = ctx
+                .r_auxiliary_ledger
+                .lock()
+                .map_err(|_| invalid("R auxiliary custody poisoned"))?;
+            validate_auxiliary_fields(
                 p,
                 &[
                     "schema",
@@ -772,6 +1076,7 @@ fn dispatch(
                     "ancestor_updates",
                     "frozen_pc_sha256",
                 ],
+                auxiliary.as_ref(),
             )?;
             check(
                 !ledger.begun
@@ -803,13 +1108,87 @@ fn dispatch(
             ledger.begun = true;
             Ok(json!({}))
         }
-        "consume_sample" => ledger.consume_with_schema(p, "rz-rovent-trainer-consume/2"),
+        "consume_sample" => {
+            if let Some(auxiliary) = ctx
+                .r_auxiliary_ledger
+                .lock()
+                .map_err(|_| invalid("R auxiliary custody poisoned"))?
+                .as_ref()
+            {
+                check(
+                    !auxiliary.is_pending(),
+                    "new P/C sample cannot replace uncommitted R auxiliary work",
+                )?;
+                check(
+                    auxiliary
+                        .dataset()
+                        .joint_eligible_current_pc_origins()?
+                        .contains(sha(&p["origin_sha256"])?),
+                    "P/C/V sample is excluded by the original joint PC/R leakage boundary",
+                )?;
+            }
+            ledger.consume_with_schema(p, "rz-rovent-trainer-consume/2")
+        }
+        "consume_auxiliary" => {
+            fields(p, &["schema", "evidence"])?;
+            check(
+                p["schema"] == "rz-rovent-trainer-consume-auxiliary/1"
+                    && ctx.window.phase == "pc"
+                    && ledger.begun
+                    && !ledger.ended
+                    && ledger.pending.len() == 8
+                    && valid_pc_rows(ledger)? > 0
+                    && ledger.samples_admitted < count(&ledger.window["max_samples"])?,
+                "R auxiliary requires a valid pending P/C group and remaining shared sample credit",
+            )?;
+            let mut auxiliary = ctx
+                .r_auxiliary_ledger
+                .lock()
+                .map_err(|_| invalid("R auxiliary custody poisoned"))?;
+            auxiliary
+                .as_mut()
+                .ok_or_else(|| invalid("R auxiliary disabled or missing original dataset owner"))?
+                .consume(&p["evidence"])?;
+            ledger.samples_admitted = ledger
+                .samples_admitted
+                .checked_add(1)
+                .ok_or_else(|| invalid("shared PC/R sample count overflow"))?;
+            Ok(json!({}))
+        }
         "completed_update" => {
+            let mut auxiliary = ctx
+                .r_auxiliary_ledger
+                .lock()
+                .map_err(|_| invalid("R auxiliary custody poisoned"))?;
+            let is_pc = p["event"]["role"] != "validator";
+            if let Some(auxiliary) = auxiliary.as_ref() {
+                auxiliary.validate_pc_origins(ledger)?;
+                if is_pc {
+                    auxiliary
+                        .validate_update(&p["event"]["r_auxiliary"], valid_pc_rows(ledger)?)?;
+                } else {
+                    check(
+                        !auxiliary.is_pending()
+                            && p["event"]
+                                .as_object()
+                                .is_some_and(|event| !event.contains_key("r_auxiliary")),
+                        "V cannot consume or report auxiliary optimization",
+                    )?;
+                }
+            }
             ledger.update_with_schema(
                 p,
                 "rz-rovent-trainer-update/2",
                 "rz-rovent-recovered-learner-update/1",
             )?;
+            if is_pc {
+                if let Some(auxiliary) = auxiliary.as_mut() {
+                    auxiliary.commit_update()?;
+                }
+            }
+            if let Some(auxiliary) = auxiliary.as_ref() {
+                auxiliary.validate_joint_retained(ledger)?;
+            }
             let raw=serde_json::to_vec(&json!({"schema":ROVENT_RECOVERED_UPDATE,"execution_id":ctx.registration.execution_id,
                 "window_id":ctx.window.window_id,"sequence":ledger.updates.len(),"source_kind":ROVENT_RECOVERY_SOURCE_KIND,
                 "past_native_authority_reissued":false,"update":p})).map_err(|e|invalid(e.to_string()))?;
@@ -828,21 +1207,31 @@ fn dispatch(
             Ok(ack)
         }
         "checkpoint_published" => {
-            fields(
-                p,
-                &[
-                    "schema",
-                    "checkpoint",
-                    "completed_updates",
-                    "sampler_state_sha256",
-                    "model_state_sha256",
-                    "optimizer_state_sha256",
-                    "scheduler_state_sha256",
-                    "rng_state_sha256",
-                    "cost",
-                    "pending_microbatches",
-                ],
-            )?;
+            {
+                let auxiliary = ctx
+                    .r_auxiliary_ledger
+                    .lock()
+                    .map_err(|_| invalid("R auxiliary custody poisoned"))?;
+                validate_auxiliary_fields(
+                    p,
+                    &[
+                        "schema",
+                        "checkpoint",
+                        "completed_updates",
+                        "sampler_state_sha256",
+                        "model_state_sha256",
+                        "optimizer_state_sha256",
+                        "scheduler_state_sha256",
+                        "rng_state_sha256",
+                        "cost",
+                        "pending_microbatches",
+                    ],
+                    auxiliary.as_ref(),
+                )?;
+                if let Some(auxiliary) = auxiliary.as_ref() {
+                    auxiliary.validate_joint_retained(ledger)?;
+                }
+            }
             check(
                 ledger.begun
                     && !ledger.ended
@@ -917,6 +1306,14 @@ fn dispatch(
             Ok(json!({}))
         }
         "end_window" => {
+            check(
+                ctx.r_auxiliary_ledger
+                    .lock()
+                    .map_err(|_| invalid("R auxiliary custody poisoned"))?
+                    .as_ref()
+                    .is_none_or(|auxiliary| !auxiliary.is_pending()),
+                "end cannot discard pending R auxiliary work",
+            )?;
             fields(
                 p,
                 &[
@@ -990,7 +1387,11 @@ fn checkpoint_admission(
     operation: &str,
     p: &Value,
 ) -> Result<Value, ArenaError> {
-    fields(
+    let source = ctx
+        .checkpoint
+        .as_ref()
+        .ok_or_else(|| invalid("current peer lacks admitted historical checkpoint"))?;
+    validate_auxiliary_fields(
         p,
         &[
             "schema",
@@ -1004,11 +1405,14 @@ fn checkpoint_admission(
             "retained_origin_set_sha256",
             "retained_origin_count",
         ],
+        source.r_auxiliary_ledger(),
     )?;
-    let source = ctx
-        .checkpoint
-        .as_ref()
-        .ok_or_else(|| invalid("current peer lacks admitted historical checkpoint"))?;
+    if let Some(original) = source.r_auxiliary_checkpoint_projection() {
+        check(
+            p["r_auxiliary"] == *original,
+            "current scratch changed the exact original R pool/sampler checkpoint projection",
+        )?;
+    }
     let publication = source.publication();
     check(
         source.original_window_schema() == ROVENT_TRAIN_WINDOW_V2,
@@ -1067,6 +1471,9 @@ fn checkpoint_admission(
         "retained_input_set_sha256":boundary.retained_input_set_sha256,"retained_input_count":boundary.retained_input_count,
         "retained_origin_set_sha256":boundary.retained_origin_set_sha256,"retained_origin_count":boundary.retained_origin_count,
         "historical_tail_cost_records":historical_tail_cost_records,"current_peer_tensor_projection":compared});
+    if let Some(original) = source.r_auxiliary_checkpoint_projection() {
+        result["r_auxiliary"] = original.clone();
+    }
     if !resume {
         let mut totals = BTreeMap::new();
         for role in ROLES {
@@ -1204,6 +1611,7 @@ pub fn run_rovent_training_recovered(
     dataset: Arc<VerifiedRoventDataset>,
     checkpoint: Option<Arc<VerifiedRoventCheckpointSource>>,
     reclamation: Option<VerifiedRoventOldRunReclamation>,
+    r_dataset: Option<Arc<VerifiedRoventRAuxiliaryDataset>>,
     cancel: Arc<AtomicBool>,
 ) -> Result<VerifiedRoventRecoveredTrainingWindow, Box<RoventRecoveredTrainingFailure>> {
     let mut process = None;
@@ -1216,6 +1624,7 @@ pub fn run_rovent_training_recovered(
     let child_identity = Arc::new(Mutex::new(None));
     let boundary_archives = Arc::new(Mutex::new(Vec::new()));
     let boundary_archive_failures = Arc::new(Mutex::new(Vec::new()));
+    let r_auxiliary_ledger = Arc::new(Mutex::new(None));
     let result = (|| -> Result<RoventRecoveredTrainingRegistration, ArenaError> {
         check(
             launch.started < launch.execution_deadline
@@ -1240,18 +1649,23 @@ pub fn run_rovent_training_recovered(
                 .verify_held(&launch.registration, &launch.registration_pin, true)?;
         let reg: RoventRecoveredTrainingRegistration = decode(&raw)?;
         reg.validate()?;
+        let historical_pc_sources = checkpoint
+            .as_ref()
+            .map(|source| source.historical_pc_datasets())
+            .transpose()?
+            .unwrap_or_default();
+        let all_pc_sources =
+            all_dataset_inputs(&dataset, r_dataset.as_deref(), &historical_pc_sources)?;
         check(
             reg.trainer_python_executable == launch.interpreter_pin
                 && reg.trainer_python_version == launch.interpreter_version
                 && reg.dependency_directories == launch.dependency_directories
                 && reg.current_dataset == dataset.registration
-                && reg.ancestor_datasets.len() == dataset_ancestors(&dataset)?.len()
+                && reg.ancestor_datasets.len() == all_pc_sources.len()
                 && reg.ancestor_datasets.iter().all(|declared| {
-                    dataset_ancestors(&dataset).is_ok_and(|owners| {
-                        owners
-                            .get(&declared.publication.sha256)
-                            .is_some_and(|owner| declared == &owner.registration)
-                    })
+                    all_pc_sources
+                        .get(&declared.publication.sha256)
+                        .is_some_and(|owner| declared == &owner.registration)
                 })
                 && launch.read_budget.observation()["maximum_bytes"] == reg.max_read_bytes,
             "recovered registration differs from current opaque input/runtime/read-budget owners",
@@ -1260,7 +1674,7 @@ pub fn run_rovent_training_recovered(
             .read_budget
             .verify_held(&launch.interpreter, &launch.interpreter_pin, false)?;
         dataset.revalidate(&launch.read_budget)?;
-        for ancestor in dataset_ancestors(&dataset)?.values() {
+        for ancestor in all_pc_sources.values() {
             ancestor.revalidate(&launch.read_budget)?;
         }
         if let Some(source) = &checkpoint {
@@ -1299,6 +1713,33 @@ pub fn run_rovent_training_recovered(
         let spec: RoventTrainWindowV2 =
             serde_json::from_value(spec_raw).map_err(|e| invalid(e.to_string()))?;
         reg.join_window(&spec)?;
+        check(
+            reg.r_auxiliary_dataset
+                .enabled()
+                .map(|declared| {
+                    r_dataset
+                        .as_ref()
+                        .is_some_and(|owner| owner.registration() == declared)
+                })
+                .unwrap_or(r_dataset.is_none()),
+            "R registration differs from the retained original dataset owner",
+        )?;
+        if let Some(source) = &r_dataset {
+            check(
+                source.joint_current_pc_publication_sha256()?
+                    == dataset.registration.publication.sha256,
+                "enabled R owner is not joint-bound to this exact current P/C publication",
+            )?;
+            source.revalidate(&launch.read_budget)?;
+        }
+        *r_auxiliary_ledger
+            .lock()
+            .map_err(|_| invalid("R auxiliary custody poisoned"))? = new_auxiliary_ledger(
+            &reg,
+            &spec,
+            r_dataset.as_ref().map(Arc::clone),
+            checkpoint.as_deref(),
+        )?;
         check(
             recipe["schema"] == "rz-rovent-generation-series/1"
                 && digest_value("rz-rovent-generation-series/1", &recipe)? == spec.recipe_sha256
@@ -1413,6 +1854,7 @@ pub fn run_rovent_training_recovered(
             })
             .ok_or_else(|| invalid("membership codec"))?;
         let membership_sha256 = digest_value(membership_domain, &membership)?;
+        validate_auxiliary_membership(&spec, &recipe, &membership, &membership_sha256)?;
         let ledger = Arc::new(Mutex::new(new_ledger(
             &spec,
             recipe,
@@ -1423,6 +1865,17 @@ pub fn run_rovent_training_recovered(
             checkpoint.as_deref(),
         )?));
         journal_slot = Some(Arc::clone(&ledger));
+        {
+            let common = ledger
+                .lock()
+                .map_err(|_| invalid("ledger custody poisoned"))?;
+            let auxiliary = r_auxiliary_ledger
+                .lock()
+                .map_err(|_| invalid("R auxiliary custody poisoned"))?;
+            if let Some(auxiliary) = auxiliary.as_ref() {
+                auxiliary.validate_joint_retained(&common)?;
+            }
+        }
         let sequence = NEXT_SOCKET
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
             .map_err(|_| invalid("socket identity overflow"))?;
@@ -1461,6 +1914,9 @@ pub fn run_rovent_training_recovered(
                 "historical_evidence_only":true,"execution_authorized":false},
             "checkpoint_admission":checkpoint.as_ref().map(|s|s.observation())});
         let mut startup = startup;
+        if let Some(source) = &r_dataset {
+            startup["r_auxiliary_admission"] = auxiliary_admission(source)?;
+        }
         startup["child_read_credit"] = json!({"reserved_bytes":reg.max_child_read_bytes,
             "scope":"charged_in_parent_shared_budget_no_refund"});
         startup["artifact_watch_profile"] = json!({"schema":"rz-rovent-training-artifact-watch/1",
@@ -1504,6 +1960,8 @@ pub fn run_rovent_training_recovered(
             dataset: Arc::clone(&dataset),
             boundary_archives: Arc::clone(&boundary_archives),
             boundary_archive_failures: Arc::clone(&boundary_archive_failures),
+            _retained_r_dataset: r_dataset.as_ref().map(Arc::clone),
+            r_auxiliary_ledger: Arc::clone(&r_auxiliary_ledger),
         };
         let broker_cancel = Arc::clone(&cancel);
         let handle = thread::Builder::new()
@@ -1740,6 +2198,9 @@ pub fn run_rovent_training_recovered(
         if let Some(source) = &checkpoint {
             source.revalidate(&launch.read_budget)?;
         }
+        if let Some(source) = &r_dataset {
+            source.revalidate(&launch.read_budget)?;
+        }
         if let Some(reclaimed) = &reclamation {
             reclaimed.revalidate()?;
         }
@@ -1792,6 +2253,13 @@ pub fn run_rovent_training_recovered(
                 .map(|owner| owner.observation())
                 .collect::<Vec<_>>()
         );
+        if let Some(auxiliary) = r_auxiliary_ledger
+            .lock()
+            .map_err(|_| invalid("R auxiliary custody poisoned"))?
+            .as_ref()
+        {
+            terminal_summary["r_auxiliary"] = auxiliary.observation();
+        }
         terminal_summary["historical_evidence_scope"] = json!({"past_native_authority_reissued":false,"past_physical_completion_reissued":false,"source_kind":ROVENT_RECOVERY_SOURCE_KIND});
         terminal_summary["parent_device_admission"] = json!({"scope":"process_local_logical_device_only","host_global_exclusivity":"unknown","physical_sharing":"unknown"});
         if let Some(device) = owner.device_admission.as_mut() {
@@ -1821,6 +2289,11 @@ pub fn run_rovent_training_recovered(
                     .lock()
                     .expect("validated boundary archive custody"),
             ),
+            r_auxiliary_ledger: r_auxiliary_ledger
+                .lock()
+                .expect("validated R auxiliary custody")
+                .take(),
+            _retained_r_dataset: r_dataset,
         }),
         Err(error) => {
             cancel.store(true, Ordering::Release);
@@ -1850,6 +2323,8 @@ pub fn run_rovent_training_recovered(
                 _retained_shared_held: shared_held,
                 boundary_archives,
                 boundary_archive_failures,
+                r_auxiliary_ledger,
+                _retained_r_dataset: r_dataset,
             }))
         }
     }

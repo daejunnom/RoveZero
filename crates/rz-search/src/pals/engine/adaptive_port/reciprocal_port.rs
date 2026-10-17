@@ -1,6 +1,7 @@
 //! Exact selected-view bridge for an owner-paused native R question. The
 //! existing Store, native ticket service and CPU worker keep their authority.
 use super::*;
+mod fresh_usage;
 use crate::cpu::{CpuCompletion, CpuReciprocalReply, CpuReciprocalRequest};
 use crate::cpu_worker::CpuSliceReport;
 use crate::pals::coordinator::{
@@ -505,6 +506,7 @@ struct ConsumedRoleSource {
     output: ContractDigest,
     question: Arc<AdaptivePortQuestion>,
     view: Arc<ReviewView>,
+    failure: Option<PalsError>,
 }
 
 pub struct AdaptiveCpuReciprocalQuestion {
@@ -642,6 +644,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         self.counters.role_calls += 1;
         self.counters.consumed_role_outputs += 1;
         match purpose {
+            RoleQueryPurpose::ValueFresh => {
+                self.counters.value_calls += 1;
+                self.counters.completed_value_calls += 1;
+                self.counters.accepted_value_outputs += 1;
+            }
             RoleQueryPurpose::RepairPolicy => {
                 self.counters.repair_calls += 1;
                 self.counters.completed_repair_calls += 1;
@@ -719,6 +726,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 output: accepted.output_digest(),
                 question: Arc::clone(&work.input.question),
                 view: Arc::clone(&work.input.view),
+                failure: None,
             },
         );
         self.account_reciprocal_role(work.input.question.context.purpose);

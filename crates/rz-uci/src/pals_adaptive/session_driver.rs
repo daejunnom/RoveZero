@@ -6,6 +6,8 @@
 mod checker_metadata;
 pub use checker_metadata::*;
 mod completion_observation;
+#[cfg(feature = "pals-adaptive")]
+mod initial_stop;
 mod root_admission;
 mod rovent;
 use completion_observation::CompletionJournal;
@@ -13,9 +15,13 @@ pub use completion_observation::{
     AdaptiveCompletionDiagnostic, AdaptiveCompletionFailure, AdaptiveCompletionObservation,
     AdaptiveCompletionReasonCounts, AdaptiveCompletionReturn,
 };
-use root_admission::RoventPcrRootAdmission;
+#[cfg(feature = "pals-adaptive")]
+use initial_stop::RoventPcrIdleCustody;
+#[cfg(feature = "pals-adaptive")]
+pub use initial_stop::{ROVENT_PCR_INITIAL_DOMAIN, RoventPcrInitialReceipt};
 #[cfg(feature = "pals-adaptive")]
 use root_admission::RoventPcrRootPolicy;
+use root_admission::{RoventPcrRootAdmission, RoventPcrRootSource};
 pub use rovent::{ROVENT_NATIVE_ROOT_DOMAIN, RoventNativeRootReceipt, RoventPcrSessionProfile};
 
 use super::{
@@ -190,6 +196,8 @@ struct IdleOwners<B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>> {
     native_finished: Option<bool>,
     native_joined: bool,
     external_finished: Option<CheckerShutdown>,
+    #[cfg(feature = "pals-adaptive")]
+    rovent_idle_custody: RoventPcrIdleCustody,
 }
 // Retained process owners stay on the heap while failure/root transitions move
 // the state. Empty variants must not reserve every possible engine payload on
@@ -329,6 +337,8 @@ where
     rovent_root_policy: Option<RoventPcrRootPolicy>,
     rovent_collection_origin: Option<super::RoventNativeCollectionOrigin>,
     latest_rovent_root: Mutex<Option<Arc<RoventNativeRootReceipt>>>,
+    #[cfg(feature = "pals-adaptive")]
+    latest_rovent_initial: Mutex<Option<Arc<RoventPcrInitialReceipt>>>,
     archive_receipts: Mutex<VecDeque<ArchiveWorkReceipt>>,
     pending_output: Mutex<Option<PendingOutput>>,
     accepted_outputs: Mutex<VecDeque<AdaptiveUciOutputObservation>>,
@@ -623,6 +633,8 @@ where
                 native_finished: None,
                 native_joined: false,
                 external_finished: None,
+                #[cfg(feature = "pals-adaptive")]
+                rovent_idle_custody: RoventPcrIdleCustody::StartupReady,
             }))),
             work,
             reset_requests: AtomicU64::new(0),
@@ -638,6 +650,8 @@ where
             rovent_root_policy: None,
             rovent_collection_origin: None,
             latest_rovent_root: Mutex::new(None),
+            #[cfg(feature = "pals-adaptive")]
+            latest_rovent_initial: Mutex::new(None),
             archive_receipts: Mutex::new(VecDeque::with_capacity(64)),
             pending_output: Mutex::new(None),
             accepted_outputs: Mutex::new(VecDeque::with_capacity(64)),
@@ -1081,11 +1095,14 @@ where
             ));
         }
         let rovent_root_legal = self.rovent_root_legal(position, context)?;
-        let root_admission = self.admit_rovent_go(position, context)?;
+        let root_source = self.prepare_rovent_go(position, context)?;
         let mut state = loop {
             match self.state.try_lock() {
                 Ok(state) => break state,
-                Err(TryLockError::WouldBlock) if context.accepts().unwrap_or(false) => {
+                Err(TryLockError::WouldBlock)
+                    if Instant::now() < context.shutdown_deadline
+                        && (root_source.is_some() || context.accepts().unwrap_or(false)) =>
+                {
                     std::thread::sleep(Duration::from_millis(1))
                 }
                 Err(TryLockError::WouldBlock) => {
@@ -1102,6 +1119,39 @@ where
         if self.closed.load(Ordering::Acquire) {
             return Err(SearchSessionFailure::physical_completion_unknown());
         }
+        // Resolve the final source gate only while borrowing the actual idle
+        // owner. Initially stopped product roots leave reset/game/Store/credit
+        // unchanged and return no live capability or root-dependent work.
+        let root_admission = match root_source {
+            None => None,
+            Some(RoventPcrRootSource::Legacy(budget)) => Some(RoventPcrRootAdmission {
+                budget,
+                #[cfg(feature = "pals-adaptive")]
+                original: None,
+            }),
+            #[cfg(feature = "pals-adaptive")]
+            Some(RoventPcrRootSource::Original(source)) => {
+                use crate::rovent_root_admission::source_seal::InitialAdmissionOutcome;
+                match source
+                    .into_initial()
+                    .map_err(|error| SearchSessionFailure::debug("RoventRootAdmission", &error))?
+                {
+                    InitialAdmissionOutcome::Admitted(original) => {
+                        let original = Arc::new(original);
+                        Some(RoventPcrRootAdmission {
+                            budget: original.root_budget_digest(),
+                            original: Some(original),
+                        })
+                    }
+                    InitialAdmissionOutcome::StoppedInitial(stopped) => {
+                        let SessionState::Idle(owners) = &*state else {
+                            return Err(SearchSessionFailure::physical_completion_unknown());
+                        };
+                        return self.finish_rovent_initial(owners, context, stopped);
+                    }
+                }
+            }
+        };
         let mut initial_game = InitialGameFailureGuard {
             closed: &self.closed,
             armed: false,
@@ -1608,6 +1658,8 @@ where
             native_finished: None,
             native_joined: false,
             external_finished: None,
+            #[cfg(feature = "pals-adaptive")]
+            rovent_idle_custody: RoventPcrIdleCustody::RetiredRoot(receipt.clone()),
         });
         match driver.into_port(&receipt) {
             Ok(port) => owners.engine = Some(Box::new(port.into_engine())),
@@ -1656,7 +1708,13 @@ where
             }
         }
         initial_game.armed = false;
+        let mate_strategy = rovent_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.frontier.as_ref())
+            .and_then(|frontier| frontier.mate_strategy.clone())
+            .filter(|strategy| result.best_move == Some(strategy.best_move()));
         Ok(SearchSessionReport {
+            mate_strategy,
             best_move: result.best_move,
             work: match rovent_receipt {
                 Some(receipt) => receipt.work()?,
@@ -1868,6 +1926,8 @@ where
                     },
                     native_joined: receipt.native_owner_joined,
                     external_finished: None,
+                    #[cfg(feature = "pals-adaptive")]
+                    rovent_idle_custody: RoventPcrIdleCustody::RetiredRoot(receipt.clone()),
                 });
                 if !root_reusable {
                     if let Some(external) = &owners.external {

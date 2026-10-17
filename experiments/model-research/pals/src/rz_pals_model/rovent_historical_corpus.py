@@ -382,11 +382,10 @@ def _join_record(registration, record, admissions, runtime_bundles=None):
     else:
         if bundle is None or _runtime_bundle_digest(bundle["body"]) != origin["runtime_bundle_sha256"]:
             raise ValueError("historical runtime bundle semantic digest differs from its raw metadata file")
-        pc = engine.get("pc")
-        artifacts = pc.get("runtime_artifacts") if type(pc) is dict else None
+        artifacts = lock["manifest"].get("provenance")
         if (type(artifacts) is not list or not any(type(item) is dict and item.get("sha256") == bundle["pin"]["sha256"]
                 and item.get("bytes") == bundle["pin"]["bytes"] for item in artifacts)):
-            raise ValueError("historical runtime bundle raw file pin absent from the original lock")
+            raise ValueError("historical runtime bundle raw file pin absent from original lock provenance")
         core = next(row for row in bundle["body"]["files"] if row["role"] == "core")
         if core["sha256"] != origin.get("runtime_library_sha256"):
             raise ValueError("historical CUDA bundle core is not the registered collection runtime library")

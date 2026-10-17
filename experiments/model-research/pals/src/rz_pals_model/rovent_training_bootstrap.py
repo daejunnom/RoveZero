@@ -430,6 +430,86 @@ def recovered_dependency_set_digest(endpoints):
     return _digest(DEPENDENCY_DOMAIN, sorted(inventory, key=lambda item: item["name"]))
 
 
+def _r_original_artifact(value):
+    """Original declared NNUEC artifact metadata, never an archive lookup path."""
+    _fields(value, ("path", "sha256", "bytes", "source", "license"), "original R NNUEC artifact reference")
+    for name in ("path", "source", "license"):
+        text = value[name]
+        if type(text) is not str or not 1 <= len(text.encode()) <= 4096 or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in text):
+            raise ValueError("bounded original R artifact metadata required")
+    _sha(value["sha256"])
+    _uint(value["bytes"], positive=True)
+    # This raw path is preserved as the original declaration only.  Its bytes
+    # are opened through separately pinned publication-relative archive files,
+    # never by joining or trusting this field as a filesystem authority.
+
+
+def _r_auxiliary_dataset_request(value):
+    """Strict optional R source request, kept separate from every P/C row."""
+    _fields(value, ("root", "publication", "collection_source_commit", "collection_source_sha256",
+        "collection_runtime_library_sha256", "collection_model_semantics_sha256", "collection_model_epoch",
+        "collection_context_epoch", "collection_recipe_sha256", "collection_stage_id", "nnuec",
+        "nnuec_parameter_sha256"), "separate recovered R auxiliary dataset")
+    root = _absolute(value["root"])
+    _pin(value["publication"])
+    if _child_path(str(root), value["publication"]["path"], "R auxiliary publication") != root / "r-publication.json":
+        raise ValueError("R auxiliary publication must pin its explicit root/r-publication.json")
+    if type(value["collection_source_commit"]) is not str or re.fullmatch(r"[0-9a-f]{40}", value["collection_source_commit"]) is None:
+        raise ValueError("full original R collection commit required")
+    for name in ("collection_source_sha256", "collection_runtime_library_sha256", "collection_model_semantics_sha256",
+            "collection_recipe_sha256", "nnuec_parameter_sha256"):
+        _sha(value[name])
+    for name in ("collection_model_epoch", "collection_context_epoch"):
+        _uint(value[name], positive=True)
+    _identifier(value["collection_stage_id"])
+    nnuec = _fields(value["nnuec"], ("schema", "semantics", "encoding", "implementation_sha256", "configuration_sha256",
+        "weights", "provenance", "diagnostic", "context_namespace_policy_sha256", "local_namespace_policy_sha256",
+        "search_conditions_sha256"), "original R typed NNUEC pin")
+    for name in ("schema", "semantics", "encoding"):
+        text = nnuec[name]
+        if type(text) is not str or not 1 <= len(text.encode()) <= 256 or any(ord(char) < 32 for char in text):
+            raise ValueError("bounded original R NNUEC schema/semantics/encoding required")
+    if (nnuec["schema"] != "rz-nnuec-fp32-v2"
+            or nnuec["semantics"] != "board800-exactb192-causal-line-kind4-directedpair-originfirst-exactc256-fp32-v2"
+            or nnuec["encoding"] != "rz-nnuec-fp32-input/2"):
+        raise ValueError("historical R auxiliary source requires its explicit registered NNUEC V2 codec")
+    for name in ("implementation_sha256", "configuration_sha256", "context_namespace_policy_sha256",
+            "local_namespace_policy_sha256", "search_conditions_sha256"):
+        _sha(nnuec[name])
+    if type(nnuec["diagnostic"]) is not bool:
+        raise ValueError("exact original R NNUEC diagnostic flag required")
+    for name in ("weights", "provenance"):
+        _r_original_artifact(nnuec[name])
+    if nnuec["weights"]["bytes"] > 32 << 20 or nnuec["provenance"]["bytes"] > 256 << 10:
+        raise ValueError("historical R original weights/provenance exceed declared source bounds")
+    return value
+
+
+def r_auxiliary_dataset_presence(registration):
+    """Preserve absent/null/enabled wire state without introducing defaults."""
+    if type(registration) is not dict:
+        raise ValueError("R auxiliary presence requires its registration object")
+    if "r_auxiliary_dataset" not in registration:
+        return "absent"
+    return "null" if registration["r_auxiliary_dataset"] is None else "enabled"
+
+
+def _r_auxiliary_ancestor_requests(registration):
+    if "ancestor_r_auxiliary_datasets" not in registration or registration["ancestor_r_auxiliary_datasets"] is None:
+        return ()
+    ancestors = registration["ancestor_r_auxiliary_datasets"]
+    if type(ancestors) is not list or len(ancestors) > 256:
+        raise ValueError("bounded explicitly present R auxiliary ancestors required")
+    if r_auxiliary_dataset_presence(registration) != "enabled":
+        raise ValueError("R auxiliary ancestor list requires an enabled current R dataset")
+    for source in ancestors:
+        _r_auxiliary_dataset_request(source)
+    identities = [source["publication"]["sha256"] for source in ancestors]
+    if identities != sorted(set(identities)) or registration["r_auxiliary_dataset"]["publication"]["sha256"] in identities:
+        raise ValueError("R auxiliary ancestors must be sorted unique publications distinct from current")
+    return ancestors
+
+
 def validate_recovered_registration(value):
     """Validate the distinct recovered DTO without converting an original /1."""
     _fields(value, ("schema", "execution_id", "action", "export_request", "recipe", "membership", "window_spec",
@@ -437,7 +517,12 @@ def validate_recovered_registration(value):
         "runtime_endpoints", "current_dataset", "ancestor_datasets", "initialization_source", "rules_profile",
         "expected_initial_completed", "expected_ancestor_completed", "resources_policy", "require_total_quota",
         "output_root", "control_root", "checkpoint_directory", "receipt_path", "max_rpc_messages", "max_rpc_bytes",
-        "max_read_bytes", "max_child_read_bytes", "max_output_bytes", "max_artifact_files"), "recovered Rovent training registration")
+        "max_read_bytes", "max_child_read_bytes", "max_output_bytes", "max_artifact_files")
+        + (("r_auxiliary_dataset",) if type(value) is dict and "r_auxiliary_dataset" in value else ())
+        + (("ancestor_r_auxiliary_datasets",) if type(value) is dict and "ancestor_r_auxiliary_datasets" in value else ()),
+        # Both optional fields retain their original absent/null/list/object
+        # presence; no disabled run receives a re-signed default value.
+        "recovered Rovent training registration")
     if value["schema"] != RECOVERED_REGISTRATION_DOMAIN:
         raise ValueError("separate recovered registration domain required; original conversion forbidden")
     _identifier(value["execution_id"])
@@ -457,6 +542,9 @@ def validate_recovered_registration(value):
         raise ValueError("duplicate recovered registered dependency directory")
     if _sha(value["trainer_dependency_set_sha256"]) != recovered_dependency_set_digest(value["runtime_endpoints"]):
         raise ValueError("recovered declared dependency endpoint digest differs")
+    if r_auxiliary_dataset_presence(value) == "enabled":
+        _r_auxiliary_dataset_request(value["r_auxiliary_dataset"])
+    _r_auxiliary_ancestor_requests(value)
     _historical_dataset_request(value["current_dataset"])
     ancestors = value["ancestor_datasets"]
     if type(ancestors) is not list or len(ancestors) > 256:
@@ -547,6 +635,24 @@ def validate_recovered_window_binding(startup, window):
         raise ValueError("recovered window exceeds its original output credit")
     if window.get("training_model_semantics_sha256") != dataset["model_semantics_sha256"]:
         raise ValueError("recovered architecture compatibility needs a separately registered policy")
+    current_presence = r_auxiliary_dataset_presence(registration)
+    window_presence = "absent" if "nnuec_r_auxiliary" not in window else "null" if window["nnuec_r_auxiliary"] is None else "enabled"
+    if current_presence != window_presence:
+        raise ValueError("registered R auxiliary dataset and /2 recipe must preserve exact presence")
+    if current_presence == "enabled":
+        auxiliary = window["nnuec_r_auxiliary"]
+        _fields(auxiliary, ("schema", "manifest_file_sha256", "index_file_sha256", "sampling_seed", "rows_per_pc_update",
+            "weight", "normalization", "optimizer_owner", "supervision_source"), "separate R auxiliary /2 recipe")
+        if auxiliary["schema"] != "rz-rovent-r-auxiliary-recipe/1":
+            raise ValueError("R auxiliary recipe requires its own explicit source domain")
+        for name in ("manifest_file_sha256", "index_file_sha256"):
+            _sha(auxiliary[name])
+        admitted = startup.get("r_auxiliary_admission")
+        if (type(admitted) is not dict or auxiliary["manifest_file_sha256"] != admitted.get("manifest_file_sha256")
+                or auxiliary["index_file_sha256"] != admitted.get("index_file_sha256")):
+            raise ValueError("R auxiliary recipe raw file pins differ from the separately admitted source")
+        if registration["r_auxiliary_dataset"]["nnuec"]["semantics"] != window.get("nnuec_semantics"):
+            raise ValueError("R auxiliary NNUEC semantics differ from the current learner declaration")
     return {"schema": "rz-rovent-recovered-window-binding/1", "window_schema": RECOVERED_WINDOW_DOMAIN,
         "trainer_dependency_scope": DEPENDENCY_SCOPE, "transitive_loaded_native_mappings": "unknown",
         "past_native_authority_reissued": False, "past_physical_completion_reissued": False, "execution_authorized": False}
@@ -621,7 +727,9 @@ def validate_recovered_startup(raw, *, expected_sha256, expected_bytes, executio
     _fields(value, ("schema", "execution_id", "window_id", "registration_sha256", "registration", "control",
         "original_started_ns", "execution_until_ns", "whole_until_ns", "source_root", "package_root", "source_files",
         "dependency_directories", "runtime_module_pins", "python_runtime", "resources", "collection_admission",
-        "checkpoint_admission", "child_read_credit", "artifact_watch_profile"), "recovered Rovent startup")
+        "checkpoint_admission", "child_read_credit", "artifact_watch_profile")
+        + (("r_auxiliary_admission",) if type(value) is dict and "r_auxiliary_admission" in value else ()),
+        "recovered Rovent startup")
     if value["schema"] != RECOVERED_STARTUP_DOMAIN:
         raise ValueError("separate recovered startup domain required; original conversion forbidden")
     _identifier(value["execution_id"])
@@ -719,6 +827,27 @@ def validate_recovered_startup(raw, *, expected_sha256, expected_bytes, executio
             or any(admission[name] is not False for name in ("past_native_authority_reissued", "past_physical_completion_reissued", "execution_authorized"))):
         raise ValueError("recovered collection data cannot reissue historical native/physical/execution authority")
     _checkpoint_metadata_admission(value["checkpoint_admission"], registration["initialization_source"])
+    auxiliary_presence = r_auxiliary_dataset_presence(registration)
+    if auxiliary_presence != "enabled":
+        if "r_auxiliary_admission" in value:
+            raise ValueError("disabled R auxiliary source cannot add a startup admission or default")
+    else:
+        source = registration["r_auxiliary_dataset"]
+        report = _fields(value.get("r_auxiliary_admission"), ("schema", "current_publication_sha256",
+            "ancestor_publication_sha256", "manifest_file_sha256", "index_file_sha256", "nnuec_parameter_sha256",
+            "record_count", "past_native_authority_reissued", "past_physical_completion_reissued",
+            "historical_evidence_only", "execution_authorized"), "separate historical R dataset admission")
+        for name in ("current_publication_sha256", "manifest_file_sha256", "index_file_sha256", "nnuec_parameter_sha256"):
+            _sha(report[name])
+        _uint(report["record_count"], 262144)
+        ancestors = _r_auxiliary_ancestor_requests(registration)
+        expected = sorted(item["publication"]["sha256"] for item in ancestors)
+        if (report["schema"] != "rz-rovent-recovered-r-dataset-set/1"
+                or report["current_publication_sha256"] != source["publication"]["sha256"]
+                or report["ancestor_publication_sha256"] != expected or report["nnuec_parameter_sha256"] != source["nnuec_parameter_sha256"]
+                or report["historical_evidence_only"] is not True
+                or any(report[name] is not False for name in ("past_native_authority_reissued", "past_physical_completion_reissued", "execution_authorized"))):
+            raise ValueError("R auxiliary startup source cannot alias P/C data or reissue historical authority")
     return copy.deepcopy(value)
 
 

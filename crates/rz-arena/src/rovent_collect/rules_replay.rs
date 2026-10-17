@@ -145,6 +145,29 @@ impl RoventSubmittedRulesReplay {
             selected_anchors,
         })
     }
+    /// 원 제출 자료의 고정 query endpoint만 Rules로 복원한다. 현재 native 또는
+    /// 교사 실행 권한은 원 live root cap와 별도로 대조해야 한다.
+    pub(super) fn original_query_position(
+        &self,
+        input: &GenerationInputV3,
+    ) -> Result<Position, ArenaError> {
+        check(
+            self.schema == ROVENT_SUBMITTED_RULES_REPLAY,
+            "submitted query replay domain",
+        )?;
+        let slot = usize::from(input.selected_view.query.anchors[0]);
+        let anchor = self
+            .selected_anchors
+            .get(slot)
+            .ok_or_else(|| invalid("submitted query replay anchor"))?;
+        let mut position = anchor.restore()?;
+        apply(&mut position, &input.selected_view.query.prefix, 256)?;
+        check(
+            exact_rules_anchor(&position)? == input.rules_anchor,
+            "submitted query Rules anchor differs",
+        )?;
+        Ok(position)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -360,6 +383,22 @@ fn verify_wdl_replay(
         .get(name)
         .ok_or_else(|| invalid("WDL original head receipt absent"))?
         .raw_receipt;
+    verify_rules_wdl_replay(
+        raw,
+        &record.input.game_id,
+        &record.input.rules_anchor,
+        target,
+    )
+}
+
+/// 원 P/C와 R 자료가 같은 Rules 재생을 사용한다. 자료 검사만 수행하며
+/// 현재 root, worker, 관측 시각 또는 target 생성 권한은 발급하지 않는다.
+pub(super) fn verify_rules_wdl_replay(
+    raw: &Value,
+    game_id: &str,
+    input_anchor: &GenerationRulesAnchorV3,
+    target: &GenerationWdlTargetV3,
+) -> Result<(), ArenaError> {
     let trace: RoventActualTrajectoryReplay =
         serde_json::from_value(raw["rules_replay"].clone())
             .map_err(|_| invalid("missing actual WDL Rules move trace"))?;
@@ -386,9 +425,9 @@ fn verify_wdl_replay(
             .map_err(|error| invalid(error.to_string()))?;
     check(
         original.anchors == anchors
-            && original.game_id == record.input.game_id
+            && original.game_id == game_id
             && original.anchors.contains(&target.anchor)
-            && target.anchor == record.input.rules_anchor
+            && &target.anchor == input_anchor
             && target.trajectory_membership_sha256 == original.sha256()?,
         "WDL input is not an exact member of the actual replayed trajectory",
     )?;
@@ -460,7 +499,7 @@ fn verify_wdl_replay(
     )?;
     check(
         raw["rules_receipt"]["schema"] == "rz-pals-rules-outcome-evidence/1"
-            && raw["rules_receipt"]["game_id"] == record.input.game_id
+            && raw["rules_receipt"]["game_id"] == game_id
             && raw["rules_receipt"]["rules_terminal"] == true
             && raw["rules_receipt"]["ending"]
                 == serde_json::to_value(ending).map_err(|error| invalid(error.to_string()))?

@@ -93,6 +93,7 @@ class LearnedExportRequest:
     native_intake: object
     window_spec: dict
     execution_authority: OriginalTrainerAuthority
+    r_auxiliary_intake: object = None
 
 
 @dataclass(frozen=True)
@@ -253,7 +254,7 @@ class StageSampler:
             "samples": self.samples, "permutation": list(self.permutation)}
 
 
-def _read_admission(owner, intake, spec):
+def _read_admission(owner, intake, spec, *, r_auxiliary_intake=None):
     from .rovent_corpus import RoventTrainingCorpus
     if type(intake) is not RoventTrainingCorpus:
         raise ValueError("original teacher-aware native corpus owner required; legacy/metadata receipts are not an intake")
@@ -267,15 +268,34 @@ def _read_admission(owner, intake, spec):
     sha(admission["corpus_sha256"])
     if admission.get("execution_authorized") is not False:
         raise ValueError("corpus report cannot issue original learner execution authority")
+    if r_auxiliary_intake is not None:
+        from . import rovent_r_auxiliary as auxiliary
+        if not auxiliary.enabled(spec):
+            raise ValueError("disabled R auxiliary cannot acquire a separate R dataset")
     return admission
 
 
-def _journal(owner, spec, admission):
+def _journal(owner, spec, admission, *, r_auxiliary_intake=None):
     value = owner.samplers
     recovered = spec["schema"] == "rz-rovent-train-window/2"
     journal_fields = ("schema", "recipe_sha256", "stage_id", "profile_sha256", "phase_inputs",
         "updates", "head_counts", "frozen_pc_sha256", "resume_cost_receipts")
-    fields(value, journal_fields + (("recovery_cost_state",) if recovered else ()), "original learner journal")
+    from . import rovent_r_auxiliary as auxiliary
+    aux_enabled = auxiliary.enabled(spec)
+    fields(value, journal_fields + (("recovery_cost_state",) if recovered else ())
+        + (("r_auxiliary",) if aux_enabled else ())
+        + (("r_auxiliary_ancestry",) if recovered and "r_auxiliary_ancestry" in value else ()), "original learner journal")
+    if "r_auxiliary_ancestry" in value:
+        from .rovent_r_ancestry import ancestry_from_journal
+        ancestry_from_journal(value)
+    if aux_enabled:
+        auxiliary.validate_auxiliary_journal(value["r_auxiliary"], value["updates"])
+        if not _typed_equal(value["r_auxiliary"]["recipe"], spec["nnuec_r_auxiliary"]):
+            raise ValueError("R auxiliary checkpoint recipe differs from the original window")
+        if r_auxiliary_intake is not None:
+            bind_r_auxiliary(owner.recipe, spec, value["r_auxiliary"], r_auxiliary_intake)
+    elif r_auxiliary_intake is not None:
+        raise ValueError("disabled R auxiliary cannot consume an independent R corpus")
     if recovered and value["recovery_cost_state"] is not None:
         from .rovent_training_recovery import validate_recovered_cost
         validate_recovered_cost(value["recovery_cost_state"])
@@ -311,7 +331,7 @@ def _journal(owner, spec, admission):
     for event in value["updates"]:
         fields(event, ("schema", "window_id", "stage_id", "role", "completed_role_updates", "profile_sha256",
             "corpus_sha256", "phase", "sample_origins", "sample_inputs", "head_counts",
-            "actual_model_state_sha256", "original_completion"), "original learner update event")
+            "actual_model_state_sha256", "original_completion") + (("r_auxiliary",) if aux_enabled and event.get("role") != "validator" else ()), "original learner update event")
         role = event["role"]
         if role not in ROLES:
             raise ValueError("unknown original learner update role")
@@ -354,7 +374,7 @@ def _journal(owner, spec, admission):
     return value
 
 
-def initial_training_journal(recipe, spec, admission):
+def initial_training_journal(recipe, spec, admission, *, r_auxiliary_intake=None):
     """Plain initial state only; this function issues no native authority."""
     validate_window_spec(recipe, spec)
     sha(admission["corpus_sha256"])
@@ -364,7 +384,62 @@ def initial_training_journal(recipe, spec, admission):
         "resume_cost_receipts": []}
     if spec["schema"] == "rz-rovent-train-window/2":
         journal["recovery_cost_state"] = None
+    from . import rovent_r_auxiliary as auxiliary
+    if auxiliary.enabled(spec):
+        journal["r_auxiliary"] = auxiliary.initial_auxiliary_journal(spec["nnuec_r_auxiliary"])
+        if r_auxiliary_intake is not None:
+            bind_r_auxiliary(recipe, spec, journal["r_auxiliary"], r_auxiliary_intake)
+    elif r_auxiliary_intake is not None:
+        raise ValueError("disabled auxiliary cannot bind an R source")
     return journal
+
+
+def bind_r_auxiliary(recipe, spec, journal, intake):
+    """Join a separate retained R dataset; a report never grants execution."""
+    from .rovent_r_corpus import RoventRCorpus
+    from . import rovent_r_auxiliary as auxiliary
+    if not auxiliary.enabled(spec) or type(intake) is not RoventRCorpus:
+        raise ValueError("enabled R auxiliary requires its own original typed R corpus")
+    registration = auxiliary.validate_auxiliary_recipe(spec["nnuec_r_auxiliary"], recipe=recipe)
+    observed = intake.observation()
+    if (intake.corpus_sha256 != registration["manifest_file_sha256"] or intake.index_sha256 != registration["index_file_sha256"]
+            or observed.get("execution_authorized") is not False):
+        raise ValueError("R auxiliary original manifest/index bytes differ from the explicit recipe")
+    manifest = intake._manifest["collection"]
+    # R's original model epoch belongs to its separately pinned NNUEC source,
+    # not to P/C's submitted model epoch. The historical R reader joins that
+    # epoch exactly to its own request/manifest; do not invent cross-role equality.
+    namespace = {name: value for name, value in _collection_namespace(spec).items() if name != "model_epoch"}
+    if any(not _typed_equal(manifest.get(name), expected) for name, expected in
+           (("recipe_sha256", recipe.sha256), ("stage_id", spec["stage_id"]), *namespace.items())):
+        raise ValueError("R auxiliary collection source/runtime/model/context differs from this window")
+    metadata = intake.pool_metadata(split="train", optimization=True)
+    # Actual sampling uses a second, joint PC/R leakage admission. Do not bind
+    # this standalone R pool into a sampler checkpoint before that admission.
+    return metadata
+
+
+def joint_r_auxiliary_dispatch(owner, intake, spec, journal, r_intake):
+    """Filter both streams with the same complete historical leakage graph.
+
+    The dispatcher owns no native, Rules or execution capability. Per-sample
+    authority still consumes the original separate PC and R corpus owners.
+    In particular, an R manifest's declared PC ancestors need not contain this
+    window's current PC corpus; selecting the R pool alone would miss that join.
+    """
+    from .rovent_joint_corpus import build_pc_r_companion
+    sidecar = journal["r_auxiliary"]
+    bind_r_auxiliary(owner.recipe, spec, sidecar, r_intake)
+    dispatch = build_pc_r_companion(intake, r_intake,
+        training_input_sha256=list(owner.inherited_input_sha256),
+        training_origin_sha256=list(owner.inherited_origin_sha256),
+        retained_r_input_sha256=sorted(set(sidecar["retained_input_sha256"]) | set(sidecar["ancestor_input_sha256"])),
+        retained_r_origin_sha256=sorted(set(sidecar["retained_origin_sha256"]) | set(sidecar["ancestor_origin_sha256"])))
+    metadata = dispatch.pool_metadata(split="train", optimization=True)
+    pool = sha(metadata["pool_sha256"])
+    if spec["phase"] == "pc" and sidecar["pool_sha256"] is not None and sidecar["pool_sha256"] != pool:
+        raise ValueError("R auxiliary joint PC/R leakage pool changed across a checkpoint boundary")
+    return dispatch, metadata
 
 
 def prepare_frozen_v_journal(owner, native_intake, window_spec):
@@ -540,7 +615,9 @@ def _source_fork_journal(value, *, recipe, source_stage, completed):
     """
     fields(value, ("schema", "recipe_sha256", "stage_id", "profile_sha256", "phase_inputs",
         "updates", "head_counts", "frozen_pc_sha256", "resume_cost_receipts")
-        + (("recovery_cost_state",) if value.get("schema") == RECOVERED_JOURNAL_DOMAIN else ()), "source fork journal")
+        + (("recovery_cost_state",) if value.get("schema") == RECOVERED_JOURNAL_DOMAIN else ())
+        + (("r_auxiliary",) if "r_auxiliary" in value else ())
+        + (("r_auxiliary_ancestry",) if value.get("schema") == RECOVERED_JOURNAL_DOMAIN and "r_auxiliary_ancestry" in value else ()), "source fork journal")
     if (value["schema"] not in (JOURNAL_DOMAIN, RECOVERED_JOURNAL_DOMAIN) or value["recipe_sha256"] != recipe.sha256
             or value["stage_id"] != source_stage or type(value["updates"]) is not list
             or len(value["updates"]) != sum(completed.values())):
@@ -698,7 +775,7 @@ def admit_learned_export(owner, checkpoint, request):
 
 def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory, *,
                          execution_authority=None, cancelled=lambda: False,
-                         execution_until_ns=None, execute=False):
+                         execution_until_ns=None, execute=False, r_auxiliary_intake=None):
     """Validate only by default; explicit execution is one finite owned window.
 
     The caller must install its initial/fork sampler journal before dispatch;
@@ -713,7 +790,18 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
     if owner.stage_id != spec["stage_id"]:
         raise ValueError("window cannot change an owned checkpoint stage")
     admission = _read_admission(owner, native_intake, spec)
-    journal = _journal(owner, spec, admission)
+    from . import rovent_r_auxiliary as auxiliary
+    aux_enabled = auxiliary.enabled(spec)
+    journal = _journal(owner, spec, admission, r_auxiliary_intake=r_auxiliary_intake)
+    if aux_enabled and r_auxiliary_intake is None:
+        raise ValueError("enabled auxiliary execution requires its separate original R intake")
+    aux_sampler, joint_dispatch = None, None
+    if aux_enabled:
+        joint_dispatch, metadata = joint_r_auxiliary_dispatch(owner, native_intake, spec, journal, r_auxiliary_intake)
+        if spec["phase"] == "pc":
+            aux_sampler = auxiliary.RAuxiliarySampler(tuple(joint_dispatch.r_rows(split="train", optimization=True)),
+                seed=spec["nnuec_r_auxiliary"]["sampling_seed"], pool_sha256=metadata["pool_sha256"],
+                state=journal["r_auxiliary"]["sampler"])
     if execute is not True:
         if execute is not False:
             raise ValueError("explicit bool execution selector required")
@@ -723,6 +811,11 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
             "arena_eligible": False}
     if not isinstance(execution_authority, OriginalTrainerAuthority):
         raise OriginalTrainingAuthorityRequired("original host/producer training authority required; JSON admission is insufficient")
+    if aux_sampler is not None:
+        # Binding happens only for explicit execution, after the complete
+        # companion graph was checked. Validation-only admission is immutable.
+        journal["r_auxiliary"]["pool_sha256"] = aux_sampler.pool_sha256
+        journal["r_auxiliary"]["sampler"] = aux_sampler.state()
     read_accounting = None
     if spec["schema"] == "rz-rovent-train-window/2":
         read_accounting = execution_authority._read_budget
@@ -748,7 +841,8 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
     phase_state = journal["phase_inputs"][spec["phase"]]
     streams, samplers = {}, {}
     for role in roles:
-        streams[role] = native_intake.rows(role, split="train", optimization=True)
+        streams[role] = (joint_dispatch.pc_rows(role, split="train", optimization=True) if joint_dispatch is not None
+            else native_intake.rows(role, split="train", optimization=True))
         pool = digest("rz-rovent-native-role-pool/1", {"corpus_sha256": admission["corpus_sha256"], "role": role,
             "inputs": [(sample["input_sha256"], sample["origin_sha256"]) for sample in
                        (native_intake.training_sample(row) for row in streams[role])]})
@@ -760,10 +854,13 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
         prior = owner.samplers
         try:
             owner.samplers = value
-            checked = _journal(owner, spec, admission)
+            checked = _journal(owner, spec, admission, r_auxiliary_intake=r_auxiliary_intake)
             for role, state in checked["phase_inputs"][spec["phase"]]["samplers"].items():
                 StageSampler(streams[role], role=role, seed=spec["sampling_seed"],
                     pool_sha256=samplers[role].pool_sha256, state=state)
+            if aux_sampler is not None and checked["r_auxiliary"]["sampler"] is not None:
+                auxiliary.RAuxiliarySampler(aux_sampler.rows, seed=aux_sampler.seed, pool_sha256=aux_sampler.pool_sha256,
+                    state=checked["r_auxiliary"]["sampler"])
         finally:
             owner.samplers = prior
     with _RNG_LOCK:
@@ -806,7 +903,9 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
                     else:
                         status = "declared_stage_updates_complete"
                     break
-                if groups >= spec["max_groups"] or consumed_samples + 8 > spec["max_samples"]:
+                next_rows = 8 + (spec["nnuec_r_auxiliary"]["rows_per_pc_update"]
+                    if aux_enabled and spec["phase"] == "pc" else 0)
+                if groups >= spec["max_groups"] or consumed_samples + next_rows > spec["max_samples"]:
                     status = "sample_group_budget_exhausted"
                     break
                 pending = [role for role in roles if owner.completed[role] < available[role]]
@@ -824,13 +923,36 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
                     execution_authority.consume_sample(lease, sample)
                 counts = _valid_counts(samples, role)
                 weights = {**spec["loss_weights"], "nnuec_wdl": spec["nnuec_loss"]["weight"]}
+                if aux_enabled:
+                    # Preserve available P/C NNUEC labels/counts as evidence;
+                    # the declared exclusive R stream owns NNUEC supervision.
+                    weights["nnuec_wdl"] = 0
                 if not any(count and weights[head] for head, count in counts.items()):
                     owner.cost["masked_groups"] += 1
                     continue
+                aux_samples, aux_projection = [], None
+                if aux_enabled and role != "validator":
+                    auxiliary_count = spec["nnuec_r_auxiliary"]["rows_per_pc_update"]
+                    aux_samples = [joint_dispatch.r_training_sample(token) for token in aux_sampler.take(auxiliary_count)]
+                    consumed_samples += len(aux_samples)
+                    for sample in aux_samples:
+                        check_admission()
+                        execution_authority.consume_auxiliary(lease,
+                            r_auxiliary_intake.original_auxiliary_evidence(sample["record_sha256"]))
+                    pc_valid_rows = sum(any(sample["targets"][head] is not None and spec["loss_weights"][head] > 0
+                        for head in ("policy", "wdl", "divergence")) for sample in samples)
+                    aux_projection = auxiliary.update_projection(spec["nnuec_r_auxiliary"], aux_samples, pc_valid_rows=pc_valid_rows)
+                    step = int(aux_projection["valid_rows"] > 0)
+                    aux_projection.update({name: step for name in ("r_auxiliary_nnuec_optimizer_steps",
+                        "r_auxiliary_nnuec_scheduler_steps", "r_auxiliary_nnuec_moments_steps")})
+                    auxiliary.validate_update_projection(aux_projection, registration=spec["nnuec_r_auxiliary"])
                 owner.dispatched[role] += 1
                 update_started = time.monotonic_ns()
                 active = {name: parameter for name, parameter in owner.model.named_parameters() if parameter.requires_grad}
                 optimizer_ids = sorted({owner.recipe.to_dict()["parameter_ownership"][_owner_component(name)] for name in active})
+                if aux_enabled and (aux_projection is None or not aux_projection["valid_rows"]):
+                    nnuec_owner = spec["nnuec_r_auxiliary"]["optimizer_owner"]
+                    optimizer_ids = [identity for identity in optimizer_ids if identity != nnuec_owner]
                 for identity in optimizer_ids:
                     owner.optimizers[identity].zero_grad(set_to_none=True)
                 try:
@@ -844,7 +966,7 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
                         owner.cost["forward_calls"] += 1
                         owner.cost["samples"] += 1
                         sums = loss_sums(outputs, batch, sample["targets"], role, divergence_index=sample["divergence_index"])
-                        if role != "validator" and sample["nnuec_wdl"] is not None:
+                        if not aux_enabled and role != "validator" and sample["nnuec_wdl"] is not None:
                             if sample["nnuec_input"] is None:
                                 raise ValueError("NNUEC target has no original same-anchor Rules input")
                             if (sample["nnuec_model_sha256"] != spec["nnuec_collection_model_sha256"]
@@ -866,6 +988,26 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
                         owner.cost["backward_calls"] += 1
                         owner.pending_microbatches += 1
                         owner.bucket = validate_payload(sample["input"]["encoded_model_input"])["line_bucket"]
+                    for sample in aux_samples:
+                        check_admission()
+                        owner.cost["samples"] += 1
+                        if sample["nnuec_wdl"] is None:
+                            continue
+                        if (sample["nnuec_model_sha256"] != spec["nnuec_collection_model_sha256"]
+                                or sample["nnuec_semantics"] != spec["nnuec_semantics"]):
+                            raise ValueError("R auxiliary changed the original NNUEC parameter/meaning namespace")
+                        nnuec = owner.model.nnuec(copy.deepcopy(sample["nnuec_input"]))
+                        owner.cost["forward_calls"] += 1
+                        logits = nnuec.wdl_logits
+                        target = torch.tensor(sample["nnuec_wdl"], dtype=torch.float32, device=logits.device)
+                        if logits.shape != (3,) or logits.shape != target.shape or not bool(torch.all(torch.isfinite(logits))):
+                            raise ValueError("R auxiliary exact-anchor WDL logits are not finite FP32 shape3")
+                        loss = -(target * torch.nn.functional.log_softmax(logits, dim=-1)).sum()
+                        loss = loss * spec["nnuec_r_auxiliary"]["weight"] / aux_projection["valid_rows"]
+                        if not bool(torch.isfinite(loss)):
+                            raise ValueError("nonfinite original R auxiliary learner loss")
+                        loss.backward()
+                        owner.cost["backward_calls"] += 1
                     if any(parameter.grad is not None and not bool(torch.all(torch.isfinite(parameter.grad))) for parameter in active.values()):
                         raise ValueError("nonfinite original learner gradient")
                     if not any(parameter.grad is not None for parameter in active.values()):
@@ -894,6 +1036,8 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
                         "sample_origins": [sample["origin_sha256"] for sample in samples],
                         "sample_inputs": [sample["input_sha256"] for sample in samples], "head_counts": counts,
                         "actual_model_state_sha256": state_digest(runtime[1](owner.model.state_dict()))}
+                    if aux_projection is not None:
+                        event["r_auxiliary"] = aux_projection
                     original = execution_authority.completed_update(lease, event, owner)
                     fields(original, ("sha256", "bytes"), "original learner update receipt pin")
                     sha(original["sha256"])
@@ -901,6 +1045,8 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
                         raise ValueError("original learner completion receipt is empty")
                     owner.cost["output_bytes"] = uint(owner.cost["output_bytes"] + original["bytes"])
                     journal["updates"].append({**event, "original_completion": copy.deepcopy(original)})
+                    if aux_projection is not None:
+                        auxiliary.complete_auxiliary_update(journal["r_auxiliary"], aux_projection, aux_sampler.state())
                     for head, count in counts.items():
                         journal["head_counts"][head] = uint(journal["head_counts"][head] + count)
                     owner.inherited_input_sha256 = sorted(set(owner.inherited_input_sha256) | {sample["input_sha256"] for sample in samples})

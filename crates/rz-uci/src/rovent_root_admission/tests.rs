@@ -1,16 +1,18 @@
 //! Pure Rules/context fixtures; no model, engine, worker or evaluator starts.
 use super::*;
+use crate::bridge::BuildSearchSettings;
 use crate::contracts::SessionScope;
+use crate::engine::driver_start_fixture::{FixtureStart, issue_start};
 use rz_contracts::rovent::ROVENT_SEARCH_REVISION;
-use rz_contracts::{CancelToken, GameGeneration, ProcessEpoch, RootGeneration};
+use rz_contracts::{GameGeneration, ProcessEpoch, RootGeneration};
 use rz_experiments::{
     ROVENT_EXECUTION_DOMAIN, ROVENT_POSITION_VISIT_UNIT, RoventExecutionManifest,
 };
-use rz_search::driver::SearchControl;
+use rz_runtime::contracts::ContractClock;
+use rz_search::time::TimeBudgetConfig;
 use serde_json::{Value, json};
 use std::{
     num::NonZeroU16,
-    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -63,36 +65,63 @@ fn context(clock: &ProcessClock) -> SearchSessionContext {
         root: RootGeneration(1),
         implementation: Digest([9; 32]),
     };
-    let hard = Instant::now() + Duration::from_secs(20);
-    let mut control = SearchControl::new(hard, 4096);
-    control.soft_deadline = hard - Duration::from_millis(300);
-    control.admission_deadline = hard - Duration::from_millis(200);
-    SearchSessionContext {
+    let go = GoLimits {
+        searchmoves: Some(vec!["e2e4".into(), "d2d4".into()]),
+        depth_plies: NonZeroU16::new(2),
+        nodes: Some(7),
+        white_time_ms: Some(120000),
+        black_time_ms: Some(120000),
+        white_increment_ms: Some(1000),
+        black_increment_ms: Some(1000),
+        ..GoLimits::default()
+    };
+    match issue_start(
+        &Position::startpos(),
+        go,
         authority,
-        original_go: Some(Arc::new(GoLimits {
-            searchmoves: Some(vec!["e2e4".into(), "d2d4".into()]),
-            depth_plies: NonZeroU16::new(2),
-            nodes: Some(7),
-            white_time_ms: Some(120000),
-            black_time_ms: Some(120000),
-            white_increment_ms: Some(1000),
-            black_increment_ms: Some(1000),
-            ..GoLimits::default()
-        })),
-        root_moves: Some(Arc::from([
-            BoardMove::from_uci("e2e4").unwrap(),
-            BoardMove::from_uci("d2d4").unwrap(),
-        ])),
-        goal: SearchGoal {
-            depth_plies: NonZeroU16::new(2),
-            mate_moves: None,
-        },
-        requested_nodes: Some(7),
-        control,
-        cancellation: CancelToken::new(),
-        shutdown_deadline: hard + Duration::from_millis(500),
-        current: Arc::new(Mutex::new(SessionScope::Search(authority))),
+        clock,
+        clock.runtime_clock().origin(),
+        start_settings(),
+        Duration::from_millis(500),
+    )
+    .unwrap()
+    {
+        FixtureStart::Started(context) => context,
+        FixtureStart::RulesOnly(_) => panic!("ongoing Rules fixture did not issue actual Start"),
     }
+}
+fn start_settings() -> BuildSearchSettings {
+    BuildSearchSettings {
+        time_config: TimeBudgetConfig::default(),
+        max_simulations: 4096,
+        untimed_limit: Duration::from_secs(60),
+    }
+}
+fn refresh_start(position: &Position, clock: &ProcessClock, context: &mut SearchSessionContext) {
+    let start = context.original_time_budget.as_ref().unwrap().start;
+    refresh_start_at(position, clock, context, start);
+}
+fn refresh_start_at(
+    position: &Position,
+    clock: &ProcessClock,
+    context: &mut SearchSessionContext,
+    start: Instant,
+) {
+    let go = context.original_go.as_deref().unwrap().clone();
+    *context = match issue_start(
+        position,
+        go,
+        context.authority,
+        clock,
+        start,
+        start_settings(),
+        Duration::from_millis(500),
+    )
+    .unwrap()
+    {
+        FixtureStart::Started(context) => context,
+        FixtureStart::RulesOnly(_) => panic!("successful source fixture requires an actual Start"),
+    };
 }
 fn sync_original_go(context: &mut SearchSessionContext) {
     let mut go = context.original_go.as_deref().cloned().unwrap_or_default();
@@ -212,6 +241,7 @@ fn dynamic_nodes_zero_is_distinct_without_relaxing_legacy_manifest_validation() 
     let mut context = context(&clock);
     context.requested_nodes = Some(0);
     sync_original_go(&mut context);
+    refresh_start(&position, &clock, &mut context);
     let zero = admission(
         &lock,
         RoventRootAdmissionPolicy::DynamicGo,
@@ -238,6 +268,7 @@ fn dynamic_nodes_zero_is_distinct_without_relaxing_legacy_manifest_validation() 
     );
     context.requested_nodes = None;
     sync_original_go(&mut context);
+    refresh_start(&position, &clock, &mut context);
     let unspecified = admission(
         &lock,
         RoventRootAdmissionPolicy::DynamicGo,
@@ -295,11 +326,13 @@ fn exact_workload_checks_go_goal_history_and_root_subset() {
         )
         .is_err()
     );
+    let mut fen_context = original.clone();
+    refresh_start(&fen_only, &clock, &mut fen_context);
     let fresh = admission(
         &lock,
         RoventRootAdmissionPolicy::DynamicGo,
         &fen_only,
-        &original,
+        &fen_context,
         &clock,
     );
     assert_ne!(
@@ -336,6 +369,7 @@ fn root_subset_rejects_empty_duplicates_and_illegal_moves_and_preserves_explicit
     }
     context.root_moves = None;
     sync_original_go(&mut context);
+    refresh_start(&position, &clock, &mut context);
     let unrestricted = admission(
         &lock,
         RoventRootAdmissionPolicy::DynamicGo,
@@ -345,6 +379,7 @@ fn root_subset_rejects_empty_duplicates_and_illegal_moves_and_preserves_explicit
     );
     context.root_moves = Some(Arc::from(position.ordered_legal_moves().moves()));
     sync_original_go(&mut context);
+    refresh_start(&position, &clock, &mut context);
     let explicit = admission(
         &lock,
         RoventRootAdmissionPolicy::DynamicGo,
@@ -467,7 +502,9 @@ fn original_deadline_order_origin_and_cleanup_ceiling_are_enforced() {
         RoventRootAdmissionFailure::DeclaredCeiling
     );
     wrong = original.clone();
-    wrong.control.deadline += Duration::from_nanos(1);
+    let later_start =
+        original.original_time_budget.as_ref().unwrap().start + Duration::from_nanos(1);
+    refresh_start_at(&position, &clock, &mut wrong, later_start);
     let changed = admission(
         &lock,
         RoventRootAdmissionPolicy::DynamicGo,
@@ -511,8 +548,11 @@ fn actual_rules_profile_goal_ceiling_and_tampered_lock_are_rejected() {
     );
     context.goal.depth_plies = NonZeroU16::new(2);
     sync_original_go(&mut context);
+    refresh_start(&position, &clock, &mut context);
     let mut wrong_profile = original_wire;
-    wrong_profile["engine"]["search"]["rules_profile_sha256"] = json!("0".repeat(64));
+    // The outer manifest rejects a missing/all-zero declaration before root
+    // admission. Use a valid nonzero declaration to exercise actual mismatch.
+    wrong_profile["engine"]["search"]["rules_profile_sha256"] = json!("f".repeat(64));
     let wrong_profile = super::tests::lock(wrong_profile);
     assert_eq!(
         RoventRootAdmission::admit(
@@ -585,6 +625,60 @@ fn actual_product_requires_original_go_and_rejects_mismatched_resolved_fields() 
 }
 
 #[test]
+fn actual_start_source_rejects_missing_or_substituted_same_value_input_owners() {
+    let position = Position::startpos();
+    let lock = lock(wire(&position));
+    let clock = ProcessClock::new(ProcessEpoch(7115));
+    let original = context(&clock);
+    let mut missing = original.clone();
+    missing.original_start = None;
+    let error = RoventRootAdmission::admit(
+        &lock,
+        RoventRootAdmissionPolicy::DynamicGo,
+        &position,
+        &missing,
+        &clock,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, RoventRootAdmissionFailure::Clock);
+    assert_eq!(error.detail, "actual Start source missing");
+    for changed in 0..5 {
+        let mut mismatch = original.clone();
+        match changed {
+            0 => {
+                mismatch.original_go =
+                    Some(Arc::new(original.original_go.as_deref().unwrap().clone()))
+            }
+            1 => {
+                mismatch.root_moves =
+                    Some(Arc::from(original.root_moves.as_ref().unwrap().as_ref()))
+            }
+            2 => {
+                mismatch.current = Arc::new(std::sync::Mutex::new(SessionScope::Search(
+                    original.authority,
+                )))
+            }
+            3 => mismatch.cancellation = rz_contracts::CancelToken::new(),
+            4 => {
+                mismatch.control.cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false))
+            }
+            _ => unreachable!(),
+        }
+        let error = RoventRootAdmission::admit(
+            &lock,
+            RoventRootAdmissionPolicy::DynamicGo,
+            &position,
+            &mismatch,
+            &clock,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, RoventRootAdmissionFailure::Clock);
+        assert_eq!(error.detail, "actual Start source mismatch");
+        assert!(error.metadata_error.is_some());
+    }
+}
+
+#[test]
 fn raw_uci_clocks_and_output_ownership_are_preserved_without_reconstructing_them() {
     let position = Position::startpos();
     let lock = lock(wire(&position));
@@ -605,6 +699,7 @@ fn raw_uci_clocks_and_output_ownership_are_preserved_without_reconstructing_them
     raw.black_increment_ms = Some(654);
     raw.moves_to_go = Some(17);
     raw.ponder = true;
+    refresh_start(&position, &clock, &mut other);
     let changed = admission(
         &lock,
         RoventRootAdmissionPolicy::DynamicGo,
@@ -630,7 +725,12 @@ fn raw_uci_clocks_and_output_ownership_are_preserved_without_reconstructing_them
         true
     );
     assert_eq!(changed.original_go(), other.original_go.as_deref().unwrap());
-    assert_eq!(changed.hard_deadline(), first.hard_deadline());
+    assert_eq!(
+        changed.hard_deadline(),
+        clock
+            .deadline(other.original_time_budget.as_ref().unwrap().hard_deadline)
+            .unwrap()
+    );
     assert_ne!(changed.root_budget_digest(), first.root_budget_digest());
 }
 
@@ -650,6 +750,7 @@ fn raw_searchmoves_repetition_and_order_join_the_session_canonical_subset() {
     let mut repeated = original.clone();
     Arc::make_mut(repeated.original_go.as_mut().unwrap()).searchmoves =
         Some(vec!["d2d4".into(), "e2e4".into(), "e2e4".into()]);
+    refresh_start(&position, &clock, &mut repeated);
     let admitted = admission(
         &lock,
         RoventRootAdmissionPolicy::ExactRegistered,
@@ -676,6 +777,7 @@ fn raw_searchmoves_repetition_and_order_join_the_session_canonical_subset() {
     let mut many = original;
     many.root_moves = Some(Arc::from([BoardMove::from_uci("e2e4").unwrap()]));
     Arc::make_mut(many.original_go.as_mut().unwrap()).searchmoves = Some(vec!["e2e4".into(); 219]);
+    refresh_start(&position, &clock, &mut many);
     let admitted = admission(
         &lock,
         RoventRootAdmissionPolicy::DynamicGo,

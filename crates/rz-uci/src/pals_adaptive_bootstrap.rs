@@ -542,6 +542,8 @@ impl PreparedAdaptiveProcessV5 {
             root_moves: None,
             goal: rz_contracts::rovent::SearchGoal::default(),
             original_go: None,
+            original_time_budget: None,
+            original_start: None,
             requested_nodes: None,
             control: rz_search::driver::SearchControl::new(hard_deadline, self.cpu_nodes_limit),
             cancellation: CancelToken::new(),

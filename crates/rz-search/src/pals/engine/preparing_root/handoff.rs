@@ -282,6 +282,8 @@ impl<M: RoleModel> ResearcherPreparingRoot<M> {
             self.semantic,
         );
         engine.deferred_researcher_source = Some(self.source.clone());
+        engine.deferred_researcher_initial =
+            Some(DeferredResearcherInitialReadback::from_ready(&ready));
         Ok(PreparingRootHandoff {
             parts: PreparingRootHandoffParts {
                 engine,

@@ -34,6 +34,13 @@ pub trait RoleOnlySearchDriver<Q> {
         output: &RoleOutput,
         physical: Option<TicketExecutionEvidence>,
     ) -> Result<(), AdaptiveManagerError>;
+    fn role_consumption_recorded(
+        &self,
+        _: &RoleTicketEnvelope,
+        _: &FrameInput<ReviewView, Q>,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
     fn role_discarded(
         &mut self,
         input: &FrameInput<ReviewView, Q>,
@@ -86,6 +93,7 @@ struct RoleOnlyBinding<Q, O> {
     accepted: Option<AcceptedRoleStep>,
     collection_dispatched: bool,
     collection_abandoned: bool,
+    consumption_recorded: bool,
 }
 
 pub struct RoleOnlyManagerSources<Q, B, D>
@@ -502,6 +510,7 @@ where
                 accepted: None,
                 collection_dispatched: false,
                 collection_abandoned: false,
+                consumption_recorded: false,
             });
             self.counters.native_preparations += 1;
             changed = true;
@@ -653,46 +662,30 @@ where
                         .delivered
                         .as_ref()
                         .ok_or(AdaptiveManagerError::Invalid("accepted P/C output custody"))?;
-                    let mut counters = self.counters;
-                    let mut accounting = self.accounting;
-                    counters.consumed_role_outputs =
-                        counters.consumed_role_outputs.checked_add(1).ok_or(
-                            AdaptiveManagerError::Capacity("P/C consumed output counter"),
-                        )?;
-                    accounting
-                        .observe_search_consumption(accepted.ticket().role, binding.physical)?;
-                    match binding
-                        .physical
-                        .filter(|e| e.measurement_complete)
-                        .and_then(|e| e.completed_nn_inputs)
-                    {
-                        Some(count) => {
-                            counters.consumed_nn_inputs =
-                                counters.consumed_nn_inputs.checked_add(count).ok_or(
-                                    AdaptiveManagerError::Capacity("P/C consumed input counter"),
-                                )?;
-                            counters.zero_nn_outputs_consumed = counters
-                                .zero_nn_outputs_consumed
-                                .checked_add(u64::from(count == 0))
-                                .ok_or(AdaptiveManagerError::Capacity("P/C zero input counter"))?;
-                        }
-                        None => {
-                            counters.consumed_nn_input_count_unknown = counters
-                                .consumed_nn_input_count_unknown
-                                .checked_add(1)
-                                .ok_or(AdaptiveManagerError::Capacity(
-                                    "P/C unknown input counter",
-                                ))?
-                        }
-                    }
-                    self.driver.consume_accepted(
+                    let returned = self.driver.consume_accepted(
                         &binding.input,
                         accepted,
                         output.proposer_ranking_output(),
                         binding.physical,
-                    )?;
-                    self.counters = counters;
-                    self.accounting = accounting;
+                    );
+                    let consumed = if returned.is_ok() {
+                        true
+                    } else {
+                        match self
+                            .driver
+                            .role_consumption_recorded(accepted.ticket(), &binding.input)
+                        {
+                            Ok(consumed) => consumed,
+                            Err(readback) => {
+                                self.record_failure(readback);
+                                false
+                            }
+                        }
+                    };
+                    if consumed {
+                        self.mark_consumed(index)?;
+                    }
+                    returned?;
                 } else {
                     self.driver
                         .role_discarded(&binding.input, binding.ticket.as_ref())?;
@@ -701,12 +694,57 @@ where
             } else {
                 self.driver
                     .role_discarded(&binding.input, binding.ticket.as_ref())?;
-                self.counters.unused_role_results += 1;
+                self.counters.unused_role_results += u64::from(!binding.consumption_recorded);
             }
             self.bindings.remove(index);
             changed = true;
         }
         Ok(changed)
+    }
+    fn mark_consumed(&mut self, index: usize) -> Result<(), AdaptiveManagerError> {
+        let binding = &self.bindings[index];
+        if binding.consumption_recorded {
+            return Ok(());
+        }
+        let ticket = binding
+            .ticket
+            .ok_or(AdaptiveManagerError::Invalid("P/C consumed ticket missing"))?;
+        let mut counters = self.counters;
+        let mut accounting = self.accounting;
+        counters.consumed_role_outputs =
+            counters
+                .consumed_role_outputs
+                .checked_add(1)
+                .ok_or(AdaptiveManagerError::Capacity(
+                    "P/C consumed output counter",
+                ))?;
+        accounting.observe_search_consumption(ticket.role, binding.physical)?;
+        match binding
+            .physical
+            .filter(|e| e.measurement_complete)
+            .and_then(|e| e.completed_nn_inputs)
+        {
+            Some(count) => {
+                counters.consumed_nn_inputs = counters
+                    .consumed_nn_inputs
+                    .checked_add(count)
+                    .ok_or(AdaptiveManagerError::Capacity("P/C consumed input counter"))?;
+                counters.zero_nn_outputs_consumed = counters
+                    .zero_nn_outputs_consumed
+                    .checked_add(u64::from(count == 0))
+                    .ok_or(AdaptiveManagerError::Capacity("P/C zero input counter"))?;
+            }
+            None => {
+                counters.consumed_nn_input_count_unknown = counters
+                    .consumed_nn_input_count_unknown
+                    .checked_add(1)
+                    .ok_or(AdaptiveManagerError::Capacity("P/C unknown input counter"))?
+            }
+        }
+        self.counters = counters;
+        self.accounting = accounting;
+        self.bindings[index].consumption_recorded = true;
+        Ok(())
     }
     fn event(&mut self, event: TicketNativeEvent<B::Output>) -> Result<(), AdaptiveManagerError> {
         match event {
@@ -1172,7 +1210,11 @@ where
                     self.driver
                         .role_discarded(&binding.input, binding.ticket.as_ref())?;
                 }
-                self.counters.unused_role_results += self.bindings.len() as u64;
+                self.counters.unused_role_results += self
+                    .bindings
+                    .iter()
+                    .filter(|binding| !binding.consumption_recorded)
+                    .count() as u64;
                 self.bindings.clear();
                 self.acks.clear();
                 self.retained_receipts.clear();

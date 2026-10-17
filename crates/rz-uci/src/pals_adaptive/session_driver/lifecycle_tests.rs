@@ -439,6 +439,8 @@ fn context(clock: &ProcessClock, root: u64, game: u64) -> SearchSessionContext {
         root_moves: None,
         goal: rz_contracts::rovent::SearchGoal::default(),
         original_go: None,
+        original_time_budget: None,
+        original_start: None,
         requested_nodes: None,
         control: SearchControl::new(now + Duration::from_secs(5), 64),
         cancellation: CancelToken::new(),

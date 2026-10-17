@@ -2,6 +2,7 @@
 //! The last commit publishes immutable data only. It cannot recreate a live
 //! native witness, current process custody, or tensor-validation authority.
 use super::super::linux;
+use super::r_auxiliary_ledger::RoventAuxiliaryLedger;
 use super::*;
 use crate::pals_collect_v3::training_process::{directory_file, open_directory};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
@@ -86,6 +87,7 @@ struct ActualPublicationSource<'a> {
     child_identity: RoventHistoricalChildIdentity,
     expected_window: Option<&'a RoventTrainWindowV2>,
     run: ActualPublicationRun<'a>,
+    r_auxiliary_ledger: Option<RoventAuxiliaryLedger>,
 }
 impl PublishedRoventCheckpointArchive {
     pub fn publication(&self) -> &RoventCheckpointPublication {
@@ -167,6 +169,7 @@ pub fn publish_rovent_training_checkpoint(
             child_identity: source.child_identity.clone(),
             expected_window: None,
             run: ActualPublicationRun::Closed(&source.process),
+            r_auxiliary_ledger: source.r_auxiliary_ledger.clone(),
         }),
         selected_checkpoint,
         target,
@@ -179,9 +182,8 @@ pub(super) fn publish_rovent_training_checkpoint_boundary(
     source: &runtime::ActualRoventCheckpointBoundary<'_>,
     target: RoventCheckpointArchiveTarget,
 ) -> Result<PublishedRoventCheckpointArchive, Box<RoventCheckpointArchiveFailure>> {
-    let input = source
-        .child_identity()
-        .map(|child_identity| ActualPublicationSource {
+    let input = source.child_identity().and_then(|child_identity| {
+        Ok(ActualPublicationSource {
             registration: source.registration(),
             journal: source.journal(),
             held: source.held(),
@@ -190,7 +192,9 @@ pub(super) fn publish_rovent_training_checkpoint_boundary(
             child_identity,
             expected_window: Some(source.window()),
             run: ActualPublicationRun::Boundary,
-        });
+            r_auxiliary_ledger: source.r_auxiliary_ledger()?,
+        })
+    });
     publish_input(input, source.checkpoint_index(), target)
 }
 fn publish_input(
@@ -229,11 +233,12 @@ fn publish_input(
         // Re-run all historical byte, row, update-chain, boundary and closure
         // checks before the final name becomes visible. This produces only a
         // temporary metadata owner, never live or tensor validation authority.
-        let verified = VerifiedRoventCheckpointSource::open(
+        let verified = VerifiedRoventCheckpointSource::open_with_r_auxiliary(
             &builder.root,
             builder.absolute(&pending)?,
             Arc::clone(source.dataset),
             source.dataset.ancestors.clone(),
+            actual_r_auxiliary_datasets(&source)?,
             &builder.target.read_budget,
         )?;
         check(
@@ -838,6 +843,51 @@ impl ArchiveBuilder {
             },
         };
         let boundary = actual_boundary(source, state)?;
+        let r_auxiliary = match &spec.nnuec_r_auxiliary {
+            RoventRAuxiliaryPresence::Absent => {
+                check(
+                    source.r_auxiliary_ledger.is_none(),
+                    "disabled actual window retained an R ledger",
+                )?;
+                RoventRAuxiliaryPresence::Absent
+            }
+            RoventRAuxiliaryPresence::Null => {
+                check(
+                    source.r_auxiliary_ledger.is_none() && state.get("r_auxiliary").is_none(),
+                    "explicit null actual R checkpoint changed presence",
+                )?;
+                RoventRAuxiliaryPresence::Null
+            }
+            RoventRAuxiliaryPresence::Enabled(recipe) => {
+                let prefix = actual_r_auxiliary_prefix(
+                    source,
+                    &spec,
+                    &boundary.completed_updates,
+                    self.target.deadline,
+                    &self.target.cancel,
+                )?;
+                prefix.validate_checkpoint_projection(&state["r_auxiliary"])?;
+                let dataset = prefix.dataset();
+                dataset.revalidate(&self.target.read_budget)?;
+                check(
+                    dataset.manifest_file_sha256() == recipe.manifest_file_sha256
+                        && dataset.index_file_sha256() == recipe.index_file_sha256,
+                    "actual R checkpoint changed original dataset file pins",
+                )?;
+                let parent_ledger_projection = self.write_bytes(
+                    &format!("{namespace}/r-auxiliary-parent-ledger.json"),
+                    &serde_json::to_vec(&prefix.observation())
+                        .map_err(|e| invalid(e.to_string()))?,
+                )?;
+                RoventRAuxiliaryPresence::Enabled(RoventCheckpointRAuxiliary {
+                    schema: ROVENT_CHECKPOINT_R_AUXILIARY.into(),
+                    dataset_publication_sha256: dataset.publication_pin().sha256.clone(),
+                    manifest_file_sha256: dataset.manifest_file_sha256().to_owned(),
+                    index_file_sha256: dataset.index_file_sha256().to_owned(),
+                    parent_ledger_projection,
+                })
+            }
+        };
         let recorded_tail_cost = if receipt.is_some() {
             let end_cost = journal
                 .end_cost
@@ -938,6 +988,7 @@ impl ArchiveBuilder {
                 .into(),
                 evidence: closure_file,
             },
+            r_auxiliary,
         })
     }
     fn commit_publication(
@@ -1098,6 +1149,182 @@ fn actual_boundary(
             .map_err(|e| invalid(e.to_string()))?,
     };
     Ok(boundary)
+}
+fn actual_r_auxiliary_datasets(
+    source: &ActualPublicationSource<'_>,
+) -> Result<Vec<Arc<VerifiedRoventRAuxiliaryDataset>>, ArenaError> {
+    fn add(
+        owner: &Arc<VerifiedRoventRAuxiliaryDataset>,
+        all: &mut BTreeMap<String, Arc<VerifiedRoventRAuxiliaryDataset>>,
+        depth: usize,
+    ) -> Result<(), ArenaError> {
+        check(depth <= 256, "actual R archive dataset ancestry depth")?;
+        let pin = &owner.publication_pin().sha256;
+        if let Some(previous) = all.get(pin) {
+            check(
+                previous.manifest_file_sha256() == owner.manifest_file_sha256()
+                    && previous.index_file_sha256() == owner.index_file_sha256(),
+                "actual R archive dataset publication conflicts with retained owner",
+            )?;
+            return Ok(());
+        }
+        check(all.len() < 257, "actual R archive dataset owner capacity")?;
+        all.insert(pin.clone(), Arc::clone(owner));
+        for ancestor in owner.ancestors() {
+            add(ancestor, all, depth + 1)?;
+        }
+        Ok(())
+    }
+    let mut all = BTreeMap::new();
+    if let Some(auxiliary) = &source.r_auxiliary_ledger {
+        add(auxiliary.dataset(), &mut all, 0)?;
+    }
+    let mut history = source.checkpoint.map(Arc::as_ref);
+    let mut depth = 0;
+    while let Some(checkpoint) = history {
+        depth += 1;
+        check(depth <= 64, "actual R archive checkpoint history depth")?;
+        if let Some(auxiliary) = checkpoint.r_auxiliary_ledger() {
+            add(auxiliary.dataset(), &mut all, 0)?;
+        }
+        history = checkpoint.parent().map(Arc::as_ref);
+    }
+    Ok(all.into_values().collect())
+}
+
+/// Replays the actual journal against the same opaque dataset rather than
+/// truncating a later ledger's counters/sets. The full tail is checked, while
+/// only the selected checkpoint prefix is serialized into its sidecar.
+fn actual_r_auxiliary_prefix(
+    source: &ActualPublicationSource<'_>,
+    spec: &RoventTrainWindowV2,
+    target: &BTreeMap<String, u64>,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<RoventAuxiliaryLedger, ArenaError> {
+    let current = source
+        .r_auxiliary_ledger
+        .as_ref()
+        .ok_or_else(|| invalid("actual R checkpoint lacks its current original ledger"))?;
+    let recipe = spec
+        .nnuec_r_auxiliary
+        .enabled()
+        .ok_or_else(|| invalid("actual R checkpoint lacks its explicit window recipe"))?;
+    check(
+        recipe == current.recipe()
+            && !current.is_pending()
+            && current.dataset().joint_current_pc_publication_sha256()?
+                == source.dataset.registration.publication.sha256,
+        "actual R checkpoint window/ledger differs or accumulation is pending",
+    )?;
+    let dataset = Arc::clone(current.dataset());
+    let mut auxiliary = match (
+        &source.registration.initialization_source,
+        source.checkpoint,
+    ) {
+        (RoventTrainingInputSource::Initialize { .. }, None) => RoventAuxiliaryLedger::new(
+            dataset,
+            recipe.clone(),
+            BTreeSet::new(),
+            BTreeSet::new(),
+            0,
+        )?,
+        (RoventTrainingInputSource::Resume { .. }, Some(parent)) => {
+            let mut prefix = parent
+                .r_auxiliary_ledger()
+                .ok_or_else(|| invalid("actual resumed R checkpoint lost its historical prefix"))?
+                .clone();
+            prefix.bind_current_dataset(dataset, recipe)?;
+            prefix
+        }
+        (RoventTrainingInputSource::Fork { .. }, Some(parent)) => {
+            if let Some(parent) = parent.r_auxiliary_ledger() {
+                parent.fork(dataset, recipe.clone())?
+            } else {
+                RoventAuxiliaryLedger::from_non_auxiliary_checkpoint(
+                    dataset,
+                    recipe.clone(),
+                    parent,
+                )?
+            }
+        }
+        _ => {
+            return Err(invalid(
+                "actual R checkpoint initialization/history mismatch",
+            ));
+        }
+    };
+    auxiliary.set_execution_phase(
+        &spec.phase,
+        if matches!(
+            source.registration.initialization_source,
+            RoventTrainingInputSource::Resume { .. }
+        ) {
+            source.checkpoint.map(Arc::as_ref)
+        } else {
+            None
+        },
+    )?;
+    let mut replay = TrainerLedger::new(
+        source.journal.window.clone(),
+        source.journal.recipe.clone(),
+        source.journal.membership_sha256.clone(),
+        source.journal.corpus_sha256.clone(),
+        source.journal.rows.clone(),
+        source.journal.initial.clone(),
+        source.journal.ancestors.clone(),
+    )?;
+    replay.profile_sha256 = source.journal.profile_sha256.clone();
+    replay.begun = true;
+    replay.consumed_inputs.extend(
+        source
+            .dataset
+            .manifest
+            .inherited_input_sha256
+            .iter()
+            .cloned(),
+    );
+    replay.consumed_origins.extend(
+        source
+            .dataset
+            .manifest
+            .inherited_origin_sha256
+            .iter()
+            .cloned(),
+    );
+    if let Some(parent) = source.checkpoint {
+        replay
+            .consumed_inputs
+            .extend(parent.retained_inputs().iter().cloned());
+        replay
+            .consumed_origins
+            .extend(parent.retained_origins().iter().cloned());
+    }
+    auxiliary.validate_joint_retained(&replay)?;
+    let mut prefix = (&replay.completed == target).then(|| auxiliary.clone());
+    for update in &source.journal.updates {
+        check(
+            Instant::now() < deadline && !cancel.load(Ordering::Acquire),
+            "actual R checkpoint prefix replay cancelled/expired",
+        )?;
+        checkpoint::replay_update_body(
+            &mut replay,
+            update,
+            "rz-rovent-trainer-consume/2",
+            "rz-rovent-trainer-update/2",
+            "rz-rovent-recovered-learner-update/1",
+            Some(&mut auxiliary),
+        )?;
+        if prefix.is_none() && &replay.completed == target {
+            auxiliary.validate_joint_retained(&replay)?;
+            prefix = Some(auxiliary.clone());
+        }
+    }
+    check(
+        auxiliary.observation() == current.observation(),
+        "actual full R update-chain replay differs from its original current ledger",
+    )?;
+    prefix.ok_or_else(|| invalid("selected R checkpoint prefix is absent from actual updates"))
 }
 fn prefix_sets(
     mut completed: BTreeMap<String, u64>,

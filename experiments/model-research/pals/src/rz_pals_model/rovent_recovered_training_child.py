@@ -123,6 +123,100 @@ def _intake(startup, reads):
     return owner, ancestors, corpus_by_publication
 
 
+def _r_auxiliary_presence(startup, spec):
+    """Preserve absent/null/enabled without importing or opening an R source.
+
+    This comparison is neither a corpus validation nor a training capability.
+    The registration and window codecs separately validate enabled objects;
+    their presence must also match before considering the typed file owner.
+    """
+    registration = startup["registration"]
+    declared, configured = "r_auxiliary_dataset" in registration, "nnuec_r_auxiliary" in spec
+    if declared != configured:
+        raise ValueError("registered R auxiliary presence differs from the exact window presence")
+    if not declared:
+        return "absent", None
+    request, auxiliary = registration["r_auxiliary_dataset"], spec["nnuec_r_auxiliary"]
+    if request is None and auxiliary is None:
+        return "null", None
+    if type(request) is not dict or type(auxiliary) is not dict:
+        raise ValueError("registered R auxiliary null/enabled state differs from the exact window state")
+    return "enabled", request
+
+
+def _intake_r_auxiliary(startup, reads, recipe, spec, *, pc_corpus_by_publication):
+    """Keep the optional R owner distinct and disabled paths free of R IO.
+
+    The historical reader selects the exact declared PC ancestor set from the
+    available validated owners. Its result still grants no old native or new
+    trainer authority; only the current parent's per-sample admission can do so.
+    """
+    state, request = _r_auxiliary_presence(startup, spec)
+    if state != "enabled":
+        return None
+    from .rovent_historical_r_corpus import HistoricalRoventRCorpus, read_historical_r_dependencies
+    if type(pc_corpus_by_publication) is not dict or len(pc_corpus_by_publication) > 257:
+        raise ValueError("bounded validated PC publication owners are required for R lineage")
+    pending, ancestors, available_pc = [], {}, tuple(pc_corpus_by_publication.values())
+    registrations = startup["registration"].get("ancestor_r_auxiliary_datasets")
+    for source in () if registrations is None else registrations:
+        dependency = read_historical_r_dependencies(source, read_budget=reads)
+        pending.append((source, dependency))
+    while pending:
+        progressed = False
+        for entry in tuple(pending):
+            source, dependency = entry
+            if any(identity not in ancestors for identity in dependency["r_ancestor_index_sha256"]):
+                continue
+            owner = HistoricalRoventRCorpus.from_registration(source, recipe=recipe, read_budget=reads,
+                pc_corpora=available_pc, r_ancestors=tuple(ancestors.values()))
+            identity = owner.corpus.index_semantic_sha256
+            if identity != dependency["canonical_index_sha256"] or identity in ancestors:
+                raise ValueError("duplicate or changed historical R ancestor corpus identity")
+            ancestors[identity] = owner
+            pending.remove(entry)
+            progressed = True
+        if not progressed:
+            raise ValueError("historical R auxiliary graph is cyclic, foreign, or incomplete")
+    dependency = read_historical_r_dependencies(request, read_budget=reads)
+    if dependency["r_ancestor_index_sha256"] != sorted(ancestors):
+        raise ValueError("registered historical R ancestors differ from the complete current R lineage")
+    owner = HistoricalRoventRCorpus.from_registration(request, recipe=recipe, read_budget=reads,
+        pc_corpora=available_pc, r_ancestors=tuple(ancestors.values()))
+    corpus, configured = owner.corpus, spec["nnuec_r_auxiliary"]
+    if (corpus.index_semantic_sha256 != dependency["canonical_index_sha256"]
+            or corpus.corpus_sha256 != configured["manifest_file_sha256"]
+            or corpus.index_sha256 != configured["index_file_sha256"]):
+        raise ValueError("typed R auxiliary corpus differs from the exact window file pins")
+    ancestors = tuple(ancestors[identity] for identity in sorted(ancestors))
+    corpus_by_publication = {item.observation()["publication_sha256"]: item.corpus for item in (*ancestors, owner)}
+    if len(corpus_by_publication) != len(ancestors) + 1:
+        raise ValueError("historical R publication cannot alias another R corpus owner")
+    return owner, ancestors, corpus_by_publication
+
+
+def _join_r_auxiliary_admission(startup, observation, ancestor_observations):
+    """Compare durable observations to this parent's pinned startup report.
+
+    Neither side is turned into historical live authority. The actual current
+    socket owner remains responsible for original custody and update admission.
+    """
+    report = startup["r_auxiliary_admission"]
+    expected = {"current_publication_sha256": observation["publication_sha256"],
+        "ancestor_publication_sha256": sorted(item["publication_sha256"] for item in ancestor_observations),
+        **{name: observation[name] for name in ("manifest_file_sha256", "index_file_sha256",
+            "nnuec_parameter_sha256", "record_count")}}
+    if (any(name not in report or type(report[name]) is not type(value) or report[name] != value
+            for name, value in expected.items()) or observation.get("execution_authorized") is not False
+            or observation.get("past_native_authority_reissued") is not False
+            or observation.get("past_physical_completion_reissued") is not False):
+        raise ValueError("typed historical R observation differs from the current parent's pinned admission")
+    return {"schema": "rz-rovent-recovered-r-child-binding/1", **expected,
+        "scope": "durable_observation_and_current_startup_projection_only_not_historical_native_or_execution_authority",
+        "past_native_authority_reissued": False, "past_physical_completion_reissued": False,
+        "execution_authorized": False}
+
+
 def _verify_imported_runtime(startup, reads, torch):
     # Endpoint byte/inode observation is independent of collection's ORT pin.
     # The old low-level observer has no lease or window codec conversion.
@@ -142,7 +236,7 @@ def _verify_imported_runtime(startup, reads, torch):
     return result
 
 
-def _initial_owner(startup, recipe, membership, spec, native_intake, reads, torch):
+def _initial_owner(startup, recipe, membership, spec, native_intake, reads, torch, *, r_auxiliary_intake=None):
     from types import SimpleNamespace
     from .generation_data import fields
     from .rovent_tensor_training import _load_pinned_tensor_file, create_tensor_owner
@@ -170,13 +264,14 @@ def _initial_owner(startup, recipe, membership, spec, native_intake, reads, torc
     if model.nnuec.metadata_state()["training"] != {"kind": "untrained"}:
         raise ValueError("recovered initialize requires an explicit untrained NNUEC declaration")
     probe = SimpleNamespace(recipe=recipe, stage_id=spec["stage_id"], inherited_input_sha256=[], inherited_origin_sha256=[])
-    admission = _read_admission(probe, native_intake, spec)
-    journal = initial_training_journal(recipe, spec, admission)
+    auxiliary = {} if r_auxiliary_intake is None else {"r_auxiliary_intake": r_auxiliary_intake}
+    admission = _read_admission(probe, native_intake, spec, **auxiliary)
+    journal = initial_training_journal(recipe, spec, admission, **auxiliary)
     probe.samplers, probe.completed = journal, dict.fromkeys(_ROLES, 0)
     def validate_sampler(value):
         candidate = copy.copy(probe)
         candidate.samplers = value
-        _journal(candidate, spec, admission)
+        _journal(candidate, spec, admission, **auxiliary)
     import random
     import numpy as np
     random.seed(spec["training_seed"])
@@ -189,13 +284,15 @@ def _initial_owner(startup, recipe, membership, spec, native_intake, reads, torc
         bucket=8, sampler_validator=validate_sampler, cuda_devices=devices, execute=True)
 
 
-def _recover_owner(startup, recipe, membership, spec, native_intake, authority, reads, torch, *, corpus_by_publication):
+def _recover_owner(startup, recipe, membership, spec, native_intake, authority, reads, torch, *, corpus_by_publication,
+                   r_auxiliary_intake=None, r_corpus_by_publication=None):
     from .rovent_tensor_training import _load_pinned_tensor_file
     from .rovent_training_child import _template_from_tensor_payload
     from .rovent_recovered_training_window import (read_historical_checkpoint_source,
         stage_rovent_resume, stage_rovent_fork, stage_rovent_export)
     registration = startup["registration"]
-    source = read_historical_checkpoint_source(startup, reads, corpus_by_publication=corpus_by_publication)
+    historical = {} if r_corpus_by_publication is None else {"r_corpus_by_publication": r_corpus_by_publication}
+    source = read_historical_checkpoint_source(startup, reads, corpus_by_publication=corpus_by_publication, **historical)
     # The actual current socket owner separately checks history and scratch
     # state; the durable publication cannot fabricate this live relationship.
     authority.attach_historical_checkpoint(source)
@@ -215,8 +312,9 @@ def _recover_owner(startup, recipe, membership, spec, native_intake, authority, 
         factory = stage_rovent_fork
     else:
         raise ValueError("recovered scratch requires explicit resume or fork source")
+    auxiliary = {} if r_auxiliary_intake is None else {"r_auxiliary_intake": r_auxiliary_intake}
     return factory(pin["path"], pin["sha256"], template, recipe, membership, native_intake, spec,
-        execution_authority=authority, max_file_bytes=pin["bytes"], execute=True)
+        execution_authority=authority, max_file_bytes=pin["bytes"], execute=True, **auxiliary)
 
 
 def _export_request(startup, reads):
@@ -235,7 +333,8 @@ def _export_request(startup, reads):
     return request
 
 
-def _execute_export(startup, owner, staged, native_intake, spec, request, authority, reads, torch, *, clock, cancelled):
+def _execute_export(startup, owner, staged, native_intake, spec, request, authority, reads, torch, *, clock, cancelled,
+                    r_auxiliary_intake=None):
     from .generation_data import uint
     from .generation_export import _hash_file
     from .rovent_tensor_training import export_tensor_owner
@@ -247,13 +346,14 @@ def _execute_export(startup, owner, staged, native_intake, spec, request, author
     try:
         if cancelled() or clock() >= startup["execution_until_ns"]:
             raise TimeoutError("recovered export cancelled or expired before writer admission")
-        lease = authority.begin_window(owner, native_intake, spec, _read_admission(owner, native_intake, spec))
+        auxiliary = {} if r_auxiliary_intake is None else {"r_auxiliary_intake": r_auxiliary_intake}
+        lease = authority.begin_window(owner, native_intake, spec, _read_admission(owner, native_intake, spec, **auxiliary))
         rules, auxiliary_bytes = _rules_export_snapshot(startup, reads)
         available = request["max_output_bytes"] - auxiliary_bytes
         if available <= 0:
             raise ValueError("recovered export cannot fit its pinned Rules snapshot")
         result = export_tensor_owner(owner, request["directory"], kind=request["kind"], rules_profile_json=rules,
-            learned_request=LearnedExportRequest(native_intake, spec, authority),
+            learned_request=LearnedExportRequest(native_intake, spec, authority, **auxiliary),
             sampler_validator=staged.sampler_validator, max_output_bytes=available, execute=True)
         owner.cost["output_bytes"] = uint(owner.cost["output_bytes"] + auxiliary_bytes)
         receipt_path = Path(request["directory"]) / "rovent-export.json"
@@ -318,6 +418,22 @@ def recovered_rovent_child_main(argv=None, *, stdin=None, clock=time.monotonic_n
         native_intake = historical.corpus
         readback["historical_dataset"] = historical.observation()
         readback["historical_ancestor_publications"] = [item.observation()["publication_sha256"] for item in ancestors]
+        r_bundle = _intake_r_auxiliary(startup, reads, recipe, spec, pc_corpus_by_publication=corpus_by_publication)
+        auxiliary, r_sources = {}, {}
+        if r_bundle is not None:
+            historical_r, r_ancestors, r_corpus_by_publication = r_bundle
+            r_intake = historical_r.corpus
+            auxiliary["r_auxiliary_intake"] = r_intake
+            r_sources["r_corpus_by_publication"] = r_corpus_by_publication
+            r_observation = historical_r.observation()
+            ancestor_r_observations = [item.observation() for item in r_ancestors]
+            readback["r_auxiliary_current_binding"] = _join_r_auxiliary_admission(startup, r_observation, ancestor_r_observations)
+            readback["historical_r_auxiliary_dataset"] = r_observation
+            readback["historical_ancestor_r_publications"] = [item["publication_sha256"] for item in ancestor_r_observations]
+            # Candidate targets remain a separate inventory. In particular,
+            # captured R rows with unknown WDL never count as valid NNUEC
+            # updates merely because their files and lineage were accepted.
+            readback["r_auxiliary_target_inventory"] = r_intake.observation()
         if cancelled or clock() >= args.execution_until_ns:
             raise TimeoutError("recovered child cancelled or expired before tensor admission")
         torch = _configure_runtime(spec)
@@ -326,10 +442,10 @@ def recovered_rovent_child_main(argv=None, *, stdin=None, clock=time.monotonic_n
             "NVIDIA_TF32_OVERRIDE": os.environ.get("NVIDIA_TF32_OVERRIDE"),
             "CUBLAS_WORKSPACE_CONFIG": os.environ.get("CUBLAS_WORKSPACE_CONFIG")}
         if registration["initialization_source"]["kind"] == "initialize":
-            owner = _initial_owner(startup, recipe, membership, spec, native_intake, reads, torch)
+            owner = _initial_owner(startup, recipe, membership, spec, native_intake, reads, torch, **auxiliary)
         else:
             staged = _recover_owner(startup, recipe, membership, spec, native_intake, authority, reads, torch,
-                corpus_by_publication=corpus_by_publication)
+                corpus_by_publication=corpus_by_publication, **auxiliary, **r_sources)
             owner = staged.owner
         start_output = owner.cost["output_bytes"]
         if (owner.completed != registration["expected_initial_completed"]
@@ -343,12 +459,12 @@ def recovered_rovent_child_main(argv=None, *, stdin=None, clock=time.monotonic_n
             "scope": "declared_model_input_contract_not_independent_Rules_execution_proof"}
         if registration["action"] == "export":
             result, export_pin, export_expense = _execute_export(startup, owner, staged, native_intake, spec,
-                request, authority, reads, torch, clock=clock, cancelled=lambda: cancelled)
+                request, authority, reads, torch, clock=clock, cancelled=lambda: cancelled, **auxiliary)
         else:
             from .rovent_recovered_training_window import train_rovent_window
             result = train_rovent_window(owner, native_intake, spec, registration["checkpoint_directory"],
                 execution_authority=authority, cancelled=lambda: cancelled,
-                execution_until_ns=args.execution_until_ns, execute=True)
+                execution_until_ns=args.execution_until_ns, execute=True, **auxiliary)
         terminal = {"schema": RESULT_DOMAIN, "execution_id": startup["execution_id"], "window_id": startup["window_id"],
             "status": "completed", "result": result, "bootstrap": readback, "historical": _history_scope(startup),
             "completed_updates": dict(owner.completed), "physical_completion": owner.physical_completion,

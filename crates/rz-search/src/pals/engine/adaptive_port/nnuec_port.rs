@@ -12,6 +12,7 @@ use crate::cpu_value::nnuec::v2::capture::{
 };
 use crate::cpu_value::nnuec::v2::cpu::V2CpuValue;
 use crate::cpu_value::nnuec::v2::review::{BoundNnuecReviewContext, PreparationError, Request};
+use crate::cpu_worker::CpuWorkerError;
 use crate::cpu_worker::PreparedValueInstallation;
 use std::sync::atomic::AtomicBool;
 
@@ -20,6 +21,7 @@ pub enum AdaptiveNnuecPreparationError {
     Semantic(PalsError),
     Preparation(PreparationError),
     Neural(NnuecError),
+    Worker(CpuWorkerError),
     StateMismatch,
 }
 impl std::fmt::Display for AdaptiveNnuecPreparationError {
@@ -43,6 +45,11 @@ impl From<NnuecError> for AdaptiveNnuecPreparationError {
         Self::Neural(error)
     }
 }
+impl From<CpuWorkerError> for AdaptiveNnuecPreparationError {
+    fn from(error: CpuWorkerError) -> Self {
+        Self::Worker(error)
+    }
+}
 
 #[derive(Debug)]
 pub enum AdaptiveNnuecCaptureError {
@@ -64,6 +71,9 @@ pub struct AdaptiveNnuecReviewSeal {
     model: CpuValueIdentity,
 }
 impl AdaptiveNnuecReviewSeal {
+    pub(super) fn work(&self) -> &CoordinatorWork<ReviewView, AdaptivePortQuestion> {
+        &self.work
+    }
     pub fn view(&self) -> &Arc<ReviewView> {
         &self.work.input.view
     }
@@ -196,7 +206,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         .map_err(AdaptiveNnuecCaptureError::Capture)
     }
 
-    fn validate_nnuec_review_completion(
+    pub(super) fn validate_nnuec_review_completion(
         &self,
         original: &AdaptiveNnuecReviewSeal,
         model: &Model,

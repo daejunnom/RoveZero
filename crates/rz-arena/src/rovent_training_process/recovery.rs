@@ -594,5 +594,11 @@ mod entry;
 pub use entry::*;
 mod checkpoint_publication;
 pub use checkpoint_publication::*;
+mod r_auxiliary;
+pub use r_auxiliary::*;
+mod r_dataset;
+pub use r_dataset::*;
+mod r_auxiliary_ledger;
+use r_auxiliary_ledger::*;
 #[cfg(test)]
-mod metadata_wire_tests;
+pub(crate) mod metadata_wire_tests;

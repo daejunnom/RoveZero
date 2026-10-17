@@ -335,6 +335,11 @@ def _optimizer_snapshot(owner, torch, clone):
 
 
 def _schedule_count(owner, names):
+    if (type(owner.samplers) is dict and "r_auxiliary" in owner.samplers
+            and all(_owner_component(name) == "nnuec" for name in names)):
+        from .rovent_r_auxiliary import validate_auxiliary_journal
+        sidecar = validate_auxiliary_journal(owner.samplers["r_auxiliary"], owner.samplers["updates"])
+        return sidecar["current_nnuec_updates"]
     active = set()
     for name in names:
         component = _owner_component(name)

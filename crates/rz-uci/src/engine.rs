@@ -2,6 +2,12 @@
 //! Model loading and physical execution remain the injected factory's responsibility.
 
 pub mod diagnostics;
+mod driver_output;
+use driver_output::DriverOutputEnvelope;
+mod driver_start;
+pub(crate) use driver_start::DriverStartSource;
+#[cfg(test)]
+pub(crate) use driver_start::fixture as driver_start_fixture;
 
 use crate::{bridge::BuildSearchSettings, *};
 use rz_contracts as contract;
@@ -245,6 +251,14 @@ impl ProcessClock {
         &self,
         instant: Instant,
     ) -> Result<contract::MonotonicTick, contract::ContractError> {
+        // Windows QPC duration conversion may round a tiny negative delta to
+        // zero. Compare the actual Instants before converting that delta.
+        if instant < self.origin {
+            return Err(failure(
+                contract::ErrorCode::InvalidInput,
+                "tick predates process clock origin",
+            ));
+        }
         let elapsed = instant.checked_duration_since(self.origin).ok_or_else(|| {
             failure(
                 contract::ErrorCode::InvalidInput,
@@ -592,6 +606,11 @@ pub enum WorkerFailureSource {
     Authority(contract::ContractError),
     Search(Box<rz_search::contracts::ContractSearchFailure>),
     Driver(crate::search_driver::SearchSessionFailure),
+    RejectedDriverReport {
+        error: contract::ContractError,
+        report: Arc<crate::search_driver::SearchSessionReport>,
+        diagnostic_failure: Option<(contract::ContractError, Box<WorkerDiagnosticReceipt>)>,
+    },
     DiagnosticRetention {
         error: contract::ContractError,
         receipt: Box<WorkerDiagnosticReceipt>,
@@ -632,6 +651,19 @@ impl WorkerCompletion {
             WorkerFailureSource::Driver(error) => SearchCompletion::Failed {
                 code: error.code.into(),
                 message: error.detail.clone(),
+            },
+            WorkerFailureSource::RejectedDriverReport {
+                error,
+                diagnostic_failure,
+                ..
+            } => SearchCompletion::Failed {
+                code: "DriverFinalReport".into(),
+                message: match diagnostic_failure {
+                    Some((diagnostic_error, _)) => {
+                        format!("{error}; original work retention failed: {diagnostic_error}")
+                    }
+                    None => error.to_string(),
+                },
             },
             WorkerFailureSource::DiagnosticRetention { error, receipt } => {
                 SearchCompletion::Failed {
@@ -674,6 +706,8 @@ struct ActiveBinding {
     ticket: SearchTicket,
     control: SearchControl,
     authority: Option<SearchAuthority>,
+    driver_output: Option<Arc<DriverOutputEnvelope>>,
+    driver_output_until: Option<Instant>,
 }
 type FailedPublication = Arc<Mutex<Option<Box<UndeliveredWorkerFailure>>>>;
 struct Worker {
@@ -711,16 +745,25 @@ struct PendingBestMove {
     line: String,
     until: Instant,
     from_driver_report: bool,
+    driver_output: Option<DriverOutputPublication>,
 }
 struct HeldPonderBestMove {
     scope: crate::contracts::SessionScope,
     line: String,
     from_driver_report: bool,
+    driver_output: Option<DriverOutputPublication>,
 }
 struct AdmittedPonderReport {
     ticket: SearchTicket,
     scope: crate::contracts::SessionScope,
     bestmove: String,
+    driver_output: Option<DriverOutputPublication>,
+}
+#[derive(Clone)]
+struct DriverOutputPublication {
+    envelope: Arc<DriverOutputEnvelope>,
+    report: Option<Arc<crate::search_driver::SearchSessionReport>>,
+    until: Instant,
 }
 impl PendingBestMove {
     fn matches_scope(&self, scope: crate::contracts::SessionScope) -> bool {
@@ -728,11 +771,63 @@ impl PendingBestMove {
     }
 }
 impl Owner {
+    #[cfg(test)]
+    fn admitted_ponder_output_for_tests(
+        &self,
+    ) -> Option<(
+        &Arc<DriverOutputEnvelope>,
+        &Arc<crate::search_driver::SearchSessionReport>,
+    )> {
+        let publication = self
+            .admitted_ponder_report
+            .as_ref()
+            .and_then(|report| report.driver_output.as_ref())
+            .or_else(|| {
+                self.held_ponder_bestmove
+                    .as_ref()
+                    .and_then(|held| held.driver_output.as_ref())
+            })?;
+        Some((&publication.envelope, publication.report.as_ref()?))
+    }
+    fn driver_publication_for(
+        &self,
+        ticket: Option<&SearchTicket>,
+    ) -> Result<Option<DriverOutputPublication>, contract::ContractError> {
+        let Some(active) = &self.active else {
+            return Ok(None);
+        };
+        if ticket.is_some_and(|ticket| ticket != &active.ticket) {
+            return Ok(None);
+        }
+        let Some(envelope) = &active.driver_output else {
+            return Ok(None);
+        };
+        let scope = self.session_owner.lifecycle_scope();
+        if envelope.scope() != scope {
+            return Ok(None);
+        }
+        let report = envelope.report_for(&active.ticket, scope)?;
+        let until = active.driver_output_until.ok_or_else(|| {
+            failure(
+                contract::ErrorCode::IdentityMismatch,
+                "actual driver Start has no original output cleanup boundary",
+            )
+        })?;
+        Ok(Some(DriverOutputPublication {
+            envelope: Arc::clone(envelope),
+            report,
+            until,
+        }))
+    }
     fn command_line(
         &mut self,
         session: &mut Session<RulesUciPort>,
         line: &str,
-    ) -> (SessionResult<RulesSearchPosition>, bool) {
+    ) -> (
+        SessionResult<RulesSearchPosition>,
+        bool,
+        Option<DriverOutputPublication>,
+    ) {
         let parsed = crate::parser::parse_with_zero_node_limit(
             line,
             session.parser_limits(),
@@ -759,7 +854,7 @@ impl Owner {
                     code: "DriverGoRejected",
                     message: error.to_string(),
                 });
-                return (rejected, false);
+                return (rejected, false, None);
             }
         }
         let enabled = matches!(
@@ -768,6 +863,7 @@ impl Owner {
         );
         let mut out = SessionResult::default();
         let mut from_driver_report = false;
+        let mut released_output = None;
         match &parsed {
             Ok(Command::Go(limits)) if limits.ponder => {
                 if !enabled
@@ -782,7 +878,7 @@ impl Owner {
                             "Ponder must be enabled and the node limit must fit the engine envelope"
                                 .into(),
                     });
-                    return (out, false);
+                    return (out, false, None);
                 }
                 // The opponent's elapsed time is never debited from the supplied own clock.
                 // A finite resource wall and simulation ceiling still bound speculative work.
@@ -819,7 +915,7 @@ impl Owner {
                         code: "StalePonderHit",
                         message: "no current predicted-root search".into(),
                     });
-                    return (out, false);
+                    return (out, false, None);
                 }
                 self.ponder = None;
                 let ticket = session.active_ticket();
@@ -830,7 +926,8 @@ impl Owner {
                     self.session_owner
                         .handle_line(session, "stop", |s| Ok(s.state.snapshot().side_to_move())),
                 );
-                from_driver_report = self.release_ponder_output(ticket.as_ref(), &mut out);
+                (from_driver_report, released_output) =
+                    self.release_ponder_output(ticket.as_ref(), &mut out);
             }
             Ok(Command::SetOption { name, .. })
                 if name.eq_ignore_ascii_case("Ponder")
@@ -850,7 +947,8 @@ impl Owner {
                         .handle_line(session, line, |s| Ok(s.state.snapshot().side_to_move())),
                 );
                 if out.accepted && matches!(parsed, Ok(Command::Stop)) {
-                    from_driver_report = self.release_ponder_output(ticket.as_ref(), &mut out);
+                    (from_driver_report, released_output) =
+                        self.release_ponder_output(ticket.as_ref(), &mut out);
                 }
                 if out.accepted
                     && matches!(
@@ -876,17 +974,17 @@ impl Owner {
                 });
             }
         }
-        (out, from_driver_report)
+        (out, from_driver_report, released_output)
     }
     fn release_ponder_output(
         &mut self,
         ticket: Option<&SearchTicket>,
         out: &mut SessionResult<RulesSearchPosition>,
-    ) -> bool {
+    ) -> (bool, Option<DriverOutputPublication>) {
         // Successful infinite work stays in Session until stop/hit. Only its
         // exact admitted ticket, scope and move can acknowledge that report;
         // a coincident fallback after an earlier stop is not report consumption.
-        let from_passive_report = self.admitted_ponder_report.take().is_some_and(|report| {
+        let passive = self.admitted_ponder_report.take().filter(|report| {
             ticket == Some(&report.ticket)
                 && report.scope == self.session_owner.lifecycle_scope()
                 && out.protocol.iter().any(|line| {
@@ -895,18 +993,23 @@ impl Owner {
                         == Some(report.bestmove.as_str())
                 })
         });
+        let from_passive_report = passive.is_some();
+        let passive_output = passive.and_then(|report| report.driver_output);
         let Some(held) = self.held_ponder_bestmove.take() else {
-            return from_passive_report;
+            return (from_passive_report, passive_output);
         };
         if held.scope != self.session_owner.lifecycle_scope() {
             out.diagnostics.push(Diagnostic {
                 code: "StalePonderOutput",
                 message: "held predicted-root move has lost its publication authority".into(),
             });
-            return from_passive_report;
+            return (from_passive_report, passive_output);
         }
         out.protocol.push(held.line);
-        held.from_driver_report || from_passive_report
+        (
+            held.from_driver_report || from_passive_report,
+            held.driver_output.or(passive_output),
+        )
     }
     fn annotate_ponder(
         &self,
@@ -959,6 +1062,7 @@ impl Owner {
         session: &Session<RulesUciPort>,
         out: &mut SessionResult<RulesSearchPosition>,
         from_driver_report: bool,
+        driver_output: Option<&DriverOutputPublication>,
     ) {
         if session.is_closed() {
             self.ponder = None;
@@ -984,6 +1088,7 @@ impl Owner {
                     scope: self.session_owner.lifecycle_scope(),
                     line,
                     from_driver_report,
+                    driver_output: driver_output.cloned(),
                 });
             }
         }
@@ -1116,20 +1221,30 @@ impl Owner {
                     .handle_event(session, Event::Complete { ticket, completion }),
             );
             self.annotate_ponder(session, &mut failed);
-            self.hold_ponder_output(session, &mut failed, false);
-            self.defer_bestmove(session, &mut failed, false);
+            self.hold_ponder_output(session, &mut failed, false, None);
+            self.defer_bestmove(session, &mut failed, false, None);
             append_result(&mut out, failed);
         }
-        let (mut next, held_driver_report) = match event {
+        let completed_output = match passive_report.as_ref() {
+            Some((ticket, _)) => match self.driver_publication_for(Some(ticket)) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    self.close_physical_fence(session, &mut out, error.into());
+                    return out;
+                }
+            },
+            None => None,
+        };
+        let (mut next, held_driver_report, held_output) = match event {
             Event::RejectedInput {
                 code: "OwnerWake", ..
-            } => (SessionResult::default(), false),
+            } => (SessionResult::default(), false, None),
             Event::Line(line) => self.command_line(session, &line),
             event => {
                 let next = self.session_owner.handle_event(session, event);
                 let mut out = SessionResult::default();
                 append_contract_result(&mut out, next);
-                (out, false)
+                (out, false, None)
             }
         };
         // Enqueueing is not consumption. A typed failed publication stays with
@@ -1195,6 +1310,7 @@ impl Owner {
         // and replaced with a frozen fallback. Only the actual admitted
         // completion outcome may acknowledge consumption of a CPU report.
         let admitted_driver_report = (from_driver_report && next.accepted) || held_driver_report;
+        let driver_output = held_output.or(completed_output);
         if from_driver_report
             && next.accepted
             && let Some((ticket, bestmove)) = passive_report
@@ -1208,11 +1324,17 @@ impl Owner {
                 ticket,
                 scope: self.session_owner.lifecycle_scope(),
                 bestmove,
+                driver_output: driver_output.clone(),
             });
         }
         self.annotate_ponder(session, &mut next);
-        self.hold_ponder_output(session, &mut next, admitted_driver_report);
-        self.defer_bestmove(session, &mut next, admitted_driver_report);
+        self.hold_ponder_output(
+            session,
+            &mut next,
+            admitted_driver_report,
+            driver_output.as_ref(),
+        );
+        self.defer_bestmove(session, &mut next, admitted_driver_report, driver_output);
         append_result(&mut out, next);
         self.finish_physical_output(session, &mut out);
         if !session.is_closed()
@@ -1236,6 +1358,7 @@ impl Owner {
         session: &mut Session<RulesUciPort>,
         out: &mut SessionResult<RulesSearchPosition>,
         from_driver_report: bool,
+        driver_output: Option<DriverOutputPublication>,
     ) {
         let scope = self.session_owner.lifecycle_scope();
         if session.is_closed()
@@ -1246,7 +1369,22 @@ impl Owner {
         {
             self.pending_bestmove = None;
         }
-        if session.is_closed() || self.workers.is_empty() {
+        if session.is_closed() {
+            return;
+        }
+        let driver_output = match driver_output {
+            Some(publication) => Some(publication),
+            None => match self.driver_publication_for(None) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    self.close_physical_fence(session, out, error.into());
+                    return;
+                }
+            },
+        };
+        // A Rules-only bestmove has no actual Start or driver report. Every
+        // actual driver Start uses this publisher even if it was already reaped.
+        if self.workers.is_empty() && driver_output.is_none() {
             return;
         }
         for line in std::mem::take(&mut out.protocol) {
@@ -1266,7 +1404,11 @@ impl Owner {
                 );
                 return;
             }
-            let Some(until) = Instant::now().checked_add(self.settings.shutdown_limit) else {
+            let until = driver_output
+                .as_ref()
+                .map(|output| output.until)
+                .or_else(|| Instant::now().checked_add(self.settings.shutdown_limit));
+            let Some(until) = until else {
                 self.close_physical_fence(
                     session,
                     out,
@@ -1283,6 +1425,7 @@ impl Owner {
                 line,
                 until,
                 from_driver_report,
+                driver_output: driver_output.clone(),
             });
         }
     }
@@ -1305,19 +1448,61 @@ impl Owner {
         }
         if self.workers.is_empty() {
             let pending = self.pending_bestmove.take().unwrap();
+            if pending.scope != self.session_owner.lifecycle_scope() {
+                self.close_physical_fence(
+                    session,
+                    out,
+                    failure(
+                        contract::ErrorCode::Stale,
+                        "actual Start output lost its original lifecycle scope",
+                    )
+                    .into(),
+                );
+                return;
+            }
+            let bestmove = pending
+                .line
+                .strip_prefix("bestmove ")
+                .and_then(|text| text.split_ascii_whitespace().next())
+                .unwrap_or("");
+            let strategy = if let Some(publication) = &pending.driver_output {
+                match (&publication.report, pending.from_driver_report) {
+                    (Some(report), _) => publication.envelope.mate_for(
+                        report,
+                        pending.scope,
+                        bestmove,
+                        pending.from_driver_report,
+                    ),
+                    (None, false) => Ok(None),
+                    (None, true) => Err(failure(
+                        contract::ErrorCode::IdentityMismatch,
+                        "reported driver output has no actual Start final report",
+                    )),
+                }
+            } else {
+                Ok(None)
+            };
+            let strategy = match strategy {
+                Ok(strategy) => strategy,
+                Err(error) => {
+                    self.close_physical_fence(session, out, error.into());
+                    return;
+                }
+            };
             if let (Some(driver), crate::contracts::SessionScope::Search(authority)) =
                 (&self.driver, pending.scope)
             {
-                let bestmove = pending
-                    .line
-                    .strip_prefix("bestmove ")
-                    .and_then(|text| text.split_ascii_whitespace().next())
-                    .unwrap_or("");
                 if let Err(error) =
                     driver.accept_uci_output(authority, bestmove, pending.from_driver_report)
                 {
                     self.close_physical_fence(session, out, error.into());
                     return;
+                }
+            }
+            if let Some(strategy) = strategy {
+                if let Some(mate) = strategy.conclusion().exact_uci_mate() {
+                    out.protocol
+                        .push(format!("info score mate {mate} pv {bestmove}"));
                 }
             }
             out.protocol.push(pending.line);
@@ -1521,9 +1706,14 @@ impl Owner {
                                 "search driver shutdown deadline overflow",
                             )
                         })?;
-                    let context = crate::search_driver::SearchSessionContext {
+                    let mut context = crate::search_driver::SearchSessionContext {
                         authority: search_authority,
                         original_go,
+                        original_start: None,
+                        original_time_budget: self
+                            .session_owner
+                            .active_binding()
+                            .map(|binding| *binding.budget()),
                         root_moves: limits
                             .searchmoves
                             .as_ref()
@@ -1552,10 +1742,31 @@ impl Owner {
                         shutdown_deadline,
                         current: Arc::clone(&self.scope),
                     };
+                    let original_start = DriverStartSource::from_start(
+                        &ticket,
+                        snapshot.rules_position(),
+                        self.session_owner.active_binding().ok_or_else(|| {
+                            failure(
+                                contract::ErrorCode::IdentityMismatch,
+                                "actual driver Start has no original binding",
+                            )
+                        })?,
+                        &context,
+                        &self.clock,
+                    )?;
+                    context.original_start = Some(Arc::clone(&original_start));
+                    let driver_output = Arc::new(DriverOutputEnvelope::new(
+                        original_start.ticket().clone(),
+                        search_authority,
+                        snapshot.rules_position(),
+                        context.root_moves.as_deref(),
+                    )?);
                     self.active = Some(ActiveBinding {
                         ticket: ticket.clone(),
                         control,
                         authority: None,
+                        driver_output: Some(Arc::clone(&driver_output)),
+                        driver_output_until: Some(shutdown_deadline),
                     });
                     let driver = Arc::clone(driver);
                     let events = sender.clone();
@@ -1575,13 +1786,42 @@ impl Owner {
                         let completion =
                             match driver.run(snapshot.rules_position(), &context, &mut progress) {
                                 Ok(report) => {
-                                    match retain_diagnostic(
+                                    // Charge/preserve the actual returned work before deciding
+                                    // whether its final move/proof is publishable.
+                                    let work_retention = retain_diagnostic(
                                         &diagnostics,
                                         WorkerDiagnosticReceipt::DriverWork {
                                             kind: driver.kind(),
-                                            work: report.work,
+                                            work: report.work.clone(),
                                         },
-                                    ) {
+                                    );
+                                    let report = match driver_output.record_retaining(report) {
+                                        Ok(report) => report,
+                                        Err((report, error)) => {
+                                            return finish_worker(
+                                                &events,
+                                                ticket,
+                                                WorkerCompletion::failed(
+                                                    WorkerFailureSource::RejectedDriverReport {
+                                                        error,
+                                                        report,
+                                                        diagnostic_failure: work_retention
+                                                            .err()
+                                                            .map(|failure| {
+                                                                (
+                                                                    failure.error,
+                                                                    Box::new(failure.receipt),
+                                                                )
+                                                            }),
+                                                    },
+                                                ),
+                                                &worker_publication,
+                                                None,
+                                                shutdown_limit,
+                                            );
+                                        }
+                                    };
+                                    match work_retention {
                                         Ok(()) => {
                                             let _ = events.try_send(Event::RejectedInput {
                                                 code: "OwnerWake",
@@ -1647,6 +1887,8 @@ impl Owner {
                     ticket: ticket.clone(),
                     control: control.clone(),
                     authority: Some(authority.clone()),
+                    driver_output: None,
+                    driver_output_until: None,
                 });
                 let profile = factory.profile();
                 let config = rz_search::contracts::ContractSearchConfig {
@@ -2468,6 +2710,27 @@ pub fn event_channel() -> (SyncSender<Event>, Receiver<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_clock_rejects_actual_instants_before_origin_even_for_tiny_deltas() {
+        let clock = ProcessClock::new(contract::ProcessEpoch(8123));
+        for delta in [Duration::from_nanos(1), Duration::from_millis(1)] {
+            let before = clock.origin.checked_sub(delta).unwrap();
+            assert!(before < clock.origin);
+            assert_eq!(
+                clock.tick_at(before).unwrap_err().code,
+                contract::ErrorCode::InvalidInput
+            );
+            assert_eq!(
+                clock.deadline(before).unwrap_err().code,
+                contract::ErrorCode::InvalidInput
+            );
+        }
+        assert_eq!(
+            clock.tick_at(clock.origin).unwrap(),
+            contract::MonotonicTick(0)
+        );
+    }
 
     struct CloseObservedDriver {
         state: crate::search_driver::DriverPhysicalCompletion,
@@ -3339,6 +3602,8 @@ mod tests {
             ticket: ticket.clone(),
             control: control.clone(),
             authority: None,
+            driver_output: None,
+            driver_output_until: None,
         });
         assert_eq!(
             owner.deadline_ticket(None, control.deadline),
@@ -4749,7 +5014,7 @@ mod tests {
         }
     }
 
-    fn search_driver_output_fixture(
+    pub(super) fn search_driver_output_fixture(
         pals: bool,
     ) -> (Owner, Session<RulesUciPort>, DriverOutputAcks) {
         let (mut owner, session) = fixture();
@@ -4801,7 +5066,7 @@ mod tests {
         (owner, session, acknowledgments)
     }
 
-    fn completed_driver_search(
+    pub(super) fn completed_driver_search(
         owner: &mut Owner,
         session: &mut Session<RulesUciPort>,
         ponder: bool,
@@ -5016,6 +5281,8 @@ mod tests {
                 ticket: ticket.clone(),
                 control: owner.session_owner.control().unwrap().clone(),
                 authority: None,
+                driver_output: None,
+                driver_output_until: None,
             });
             owner.handle(
                 &mut session,

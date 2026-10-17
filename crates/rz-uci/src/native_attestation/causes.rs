@@ -640,6 +640,13 @@ impl Budget {
                     )
                 }),
             },
+            WorkerFailureSource::RejectedDriverReport { error, .. } => {
+                CauseNodeV1::WorkerBoundary {
+                    // The original report and work remain in the typed worker
+                    // owner; this legacy graph cannot relabel them as V5 work.
+                    original: self.link(|budget| budget.contract(error, depth + 1)),
+                }
+            }
             WorkerFailureSource::Factory(error) => CauseNodeV1::WorkerFactory {
                 original: self.link(|budget| budget.contract(error, depth + 1)),
             },

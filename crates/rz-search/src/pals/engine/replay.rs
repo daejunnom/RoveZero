@@ -1591,6 +1591,7 @@ impl<M: RoleModel> FreshReplayOwner<M> {
         // evidence. Both restricted root observations remain sources only.
         if kind == EndpointKind::Repair {
             self.engine.semantic.nodes[target].evidence = Some(CpuEvidence {
+                context: None,
                 score: report.score,
                 depth: report.completed_depth,
                 scope: report.score_scope,
@@ -3013,6 +3014,7 @@ mod repair_tests {
         // Internal adversarial fixture only: a matching actual raw score/state
         // still has AnalyzeRootMoves/restricted namespace and must be refused.
         owner.engine.semantic.nodes[target].evidence = Some(CpuEvidence {
+            context: None,
             score: report.score,
             depth: report.completed_depth,
             scope: report.score_scope,

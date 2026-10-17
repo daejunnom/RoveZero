@@ -5,6 +5,8 @@
 //! configuration is a visible test failure, never an ignored/PATH fallback.
 
 use super::*;
+use rz_experiments::{ArtifactRef, RoventNnuecPin};
+use rz_search::cpu_value::nnuec::v2 as nnuec_v2;
 use sha2::{Digest as _, Sha256};
 use std::{
     io::{Read, Write},
@@ -45,7 +47,7 @@ fn roles(proposer: u64, critic: u64, validator: u64) -> BTreeMap<String, u64> {
     .into()
 }
 
-fn recipe() -> Value {
+fn recipe(auxiliary_enabled: bool) -> Value {
     let actors = ["stockfish", "reckless"]
         .into_iter()
         .enumerate()
@@ -69,7 +71,8 @@ fn recipe() -> Value {
         "student_id":"one-student","learner_id":"one-learner",
         "source_sha256":h("collection-source"),"model_semantics_sha256":h("model-semantics"),
         "actors":actors,"parameter_ownership":{"pc_shared":"pc","p_private":"pc","c_private":"pc",
-            "v_private":"v","nnuec":"pc","membership_sha256":h("membership")},
+            "v_private":"v","nnuec":if auxiliary_enabled {"nnuec-private"} else {"pc"},
+            "membership_sha256":h("membership")},
         "stages":[stage("common","common_student",None,&["stockfish","reckless"]),
             stage("stockfish-ft","teacher_finetune",Some("common"),&["stockfish"]),
             stage("reckless-ft","teacher_finetune",Some("common"),&["reckless"])],
@@ -80,7 +83,44 @@ fn recipe() -> Value {
 /// Constructors use the real Rust types. No serde Value -> DTO conversion can
 /// conceal a renamed/added field or the enum's actual wire representation.
 fn fixture_with_training_epoch(training_model_epoch: u64) -> Value {
-    let recipe = recipe();
+    fixture_with_auxiliary(
+        training_model_epoch,
+        RoventRAuxiliaryPresenceState::Absent,
+        1e-8,
+    )
+}
+
+fn original_nnuec_pin() -> RoventNnuecPin {
+    let artifact = |path: &str, label: &str| ArtifactRef {
+        path: path.into(),
+        sha256: h(label),
+        bytes: 128,
+        source: "https://github.com/daejunnom/RoveZero".into(),
+        license: "MIT".into(),
+    };
+    RoventNnuecPin {
+        schema: nnuec_v2::SCHEMA.into(),
+        semantics: nnuec_v2::SEMANTICS.into(),
+        encoding: nnuec_v2::INPUT_SCHEMA.into(),
+        implementation_sha256: h("nnuec-implementation"),
+        configuration_sha256: h("nnuec-configuration"),
+        weights: artifact("nnuec/weights.bin", "nnuec-original-raw-weights"),
+        provenance: artifact("nnuec/provenance.json", "nnuec-original-provenance"),
+        diagnostic: true,
+        context_namespace_policy_sha256: h("nnuec-context-namespace-policy"),
+        local_namespace_policy_sha256: h("nnuec-local-namespace-policy"),
+        search_conditions_sha256: h("nnuec-search-conditions"),
+    }
+}
+
+/// Every optional field is built in its real type. No post-serialization
+/// insertion can hide an absent/null alias or synthesize a default R object.
+fn fixture_with_auxiliary(
+    training_model_epoch: u64,
+    auxiliary_presence: RoventRAuxiliaryPresenceState,
+    auxiliary_weight: f64,
+) -> Value {
+    let recipe = recipe(auxiliary_presence == RoventRAuxiliaryPresenceState::Enabled);
     let recipe_sha256 = generation_digest("rz-rovent-generation-series/1", &recipe).unwrap();
     let runtime_endpoints = vec![
         RoventTrainerRuntimeEndpoint {
@@ -116,7 +156,7 @@ fn fixture_with_training_epoch(training_model_epoch: u64) -> Value {
         training_model_semantics_sha256: h("model-semantics"),
         training_model_epoch,
         nnuec_collection_model_sha256: h("nnuec-collection-model"),
-        nnuec_semantics: "nnuec-fp32-wire-fixture".into(),
+        nnuec_semantics: nnuec_v2::SEMANTICS.into(),
         phase: "pc".into(),
         frozen_pc_sha256: None,
         device: "cpu".into(),
@@ -140,6 +180,23 @@ fn fixture_with_training_epoch(training_model_epoch: u64) -> Value {
             target: "same_exact_rules_anchor".into(),
             normalization: "valid_rows".into(),
             weight: 0.5,
+        },
+        nnuec_r_auxiliary: match auxiliary_presence {
+            RoventRAuxiliaryPresenceState::Absent => RoventRAuxiliaryPresence::Absent,
+            RoventRAuxiliaryPresenceState::Null => RoventRAuxiliaryPresence::Null,
+            RoventRAuxiliaryPresenceState::Enabled => {
+                RoventRAuxiliaryPresence::Enabled(RoventRAuxiliaryRecipe {
+                    schema: ROVENT_R_AUXILIARY_RECIPE.into(),
+                    manifest_file_sha256: h("r-manifest-raw-file"),
+                    index_file_sha256: h("r-index-raw-file"),
+                    sampling_seed: 37,
+                    rows_per_pc_update: 64,
+                    weight: auxiliary_weight,
+                    normalization: ROVENT_R_AUXILIARY_NORMALIZATION.into(),
+                    optimizer_owner: "nnuec-private".into(),
+                    supervision_source: ROVENT_R_AUXILIARY_SUPERVISION.into(),
+                })
+            }
         },
         max_updates: 4,
         max_groups: 4,
@@ -195,6 +252,34 @@ fn fixture_with_training_epoch(training_model_epoch: u64) -> Value {
         runtime_endpoints,
         current_dataset: dataset,
         ancestor_datasets: vec![],
+        r_auxiliary_dataset: match auxiliary_presence {
+            RoventRAuxiliaryPresenceState::Absent => RoventRAuxiliaryPresence::Absent,
+            RoventRAuxiliaryPresenceState::Null => RoventRAuxiliaryPresence::Null,
+            RoventRAuxiliaryPresenceState::Enabled => {
+                RoventRAuxiliaryPresence::Enabled(RoventHistoricalRAuxiliaryDatasetRegistration {
+                    root: "/metadata-fixture/r-dataset".into(),
+                    publication: pin(
+                        "/metadata-fixture/r-dataset/r-publication.json",
+                        "r-dataset-publication",
+                    ),
+                    collection_source_commit: "a".repeat(40),
+                    collection_source_sha256: window.collection_source_sha256.clone(),
+                    collection_runtime_library_sha256: window
+                        .collection_runtime_library_sha256
+                        .clone(),
+                    collection_model_semantics_sha256: window
+                        .collection_model_semantics_sha256
+                        .clone(),
+                    collection_model_epoch: window.collection_model_epoch,
+                    collection_context_epoch: window.collection_context_epoch,
+                    collection_recipe_sha256: window.recipe_sha256.clone(),
+                    collection_stage_id: window.stage_id.clone(),
+                    nnuec: original_nnuec_pin(),
+                    nnuec_parameter_sha256: window.nnuec_collection_model_sha256.clone(),
+                })
+            }
+        },
+        ancestor_r_auxiliary_datasets: RoventRAuxiliaryPresence::Absent,
         initialization_source: RoventTrainingInputSource::Resume {
             checkpoint: RoventHistoricalCheckpointRegistration {
                 root: "/metadata-fixture/checkpoint".into(),
@@ -260,6 +345,26 @@ fn fixture_with_training_epoch(training_model_epoch: u64) -> Value {
         original_membership: relative_pin("inputs/membership.json", "membership"),
         original_window_spec: relative_pin("inputs/window.json", "window-raw-bytes"),
         parent_publication: None,
+        r_auxiliary: match auxiliary_presence {
+            RoventRAuxiliaryPresenceState::Absent => RoventRAuxiliaryPresence::Absent,
+            RoventRAuxiliaryPresenceState::Null => RoventRAuxiliaryPresence::Null,
+            RoventRAuxiliaryPresenceState::Enabled => {
+                let source = registration.r_auxiliary_dataset.enabled().unwrap();
+                let auxiliary = window.nnuec_r_auxiliary.enabled().unwrap();
+                RoventRAuxiliaryPresence::Enabled(RoventCheckpointRAuxiliary {
+                    schema: ROVENT_CHECKPOINT_R_AUXILIARY.into(),
+                    dataset_publication_sha256: source.publication.sha256.clone(),
+                    manifest_file_sha256: auxiliary.manifest_file_sha256.clone(),
+                    index_file_sha256: auxiliary.index_file_sha256.clone(),
+                    // Shape-only pinned metadata, not a claim that an old
+                    // ledger, native lease or physical completion exists.
+                    parent_ledger_projection: relative_pin(
+                        "receipts/r-ledger-projection-shape.json",
+                        "r-ledger-projection-shape-only",
+                    ),
+                })
+            }
+        },
         boundary: RoventCheckpointBoundary {
             completed_updates: roles(1, 0, 0),
             ancestor_updates: roles(0, 0, 0),
@@ -317,10 +422,10 @@ impl Drop for OwnedDecoder {
         }
     }
 }
-struct DecoderOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct DecoderOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 fn bounded_read(
     mut pipe: impl Read,
@@ -349,6 +454,15 @@ fn bounded_read(
     }
 }
 fn decode_in_python(value: &Value) -> DecoderOutput {
+    let helper = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../experiments/model-research/pals/tests/rovent_metadata_wire_decode.py");
+    decode_python_fixture(value, &helper)
+}
+pub(crate) fn decode_python_fixture(value: &Value, helper: &Path) -> DecoderOutput {
+    assert!(
+        helper.is_absolute(),
+        "metadata helper must have an explicit absolute path"
+    );
     let python = std::env::var_os("RZ_ROVENT_METADATA_PYTHON")
         .map(PathBuf::from)
         .expect("set RZ_ROVENT_METADATA_PYTHON to the exact absolute stdlib-only decoder interpreter; this cross-language test is not ignored");
@@ -356,8 +470,6 @@ fn decode_in_python(value: &Value) -> DecoderOutput {
         python.is_absolute(),
         "decoder interpreter must be absolute; no PATH fallback"
     );
-    let helper = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../experiments/model-research/pals/tests/rovent_metadata_wire_decode.py");
     let input = serde_json::to_vec(value).unwrap();
     assert!(
         input.len() <= MAX_PIPE_BYTES,
@@ -477,6 +589,147 @@ fn typed_zero_training_epoch_preserves_positive_collection_epochs() {
             > 0
     );
     assert_python_accepts_fixture(fixture);
+}
+
+#[test]
+fn typed_r_auxiliary_states_preserve_presence_and_independent_profile_digests() {
+    let mut profiles = BTreeSet::new();
+    for (offset, presence) in [
+        RoventRAuxiliaryPresenceState::Absent,
+        RoventRAuxiliaryPresenceState::Null,
+        RoventRAuxiliaryPresenceState::Enabled,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let epoch = (1_u64 << 53) + 5 + (offset as u64 * 2);
+        let fixture = fixture_with_auxiliary(epoch, presence, 1e-8);
+        let window = &fixture["window"];
+        let registration = &fixture["registration"];
+        let publication = &fixture["checkpoint_publication"];
+        assert_eq!(window["training_model_epoch"].as_u64(), Some(epoch));
+        assert_eq!(publication["training_model_epoch"].as_u64(), Some(epoch));
+        assert_eq!(
+            window["collection_context_epoch"].as_u64(),
+            Some((1_u64 << 53) + 3)
+        );
+        assert!(registration.get("ancestor_r_auxiliary_datasets").is_none());
+        match presence {
+            RoventRAuxiliaryPresenceState::Absent => {
+                assert!(window.get("nnuec_r_auxiliary").is_none());
+                assert!(registration.get("r_auxiliary_dataset").is_none());
+                assert!(publication.get("r_auxiliary").is_none());
+                assert_eq!(fixture["recipe"]["parameter_ownership"]["nnuec"], "pc");
+            }
+            RoventRAuxiliaryPresenceState::Null => {
+                assert_eq!(window.get("nnuec_r_auxiliary"), Some(&Value::Null));
+                assert_eq!(registration.get("r_auxiliary_dataset"), Some(&Value::Null));
+                assert_eq!(publication.get("r_auxiliary"), Some(&Value::Null));
+                assert_eq!(fixture["recipe"]["parameter_ownership"]["nnuec"], "pc");
+            }
+            RoventRAuxiliaryPresenceState::Enabled => {
+                let auxiliary = &window["nnuec_r_auxiliary"];
+                let dataset = &registration["r_auxiliary_dataset"];
+                let sidecar = &publication["r_auxiliary"];
+                assert_eq!(
+                    fixture["recipe"]["parameter_ownership"]["nnuec"],
+                    "nnuec-private"
+                );
+                assert_eq!(auxiliary["optimizer_owner"], "nnuec-private");
+                assert_eq!(auxiliary["rows_per_pc_update"], 64);
+                assert_eq!(
+                    auxiliary["weight"].as_f64().unwrap().to_bits(),
+                    1e-8_f64.to_bits()
+                );
+                assert_eq!(dataset["nnuec"]["schema"], nnuec_v2::SCHEMA);
+                assert_eq!(dataset["nnuec"]["semantics"], nnuec_v2::SEMANTICS);
+                assert_eq!(dataset["nnuec"]["encoding"], nnuec_v2::INPUT_SCHEMA);
+                assert_ne!(
+                    dataset["nnuec_parameter_sha256"],
+                    dataset["nnuec"]["weights"]["sha256"]
+                );
+                assert_eq!(
+                    sidecar["dataset_publication_sha256"],
+                    dataset["publication"]["sha256"]
+                );
+                for name in ["manifest_file_sha256", "index_file_sha256"] {
+                    assert_eq!(sidecar[name], auxiliary[name]);
+                }
+            }
+        }
+        assert!(
+            profiles.insert(
+                fixture["expected_profile_sha256"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            )
+        );
+        assert_python_accepts_fixture(fixture);
+    }
+    // Training epoch is excluded from the fixed profile. Thus the distinction
+    // between Absent and Null here comes from actual optional-field presence.
+    assert_eq!(profiles.len(), 3);
+}
+
+#[test]
+fn typed_enabled_r_weight_preserves_adjacent_f64_profile_coefficients() {
+    let first_weight = 1e-8_f64;
+    let second_weight = f64::from_bits(first_weight.to_bits() + 1);
+    let first = fixture_with_auxiliary(
+        (1_u64 << 53) + 13,
+        RoventRAuxiliaryPresenceState::Enabled,
+        first_weight,
+    );
+    let second = fixture_with_auxiliary(
+        (1_u64 << 53) + 13,
+        RoventRAuxiliaryPresenceState::Enabled,
+        second_weight,
+    );
+    assert_ne!(first_weight.to_bits(), second_weight.to_bits());
+    assert_ne!(
+        first["expected_profile_sha256"],
+        second["expected_profile_sha256"]
+    );
+    for (fixture, weight) in [(first, first_weight), (second, second_weight)] {
+        assert_eq!(
+            fixture["window"]["nnuec_r_auxiliary"]["weight"]
+                .as_f64()
+                .unwrap()
+                .to_bits(),
+            weight.to_bits()
+        );
+        assert_python_accepts_fixture(fixture);
+    }
+}
+
+#[test]
+fn independent_python_decoder_rejects_r_presence_and_original_source_substitution() {
+    let original = fixture_with_auxiliary(
+        (1_u64 << 53) + 17,
+        RoventRAuxiliaryPresenceState::Enabled,
+        0.125,
+    );
+    let mut missing_owner = original.clone();
+    missing_owner["registration"]["r_auxiliary_dataset"] = Value::Null;
+    assert!(
+        !decode_in_python(&missing_owner).status.success(),
+        "enabled R window silently acquired a null current dataset"
+    );
+    let mut other_manifest = original.clone();
+    other_manifest["checkpoint_publication"]["r_auxiliary"]["manifest_file_sha256"] =
+        json!(h("different-r-manifest-raw-file"));
+    assert!(
+        !decode_in_python(&other_manifest).status.success(),
+        "checkpoint sidecar silently substituted the original raw R manifest"
+    );
+    let mut other_dataset = original;
+    other_dataset["checkpoint_publication"]["r_auxiliary"]["dataset_publication_sha256"] =
+        json!(h("different-r-dataset-publication"));
+    assert!(
+        !decode_in_python(&other_dataset).status.success(),
+        "checkpoint sidecar silently substituted the registered original R dataset"
+    );
 }
 
 #[test]

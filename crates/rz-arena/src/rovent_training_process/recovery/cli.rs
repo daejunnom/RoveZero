@@ -6,7 +6,7 @@
 //! owner after registering its own cancellation hooks. The owner's admission
 //! must compare every requested bound with the exact pinned registration.
 
-use super::super::{invalid, RoventTrainingFilePin, MAX_TRAINER_OUTPUT_BYTES};
+use super::super::{MAX_TRAINER_OUTPUT_BYTES, RoventTrainingFilePin, invalid};
 use crate::ArenaError;
 use rz_experiments::pals_data_v3::{generation_identifier, generation_sha};
 use std::{

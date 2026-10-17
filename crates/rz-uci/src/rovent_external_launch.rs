@@ -32,6 +32,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 mod actual_root;
+mod collection_teacher;
+pub use collection_teacher::RoventCollectionTeacherOwner;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

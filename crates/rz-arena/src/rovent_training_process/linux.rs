@@ -1965,9 +1965,9 @@ pub(super) fn run(
                 launch,
                 corpus,
                 previous,
-                held,
-                pending_broker,
-                shared_held: Some(shared_held),
+                _retained_held: held,
+                _retained_pending_broker: pending_broker,
+                _retained_shared_held: Some(shared_held),
             }))
         }
     }

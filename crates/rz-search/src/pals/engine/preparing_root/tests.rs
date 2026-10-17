@@ -20,7 +20,7 @@ use rz_contracts::{
 };
 use std::num::NonZeroU16;
 
-fn source() -> DeferredNnuecRSource {
+pub(in crate::pals::engine) fn source() -> DeferredNnuecRSource {
     let checkpoint = Checkpoint {
         schema: SCHEMA.into(),
         semantics: SEMANTICS.into(),
@@ -85,7 +85,7 @@ fn source() -> DeferredNnuecRSource {
     .unwrap();
     DeferredNnuecRSource::new(Arc::new(Model::new(checkpoint).unwrap()), plan)
 }
-fn owner() -> ResearcherPreparingOwner<AdaptivePortModel> {
+pub(in crate::pals::engine) fn owner() -> ResearcherPreparingOwner<AdaptivePortModel> {
     let value = LegalOrderRoleMock.value_identity().unwrap().clone();
     let namespace = AdaptiveModelNamespace::new(
         value.clone(),
@@ -228,4 +228,79 @@ fn initial_zero_and_one_node_roots_return_the_same_preparing_owner_without_c_or_
         assert!(store.matches(again.stores()));
         assert_eq!(again.authority(), next);
     }
+}
+
+#[test]
+fn terminal_initial_root_does_not_prepare_an_unneeded_c_view() {
+    let owner = owner();
+    let authority = SearchAuthority {
+        epoch: ProcessEpoch(81),
+        game: GameGeneration(0),
+        root: RootGeneration(9),
+        implementation: ContractDigest([81; 32]),
+    };
+    let clock = InstantClock::new(ClockDomain(authority.epoch), Instant::now());
+    let deadline = Deadline {
+        clock: clock.domain(),
+        at: MonotonicTick(20_000_000_000),
+    };
+    let hard = clock.instant_at(deadline.at).unwrap();
+    let terminal = Position::from_fen("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+    let mut root = owner
+        .bind_root(
+            terminal,
+            authority,
+            deadline,
+            hard,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .map_err(|(_, error)| error)
+        .unwrap();
+    let next = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let issuer: adaptive_port::AdaptiveRulesOwnerIssuer =
+        Arc::new(move || Ok(OwnerId(next.fetch_add(1, Ordering::Relaxed))));
+    root.attach_original_controls(
+        ResearcherRootStartup {
+            mode: ExecutionMode::CpuPcr,
+            root_budget: ContractDigest([82; 32]),
+            goal: SearchGoal::default(),
+            nodes: Some(8),
+            selective_policy: ContractDigest([83; 32]),
+            frontier_limits: FrontierLimits {
+                maximum_goal_plies: NonZeroU16::new(16).unwrap(),
+                maximum_frames: 16,
+                maximum_paths: 64,
+                maximum_mate_nodes: 64,
+                maximum_native_receipts: 8,
+            },
+            clock,
+            limits: PalsLimits {
+                deadline: hard,
+                max_rounds: 4,
+                max_cpu_nodes: 256,
+                cpu_depth: 2,
+            },
+            cleanup_deadline: hard + Duration::from_secs(1),
+        },
+        issuer,
+        None,
+    )
+    .unwrap();
+    root.prepare_original_root_rules().unwrap();
+    let before = root.original_frontier_receipt().unwrap().snapshot.work;
+    assert!(root.initial_review_source().is_err());
+    assert!(root.initial_view.is_none());
+    assert_eq!(root.stores().review_pin_count().unwrap(), 1);
+    assert_eq!(
+        root.original_frontier_receipt().unwrap().snapshot.work,
+        before
+    );
+    assert_eq!(
+        root.original_ledger()
+            .unwrap()
+            .registration_observation()
+            .unwrap()
+            .active_jobs,
+        0
+    );
 }

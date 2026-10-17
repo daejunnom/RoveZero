@@ -43,6 +43,12 @@ pub struct SearchSessionContext {
     /// The received go, before ponder normalization or Rules subset sealing.
     /// Legacy callers may omit it; native Rovent admission requires it.
     pub original_go: Option<Arc<crate::parser::GoLimits>>,
+    /// Exact actual Start allocation. No later hit or root descriptor rebuild
+    /// may replace this original clock evidence.
+    pub original_time_budget: Option<rz_search::time::TimeBudget>,
+    /// Private immutable custody issued only by the actual Session Start.
+    /// Legacy consumers have no native Rovent work authority through `None`.
+    pub(crate) original_start: Option<Arc<crate::engine::DriverStartSource>>,
     /// Canonical root-only subset. Child legal/policy order remains Rules-owned.
     pub root_moves: Option<Arc<[BoardMove]>>,
     pub goal: rz_contracts::rovent::SearchGoal,
@@ -1381,6 +1387,7 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
                     detail: error.to_string(),
                 })? {
                     return Ok(SearchSessionReport {
+                        mate_strategy: None,
                         best_move: None,
                         work: DriverWork::Pals {
                             rounds: 0,
@@ -1409,6 +1416,7 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
                 detail: error.to_string(),
             })? {
                 return Ok(SearchSessionReport {
+                    mate_strategy: None,
                     best_move: None,
                     work: DriverWork::Pals {
                         rounds: 0,
@@ -1518,6 +1526,7 @@ impl<M: rz_search::pals::engine::RoleModel + 'static> SearchSessionDriver for Pa
                 }
             }
             Ok(SearchSessionReport {
+                mate_strategy: None,
                 best_move: report.best_move,
                 work: DriverWork::Pals {
                     rounds: report.counters.rounds,
@@ -1788,6 +1797,9 @@ fn checker_implementation(
 }
 #[derive(Clone, Debug)]
 pub struct SearchSessionReport {
+    /// The actual checked strategy belongs to this immutable final report.
+    /// Numeric CP/WDL and a later global observation cannot create it.
+    pub mate_strategy: Option<rz_search::pals::rovent_frontier::FrontierMateStrategy>,
     pub best_move: Option<BoardMove>,
     pub work: DriverWork,
 }
@@ -2090,6 +2102,7 @@ impl SearchSessionDriver for CpuSessionDriver {
                     detail: error.to_string(),
                 })? {
                     return Ok(SearchSessionReport {
+                        mate_strategy: None,
                         best_move: None,
                         work: DriverWork::Cpu {
                             nodes: 0,
@@ -2115,6 +2128,7 @@ impl SearchSessionDriver for CpuSessionDriver {
                 detail: error.to_string(),
             })? {
                 return Ok(SearchSessionReport {
+                    mate_strategy: None,
                     best_move: None,
                     work: DriverWork::Cpu {
                         nodes: 0,
@@ -2181,6 +2195,7 @@ impl SearchSessionDriver for CpuSessionDriver {
                 }
             }
             Ok(SearchSessionReport {
+                mate_strategy: None,
                 best_move: report.best_move,
                 work: DriverWork::Cpu {
                     nodes: report.nodes,
@@ -2303,6 +2318,8 @@ mod tests {
                 root_moves: None,
                 goal: rz_contracts::rovent::SearchGoal::default(),
                 original_go: None,
+                original_time_budget: None,
+                original_start: None,
                 requested_nodes: None,
                 control,
                 cancellation: CancelToken::new(),
@@ -2559,6 +2576,8 @@ mod tests {
             root_moves: None,
             goal: rz_contracts::rovent::SearchGoal::default(),
             original_go: None,
+            original_time_budget: None,
+            original_start: None,
             requested_nodes: None,
             control,
             cancellation: CancelToken::new(),

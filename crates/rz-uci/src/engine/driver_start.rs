@@ -1,0 +1,133 @@
+//! The actual UCI Start's immutable input custody. This is deliberately not a
+//! codec: metadata, a copied hash or a new clock cannot reconstruct this owner.
+
+use super::{ProcessClock, SearchTicket, failure};
+use crate::bridge::SearchBinding;
+use crate::contracts::SessionScope;
+use crate::parser::GoLimits;
+use crate::search_driver::SearchSessionContext;
+use rz_contracts::pals::SearchAuthority;
+use rz_contracts::{CancelToken, ContractError, ErrorCode};
+use rz_position::{BoardMove, Position, PositionSnapshot};
+use rz_runtime::contracts::{ContractClock, ContractSystemClock};
+use rz_search::{driver::SearchControl, time::TimeBudget};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+
+#[cfg(test)]
+pub(crate) mod fixture;
+
+#[derive(Debug)]
+pub(crate) struct DriverStartSource {
+    ticket: SearchTicket,
+    authority: SearchAuthority,
+    root: PositionSnapshot,
+    original_go: Arc<GoLimits>,
+    budget: TimeBudget,
+    root_moves: Option<Arc<[BoardMove]>>,
+    goal: rz_contracts::rovent::SearchGoal,
+    requested_nodes: Option<u64>,
+    control: SearchControl,
+    cancellation: CancelToken,
+    current: Arc<Mutex<SessionScope>>,
+    runtime_clock: ContractSystemClock,
+    cleanup: Instant,
+}
+impl DriverStartSource {
+    /// Only the engine's actual Effect::Start branch can call this constructor.
+    pub(super) fn from_start(
+        ticket: &SearchTicket,
+        root: &Position,
+        binding: &SearchBinding,
+        context: &SearchSessionContext,
+        clock: &ProcessClock,
+    ) -> Result<Arc<Self>, ContractError> {
+        let original_go = context
+            .original_go
+            .as_ref()
+            .ok_or_else(|| invalid("actual Start original go is absent"))?;
+        let actual = binding.control();
+        if binding.ticket() != ticket
+            || context.original_time_budget != Some(*binding.budget())
+            || context.control.deadline != actual.deadline
+            || context.control.soft_deadline != actual.soft_deadline
+            || context.control.admission_deadline != actual.admission_deadline
+            || context.control.max_simulations > actual.max_simulations
+            || !Arc::ptr_eq(&context.control.cancellation, &actual.cancellation)
+            || context.authority.epoch != clock.epoch()
+        {
+            return Err(invalid(
+                "actual Start input differs from its original binding",
+            ));
+        }
+        Ok(Arc::new(Self {
+            ticket: ticket.clone(),
+            authority: context.authority,
+            root: root.snapshot(),
+            original_go: Arc::clone(original_go),
+            budget: *binding.budget(),
+            root_moves: context.root_moves.clone(),
+            goal: context.goal,
+            requested_nodes: context.requested_nodes,
+            control: context.control.clone(),
+            cancellation: context.cancellation.clone(),
+            current: Arc::clone(&context.current),
+            runtime_clock: clock.runtime_clock(),
+            cleanup: context.shutdown_deadline,
+        }))
+    }
+
+    /// Validation does not require a live deadline: an original stopped Start
+    /// still owns metadata, while the later gate alone may issue live work.
+    pub(crate) fn verify(
+        &self,
+        root: &Position,
+        context: &SearchSessionContext,
+        clock: &ProcessClock,
+    ) -> Result<(), ContractError> {
+        let current_clock = clock.runtime_clock();
+        if self.authority != context.authority
+            || !self.root.same_state(&root.snapshot())
+            || !context
+                .original_go
+                .as_ref()
+                .is_some_and(|go| Arc::ptr_eq(go, &self.original_go))
+            || context.original_time_budget != Some(self.budget)
+            || context.goal != self.goal
+            || context.requested_nodes != self.requested_nodes
+            || !same_moves(&self.root_moves, &context.root_moves)
+            || context.control.deadline != self.control.deadline
+            || context.control.soft_deadline != self.control.soft_deadline
+            || context.control.admission_deadline != self.control.admission_deadline
+            || context.control.max_simulations != self.control.max_simulations
+            || !Arc::ptr_eq(&self.control.cancellation, &context.control.cancellation)
+            || !self
+                .cancellation
+                .shares_cancellation_with(&context.cancellation)
+            || !Arc::ptr_eq(&self.current, &context.current)
+            || self.cleanup != context.shutdown_deadline
+            || current_clock.domain() != self.runtime_clock.domain()
+            || current_clock.origin() != self.runtime_clock.origin()
+        {
+            return Err(invalid(
+                "original Start source/control/Rules instance differs",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn ticket(&self) -> &SearchTicket {
+        &self.ticket
+    }
+}
+fn same_moves(a: &Option<Arc<[BoardMove]>>, b: &Option<Arc<[BoardMove]>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+fn invalid(detail: &'static str) -> ContractError {
+    failure(ErrorCode::IdentityMismatch, detail)
+}

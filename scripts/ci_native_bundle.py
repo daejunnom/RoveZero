@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a bounded same-HEAD validation bundle; never run a neural workload.
 
-CPU compilation and four explicit static metadata getters only. Cargo ELF
+CPU compilation and explicit static metadata getters only. Cargo ELF
 FD/copy custody and component framing follow the reviewed report payload;
 process-tree custody reuses managed_process.run_group. No Cloud entry, model,
 runtime DSO, weight, credential discovery, cache adoption, or retry is present.
@@ -50,6 +50,8 @@ SPECS = (
     ('rz-eval', 'example', 'virtual_review_numeric_capture', 'onnx,contracts'),
     ('rz-uci', 'bin', 'rz-pals-adaptive', 'pals-adaptive,onnx-cuda'),
     ('rz-uci', 'example', 'pals_rules_descriptor', 'pals-adaptive,onnx-cuda'),
+    ('rz-uci', 'bin', 'rz-rovent', 'pals-adaptive,onnx-cuda'),
+    ('rz-arena', 'bin', 'rz-rovent-trainer', 'pals-collection-onnx,native-cuda'),
     ('rz-uci', 'example', 'pals_continuation_diagnostic', 'pals-adaptive-diagnostics'),
 )
 WARM = ('rz-uci', 'example', 'virtual_review_warm_numeric_capture',
@@ -241,6 +243,27 @@ def validate_registry(value):
             and all(type(value.get(name)) is str and re.fullmatch('[a-f0-9]{64}', value[name])
                     for name in ('model_semantic_sha256', 'encoding_sha256')),
             'StaticRegistryGetterOutput')
+
+
+def validate_rovent_build_metadata(value, expected_head, components):
+    """Observe compile metadata only; neither load nor admit a native runtime."""
+    fields = {'domain', 'source_commit', 'source_components', 'target_os', 'target_arch',
+              'onnx_cpu_compiled', 'onnx_cuda_compiled', 'native_runtime_loaded',
+              'native_model_loaded', 'neural_execution_observed'}
+    require(type(value) is dict and set(value) == fields
+            and value['domain'] == 'rz-rovent-build-capabilities/1'
+            and value['source_commit'] == expected_head
+            and value['target_os'] == 'linux' and value['target_arch'] == 'x86_64'
+            and value['onnx_cpu_compiled'] is True and value['onnx_cuda_compiled'] is True
+            and all(value[name] is False for name in (
+                'native_runtime_loaded', 'native_model_loaded', 'neural_execution_observed')),
+            'StaticRoventBuildMetadata')
+    observed = value['source_components']
+    private = {'rovent_bootstrap', 'rovent_process_boundary'}
+    require(type(observed) is dict and set(observed) == set(components) | private
+            and all(observed[name] == digest for name, digest in components.items())
+            and all(type(observed[name]) is str and re.fullmatch('[a-f0-9]{64}', observed[name])
+                    for name in private), 'StaticRoventRegisteredSourceMismatch')
 
 
 def stream_child(argv):
@@ -444,6 +467,14 @@ def run(source, root, expected_head, seconds):
         compiled = strict_json(build.command('compiled-source-inventory', [str(private / 'rz-pals-adaptive'), '--source-inventory'], env))
         require(compiled == {'domain': 'rz-pals-compiled-source-registration-v5/1', 'source_commit': expected_head,
                              'components': components, 'neural_execution': False, 'training_execution': False}, 'CompiledInventorySourceMismatch')
+        rovent = strict_json(build.command('rovent-build-metadata', [str(private / 'rz-rovent'), '--build-capabilities-json'], env))
+        validate_rovent_build_metadata(rovent, expected_head, components)
+        receipt['rovent_build_binding'] = {
+            'ELF': receipt['binaries']['rz-rovent']['pin'],
+            'metadata': rovent,
+            'registered_components_independently_matched': True,
+            'private_component_digests': 'observed_only_not_independently_recomputed',
+            'scope': 'same_actual_ELF_compile_metadata_no_runtime_model_or_execution_authority'}
         native = strict_json(build.command('native-source-pins', [str(private / 'virtual_review_numeric_capture'), '--source-pins'], env))
         require(native == {name: components[name] for name in CORE5}, 'NativeCore5SourceMismatch')
         registry = strict_json(build.command('static-model-registry', [str(private / 'virtual_review_numeric_capture'), '--model-registry'], env))

@@ -21,7 +21,16 @@ use std::collections::{HashMap, VecDeque};
 
 mod frontier_port;
 mod goal_local;
+mod peer_questions;
+mod repair_cycle;
+mod repair_witness;
 pub use frontier_port::PcFrontierStartup;
+use peer_questions::{PcPeerQuestion, PcPeerSource};
+use repair_cycle::{PcRepairCycles, PcRepairStep, PublishedPcLine};
+pub use repair_witness::{
+    PcAcceptedFreshEndpoint, PcDivergenceResolution, PcDivergenceSource, PcDivergenceWitness,
+    PcRepairAcceptedLine,
+};
 
 const MAX_PC_PENDING: usize = 64;
 const MAX_PC_CONSUMED: usize = 128;
@@ -38,6 +47,8 @@ pub struct PcPortQuestion {
     continuation_end: usize,
     responsibilities: Vec<PcResponsibilitySource>,
     goal_local: Option<Arc<goal_local::PcGoalLocalRules>>,
+    peer: Option<Arc<PcPeerQuestion>>,
+    repair: Option<Arc<PcRepairStep>>,
     source: Arc<PcQuestionSource>,
 }
 
@@ -50,6 +61,10 @@ struct PcQuestionSource {
     continuation_end: usize,
     responsibilities: ContractDigest,
     goal_local: Option<ContractDigest>,
+    peer: Option<rz_contracts::rovent::QuestionEnvelope>,
+    repair: Option<ContractDigest>,
+    root_budget: Option<ContractDigest>,
+    mode: ExecutionMode,
     stage: RefinementStage,
     first: Option<BoardMove>,
     position: PositionSnapshot,
@@ -96,7 +111,7 @@ impl PcResponsibilitySource {
     ) -> Result<Self, PalsError> {
         let query = &input.question;
         let origin = accepted
-            .origin(query.frontier_frame(), None)
+            .origin(query.frontier_frame(), query.reciprocal_question())
             .map_err(|_| RoleError::InvalidOutput)?;
         let source = Self {
             kind,
@@ -149,11 +164,8 @@ impl PcResponsibilitySource {
         if ticket.role != expected_role {
             return Err(RoleError::InvalidOutput.into());
         }
-        let mut replay = Position::from_snapshot(&self.parent, Default::default())?;
-        replay.make_move(self.movement)?;
-        if !replay.snapshot().same_state(&self.snapshot) {
-            return Err(RoleError::InvalidOutput.into());
-        }
+        // The private constructor already received this exact quota-paid
+        // checked child. Revalidating immutable custody performs no Rules work.
         Ok(())
     }
 }
@@ -178,6 +190,26 @@ impl PcPortQuestion {
     }
     pub fn deadline(&self) -> Instant {
         self.deadline
+    }
+    pub fn reciprocal_question(&self) -> Option<rz_contracts::rovent::QuestionEnvelope> {
+        self.peer.as_ref().map(|peer| peer.envelope())
+    }
+    pub fn goal_local_origin_digest(&self) -> Option<ContractDigest> {
+        self.goal_local
+            .as_ref()
+            .map(|origin| origin.origin_digest())
+    }
+    pub(crate) fn validated_horizon_source<'a>(
+        input: &'a FrameInput<ReviewView, Self>,
+        stores: &PalsStores,
+    ) -> Result<&'a crate::pals::rovent_frontier::UnmetHorizonQuestion, PalsError> {
+        Self::validate_input_source(input, stores)?;
+        input
+            .question
+            .goal_local
+            .as_ref()
+            .and_then(|origin| origin.horizon())
+            .ok_or(RoleError::InvalidOutput.into())
     }
     pub(crate) fn original_deadline(&self) -> Deadline {
         self.source.original_deadline
@@ -278,11 +310,27 @@ impl PcPortQuestion {
         if question.frame != source.frame
             || question.continuation_end != source.continuation_end
             || source.goal_local != question.goal_local.as_ref().map(|origin| origin.digest())
+            || source.peer != question.reciprocal_question()
+            || source.repair
+                != question
+                    .repair
+                    .as_ref()
+                    .map(|step| step.digest())
+                    .transpose()?
             || source.responsibilities != responsibility_digest(&question.responsibilities)?
         {
             return Err(RoleError::InvalidOutput.into());
         }
+        if let Some(peer) = &question.peer {
+            peer.validate(question, view, source.mode)?;
+        }
+        if let Some(step) = &question.repair {
+            step.validates(input, &source.owner, source.authority, source.root_budget)?;
+        }
         if let Some(origin) = &question.goal_local {
+            if source.root_budget != Some(origin.root_budget()) {
+                return Err(RoleError::InvalidOutput.into());
+            }
             origin.validates_input(input, &source.owner, source.authority, origin.root_budget())?;
         }
         for responsibility in &question.responsibilities {
@@ -305,7 +353,8 @@ impl PcPortQuestion {
             || actual_view != source.view
             || input.public_context.0 != view.record_scope_digest()
             || question.first != source.first
-            || question.first != question.context.prefix.first().copied()
+            || (question.repair.is_none()
+                && question.first != question.context.prefix.first().copied())
             || source.logical != logical_digest(&question.context)?
             || !source.position.same_state(&question.position.snapshot())
             || !view.validates(stores)
@@ -353,6 +402,8 @@ struct PcPlan {
     frame: u64,
     responsibilities: Vec<PcResponsibilitySource>,
     goal_local: Option<Arc<goal_local::PcGoalLocalRules>>,
+    peer_source: Option<PcPeerSource>,
+    repair: Option<Arc<PcRepairStep>>,
     continuation_end: usize,
     purpose: RoleQueryPurpose,
     prefix: Vec<BoardMove>,
@@ -369,6 +420,7 @@ struct PcConsumed {
     evidence: ContractDigest,
     question: std::sync::Weak<PcPortQuestion>,
     view: std::sync::Weak<ReviewView>,
+    semantic_committed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -410,6 +462,7 @@ pub struct PcSemanticPort<M: RoleModel> {
     root: usize,
     rules: Arc<ContractState>,
     root_moves: Arc<RootMoveDomain>,
+    rules_owner_issuer: adaptive_port::AdaptiveRulesOwnerIssuer,
     root_ranking: Vec<BoardMove>,
     authority: SearchAuthority,
     deadline: Deadline,
@@ -423,6 +476,8 @@ pub struct PcSemanticPort<M: RoleModel> {
     counters: PcPortCounters,
     completion: PcPortCompletion,
     frontier_state: Option<frontier_port::PcFrontierState>,
+    retired_strategy: Option<crate::pals::rovent_frontier::FrontierMateStrategy>,
+    repair_cycles: Option<PcRepairCycles>,
 }
 
 impl<M: RoleModel> PcSemanticPort<M> {
@@ -480,6 +535,8 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 frame: 1,
                 responsibilities: Vec::new(),
                 goal_local: None,
+                peer_source: None,
+                repair: None,
                 continuation_end: 0,
                 purpose: RoleQueryPurpose::ProposePolicy,
                 prefix: Vec::new(),
@@ -493,6 +550,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
             root,
             rules,
             root_moves,
+            rules_owner_issuer,
             root_ranking: Vec::new(),
             authority,
             deadline,
@@ -504,6 +562,8 @@ impl<M: RoleModel> PcSemanticPort<M> {
             pending: HashMap::new(),
             consumed: VecDeque::new(),
             frontier_state: None,
+            retired_strategy: None,
+            repair_cycles: None,
             counters: PcPortCounters {
                 completed_nn_inputs: Some(0),
                 ..PcPortCounters::default()
@@ -637,22 +697,43 @@ impl<M: RoleModel> PcSemanticPort<M> {
             }
             return Ok(None);
         }
+        // Materializing a frozen pair is a local recipe, not an NN input.
+        // Each actual endpoint is admitted separately below on its own turn.
+        if plan.repair.as_ref().is_some_and(|step| step.is_recipe()) {
+            self.materialize_repair_recipe(&plan)?;
+            return self.next_role();
+        }
         if self.owner.semantic.nodes[node].terminal.is_none() && !self.admit_frontier_role()? {
             return Ok(None);
         }
-        let legal = self.owner.semantic.nodes[node].position.legal_moves();
+        let legal = if plan.purpose == RoleQueryPurpose::DivergencePolicy {
+            Vec::new()
+        } else {
+            self.owner.semantic.nodes[node].position.legal_moves()
+        };
         let question = RoleQuestion {
             purpose: plan.purpose,
             prefix: &plan.prefix,
             proposal: &plan.proposal,
             refutation: plan.counter.as_deref(),
-            divergences: &[],
+            divergences: plan.repair.as_ref().map_or(&[], |step| step.divergences()),
         };
-        let context = self.owner.role_context(node, question)?;
-        let view = self
-            .owner
-            .prepare_review_view(node, question, &legal)?
-            .ok_or(RoleError::Unavailable)?;
+        let context =
+            if let Some(context) = plan.repair.as_ref().and_then(|step| step.frozen_context()) {
+                context.clone()
+            } else {
+                self.owner.role_context(node, question)?
+            };
+        let view = if let Some(frozen) = plan.repair.as_ref().and_then(|step| step.frozen()) {
+            if !frozen.validates(&self.owner.semantic.stores) {
+                return Err(StoreError::StaleConsumer.into());
+            }
+            Arc::clone(frozen)
+        } else {
+            self.owner
+                .prepare_review_view(node, question, &legal)?
+                .ok_or(RoleError::Unavailable)?
+        };
         let seal = ReviewViewSeal {
             authority: self.authority,
             view_sequence: view.sequence(),
@@ -666,6 +747,26 @@ impl<M: RoleModel> PcSemanticPort<M> {
         };
         let sequence = self.next_question;
         let next = sequence.checked_add(1).ok_or(PalsError::Capacity)?;
+        let stage = stage_for_purpose(plan.purpose)?;
+        let position = self.owner.semantic.nodes[node].position.clone();
+        let first = plan
+            .repair
+            .as_ref()
+            .map(|step| step.first())
+            .or_else(|| plan.prefix.first().copied());
+        let peer = self
+            .prepare_peer_question(
+                plan.peer_source.as_ref(),
+                plan.purpose,
+                &context,
+                &position,
+                &view,
+                seal,
+                sequence,
+                stage,
+                first,
+            )?
+            .map(Arc::new);
         let mut digest = question_digest(
             self.authority,
             sequence,
@@ -680,14 +781,21 @@ impl<M: RoleModel> PcSemanticPort<M> {
             hash.update(origin.digest().0);
             digest = ContractDigest(hash.finalize().into());
         }
+        if let Some(step) = &plan.repair {
+            let mut hash = Sha256::new();
+            hash.update(b"rz-rovent-pc-repair-invocation/1\0");
+            hash.update(digest.0);
+            hash.update(step.digest()?.0);
+            digest = ContractDigest(hash.finalize().into());
+        }
+        if let Some(peer) = &peer {
+            digest = peer.envelope().question_digest;
+        }
         let continuation_end = if plan.continuation_end == 0 {
             self.continuation_limit()
         } else {
             plan.continuation_end
         };
-        let stage = stage_for_purpose(plan.purpose)?;
-        let position = self.owner.semantic.nodes[node].position.clone();
-        let first = plan.prefix.first().copied();
         let source = Arc::new(PcQuestionSource {
             owner: Arc::clone(&self.identity),
             authority: self.authority,
@@ -697,6 +805,10 @@ impl<M: RoleModel> PcSemanticPort<M> {
             continuation_end,
             responsibilities: responsibility_digest(&plan.responsibilities)?,
             goal_local: plan.goal_local.as_ref().map(|origin| origin.digest()),
+            peer: peer.as_ref().map(|peer| peer.envelope()),
+            repair: plan.repair.as_ref().map(|step| step.digest()).transpose()?,
+            root_budget: self.original_root_budget(),
+            mode: self.mode,
             stage,
             first,
             position: position.snapshot(),
@@ -717,6 +829,8 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 continuation_end,
                 responsibilities: plan.responsibilities.clone(),
                 goal_local: plan.goal_local.clone(),
+                peer,
+                repair: plan.repair.clone(),
                 source,
             }),
             view_seal: seal,
@@ -861,7 +975,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
                     .view
                     .upgrade()
                     .is_some_and(|v| Arc::ptr_eq(&v, &input.view));
-            return if same {
+            return if same && old.semantic_committed {
                 Ok(())
             } else {
                 Err(RoleError::InvalidOutput.into())
@@ -876,6 +990,9 @@ impl<M: RoleModel> PcSemanticPort<M> {
         if self.consumed.len() >= MAX_PC_CONSUMED {
             return Err(PalsError::Capacity);
         }
+        self.consumed
+            .try_reserve(1)
+            .map_err(|_| PalsError::Capacity)?;
         let result = self.consume_once(input, accepted, output, physical);
         if let Err(error) = &result {
             if let Some(held) = self.pending.get_mut(&input.question_digest) {
@@ -885,14 +1002,42 @@ impl<M: RoleModel> PcSemanticPort<M> {
             return result;
         }
         self.pending.remove(&input.question_digest);
-        self.consumed.push_back(PcConsumed {
-            ticket: *accepted.ticket(),
-            evidence: accepted.output_digest(),
-            question: Arc::downgrade(&input.question),
-            view: Arc::downgrade(&input.view),
-        });
+        self.consumed
+            .iter_mut()
+            .find(|entry| entry.ticket == *accepted.ticket())
+            .ok_or(RoleError::InvalidOutput)?
+            .semantic_committed = true;
         self.complete_role_queue()?;
         Ok(())
+    }
+
+    /// An observation of the exact head already consumed by this owner. It
+    /// grants no acceptance and remains true if later Store publication failed.
+    pub fn role_consumption_recorded(
+        &self,
+        ticket: &RoleTicketEnvelope,
+        input: &FrameInput<ReviewView, PcPortQuestion>,
+    ) -> Result<bool, PalsError> {
+        PcPortQuestion::validate_input_source(input, &self.owner.semantic.stores)?;
+        if !Arc::ptr_eq(&input.question.source.owner, &self.identity)
+            || input.question.source.authority != self.authority
+            || input.question.source.original_deadline != self.deadline
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        Ok(self.consumed.iter().any(|entry| {
+            entry.ticket == *ticket
+                && ticket.question == input.question_digest
+                && ticket.view == input.view_seal
+                && entry
+                    .question
+                    .upgrade()
+                    .is_some_and(|q| Arc::ptr_eq(&q, &input.question))
+                && entry
+                    .view
+                    .upgrade()
+                    .is_some_and(|v| Arc::ptr_eq(&v, &input.view))
+        }))
     }
 
     pub fn role_discarded(
@@ -952,6 +1097,27 @@ impl<M: RoleModel> PcSemanticPort<M> {
             best_move = None;
             best = self.owner.semantic.rules_value(self.root);
             scope = PalsValueScope::RulesTerminal;
+        } else if let Some(strategy) = self
+            .rovent_frontier()
+            .and_then(|frontier| frontier.snapshot().mate_strategy)
+            .or_else(|| self.retired_strategy.clone())
+            .filter(|strategy| {
+                strategy.validates_root(
+                    &self.owner.semantic.nodes[self.root].position.snapshot(),
+                    self.root_moves.allowed(),
+                )
+            })
+        {
+            best_move = Some(strategy.best_move());
+            // A proof move must not inherit a different model-selected move's
+            // estimate. The mate proof itself stays typed in Frontier receipt.
+            let selected = self.owner.semantic.nodes[self.root]
+                .edges
+                .iter()
+                .find(|edge| edge.movement == strategy.best_move());
+            (best, scope) = selected
+                .map(|edge| self.owner.root_model_value(edge.child))
+                .unwrap_or((PalsResolvedValue::Unknown, PalsValueScope::Unknown));
         }
         PcPortResult {
             best_move,
@@ -986,6 +1152,8 @@ impl<M: RoleModel> PcSemanticPort<M> {
             || source.sequence == 0
             || source.sequence >= self.next_question
             || input.question.deadline != self.hard_deadline
+            || source.mode != self.mode
+            || source.root_budget != self.original_root_budget()
             || !Arc::ptr_eq(&held.input.question, &input.question)
             || !Arc::ptr_eq(&held.input.view, &input.view)
         {
@@ -1031,6 +1199,9 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 "PC Fresh endpoint needs original physical evidence",
             )
             .into());
+        }
+        if query.repair.is_some() {
+            return self.consume_repair_once(input, accepted, output, physical);
         }
         let ranked = rank_moves(&input.view.query().legal, output)?;
         let root_ranking = query.context.prefix.is_empty().then(|| {
@@ -1080,31 +1251,15 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 return Err(PalsError::Capacity);
             }
         }
-        self.owner
-            .semantic
-            .review_index
-            .as_mut()
-            .ok_or(PalsError::InvalidConfig)?
-            .consume(&input.view, &self.owner.semantic.stores)?;
-        self.counters.consumed_role_outputs += 1;
-        match role_for_purpose(query.context.purpose)? {
-            Role::Proposer => self.counters.accepted_proposer += 1,
-            Role::Critic => self.counters.accepted_critic += 1,
-            Role::Validator => unreachable!("PC never admits V"),
-        }
-        if fresh {
-            self.counters.accepted_fresh += 1;
-        }
-        self.counters.completed_nn_inputs = match (
-            self.counters.completed_nn_inputs,
-            physical.and_then(|e| e.completed_nn_inputs),
-        ) {
-            (Some(total), Some(count)) => total.checked_add(count),
-            _ => None,
-        };
+        self.consume_pc_head_once(input, accepted, physical)?;
         if let Some(ranking) = root_ranking {
             self.root_ranking = ranking;
         }
+        let peer_source = if !fresh && query.goal_local.is_none() && self.frontier_state.is_some() {
+            Some(PcPeerSource::freeze(input, accepted, output)?)
+        } else {
+            None
+        };
         if fresh {
             self.commit_value(input, output)?;
             if self.frontier_state.is_some() {
@@ -1118,9 +1273,30 @@ impl<M: RoleModel> PcSemanticPort<M> {
             }
         }
         for (movement, prefix) in continuations {
-            let Some(child) = self.admit_selected_child(input, accepted, output, movement)? else {
+            let Some(admitted) = self.admit_selected_child(input, accepted, output, movement)?
+            else {
                 return Ok(());
             };
+            let child = admitted.node;
+            if let Some(origin) = &query.goal_local {
+                let checked = admitted.checked.ok_or(RoleError::InvalidOutput)?;
+                let next =
+                    Arc::new(origin.successor(input, accepted, output, movement, checked, child)?);
+                self.ready.push_back(PcPlan {
+                    node: child,
+                    frame: query.frame,
+                    responsibilities: Vec::new(),
+                    goal_local: Some(Arc::clone(&next)),
+                    peer_source: None,
+                    repair: None,
+                    continuation_end: next.continuation_end(),
+                    purpose: next.purpose(),
+                    prefix,
+                    proposal: Vec::new(),
+                    counter: None,
+                });
+                continue;
+            }
             let kind = match query.context.purpose {
                 RoleQueryPurpose::ReplyPolicy => RecordKind::Counterexample,
                 RoleQueryPurpose::RepairPolicy => RecordKind::Repair,
@@ -1158,12 +1334,27 @@ impl<M: RoleModel> PcSemanticPort<M> {
                     prefix.clone(),
                 )?);
             }
+            if query.context.prefix.is_empty()
+                && query.context.purpose == RoleQueryPurpose::ProposePolicy
+            {
+                self.enqueue_actual_repair_cycle(
+                    input,
+                    accepted,
+                    output,
+                    child,
+                    &prefix,
+                    frame,
+                    &responsibilities,
+                )?;
+            }
             self.ready.push_back(if end || terminal {
                 PcPlan {
                     node: child,
                     frame,
                     responsibilities: responsibilities.clone(),
                     goal_local: None,
+                    peer_source: None,
+                    repair: None,
                     continuation_end,
                     purpose: RoleQueryPurpose::ValueFresh,
                     proposal: prefix.clone(),
@@ -1176,6 +1367,8 @@ impl<M: RoleModel> PcSemanticPort<M> {
                     frame,
                     responsibilities: responsibilities.clone(),
                     goal_local: None,
+                    peer_source: peer_source.clone(),
+                    repair: None,
                     continuation_end,
                     purpose: RoleQueryPurpose::RepairPolicy,
                     proposal: input.view.query().proposal.clone(),
@@ -1188,6 +1381,8 @@ impl<M: RoleModel> PcSemanticPort<M> {
                     frame,
                     responsibilities: responsibilities.clone(),
                     goal_local: None,
+                    peer_source: peer_source.clone(),
+                    repair: None,
                     continuation_end,
                     purpose: RoleQueryPurpose::ReplyPolicy,
                     proposal: prefix.clone(),
@@ -1199,7 +1394,54 @@ impl<M: RoleModel> PcSemanticPort<M> {
         Ok(())
     }
 
+    fn consume_pc_head_once(
+        &mut self,
+        input: &FrameInput<ReviewView, PcPortQuestion>,
+        accepted: &AcceptedRoleStep,
+        physical: Option<AdaptivePortRoleEvidence>,
+    ) -> Result<(), PalsError> {
+        let query = &input.question;
+        let fresh = query.context.purpose == RoleQueryPurpose::ValueFresh;
+        self.owner
+            .semantic
+            .review_index
+            .as_mut()
+            .ok_or(PalsError::InvalidConfig)?
+            .consume(&input.view, &self.owner.semantic.stores)?;
+        self.consumed.push_back(PcConsumed {
+            ticket: *accepted.ticket(),
+            evidence: accepted.output_digest(),
+            question: Arc::downgrade(&input.question),
+            view: Arc::downgrade(&input.view),
+            semantic_committed: false,
+        });
+        self.counters.consumed_role_outputs += 1;
+        match role_for_purpose(query.context.purpose)? {
+            Role::Proposer => self.counters.accepted_proposer += 1,
+            Role::Critic => self.counters.accepted_critic += 1,
+            Role::Validator => unreachable!("PC never admits V"),
+        }
+        if fresh {
+            self.counters.accepted_fresh += 1;
+        }
+        self.counters.completed_nn_inputs = match (
+            self.counters.completed_nn_inputs,
+            physical.and_then(|e| e.completed_nn_inputs),
+        ) {
+            (Some(total), Some(count)) => total.checked_add(count),
+            _ => None,
+        };
+        Ok(())
+    }
+
     fn publish_line(&mut self, kind: RecordKind, moves: &[BoardMove]) -> Result<(), PalsError> {
+        self.publish_pc_repair_line(kind, moves).map(|_| ())
+    }
+    fn publish_pc_repair_line(
+        &mut self,
+        kind: RecordKind,
+        moves: &[BoardMove],
+    ) -> Result<PublishedPcLine, PalsError> {
         let root = &self.owner.semantic.nodes[self.root];
         let root_state = root.state;
         let root_situation = root.situation;
@@ -1298,7 +1540,13 @@ impl<M: RoleModel> PcSemanticPort<M> {
             },
             None,
             Some(observation),
-        )
+        )?;
+        Ok(PublishedPcLine {
+            line,
+            observation,
+            revision,
+            kind,
+        })
     }
 
     fn commit_value(
@@ -1383,7 +1631,7 @@ fn role_for_purpose(purpose: RoleQueryPurpose) -> Result<Role, PalsError> {
         RoleQueryPurpose::ProposePolicy
         | RoleQueryPurpose::RepairPolicy
         | RoleQueryPurpose::ValueFresh => Ok(Role::Proposer),
-        RoleQueryPurpose::ReplyPolicy => Ok(Role::Critic),
+        RoleQueryPurpose::ReplyPolicy | RoleQueryPurpose::DivergencePolicy => Ok(Role::Critic),
         _ => Err(RoleError::Unsupported("PC port does not admit V or an undeclared head").into()),
     }
 }
@@ -1393,6 +1641,7 @@ fn stage_for_purpose(purpose: RoleQueryPurpose) -> Result<RefinementStage, PalsE
         RoleQueryPurpose::ReplyPolicy => Ok(RefinementStage::CriticReply),
         RoleQueryPurpose::RepairPolicy => Ok(RefinementStage::Repair),
         RoleQueryPurpose::ValueFresh => Ok(RefinementStage::ProposalValueFresh),
+        RoleQueryPurpose::DivergencePolicy => Ok(RefinementStage::CriticDivergence),
         _ => Err(RoleError::InvalidOutput.into()),
     }
 }

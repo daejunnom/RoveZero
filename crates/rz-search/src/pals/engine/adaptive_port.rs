@@ -19,13 +19,18 @@ mod conditional_evidence;
 mod consumption_observation;
 mod continuation_blueprint;
 mod cpu_commit;
+mod cpu_evidence_context;
+pub(in crate::pals::engine) use cpu_evidence_context::CpuEvidenceContextSeal;
 mod external_commit;
 #[cfg(test)]
 mod fixed_trace_tests;
 mod frontier_port;
 mod goal_hooks;
+pub(in crate::pals::engine) mod goal_local;
 mod legacy_full_context;
+mod mate_strategy;
 mod model_namespace;
+mod nnuec_installation;
 mod nnuec_port;
 #[cfg(test)]
 mod port_tests;
@@ -51,6 +56,10 @@ pub use continuation_blueprint::{
 pub use external_commit::{AdaptiveForeignPublication, AdaptivePortExternalQuestion};
 pub use frontier_port::{
     AdaptiveFrontierReceipt, AdaptiveFrontierStartup, AdaptiveReviewLeaseAdmission,
+};
+pub use goal_local::{
+    AdaptiveGoalLocalAdmission, GoalLocalBlockReason, GoalLocalInput, GoalLocalLeaf,
+    GoalLocalLeafKind, GoalLocalQuestionKey, GoalLocalStep,
 };
 pub use legacy_full_context::LegacyFullRoleRecords;
 pub use model_namespace::AdaptiveModelNamespace;
@@ -158,6 +167,7 @@ pub struct AdaptivePortQuestion {
     paired_fresh_seal: Option<FreshPairSeal>,
     question_digest: ContractDigest,
     frontier_source: frontier_port::FrontierQuestionSource,
+    goal_local: Option<Arc<goal_local::GoalLocalOrigin>>,
     // Observer-only inline Copy metadata. Never hashed, encoded, selected or
     // consulted by Rules, a cache, acceptance, scheduling or the model.
     diagnostic_repair_line: Option<AdaptiveRepairLineProvenance>,
@@ -181,6 +191,9 @@ impl AdaptivePortQuestion {
         }
         if let Some(records) = &self.legacy_full_records {
             bytes = bytes.checked_add(usize::try_from(records.owned_host_bytes()?).ok()?)?;
+        }
+        if let Some(origin) = &self.goal_local {
+            bytes = bytes.checked_add(usize::try_from(origin.owned_host_bytes()?).ok()?)?;
         }
         u64::try_from(bytes).ok()
     }
@@ -478,6 +491,8 @@ pub struct AdaptiveEnginePort<M: RoleModel> {
     /// completed ticket's Store lease. Only the opt-in legacy route uses it.
     last_legacy_full_snapshot: Option<std::sync::Weak<LegacyFullRoleRecords>>,
     reciprocal: reciprocal_port::ReciprocalPortState,
+    nnuec_installations: nnuec_installation::NnuecQuestionInstallations,
+    goal_local: goal_local::GoalLocalPortState,
 }
 #[derive(Clone)]
 struct CpuPortAdmission {
@@ -506,6 +521,8 @@ struct CpuPortAdmission {
     value_identity: CpuValueIdentity,
     base_condition: String,
     profiles: Vec<crate::cpu_worker::CpuWorkerProfile>,
+    evaluation_namespace: ContractDigest,
+    search_conditions: ContractDigest,
     job: Option<rz_contracts::pals_adaptive::CpuJobEnvelope>,
     grant: Option<rz_contracts::pals_adaptive::SliceGrant>,
     owner: Option<rz_contracts::pals_adaptive::CpuWorkerId>,
@@ -742,6 +759,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             validator_state: validator_port::ValidatorPortState::default(),
             last_legacy_full_snapshot: None,
             reciprocal: reciprocal_port::ReciprocalPortState::default(),
+            nnuec_installations: nnuec_installation::NnuecQuestionInstallations::default(),
+            goal_local: goal_local::GoalLocalPortState::default(),
         }
     }
     /// Explicit root-local diagnostic opt-in before the first observed call.
@@ -851,7 +870,19 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     }
     /// Pure ownership transfer. This method attests no drain, worker join,
     /// archive install or physical fence; the concrete owner must verify them.
-    pub fn into_engine(self) -> PalsEngine<M> {
+    pub fn into_engine(mut self) -> PalsEngine<M> {
+        // The admitted-root constructors reject a previously retired owner.
+        // Any unfinished logical source and even a failed pin projection must
+        // move with this same Store instead of disappearing with the facade.
+        let pins = self.goal_local_protected_pins();
+        let state = std::mem::take(&mut self.goal_local);
+        self.engine.semantic.retired_goal_local = goal_local::GoalLocalRetiredCustody::preserve(
+            state,
+            pins,
+            self.engine.semantic.stores.read_owner(),
+            self.engine.semantic.stores.generation(),
+            self.authority,
+        );
         self.engine
     }
     /// Register scheduling before accepting any role. A previously prepared
@@ -1620,7 +1651,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 Ok(true)
             }
             Some(_) => Err(RoleError::InvalidOutput.into()),
-            None => Ok(false),
+            None => Ok(self.reciprocal_head_use_recorded(ticket, view)
+                || self.rovent_goal_consumption_recorded(ticket, view)),
         }
     }
 
@@ -1664,7 +1696,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     ) -> Result<(), PalsError> {
         self.check_live()?;
         let query = &input.question;
-        if frame.authority != self.authority
+        if query.goal_local.is_some()
+            || frame.authority != self.authority
             || self.closed.contains(&frame)
             || original_deadline != self.deadline
             || input.stage != query.stage
@@ -1760,6 +1793,72 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         paired_repaired: Option<ObservationId>,
         purpose: RoleQueryPurpose,
     ) -> Result<FrameInput<ReviewView, AdaptivePortQuestion>, PalsError> {
+        self.input_with_source(
+            node,
+            stage,
+            first,
+            prefix,
+            proposal,
+            counter,
+            repaired,
+            attack_ply,
+            recheck,
+            frozen,
+            paired_repaired,
+            purpose,
+            None,
+        )
+    }
+
+    fn input_goal_local(
+        &mut self,
+        node: usize,
+        stage: RefinementStage,
+        first: BoardMove,
+        prefix: Vec<BoardMove>,
+        origin: Arc<goal_local::GoalLocalOrigin>,
+    ) -> Result<FrameInput<ReviewView, AdaptivePortQuestion>, PalsError> {
+        origin.validate_prepared_node(self, node, first, &prefix)?;
+        if stage != origin.stage() {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        let purpose = origin.purpose();
+        let input = self.input_with_source(
+            node,
+            stage,
+            Some(first),
+            prefix,
+            Vec::new(),
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            purpose,
+            Some(Arc::clone(&origin)),
+        )?;
+        origin.validates_frame_input(&input)?;
+        Ok(input)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn input_with_source(
+        &mut self,
+        node: usize,
+        stage: RefinementStage,
+        first: Option<BoardMove>,
+        prefix: Vec<BoardMove>,
+        proposal: Vec<BoardMove>,
+        counter: Option<Vec<BoardMove>>,
+        repaired: Option<Vec<BoardMove>>,
+        attack_ply: Option<usize>,
+        recheck: bool,
+        frozen: Option<Arc<ReviewView>>,
+        paired_repaired: Option<ObservationId>,
+        purpose: RoleQueryPurpose,
+        goal_local: Option<Arc<goal_local::GoalLocalOrigin>>,
+    ) -> Result<FrameInput<ReviewView, AdaptivePortQuestion>, PalsError> {
         self.check_live()?;
         let divergences = if stage == RefinementStage::CriticDivergence {
             self.divergence_indices(&proposal)?
@@ -1768,7 +1867,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         };
         // The branch continuation is owner-private state, not an extra model
         // refutation. Keep the synchronous Reply/ValueFresh input semantics.
-        let model_proposal = if purpose == RoleQueryPurpose::ValueFresh {
+        let model_proposal = if goal_local.is_some() {
+            &[][..]
+        } else if purpose == RoleQueryPurpose::ValueFresh {
             prefix.as_slice()
         } else {
             proposal.as_slice()
@@ -1827,6 +1928,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         hash.update(view.digest());
         hash.update(view.seal_digest());
         hash.update(context.focus_prefix_sha256());
+        if let Some(origin) = &goal_local {
+            hash.update(b"goal-local-rules-origin\0");
+            hash.update(origin.digest().0);
+        }
         if let Some(records) = &legacy_full_records {
             hash.update(b"legacy-full-raw-snapshot\0");
             hash.update(records.digest());
@@ -1840,6 +1945,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             &context,
             self.seal(&view),
             legacy_full_records.as_ref(),
+            goal_local.as_ref().map(|origin| origin.digest()),
         )?;
         let query = AdaptivePortQuestion {
             position: self.engine.semantic.nodes[node].position.clone(),
@@ -1862,6 +1968,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             paired_fresh_seal: None,
             question_digest,
             frontier_source,
+            goal_local,
             diagnostic_repair_line: None,
         };
         Ok(FrameInput {

@@ -122,6 +122,15 @@ impl<M: RoleModel> RoleOnlySearchDriver<PcPortQuestion> for PcPortDriver<M> {
     ) -> Result<(), AdaptiveManagerError> {
         self.port.role_discarded(input, ticket).map_err(semantic)
     }
+    fn role_consumption_recorded(
+        &self,
+        ticket: &RoleTicketEnvelope,
+        input: &FrameInput<ReviewView, PcPortQuestion>,
+    ) -> Result<bool, AdaptiveManagerError> {
+        self.port
+            .role_consumption_recorded(ticket, input)
+            .map_err(semantic)
+    }
     fn is_complete(&self) -> bool {
         self.port.is_complete()
     }

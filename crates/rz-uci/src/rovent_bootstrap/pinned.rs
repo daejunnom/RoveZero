@@ -28,6 +28,13 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
+mod collection;
+mod nnuec;
+pub use collection::{
+    RoventCollectionPreloadSources, RoventCollectionTeacherSourceCustody,
+    RoventCollectionTeacherSources, RoventTeacherAssetSelection, RoventTeacherSourceSelection,
+};
+use nnuec::PinnedNnuecArtifacts;
 
 const MAX_GRAPH_BYTES: u64 = 1 << 30;
 const MAX_WEIGHTS_BYTES: u64 = 8 << 30;
@@ -79,6 +86,8 @@ pub struct RoventPinnedNativeSources {
     _provenance: PinnedBlob,
     runtime: Vec<PinnedBlob>,
     runtime_bundle_manifest: Option<PinnedBlob>,
+    nnuec: Option<PinnedNnuecArtifacts>,
+    collection: Option<Arc<RoventCollectionPreloadSources>>,
 }
 impl RoventPinnedNativeSources {
     /// Pure byte/descriptor admission. No ORT runtime, model or R worker starts.
@@ -89,8 +98,46 @@ impl RoventPinnedNativeSources {
         selection: RoventNativeAssetSelection,
         control: &RoventStartupControl,
     ) -> Result<Self, BackendError> {
+        Self::open_selected(lock, root, private_root_path, selection, control, None)
+    }
+    /// Explicit source-only Collection preload. The same full lock and all
+    /// original teacher source descriptors are retained; no target is granted.
+    pub fn open_collection(
+        lock: Arc<RoventInputLock>,
+        root: Dir,
+        private_root_path: PathBuf,
+        selection: RoventNativeAssetSelection,
+        control: &RoventStartupControl,
+        collection: Arc<RoventCollectionPreloadSources>,
+    ) -> Result<Self, BackendError> {
+        if !collection.matches_input_lock(&lock) {
+            return Err(fail(
+                K::IdentityMismatch,
+                "Collection preload source lock differs",
+            ));
+        }
+        Self::open_selected(
+            lock,
+            root,
+            private_root_path,
+            selection,
+            control,
+            Some(collection),
+        )
+    }
+    fn open_selected(
+        lock: Arc<RoventInputLock>,
+        root: Dir,
+        private_root_path: PathBuf,
+        selection: RoventNativeAssetSelection,
+        control: &RoventStartupControl,
+        collection: Option<Arc<RoventCollectionPreloadSources>>,
+    ) -> Result<Self, BackendError> {
         control.check()?;
-        let topology = admitted_topology(&lock)?;
+        let topology = match &collection {
+            Some(original) => super::admitted_collection_topology(&lock, original)?,
+            None => admitted_topology(&lock)?,
+        };
         if !private_root_path.is_absolute() {
             return Err(fail(
                 K::InvalidInput,
@@ -223,6 +270,7 @@ impl RoventPinnedNativeSources {
                 "explicit runtime bundle manifest/provider mismatch",
             ));
         }
+        let nnuec = PinnedNnuecArtifacts::open(&root, &lock, control)?;
         let owner = Self {
             lock,
             topology,
@@ -238,6 +286,8 @@ impl RoventPinnedNativeSources {
             _provenance: provenance,
             runtime,
             runtime_bundle_manifest,
+            nnuec,
+            collection,
         };
         owner.validate_lock()?;
         control.check()?;
@@ -245,6 +295,9 @@ impl RoventPinnedNativeSources {
     }
     pub fn lock(&self) -> &RoventInputLock {
         &self.lock
+    }
+    pub fn collection_preload_sources(&self) -> Option<&Arc<RoventCollectionPreloadSources>> {
+        self.collection.as_ref()
     }
     /// Read only the original retained metadata descriptor. Its ArtifactRef
     /// pins JSON bytes; a CUDA runtime bundle's binary-codec digest is separate.
@@ -374,7 +427,11 @@ impl RoventPinnedNativeSources {
             .transpose()
     }
     pub fn validate_lock(&self) -> Result<(), BackendError> {
-        if admitted_topology(&self.lock)? != self.topology {
+        let topology = match &self.collection {
+            Some(original) => super::admitted_collection_topology(&self.lock, original)?,
+            None => admitted_topology(&self.lock)?,
+        };
+        if topology != self.topology {
             return Err(fail(
                 K::IdentityMismatch,
                 "native topology changed after pinning",

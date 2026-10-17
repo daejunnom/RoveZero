@@ -6,6 +6,12 @@ use rz_search::external_cpu::{
 };
 use rz_uci::pals_checker_profile::rovent::RoventExternalProfile;
 use rz_uci::rovent_external_launch::{PreparedRoventExternalLaunch, RoventExternalOwner};
+mod collection;
+pub use collection::RoventCollectionTeacherBinding;
+mod session;
+pub use session::*;
+mod pump;
+pub use pump::*;
 
 fn process_json(p: ExternalProcessIdentity) -> Value {
     json!({"pid":p.pid,"process_group":p.process_group,"proc_start_ticks":p.proc_start_ticks})
@@ -200,13 +206,43 @@ impl RoventCorpusProducer {
             .result()
             .as_ref()
             .map_err(|e| invalid(e.to_string()))?;
+        let startup = owner
+            .verified_startup()
+            .map_err(|e| invalid(e.to_string()))?
+            .ok_or_else(|| invalid("teacher startup lost"))?;
+        let attempt = completion
+            .attempt()
+            .ok_or_else(|| invalid("teacher missing original physical attempt"))?;
+        self.apply_completed_teacher_policy(
+            row,
+            binding.actor_id,
+            binding.pin,
+            binding.raw,
+            &startup,
+            outcome,
+            attempt,
+            completion.timing(),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn apply_completed_teacher_policy(
+        &mut self,
+        row: &mut RoventRetiredRecord,
+        actor_id: String,
+        pin: RoventTeacherPin,
+        binding_raw: Value,
+        startup: &rz_uci::rovent_external_launch::VerifiedRoventExternalStartup,
+        outcome: &rz_search::external_cpu::ProfiledExternalOutcome,
+        attempt: &rz_search::cpu_checker::CheckerAttempt,
+        timing: rz_search::external_cpu::ProfiledExternalTiming,
+    ) -> Result<(), ArenaError> {
         let r = &outcome.report;
         let raw = &r.raw;
         check(
             r.purpose == ExternalEnginePurpose::Teacher
-                && r.profile.source_commit() == binding.pin.source_commit
-                && raw.identity.binary_sha256 == binding.pin.binary_sha256
-                && raw.identity.options == binding.pin.options
+                && r.profile.source_commit() == pin.source_commit
+                && raw.identity.binary_sha256 == pin.binary_sha256
+                && raw.identity.options == pin.options
                 && outcome.conditional_policy_target_known
                 && r.readiness_barrier_completed
                 && !outcome.opinions.is_empty()
@@ -236,10 +272,6 @@ impl RoventCorpusProducer {
             depth = depth.min(o.depth);
         }
         let sequence = self.next()?;
-        let startup = owner
-            .verified_startup()
-            .map_err(|e| invalid(e.to_string()))?
-            .ok_or_else(|| invalid("teacher startup lost"))?;
         let raw_report = json!({"identity":raw.identity,"observed_uci":{"name":raw.observed_uci.name,"author":raw.observed_uci.author},
             "request_id":raw.request_id,"best_move":raw.best_move.map(|m|Move16::pack(m).map(|v|v.bits())).transpose().map_err(|e|invalid(e.to_string()))?,
             "pv":packed(&raw.pv)?,"score":score_json(raw.score),"bound":format!("{:?}",raw.bound),"wdl_per_mille":raw.wdl_per_mille,
@@ -249,9 +281,6 @@ impl RoventCorpusProducer {
             "elapsed_ns":raw.elapsed.as_nanos().min(u128::from(u64::MAX)) as u64});
         let opinions_json=opinions.iter().map(|o|Ok(json!({"rank":o.rank,"depth":o.depth,"seldepth":o.seldepth,
             "pv":packed(&o.pv)?,"score":score_json(o.score),"bound":format!("{:?}",o.bound),"reported_wdl":o.reported_wdl}))).collect::<Result<Vec<_>,ArenaError>>()?;
-        let attempt = completion
-            .attempt()
-            .ok_or_else(|| invalid("teacher missing original physical attempt"))?;
         let physical = attempt
             .external
             .as_ref()
@@ -264,15 +293,15 @@ impl RoventCorpusProducer {
                 "exit_observed":p.exit_observed,"stdout_drained":p.stdout_drained,"stderr_drained":p.stderr_drained,
                 "exit_code":p.exit_code,"exit_signal":p.exit_signal,"cleanup_complete":p.cleanup_complete,
                 "quarantined":p.quarantined,"ownership_lost":p.ownership_lost,"stdout_bytes":p.stdout_bytes,"stderr_bytes":p.stderr_bytes}});
-        let body = json!({"schema":HEAD_DOMAIN,"kind":"teacher_policy","actor_id":binding.actor_id,
-            "input_sha256":row.record.input_sha256,"anchor":binding.anchor,"teacher_pin":binding.pin,"binding":binding.raw,
+        let body = json!({"schema":HEAD_DOMAIN,"kind":"teacher_policy","actor_id":actor_id,
+            "input_sha256":row.record.input_sha256,"anchor":row.record.input.rules_anchor,"teacher_pin":pin,"binding":binding_raw,
             "completion":{"profile":r.profile,"purpose":r.purpose,"issued_go":r.issued_go,"requested":r.requested,"issued":r.issued,
                 "readiness_barrier_completed":r.readiness_barrier_completed,"go_issued":true,"raw":raw_report,"opinions":opinions_json,
                 "requested_multipv":outcome.requested_multipv,"conditional_policy_target_known":outcome.conditional_policy_target_known,
                 "option_application_observed":r.option_application_observed,"model_loading_observed":startup.model_loading_observed(),"attempt":attempt_json,
                 "stop_control":outcome.stop_control.map(|c|json!({"sequence":c.sequence,"action":format!("{:?}",c.action)})),
-                "timing":{"go_issued":completion.timing().go_issued_at.is_some(),"stop_sent":completion.timing().stop_sent_at.is_some(),
-                    "bestmove_drained":completion.timing().bestmove_drained_at.is_some(),"ready_completed":completion.timing().ready_completed_at.is_some()}}});
+                "timing":{"go_issued":timing.go_issued_at.is_some(),"stop_sent":timing.stop_sent_at.is_some(),
+                    "bestmove_drained":timing.bestmove_drained_at.is_some(),"ready_completed":timing.ready_completed_at.is_some()}}});
         let seal = generation_digest(HEAD_DOMAIN, &body)?;
         row.record.targets.policy = Some(GenerationPolicyTargetV3 {
             observed_sequence: sequence,
@@ -284,18 +313,18 @@ impl RoventCorpusProducer {
             stale: false,
             anchor: row.record.input.rules_anchor.clone(),
             ranked_moves: ranked,
-            teacher_binary_sha256: binding.pin.binary_sha256.clone(),
-            teacher_profile_sha256: binding.pin.profile_sha256.clone(),
+            teacher_binary_sha256: pin.binary_sha256.clone(),
+            teacher_profile_sha256: pin.profile_sha256.clone(),
             go_sequence: raw.request_id,
             completed_depth: u32::from(depth),
         });
         row.record.head_sources.insert(
             "policy".into(),
             RoventHeadSource {
-                actor_id: binding.actor_id,
+                actor_id,
                 source: "rovent_completed_teacher_multipv".into(),
-                binary_sha256: Some(binding.pin.binary_sha256),
-                profile_sha256: Some(binding.pin.profile_sha256),
+                binary_sha256: Some(pin.binary_sha256),
+                profile_sha256: Some(pin.profile_sha256),
                 raw_receipt: body,
                 raw_receipt_sha256: seal,
                 observed_sequence: sequence,

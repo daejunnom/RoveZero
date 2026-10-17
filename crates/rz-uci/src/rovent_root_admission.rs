@@ -14,15 +14,15 @@ pub use rz_experiments::{
     RoventOriginalGoCoverage, RoventRootAdmissionPolicy,
 };
 use rz_experiments::{
-    RoventInputLock, RoventParsedGo, RoventResolvedGo, RoventRootAuthority, RoventRootClocks,
+    RoventInputLock, RoventParsedGo, RoventRootAllocationClock, RoventRootAuthority,
     RoventRootDeadline, RoventRootDeclaredCeilings, RoventRootDescriptor,
-    RoventRootDescriptorInput,
 };
 use rz_position::{BoardMove, Position, PositionSnapshot};
-use rz_runtime::contracts::{ContractClock, ContractSystemClock};
+use rz_runtime::contracts::ContractSystemClock;
 use std::{fmt, sync::Arc};
 
 pub mod preadmission;
+pub mod source_seal;
 
 const MAX_ROOT_MOVES: usize = 218;
 const MAX_CANONICAL_BYTES: usize = 64 << 10;
@@ -105,6 +105,9 @@ pub struct RoventRootAdmission {
     deadline_seal: Digest,
     digest: Digest,
     canonical: Vec<u8>,
+    allocation_clock: RoventRootAllocationClock,
+    allocation_clock_digest: Digest,
+    allocation_clock_canonical: Vec<u8>,
 }
 impl RoventRootAdmission {
     pub fn admit(
@@ -114,228 +117,9 @@ impl RoventRootAdmission {
         context: &SearchSessionContext,
         clock: &ProcessClock,
     ) -> Result<Self, RoventRootAdmissionError> {
-        lock.validate().map_err(|_| {
-            fail(
-                RoventRootAdmissionFailure::InvalidLock,
-                "original startup input lock",
-            )
-        })?;
-        accepts(context)?;
-        let original_go = context.original_go.as_deref().ok_or_else(|| {
-            fail(
-                RoventRootAdmissionFailure::OriginalGoMissing,
-                "actual admission requires the original parsed UCI go",
-            )
-        })?;
-        // Normal product input was already bounded by the UCI parser. Keep
-        // canonical construction bounded even if an internal caller forges a
-        // much larger GoLimits; raw repetition is not a distinct-move limit.
-        if let Some(moves) = &original_go.searchmoves {
-            let bytes = moves.iter().try_fold(0usize, |bytes, movement| {
-                bytes.checked_add(movement.len())?.checked_add(3)
-            });
-            require(
-                bytes.is_some_and(|bytes| bytes <= MAX_CANONICAL_BYTES / 2),
-                RoventRootAdmissionFailure::CanonicalEncoding,
-                "original go exceeds the bounded root descriptor budget",
-            )?;
-        }
-        require(
-            original_go.nodes == context.requested_nodes
-                && original_go.depth_plies == context.goal.depth_plies
-                && original_go.mate_moves == context.goal.mate_moves,
-            RoventRootAdmissionFailure::OriginalGoMismatch,
-            "original parsed go nodes or goal differ from resolved search context",
-        )?;
-        let runtime_clock = clock.runtime_clock();
-        require(
-            clock.epoch().0 != 0
-                && context.authority.epoch == clock.epoch()
-                && runtime_clock.domain() == clock.domain()
-                && context.authority.implementation != Digest([0; 32]),
-            RoventRootAdmissionFailure::Clock,
-            "original authority and process clock domains differ",
-        )?;
-        let convert = |instant| {
-            clock.deadline(instant).map_err(|_| {
-                fail(
-                    RoventRootAdmissionFailure::Clock,
-                    "deadline predates or overflows the original process origin",
-                )
-            })
-        };
-        require(
-            convert(runtime_clock.origin())?.at.0 == 0,
-            RoventRootAdmissionFailure::Clock,
-            "runtime and UCI process origins differ",
-        )?;
-        let hard = convert(context.control.deadline)?;
-        let soft = convert(context.control.soft_deadline)?;
-        let admission = convert(context.control.admission_deadline)?;
-        let cleanup = convert(context.shutdown_deadline)?;
-        require(
-            soft.at <= admission.at && admission.at <= hard.at && hard.at <= cleanup.at,
-            RoventRootAdmissionFailure::DeadlineOrder,
-            "original soft/admission/hard/cleanup deadline order",
-        )?;
-        let cleanup_limit = lock
-            .manifest
-            .cleanup_max_ms
-            .checked_mul(1_000_000)
-            .ok_or_else(|| {
-                fail(
-                    RoventRootAdmissionFailure::DeclaredCeiling,
-                    "declared cleanup ceiling overflows nanoseconds",
-                )
-            })?;
-        require(
-            cleanup.at.0 - hard.at.0 <= cleanup_limit,
-            RoventRootAdmissionFailure::DeclaredCeiling,
-            "original cleanup exceeds the declared cleanup ceiling",
-        )?;
-        hard.accepts(
-            clock.domain(),
-            clock
-                .now()
-                .map_err(|_| fail(RoventRootAdmissionFailure::Clock, "original process now"))?,
-        )
-        .map_err(|_| {
-            fail(
-                RoventRootAdmissionFailure::RevokedAuthority,
-                "original hard deadline expired",
-            )
-        })?;
-        let registered = &lock.manifest.engine.search;
-        context
-            .goal
-            .validate(registered.registered_max_chess_plies)
-            .map_err(|_| {
-                fail(
-                    RoventRootAdmissionFailure::Goal,
-                    "go exceeds registered chess-ply capability",
-                )
-            })?;
-        let snapshot = position.snapshot();
-        // This is exactly ContractState.identity.semantic, including history
-        // origin/completeness, all known canonical states and irreversible marks.
-        let state_and_history = rz_position::contracts::rules_snapshot_semantic_digest(&snapshot);
-        let rules_profile = rz_position::contracts::profile_digest();
-        require(
-            registered.rules_profile_sha256 == hex(rules_profile),
-            RoventRootAdmissionFailure::RulesProfile,
-            "registered Rules profile differs from actual Rules",
-        )?;
-        let legal = position.ordered_legal_moves();
-        let root_moves = canonical_subset(legal.moves(), context.root_moves.as_deref())?;
-        let parsed_root_moves =
-            canonical_original_subset(legal.moves(), original_go.searchmoves.as_deref())?;
-        require(
-            parsed_root_moves.as_deref() == root_moves.as_deref(),
-            RoventRootAdmissionFailure::OriginalGoMismatch,
-            "original parsed go root subset differs from resolved search context",
-        )?;
-        let allowed_moves = root_moves
-            .clone()
-            .unwrap_or_else(|| Arc::from(legal.moves()));
-        if policy == RoventRootAdmissionPolicy::ExactRegistered {
-            let declared = registered
-                .searchmoves
-                .as_ref()
-                .map(|moves| {
-                    moves
-                        .iter()
-                        .map(|movement| {
-                            BoardMove::from_uci(movement).map_err(|_| {
-                                fail(
-                                    RoventRootAdmissionFailure::RegisteredWorkload,
-                                    "registered root move decoding",
-                                )
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .transpose()?;
-            let declared = canonical_subset(legal.moves(), declared.as_deref())?;
-            require(
-                registered.root_state_and_history_sha256 == hex(state_and_history)
-                    && registered.requested_nodes == context.requested_nodes
-                    && registered.goal() == context.goal
-                    && declared.as_deref() == root_moves.as_deref(),
-                RoventRootAdmissionFailure::RegisteredWorkload,
-                "actual root/history/go/subset differs from exact registered workload",
-            )?;
-        }
-        let startup_lock = parse_digest(&lock.canonical_sha256)?;
-        let declared_ceilings = RoventRootDeclaredCeilings {
-            resource_plan: lock.manifest.resources.clone(),
-            registered_max_chess_plies: registered.registered_max_chess_plies,
-            cpu_credit_limit: lock.manifest.coordinator.cpu_credit_limit,
-            questions_max: lock.manifest.coordinator.questions_max,
-            ancestor_depth_max: lock.manifest.coordinator.ancestor_depth_max,
-            waiting_jobs_max: lock.manifest.coordinator.waiting_jobs_max,
-            role_tickets_max: lock.manifest.coordinator.role_tickets_max,
-            wall_time_max_ms: lock.manifest.wall_time_max_ms,
-            cleanup_max_ms: lock.manifest.cleanup_max_ms,
-            output_bytes_max: lock.manifest.output_bytes_max,
-        };
-        // Only this actual Rules/context/clock path can wrap pure metadata in
-        // the live capability. A decoded descriptor has no reverse constructor.
-        let descriptor = RoventRootDescriptor::seal(RoventRootDescriptorInput {
-            policy,
-            startup_lock_sha256: hex(startup_lock),
-            state_and_history_sha256: hex(state_and_history),
-            rules_profile_sha256: hex(rules_profile),
-            authority: authority_descriptor(context.authority),
-            node_unit: registered.node_unit.clone(),
-            search_configuration_sha256: registered.search_configuration_sha256.clone(),
-            coordinator_policy_sha256: lock.manifest.coordinator.policy_sha256.clone(),
-            original_go: RoventResolvedGo {
-                coverage: RoventOriginalGoCoverage::FullOriginalGo,
-                requested_nodes: context.requested_nodes,
-                depth_plies: context.goal.depth_plies,
-                mate_moves: context.goal.mate_moves,
-                searchmoves: root_moves.as_ref().map(|moves| move_texts(moves)),
-                transport_simulation_cap: context.control.max_simulations,
-                original_parsed_limits: Some(original_go_descriptor(original_go)),
-            },
-            allowed_root_moves: move_texts(&allowed_moves),
-            clock: RoventRootClocks {
-                hard: deadline_descriptor(hard),
-                soft: deadline_descriptor(soft),
-                admission: deadline_descriptor(admission),
-                cleanup: deadline_descriptor(cleanup),
-            },
-            declared_ceilings,
-        })
-        .map_err(codec_error)?;
-        descriptor.verify_against(lock).map_err(codec_error)?;
-        let root_budget = descriptor.root_budget_digest().map_err(codec_error)?;
-        let deadline_seal = descriptor.deadline_seal_digest().map_err(codec_error)?;
-        let canonical = descriptor.canonical_bytes().map_err(codec_error)?;
-        let digest = descriptor.digest().map_err(codec_error)?;
-        // No old authority can become a successful admission while Rules work
-        // or canonical encoding was in progress.
-        accepts(context)?;
-        Ok(Self {
-            policy,
-            startup_lock,
-            state_and_history,
-            rules_profile,
-            snapshot,
-            context: context.clone(),
-            runtime_clock,
-            root_moves,
-            allowed_moves,
-            hard,
-            soft,
-            admission,
-            cleanup,
-            descriptor,
-            root_budget,
-            deadline_seal,
-            digest,
-            canonical,
-        })
+        source_seal::SourceSeal::prepare(lock, policy, position, context, clock)?
+            .try_into_live()
+            .map_err(|(_, error)| error)
     }
     pub fn policy(&self) -> RoventRootAdmissionPolicy {
         self.policy
@@ -412,20 +196,17 @@ impl RoventRootAdmission {
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical
     }
+    pub fn allocation_clock(&self) -> &RoventRootAllocationClock {
+        &self.allocation_clock
+    }
+    pub fn allocation_clock_digest(&self) -> Digest {
+        self.allocation_clock_digest
+    }
+    pub fn allocation_clock_canonical_bytes(&self) -> &[u8] {
+        &self.allocation_clock_canonical
+    }
 }
 
-fn accepts(context: &SearchSessionContext) -> Result<(), RoventRootAdmissionError> {
-    require(
-        context.accepts().map_err(|_| {
-            fail(
-                RoventRootAdmissionFailure::RevokedAuthority,
-                "original UCI authority unavailable",
-            )
-        })?,
-        RoventRootAdmissionFailure::RevokedAuthority,
-        "original UCI authority revoked or expired",
-    )
-}
 fn canonical_subset(
     legal: &[BoardMove],
     requested: Option<&[BoardMove]>,

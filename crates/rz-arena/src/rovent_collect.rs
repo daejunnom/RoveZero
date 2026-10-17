@@ -123,6 +123,8 @@ pub struct RoventSubmittedInputSeal {
     manifest_sha256: String,
     ticket: RoleTicketEnvelope,
     input_sha256: String,
+    // GenerationInputV3 selected-view seal, distinct from native ticket view digest.
+    selected_view_sha256: String,
     anchor: GenerationRulesAnchorV3,
     role: GenerationRoleV3,
     teacher_actor_id: Option<String>,
@@ -149,6 +151,7 @@ fn input_seal(
         manifest_sha256: manifest.into(),
         ticket,
         input_sha256: input_sha256.into(),
+        selected_view_sha256: input.view_sha256.clone(),
         anchor: input.rules_anchor.clone(),
         role: input.role,
         teacher_actor_id: lineage.teacher_actor_id.clone(),
@@ -856,6 +859,7 @@ pub struct RoventCorpusWriter {
         BTreeMap<String, std::sync::Arc<publication::RoventPublicationSourceSnapshot>>,
     publication_payloads:
         BTreeMap<String, std::sync::Arc<publication::RoventPublicationSourceSnapshot>>,
+    allocations: allocation::RoventAllocationSupplementCapture,
 }
 impl RoventCorpusWriter {
     pub fn new(manifest: &RoventCorpusManifest) -> Result<Self, ArenaError> {
@@ -879,6 +883,7 @@ impl RoventCorpusWriter {
             admissions: BTreeMap::new(),
             publication_sources: BTreeMap::new(),
             publication_payloads: BTreeMap::new(),
+            allocations: allocation::RoventAllocationSupplementCapture::new(),
         })
     }
     pub fn append(&mut self, row: PublishedRoventRecord) -> Result<(), ArenaError> {
@@ -936,7 +941,11 @@ impl RoventCorpusWriter {
         let admission_bytes = if self.admissions.contains_key(&admission_sha) {
             0
         } else {
-            512
+            1024 + row
+                .admission
+                .root_admission()
+                .allocation_clock_canonical_bytes()
+                .len() as u64
         };
         let added = (bytes.len() as u64)
             .checked_add(origin_bytes)
@@ -958,6 +967,7 @@ impl RoventCorpusWriter {
                 && !self.record_seals.contains(&row.record.record_sha256),
             "corpus output cap/duplicate; flush full chunk explicitly",
         )?;
+        self.allocations.retain(&row)?;
         self.record_seals.insert(row.record.record_sha256.clone());
         if let Some(key) = new_payload {
             self.publication_payloads
@@ -1016,7 +1026,11 @@ impl RoventCorpusWriter {
 #[cfg(feature = "pals-collection-onnx")]
 mod teacher;
 #[cfg(feature = "pals-collection-onnx")]
-pub use teacher::{RoventRegisteredTeacher, RoventTeacherBinding};
+pub use teacher::{
+    RoventCollectionTeacherBinding, RoventCollectionTeacherCompleted,
+    RoventCollectionTeacherFailure, RoventCollectionTeacherPump, RoventCollectionTeacherSession,
+    RoventCollectionTeacherShutdown, RoventRegisteredTeacher, RoventTeacherBinding,
+};
 #[cfg(feature = "pals-collection-onnx")]
 mod native_capture;
 #[cfg(feature = "pals-collection-onnx")]
@@ -1029,12 +1043,28 @@ mod rules_replay;
 pub use rules_replay::*;
 mod historical_scope;
 pub use historical_scope::{RoventHistoricalRecordEvidence, verify_historical_record_evidence};
+pub(crate) use historical_scope::{RoventNativeOriginEvidence, RoventRootAdmissionEvidence};
 mod publication;
 pub use publication::{
     FinishedRoventCorpus, ROVENT_CORPUS_PUBLICATION, ROVENT_PUBLICATION_FILE,
     ROVENT_PUBLICATION_INDEX, ROVENT_PUBLICATION_MANIFEST, RoventCorpusPublication,
     RoventPublicationAdmission, RoventPublicationFile,
 };
+mod r_readout;
+pub use r_readout::*;
+mod r_publication;
+pub use r_publication::*;
+mod r_writer;
+pub use r_writer::*;
+mod r_historical;
+pub use r_historical::*;
+mod allocation;
+pub use allocation::{
+    ROVENT_ALLOCATION_SUPPLEMENT, ROVENT_R_ALLOCATION_SUPPLEMENT, RoventAllocationSupplement,
+    RoventAllocationSupplementEntry,
+};
+#[cfg(all(test, target_os = "linux"))]
+mod r_wire_tests;
 
 #[cfg(test)]
 mod tests {

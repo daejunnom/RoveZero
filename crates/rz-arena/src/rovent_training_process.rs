@@ -372,11 +372,11 @@ pub struct RoventTrainingFailure {
     pub corpus: Arc<OriginalRoventCorpusCustody>,
     pub previous: Option<Arc<VerifiedRoventTrainingWindow>>,
     #[cfg(target_os = "linux")]
-    held: Option<linux::LinuxHeld>,
+    _retained_held: Option<linux::LinuxHeld>,
     #[cfg(target_os = "linux")]
-    pending_broker: Option<linux::PendingBroker>,
+    _retained_pending_broker: Option<linux::PendingBroker>,
     #[cfg(target_os = "linux")]
-    shared_held: Option<Arc<std::sync::Mutex<Option<linux::LinuxHeld>>>>,
+    _retained_shared_held: Option<Arc<std::sync::Mutex<Option<linux::LinuxHeld>>>>,
 }
 impl std::fmt::Debug for RoventTrainingFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -644,23 +644,27 @@ impl TrainerLedger {
             ],
         )?;
         let event = &p["event"];
-        fields(
-            event,
-            &[
-                "schema",
-                "window_id",
-                "stage_id",
-                "role",
-                "completed_role_updates",
-                "profile_sha256",
-                "corpus_sha256",
-                "phase",
-                "sample_origins",
-                "sample_inputs",
-                "head_counts",
-                "actual_model_state_sha256",
-            ],
-        )?;
+        let mut event_fields = vec![
+            "schema",
+            "window_id",
+            "stage_id",
+            "role",
+            "completed_role_updates",
+            "profile_sha256",
+            "corpus_sha256",
+            "phase",
+            "sample_origins",
+            "sample_inputs",
+            "head_counts",
+            "actual_model_state_sha256",
+        ];
+        if schema == "rz-rovent-trainer-update/2"
+            && self.window["nnuec_r_auxiliary"].is_object()
+            && event["role"] != "validator"
+        {
+            event_fields.push("r_auxiliary");
+        }
+        fields(event, &event_fields)?;
         check(
             self.begun
                 && !self.ended
@@ -754,7 +758,16 @@ impl TrainerLedger {
     }
     fn head_weight(&self, head: &str) -> f64 {
         if head == "nnuec_wdl" {
-            self.window["nnuec_loss"]["weight"].as_f64().unwrap_or(0.0)
+            // Enabled R auxiliary retains P/C NNUEC evidence counts but
+            // supervises that private optimizer from the separate R stream.
+            // The absent/null path preserves the original P/C behavior.
+            if self.window["schema"] == "rz-rovent-train-window/2"
+                && self.window["nnuec_r_auxiliary"].is_object()
+            {
+                0.0
+            } else {
+                self.window["nnuec_loss"]["weight"].as_f64().unwrap_or(0.0)
+            }
         } else {
             self.window["loss_weights"][head].as_f64().unwrap_or(0.0)
         }

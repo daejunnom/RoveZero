@@ -52,7 +52,7 @@ class RecoveredParentSocketTrainerAuthority(ParentSocketTrainerAuthority):
                 "trainer_source_sha256", "trainer_python_executable_sha256", "trainer_dependency_set_sha256",
                 "training_model_semantics_sha256")},
             "completed_updates": dict(owner.completed), "ancestor_updates": dict(owner.ancestor_updates),
-            "frozen_pc_sha256": spec["frozen_pc_sha256"]}
+            "frozen_pc_sha256": spec["frozen_pc_sha256"], **self._auxiliary_state(owner)}
         if self._rpc("begin_window", payload):
             raise ValueError("recovered begin acknowledgement cannot serialize a capability")
         self._lease = _WindowLease(self)
@@ -65,6 +65,19 @@ class RecoveredParentSocketTrainerAuthority(ParentSocketTrainerAuthority):
         if self._rpc("consume_sample", payload):
             raise ValueError("recovered consume acknowledgement must be empty")
 
+    def consume_auxiliary(self, lease, evidence):
+        self._checked_lease(lease)
+        payload = {"schema": "rz-rovent-trainer-consume-auxiliary/1", "evidence": copy.deepcopy(evidence)}
+        if self._rpc("consume_auxiliary", payload):
+            raise ValueError("separate R auxiliary acknowledgement must be empty")
+
+    @staticmethod
+    def _auxiliary_state(owner):
+        if "r_auxiliary" not in owner.samplers:
+            return {}
+        from .rovent_r_auxiliary import checkpoint_projection
+        return {"r_auxiliary": checkpoint_projection(owner.samplers["r_auxiliary"], owner.samplers["updates"])}
+
     def completed_update(self, lease, event, owner):
         self._checked_lease(lease)
         return self._rpc("completed_update", {"schema": "rz-rovent-trainer-update/2", "event": copy.deepcopy(event),
@@ -75,7 +88,7 @@ class RecoveredParentSocketTrainerAuthority(ParentSocketTrainerAuthority):
         payload = {"schema": "rz-rovent-trainer-checkpoint/2",
             "checkpoint": {name: checkpoint[name] for name in ("path", "sha256", "bytes")},
             "completed_updates": dict(owner.completed), **self._state(owner),
-            "cost": dict(owner.cost), "pending_microbatches": owner.pending_microbatches}
+            "cost": dict(owner.cost), "pending_microbatches": owner.pending_microbatches, **self._auxiliary_state(owner)}
         if self._rpc("checkpoint_published", payload):
             raise ValueError("recovered checkpoint acknowledgement must be empty")
 
@@ -98,7 +111,7 @@ class RecoveredParentSocketTrainerAuthority(ParentSocketTrainerAuthority):
         if any(checkpoint[name] != source.tensor_pin[name] for name in ("sha256", "bytes")):
             raise ValueError("scratch tensor differs from the exact historical checkpoint input")
         observed = {**self._state(owner), "completed_updates": dict(owner.completed),
-            "cost": dict(owner.cost), "pending_microbatches": owner.pending_microbatches}
+            "cost": dict(owner.cost), "pending_microbatches": owner.pending_microbatches, **self._auxiliary_state(owner)}
         projection = project_historical_checkpoint(source.retirement_raw,
             receipt_sha256=source.retirement_pin["sha256"], receipt_bytes=source.retirement_pin["bytes"],
             recovered_checkpoint_pin=source.tensor_pin, observed_state=observed)
@@ -107,7 +120,8 @@ class RecoveredParentSocketTrainerAuthority(ParentSocketTrainerAuthority):
         return {"projection": projection, "recipe_sha256": owner.recipe.sha256, "stage_id": owner.stage_id,
             "membership_sha256": membership_digest(owner.membership), "ancestor_updates": dict(owner.ancestor_updates),
             "retained_input_set_sha256": inputs["sha256"], "retained_input_count": inputs["count"],
-            "retained_origin_set_sha256": origins["sha256"], "retained_origin_count": origins["count"]}
+            "retained_origin_set_sha256": origins["sha256"], "retained_origin_count": origins["count"],
+            **self._auxiliary_state(owner)}
 
     def validate_checkpoint_state(self, owner, intake, checkpoint):
         return self._rpc("validate_checkpoint_state", {"schema": "rz-rovent-trainer-resume/2",

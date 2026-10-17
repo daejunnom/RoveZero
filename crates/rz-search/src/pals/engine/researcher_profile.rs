@@ -79,6 +79,7 @@ impl<M: RoleModel> PalsEngine<M> {
             held_cpu_task: None,
             rovent_root_prefix_plies,
             deferred_researcher_source: None,
+            deferred_researcher_initial: None,
             researcher,
             semantic,
             last_cpu_checkpoint_cleanup_error: None,

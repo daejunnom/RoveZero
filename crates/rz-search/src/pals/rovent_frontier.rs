@@ -40,8 +40,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+mod horizon_questions;
 mod question;
 pub use super::rovent_solved::RootMateStrategy as FrontierMateStrategy;
+pub use horizon_questions::{
+    FrontierHorizonAcceptance, UnmetHorizonQuestion, UnmetHorizonQuestionKey,
+};
 pub(crate) use question::VerifiedFrontierQuestion;
 use question::WeakQuestionOwner;
 
@@ -172,6 +176,26 @@ impl CheckedFrontierStep {
     }
 }
 impl CheckedFrontierLine {
+    /// Declared owned backing excluding allocator overhead and physical
+    /// sharing. Used by retained semantic custody, never a measured peak.
+    pub(crate) fn owned_host_bytes(&self) -> Option<u64> {
+        let mut bytes = std::mem::size_of::<Self>()
+            .checked_add(
+                self.prefix
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<BoardMove>())?,
+            )?
+            .checked_add(
+                self.steps
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<CheckedFrontierStep>())?,
+            )?
+            .checked_add(self.root_snapshot.retained_history_bytes()?)?;
+        for step in &self.steps {
+            bytes = bytes.checked_add(step.snapshot.retained_history_bytes()?)?;
+        }
+        u64::try_from(bytes).ok()
+    }
     pub(crate) fn matches(&self, frontier: &RoventFrontier, stores: &PalsStores) -> bool {
         self.owner == frontier.owner
             && self.authority == frontier.registration.authority

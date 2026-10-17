@@ -76,8 +76,15 @@ def _cost(value):
 
 def _state(value, *, checkpoint_envelope=False, checkpoint_domain=CHECKPOINT_DOMAIN):
     extras = ("schema", "checkpoint") if checkpoint_envelope else ()
-    _fields(value, (*extras, *STATE_HASH_FIELDS, "completed_updates", "cost", "pending_microbatches"),
+    auxiliary = type(value) is dict and "r_auxiliary" in value
+    if auxiliary and checkpoint_envelope and checkpoint_domain != RECOVERED_CHECKPOINT_DOMAIN:
+        raise ValueError("legacy checkpoint retirement cannot acquire R auxiliary state")
+    _fields(value, (*extras, *STATE_HASH_FIELDS, "completed_updates", "cost", "pending_microbatches")
+            + (("r_auxiliary",) if auxiliary else ()),
             "historical trainer checkpoint" if checkpoint_envelope else "observed recovered tensor state")
+    if auxiliary:
+        from .rovent_r_auxiliary import validate_checkpoint_projection
+        validate_checkpoint_projection(value["r_auxiliary"])
     if checkpoint_envelope:
         if value["schema"] != checkpoint_domain:
             raise ValueError("original trainer checkpoint receipt domain required")
@@ -157,9 +164,11 @@ def project_historical_checkpoint(raw_receipt, *, receipt_sha256, receipt_bytes,
         raise ValueError("historical completed_updates differ from recovered tensor scratch")
     if historical["cost"] != observed["cost"]:
         raise ValueError("historical snapshot cost differs from recovered tensor scratch")
+    if ("r_auxiliary" in historical) != ("r_auxiliary" in observed) or historical.get("r_auxiliary") != observed.get("r_auxiliary"):
+        raise ValueError("historical R auxiliary tensor projection differs from recovered scratch")
     # Both pending values have independently passed the strict integer-zero
     # boundary check. The result deliberately makes no old-run drain claim.
-    return {"schema": PROJECTION_DOMAIN, "status": "historical_integrity_only",
+    result = {"schema": PROJECTION_DOMAIN, "status": "historical_integrity_only",
             "receipt_pin": {"sha256": receipt_sha256, "bytes": receipt_bytes},
             "historical_execution_id": receipt["execution_id"], "historical_window_id": receipt["window_id"],
             "historical_checkpoint_pin": copy.deepcopy(historical["checkpoint"]),
@@ -169,3 +178,6 @@ def project_historical_checkpoint(raw_receipt, *, receipt_sha256, receipt_bytes,
             "snapshot_cost": copy.deepcopy(historical["cost"]), "pending_microbatches": 0,
             "past_native_authority_reissued": False, "execution_authorized": False,
             "physical_completion_scope": "checkpoint_does_not_prove_old_run_closure"}
+    if "r_auxiliary" in historical:
+        result["r_auxiliary"] = copy.deepcopy(historical["r_auxiliary"])
+    return result

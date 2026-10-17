@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[path = "nnuec_v2_review_retirement.rs"]
 mod retirement;
@@ -444,12 +444,55 @@ fn check_control(deadline: Instant, cancel: &AtomicBool) -> Result<(), Preparati
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparationStatus {
+    Completed,
+    Failed,
+    Cancelled,
+    Expired,
+}
+
+/// Actual owner durations for the same Completion provenance. This is not a
+/// role ticket, neural-input count, node charge, cache authority, or acceptance
+/// witness. No terminal after an admitted request remains an unknown outcome;
+/// a missing observation must never be converted into zero service/success.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparationObservation {
+    queue_wait: Duration,
+    actor_dispatch: Duration,
+    service: Duration,
+    status: PreparationStatus,
+    reused_record_scope: Option<bool>,
+}
+impl PreparationObservation {
+    pub fn queue_wait(&self) -> Duration {
+        self.queue_wait
+    }
+    /// Actor work between dequeue and this request's service start, including
+    /// observing an independently requested cache epoch. It is not queue wait.
+    pub fn actor_dispatch(&self) -> Duration {
+        self.actor_dispatch
+    }
+    pub fn service(&self) -> Duration {
+        self.service
+    }
+    pub fn status(&self) -> PreparationStatus {
+        self.status
+    }
+    /// Only a successfully prepared result can report record-scope reuse.
+    /// This never means a complete query/input cache hit or zero work.
+    pub fn reused_record_scope(&self) -> Option<bool> {
+        self.reused_record_scope
+    }
+}
+
 pub struct Completion {
     pub provenance: Provenance,
     pub result: Result<BoundNnuecReviewContext, PreparationError>,
+    pub observation: PreparationObservation,
 }
 enum Command {
-    Prepare(Request, u64),
+    Prepare(Request, u64, Instant),
     Materialize(MaterializationRequest),
     RetireEngine(NnuecEngineRetirementId, RecoveredNnuecEngine),
     Wake,
@@ -507,10 +550,12 @@ impl PreparationActor {
                 // stays on this actor even when a manager drops its terminal.
                 let mut materialization_owner = None;
                 while let Ok(command) = commands.recv() {
+                    let dequeued_at = Instant::now();
                     factory.sync_cache_epoch();
                     match command {
                         Command::Wake => {}
-                        Command::Prepare(request, epoch) => {
+                        Command::Prepare(request, epoch, enqueued_at) => {
+                            let started_at = Instant::now();
                             let provenance = request.provenance.clone();
                             let result = if stop.load(Ordering::Acquire) {
                                 Err(PreparationError::Cancelled)
@@ -518,7 +563,31 @@ impl PreparationActor {
                                 factory.prepare_at(request, epoch)
                             };
                             factory.sync_cache_epoch();
-                            if results.send(Completion { provenance, result }).is_err() {
+                            let finished_at = Instant::now();
+                            let status = match &result {
+                                Ok(_) => PreparationStatus::Completed,
+                                Err(PreparationError::Cancelled) => PreparationStatus::Cancelled,
+                                Err(PreparationError::Expired) => PreparationStatus::Expired,
+                                Err(_) => PreparationStatus::Failed,
+                            };
+                            let observation = PreparationObservation {
+                                queue_wait: dequeued_at.duration_since(enqueued_at),
+                                actor_dispatch: started_at.duration_since(dequeued_at),
+                                service: finished_at.duration_since(started_at),
+                                status,
+                                reused_record_scope: result
+                                    .as_ref()
+                                    .ok()
+                                    .map(|bound| bound.reused_record_scope()),
+                            };
+                            if results
+                                .send(Completion {
+                                    provenance,
+                                    result,
+                                    observation,
+                                })
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -615,15 +684,16 @@ impl PreparationActor {
             .try_send(Command::Prepare(
                 request,
                 self.invalidations.load(Ordering::Acquire),
+                Instant::now(),
             )) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.outstanding.store(0, Ordering::Release);
                 match error {
-                    TrySendError::Full(Command::Prepare(request, _)) => {
+                    TrySendError::Full(Command::Prepare(request, _, _)) => {
                         Err((PreparationError::Busy, request))
                     }
-                    TrySendError::Disconnected(Command::Prepare(request, _)) => {
+                    TrySendError::Disconnected(Command::Prepare(request, _, _)) => {
                         Err((PreparationError::WorkerStopped, request))
                     }
                     _ => unreachable!("only a prepare command was submitted"),
@@ -1066,6 +1136,7 @@ mod tests {
             .unwrap()
         };
         let actor = PreparationActor::spawn(Arc::clone(&model)).unwrap();
+        let observed_from = Instant::now();
         actor
             .try_submit(make_request())
             .unwrap_or_else(|_| panic!("first admission"));
@@ -1084,8 +1155,98 @@ mod tests {
             );
             thread::yield_now();
         };
+        assert_eq!(
+            completion.observation.status(),
+            PreparationStatus::Completed
+        );
+        assert_eq!(completion.observation.reused_record_scope(), Some(false));
+        assert_eq!(completion.provenance.view_seal, view.seal_digest());
+        assert!(
+            completion.observation.queue_wait()
+                + completion.observation.actor_dispatch()
+                + completion.observation.service()
+                <= observed_from.elapsed()
+        );
         let bound = completion.result.unwrap();
         assert!(bound.validates(&stores, state, stores.generation(), view.seal_digest()));
+        actor
+            .try_submit(make_request())
+            .unwrap_or_else(|_| panic!("second admission"));
+        let reused = loop {
+            if let Some(completion) = actor.try_complete().unwrap() {
+                break completion;
+            }
+            assert!(Instant::now() < until);
+            thread::yield_now();
+        };
+        assert_eq!(reused.observation.status(), PreparationStatus::Completed);
+        assert_eq!(reused.observation.reused_record_scope(), Some(true));
+        assert_eq!(reused.provenance.view_seal, view.seal_digest());
+        assert!(Arc::ptr_eq(
+            bound.context(),
+            reused.result.unwrap().context()
+        ));
+        actor.shutdown().unwrap();
+    }
+
+    #[test]
+    fn actor_observations_preserve_actual_cancel_expiry_and_failure_outcomes() {
+        let (stores, mut index, state, _) = setup();
+        let model = Arc::new(Model::new(super::super::tests::checkpoint()).unwrap());
+        let view = Arc::new(
+            index
+                .select(
+                    &stores,
+                    state,
+                    query(RoleQueryPurpose::ProposePolicy),
+                    ReviewSelectionPolicy::default(),
+                )
+                .unwrap(),
+        );
+        let actor = PreparationActor::spawn(Arc::clone(&model)).unwrap();
+        for (status, expected) in [
+            (PreparationStatus::Cancelled, PreparationError::Cancelled),
+            (PreparationStatus::Expired, PreparationError::Expired),
+            (PreparationStatus::Failed, PreparationError::StaleView),
+        ] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let mut request = Request::admit(
+                &model,
+                Arc::clone(&view),
+                &stores,
+                state,
+                stores.generation(),
+                Instant::now() + Duration::from_secs(10),
+                Arc::clone(&cancel),
+            )
+            .unwrap();
+            match status {
+                PreparationStatus::Cancelled => cancel.store(true, Ordering::Release),
+                PreparationStatus::Expired => {
+                    request.deadline = Instant::now() - Duration::from_secs(1)
+                }
+                PreparationStatus::Failed => {
+                    request.provenance.model.semantics.push_str("-foreign")
+                }
+                PreparationStatus::Completed => unreachable!(),
+            }
+            let original = request.provenance().clone();
+            actor
+                .try_submit(request)
+                .unwrap_or_else(|_| panic!("actual observed admission"));
+            let until = Instant::now() + Duration::from_secs(10);
+            let completion = loop {
+                if let Some(completion) = actor.try_complete().unwrap() {
+                    break completion;
+                }
+                assert!(Instant::now() < until);
+                thread::yield_now();
+            };
+            assert_eq!(completion.provenance, original);
+            assert_eq!(completion.observation.status(), status);
+            assert_eq!(completion.observation.reused_record_scope(), None);
+            assert_eq!(completion.result.err(), Some(expected));
+        }
         actor.shutdown().unwrap();
     }
 

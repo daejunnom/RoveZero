@@ -1,6 +1,9 @@
 """R auxiliary recipe/cursor fixtures; no optimizer or neural dispatch."""
 import copy
 import importlib.abc
+import hashlib
+import json
+import struct
 import sys
 import unittest
 
@@ -102,6 +105,18 @@ class RAuxiliaryPreparationTests(unittest.TestCase):
         self.assertNotEqual(identity, auxiliary.auxiliary_pool_digest("b" * 64, list(reversed(rows))))
         with self.assertRaisesRegex(ValueError, "duplicate R occurrence"):
             auxiliary.auxiliary_pool_digest("b" * 64, [rows[0], copy.deepcopy(rows[0])])
+
+    def test_recipe_seal_uses_explicit_f64_bits_and_preserves_raw_recipe(self):
+        value = {**recipe_value(), "weight": 1e-8}
+        before = copy.deepcopy(value)
+        projection = {"algorithm": "coefficient-f64-bits-v1",
+            "recipe": {**value, "weight": struct.pack(">d", 1e-8).hex()}}
+        raw = json.dumps(["rz-rovent-r-auxiliary-recipe-seal/1", projection],
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        self.assertEqual(auxiliary.auxiliary_recipe_digest(value), hashlib.sha256(raw).hexdigest())
+        self.assertEqual(value, before)
+        self.assertEqual(auxiliary.auxiliary_recipe_digest({**value, "weight": 1}),
+            auxiliary.auxiliary_recipe_digest({**value, "weight": 1.0}))
 
 
 if __name__ == "__main__":

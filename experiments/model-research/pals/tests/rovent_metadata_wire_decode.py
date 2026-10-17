@@ -67,6 +67,27 @@ def main():
     window = validate_window_spec(recipe, fixture["window"])
     publication = validate_checkpoint_publication_metadata(
         fixture["checkpoint_publication"], original_window=window)
+    def presence(value, name):
+        return "absent" if name not in value else "null" if value[name] is None else "enabled"
+    state = presence(window, "nnuec_r_auxiliary")
+    if state != presence(registration, "r_auxiliary_dataset") or state != presence(publication, "r_auxiliary"):
+        raise ValueError("Rust auxiliary absent/null/enabled identities differ across source envelopes")
+    if state == "enabled":
+        request = registration["r_auxiliary_dataset"]
+        source = window["nnuec_r_auxiliary"]
+        sidecar = publication["r_auxiliary"]
+        if (sidecar["dataset_publication_sha256"] != request["publication"]["sha256"]
+                or sidecar["manifest_file_sha256"] != source["manifest_file_sha256"]
+                or sidecar["index_file_sha256"] != source["index_file_sha256"]
+                or request["collection_source_sha256"] != window["collection_source_sha256"]
+                or request["collection_runtime_library_sha256"] != window["collection_runtime_library_sha256"]
+                or request["collection_model_semantics_sha256"] != window["collection_model_semantics_sha256"]
+                or request["collection_recipe_sha256"] != window["recipe_sha256"]
+                or request["collection_stage_id"] != window["stage_id"]
+                or request["nnuec"]["semantics"] != window["nnuec_semantics"]
+                or request["nnuec_parameter_sha256"] != window["nnuec_collection_model_sha256"]
+                or request["collection_context_epoch"] != window["collection_context_epoch"]):
+            raise ValueError("Rust auxiliary recipe/source/sidecar exact metadata pins differ")
     if (registration["trainer_source_sha256"] != window["trainer_source_sha256"]
             or registration["trainer_python_executable"]["sha256"] != window["trainer_python_executable_sha256"]
             or registration["trainer_dependency_set_sha256"] != window["trainer_dependency_set_sha256"]

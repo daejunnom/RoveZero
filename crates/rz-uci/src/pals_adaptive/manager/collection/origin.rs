@@ -7,7 +7,7 @@ use rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace;
 use rz_search::pals::rovent_engine::RootMoveDomain;
 use rz_search::pals::rovent_frontier::RoventFrontier;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 pub const ROVENT_COLLECTION_NATIVE_ORIGIN: &str = "rz-rovent-collection-native-origin/1";
@@ -250,7 +250,8 @@ impl RoventCollectionRootAdmission {
             || !root_admission
                 .root_snapshot()
                 .same_state(&registration.root_rules.rules().snapshot())
-            || root_admission.allowed_root_moves().as_ref() != registration.root_moves.allowed().as_ref()
+            || root_admission.allowed_root_moves().as_ref()
+                != registration.root_moves.allowed().as_ref()
         {
             return Err(reject(
                 "actual attached frontier differs from original loaded collection scope",

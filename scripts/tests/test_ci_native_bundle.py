@@ -149,6 +149,28 @@ class NativeBundleTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 bundle.strict_json(raw)
 
+    def test_rovent_compile_metadata_cannot_claim_native_execution_or_replace_registered_sources(self):
+        components = {'uci': 'ab' * 32, 'rules': 'cd' * 32}
+        head = '19' * 20
+        value = {'domain': 'rz-rovent-build-capabilities/1', 'source_commit': head,
+                 'source_components': dict(components, rovent_bootstrap='ef' * 32,
+                                           rovent_process_boundary='42' * 32),
+                 'target_os': 'linux', 'target_arch': 'x86_64',
+                 'onnx_cpu_compiled': True, 'onnx_cuda_compiled': True,
+                 'native_runtime_loaded': False, 'native_model_loaded': False,
+                 'neural_execution_observed': False}
+        bundle.validate_rovent_build_metadata(value, head, components)
+        for field in ('native_runtime_loaded', 'native_model_loaded', 'neural_execution_observed'):
+            wrong = copy.deepcopy(value)
+            wrong[field] = True
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, 'StaticRoventBuildMetadata'):
+                bundle.validate_rovent_build_metadata(wrong, head, components)
+        for name in ('uci', 'rules', 'rovent_bootstrap', 'rovent_process_boundary'):
+            wrong = copy.deepcopy(value)
+            wrong['source_components'][name] = 'NOT_A_REGISTERED_DIGEST'
+            with self.subTest(component=name), self.assertRaisesRegex(RuntimeError, 'StaticRoventRegisteredSourceMismatch'):
+                bundle.validate_rovent_build_metadata(wrong, head, components)
+
     def test_registry_public_methods_remain_static_and_source_bound_elsewhere(self):
         registry = {'schema': 'rz-pals-report-model-registry-query/1', 'model_profile': 'virtual_review_v1',
                     'registry_methods': ['PalsModelProfile::VirtualReviewV1.registered_semantics_sha256',

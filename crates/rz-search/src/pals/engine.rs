@@ -162,6 +162,10 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 include_str!("engine/preparing_root/lifecycle.rs"),
             ),
             (
+                "pals/engine/preparing_root/retirement.rs",
+                include_str!("engine/preparing_root/retirement.rs"),
+            ),
+            (
                 "pals/engine/preparing_root/registration.rs",
                 include_str!("engine/preparing_root/registration.rs"),
             ),
@@ -185,6 +189,18 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
             (
                 "pals/engine/pc_port/goal_local.rs",
                 include_str!("engine/pc_port/goal_local.rs"),
+            ),
+            (
+                "pals/engine/pc_port/peer_questions.rs",
+                include_str!("engine/pc_port/peer_questions.rs"),
+            ),
+            (
+                "pals/engine/pc_port/repair_cycle.rs",
+                include_str!("engine/pc_port/repair_cycle.rs"),
+            ),
+            (
+                "pals/engine/pc_port/repair_witness.rs",
+                include_str!("engine/pc_port/repair_witness.rs"),
             ),
             (
                 "pals/engine/frozen_recheck.rs",
@@ -1297,6 +1313,7 @@ struct Node {
 }
 #[derive(Clone, Debug)]
 struct CpuEvidence {
+    context: Option<Arc<adaptive_port::CpuEvidenceContextSeal>>,
     score: i32,
     depth: u16,
     scope: CpuScoreScope,
@@ -1384,6 +1401,7 @@ pub struct PalsEngine<M: RoleModel> {
     held_cpu_task: Option<HeldCpuTask>,
     rovent_root_prefix_plies: Option<u16>,
     deferred_researcher_source: Option<crate::cpu_worker::DeferredNnuecRSource>,
+    deferred_researcher_initial: Option<preparing_root::DeferredResearcherInitialReadback>,
     // Explicit shutdown still supplies completion evidence. On ordinary Rust
     // destruction, release the actual researcher before its Store/context owner.
     researcher: RegisteredResearcher,
@@ -2734,6 +2752,7 @@ impl<M: RoleModel> PalsEngine<M> {
                         self.semantic.stores.observations.get(observation)?.scope,
                     ) {
                         self.semantic.nodes[node].evidence = Some(CpuEvidence {
+                            context: None,
                             score: value,
                             depth,
                             scope: CpuScoreScope::CompletedIteration,
@@ -2945,6 +2964,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 return Ok(());
             }
             self.semantic.nodes[node].evidence = Some(CpuEvidence {
+                context: None,
                 score: report.score,
                 depth: report.completed_depth,
                 scope: report.score_scope,
@@ -7216,6 +7236,7 @@ mod tests {
         let leaf = node;
         let identity = engine.owned_identity().unwrap().clone();
         engine.semantic.nodes[leaf].evidence = Some(CpuEvidence {
+            context: None,
             score: 100,
             depth: 1,
             scope: CpuScoreScope::CompletedIteration,
@@ -7231,6 +7252,7 @@ mod tests {
             // preferred alternative remains the first unexamined response.
             let counter_leaf = engine.intern(counter_position).unwrap();
             engine.semantic.nodes[counter_leaf].evidence = Some(CpuEvidence {
+                context: None,
                 score: -100,
                 depth: 1,
                 scope: CpuScoreScope::CompletedIteration,
@@ -9713,6 +9735,7 @@ mod tests {
             .connect(root, movement, child, &mut PalsCounters::default())
             .unwrap();
         engine.semantic.nodes[child].evidence = Some(CpuEvidence {
+            context: None,
             score: -25,
             depth: 1,
             scope: CpuScoreScope::CompletedIteration,

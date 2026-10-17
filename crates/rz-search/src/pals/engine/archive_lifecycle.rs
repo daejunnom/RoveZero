@@ -896,6 +896,15 @@ impl<M: RoleModel> PalsEngine<M> {
 
     pub(super) fn resident_archive_pins(&self) -> Result<StorePins, PalsError> {
         let mut pins = self.semantic.archive_state.active_search_pins.clone();
+        if let Some(custody) = &self.semantic.retired_goal_local {
+            custody.validate_owner(&self.semantic.stores)?;
+            let protected = custody.protected_pins()?;
+            pins.states.extend(&protected.states);
+            pins.lines.extend(&protected.lines);
+            pins.observations.extend(&protected.observations);
+            pins.situations.extend(&protected.situations);
+            pins.executions.extend(&protected.executions);
+        }
         for node in &self.semantic.nodes {
             if !self
                 .semantic
@@ -1920,6 +1929,7 @@ fn decode_archive_node(
             return Err(StoreError::ArchiveIntegrity("engine CPU Rules-terminal scope").into());
         }
         Some(CpuEvidence {
+            context: None,
             score,
             depth,
             scope,
@@ -3278,6 +3288,7 @@ mod tests {
         let model_identity = engine.semantic.model.value_identity().unwrap().clone();
         let node = &mut engine.semantic.nodes[index];
         node.evidence = Some(CpuEvidence {
+            context: None,
             score: 23,
             depth: 0,
             scope: CpuScoreScope::FrontierOnly,

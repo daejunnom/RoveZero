@@ -141,6 +141,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         pins.states.insert(root.state);
         pins.situations.insert(root.situation);
         pins.lines.insert(situation.focus);
+        merge_pins(&mut pins, &self.goal_local_protected_pins()?);
         for admission in self.cpu_admissions.values() {
             if let Some(execution) = admission.execution {
                 pins.executions.insert(execution);
@@ -734,6 +735,7 @@ fn seal_owner<M: RoleModel>(
         }
     }
     if let ArchiveOwner::Port(port) = owner {
+        merge_pins(&mut active_cpu_pins, &port.goal_local_protected_pins()?);
         if port.authority != authority || work.deadline > port.limits.deadline {
             return Err(StoreError::StaleConsumer.into());
         }

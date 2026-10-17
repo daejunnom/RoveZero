@@ -151,9 +151,17 @@ def _head_counts(value):
 def _journal_groups(value):
     """Validate original-shaped journal data, without verifying its authority."""
     recovered = type(value) is dict and value.get("schema") == _RECOVERED_JOURNAL_DOMAIN
+    auxiliary = type(value) is dict and "r_auxiliary" in value
+    if auxiliary and not recovered:
+        raise ValueError("legacy NNUEC journal cannot acquire an auxiliary stream")
     _fields(value, ("schema", "recipe_sha256", "stage_id", "profile_sha256", "phase_inputs", "updates", "head_counts",
-                    "frozen_pc_sha256", "resume_cost_receipts") + (("recovery_cost_state",) if recovered else ()),
+                    "frozen_pc_sha256", "resume_cost_receipts") + (("recovery_cost_state",) if recovered else ())
+            + (("r_auxiliary",) if auxiliary else ())
+            + (("r_auxiliary_ancestry",) if recovered and "r_auxiliary_ancestry" in value else ()),
             "NNUEC original learner journal")
+    if "r_auxiliary_ancestry" in value:
+        from .rovent_r_ancestry import ancestry_from_journal
+        ancestry_from_journal(value)
     if value["schema"] not in (_JOURNAL_DOMAIN, _RECOVERED_JOURNAL_DOMAIN):
         raise ValueError("explicit original learner journal domain required")
     if recovered and value["recovery_cost_state"] is not None:
@@ -184,7 +192,8 @@ def _journal_groups(value):
     counted, heads, groups, receipt_bytes = dict.fromkeys(_ROLES, 0), dict.fromkeys(_HEADS, 0), 0, 0
     for event in updates:
         _fields(event, ("schema", "window_id", "stage_id", "role", "completed_role_updates", "profile_sha256", "corpus_sha256",
-            "phase", "sample_origins", "sample_inputs", "head_counts", "actual_model_state_sha256", "original_completion"),
+            "phase", "sample_origins", "sample_inputs", "head_counts", "actual_model_state_sha256", "original_completion")
+            + (("r_auxiliary",) if auxiliary and event.get("role") != "validator" else ()),
             "NNUEC original learner event")
         role = event["role"]
         if type(role) is not str or role not in _ROLES:
@@ -210,7 +219,7 @@ def _journal_groups(value):
             raise ValueError("original learner event violates valid private head routing")
         for head, count in event_heads.items():
             heads[head] = _uint(heads[head] + count)
-        if role in ("proposer", "critic") and event_heads["nnuec_wdl"] > 0:
+        if not auxiliary and role in ("proposer", "critic") and event_heads["nnuec_wdl"] > 0:
             groups += 1
         receipt = _fields(event["original_completion"], ("sha256", "bytes"), "original learner receipt pin")
         _sha(receipt["sha256"])
@@ -231,6 +240,9 @@ def _journal_groups(value):
         _sha(receipt["original_receipt_sha256"])
         for count in _fields(receipt["cost_delta"], _COSTS, "original learner retained cost delta").values():
             _uint(count)
+    if auxiliary:
+        from .rovent_r_auxiliary import validate_auxiliary_journal
+        groups = validate_auxiliary_journal(value["r_auxiliary"], updates)["current_nnuec_updates"]
     return groups
 
 
@@ -290,11 +302,11 @@ def derive_nnuec_tensor_training_state(*, source_declaration, parameter_updates,
     if type(samplers) is not dict:
         raise ValueError("plain NNUEC learner sampler state required")
     maximum = max(counts.values(), default=0)
-    if samplers.get("schema") == _JOURNAL_DOMAIN:
+    if samplers.get("schema") in (_JOURNAL_DOMAIN, _RECOVERED_JOURNAL_DOMAIN):
         groups = _journal_groups(samplers)
         if maximum != groups:
             raise ValueError("NNUEC valid journal update groups differ from maximum parameter steps")
-        journal_sha = _digest(_JOURNAL_DOMAIN, samplers)
+        journal_sha = _digest(samplers["schema"], samplers)
     else:
         groups, journal_sha = (None if maximum else 0), None
     classification, known = _aggregate(parent, groups)

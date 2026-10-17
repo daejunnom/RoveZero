@@ -89,6 +89,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         repair_publication_sink: Option<&mut Option<AdaptivePublishedRepairLine>>,
     ) -> Result<AdaptivePortStep, PalsError> {
         self.validate_role(work, ticket, output)?;
+        if let Some(failure) = self.reciprocal_source_failure(work, ticket, output) {
+            return Err(failure);
+        }
         let source_preconsumed = self.reciprocal_source_consumed(work, ticket, output);
         let observations_before = self
             .engine
@@ -1083,19 +1086,35 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         Ok(Some((line, observation)))
     }
 
-    fn checked_role_value(
+    pub(super) fn checked_role_value(
         &self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
         ticket: &RoleTicketEnvelope,
         output: &RoleOutput,
         physical: Option<AdaptivePortRoleEvidence>,
     ) -> Result<ModelValueOutput, PalsError> {
+        self.checked_value_input(&work.input, ticket, output, physical)
+    }
+
+    pub(super) fn checked_value_input(
+        &self,
+        input: &FrameInput<ReviewView, AdaptivePortQuestion>,
+        ticket: &RoleTicketEnvelope,
+        output: &RoleOutput,
+        physical: Option<AdaptivePortRoleEvidence>,
+    ) -> Result<ModelValueOutput, PalsError> {
+        AdaptivePortQuestion::validate_frontier_input(input, &self.engine.semantic.stores)?;
         self.verify_registered_model_namespace(ticket, output)?;
         let physical = physical.ok_or(RoleError::InvalidOutput)?;
-        if ticket.role != Role::Proposer
-            || ticket.question != work.input.question_digest
+        if ticket.authority != self.authority
+            || ticket.original_deadline != self.deadline
+            || ticket.view != input.view_seal
+            || output.id != ticket.id
+            || output.authority != ticket.authority
+            || ticket.role != Role::Proposer
+            || ticket.question != input.question_digest
             || ticket.representation != output.key
-            || work.input.question.context.purpose != RoleQueryPurpose::ValueFresh
+            || input.question.context.purpose != RoleQueryPurpose::ValueFresh
             || physical.physical_fresh != Some(true)
             || !physical.measurement_complete
             // Fresh WDL needs a known completed evaluation. Its physical graph
@@ -1106,7 +1125,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(RoleError::InvalidOutput.into());
         }
-        let query = &work.input.question;
+        validate_payload(RoleQueryPurpose::ValueFresh, &input.view, output)?;
+        let query = &input.question;
         let RolePayload::Proposal { wdl, .. } = output.payload else {
             return Err(RoleError::InvalidOutput.into());
         };
@@ -1143,11 +1163,21 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         output: &RoleOutput,
         physical: Option<AdaptivePortRoleEvidence>,
     ) -> Result<ObservationId, PalsError> {
+        self.commit_value_input(&work.input, ticket, output, physical)
+    }
+
+    pub(super) fn commit_value_input(
+        &mut self,
+        input: &FrameInput<ReviewView, AdaptivePortQuestion>,
+        ticket: &RoleTicketEnvelope,
+        output: &RoleOutput,
+        physical: Option<AdaptivePortRoleEvidence>,
+    ) -> Result<ObservationId, PalsError> {
         // Recheck the immutable producer namespace at the actual Store commit
         // boundary, even though admission already validated it before attempt.
-        let value = self.checked_role_value(work, ticket, output, physical)?;
+        let value = self.checked_value_input(input, ticket, output, physical)?;
         let identity = value.identity.clone();
-        let query = &work.input.question;
+        let query = &input.question;
         let observation = self
             .engine
             .semantic
@@ -1418,13 +1448,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .collect();
         let mut counters = self.counters;
         if self.engine.uses_model_resolver() {
-            return self.engine.model_result(
+            let result = self.engine.model_result(
                 self.root,
                 &legal,
                 completion,
                 self.started,
                 &mut counters,
-            );
+            )?;
+            return self.apply_rovent_mate_strategy(result);
         }
         let mut best = legal.first().copied();
         let mut score = None;
@@ -1481,7 +1512,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         }
         counters.retained_situations = self.engine.semantic.nodes.len();
         counters.root_scope_observation_complete = true;
-        Ok(PalsResult {
+        self.apply_rovent_mate_strategy(PalsResult {
             best_move: best,
             score,
             resolved_value: score.map_or(PalsResolvedValue::Unknown, |value| {

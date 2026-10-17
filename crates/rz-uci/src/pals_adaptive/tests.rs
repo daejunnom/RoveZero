@@ -3,12 +3,17 @@
 //! semantic scope ends as explicit Unknown after checked worker evidence.
 #[path = "fixed_trace_tests.rs"]
 mod fixed_trace;
+#[path = "nnuec_owner_tests.rs"]
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod nnuec_owner;
 #[path = "reciprocal_tests.rs"]
 mod reciprocal;
 #[path = "reserved_replay_tests.rs"]
 mod reserved_replay;
 #[path = "role_only_tests.rs"]
 mod role_only;
+#[path = "role_only_goal_tests.rs"]
+mod role_only_goal;
 
 use super::*;
 use crate::pals_adaptive::{

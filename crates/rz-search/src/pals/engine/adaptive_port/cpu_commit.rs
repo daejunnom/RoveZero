@@ -548,6 +548,16 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if !is_cpu_stage(question.stage) || self.closed.contains(&work.frame) {
             return Err(StoreError::InvalidConditions("not an open CPU frame").into());
         }
+        let installed = self.installed_cpu_binding(work)?;
+        if (self.engine.owned_identity()?.semantics == crate::cpu_value::nnuec::v2::SEMANTICS
+            && installed.is_none())
+            || installed.is_some_and(|profile| profiles != [profile])
+        {
+            return Err(StoreError::InvalidConditions(
+                "CPU question has no exact installed NNUEC owner",
+            )
+            .into());
+        }
         let node = &self.engine.semantic.nodes[question.node];
         if node.terminal.is_some()
             || node.state != question.context.state
@@ -614,7 +624,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             return Err(PalsError::InvalidLimits);
         }
         let value_identity = self.engine.owned_identity()?.clone();
-        let (evaluation_namespace, search_conditions) = self.cpu_namespace_digests()?;
+        let (legacy_namespace, search_conditions) = self.cpu_namespace_digests()?;
+        let evaluation_namespace =
+            installed.map_or(legacy_namespace, |profile| profile.evaluation_namespace);
         let mut owners = HashSet::new();
         for profile in profiles {
             if !owners.insert(profile.owner)
@@ -713,6 +725,16 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 question.context.prefix.len(),
             )
         };
+        let task_condition = if installed.is_some() {
+            let binding: String = evaluation_namespace
+                .0
+                .iter()
+                .map(|value| format!("{value:02x}"))
+                .collect();
+            format!("{task_condition};nnuec-context-binding={binding}")
+        } else {
+            task_condition
+        };
         if physical_budget_exhausted || remaining == 0 {
             return Ok(None);
         }
@@ -802,6 +824,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 value_identity,
                 base_condition,
                 profiles: profiles.to_vec(),
+                evaluation_namespace,
+                search_conditions,
                 job: None,
                 grant: None,
                 owner: None,
@@ -837,7 +861,20 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 "CPU question was not prepared",
             ))?
             .clone();
-        let (evaluation_namespace, search_conditions) = self.cpu_namespace_digests()?;
+        let evaluation_namespace = admission.evaluation_namespace;
+        let search_conditions = admission.search_conditions;
+        if self.engine.owned_identity()?.semantics == crate::cpu_value::nnuec::v2::SEMANTICS
+            && self.installed_cpu_binding(work)?.is_none_or(|profile| {
+                admission.profiles.as_slice() != [profile]
+                    || profile.evaluation_namespace != evaluation_namespace
+                    || profile.search_conditions != search_conditions
+            })
+        {
+            return Err(StoreError::InvalidConditions(
+                "CPU grant lost original NNUEC installation",
+            )
+            .into());
+        }
         if admission.terminal
             || admission.quarantined
             || admission.grant.is_some()
@@ -1362,6 +1399,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             self.engine.semantic.stores.tasks.fail(execution)?;
         }
         if consume_current && !aborted && self.cpu_context_current(work, &admission) {
+            let prepared_context = self.prepare_cpu_context_seal(work, &admission)?;
             let now_tick = self.engine.tick_at(Instant::now());
             let original_consumer =
                 admission
@@ -1419,23 +1457,31 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .get_mut(&digest)
                 .expect("checked CPU consumer")
                 .consumed_observation = Some(observation);
-            // Discovery estimates describe the divergence question, including
-            // unrestricted discovery. They never enter generic node evidence.
-            if work.input.stage != RefinementStage::CpuDiscovery {
-                self.engine.semantic.nodes[admission.node].evidence = Some(CpuEvidence {
-                    score: report.score,
-                    depth: report.completed_depth,
-                    scope: report.score_scope,
-                    value_identity: report.value_identity.clone(),
-                    provenance: Some((observation, execution)),
-                });
-            }
             if complete && !receipt.continuation_retained {
                 self.counters.consumed_cpu_tasks += 1;
             } else if report.score_scope == CpuScoreScope::CompletedIteration {
                 self.counters.consumed_partial_cpu_values += 1;
             } else if report.score_scope == CpuScoreScope::FrontierOnly {
                 self.counters.consumed_frontier_cpu_values += 1;
+            }
+            // Discovery estimates describe the divergence question, including
+            // unrestricted discovery. They never enter generic node evidence.
+            if work.input.stage != RefinementStage::CpuDiscovery {
+                let context = self.consumed_cpu_context_seal(
+                    work,
+                    &admission,
+                    prepared_context,
+                    execution,
+                    observation,
+                )?;
+                self.engine.semantic.nodes[admission.node].evidence = Some(CpuEvidence {
+                    score: report.score,
+                    depth: report.completed_depth,
+                    scope: report.score_scope,
+                    value_identity: report.value_identity.clone(),
+                    provenance: Some((observation, execution)),
+                    context,
+                });
             }
             if work.input.stage != RefinementStage::CpuDiscovery {
                 self.record_cpu_verification_hot(
@@ -1450,7 +1496,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         Ok((observation, complete))
     }
 
-    fn cpu_namespace_digests(&self) -> Result<(ContractDigest, ContractDigest), PalsError> {
+    pub(super) fn cpu_namespace_digests(
+        &self,
+    ) -> Result<(ContractDigest, ContractDigest), PalsError> {
         let bytes = serde_json::to_vec(self.engine.owned_identity()?)
             .map_err(|_| PalsError::InvalidConfig)?;
         let mut value = Sha256::new();

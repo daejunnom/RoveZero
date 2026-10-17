@@ -16,6 +16,7 @@ pub struct RoventRecoveredTrainingInspection {
     _retained_registration: HeldHistoricalFile,
     _retained_metadata: Vec<HeldHistoricalFile>,
     _retained_dataset: Arc<VerifiedRoventDataset>,
+    _retained_r_datasets: Vec<Arc<VerifiedRoventRAuxiliaryDataset>>,
     _retained_checkpoint: Option<Arc<VerifiedRoventCheckpointSource>>,
     _retained_budget: Arc<RoventRecoveryReadBudget>,
 }
@@ -186,6 +187,13 @@ fn run_after_resource_preparation(
     )?;
     let datasets = RegisteredDatasetGraph::new(&registration, &budget)?;
     let dataset = Arc::clone(&datasets.current);
+    let r_datasets =
+        RegisteredRAuxiliaryDatasetGraph::new(&registration, &datasets, &recipe, &budget)?;
+    let live_r_dataset = r_datasets
+        .current
+        .as_ref()
+        .map(|owner| owner.for_current_pc(Arc::clone(&dataset), &recipe, &budget))
+        .transpose()?;
     let checkpoint_registration = match &registration.initialization_source {
         RoventTrainingInputSource::Initialize { .. } => None,
         RoventTrainingInputSource::Resume { checkpoint }
@@ -203,11 +211,12 @@ fn run_after_resource_preparation(
                 .iter()
                 .map(|sha| datasets.by_publication(sha))
                 .collect::<Result<Vec<_>, _>>()?;
-            VerifiedRoventCheckpointSource::open(
+            VerifiedRoventCheckpointSource::open_with_r_auxiliary(
                 &source.root,
                 source.publication.clone(),
                 current,
                 ancestors,
+                r_datasets.all(),
                 &budget,
             )
             .map(Arc::new)
@@ -241,6 +250,7 @@ fn run_after_resource_preparation(
                 observation: json!({"schema":"rz-rovent-recovered-trainer-inspection/1",
                 "execution_id":registration.execution_id,"source_kind":ROVENT_RECOVERY_SOURCE_KIND,
                 "dataset":dataset.observation(),"checkpoint":checkpoint.as_ref().map(|owner|owner.observation()),
+                "r_auxiliary_dataset":live_r_dataset.as_ref().map(|owner|owner.observation()),
                 "window_profile_sha256":window.profile_sha256()?,"read_budget":budget.observation(),
                 "resources_applied":false,"resource_scope":"inspection_read_and_time_budget_only_not_whole_cpu_memory_enforcement",
                 "past_native_authority_reissued":false,"past_physical_completion_reissued":false,
@@ -248,6 +258,7 @@ fn run_after_resource_preparation(
                 _retained_registration: registration_file,
                 _retained_metadata: vec![window_file, recipe_file],
                 _retained_dataset: dataset,
+                _retained_r_datasets: r_datasets.all().into_iter().chain(live_r_dataset).collect(),
                 _retained_checkpoint: checkpoint,
                 _retained_budget: budget,
             },
@@ -298,7 +309,14 @@ fn run_after_resource_preparation(
     // In particular, do not map a post-spawn failure to ArenaError and discard
     // its original process/cgroup/IPC/checkpoint custody.
     Ok(
-        match run_rovent_training_recovered(launch, dataset, checkpoint, reclamation, cancel) {
+        match run_rovent_training_recovered(
+            launch,
+            dataset,
+            checkpoint,
+            reclamation,
+            live_r_dataset,
+            cancel,
+        ) {
             Ok(owner) => publish_completed(owner),
             Err(failure) => RoventRecoveredTrainingOutcome::Failed(failure),
         },
@@ -479,6 +497,158 @@ struct DatasetProbe {
     index_sha256: String,
     ancestor_indices: Vec<String>,
 }
+
+struct RDatasetProbe {
+    registration: RoventHistoricalRAuxiliaryDatasetRegistration,
+    manifest: rz_experiments::rovent_r_readout::RoventRReadoutManifest,
+}
+struct RegisteredRAuxiliaryDatasetGraph {
+    current: Option<Arc<VerifiedRoventRAuxiliaryDataset>>,
+    ancestors: Vec<Arc<VerifiedRoventRAuxiliaryDataset>>,
+}
+impl RegisteredRAuxiliaryDatasetGraph {
+    fn all(&self) -> Vec<Arc<VerifiedRoventRAuxiliaryDataset>> {
+        self.current
+            .iter()
+            .chain(&self.ancestors)
+            .map(Arc::clone)
+            .collect()
+    }
+    fn new(
+        registration: &RoventRecoveredTrainingRegistration,
+        pc: &RegisteredDatasetGraph,
+        recipe: &Value,
+        budget: &RoventRecoveryReadBudget,
+    ) -> Result<Self, ArenaError> {
+        let current = registration.r_auxiliary_dataset.enabled();
+        let ancestors = registration
+            .ancestor_r_auxiliary_datasets
+            .enabled()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if current.is_none() && ancestors.is_empty() {
+            return Ok(Self {
+                current: None,
+                ancestors: Vec::new(),
+            });
+        }
+        let mut probes = BTreeMap::new();
+        let mut current_index = None;
+        for request in ancestors.iter().chain(current.into_iter()) {
+            request.validate()?;
+            let (_, raw) = budget.read(&request.publication, MAX_METADATA_BYTES, true)?;
+            let publication: crate::rovent_collect::RoventRCorpusPublication = decode(&raw)?;
+            publication.validate()?;
+            let (_, raw) = budget.read(
+                &archive_pin(&request.root, &publication.manifest)?,
+                MAX_METADATA_BYTES,
+                true,
+            )?;
+            let manifest: rz_experiments::rovent_r_readout::RoventRReadoutManifest = decode(&raw)?;
+            check(
+                manifest
+                    .sha256()
+                    .map_err(|error| invalid(error.to_string()))?
+                    == publication.canonical_manifest_sha256,
+                "R dataset graph original manifest canonical pin changed",
+            )?;
+            if current.is_some_and(|item| request.publication == item.publication) {
+                current_index = Some(publication.canonical_index_sha256.clone());
+            }
+            check(
+                probes
+                    .insert(
+                        publication.canonical_index_sha256,
+                        RDatasetProbe {
+                            registration: request.clone(),
+                            manifest,
+                        },
+                    )
+                    .is_none(),
+                "duplicate R dataset canonical index registration",
+            )?;
+        }
+        let mut done = BTreeMap::new();
+        let mut active = BTreeSet::new();
+        let current = current_index
+            .map(|index| Self::open(&index, &probes, pc, recipe, &mut done, &mut active, budget))
+            .transpose()?;
+        // Earlier R sources are historical checkpoint inputs even when the
+        // new window has no R work. Only the exact old chain opens these roots.
+        for publication in registered_checkpoint_sources(registration, budget)?.1 {
+            let index = probes
+                .iter()
+                .find(|(_, probe)| probe.registration.publication.sha256 == publication)
+                .map(|(index, _)| index)
+                .ok_or_else(|| {
+                    invalid("original checkpoint requires an unregistered R publication")
+                })?;
+            Self::open(index, &probes, pc, recipe, &mut done, &mut active, budget)?;
+        }
+        check(
+            done.len() == probes.len(),
+            "extra unreachable R dataset registration",
+        )?;
+        let mut ancestors = done
+            .into_values()
+            .filter(|item| {
+                current.as_ref().is_none_or(|current| {
+                    item.publication_pin().sha256 != current.publication_pin().sha256
+                })
+            })
+            .collect::<Vec<_>>();
+        ancestors.sort_by(|a, b| a.publication_pin().sha256.cmp(&b.publication_pin().sha256));
+        Ok(Self { current, ancestors })
+    }
+    fn open(
+        index: &str,
+        probes: &BTreeMap<String, RDatasetProbe>,
+        pc: &RegisteredDatasetGraph,
+        recipe: &Value,
+        done: &mut BTreeMap<String, Arc<VerifiedRoventRAuxiliaryDataset>>,
+        active: &mut BTreeSet<String>,
+        budget: &RoventRecoveryReadBudget,
+    ) -> Result<Arc<VerifiedRoventRAuxiliaryDataset>, ArenaError> {
+        if let Some(owner) = done.get(index) {
+            return Ok(Arc::clone(owner));
+        }
+        check(
+            active.len() <= 256 && active.insert(index.to_owned()),
+            "R dataset ancestor cycle/depth limit",
+        )?;
+        let probe = probes
+            .get(index)
+            .ok_or_else(|| invalid("missing original R ancestor dataset"))?;
+        let ancestors = probe
+            .manifest
+            .r_ancestor_index_sha256
+            .iter()
+            .map(|sha| Self::open(sha, probes, pc, recipe, done, active, budget))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pc_datasets = probe
+            .manifest
+            .pc_ancestor_index_sha256
+            .iter()
+            .map(|sha| {
+                std::iter::once(&pc.current)
+                    .chain(&pc.ancestors)
+                    .find(|owner| owner.index.sha256().ok().as_deref() == Some(sha.as_str()))
+                    .cloned()
+                    .ok_or_else(|| invalid("R manifest references unregistered P/C ancestor index"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let owner = Arc::new(VerifiedRoventRAuxiliaryDataset::open(
+            probe.registration.clone(),
+            recipe,
+            pc_datasets,
+            ancestors,
+            budget,
+        )?);
+        active.remove(index);
+        done.insert(index.to_owned(), Arc::clone(&owner));
+        Ok(owner)
+    }
+}
 struct RegisteredDatasetGraph {
     current: Arc<VerifiedRoventDataset>,
     ancestors: Vec<Arc<VerifiedRoventDataset>>,
@@ -545,6 +715,23 @@ impl RegisteredDatasetGraph {
             &mut active,
             budget,
         )?;
+        // R and P/C are different source domains. An R collection may retain
+        // a pinned P/C genealogy that is outside the current P/C corpus's
+        // own ancestor closure. Admit those explicitly declared index roots
+        // through the same full P/C verifier; unrelated extras still fail.
+        for index in registered_r_pc_indices(registration, budget)? {
+            Self::open(&index, &probes, &mut done, &mut active, budget)?;
+        }
+        for publication in registered_checkpoint_sources(registration, budget)?.0 {
+            let index = probes
+                .iter()
+                .find(|(_, probe)| probe.registration.publication.sha256 == publication)
+                .map(|(index, _)| index)
+                .ok_or_else(|| {
+                    invalid("original checkpoint requires an unregistered P/C publication")
+                })?;
+            Self::open(index, &probes, &mut done, &mut active, budget)?;
+        }
         check(
             done.len() == probes.len(),
             "extra unreachable historical dataset registration",
@@ -599,4 +786,87 @@ impl RegisteredDatasetGraph {
         done.insert(key.into(), Arc::clone(&owner));
         Ok(owner)
     }
+}
+
+fn registered_r_pc_indices(
+    registration: &RoventRecoveredTrainingRegistration,
+    budget: &RoventRecoveryReadBudget,
+) -> Result<BTreeSet<String>, ArenaError> {
+    let mut needed = BTreeSet::new();
+    for item in registration
+        .r_auxiliary_dataset
+        .enabled()
+        .into_iter()
+        .chain(
+            registration
+                .ancestor_r_auxiliary_datasets
+                .enabled()
+                .into_iter()
+                .flatten(),
+        )
+    {
+        let (_, raw) = budget.read(&item.publication, MAX_METADATA_BYTES, true)?;
+        let publication: crate::rovent_collect::RoventRCorpusPublication = decode(&raw)?;
+        publication.validate()?;
+        let (_, raw) = budget.read(
+            &archive_pin(&item.root, &publication.manifest)?,
+            MAX_METADATA_BYTES,
+            true,
+        )?;
+        let manifest: rz_experiments::rovent_r_readout::RoventRReadoutManifest = decode(&raw)?;
+        check(
+            manifest
+                .sha256()
+                .map_err(|error| invalid(error.to_string()))?
+                == publication.canonical_manifest_sha256,
+            "R reference source changed original manifest pin",
+        )?;
+        needed.extend(manifest.pc_ancestor_index_sha256);
+        check(
+            needed.len() <= 256,
+            "R referenced P/C ancestor set exceeds its original bound",
+        )?;
+    }
+    Ok(needed)
+}
+
+fn registered_checkpoint_sources(
+    registration: &RoventRecoveredTrainingRegistration,
+    budget: &RoventRecoveryReadBudget,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), ArenaError> {
+    let source = match &registration.initialization_source {
+        RoventTrainingInputSource::Initialize { .. } => {
+            return Ok((BTreeSet::new(), BTreeSet::new()));
+        }
+        RoventTrainingInputSource::Resume { checkpoint }
+        | RoventTrainingInputSource::Fork { checkpoint, .. } => checkpoint,
+    };
+    let mut pc = BTreeSet::new();
+    let mut r = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut next = Some(source.publication.clone());
+    while let Some(pin) = next {
+        check(
+            seen.len() < 64 && seen.insert(pin.sha256.clone()),
+            "original checkpoint metadata chain cycle/depth",
+        )?;
+        let (_, raw) = budget.read(&pin, MAX_METADATA_BYTES, true)?;
+        let publication: RoventCheckpointPublication = decode(&raw)?;
+        publication.validate()?;
+        pc.insert(publication.current_dataset_publication_sha256);
+        pc.extend(publication.ancestor_dataset_publication_sha256);
+        if let Some(auxiliary) = publication.r_auxiliary.enabled() {
+            r.insert(auxiliary.dataset_publication_sha256.clone());
+        }
+        check(
+            pc.len() <= 257 && r.len() <= 257,
+            "original checkpoint source graph capacity",
+        )?;
+        next = publication
+            .parent_publication
+            .as_ref()
+            .map(|file| archive_pin(&source.root, file))
+            .transpose()?;
+    }
+    Ok((pc, r))
 }

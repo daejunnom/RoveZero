@@ -13,6 +13,11 @@ pub(super) struct RoventPcrRootAdmission {
     #[cfg(feature = "pals-adaptive")]
     pub(super) original: Option<Arc<crate::rovent_root_admission::RoventRootAdmission>>,
 }
+pub(super) enum RoventPcrRootSource {
+    Legacy(Digest),
+    #[cfg(feature = "pals-adaptive")]
+    Original(crate::rovent_root_admission::source_seal::SourceSeal),
+}
 
 impl<B> AdaptiveSessionDriver<B>
 where
@@ -68,6 +73,19 @@ where
                 "root policy cannot change after physical work",
             ));
         }
+        let SessionState::Idle(owners) = &*state else {
+            unreachable!()
+        };
+        let ready = owners
+            .native
+            .ready_clock()
+            .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
+        if ready.domain() != self.clock.domain()
+            || ready.origin() != self.clock.runtime_clock().origin()
+            || owners.native.is_quarantined()
+        {
+            return Err(SearchSessionFailure::physical_completion_unknown());
+        }
         let mut hash = Sha256::new();
         hash.update(b"rz-rovent-pcr-startup-root-policy/1\0");
         hash.update(self.options.implementation.0);
@@ -82,35 +100,26 @@ where
         Ok(())
     }
 
-    pub(super) fn admit_rovent_go(
+    pub(super) fn prepare_rovent_go(
         &self,
         position: &Position,
         context: &SearchSessionContext,
-    ) -> Result<Option<RoventPcrRootAdmission>, SearchSessionFailure> {
+    ) -> Result<Option<RoventPcrRootSource>, SearchSessionFailure> {
         let Some(profile) = &self.rovent else {
             return Ok(None);
         };
         #[cfg(feature = "pals-adaptive")]
         if let Some(registered) = &self.rovent_root_policy {
-            let original = Arc::new(
-                crate::rovent_root_admission::RoventRootAdmission::admit(
-                    &registered.lock,
-                    registered.policy,
-                    position,
-                    context,
-                    &self.clock,
-                )
-                .map_err(|error| SearchSessionFailure::debug("RoventRootAdmission", &error))?,
-            );
-            return Ok(Some(RoventPcrRootAdmission {
-                budget: original.root_budget_digest(),
-                original: Some(original),
-            }));
+            let source = crate::rovent_root_admission::source_seal::SourceSeal::prepare(
+                &registered.lock,
+                registered.policy,
+                position,
+                context,
+                &self.clock,
+            )
+            .map_err(|error| SearchSessionFailure::debug("RoventRootAdmission", &error))?;
+            return Ok(Some(RoventPcrRootSource::Original(source)));
         }
-        Ok(Some(RoventPcrRootAdmission {
-            budget: profile.root_budget,
-            #[cfg(feature = "pals-adaptive")]
-            original: None,
-        }))
+        Ok(Some(RoventPcrRootSource::Legacy(profile.root_budget)))
     }
 }

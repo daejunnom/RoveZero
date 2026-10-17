@@ -77,6 +77,7 @@ fn publication() -> RoventCheckpointPublication {
             physical_scope: "historical report".into(),
             evidence: pin("closure.json"),
         },
+        r_auxiliary: RoventRAuxiliaryPresence::Absent,
     }
 }
 fn documents() -> (RoventCheckpointPublication, Value, Value, Value) {
@@ -143,6 +144,81 @@ fn update_receipt(l: &TrainerLedger, index: usize, n: u64) -> Value {
         "sequence":index+1,"original_native_lineage_verified":true,"update":update})
 }
 
+fn auxiliary_recipe() -> RoventRAuxiliaryRecipe {
+    RoventRAuxiliaryRecipe {
+        schema: ROVENT_R_AUXILIARY_RECIPE.into(),
+        manifest_file_sha256: h('a'),
+        index_file_sha256: h('b'),
+        sampling_seed: 29,
+        rows_per_pc_update: 2,
+        weight: 0.5,
+        normalization: ROVENT_R_AUXILIARY_NORMALIZATION.into(),
+        optimizer_owner: "nnuec-private".into(),
+        supervision_source: ROVENT_R_AUXILIARY_SUPERVISION.into(),
+    }
+}
+fn auxiliary_sidecar() -> RoventCheckpointRAuxiliary {
+    RoventCheckpointRAuxiliary {
+        schema: ROVENT_CHECKPOINT_R_AUXILIARY.into(),
+        dataset_publication_sha256: h('c'),
+        manifest_file_sha256: h('a'),
+        index_file_sha256: h('b'),
+        parent_ledger_projection: pin("r-auxiliary-ledger.json"),
+    }
+}
+
+#[test]
+fn checkpoint_r_auxiliary_preserves_absence_null_and_exact_sidecar_pins() {
+    let p = publication();
+    let absent = serde_json::to_value(&p).unwrap();
+    assert!(!absent.as_object().unwrap().contains_key("r_auxiliary"));
+    let decoded: RoventCheckpointPublication = serde_json::from_value(absent.clone()).unwrap();
+    assert!(decoded.r_auxiliary.is_absent());
+    assert_eq!(serde_json::to_value(decoded).unwrap(), absent);
+    let mut null = absent.clone();
+    null["r_auxiliary"] = Value::Null;
+    let decoded: RoventCheckpointPublication = serde_json::from_value(null.clone()).unwrap();
+    assert!(decoded.r_auxiliary.is_null());
+    assert_eq!(serde_json::to_value(decoded).unwrap(), null);
+    let mut enabled = absent;
+    enabled["r_auxiliary"] = json!(auxiliary_sidecar());
+    let decoded: RoventCheckpointPublication = serde_json::from_value(enabled.clone()).unwrap();
+    decoded.validate().unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), enabled);
+    enabled["r_auxiliary"]["native_authority"] = json!(true);
+    assert!(serde_json::from_value::<RoventCheckpointPublication>(enabled).is_err());
+}
+
+#[test]
+fn r_sidecar_artifact_aliases_and_unpinned_owner_identity_are_rejected() {
+    let mut p = publication();
+    let mut sidecar = auxiliary_sidecar();
+    sidecar.parent_ledger_projection = p.checkpoint_retirement.clone();
+    p.r_auxiliary = RoventRAuxiliaryPresence::Enabled(sidecar);
+    assert!(p.validate().is_err());
+    let mut sidecar = auxiliary_sidecar();
+    sidecar.manifest_file_sha256 = "canonical-is-not-an-original-file-pin".into();
+    p.r_auxiliary = RoventRAuxiliaryPresence::Enabled(sidecar);
+    assert!(p.validate().is_err());
+}
+
+#[test]
+fn r_lineage_union_keeps_old_r_seals_across_a_disabled_stage() {
+    // A's original R seals and C's new R seals stay in the R namespace. The
+    // disabled B stage contributes no R set, and its P/C sets are never read.
+    let original_a = BTreeSet::from([h('a'), h('b')]);
+    let original_c = BTreeSet::from([h('b'), h('c')]);
+    let mut inherited = BTreeSet::new();
+    union_r_seals(&mut inherited, &original_a).unwrap();
+    union_r_seals(&mut inherited, &BTreeSet::new()).unwrap();
+    union_r_seals(&mut inherited, &original_c).unwrap();
+    assert_eq!(inherited, BTreeSet::from([h('a'), h('b'), h('c')]));
+    assert!(!inherited.contains(&h('f'))); // unrelated P/C input seal
+    let mut invalid = BTreeSet::new();
+    assert!(union_r_seals(&mut invalid, &BTreeSet::from(["not-a-sha".into()])).is_err());
+    assert!(invalid.is_empty());
+}
+
 #[test]
 fn strict_publication_rejects_duplicate_unknown_fields_and_ambiguous_initialization() {
     let p = publication();
@@ -197,8 +273,7 @@ fn original_v1_identity_bytes_are_not_relabelled_as_separate_trainer_runtime() {
     changed["schema"] = json!("rz-rovent-train-window/3");
     assert!(validate_documents(&p, &recipe, &membership, &changed).is_err());
 }
-#[test]
-fn explicit_v2_joins_collection_trainer_and_separate_epochs() {
+fn v2_documents() -> (RoventCheckpointPublication, Value, Value, Value) {
     let (mut p, recipe, membership, _) = documents();
     let window = json!({"schema":ROVENT_TRAIN_WINDOW_V2,"window_id":p.window_id,"stage_id":p.stage_id,"recipe_sha256":p.recipe_sha256,
         "collection_source_sha256":p.collection_source_sha256,"collection_runtime_library_sha256":p.collection_runtime_library_sha256,
@@ -216,6 +291,12 @@ fn explicit_v2_joins_collection_trainer_and_separate_epochs() {
         "max_updates":2,"max_groups":4,"max_samples":32,"max_wall_ns":1000000000,"max_output_bytes":1024,"checkpoint_interval":1});
     let typed: RoventTrainWindowV2 = serde_json::from_value(window.clone()).unwrap();
     p.training_profile_sha256 = typed.profile_sha256().unwrap();
+    (p, recipe, membership, window)
+}
+#[test]
+fn explicit_v2_joins_collection_trainer_and_separate_epochs() {
+    let (p, recipe, membership, window) = v2_documents();
+    let typed: RoventTrainWindowV2 = serde_json::from_value(window.clone()).unwrap();
     assert_ne!(typed.training_model_epoch, p.collection_model_epoch);
     assert_eq!(
         validate_documents(&p, &recipe, &membership, &window).unwrap(),
@@ -233,6 +314,56 @@ fn explicit_v2_joins_collection_trainer_and_separate_epochs() {
     let mut wrong = window;
     wrong["collection_context_epoch"] = json!(p.collection_context_epoch + 1);
     assert!(validate_documents(&p, &recipe, &membership, &wrong).is_err());
+}
+#[test]
+fn enabled_checkpoint_needs_an_exact_external_r_dataset_owner() {
+    let (mut p, recipe, _, mut window) = v2_documents();
+    let budget = RoventRecoveryReadBudget::new(
+        1024,
+        Instant::now() + std::time::Duration::from_secs(1),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    p.r_auxiliary = RoventRAuxiliaryPresence::Enabled(auxiliary_sidecar());
+    window["nnuec_r_auxiliary"] = json!(auxiliary_recipe());
+    assert!(
+        initial_r_auxiliary_ledger(&p, &window, None, &recipe, None, &BTreeMap::new(), &budget)
+            .is_err()
+    );
+    assert_eq!(budget.observation()["charged_bytes"], 0);
+    // A serialized sidecar and an invented native-success flag cannot issue
+    // the missing opaque owner, and no file/NN/process work was attempted.
+    assert!(p.r_auxiliary.enabled().is_some());
+}
+
+#[test]
+fn explicit_null_publication_keeps_original_disabled_retirement_bytes() {
+    let (mut p, recipe, _, mut window) = v2_documents();
+    p.r_auxiliary = RoventRAuxiliaryPresence::Null;
+    window["nnuec_r_auxiliary"] = Value::Null;
+    let budget = RoventRecoveryReadBudget::new(
+        1024,
+        Instant::now() + std::time::Duration::from_secs(1),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    assert!(
+        initial_r_auxiliary_ledger(&p, &window, None, &recipe, None, &BTreeMap::new(), &budget)
+            .unwrap()
+            .is_none()
+    );
+    let mut state = p.boundary.state_value();
+    state["schema"] = json!("rz-rovent-trainer-checkpoint/2");
+    state["checkpoint"] =
+        json!({"path":"/old/tensor.pt","sha256":p.tensor.sha256,"bytes":p.tensor.bytes});
+    let receipt = json!({"schema":"rz-rovent-recovered-checkpoint-retirement/1",
+        "execution_id":p.execution_id,"window_id":p.window_id,"source_kind":ROVENT_RECOVERY_SOURCE_KIND,
+        "past_native_authority_reissued":false,"checkpoint":state});
+    validate_retirement(&p, &receipt, None, ROVENT_TRAIN_WINDOW_V2).unwrap();
+    assert!(receipt["checkpoint"].get("r_auxiliary").is_none());
+    let mut changed = receipt;
+    changed["checkpoint"]["r_auxiliary"] = Value::Null;
+    assert!(validate_retirement(&p, &changed, None, ROVENT_TRAIN_WINDOW_V2).is_err());
 }
 #[test]
 fn initialize_cannot_skip_a_declared_recipe_parent() {

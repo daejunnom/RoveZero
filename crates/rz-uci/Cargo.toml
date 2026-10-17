@@ -14,6 +14,11 @@ name = "rz-pals-adaptive"
 path = "src/bin/pals-adaptive.rs"
 required-features = ["pals-adaptive", "onnx-cpu"]
 
+[[bin]]
+name = "rz-rovent"
+path = "src/bin/rovent.rs"
+required-features = ["pals-adaptive", "onnx-cpu"]
+
 [[example]]
 name = "search_probe"
 required-features = ["onnx-cpu"]

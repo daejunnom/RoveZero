@@ -205,7 +205,7 @@ class HistoricalCorpusTests(unittest.TestCase):
         raw_sha = hashlib.sha256(bundle_bytes).hexdigest()
         semantic_sha = historical._runtime_bundle_digest(bundle)
         self.assertNotEqual(raw_sha, semantic_sha)
-        lock["manifest"]["engine"]["pc"] = {"runtime_artifacts": [artifact("runtime.json", raw_sha, len(bundle_bytes))]}
+        lock["manifest"]["provenance"] = [artifact("runtime.json", raw_sha, len(bundle_bytes))]
         lock["canonical_sha256"] = data.digest("rz-rovent-execution-canonical/1", lock["manifest"])
         admission = record["native"]["raw_retirement"]["root_admission"]
         admission["native_origin"].update(input_lock_sha256=lock["canonical_sha256"], runtime_bundle_sha256=semantic_sha)

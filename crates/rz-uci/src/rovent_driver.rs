@@ -283,6 +283,7 @@ impl<M: RoleModel + 'static> SearchSessionDriver for RoventSessionDriver<M> {
                 .map_err(|error| SearchSessionFailure::debug("RoventAuthority", &error))?
             {
                 return Ok(SearchSessionReport {
+                    mate_strategy: None,
                     best_move: None,
                     work: empty_work(),
                 });
@@ -306,6 +307,7 @@ impl<M: RoleModel + 'static> SearchSessionDriver for RoventSessionDriver<M> {
             .map_err(|error| SearchSessionFailure::debug("RoventAuthority", &error))?
         {
             return Ok(SearchSessionReport {
+                mate_strategy: None,
                 best_move: None,
                 work: empty_work(),
             });
@@ -328,6 +330,7 @@ impl<M: RoleModel + 'static> SearchSessionDriver for RoventSessionDriver<M> {
             .map_err(|error| SearchSessionFailure::debug("RoventAuthority", &error))?
         {
             return Ok(SearchSessionReport {
+                mate_strategy: None,
                 best_move: None,
                 work: empty_work(),
             });
@@ -388,6 +391,10 @@ impl<M: RoleModel + 'static> SearchSessionDriver for RoventSessionDriver<M> {
             );
         let work = work(&result)?;
         let best_move = eligible.then_some(result.best_move).flatten();
+        let mate_strategy = result
+            .mate_strategy
+            .clone()
+            .filter(|strategy| best_move == Some(strategy.best_move()));
         *self
             .latest
             .lock()
@@ -397,7 +404,11 @@ impl<M: RoleModel + 'static> SearchSessionDriver for RoventSessionDriver<M> {
                 result,
                 uci_output_eligible: eligible,
             }));
-        Ok(SearchSessionReport { best_move, work })
+        Ok(SearchSessionReport {
+            best_move,
+            work,
+            mate_strategy,
+        })
     }
 }
 

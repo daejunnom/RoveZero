@@ -84,7 +84,7 @@ def validate_learning_controls(value):
 
 def validate_window_spec(recipe, value):
     """Validate only /2. A JSON success is never an original window authority."""
-    fields(value, WINDOW_FIELDS, "Rovent /2 training window")
+    fields(value, WINDOW_FIELDS + (("nnuec_r_auxiliary",) if type(value) is dict and "nnuec_r_auxiliary" in value else ()), "Rovent /2 training window")
     if type(recipe) is not SeriesRecipe or value["schema"] != WINDOW_DOMAIN:
         raise ValueError("explicit Rovent /2 window required; legacy conversion is forbidden")
     identifier(value["window_id"])
@@ -106,6 +106,9 @@ def validate_window_spec(recipe, value):
         uint(value[name])
     identifier(value["nnuec_semantics"])
     validate_learning_controls(value)
+    if "nnuec_r_auxiliary" in value:
+        from .rovent_r_auxiliary import validate_auxiliary_recipe
+        validate_auxiliary_recipe(value["nnuec_r_auxiliary"], recipe=recipe)
     return value
 
 
@@ -169,7 +172,7 @@ def validate_trainer_binding(recipe, spec, *, source_sha256, python_executable_s
 
 def training_profile_digest(spec):
     """A new profile domain; do not pass /2 fields to the /1 canonicalizer."""
-    fields(spec, WINDOW_FIELDS, "Rovent /2 training window profile")
+    fields(spec, WINDOW_FIELDS + (("nnuec_r_auxiliary",) if type(spec) is dict and "nnuec_r_auxiliary" in spec else ()), "Rovent /2 training window profile")
     if spec["schema"] != WINDOW_DOMAIN:
         raise ValueError("Rovent /2 fixed training profile requires a /2 window")
     validate_learning_controls(spec)
@@ -194,4 +197,8 @@ def training_profile_digest(spec):
     normalized["optimizer"] = coefficient(spec["optimizer"])
     normalized["loss_weights"] = coefficient(spec["loss_weights"])
     normalized["nnuec_loss"] = {**spec["nnuec_loss"], "weight": coefficient(spec["nnuec_loss"]["weight"])}
+    if spec.get("nnuec_r_auxiliary") is not None:
+        from .rovent_r_auxiliary import validate_auxiliary_recipe
+        auxiliary = validate_auxiliary_recipe(spec["nnuec_r_auxiliary"])
+        normalized["nnuec_r_auxiliary"] = {**auxiliary, "weight": coefficient(auxiliary["weight"])}
     return digest(PROFILE_DOMAIN, {"algorithm": "coefficient-f64-bits-v1", "window": normalized})

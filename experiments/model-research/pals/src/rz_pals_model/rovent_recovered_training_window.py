@@ -55,19 +55,36 @@ class HistoricalCheckpointInput:
     source_intake: object
     read_budget: object
     snapshot_directory: str
+    source_r_auxiliary_intake: object = None
 
 
 def validate_checkpoint_publication_metadata(value, *, original_window=None):
     """Check the actual publication DTO without IO, tensor loads or a lease."""
-    fields(value, _PUBLICATION_FIELDS, "historical checkpoint publication")
+    fields(value, _PUBLICATION_FIELDS + (("r_auxiliary",) if type(value) is dict and "r_auxiliary" in value else ()), "historical checkpoint publication")
     if value["schema"] != PUBLICATION_DOMAIN:
         raise ValueError("explicit historical checkpoint publication domain required")
     for name in ("collection_model_epoch", "collection_context_epoch", "training_model_epoch"):
         uint(value[name])
+    auxiliary_publication = value.get("r_auxiliary")
+    if auxiliary_publication is not None:
+        fields(auxiliary_publication, ("schema", "dataset_publication_sha256", "manifest_file_sha256", "index_file_sha256",
+            "parent_ledger_projection"), "checkpoint's separate R auxiliary source")
+        if auxiliary_publication["schema"] != "rz-rovent-checkpoint-r-auxiliary/1":
+            raise ValueError("explicit checkpoint R source sidecar required")
+        for name in ("dataset_publication_sha256", "manifest_file_sha256", "index_file_sha256"):
+            sha(auxiliary_publication[name])
+        artifact_reference(auxiliary_publication["parent_ledger_projection"])
     if original_window is not None:
         if type(original_window) is not dict:
             raise ValueError("original pinned training window metadata required")
         domain = original_window.get("schema")
+        from .rovent_r_auxiliary import enabled
+        if enabled(original_window):
+            if (auxiliary_publication is None or any(auxiliary_publication[name] != original_window["nnuec_r_auxiliary"][name]
+                    for name in ("manifest_file_sha256", "index_file_sha256"))):
+                raise ValueError("original enabled window lost its exact R auxiliary publication")
+        elif auxiliary_publication is not None:
+            raise ValueError("disabled original window cannot acquire an R publication")
         if domain == "rz-rovent-train-window/2":
             names = ("collection_source_sha256", "collection_runtime_library_sha256", "collection_model_epoch",
                 "collection_context_epoch", "training_model_epoch", "trainer_source_sha256",
@@ -98,7 +115,7 @@ def _relative_pin(root, value):
     return {"path": str(path), "sha256": pin["sha256"], "bytes": pin["bytes"]}
 
 
-def read_historical_checkpoint_source(startup, reads, *, corpus_by_publication):
+def read_historical_checkpoint_source(startup, reads, *, corpus_by_publication, r_corpus_by_publication=None):
     """Read exact registered metadata; no sibling discovery or tensor loading."""
     registration = startup["registration"]
     initialization = registration["initialization_source"]
@@ -135,8 +152,26 @@ def read_historical_checkpoint_source(startup, reads, *, corpus_by_publication):
     from .rovent_corpus import RoventTrainingCorpus
     if type(intake) is not RoventTrainingCorpus:
         raise ValueError("historical checkpoint's original corpus was not retained")
+    source_r = None
+    from . import rovent_r_auxiliary as auxiliary
+    if auxiliary.enabled(original_window):
+        if type(r_corpus_by_publication) is not dict or len(r_corpus_by_publication) > 257:
+            raise ValueError("historical auxiliary source requires its complete separate original R publication map")
+        registered_r = original_window["nnuec_r_auxiliary"]
+        original_r = publication["r_auxiliary"]
+        matches = [owner for identity, owner in r_corpus_by_publication.items()
+            if identity == original_r["dataset_publication_sha256"] and owner.corpus_sha256 == registered_r["manifest_file_sha256"]
+                and owner.index_sha256 == registered_r["index_file_sha256"]]
+        if len(matches) != 1:
+            raise ValueError("original checkpoint R source is missing, duplicated or replaced by the current dataset")
+        source_r = matches[0]
+        # The retained parent ledger's raw file is part of the shared read
+        # budget. Its historical JSON does not reissue a current capability.
+        parent_projection = reads.json(_relative_pin(source["root"], original_r["parent_ledger_projection"]), maximum=16 << 20)
+        if type(parent_projection) is not dict:
+            raise ValueError("original R auxiliary parent ledger metadata must be retained")
     return HistoricalCheckpointInput(tensor, copy.deepcopy(publication), copy.deepcopy(source["publication"]),
-        raw, retirement, copy.deepcopy(original_window), intake, reads, str(Path(registration["output_root"]) / "tmp"))
+        raw, retirement, copy.deepcopy(original_window), intake, reads, str(Path(registration["output_root"]) / "tmp"), source_r)
 
 
 def _authority(value):
@@ -153,23 +188,29 @@ def _source(authority):
     return source
 
 
-def _read_admission(owner, intake, spec):
+def _read_admission(owner, intake, spec, *, r_auxiliary_intake=None):
     validate_window_spec(owner.recipe, spec)
     return core._read_admission(owner, intake, spec)
 
 
-def _journal(owner, spec, admission):
+def _journal(owner, spec, admission, *, r_auxiliary_intake=None):
     validate_window_spec(owner.recipe, spec)
-    return core._journal(owner, spec, admission)
+    return core._journal(owner, spec, admission, r_auxiliary_intake=r_auxiliary_intake)
 
 
-def initial_training_journal(recipe, spec, admission):
+def initial_training_journal(recipe, spec, admission, *, r_auxiliary_intake=None):
     validate_window_spec(recipe, spec)
-    return core.initial_training_journal(recipe, spec, admission)
+    return core.initial_training_journal(recipe, spec, admission, r_auxiliary_intake=r_auxiliary_intake)
 
 
 def _checked_admission(owner, value, authority, *, exported=False):
-    fields(value, _ACK_FIELDS + (_EXPORT_FIELDS if exported else ()), "new-process historical checkpoint admission")
+    fields(value, _ACK_FIELDS + (_EXPORT_FIELDS if exported else ())
+        + (("r_auxiliary",) if "r_auxiliary" in owner.samplers else ()), "new-process historical checkpoint admission")
+    if "r_auxiliary" in owner.samplers:
+        from .rovent_r_auxiliary import checkpoint_projection
+        expected_aux = checkpoint_projection(owner.samplers["r_auxiliary"], owner.samplers["updates"])
+        if not _typed_equal(value["r_auxiliary"], expected_aux):
+            raise ValueError("current parent changed original R auxiliary source/count/seal checkpoint state")
     source = _source(authority)
     inputs = core.retained_seal_set(owner.inherited_input_sha256, "input")
     origins = core.retained_seal_set(owner.inherited_origin_sha256, "origin")
@@ -225,18 +266,28 @@ def _checked_admission(owner, value, authority, *, exported=False):
     return copy.deepcopy(value)
 
 
-def _sampler_validator(owner, intake, spec):
+def _sampler_validator(owner, intake, spec, *, r_auxiliary_intake=None):
     admission = core._read_admission(owner, intake, spec)
     def validate(value):
         probe = copy.copy(owner)
         probe.samplers = value
-        journal = core._journal(probe, spec, admission)
+        journal = core._journal(probe, spec, admission, r_auxiliary_intake=r_auxiliary_intake)
+        dispatch = None
+        if r_auxiliary_intake is not None:
+            dispatch, metadata = core.joint_r_auxiliary_dispatch(probe, intake, spec, journal, r_auxiliary_intake)
         for role, state in journal["phase_inputs"][spec["phase"]]["samplers"].items():
-            rows = intake.rows(role, split="train", optimization=True)
+            rows = (dispatch.pc_rows(role, split="train", optimization=True) if dispatch is not None
+                else intake.rows(role, split="train", optimization=True))
             pool = digest("rz-rovent-native-role-pool/1", {"corpus_sha256": admission["corpus_sha256"], "role": role,
                 "inputs": [(sample["input_sha256"], sample["origin_sha256"]) for sample in
                            (intake.training_sample(row) for row in rows)]})
             core.StageSampler(rows, role=role, seed=spec["sampling_seed"], pool_sha256=pool, state=state)
+        if r_auxiliary_intake is not None and spec["phase"] == "pc":
+            from .rovent_r_auxiliary import RAuxiliarySampler
+            sidecar = journal["r_auxiliary"]
+            if sidecar["sampler"] is not None:
+                RAuxiliarySampler(tuple(dispatch.r_rows(split="train", optimization=True)),
+                    seed=spec["nnuec_r_auxiliary"]["sampling_seed"], pool_sha256=metadata["pool_sha256"], state=sidecar["sampler"])
     return validate
 
 
@@ -255,7 +306,8 @@ def _raw_scratch(path, expected_sha256, template, recipe, membership, authority,
     probe = SimpleNamespace(recipe=recipe, stage_id=payload["stage_id"], completed=payload["ledger"]["completed"],
         samplers=payload["samplers"], inherited_input_sha256=payload["inherited_input_sha256"],
         inherited_origin_sha256=payload["inherited_origin_sha256"])
-    validator = _sampler_validator(probe, source.source_intake, source.source_window)
+    validator = _sampler_validator(probe, source.source_intake, source.source_window,
+        r_auxiliary_intake=source.source_r_auxiliary_intake)
     owner = _restore_scratch(payload, template, recipe, membership, sampler_validator=validator, runtime=runtime)
     owner.source_checkpoint_sha256, owner.source_checkpoint_path = expected_sha256, str(path)
     owner.source_model_state_sha256 = runtime[5](payload["model"])
@@ -265,7 +317,7 @@ def _raw_scratch(path, expected_sha256, template, recipe, membership, authority,
 
 
 def _stage_recovered_checkpoint(path, expected_sha256, template, recipe, membership, native_intake, window_spec, *,
-                                execution_authority=None, max_file_bytes, purpose, execute=False):
+                                execution_authority=None, max_file_bytes, purpose, execute=False, r_auxiliary_intake=None):
     spec = copy.deepcopy(validate_window_spec(recipe, window_spec))
     if purpose not in ("resume", "export"):
         raise ValueError("explicit recovered resume or raw export purpose required")
@@ -300,7 +352,7 @@ def _stage_recovered_checkpoint(path, expected_sha256, template, recipe, members
         owner.samplers["recovery_cost_state"] = cost_state
         if spec["phase"] == "v" and "v" not in owner.samplers["phase_inputs"]:
             owner.samplers = core.prepare_frozen_v_journal(owner, native_intake, spec)
-    validator = _sampler_validator(owner, native_intake, spec)
+    validator = _sampler_validator(owner, native_intake, spec, r_auxiliary_intake=r_auxiliary_intake)
     current = tensor_payload(owner, sampler_validator=validator, execute=True)
     return core.StagedLearnerResume(owner, validator, original, runtime[5](current))
 
@@ -316,7 +368,7 @@ def stage_rovent_export(path, expected_sha256, template, recipe, membership, nat
 
 
 def stage_recovered_rovent_fork(path, expected_sha256, template, recipe, membership, native_intake, window_spec, *,
-                                execution_authority=None, max_file_bytes, execute=False):
+                                execution_authority=None, max_file_bytes, execute=False, r_auxiliary_intake=None):
     spec = copy.deepcopy(validate_window_spec(recipe, window_spec))
     target = recipe.stage(spec["stage_id"])
     if target.parent_stage_id is None:
@@ -342,11 +394,29 @@ def stage_recovered_rovent_fork(path, expected_sha256, template, recipe, members
     probe = SimpleNamespace(recipe=recipe, stage_id=target.stage_id, completed=dict.fromkeys(ROLES, 0),
         inherited_input_sha256=list(parent.inherited_input_sha256), inherited_origin_sha256=list(parent.inherited_origin_sha256))
     admission = _read_admission(probe, native_intake, spec)
-    journal = initial_training_journal(recipe, spec, admission)
+    journal = initial_training_journal(recipe, spec, admission, r_auxiliary_intake=r_auxiliary_intake)
+    from . import rovent_r_auxiliary as auxiliary
+    from .rovent_r_ancestry import ancestry_from_journal
+    ancestry = ancestry_from_journal(parent.samplers)
+    if auxiliary.enabled(spec):
+        if "r_auxiliary" in parent.samplers:
+            journal["r_auxiliary"] = auxiliary.fork_auxiliary_journal(parent.samplers["r_auxiliary"], spec["nnuec_r_auxiliary"])
+        tracked = nnuec_known_updates(_nnuec_tensor_training_state(parent))
+        if tracked is None:
+            raise ValueError("unverified NNUEC ancestry cannot become a known auxiliary fork")
+        # All NNUEC tensor steps and R-only source seals have distinct owners.
+        # A disabled middle stage may add valid old-PC NNUEC updates without
+        # creating any new R source occurrence.
+        journal["r_auxiliary"]["ancestor_nnuec_updates"] = tracked
+        journal["r_auxiliary"]["ancestor_input_sha256"] = ancestry["input_sha256"]
+        journal["r_auxiliary"]["ancestor_origin_sha256"] = ancestry["origin_sha256"]
+        core.bind_r_auxiliary(recipe, spec, journal["r_auxiliary"], r_auxiliary_intake)
+    elif ancestry["input_sha256"] or ancestry["origin_sha256"]:
+        journal["r_auxiliary_ancestry"] = ancestry
     journal["recovery_cost_state"] = initial_recovered_cost(parent.cost, original["recorded_tail_cost"],
         inherited_unknown_tails=original["inherited_unknown_tails"])
     probe.samplers = journal
-    validator = _sampler_validator(probe, native_intake, spec)
+    validator = _sampler_validator(probe, native_intake, spec, r_auxiliary_intake=r_auxiliary_intake)
     child = stage_tensor_fork(path, expected_sha256, template, recipe, membership,
         source_sampler_validator=source_validator, target_sampler_validator=validator, target_stage_id=target.stage_id,
         reset_seed=spec["training_seed"], reset_samplers=journal, reset_bucket=8, max_file_bytes=maximum,
@@ -354,7 +424,7 @@ def stage_recovered_rovent_fork(path, expected_sha256, template, recipe, members
     if original["recorded_tail_cost"]["status"] == "known":
         for name, count in original["recorded_tail_cost"]["delta"].items():
             child.ancestor_cost[name] = uint(child.ancestor_cost[name] + count)
-    final_validator = _sampler_validator(child, native_intake, spec)
+    final_validator = _sampler_validator(child, native_intake, spec, r_auxiliary_intake=r_auxiliary_intake)
     current = tensor_payload(child, sampler_validator=final_validator, execute=True)
     return core.StagedLearnerResume(child, final_validator, original, runtime[5](current))
 
@@ -386,7 +456,7 @@ def admit_recovered_learned_export(owner, checkpoint, request):
     authority = _authority(request.execution_authority)
     spec = validate_window_spec(owner.recipe, request.window_spec)
     admission = _read_admission(owner, request.native_intake, spec)
-    journal = _journal(owner, spec, admission)
+    journal = _journal(owner, spec, admission, r_auxiliary_intake=request.r_auxiliary_intake)
     stage_limits = dict(zip(ROLES, owner.recipe.stage(owner.stage_id).role_updates))
     if owner.completed != stage_limits or owner.pending_microbatches:
         raise ValueError("recovered learned export requires all declared current-stage update boundaries")
@@ -418,7 +488,8 @@ def admit_recovered_learned_export(owner, checkpoint, request):
     if steps == 0:
         if (datasets or lineage["last_execution_id"] is not None or lineage["last_window_id"] is not None
                 or not nnuec_is_unmodified(derived) or derived["source_declaration"] != {"kind": "untrained"}
-                or journal["head_counts"]["nnuec_wdl"]
+                or (journal["r_auxiliary"]["current_nnuec_updates"] if "r_auxiliary" in journal
+                    else journal["head_counts"]["nnuec_wdl"])
                 or any(count for name, count in owner.parameter_updates.items() if name.startswith("nnuec."))):
             raise ValueError("learned or modified NNUEC tensors cannot be relabelled as untrained")
         declaration = {"kind": "untrained"}

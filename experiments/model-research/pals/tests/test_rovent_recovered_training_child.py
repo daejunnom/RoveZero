@@ -1,4 +1,5 @@
 """Recovered entry source contracts; no model/optimizer or learner execution."""
+import builtins
 import copy
 import hashlib
 import io
@@ -132,6 +133,127 @@ class RecoveredChildContractTests(unittest.TestCase):
         self.assertFalse(result["past_physical_completion_reissued"])
         result["collection_admission"]["execution_authorized"] = True
         self.assertFalse(startup["collection_admission"]["execution_authorized"])
+
+    def test_optional_r_presence_keeps_absent_and_null_distinct_without_reading(self):
+        startup = {"registration": {}}
+        spec = {}
+        self.assertEqual(child._r_auxiliary_presence(startup, spec), ("absent", None))
+        self.assertEqual(startup, {"registration": {}})
+        self.assertEqual(spec, {})
+        startup["registration"]["r_auxiliary_dataset"] = None
+        spec["nnuec_r_auxiliary"] = None
+        self.assertEqual(child._r_auxiliary_presence(startup, spec), ("null", None))
+        self.assertIn("r_auxiliary_dataset", startup["registration"])
+        self.assertIn("nnuec_r_auxiliary", spec)
+
+    def test_optional_r_presence_rejects_cross_presence_and_null_enabled_mismatch(self):
+        for registration, spec in (({}, {"nnuec_r_auxiliary": None}),
+                ({"r_auxiliary_dataset": None}, {}),
+                ({"r_auxiliary_dataset": {}}, {"nnuec_r_auxiliary": None}),
+                ({"r_auxiliary_dataset": None}, {"nnuec_r_auxiliary": {}}),
+                ({"r_auxiliary_dataset": []}, {"nnuec_r_auxiliary": {}})):
+            with self.subTest(registration=registration, spec=spec), self.assertRaisesRegex(ValueError, "R auxiliary"):
+                child._r_auxiliary_presence({"registration": registration}, spec)
+        request = {"fixture": "not yet an admitted corpus"}
+        state, returned = child._r_auxiliary_presence({"registration": {"r_auxiliary_dataset": request}},
+            {"nnuec_r_auxiliary": {"fixture": "not execution authority"}})
+        self.assertEqual(state, "enabled")
+        self.assertIs(returned, request)
+
+    def test_disabled_r_intake_performs_no_r_import_or_io(self):
+        original_import = builtins.__import__
+        def guarded_import(name, *args, **kwargs):
+            if name.endswith(("rovent_historical_r_corpus", "rovent_r_corpus", "rovent_r_auxiliary")):
+                raise AssertionError("disabled R path must not import a reader or sampler")
+            return original_import(name, *args, **kwargs)
+        class Reads:
+            def __getattr__(self, _name):
+                raise AssertionError("disabled R path must not touch a read budget")
+        with patch.object(builtins, "__import__", side_effect=guarded_import):
+            for registration, spec in (({}, {}), ({"r_auxiliary_dataset": None}, {"nnuec_r_auxiliary": None})):
+                with self.subTest(spec=spec):
+                    self.assertIsNone(child._intake_r_auxiliary({"registration": registration}, Reads(),
+                        object(), spec, pc_corpus_by_publication=object()))
+
+    def test_enabled_r_intake_uses_a_distinct_typed_reader_and_exact_window_pins(self):
+        from rz_pals_model import rovent_historical_r_corpus as historical_r
+        request = {"fixture": "mocked file reader only"}
+        startup = {"registration": {"r_auxiliary_dataset": request}}
+        spec = {"nnuec_r_auxiliary": {"manifest_file_sha256": "a" * 64, "index_file_sha256": "b" * 64}}
+        pc_owner, recipe, reads = object(), object(), object()
+        corpus = SimpleNamespace(corpus_sha256="a" * 64, index_sha256="b" * 64, index_semantic_sha256="d" * 64)
+        r_owner = SimpleNamespace(corpus=corpus, observation=lambda: {"publication_sha256": "e" * 64})
+        dependency = {"canonical_index_sha256": "d" * 64, "r_ancestor_index_sha256": []}
+        with patch.object(historical_r, "read_historical_r_dependencies", return_value=dependency), \
+                patch.object(historical_r.HistoricalRoventRCorpus, "from_registration", return_value=r_owner) as reader:
+            result = child._intake_r_auxiliary(startup, reads, recipe, spec, pc_corpus_by_publication={"c" * 64: pc_owner})
+            self.assertEqual(result, (r_owner, (), {"e" * 64: corpus}))
+            reader.assert_called_once_with(request, recipe=recipe, read_budget=reads, pc_corpora=(pc_owner,), r_ancestors=())
+            corpus.index_sha256 = "d" * 64
+            with self.assertRaisesRegex(ValueError, "exact window file pins"):
+                child._intake_r_auxiliary(startup, reads, recipe, spec, pc_corpus_by_publication={"c" * 64: pc_owner})
+
+    def test_missing_r_ancestor_fails_before_loading_a_current_or_ancestor_row(self):
+        from rz_pals_model import rovent_historical_r_corpus as historical_r
+        startup = {"registration": {"r_auxiliary_dataset": {}, "ancestor_r_auxiliary_datasets": [{"fixture": "orphan"}]}}
+        spec = {"nnuec_r_auxiliary": {}}
+        dependency = {"canonical_index_sha256": "a" * 64, "r_ancestor_index_sha256": ["b" * 64]}
+        with patch.object(historical_r, "read_historical_r_dependencies", return_value=dependency), \
+                patch.object(historical_r.HistoricalRoventRCorpus, "from_registration",
+                    side_effect=AssertionError("unknown ancestor must not be substituted with current R")):
+            with self.assertRaisesRegex(ValueError, "cyclic, foreign, or incomplete"):
+                child._intake_r_auxiliary(startup, object(), object(), spec, pc_corpus_by_publication={})
+
+    def test_r_graph_uses_canonical_dependencies_and_retains_raw_publication_map(self):
+        from rz_pals_model import rovent_historical_r_corpus as historical_r
+        sources = {name: {"fixture": name} for name in ("a", "b", "current")}
+        startup = {"registration": {"r_auxiliary_dataset": sources["current"],
+            "ancestor_r_auxiliary_datasets": [sources["b"], sources["a"]]}}
+        spec = {"nnuec_r_auxiliary": {"manifest_file_sha256": "d" * 64, "index_file_sha256": "e" * 64}}
+        canonical = {"a": "1" * 64, "b": "2" * 64, "current": "3" * 64}
+        raw = {"a": "7" * 64, "b": "8" * 64, "current": "9" * 64}
+        dependencies = {"a": [], "b": [canonical["a"]], "current": [canonical["a"], canonical["b"]]}
+        owners = {}
+        for name in sources:
+            owners[name] = SimpleNamespace(corpus=SimpleNamespace(index_semantic_sha256=canonical[name],
+                corpus_sha256=spec["nnuec_r_auxiliary"]["manifest_file_sha256"],
+                index_sha256=spec["nnuec_r_auxiliary"]["index_file_sha256"]),
+                observation=lambda name=name: {"publication_sha256": raw[name]})
+        def dependency(source, *, read_budget):
+            name = source["fixture"]
+            return {"canonical_index_sha256": canonical[name], "r_ancestor_index_sha256": dependencies[name]}
+        def load(source, **_kwargs):
+            return owners[source["fixture"]]
+        with patch.object(historical_r, "read_historical_r_dependencies", side_effect=dependency), \
+                patch.object(historical_r.HistoricalRoventRCorpus, "from_registration", side_effect=load) as reader:
+            current, ancestors, publication_map = child._intake_r_auxiliary(startup, object(), object(), spec,
+                pc_corpus_by_publication={})
+        self.assertIs(current, owners["current"])
+        self.assertEqual(ancestors, (owners["a"], owners["b"]))
+        self.assertEqual(publication_map, {raw[name]: owners[name].corpus for name in owners})
+        self.assertEqual([call.args[0]["fixture"] for call in reader.call_args_list], ["a", "b", "current"])
+
+    def test_r_observation_join_preserves_data_scope_and_checks_raw_pins_count_and_parameter(self):
+        observation = {"publication_sha256": "1" * 64, "manifest_file_sha256": "2" * 64,
+            "index_file_sha256": "3" * 64, "nnuec_parameter_sha256": "4" * 64, "record_count": 2,
+            "past_native_authority_reissued": False, "past_physical_completion_reissued": False,
+            "execution_authorized": False}
+        ancestor = {"publication_sha256": "5" * 64}
+        report = {"current_publication_sha256": observation["publication_sha256"],
+            "ancestor_publication_sha256": [ancestor["publication_sha256"]],
+            **{name: observation[name] for name in ("manifest_file_sha256", "index_file_sha256", "nnuec_parameter_sha256", "record_count")}}
+        startup = {"r_auxiliary_admission": report}
+        result = child._join_r_auxiliary_admission(startup, observation, [ancestor])
+        self.assertFalse(result["execution_authorized"])
+        self.assertFalse(result["past_native_authority_reissued"])
+        self.assertFalse(result["past_physical_completion_reissued"])
+        for name, value in (("current_publication_sha256", "6" * 64), ("manifest_file_sha256", "6" * 64),
+                ("nnuec_parameter_sha256", "6" * 64), ("record_count", 3), ("record_count", True),
+                ("ancestor_publication_sha256", [])):
+            changed = copy.deepcopy(startup)
+            changed["r_auxiliary_admission"][name] = value
+            with self.subTest(name=name, value=value), self.assertRaisesRegex(ValueError, "pinned admission"):
+                child._join_r_auxiliary_admission(changed, observation, [ancestor])
 
     def test_export_request_has_a_separate_domain_and_direct_new_output_child(self):
         with tempfile.TemporaryDirectory() as directory:

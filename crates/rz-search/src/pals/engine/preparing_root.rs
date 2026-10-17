@@ -12,9 +12,14 @@ use rz_contracts::pals::SearchAuthority;
 mod controls;
 mod handoff;
 mod lifecycle;
+mod retirement;
 pub use controls::{ResearcherPreparingError, ResearcherRootStartup, RetiredPreparingRoot};
 pub(super) use handoff::PreparingRegistrationSeal;
 pub use handoff::{PreparingRootFinishRejection, PreparingRootHandoff};
+pub(super) use retirement::DeferredResearcherInitialReadback;
+pub use retirement::{
+    ReleasedResearcherReadback, ResearcherRetirementRejection, RetiredResearcherOwner,
+};
 
 /// Root-independent semantic owner while no actual researcher exists.
 /// Early bounded roots return this same owner, not a newly allocated Store.
@@ -230,6 +235,24 @@ impl<M: RoleModel> ResearcherPreparingRoot<M> {
     ) -> Result<PreparingRootReviewSource<'_>, PalsError> {
         self.validate_preparing_source()?;
         if self.initial_view.is_none() {
+            use crate::pals::rovent_frontier::FrontierGoalStatus;
+            if self.semantic.nodes[self.root].terminal.is_some()
+                || self
+                    .semantic
+                    .rovent_frontier
+                    .as_deref()
+                    .is_some_and(|frontier| {
+                        matches!(
+                            frontier.snapshot().goal,
+                            FrontierGoalStatus::DepthSatisfied | FrontierGoalStatus::MateSatisfied
+                        )
+                    })
+            {
+                return Err(StoreError::InvalidConditions(
+                    "preparing root is already terminal or goal satisfied",
+                )
+                .into());
+            }
             let original = self.original.as_ref().ok_or(PalsError::InvalidLimits)?;
             let clock = original.startup.clock;
             use crate::contract_time::ContractClock;
@@ -322,4 +345,4 @@ impl<M: RoleModel> ResearcherPreparingRoot<M> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::pals::engine) mod tests;

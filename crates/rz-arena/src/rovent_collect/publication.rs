@@ -276,6 +276,7 @@ pub struct FinishedRoventCorpus {
     index: RoventCorpusIndex,
     native_admission_sha256: Vec<String>,
     admissions: BTreeMap<String, Arc<RoventPublicationSourceSnapshot>>,
+    allocations: super::allocation::RoventAllocationSupplementCapture,
 }
 
 /// Minted only while consuming an original PublishedRecord. It deliberately
@@ -363,6 +364,7 @@ impl FinishedRoventCorpus {
             index: writer.index,
             native_admission_sha256: writer.admissions.keys().cloned().collect(),
             admissions: writer.admissions,
+            allocations: writer.allocations,
         })
     }
     pub fn manifest(&self) -> &RoventCorpusManifest {
@@ -373,6 +375,18 @@ impl FinishedRoventCorpus {
     }
     pub fn native_admission_sha256(&self) -> &[String] {
         &self.native_admission_sha256
+    }
+    /// 원 /1 commit과 raw /2를 변경하지 않는 별도 시각 근거 artifact다.
+    /// base publication을 먼저 게시한 뒤 같은 private directory에서 호출한다.
+    #[cfg(target_os = "linux")]
+    pub fn publish_allocation_supplement(
+        &self,
+        directory: &cap_std::fs::Dir,
+        until: std::time::Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<super::allocation::RoventAllocationSupplement, ArenaError> {
+        self.allocations
+            .publish(directory, &self.manifest, &self.index, until, cancel)
     }
 
     /// Linux durable publication over the caller's original private directory

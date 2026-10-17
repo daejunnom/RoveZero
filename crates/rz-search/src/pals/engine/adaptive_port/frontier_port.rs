@@ -48,6 +48,7 @@ pub(super) struct FrontierQuestionSource {
     context: ContractDigest,
     view: ReviewViewSeal,
     legacy: Option<std::sync::Weak<LegacyFullRoleRecords>>,
+    goal_origin: Option<ContractDigest>,
 }
 
 impl FrontierQuestionSource {
@@ -59,6 +60,7 @@ impl FrontierQuestionSource {
         context: &RoleLogicalContext,
         view: ReviewViewSeal,
         legacy: Option<&Arc<LegacyFullRoleRecords>>,
+        goal_origin: Option<ContractDigest>,
     ) -> Result<Self, PalsError> {
         Ok(Self {
             authority,
@@ -68,6 +70,7 @@ impl FrontierQuestionSource {
             context: source_context_digest(context)?,
             view,
             legacy: legacy.map(Arc::downgrade),
+            goal_origin,
         })
     }
 }
@@ -81,6 +84,9 @@ impl AdaptivePortQuestion {
     ) -> Result<(), PalsError> {
         let input = &work.input;
         let query = &input.question;
+        if query.goal_local.is_some() {
+            return Err(RoleError::Unsupported("goal-local input has no ordinary frame").into());
+        }
         let source = &query.frontier_source;
         let first = query.first.ok_or(RoleError::InvalidOutput)?;
         let first = rz_contracts::pals::Move16::encode(
@@ -95,7 +101,7 @@ impl AdaptivePortQuestion {
         Self::validate_frontier_input(input, stores)
     }
 
-    fn validate_frontier_input(
+    pub(super) fn validate_frontier_input(
         input: &FrameInput<ReviewView, AdaptivePortQuestion>,
         stores: &PalsStores,
     ) -> Result<(), PalsError> {
@@ -138,8 +144,16 @@ impl AdaptivePortQuestion {
         if !legacy_matches {
             return Err(RoleError::InvalidOutput.into());
         }
+        if query.goal_local.as_ref().map(|origin| origin.digest()) != source.goal_origin {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        if let Some(origin) = &query.goal_local {
+            origin.validates_frame_input(input)?;
+        }
         let visible = view.query();
-        let proposal = if query.context.purpose == RoleQueryPurpose::ValueFresh {
+        let proposal = if query.goal_local.is_some() {
+            &[][..]
+        } else if query.context.purpose == RoleQueryPurpose::ValueFresh {
             query.context.prefix.as_slice()
         } else {
             query.proposal.as_slice()
@@ -1117,6 +1131,13 @@ mod tests {
                 .unwrap()
             );
         }
+        assert_eq!(port.counters.role_calls, 1);
+        assert_eq!(port.counters.value_calls, 1);
+        assert_eq!(port.counters.consumed_role_outputs, 1);
+        assert!(
+            port.role_consumption_recorded(accepted.ticket(), &endpoint.input.view)
+                .unwrap()
+        );
         let mut changed_output = output.clone();
         let RolePayload::Proposal {
             candidate_logits, ..
@@ -1185,4 +1206,5 @@ mod tests {
     }
 
     include!("checked_replay_tests.rs");
+    include!("fresh_usage_tests.rs");
 }

@@ -7,6 +7,9 @@ use crate::pals::rovent_frontier::{FrontierGoalStatus, FrontierLimits, FrontierR
 use rz_contracts::rovent::SearchGoal;
 use std::num::NonZeroU16;
 
+#[path = "peer_tests.rs"]
+mod peer_tests;
+
 type GoalPort = PcSemanticPort<AdaptivePortModel>;
 
 fn goal_port(position: Position, goal: SearchGoal, roots: Option<&[BoardMove]>) -> GoalPort {
@@ -310,4 +313,144 @@ fn real_missing_mate_descriptor_does_not_forge_a_policy_opinion_or_peer() {
     } else {
         assert_eq!(input.question.context.purpose, RoleQueryPurpose::ValueFresh);
     }
+}
+
+#[test]
+fn missing_origin_survives_actual_policy_consumption_and_fresh_without_new_duties() {
+    let mut port = goal_port(
+        Position::startpos(),
+        SearchGoal {
+            depth_plies: None,
+            mate_moves: NonZeroU16::new(2),
+        },
+        None,
+    );
+    port.prepare_rovent_root_rules().unwrap();
+    port.ready.clear();
+    port.complete_role_queue().unwrap();
+    let first = port.next_role().unwrap().unwrap();
+    let origin = first.question.goal_local_origin_digest().unwrap();
+    let end = first.question.continuation_end;
+    let mut input = first;
+    let before_frames = port
+        .rovent_frontier_receipt()
+        .unwrap()
+        .snapshot
+        .registered_frames;
+    let mut request = 1;
+    loop {
+        assert_eq!(input.question.goal_local_origin_digest(), Some(origin));
+        assert!(input.question.reciprocal_question().is_none());
+        assert!(input.question.responsibilities.is_empty());
+        assert!(input.view.query().proposal.is_empty());
+        assert!(input.view.query().counterexample.is_none());
+        let is_fresh = input.question.context.purpose == RoleQueryPurpose::ValueFresh;
+        let (proof, output) = accepted(&mut port, &input, request);
+        port.consume_accepted(
+            &input,
+            &proof,
+            &output,
+            Some(evidence(&port, &input, request)),
+        )
+        .unwrap();
+        assert!(
+            port.role_consumption_recorded(proof.ticket(), &input)
+                .unwrap()
+        );
+        assert_eq!(
+            port.rovent_frontier_receipt()
+                .unwrap()
+                .snapshot
+                .registered_frames,
+            before_frames
+        );
+        assert!(port.owner.records().is_empty());
+        if is_fresh {
+            break;
+        }
+        input = port.next_role().unwrap().unwrap();
+        assert!(input.question.context.prefix.len() <= end);
+        request += 1;
+        assert!(request <= 4);
+    }
+    assert!(port.counters.accepted_fresh > 0);
+    assert_eq!(std::mem::size_of_val(port.researcher()), 0);
+}
+
+#[test]
+fn shallow_fresh_keeps_original_duty_until_paid_goal_local_continuation_closes_it() {
+    let roots = [BoardMove::from_uci("e2e4").unwrap()];
+    let mut port = goal_port(
+        Position::startpos(),
+        SearchGoal {
+            depth_plies: NonZeroU16::new(5),
+            mate_moves: None,
+        },
+        Some(&roots),
+    );
+    // A real shallow Fresh checkpoint is allowed as progress. This bounded
+    // fixture deliberately ends its first selected segment at two plies.
+    port.ready.front_mut().unwrap().continuation_end = 2;
+    let mut request = 1;
+    let mut saw_shallow = false;
+    let mut saw_horizon_source = false;
+    while let Some(input) = port.next_role().unwrap() {
+        let shallow = input.question.context.purpose == RoleQueryPurpose::ValueFresh
+            && input.question.context.prefix.len() == 2;
+        if input.question.goal_local_origin_digest().is_some() {
+            assert!(input.question.reciprocal_question().is_none());
+            assert!(input.question.responsibilities.is_empty());
+            assert!(PcPortQuestion::validated_horizon_source(&input, port.owner.stores()).is_ok());
+            saw_horizon_source = true;
+        }
+        let (proof, output) = accepted(&mut port, &input, request);
+        port.consume_accepted(
+            &input,
+            &proof,
+            &output,
+            Some(evidence(&port, &input, request)),
+        )
+        .unwrap();
+        assert!(
+            port.role_consumption_recorded(proof.ticket(), &input)
+                .unwrap()
+        );
+        if shallow {
+            let receipt = port.rovent_frontier_receipt().unwrap();
+            assert!(receipt.snapshot.completed_frames < receipt.snapshot.registered_frames);
+            assert_ne!(receipt.snapshot.goal, FrontierGoalStatus::DepthSatisfied);
+            saw_shallow = true;
+        }
+        request += 1;
+        assert!(request <= 24);
+    }
+    assert!(saw_shallow && saw_horizon_source);
+    let receipt = port.rovent_frontier_receipt().unwrap();
+    assert_eq!(receipt.snapshot.goal, FrontierGoalStatus::DepthSatisfied);
+    assert_eq!(
+        receipt.snapshot.completed_frames,
+        receipt.snapshot.registered_frames
+    );
+    assert!(port.counters.accepted_fresh >= 3);
+    assert_eq!(receipt.snapshot.work.native_nodes, 0);
+}
+
+#[test]
+fn final_pc_selection_uses_the_actual_mate_strategy_even_after_frontier_retirement() {
+    let position = Position::from_fen("7k/8/5KQ1/8/8/8/8/8 w - - 0 1").unwrap();
+    let mating = BoardMove::from_uci("g6g7").unwrap();
+    let other = BoardMove::from_uci("g6f5").unwrap();
+    let roots = [mating, other];
+    let mut port = goal_port(position, SearchGoal::default(), Some(&roots));
+    port.prepare_rovent_root_rules().unwrap();
+    port.root_ranking = vec![other, mating];
+    let receipt = port.rovent_frontier_receipt().unwrap();
+    assert_eq!(
+        receipt.snapshot.mate_strategy.as_ref().unwrap().best_move(),
+        mating
+    );
+    assert_eq!(port.finish_materialized().best_move, Some(mating));
+    port.retire_rovent_frontier().unwrap();
+    assert_eq!(port.finish_materialized().best_move, Some(mating));
+    assert_eq!(port.counters.submitted_role_calls, 0);
 }

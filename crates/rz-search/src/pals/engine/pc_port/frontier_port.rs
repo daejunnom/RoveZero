@@ -33,6 +33,10 @@ pub(super) struct PcFrontierState {
     duties: Vec<PcFrontierDuty>,
     last_error: Option<FrontierError>,
 }
+pub(super) struct PcAdmittedChild {
+    pub(super) node: usize,
+    pub(super) checked: Option<crate::pals::rovent_frontier::CheckedFrontierLine>,
+}
 
 impl<M: RoleModel> PcSemanticPort<M> {
     /// Attach before any role input exists. Every compared Rules/Store/model
@@ -126,6 +130,13 @@ impl<M: RoleModel> PcSemanticPort<M> {
 
     pub fn original_root_budget(&self) -> Option<ContractDigest> {
         self.frontier_state.as_ref().map(|state| state.root_budget)
+    }
+
+    pub(super) fn original_frontier_clock(&self) -> Result<InstantClock, PalsError> {
+        self.frontier_state
+            .as_ref()
+            .map(|state| state.clock)
+            .ok_or(PalsError::InvalidConfig)
     }
 
     pub(super) fn continuation_limit(&self) -> usize {
@@ -291,7 +302,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
         accepted: &AcceptedRoleStep,
         output: &RoleOutput,
         movement: BoardMove,
-    ) -> Result<Option<usize>, PalsError> {
+    ) -> Result<Option<PcAdmittedChild>, PalsError> {
         let Some((clock, now)) = self
             .frontier_time()
             .map_err(|error| self.frontier_failure(error))?
@@ -302,7 +313,10 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 .checked_transitions
                 .checked_add(u64::from(fresh))
                 .ok_or(PalsError::Capacity)?;
-            return Ok(Some(child));
+            return Ok(Some(PcAdmittedChild {
+                node: child,
+                checked: None,
+            }));
         };
         let semantic = &mut self.owner.semantic;
         let checked = semantic
@@ -319,7 +333,13 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 now,
             );
         match checked {
-            Ok(line) => self.adopt_frontier_line(&line).map(Some),
+            Ok(line) => {
+                let node = self.adopt_frontier_line(&line)?;
+                Ok(Some(PcAdmittedChild {
+                    node,
+                    checked: Some(line),
+                }))
+            }
             Err(error) => {
                 self.frontier_boundary_or_failure(error)?;
                 Ok(None)
@@ -355,14 +375,26 @@ impl<M: RoleModel> PcSemanticPort<M> {
         ) {
             return Ok(false);
         }
-        let Some(question) = frontier.missing_mate_questions(1, clock, now)?.pop() else {
-            return Ok(false);
+        let unmet = frontier.unmet_horizon_questions(1, clock, now)?.pop();
+        let origin = if let Some(question) = unmet {
+            Arc::new(goal_local::PcGoalLocalRules::prepare_horizon(
+                self, question,
+            )?)
+        } else {
+            let Some(question) = frontier.missing_mate_questions(1, clock, now)?.pop() else {
+                return Ok(false);
+            };
+            Arc::new(goal_local::PcGoalLocalRules::prepare(self, question)?)
         };
-        let origin = Arc::new(goal_local::PcGoalLocalRules::prepare(self, question)?);
-        let frame = self.next_frame;
-        self.next_frame = frame
-            .checked_add(1)
-            .ok_or(FrontierError::Capacity("P/C goal frame sequence"))?;
+        let frame = if let Some(frame) = origin.frame() {
+            frame.sequence
+        } else {
+            let frame = self.next_frame;
+            self.next_frame = frame
+                .checked_add(1)
+                .ok_or(FrontierError::Capacity("P/C goal frame sequence"))?;
+            frame
+        };
         self.ready
             .try_reserve(1)
             .map_err(|_| FrontierError::Capacity("P/C missing-goal queue"))?;
@@ -376,6 +408,8 @@ impl<M: RoleModel> PcSemanticPort<M> {
             proposal: Vec::new(),
             counter: None,
             goal_local: Some(origin),
+            peer_source: None,
+            repair: None,
         });
         Ok(true)
     }
@@ -482,6 +516,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
         }
         self.owner.semantic.rovent_frontier.take();
         self.frontier_state.take();
+        self.retired_strategy = receipt.snapshot.mate_strategy.clone();
         Ok(Some(receipt))
     }
 
@@ -500,6 +535,13 @@ impl<M: RoleModel> PcSemanticPort<M> {
         &mut self,
         input: &FrameInput<ReviewView, PcPortQuestion>,
     ) -> Result<(), FrontierError> {
+        if input.question.repair.is_some()
+            && input.question.context.purpose == RoleQueryPurpose::DivergencePolicy
+        {
+            // An attack-index question inspects an existing paid path. It is
+            // not a new Rules child or a fabricated root-first obligation.
+            return Ok(());
+        }
         let Some((clock, now)) = self.frontier_time()? else {
             return Ok(());
         };
@@ -571,6 +613,43 @@ impl<M: RoleModel> PcSemanticPort<M> {
             .as_deref_mut()
             .ok_or(FrontierError::ForeignRoot)?;
         let endpoint = frontier.observe_verified_question(&cap, stores, clock, now)?;
+        if input
+            .question
+            .goal_local
+            .as_ref()
+            .and_then(|origin| origin.horizon())
+            .is_some()
+        {
+            let disposition = match fresh {
+                Some((accepted, output, physical)) => frontier.accept_pc_goal_horizon_fresh(
+                    input, stores, endpoint, accepted, output, physical, clock, now,
+                )?,
+                None => {
+                    frontier.accept_pc_goal_horizon_rules(input, stores, endpoint, clock, now)?
+                }
+            };
+            if disposition.closed() {
+                let origin = input
+                    .question
+                    .goal_local
+                    .as_ref()
+                    .and_then(|origin| origin.horizon())
+                    .ok_or(FrontierError::MissingAcceptance)?;
+                let state = self
+                    .frontier_state
+                    .as_mut()
+                    .ok_or(FrontierError::ForeignRoot)?;
+                for duty in &mut state.duties {
+                    if duty.frame == origin.frame()
+                        && duty.kind == origin.kind()
+                        && duty.question == origin.source_question()
+                    {
+                        duty.finished = true;
+                    }
+                }
+            }
+            return Ok(());
+        }
         let state = self
             .frontier_state
             .as_mut()
@@ -590,28 +669,33 @@ impl<M: RoleModel> PcSemanticPort<M> {
             {
                 continue;
             }
-            match fresh {
-                Some((accepted, output, physical)) => frontier.accept_verified_fresh_endpoint(
-                    duty.obligation,
-                    &cap,
-                    stores,
-                    endpoint,
-                    accepted,
-                    output,
-                    physical,
-                    clock,
-                    now,
-                )?,
-                None => frontier.accept_verified_rules_endpoint(
-                    duty.obligation,
-                    &cap,
-                    stores,
-                    endpoint,
-                    clock,
-                    now,
-                )?,
-            }
-            duty.finished = true;
+            let closed = match fresh {
+                Some((accepted, output, physical)) => frontier
+                    .accept_verified_fresh_horizon_once(
+                        duty.obligation,
+                        &cap,
+                        stores,
+                        endpoint,
+                        accepted,
+                        output,
+                        physical,
+                        clock,
+                        now,
+                    )?
+                    .closed(),
+                None => {
+                    frontier.accept_verified_rules_endpoint(
+                        duty.obligation,
+                        &cap,
+                        stores,
+                        endpoint,
+                        clock,
+                        now,
+                    )?;
+                    true
+                }
+            };
+            duty.finished = closed;
         }
         Ok(())
     }

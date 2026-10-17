@@ -307,12 +307,20 @@ fn store_publication_failure_preserves_actual_head_consumption_once() {
     assert!(port.consume_accepted(&root, &proof, &output, None).is_err());
     assert_eq!(port.counters.consumed_role_outputs, 1);
     assert_eq!(port.counters.accepted_proposer, 1);
+    assert!(
+        port.role_consumption_recorded(proof.ticket(), &root)
+            .unwrap()
+    );
     assert_eq!(port.completion, PcPortCompletion::Failed);
     assert!(port.owner.semantic.nodes[port.root].edges.len() > 0);
     assert!(port.pending[&root.question_digest].failure.is_some());
     let before = port.counters;
     assert!(port.consume_accepted(&root, &proof, &output, None).is_err());
     assert_eq!(port.counters, before);
+    assert!(
+        port.role_consumption_recorded(proof.ticket(), &root)
+            .unwrap()
+    );
 }
 
 #[test]

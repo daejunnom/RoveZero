@@ -45,13 +45,13 @@ fn main() -> std::process::ExitCode {
 #[cfg(all(target_os = "linux", feature = "pals-collection-onnx"))]
 mod supported {
     use rz_arena::rovent_training_process::recovery::{
-        cli::{parse_rovent_trainer_cli, RoventTrainerCliParse, ROVENT_TRAINER_CLI_USAGE},
+        cli::{ROVENT_TRAINER_CLI_USAGE, RoventTrainerCliParse, parse_rovent_trainer_cli},
         run_rovent_recovered_from_cli,
     };
     use std::{
         error::Error,
         io::{self, Write},
-        sync::{atomic::AtomicBool, Arc},
+        sync::{Arc, atomic::AtomicBool},
         time::Instant,
     };
 

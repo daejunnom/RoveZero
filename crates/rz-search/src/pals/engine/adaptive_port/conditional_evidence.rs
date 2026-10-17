@@ -15,7 +15,7 @@ pub(super) struct SupportedCounter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use rz_contracts::{ClockDomain, GameGeneration, MonotonicTick, ProcessEpoch, RootGeneration};
 
@@ -28,7 +28,7 @@ mod tests {
             .collect()
     }
 
-    fn port(position: Position) -> Port {
+    pub(in crate::pals::engine::adaptive_port) fn port(position: Position) -> Port {
         port_with_line_plies(position, 4)
     }
 
@@ -82,7 +82,12 @@ mod tests {
 
     // Contract fixtures below fabricate no physical search claims. They seal
     // checked hot task/observation inputs to exercise the semantic consumer.
-    fn accepted_raw(port: &mut Port, moves: &[BoardMove], score: i32, depth: u16) -> ObservationId {
+    pub(in crate::pals::engine::adaptive_port) fn accepted_raw(
+        port: &mut Port,
+        moves: &[BoardMove],
+        score: i32,
+        depth: u16,
+    ) -> ObservationId {
         raw_fixture(port, moves, score, depth, false)
     }
 
@@ -200,6 +205,7 @@ mod tests {
             scope: CpuScoreScope::CompletedIteration,
             value_identity: identity,
             provenance: Some((observation, execution)),
+            context: None,
         });
         observation
     }
@@ -671,6 +677,43 @@ mod tests {
         assert_eq!(port.conditional_witness_line(uncommitted), None);
         assert_eq!(port.counters.supported_refutations, 0);
     }
+
+    #[test]
+    fn different_contextual_binding_is_not_a_comparable_raw_basis() {
+        let mut port = port(Position::startpos());
+        let (proposal, counter, _) = branches();
+        accepted_raw(&mut port, &proposal, 100, 2);
+        accepted_raw(&mut port, &counter, -100, 2);
+        let proposal_node = port.replay_node(&proposal).unwrap();
+        let counter_node = port.replay_node(&counter).unwrap();
+        let mut old = port
+            .conditional_endpoint(proposal_node, proposal.len())
+            .unwrap()
+            .unwrap();
+        let mut new = port
+            .conditional_endpoint(counter_node, counter.len())
+            .unwrap()
+            .unwrap();
+        assert!(old.comparable(&new));
+        let EndpointBasis::OwnCpu {
+            base_condition: old_condition,
+            ..
+        } = &mut old.basis
+        else {
+            panic!("actual accepted own CPU fixture")
+        };
+        old_condition.push_str(";nnuec-context-binding=original-view");
+        assert!(!old.comparable(&new));
+        let EndpointBasis::OwnCpu {
+            base_condition: new_condition,
+            ..
+        } = &mut new.basis
+        else {
+            panic!("actual accepted own CPU fixture")
+        };
+        new_condition.push_str(";nnuec-context-binding=other-view");
+        assert!(!old.comparable(&new));
+    }
 }
 
 #[derive(Clone)]
@@ -1132,7 +1175,13 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .observations
             .get(observation_id)?;
         let task = self.engine.semantic.stores.tasks.get(execution)?;
-        let base_condition = self.engine.cpu_condition();
+        let base_condition = task
+            .key
+            .cpu_condition
+            .clone()
+            .ok_or(StoreError::InvalidEvidence(
+                "adaptive conditional CPU condition missing",
+            ))?;
         let descriptor = self.engine.owned_descriptor()?;
         let profile = stable_id(descriptor.config.profile.identity());
         let condition = stable_id(&format!(
@@ -1155,11 +1204,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             || observation.model_value_identity.is_some()
             || observation.cpu_condition.is_none()
             || observation.cpu_condition != task.key.cpu_condition
-            || task
-                .key
-                .cpu_condition
-                .as_ref()
-                .is_none_or(|actual| actual != &base_condition)
+            || !self.conditional_cpu_task_condition_matches(
+                accepted,
+                &task.key,
+                execution,
+                observation_id,
+            )
             || task.key.state != endpoint.state
             || task.key.line.is_some()
             || task.key.question != TaskQuestion::AnalyzePosition

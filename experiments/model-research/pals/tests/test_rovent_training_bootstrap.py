@@ -156,6 +156,37 @@ def recovered_resume(value):
     return value
 
 
+def recovered_r_auxiliary_fixture():
+    """Separate R raw file/parameter identities; no P/C record conversion."""
+    value = recovered_fixture()
+    registration = value["registration"]
+    pc = registration["current_dataset"]
+    seal = lambda label: hashlib.sha256(label.encode()).hexdigest()
+    original = lambda label: {"path": "original-source/" + label + ".json", "sha256": seal(label + " original bytes"),
+        "bytes": 17, "source": "fixture-original-declaration", "license": "MIT"}
+    request = {"root": "/tmp/rovent-fixture-r-history",
+        "publication": pin("/tmp/rovent-fixture-r-history/r-publication.json", b"separate original R publication"),
+        "collection_source_commit": pc["collection_source_commit"], "collection_source_sha256": pc["collection_source_sha256"],
+        "collection_runtime_library_sha256": pc["collection_runtime_library_sha256"],
+        "collection_model_semantics_sha256": pc["model_semantics_sha256"], "collection_model_epoch": pc["model_epoch"],
+        "collection_context_epoch": pc["context_epoch"], "collection_recipe_sha256": pc["recipe_sha256"],
+        "collection_stage_id": pc["stage_id"], "nnuec_parameter_sha256": seal("parsed R NNUEC parameters"),
+        "nnuec": {"schema": "rz-nnuec-fp32-v2",
+            "semantics": "board800-exactb192-causal-line-kind4-directedpair-originfirst-exactc256-fp32-v2",
+            "encoding": "rz-nnuec-fp32-input/2", "implementation_sha256": seal("original implementation"),
+            "configuration_sha256": seal("original config"), "weights": original("weights"), "provenance": original("provenance"),
+            "diagnostic": False, "context_namespace_policy_sha256": seal("original context namespace"),
+            "local_namespace_policy_sha256": seal("original local namespace"), "search_conditions_sha256": seal("original search")}}
+    registration["r_auxiliary_dataset"] = request
+    value["r_auxiliary_admission"] = {"schema": "rz-rovent-recovered-r-dataset-set/1",
+        "current_publication_sha256": request["publication"]["sha256"], "ancestor_publication_sha256": [],
+        "manifest_file_sha256": seal("raw R manifest bytes"), "index_file_sha256": seal("raw R index bytes"),
+        "nnuec_parameter_sha256": request["nnuec_parameter_sha256"], "record_count": 3,
+        "past_native_authority_reissued": False, "past_physical_completion_reissued": False,
+        "historical_evidence_only": True, "execution_authorized": False}
+    return value
+
+
 def validate_recovered(value, **changes):
     raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
     arguments = {"expected_sha256": hashlib.sha256(raw).hexdigest(), "expected_bytes": len(raw),
@@ -209,6 +240,89 @@ class RoventRecoveredBootstrapProjectionTests(unittest.TestCase):
         value["dependency_directories"].reverse()
         with self.assertRaisesRegex(ValueError, "identity roster"):
             validate_recovered(value)
+
+    def test_r_auxiliary_absent_and_null_presence_are_preserved_without_startup_defaults(self):
+        absent = recovered_fixture()
+        checked_absent = validate_recovered(absent)
+        self.assertNotIn("r_auxiliary_dataset", checked_absent["registration"])
+        self.assertNotIn("ancestor_r_auxiliary_datasets", checked_absent["registration"])
+        self.assertNotIn("r_auxiliary_admission", checked_absent)
+        explicit = recovered_fixture()
+        explicit["registration"].update(r_auxiliary_dataset=None, ancestor_r_auxiliary_datasets=None)
+        checked = validate_recovered(explicit)
+        self.assertIsNone(checked["registration"]["r_auxiliary_dataset"])
+        self.assertIsNone(checked["registration"]["ancestor_r_auxiliary_datasets"])
+        self.assertNotEqual(json.dumps(checked_absent, sort_keys=True), json.dumps(checked, sort_keys=True))
+        explicit["r_auxiliary_admission"] = None
+        with self.assertRaisesRegex(ValueError, "disabled R auxiliary"):
+            validate_recovered(explicit)
+
+    def test_r_auxiliary_enabled_source_keeps_raw_weights_separate_from_parameters_and_pc(self):
+        value = recovered_r_auxiliary_fixture()
+        checked = validate_recovered(value)
+        r = checked["registration"]["r_auxiliary_dataset"]
+        self.assertNotEqual(r["nnuec"]["weights"]["sha256"], r["nnuec_parameter_sha256"])
+        self.assertNotEqual(r["publication"]["sha256"], checked["registration"]["current_dataset"]["publication"]["sha256"])
+        self.assertFalse(checked["r_auxiliary_admission"]["execution_authorized"])
+        self.assertEqual(checked["r_auxiliary_admission"]["nnuec_parameter_sha256"], r["nnuec_parameter_sha256"])
+        changed = copy.deepcopy(value)
+        changed["r_auxiliary_admission"]["nnuec_parameter_sha256"] = r["nnuec"]["weights"]["sha256"]
+        with self.assertRaisesRegex(ValueError, "cannot alias P/C data"):
+            validate_recovered(changed)
+
+    def test_r_auxiliary_admission_cannot_claim_past_process_or_current_training_authority(self):
+        for name in ("past_native_authority_reissued", "past_physical_completion_reissued", "execution_authorized"):
+            value = recovered_r_auxiliary_fixture()
+            value["r_auxiliary_admission"][name] = True
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "historical authority"):
+                validate_recovered(value)
+        value = recovered_r_auxiliary_fixture()
+        value.pop("r_auxiliary_admission")
+        with self.assertRaisesRegex(ValueError, "fields mismatch"):
+            validate_recovered(value)
+
+    def test_r_auxiliary_ancestor_presence_and_sorted_distinct_publication_roster_are_strict(self):
+        disabled = recovered_fixture()
+        disabled["registration"]["ancestor_r_auxiliary_datasets"] = []
+        with self.assertRaisesRegex(ValueError, "enabled current R dataset"):
+            validate_recovered(disabled)
+        value = recovered_r_auxiliary_fixture()
+        value["registration"]["ancestor_r_auxiliary_datasets"] = []
+        self.assertEqual(validate_recovered(value), value)
+        source = value["registration"]["r_auxiliary_dataset"]
+        value["registration"]["ancestor_r_auxiliary_datasets"] = [copy.deepcopy(source)]
+        with self.assertRaisesRegex(ValueError, "distinct from current"):
+            validate_recovered(value)
+
+    def test_r_auxiliary_window_join_preserves_presence_and_original_raw_file_pins(self):
+        value = recovered_r_auxiliary_fixture()
+        registration, admission = value["registration"], value["r_auxiliary_admission"]
+        dataset, rsource = registration["current_dataset"], registration["r_auxiliary_dataset"]
+        window = {"schema": bootstrap.RECOVERED_WINDOW_DOMAIN, "window_id": value["window_id"],
+            "trainer_source_sha256": registration["trainer_source_sha256"],
+            "trainer_python_executable_sha256": registration["trainer_python_executable"]["sha256"],
+            "trainer_dependency_set_sha256": registration["trainer_dependency_set_sha256"],
+            "trainer_dependency_scope": bootstrap.DEPENDENCY_SCOPE,
+            "collection_source_sha256": dataset["collection_source_sha256"],
+            "collection_runtime_library_sha256": dataset["collection_runtime_library_sha256"],
+            "collection_model_semantics_sha256": dataset["model_semantics_sha256"],
+            "collection_model_epoch": dataset["model_epoch"], "collection_context_epoch": dataset["context_epoch"],
+            "recipe_sha256": dataset["recipe_sha256"], "stage_id": dataset["stage_id"], "device": "cpu",
+            "max_output_bytes": 1024, "training_model_semantics_sha256": dataset["model_semantics_sha256"],
+            "nnuec_semantics": rsource["nnuec"]["semantics"],
+            "nnuec_r_auxiliary": {"schema": "rz-rovent-r-auxiliary-recipe/1",
+                "manifest_file_sha256": admission["manifest_file_sha256"], "index_file_sha256": admission["index_file_sha256"],
+                "sampling_seed": 31, "rows_per_pc_update": 1, "weight": 0.5, "normalization": "valid_exact_trajectory_rows",
+                "optimizer_owner": "exclusive_nnuec", "supervision_source": "r_auxiliary_only_preserve_pc_evidence"}}
+        self.assertFalse(bootstrap.validate_recovered_window_binding(value, window)["execution_authorized"])
+        no_recipe = copy.deepcopy(window)
+        no_recipe.pop("nnuec_r_auxiliary")
+        with self.assertRaisesRegex(ValueError, "preserve exact presence"):
+            bootstrap.validate_recovered_window_binding(value, no_recipe)
+        changed = copy.deepcopy(window)
+        changed["nnuec_r_auxiliary"]["manifest_file_sha256"] = rsource["nnuec_parameter_sha256"]
+        with self.assertRaisesRegex(ValueError, "raw file pins"):
+            bootstrap.validate_recovered_window_binding(value, changed)
 
     def test_new_projection_has_distinct_data_python_dependency_and_source_namespaces(self):
         value = recovered_fixture()

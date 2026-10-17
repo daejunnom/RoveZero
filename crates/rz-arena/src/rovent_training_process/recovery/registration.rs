@@ -80,6 +80,8 @@ pub struct RoventTrainWindowV2 {
     pub training_seed: u32,
     pub loss_weights: BTreeMap<String, f64>,
     pub nnuec_loss: RoventNnuecLoss,
+    #[serde(default, skip_serializing_if = "RoventRAuxiliaryPresence::is_absent")]
+    pub nnuec_r_auxiliary: RoventRAuxiliaryPresence<RoventRAuxiliaryRecipe>,
     pub max_updates: u64,
     pub max_groups: u64,
     pub max_samples: u64,
@@ -97,6 +99,9 @@ pub struct RoventNnuecLoss {
 }
 impl RoventTrainWindowV2 {
     pub fn validate(&self) -> Result<(), ArenaError> {
+        if let Some(auxiliary) = self.nnuec_r_auxiliary.enabled() {
+            auxiliary.validate()?;
+        }
         check(
             self.schema == ROVENT_TRAIN_WINDOW_V2
                 && [&self.window_id, &self.stage_id, &self.nnuec_semantics]
@@ -202,6 +207,9 @@ impl RoventTrainWindowV2 {
         normalize_coefficients(&mut value["optimizer"])?;
         normalize_coefficients(&mut value["loss_weights"])?;
         normalize_coefficients(&mut value["nnuec_loss"]["weight"])?;
+        if self.nnuec_r_auxiliary.enabled().is_some() {
+            normalize_coefficients(&mut value["nnuec_r_auxiliary"]["weight"])?;
+        }
         digest_value(
             ROVENT_TRAIN_PROFILE_V2,
             &json!({"algorithm":ROVENT_TRAIN_PROFILE_COEFFICIENT_CODEC,"window":value}),
@@ -283,6 +291,12 @@ pub struct RoventRecoveredTrainingRegistration {
     pub runtime_endpoints: Vec<RoventTrainerRuntimeEndpoint>,
     pub current_dataset: RoventHistoricalDatasetRegistration,
     pub ancestor_datasets: Vec<RoventHistoricalDatasetRegistration>,
+    #[serde(default, skip_serializing_if = "RoventRAuxiliaryPresence::is_absent")]
+    pub r_auxiliary_dataset:
+        RoventRAuxiliaryPresence<RoventHistoricalRAuxiliaryDatasetRegistration>,
+    #[serde(default, skip_serializing_if = "RoventRAuxiliaryPresence::is_absent")]
+    pub ancestor_r_auxiliary_datasets:
+        RoventRAuxiliaryPresence<Vec<RoventHistoricalRAuxiliaryDatasetRegistration>>,
     pub initialization_source: RoventTrainingInputSource,
     pub rules_profile: RoventTrainingFilePin,
     pub expected_initial_completed: BTreeMap<String, u64>,
@@ -328,6 +342,37 @@ impl RoventRecoveredTrainingRegistration {
             "recovery registration identity/source/endpoint inventory",
         )?;
         self.resources_policy.validate()?;
+        if let Some(dataset) = self.r_auxiliary_dataset.enabled() {
+            dataset.validate()?;
+        }
+        if let Some(ancestors) = self.ancestor_r_auxiliary_datasets.enabled() {
+            check(
+                ancestors.len() <= 256
+                    && (self.r_auxiliary_dataset.enabled().is_some()
+                        || !matches!(
+                            self.initialization_source,
+                            RoventTrainingInputSource::Initialize { .. }
+                        )),
+                "R ancestry requires a bounded current R source or an explicit historical checkpoint",
+            )?;
+            check(
+                ancestors
+                    .windows(2)
+                    .all(|pair| pair[0].publication.sha256 < pair[1].publication.sha256),
+                "R ancestor publications must have original sorted unique pins",
+            )?;
+            let mut publications = BTreeSet::new();
+            if let Some(current) = self.r_auxiliary_dataset.enabled() {
+                publications.insert(current.publication.sha256.clone());
+            }
+            for ancestor in ancestors {
+                ancestor.validate()?;
+                check(
+                    publications.insert(ancestor.publication.sha256.clone()),
+                    "duplicate current/ancestor R publication",
+                )?;
+            }
+        }
         for pin in [
             &self.recipe,
             &self.membership,
@@ -426,6 +471,25 @@ impl RoventRecoveredTrainingRegistration {
     pub fn join_window(&self, window: &RoventTrainWindowV2) -> Result<(), ArenaError> {
         self.validate()?;
         window.validate()?;
+        check(
+            window.nnuec_r_auxiliary.state() == self.r_auxiliary_dataset.state(),
+            "window and R dataset presence differ; null/absence may not be aliased",
+        )?;
+        if let Some(dataset) = self.r_auxiliary_dataset.enabled() {
+            check(
+                dataset.collection_source_sha256 == window.collection_source_sha256
+                    && dataset.collection_runtime_library_sha256
+                        == window.collection_runtime_library_sha256
+                    && dataset.collection_model_semantics_sha256
+                        == window.collection_model_semantics_sha256
+                    && dataset.collection_context_epoch == window.collection_context_epoch
+                    && dataset.collection_recipe_sha256 == window.recipe_sha256
+                    && dataset.collection_stage_id == window.stage_id
+                    && dataset.nnuec.semantics == window.nnuec_semantics
+                    && dataset.nnuec_parameter_sha256 == window.nnuec_collection_model_sha256,
+                "R dataset changed original collection identities",
+            )?;
+        }
         check(
             window.trainer_source_sha256 == self.trainer_source_sha256
                 && window.trainer_python_executable_sha256 == self.trainer_python_executable.sha256
@@ -537,6 +601,7 @@ mod tests {
                 normalization: "valid_rows".into(),
                 weight: 0.5,
             },
+            nnuec_r_auxiliary: RoventRAuxiliaryPresence::Absent,
             max_updates: 4,
             max_groups: 4,
             max_samples: 32,

@@ -47,23 +47,39 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         physical: AdaptivePortRoleEvidence,
         clock: ClockDomain,
         now: MonotonicTick,
-    ) -> Result<bool, FrontierError> {
+    ) -> Result<bool, PalsError> {
         if !self.rovent_goal_work_live(work)? {
             return Ok(false);
         }
         let kind = fresh_kind(work.input.stage).ok_or(FrontierError::MissingAcceptance)?;
-        self.with_rovent_frontier(|frontier, stores| {
-            let Some(obligation) = frontier.adaptive_obligation(work.frame, kind)? else {
+        // Capacity and original physical/source validation precede head use.
+        // The controller is the only place that may close its responsibility.
+        let obligation = self
+            .rovent_frontier()
+            .ok_or(FrontierError::ForeignRoot)?
+            .adaptive_obligation(work.frame, kind)?;
+        let Some(obligation) = obligation else {
+            self.with_rovent_frontier(|frontier, stores| {
                 frontier.observe_local_question(work, stores, clock, now)?;
-                return Ok(false);
-            };
+                Ok(())
+            })?;
+            return Ok(false);
+        };
+        let permit = self.prepare_fresh_source_use(work, accepted, output, physical)?;
+        self.with_rovent_frontier(|frontier, stores| {
             let endpoint = frontier.observe_local_question(work, stores, clock, now)?;
-            frontier.accept_local_fresh_endpoint_once(
+            // Shallow Fresh is real progress and consumption, while only the
+            // controller's Closed disposition finishes the original duty.
+            frontier.accept_local_fresh_horizon_once(
                 obligation, work, stores, endpoint, accepted, output, physical, clock, now,
             )?;
-            Ok(true)
+            Ok(())
         })?
-        .ok_or(FrontierError::ForeignRoot)
+        .ok_or(FrontierError::ForeignRoot)?;
+        if let Some(permit) = permit {
+            self.record_used_fresh_source(permit)?;
+        }
+        Ok(true)
     }
 
     /// Rules terminal is exact evidence for this endpoint. CPU/NN values,
