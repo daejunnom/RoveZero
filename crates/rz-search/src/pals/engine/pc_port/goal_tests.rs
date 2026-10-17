@@ -242,7 +242,20 @@ fn terminal_selected_child_closes_rules_duty_without_an_extra_role_call() {
         .unwrap();
     assert!(port.next_role().unwrap().is_none());
     let receipt = port.rovent_frontier_receipt().unwrap();
-    assert_eq!(receipt.snapshot.goal, FrontierGoalStatus::DepthSatisfied);
+    assert_eq!(receipt.snapshot.goal, FrontierGoalStatus::MateSatisfied);
+    assert!(receipt.snapshot.horizon.target_satisfied);
+    assert_eq!(receipt.snapshot.horizon.completed_depth.unwrap().0, 1);
+    assert_eq!(receipt.snapshot.horizon.maximum_examined_ply.0, 1);
+    let strategy = receipt.snapshot.mate_strategy.as_ref().unwrap();
+    assert_eq!(strategy.best_move(), roots[0]);
+    assert!(strategy.root_restricted());
+    assert!(strategy.validates_root(
+        &port.owner.semantic.nodes[port.root].position.snapshot(),
+        &roots,
+    ));
+    assert_eq!(strategy.conclusion().exact_uci_mate(), Some(1));
+    assert_eq!(receipt.snapshot.work.checked_transitions, 1);
+    assert_eq!(receipt.snapshot.work.native_nodes, 0);
     assert_eq!(receipt.snapshot.registered_frames, 1);
     assert_eq!(receipt.snapshot.completed_frames, 1);
     assert_eq!(port.counters.submitted_role_calls, 1);
@@ -255,7 +268,7 @@ fn terminal_selected_child_closes_rules_duty_without_an_extra_role_call() {
     assert_eq!(port.completion, PcPortCompletion::Failed);
     assert_eq!(
         port.rovent_frontier_receipt().unwrap().snapshot.goal,
-        FrontierGoalStatus::DepthSatisfied
+        FrontierGoalStatus::MateSatisfied
     );
 }
 

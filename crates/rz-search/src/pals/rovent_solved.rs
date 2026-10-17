@@ -964,16 +964,23 @@ mod tests {
         for movement in ["a2a3", "a7a6", "f1g1"] {
             position.make_uci(movement).unwrap();
         }
-        let allowed = [mv("g8h8"), mv("g8f8"), mv("g8h7")];
+        // Qg1 checks the king: these three king evasions are the full legal
+        // root domain. Passing all of them via Some would remain unrestricted.
+        let legal = position.legal_moves();
+        assert_eq!(legal.len(), 3);
+        assert!(
+            [mv("g8h8"), mv("g8f8"), mv("g8h7")]
+                .iter()
+                .all(|movement| legal.contains(movement))
+        );
+        let allowed = [mv("g8h8"), mv("g8f8")];
+        assert!(allowed.len() < legal.len());
+        assert!(legal.contains(&mv("g8h7")) && !allowed.contains(&mv("g8h7")));
         let mut proof =
             MateProofStore::new(&position, Color::White, ChessPly(4), Some(&allowed), 32).unwrap();
         let root = proof.root();
         assert!(proof.root_strategy().is_none());
-        for branch in [
-            &["g8h8", "g1g7"][..],
-            &["g8h7", "g1g7"][..],
-            &["g8f8", "g1g7", "f8e8", "g7e7"][..],
-        ] {
+        for branch in [&["g8h8", "g1g7"][..], &["g8f8", "g1g7", "f8e8", "g7e7"][..]] {
             let mut parent = root;
             for movement in branch {
                 parent = proof.open_child(parent, mv(movement)).unwrap();
