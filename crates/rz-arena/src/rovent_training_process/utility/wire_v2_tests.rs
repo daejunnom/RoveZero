@@ -6,11 +6,24 @@
 use super::execution::{
     RoventUtilityCheckpointReference, RoventUtilityDatasetReference, RoventUtilityExecutionAction,
     RoventUtilityFrozenPcSource, RoventUtilityInitializationSource, RoventUtilityRequiredNullable,
+    RoventUtilityTrainWindow,
 };
 use super::execution_v2::{
     ROVENT_UTILITY_EXECUTION_REGISTRATION_V2, RoventUtilityAncestorDatasetRegistration,
     RoventUtilityExecutionRegistrationV2,
 };
+use super::registration::{
+    ROVENT_UTILITY_BASE_SCHEMA, ROVENT_UTILITY_BASE_SEMANTICS, ROVENT_UTILITY_COST_OBJECTIVE,
+    ROVENT_UTILITY_FROZEN_COMPONENTS, ROVENT_UTILITY_SCHEMA, ROVENT_UTILITY_SEMANTICS,
+    RoventUtilityBaseConfig, RoventUtilityFrozenBase, RoventUtilityInitialParameters,
+    RoventUtilityParameter, RoventUtilityParameterNames, RoventUtilityParameterSpec,
+    RoventUtilityParameters, RoventUtilityTrainingRecipe,
+};
+use super::registration_cohort::{
+    ROVENT_UTILITY_COHORT_COST_SCOPE, RoventUtilityCohortSourceRegistration,
+    prepare_utility_cohort_training, validate_utility_cohort_preparation,
+};
+use super::window_v2::{ROVENT_UTILITY_WINDOW_DOMAIN_V2, RoventUtilityTrainWindowV2};
 use crate::rovent_training_process::recovery::metadata_wire_tests::decode_python_fixture;
 use crate::rovent_training_process::recovery::{
     RoventHistoricalDatasetRegistration, RoventHistoricalRAuxiliaryDatasetRegistration,
@@ -126,6 +139,72 @@ fn utility_source(label: &str) -> RoventUtilityDatasetReference {
             &format!("{label}-original-durable-ack"),
         ),
     }
+}
+
+fn cohort_preparation(trainer_source_sha256: &str) -> Value {
+    let recipe = RoventUtilityTrainingRecipe::fixed("utility-v2-wire-owner").unwrap();
+    let config = RoventUtilityBaseConfig {
+        board_width: 2,
+        line_width: 3,
+        context_width: 4,
+        local_width: 5,
+        hidden_width: 6,
+        causal_window: 3,
+        max_lines: 64,
+        max_plies: 256,
+    };
+    let parameter = |name: &str, shape: Vec<u32>| RoventUtilityParameter {
+        checkpoint_path: format!("parameters.{name}"),
+        shape,
+        dtype: "float32".into(),
+        planned_requires_grad: true,
+    };
+    let spec = RoventUtilityParameterSpec {
+        hidden_width: 2,
+        input_width: config.utility_input_width().unwrap(),
+        wire_to_parameter: RoventUtilityParameterNames {
+            hidden_weights: "utility.hidden_weights".into(),
+            hidden_bias: "utility.hidden_bias".into(),
+            output_weights: "utility.output_weights".into(),
+            output_bias: "utility.output_bias".into(),
+        },
+        parameters: RoventUtilityParameters {
+            hidden_weights: parameter("hidden_weights", vec![2, 17]),
+            hidden_bias: parameter("hidden_bias", vec![2]),
+            output_weights: parameter("output_weights", vec![7, 2]),
+            output_bias: parameter("output_bias", vec![7]),
+        },
+        optimizer_owner: recipe.optimizer_owner.clone(),
+        frozen_components: ROVENT_UTILITY_FROZEN_COMPONENTS
+            .iter()
+            .map(|name| (*name).into())
+            .collect(),
+    };
+    let parameter_spec_sha256 = spec
+        .canonical_sha256(&config, &recipe.optimizer_owner)
+        .unwrap();
+    let source = RoventUtilityCohortSourceRegistration {
+        collection_source_sha256: h("v2-current-collection-source"),
+        trainer_source_sha256: trainer_source_sha256.into(),
+        cost_epoch_sha256: h("v2-original-cohort-cost-epoch"),
+        resource_profile_sha256: h("v2-original-resource-profile"),
+        cost_scope: ROVENT_UTILITY_COHORT_COST_SCOPE.into(),
+        objective: ROVENT_UTILITY_COST_OBJECTIVE.into(),
+        frozen_base: RoventUtilityFrozenBase {
+            schema: ROVENT_UTILITY_BASE_SCHEMA.into(),
+            semantics: ROVENT_UTILITY_BASE_SEMANTICS.into(),
+            weights_sha256: h("v2-base-semantic-parameter-identity"),
+            config,
+        },
+        utility: RoventUtilityInitialParameters {
+            schema: ROVENT_UTILITY_SCHEMA.into(),
+            semantics: ROVENT_UTILITY_SEMANTICS.into(),
+            initial_weights_sha256: h("v2-initial-utility-semantic-parameter-identity"),
+            base_weights_sha256: h("v2-base-semantic-parameter-identity"),
+            parameter_spec_sha256,
+        },
+    };
+    prepare_utility_cohort_training(&recipe, &source, &spec).unwrap()
 }
 
 fn fixture() -> Value {
@@ -249,6 +328,63 @@ fn fixture() -> Value {
         max_artifact_files: 256,
     };
     registration.validate().unwrap();
+    let preparation = cohort_preparation(&registration.trainer_source_sha256);
+    let preparation_sha256 = validate_utility_cohort_preparation(&preparation).unwrap();
+    let window = RoventUtilityTrainWindowV2 {
+        schema: ROVENT_UTILITY_WINDOW_DOMAIN_V2.into(),
+        window_id: "utility-v2-wire-window".into(),
+        run_id: "utility-v2-wire-run".into(),
+        preparation_sha256: preparation_sha256.clone(),
+        dataset_sha256: h("v2-current-canonical-dataset-seal"),
+        device: "cpu".into(),
+        precision: "fp32".into(),
+        tf32: false,
+        deterministic: true,
+        cpu_threads: 2,
+        interop_threads: 1,
+        training_seed: 31,
+        microbatch: 1,
+        accumulation: 8,
+        max_optimizer_updates: 4,
+        checkpoint_every_updates: 2,
+        max_wall_time_ns: 60_000_000_000,
+        checkpoint_reserve_ns: 5_000_000_000,
+        cleanup_time_ns: 30_000_000_000,
+        max_read_bytes: registration.max_child_read_bytes,
+        max_output_bytes: 1 << 20,
+        max_groups: 16,
+        max_contexts: 128,
+    };
+    registration
+        .join_cohort_window(&window, &preparation)
+        .unwrap();
+    // This is an independent original /1 struct literal for codec
+    // compatibility. It is not produced by removing or defaulting /2 fields.
+    let legacy_window = RoventUtilityTrainWindow {
+        schema: super::execution::ROVENT_UTILITY_WINDOW_DOMAIN.into(),
+        window_id: "utility-v2-wire-window".into(),
+        run_id: "utility-v2-wire-run".into(),
+        preparation_sha256: preparation_sha256.clone(),
+        dataset_sha256: h("v2-current-canonical-dataset-seal"),
+        device: "cpu".into(),
+        precision: "fp32".into(),
+        tf32: false,
+        deterministic: true,
+        cpu_threads: 2,
+        interop_threads: 1,
+        training_seed: 31,
+        microbatch: 1,
+        accumulation: 8,
+        max_optimizer_updates: 4,
+        checkpoint_every_updates: 2,
+        max_wall_time_ns: 60_000_000_000,
+        cleanup_time_ns: 30_000_000_000,
+        max_read_bytes: 8 << 20,
+        max_output_bytes: 1 << 20,
+        max_groups: 16,
+        max_contexts: 128,
+    };
+    legacy_window.join_cohort_preparation(&preparation).unwrap();
     let expected_ancestor_kinds = registration
         .ancestor_datasets
         .iter()
@@ -259,7 +395,11 @@ fn fixture() -> Value {
         .iter()
         .map(|ancestor| generation_digest(ANCESTOR_WIRE_DOMAIN, ancestor).unwrap())
         .collect::<Vec<_>>();
-    json!({"schema":FIXTURE_DOMAIN,"registration":registration,
+    json!({"schema":FIXTURE_DOMAIN,"registration":registration,"preparation":preparation,
+        "window":window,"legacy_window":legacy_window,
+        "expected_preparation_sha256":preparation_sha256,
+        "expected_window_sha256":window.canonical_sha256().unwrap(),
+        "expected_legacy_window_sha256":legacy_window.canonical_sha256().unwrap(),
         "expected_registration_sha256":registration.canonical_sha256().unwrap(),
         "expected_ancestor_kinds":expected_ancestor_kinds,
         "expected_ancestor_metadata_sha256":expected_ancestor_metadata_sha256})
@@ -279,9 +419,14 @@ struct Accepted {
     schema: String,
     status: String,
     registration_sha256: String,
+    preparation_sha256: String,
+    window_sha256: String,
+    legacy_window_sha256: String,
     ancestor_kinds: Vec<String>,
     ancestor_metadata_sha256: Vec<String>,
     original_v1_decoder_rejected: bool,
+    original_v1_window_compatible: bool,
+    window_families_kept_separate: bool,
     historical_family_coverage_verified: bool,
     performed_optimizer_updates: u64,
     past_native_authority_reissued: bool,
@@ -362,6 +507,15 @@ fn actual_v2_registration_preserves_all_four_original_tagged_payloads() {
         result.registration_sha256
     );
     assert_eq!(
+        fixture["expected_preparation_sha256"],
+        result.preparation_sha256
+    );
+    assert_eq!(fixture["expected_window_sha256"], result.window_sha256);
+    assert_eq!(
+        fixture["expected_legacy_window_sha256"],
+        result.legacy_window_sha256
+    );
+    assert_eq!(
         fixture["expected_ancestor_kinds"],
         json!(result.ancestor_kinds)
     );
@@ -370,11 +524,110 @@ fn actual_v2_registration_preserves_all_four_original_tagged_payloads() {
         json!(result.ancestor_metadata_sha256)
     );
     assert!(result.original_v1_decoder_rejected);
+    assert!(result.original_v1_window_compatible);
+    assert!(result.window_families_kept_separate);
     assert!(!result.historical_family_coverage_verified);
     assert_eq!(result.performed_optimizer_updates, 0);
     assert!(!result.past_native_authority_reissued);
     assert!(!result.execution_authorized);
     assert!(!result.neural_imports);
+}
+
+#[test]
+fn actual_window_v2_reserve_and_original_window_v1_have_separate_canonical_contracts() {
+    let fixture = fixture();
+    let window = &fixture["window"];
+    let legacy = &fixture["legacy_window"];
+    assert_eq!(window.as_object().unwrap().len(), 23);
+    assert_eq!(legacy.as_object().unwrap().len(), 22);
+    assert_eq!(window["schema"], ROVENT_UTILITY_WINDOW_DOMAIN_V2);
+    assert_eq!(
+        legacy["schema"],
+        super::execution::ROVENT_UTILITY_WINDOW_DOMAIN
+    );
+    assert!(legacy.get("checkpoint_reserve_ns").is_none());
+    assert_eq!(
+        window["checkpoint_reserve_ns"].as_u64(),
+        Some(5_000_000_000)
+    );
+    assert!(
+        window["checkpoint_reserve_ns"].as_u64().unwrap()
+            < window["max_wall_time_ns"].as_u64().unwrap()
+    );
+    for (name, value) in legacy.as_object().unwrap() {
+        if name != "schema" {
+            assert_eq!(window.get(name), Some(value));
+        }
+    }
+    assert_eq!(
+        window["max_read_bytes"],
+        fixture["registration"]["max_child_read_bytes"]
+    );
+    assert_ne!(
+        fixture["expected_window_sha256"],
+        fixture["expected_legacy_window_sha256"]
+    );
+    assert_ne!(
+        fixture["expected_preparation_sha256"],
+        fixture["registration"]["preparation"]["sha256"]
+    );
+    let typed: RoventUtilityTrainWindowV2 = serde_json::from_value(window.clone()).unwrap();
+    assert_eq!(
+        typed.canonical_sha256().unwrap(),
+        fixture["expected_window_sha256"]
+    );
+    let original: RoventUtilityTrainWindow = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(
+        original.canonical_sha256().unwrap(),
+        fixture["expected_legacy_window_sha256"]
+    );
+}
+
+#[test]
+fn independent_window_v2_decoder_requires_a_positive_integer_reserve_inside_original_wall() {
+    let original = fixture();
+    let wall = original["window"]["max_wall_time_ns"].clone();
+    let mut cases = Vec::new();
+    let mut missing = original.clone();
+    missing["window"]
+        .as_object_mut()
+        .unwrap()
+        .remove("checkpoint_reserve_ns");
+    cases.push(("missing", missing));
+    for (name, value) in [
+        ("zero", json!(0)),
+        ("equal_wall", wall),
+        ("boolean", json!(true)),
+    ] {
+        let mut changed = original.clone();
+        changed["window"]["checkpoint_reserve_ns"] = value;
+        cases.push((name, changed));
+    }
+    let mut old_schema = original.clone();
+    old_schema["window"]["schema"] = json!(super::execution::ROVENT_UTILITY_WINDOW_DOMAIN);
+    cases.push(("old_schema_with_reserve", old_schema));
+    let mut legacy_shape = original;
+    legacy_shape["window"] = legacy_shape["legacy_window"].clone();
+    cases.push(("old_schema_without_reserve", legacy_shape));
+    for (name, mut changed) in cases {
+        if let Ok(typed) =
+            serde_json::from_value::<RoventUtilityTrainWindowV2>(changed["window"].clone())
+        {
+            assert!(
+                typed.validate().is_err(),
+                "Rust silently accepted invalid /2 reserve case {name}"
+            );
+        }
+        // Keep the declared digest consistent with the mutated wire bytes, so
+        // rejecting these operands cannot rely only on an old expected hash.
+        let domain = changed["window"]["schema"].as_str().unwrap();
+        changed["expected_window_sha256"] =
+            json!(generation_digest(domain, &changed["window"]).unwrap());
+        assert!(
+            !decode(&changed).status.success(),
+            "F silently accepted invalid /2 reserve case {name}"
+        );
+    }
 }
 
 #[test]

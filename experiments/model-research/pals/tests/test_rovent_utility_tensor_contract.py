@@ -139,6 +139,28 @@ class UtilityTensorPureContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "explicit utility tensor execution required"):
                     tensors._runtime(value)
 
+    def test_checkpoint_reserve_precedes_original_execution_without_renewing_it(self):
+        spec = {"schema": run.WINDOW_DOMAIN, "max_wall_time_ns": 100, "checkpoint_reserve_ns": 20}
+        self.assertEqual(run._execution_cutoffs(spec, started_ns=10, execution_until_ns=95), (95, 75))
+        self.assertEqual(run._execution_cutoffs(spec, started_ns=10, execution_until_ns=1000), (110, 90))
+        # A parent deadline consumed by preparation is still the same absolute
+        # deadline; the child's start never earns another full execution lease.
+        self.assertEqual(run._execution_cutoffs(spec, started_ns=90, execution_until_ns=100), (100, 80))
+
+    def test_checkpoint_reserve_is_explicit_bounded_integer_and_never_defaults(self):
+        spec = {"schema": run.WINDOW_DOMAIN, "max_wall_time_ns": 100, "checkpoint_reserve_ns": 20}
+        for value in (0, -1, True, 100, 101, None, "20"):
+            with self.subTest(reserve=value), self.assertRaises(ValueError):
+                run._execution_cutoffs({**spec, "checkpoint_reserve_ns": value}, started_ns=10, execution_until_ns=95)
+        with self.assertRaises(ValueError):
+            run._execution_cutoffs({"schema": run.WINDOW_DOMAIN, "max_wall_time_ns": 100},
+                started_ns=10, execution_until_ns=95)
+        with self.assertRaises(ValueError):
+            run._execution_cutoffs({**spec, "schema": "rz-rovent-utility-train-window/1"},
+                started_ns=10, execution_until_ns=95)
+        with self.assertRaises(ValueError):
+            run._execution_cutoffs(spec, started_ns=2**64 - 1, execution_until_ns=2**64 - 1)
+
     def test_explicit_false_does_not_consult_the_owner_or_checkpoint_path(self):
         class Untouchable:
             def __getattribute__(self, name):

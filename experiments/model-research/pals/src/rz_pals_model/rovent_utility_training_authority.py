@@ -22,8 +22,8 @@ import time
 from .rovent_training_authority import _process_identity
 from .rovent_training_bootstrap import PinnedReadBudget, _strict_json
 from .generation_export import COST_FIELDS
-from .rovent_utility_training_window import (_fields, _identifier, _sha, _uint, utility_window_digest,
-    validate_window_spec, validate_utility_sampler)
+from .rovent_utility_training_window import (_fields, _identifier, _sha, _uint, utility_window_v2_digest,
+    validate_utility_window_v2, validate_utility_sampler)
 
 
 STARTUP_SCHEMA = "rz-rovent-utility-trainer-startup/1"
@@ -274,13 +274,13 @@ class ParentSocketUtilityTrainerAuthority:
         if type(intake) is not HistoricalUtilityRouteDataset:
             raise ValueError("the exact utility historical dataset owner is required")
         admission = intake.observation()
-        checked = validate_window_spec(owner.preparation, spec)
+        checked = validate_utility_window_v2(owner.preparation, spec)
         if admission["dataset_sha256"] != checked["dataset_sha256"]:
             raise ValueError("utility window differs from its original dataset observation")
         validate_utility_sampler(owner.sampler, context_ids=intake.context_ids, pool_sha256=intake.pool_sha256,
             run_id=checked["run_id"], seed=checked["training_seed"])
         payload = {"schema": "rz-rovent-utility-trainer-begin/1", "preparation_sha256": owner.preparation["preparation_sha256"],
-            "window_spec_sha256": utility_window_digest(checked), "dataset_sha256": checked["dataset_sha256"],
+            "window_spec_sha256": utility_window_v2_digest(checked), "dataset_sha256": checked["dataset_sha256"],
             "completed_updates": owner.completed_updates, "ancestor_updates": owner.ancestor_updates,
             # These are the same actual owner's numerical metadata observations.
             # The parent checks raw/semantic assets separately; its serde float

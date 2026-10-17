@@ -902,6 +902,7 @@
       "crates/rz-arena/src/rovent_training_process/utility/execution_v2.rs",
       "crates/rz-arena/src/rovent_training_process/utility/registration.rs",
       "crates/rz-arena/src/rovent_training_process/utility/registration_cohort.rs",
+      "crates/rz-arena/src/rovent_training_process/utility/window_v2.rs",
       "experiments/model-research/pals/src/rz_pals_model/artifacts.py",
       "experiments/model-research/pals/src/rz_pals_model/config.py",
       "experiments/model-research/pals/src/rz_pals_model/generation_chunks.py",
@@ -973,6 +974,7 @@
       "crates/rz-arena/src/rovent_training_process/utility/execution_v2.rs",
       "crates/rz-arena/src/rovent_training_process/utility/registration.rs",
       "crates/rz-arena/src/rovent_training_process/utility/registration_cohort.rs",
+      "crates/rz-arena/src/rovent_training_process/utility/window_v2.rs",
       "experiments/model-research/pals/src/rz_pals_model/artifacts.py",
       "experiments/model-research/pals/src/rz_pals_model/generation_export.py",
       "experiments/model-research/pals/src/rz_pals_model/generation_export_cli.py",
@@ -1153,6 +1155,7 @@
       "crates/rz-arena/src/rovent_training_process/utility/execution_v2.rs",
       "crates/rz-arena/src/rovent_training_process/utility/registration.rs",
       "crates/rz-arena/src/rovent_training_process/utility/registration_cohort.rs",
+      "crates/rz-arena/src/rovent_training_process/utility/window_v2.rs",
       "crates/rz-arena/src/runner.rs"
     ],
     "clock_pgn_audit": [

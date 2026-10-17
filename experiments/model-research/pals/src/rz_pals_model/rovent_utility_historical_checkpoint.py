@@ -21,7 +21,7 @@ from .rovent_training_bootstrap import (PinnedReadBudget, _strict_json, _absolut
 from .rovent_utility_training import COHORT_PREPARATION_DOMAIN, validate_training_preparation
 from .rovent_utility_training_authority import (COST_FIELDS, MAX_COMPLETION_RECEIPT_BYTES,
     validate_utility_checkpoint_cost, _cost, _fields, _sha, _uint, _identifier, _cost_evidence)
-from .rovent_utility_training_window import validate_utility_sampler, next_utility_sample, validate_window_spec, utility_window_digest
+from .rovent_utility_training_window import validate_utility_sampler, next_utility_sample, validate_utility_window_v2, utility_window_v2_digest
 
 
 TENSOR_PROJECTION_DOMAIN = "rz-rovent-utility-tensor-projection/1"
@@ -587,7 +587,7 @@ class _Replay:
             "ancestor_updates", "derived_training_state_sha256", *STATE_FIELDS), "original utility begin")
         self.counts(value)
         expected = {"schema": "rz-rovent-utility-trainer-begin/1", "preparation_sha256": self.window["preparation_sha256"],
-            "window_spec_sha256": utility_window_digest(self.window), "dataset_sha256": self.window["dataset_sha256"],
+            "window_spec_sha256": utility_window_v2_digest(self.window), "dataset_sha256": self.window["dataset_sha256"],
             "initial_source_declaration": self.initial["initial_source_declaration"],
             "frozen_base_mapping_sha256": self.initial["frozen_base_mapping_sha256"],
             "frozen_base_weights_sha256": self.initial["frozen_base_weights_sha256"], "completed_updates": self.completed,
@@ -753,7 +753,7 @@ def _parent_join(initial, registration, parent):
         raise ValueError("original utility initialization tag required")
 
 
-def _closure_join(archive, publication, closure, cost, replay, parent_unknown):
+def _closure_join(archive, publication, closure, cost, replay, parent_unknown, retirement, projection):
     _closure(closure)
     if any(closure[name] != publication[name] for name in ("execution_id", "window_id", "run_id")):
         raise ValueError("utility publication changed original process closure identity")
@@ -801,6 +801,16 @@ def _closure_join(archive, publication, closure, cost, replay, parent_unknown):
             or end["status"] not in ("window_complete", "window_limit", "partial_accumulation_discarded", "export_complete", "export_failed")
             or replay.pending and end["status"] != "partial_accumulation_discarded"):
         raise ValueError("original utility end changed actual dispatch, physical or partial-discard observations")
+    checkpoint = end["checkpoint"]
+    _fields(checkpoint, ("path", "sha256", "bytes", "tensor_projection", "completed_updates", "state_sha256",
+        "snapshot_cost", "post_snapshot_cost"), "original saved utility terminal checkpoint")
+    original_request = retirement["original_request"]
+    if (not _equal({name: checkpoint[name] for name in ("path", "sha256", "bytes")}, original_request["checkpoint"])
+            or not _equal(checkpoint["tensor_projection"], original_request["tensor_projection"])
+            or type(checkpoint["completed_updates"]) is not int or checkpoint["completed_updates"] != projection["completed_updates"]
+            or checkpoint["state_sha256"] != projection["payload_state_sha256"]
+            or any(not _equal(checkpoint[name], original_request[name]) for name in ("snapshot_cost", "post_snapshot_cost"))):
+        raise ValueError("terminal utility checkpoint differs from its actual selected retirement boundary")
     child_reference = _relative_ref(terminal["original_child_terminal"], MAX_PROJECTION_BYTES)
     child = archive.json(child_reference)
     optional = ("error_type", "error_chain_types") if type(child) is dict and "error_type" in child else ()
@@ -825,6 +835,21 @@ def _closure_join(archive, publication, closure, cost, replay, parent_unknown):
         and end["physical_completion"] == "confirmed" and end["quarantined"] is False else "unresolved"), boundary_unknown
 
 
+def _projection_source_join(projection, window, registration, parent):
+    expected_devices = [] if window["device"] == "cpu" else [int(window["device"][5:])]
+    if projection["cuda_devices"] != expected_devices:
+        raise ValueError("original utility tensor CUDA RNG roster differs from its exact window device")
+    if parent is None:
+        expected_source_cost, expected_parent_tensor = None, None
+    else:
+        expected_source_cost = parent["cost"]
+        expected_parent_tensor = (parent["publication"]["tensor"]["sha256"] if registration["initialization_source"]["mode"] == "fork"
+            else parent["projection"]["parent_checkpoint_sha256"])
+    if (not _equal(projection["source_cost_observation"], expected_source_cost)
+            or projection["parent_checkpoint_sha256"] != expected_parent_tensor):
+        raise ValueError("original utility source cost or inherited fork tensor pointer changed")
+
+
 def _source(archive, reference, datasets, *, depth=0):
     if depth > 256 or len(archive.completed) + len(archive.active) >= 257:
         raise ValueError("bounded original utility checkpoint publication ancestry required")
@@ -841,20 +866,16 @@ def _source(archive, reference, datasets, *, depth=0):
         preparation = validate_training_preparation(archive.json(publication["original_preparation"]))
         if preparation["schema"] != COHORT_PREPARATION_DOMAIN:
             raise ValueError("historical actual utility source requires its original cohort preparation/2")
-        window = validate_window_spec(preparation, archive.json(publication["original_window"]))
-        from .rovent_utility_training_bootstrap import (validate_registration,
-            validate_utility_registration_v2, REGISTRATION_DOMAIN, REGISTRATION_V2_DOMAIN)
+        window = validate_utility_window_v2(preparation, archive.json(publication["original_window"]))
+        from .rovent_utility_training_bootstrap import validate_utility_registration_v2
         registration_value = archive.json(publication["original_registration"])
-        if type(registration_value) is dict and registration_value.get("schema") == REGISTRATION_V2_DOMAIN:
-            registration = validate_utility_registration_v2(registration_value)
-        elif type(registration_value) is dict and registration_value.get("schema") == REGISTRATION_DOMAIN:
-            registration = validate_registration(registration_value)
-        else:
-            raise ValueError("explicit original utility registration codec required")
+        # The old /1 parser remains available as its original declaration
+        # codec. It is not an actual cohort learner checkpoint source.
+        registration = validate_utility_registration_v2(registration_value)
         if (any(publication[name] != registration[name] for name in ("execution_id", "trainer_source_sha256", "trainer_dependency_set_sha256"))
                 or publication["trainer_python_executable_sha256"] != registration["trainer_python_executable"]["sha256"]
                 or any(publication[name] != window[name] for name in ("window_id", "run_id", "dataset_sha256", "preparation_sha256"))
-                or publication["window_spec_sha256"] != utility_window_digest(window)
+                or publication["window_spec_sha256"] != utility_window_v2_digest(window)
                 or preparation["preparation_sha256"] != publication["preparation_sha256"]
                 or preparation["registration"]["trainer_source_sha256"] != registration["trainer_source_sha256"]
                 or not _equal(_pin_identity(registration["preparation"]), _pin_identity(publication["original_preparation"]))
@@ -880,6 +901,7 @@ def _source(archive, reference, datasets, *, depth=0):
                 raise ValueError("historical utility relocated files changed original raw byte pins")
         if not _equal(projection["preparation"], preparation):
             raise ValueError("historical utility tensor projection changed original preparation")
+        _projection_source_join(projection, window, registration, parent)
         if (not _equal(initial["initial_source_declaration"], projection["metadata"]["initial_training"])
                 or initial["frozen_base_weights_sha256"] != projection["metadata"]["base_weights_sha256"]
                 or initial["frozen_base_mapping_sha256"] != projection["metadata"]["frozen_base_mapping_sha256"]):
@@ -922,7 +944,7 @@ def _source(archive, reference, datasets, *, depth=0):
             if tail["evidence"] is not None:
                 archive.verify(tail["evidence"], MAX_PROJECTION_BYTES)
         closure = _closure(archive.json(publication["closure"]))
-        classification, boundary_unknown = _closure_join(archive, publication, closure, cost, replay, expected_unknown)
+        classification, boundary_unknown = _closure_join(archive, publication, closure, cost, replay, expected_unknown, retirement, projection)
         if boundary_unknown is not None:
             expected_unknown.append(boundary_unknown)
             expected_unknown.sort(key=lambda item: (item["checkpoint_publication_sha256"], item["execution_id"], item["window_id"]))

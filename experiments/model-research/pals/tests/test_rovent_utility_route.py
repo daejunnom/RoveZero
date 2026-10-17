@@ -33,6 +33,7 @@ try:
     from rz_pals_model.rovent_utility_input import validate_submitted_utility_input
     from rz_pals_model.rovent_historical_corpus import HistoricalRoventCorpus
     from rz_pals_model.rovent_historical_r_corpus import HistoricalRoventRCorpus
+    from rz_pals_model.rovent_corpus_codec import LEGACY_CODEC, SUBMITTED_CODEC
     from test_rovent_utility_input import fixture as capture_fixture, input_mapping
     from test_rovent_utility_cohort_files import (publication_fixture, ack_fixture,
         raw as json_file_bytes, file_pin, payloads)
@@ -98,7 +99,7 @@ def synthetic_files(label):
     return owner
 
 
-def report_fixture(files, captured, prepared, *, split="train", ancestors=(), label="current"):
+def report_fixture(files, captured, prepared, *, split="train", ancestors=(), ancestor_descriptors=(), label="current"):
     registered = prepared["registration"]
     all_pairs = [seal(label + ":pair:" + str(index)) for index in range(3)]
     return {"cohort_id": files.publication()["cohort_id"], "profile_sha256": seal(label + ":profile"),
@@ -114,7 +115,28 @@ def report_fixture(files, captured, prepared, *, split="train", ancestors=(), la
             for role in ("critic", "proposer")],
         "split": split, "opening_id": label + "-opening", "game_id": label + "-game",
         "line_genealogy_id": label + "-line", "transposition_sha256": seal(label + ":transposition"),
-        "ancestor_dataset_publication_sha256": sorted(ancestors)}
+        "rules_state_sha256": seal(label + ":rules-state"),
+        "ancestor_dataset_publication_sha256": sorted(ancestors),
+        "ancestor_datasets": copy.deepcopy(list(ancestor_descriptors))}
+
+
+def synthetic_corpus(owner):
+    metadata = owner._synthetic_metadata
+    return SimpleNamespace(_records=owner._synthetic_records,
+        corpus_sha256=metadata["manifest_file_sha256"], index_sha256=metadata["index_file_sha256"],
+        manifest_semantic_sha256=metadata["canonical_manifest_sha256"],
+        index_semantic_sha256=metadata["canonical_index_sha256"])
+
+
+def ancestor_descriptor(owner):
+    """Expected descriptor from fixture getters, not the route's assembler."""
+    if type(owner) is route.HistoricalUtilityRouteDataset:
+        observed = owner.observation()
+        return {"kind": "utility_cohort", "publication_sha256": observed["publication_sha256"],
+            "metadata": {"dataset_sha256": observed["dataset_sha256"], "pool_sha256": owner.pool_sha256,
+                "preparation_sha256": observed["preparation_sha256"], "context_sha256": owner.context_ids[0]}}
+    return {"kind": owner._synthetic_kind, "publication_sha256": owner._synthetic_publication_sha256,
+        "metadata": copy.deepcopy(owner._synthetic_metadata)}
 
 
 class UtilityRouteAssemblyTests(unittest.TestCase):
@@ -138,8 +160,7 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
         for owner_type in (HistoricalRoventCorpus, HistoricalRoventRCorpus):
             for patcher in (mock.patch.object(owner_type, "observation", lambda item: {
                     "publication_sha256": item._synthetic_publication_sha256}),
-                    mock.patch.object(owner_type, "corpus", property(lambda item: SimpleNamespace(
-                        _records=item._synthetic_records)))):
+                    mock.patch.object(owner_type, "corpus", property(synthetic_corpus))):
                 patcher.start()
                 self.addCleanup(patcher.stop)
 
@@ -158,9 +179,15 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
         return result
 
     def typed_ancestor(self, kind, *, publication, rows):
-        owner_type = HistoricalRoventCorpus if kind == "pc" else HistoricalRoventRCorpus
+        owner_type = HistoricalRoventCorpus if kind in ("pc", "pc_legacy", "pc_submitted_input_v1") else HistoricalRoventRCorpus
         owner = owner_type.__new__(owner_type)
         owner._synthetic_publication_sha256, owner._synthetic_records = publication, copy.deepcopy(rows)
+        owner._synthetic_kind = ("pc_submitted_input_v1" if kind == "pc_submitted_input_v1" else
+            "pc_legacy" if owner_type is HistoricalRoventCorpus else "r_auxiliary")
+        owner._synthetic_metadata = {name: seal(publication + ":" + name) for name in
+            ("manifest_file_sha256", "index_file_sha256", "canonical_manifest_sha256", "canonical_index_sha256")}
+        if owner_type is HistoricalRoventCorpus:
+            owner._codec = SUBMITTED_CODEC if kind == "pc_submitted_input_v1" else LEGACY_CODEC
         return owner
 
     def row(self, kind, *, split="train", label="other", opening=None, rules_state=None):
@@ -199,7 +226,7 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
                 "target_sha256", "submission_target_sha256", "utility_context_sha256", "collection_source_sha256",
                 "cost_epoch_sha256", "resource_profile_sha256", "frozen_base_weights_sha256", "split",
                 "opening_id", "game_id", "line_genealogy_id", "transposition_sha256",
-                "ancestor_dataset_publication_sha256", "all_pair_sha256", "known_pair_sha256", "known_pairs")},
+                "rules_state_sha256", "ancestor_dataset_publication_sha256", "all_pair_sha256", "known_pair_sha256", "known_pairs")},
             "cost_scope": training.COHORT_COST_SCOPE, "execution_authorized": False}
         context = framed(route.CONTEXT_DOMAIN, body)
         body["context_sha256"] = context
@@ -213,7 +240,9 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
         self.assertEqual(owner.publication_pin, publication_pin)
         self.assertEqual(owner.durable_ack_pin, ack_pin)
         self.assertEqual(owner.sample(0)["source_projection"], body)
+        self.assertNotIn("ancestor_datasets", owner.sample(0)["source_projection"])
         self.assertEqual(owner.observation()["dataset_sha256"], dataset)
+        self.assertEqual(owner.observation()["rules_state_sha256"], report["rules_state_sha256"])
         self.assertNotEqual(publication_pin["sha256"], framed("not-a-raw-file", files.publication()))
 
     def test_repeated_sample_preserves_the_same_immutable_capture_and_native_pair_order(self):
@@ -273,7 +302,10 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 route.HistoricalUtilityRouteDataset.from_registration(object(),
                     preparation=self.preparation, read_budget=object())
-        for mutate in (lambda value: value.update(execution_authorized=True), lambda value: value.pop("profile_sha256")):
+        for mutate in (lambda value: value.update(execution_authorized=True),
+                       lambda value: value.pop("profile_sha256"),
+                       lambda value: value.pop("rules_state_sha256"),
+                       lambda value: value.pop("ancestor_datasets")):
             changed = copy.deepcopy(report)
             mutate(changed)
             with self.assertRaises(ValueError):
@@ -285,7 +317,9 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
         changes = [(key, seal("wrong:" + key)) for key in ("cohort_id", "collection_source_sha256",
             "cost_epoch_sha256", "resource_profile_sha256", "frozen_base_weights_sha256", "input_sha256",
             "target_sha256", "submission_target_sha256", "utility_context_sha256")]
-        changes += [("usage", "deployment"), ("split", "unknown"), ("input_reference_json", self.captured.input_json + " ")]
+        changes += [("usage", "deployment"), ("split", "unknown"),
+            ("rules_state_sha256", True), ("rules_state_sha256", "not-a-sha"),
+            ("input_reference_json", self.captured.input_json + " ")]
         for key, value in changes:
             changed = copy.deepcopy(original)
             changed[key] = value
@@ -365,6 +399,7 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
 
     def test_metadata_changes_invalidate_the_owner_instead_of_resealing_it(self):
         mutations = (lambda owner: owner._report.update(profile_sha256=seal("changed-profile")),
+            lambda owner: owner._report.update(rules_state_sha256=seal("changed-rules-state")),
             lambda owner: owner._preparation["registration"].update(cost_epoch_sha256=seal("changed-cost")),
             lambda owner: owner._projection.update(execution_authorized=True),
             lambda owner: setattr(owner, "_pool_sha256", seal("changed-pool")),
@@ -423,7 +458,8 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
             self.row("pc", label="unrelated"), self.row("pc", label="bridge", opening="current-opening")])
         researcher = self.typed_ancestor("r", publication=r_pin, rows=[self.row("r", label="r-only")])
         files = synthetic_files("mixed")
-        report = report_fixture(files, self.captured, self.preparation, ancestors=(pc_pin, r_pin))
+        report = report_fixture(files, self.captured, self.preparation, ancestors=(pc_pin, r_pin),
+            ancestor_descriptors=(ancestor_descriptor(pc), ancestor_descriptor(researcher)))
         owner = self.build(files=files, report=report, ancestors=(pc, researcher))
         observed = owner.validate_ancestors((researcher, pc))
         self.assertEqual(observed["ancestor_publication_sha256"], sorted((pc_pin, r_pin)))
@@ -438,7 +474,8 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
             ancestor = self.typed_ancestor(kind, publication=pin,
                 rows=[self.row(kind, split="validation", opening="current-opening")])
             files = synthetic_files(kind + ":direct")
-            report = report_fixture(files, self.captured, self.preparation, ancestors=(pin,))
+            report = report_fixture(files, self.captured, self.preparation, ancestors=(pin,),
+                ancestor_descriptors=(ancestor_descriptor(ancestor),))
             with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "crosses global splits"):
                 self.build(files=files, report=report, ancestors=(ancestor,))
         state, pc_pin, r_pin = seal("indirect-rules-state"), seal("indirect-pc"), seal("indirect-r")
@@ -447,7 +484,8 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
         researcher = self.typed_ancestor("r", publication=r_pin,
             rows=[self.row("r", label="holdout-only", split="holdout", rules_state=state)])
         files = synthetic_files("indirect")
-        report = report_fixture(files, self.captured, self.preparation, ancestors=(pc_pin, r_pin))
+        report = report_fixture(files, self.captured, self.preparation, ancestors=(pc_pin, r_pin),
+            ancestor_descriptors=(ancestor_descriptor(pc), ancestor_descriptor(researcher)))
         with self.assertRaisesRegex(ValueError, "crosses global splits"):
             self.build(files=files, report=report, ancestors=(pc, researcher))
 
@@ -457,7 +495,8 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
         researcher = self.typed_ancestor("r", publication=r_pin,
             rows=[self.row("r", label="far", split="holdout", rules_state=state)])
         files = synthetic_files("unrelated-component")
-        report = report_fixture(files, self.captured, self.preparation, ancestors=(pc_pin, r_pin))
+        report = report_fixture(files, self.captured, self.preparation, ancestors=(pc_pin, r_pin),
+            ancestor_descriptors=(ancestor_descriptor(pc), ancestor_descriptor(researcher)))
         owner = self.build(files=files, report=report, ancestors=(pc, researcher))
         self.assertEqual(owner.validate_ancestors((pc, researcher))["ancestor_cross_split_components"], 1)
 
@@ -465,7 +504,8 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
         ancestor = self.build(label="ancestor")
         pin = ancestor.publication_pin["sha256"]
         files = synthetic_files("child")
-        report = report_fixture(files, self.captured, self.preparation, ancestors=(pin,), label="different-lineage")
+        report = report_fixture(files, self.captured, self.preparation, ancestors=(pin,),
+            ancestor_descriptors=(ancestor_descriptor(ancestor),), label="different-lineage")
         owner = self.build(files=files, report=report, ancestors=(ancestor,))
         self.assertEqual(owner.validate_ancestors((ancestor,))["inspected_occurrences"], 1)
         with self.assertRaises(ValueError):
@@ -473,6 +513,96 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             owner.validate_ancestors((owner,))
         report["split"] = "validation"
+        with self.assertRaisesRegex(ValueError, "crosses global splits"):
+            self.build(files=files, report=report, ancestors=(ancestor,))
+
+    def test_all_four_ancestor_kinds_join_each_original_metadata_seal_and_detach_descriptors(self):
+        for kind in ("pc_legacy", "pc_submitted_input_v1", "r_auxiliary", "utility_cohort"):
+            if kind == "utility_cohort":
+                ancestor = self.build(label="four-seal-utility-ancestor")
+            else:
+                row_kind = "r" if kind == "r_auxiliary" else "pc"
+                ancestor = self.typed_ancestor(kind, publication=seal(kind + ":publication"),
+                    rows=[self.row(row_kind, label=kind + "-unrelated")])
+            descriptor = ancestor_descriptor(ancestor)
+            self.assertEqual(descriptor["kind"], kind)
+            self.assertEqual(len(descriptor["metadata"]), 4)
+            files = synthetic_files(kind + ":descriptor-child")
+            report = report_fixture(files, self.captured, self.preparation,
+                ancestors=(descriptor["publication_sha256"],), ancestor_descriptors=(descriptor,))
+            owner = self.build(files=files, report=report, ancestors=(ancestor,))
+            self.assertEqual(owner.source_ancestor_descriptors(), [descriptor])
+            detached = owner.source_ancestor_descriptors()
+            detached[0]["metadata"].clear()
+            self.assertEqual(owner.source_ancestor_descriptors(), [descriptor])
+            self.assertEqual(owner.sample(0)["source_projection"]["ancestor_dataset_publication_sha256"],
+                [descriptor["publication_sha256"]])
+            self.assertNotIn("ancestor_datasets", owner.sample(0)["source_projection"])
+            for metadata_key in descriptor["metadata"]:
+                changed = copy.deepcopy(report)
+                changed["ancestor_datasets"][0]["metadata"][metadata_key] = seal("different:" + metadata_key)
+                with self.subTest(kind=kind, seal=metadata_key), self.assertRaises(ValueError):
+                    self.build(files=files, report=changed, ancestors=(ancestor,))
+            changed = copy.deepcopy(report)
+            changed["ancestor_datasets"][0]["kind"] = (
+                "pc_submitted_input_v1" if kind == "pc_legacy" else "pc_legacy")
+            with self.subTest(kind=kind, field="kind"), self.assertRaises(ValueError):
+                self.build(files=files, report=changed, ancestors=(ancestor,))
+
+    def test_ancestor_descriptors_are_closed_typed_and_cover_the_original_publication_set(self):
+        ancestor = self.typed_ancestor("pc_legacy", publication=seal("descriptor-shape-publication"),
+            rows=[self.row("pc", label="descriptor-shape-row")])
+        descriptor = ancestor_descriptor(ancestor)
+        files = synthetic_files("descriptor-shapes")
+        original = report_fixture(files, self.captured, self.preparation,
+            ancestors=(descriptor["publication_sha256"],), ancestor_descriptors=(descriptor,))
+        mutations = (
+            lambda report: report["ancestor_datasets"].clear(),
+            lambda report: report["ancestor_dataset_publication_sha256"].clear(),
+            lambda report: report["ancestor_datasets"].append(copy.deepcopy(report["ancestor_datasets"][0])),
+            lambda report: report["ancestor_datasets"][0].update(extra="not-an-original-field"),
+            lambda report: report["ancestor_datasets"][0].pop("metadata"),
+            lambda report: report["ancestor_datasets"][0].update(kind="pc"),
+            lambda report: report["ancestor_datasets"][0].update(publication_sha256=seal("different-publication")),
+            lambda report: report["ancestor_datasets"][0]["metadata"].pop("index_file_sha256"),
+            lambda report: report["ancestor_datasets"][0]["metadata"].update(extra=seal("extra")),
+            lambda report: report["ancestor_datasets"][0]["metadata"].update(manifest_file_sha256=True),
+            lambda report: report["ancestor_datasets"][0]["metadata"].update(canonical_index_sha256="not-a-sha"),
+        )
+        for index, mutate in enumerate(mutations):
+            report = copy.deepcopy(original)
+            mutate(report)
+            with self.subTest(case=index), self.assertRaises(ValueError):
+                self.build(files=files, report=report, ancestors=(ancestor,))
+        ancestor._codec = object()
+        with self.assertRaisesRegex(ValueError, "exact source family"):
+            self.build(files=files, report=original, ancestors=(ancestor,))
+
+    def test_exact_rules_state_alone_connects_current_to_pc_r_or_utility_cross_split_ancestors(self):
+        current_state = seal("current:rules-state")
+        for kind in ("pc", "r"):
+            ancestor = self.typed_ancestor(kind, publication=seal(kind + ":rules-only-publication"),
+                rows=[self.row(kind, split="validation", label=kind + "-rules-only", rules_state=current_state)])
+            descriptor = ancestor_descriptor(ancestor)
+            files = synthetic_files(kind + ":rules-only-child")
+            report = report_fixture(files, self.captured, self.preparation,
+                ancestors=(descriptor["publication_sha256"],), ancestor_descriptors=(descriptor,))
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "crosses global splits"):
+                self.build(files=files, report=report, ancestors=(ancestor,))
+        different_capture = capture(different_context=True)
+        ancestor_files = synthetic_files("utility-rules-only-ancestor")
+        ancestor_report = report_fixture(ancestor_files, different_capture, self.preparation,
+            split="validation", label="utility-rules-only-ancestor")
+        ancestor_report["rules_state_sha256"] = current_state
+        ancestor = self.build(files=ancestor_files, report=ancestor_report, captured=different_capture)
+        descriptor = ancestor_descriptor(ancestor)
+        files = synthetic_files("utility-rules-only-child")
+        report = report_fixture(files, self.captured, self.preparation,
+            ancestors=(descriptor["publication_sha256"],), ancestor_descriptors=(descriptor,))
+        for key in ("input_sha256", "target_sha256", "submission_target_sha256", "utility_context_sha256"):
+            self.assertNotEqual(report[key], ancestor_report[key], key)
+        for key in ("opening_id", "game_id", "line_genealogy_id", "transposition_sha256"):
+            self.assertNotEqual(report[key], ancestor_report[key], key)
         with self.assertRaisesRegex(ValueError, "crosses global splits"):
             self.build(files=files, report=report, ancestors=(ancestor,))
 

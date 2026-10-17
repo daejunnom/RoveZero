@@ -208,6 +208,31 @@ class UtilityHistoricalCheckpointTests(unittest.TestCase):
             changed = copy.deepcopy(value); mutate(changed)
             with self.assertRaises(ValueError): history._initial(changed)
 
+    def test_original_window_device_and_fresh_source_fields_are_not_inferred(self):
+        value = projection(); window = {"device": "cpu"}; registration = {"initialization_source": {"mode": "initialize"}}
+        history._projection_source_join(value, window, registration, None)
+        for mutate in (lambda item: item.update(cuda_devices=[0]),
+                       lambda item: item.update(parent_checkpoint_sha256="96" * 32),
+                       lambda item: item.update(source_cost_observation={"status": "known"})):
+            changed = copy.deepcopy(value); mutate(changed)
+            with self.assertRaises(ValueError): history._projection_source_join(changed, window, registration, None)
+
+    def test_resume_preserves_old_fork_pointer_but_fork_pins_immediate_raw_tensor(self):
+        parent = {"cost": {"fixture": "original-parent-cost"},
+            "publication": {"tensor": ref("original/source.pt", "97")},
+            "projection": {"parent_checkpoint_sha256": "98" * 32}}
+        value = projection(); value["source_cost_observation"] = copy.deepcopy(parent["cost"])
+        window = {"device": "cpu"}; registration = {"initialization_source": {"mode": "resume"}}
+        value["parent_checkpoint_sha256"] = "98" * 32
+        history._projection_source_join(value, window, registration, parent)
+        changed = copy.deepcopy(value); changed["parent_checkpoint_sha256"] = "97" * 32
+        with self.assertRaises(ValueError): history._projection_source_join(changed, window, registration, parent)
+        registration["initialization_source"]["mode"] = "fork"
+        history._projection_source_join(changed, window, registration, parent)
+        with self.assertRaises(ValueError): history._projection_source_join(value, window, registration, parent)
+        changed["source_cost_observation"] = None
+        with self.assertRaises(ValueError): history._projection_source_join(changed, window, registration, parent)
+
     def test_streamed_journal_counts_newline_inside_256_kib_event_limit(self):
         # In-memory byte/FD fixture only. It never creates an archive source,
         # dataset, original process proof, learner acknowledgement or lease.

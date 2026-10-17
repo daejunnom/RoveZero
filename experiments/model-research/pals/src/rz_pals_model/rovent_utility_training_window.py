@@ -16,6 +16,7 @@ from .rovent_training_bootstrap import MAX_READ_BYTES
 
 
 WINDOW_DOMAIN = "rz-rovent-utility-train-window/1"
+WINDOW_V2_DOMAIN = "rz-rovent-utility-train-window/2"
 SAMPLER_DOMAIN = "rz-rovent-utility-sampler/1"
 MAX_UPDATES = 131072
 MAX_WALL_NS = 24 * 60 * 60 * 10**9
@@ -25,6 +26,7 @@ WINDOW_FIELDS = ("schema", "window_id", "run_id", "preparation_sha256", "dataset
                  "precision", "tf32", "deterministic", "cpu_threads", "interop_threads", "training_seed", "microbatch", "accumulation",
                  "max_optimizer_updates", "checkpoint_every_updates", "max_wall_time_ns",
                  "cleanup_time_ns", "max_read_bytes", "max_output_bytes", "max_groups", "max_contexts")
+WINDOW_V2_FIELDS = (*WINDOW_FIELDS, "checkpoint_reserve_ns")
 SAMPLER_FIELDS = ("schema", "run_id", "pool_sha256", "context_ids", "seed", "epoch", "permutation", "cursor")
 
 
@@ -57,18 +59,44 @@ def _json(value):
 
 
 def utility_window_digest(value):
-    """Pin metadata only; this digest is never a process lease."""
-    return hashlib.sha256(_json([WINDOW_DOMAIN, value])).hexdigest()
+    """Pin only the original V1 domain; never upgrade a new window."""
+    return _window_digest(value, expected_domain=WINDOW_DOMAIN)
+
+
+def utility_window_v2_digest(value):
+    """Pin an explicit V2 reserve inside its distinct canonical domain."""
+    return _window_digest(value, expected_domain=WINDOW_V2_DOMAIN)
+
+
+def _window_digest(value, *, expected_domain):
+    if type(value) is not dict or value.get("schema") != expected_domain:
+        raise ValueError("explicit original utility window digest domain required")
+    return hashlib.sha256(_json([expected_domain, value])).hexdigest()
 
 
 def validate_window_spec(preparation, value):
+    """Read only original V1 metadata; never accept or default a V2 reserve."""
+    return _validate_window_spec(preparation, value, expected_domain=WINDOW_DOMAIN)
+
+
+def validate_utility_window_v2(preparation, value):
+    """Require an original bounded checkpoint reserve inside the hard window.
+
+    This declaration neither extends execution/cleanup deadlines nor renews
+    the original read budget. The live parent and trainer separately close
+    forward/update admission before spending the reserved final-write time.
+    """
+    return _validate_window_spec(preparation, value, expected_domain=WINDOW_V2_DOMAIN)
+
+
+def _validate_window_spec(preparation, value, *, expected_domain):
     if type(preparation) is not dict:
         raise ValueError("explicit utility preparation required")
     expected = validate_training_preparation(preparation)
     if _json(preparation) != _json(expected):
         raise ValueError("utility preparation changed from its exact declared codec")
-    _fields(value, WINDOW_FIELDS, "utility window")
-    if value["schema"] != WINDOW_DOMAIN or value["preparation_sha256"] != expected["preparation_sha256"]:
+    _fields(value, WINDOW_V2_FIELDS if expected_domain == WINDOW_V2_DOMAIN else WINDOW_FIELDS, "utility window")
+    if value["schema"] != expected_domain or value["preparation_sha256"] != expected["preparation_sha256"]:
         raise ValueError("separate utility window/preparation seal required")
     _identifier(value["window_id"]); _identifier(value["run_id"])
     _sha(value["preparation_sha256"]); _sha(value["dataset_sha256"])
@@ -85,6 +113,8 @@ def validate_window_spec(preparation, value):
     _uint(value["max_optimizer_updates"], MAX_UPDATES)
     _uint(value["checkpoint_every_updates"], MAX_UPDATES, positive=True)
     _uint(value["max_wall_time_ns"], MAX_WALL_NS, positive=True)
+    if expected_domain == WINDOW_V2_DOMAIN:
+        _uint(value["checkpoint_reserve_ns"], value["max_wall_time_ns"] - 1, positive=True)
     _uint(value["cleanup_time_ns"], MAX_CLEANUP_NS, positive=True)
     _uint(value["max_read_bytes"], MAX_READ_BYTES, positive=True)
     _uint(value["max_output_bytes"], MAX_OUTPUT_BYTES, positive=True)

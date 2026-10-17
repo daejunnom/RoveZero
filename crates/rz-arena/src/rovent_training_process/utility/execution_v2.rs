@@ -10,11 +10,12 @@
 use super::execution::{
     MAX_BINARY_BYTES, MAX_METADATA_BYTES, ROVENT_UTILITY_MAX_READ_BYTES,
     RoventUtilityDatasetReference, RoventUtilityExecutionAction, RoventUtilityFrozenPcSource,
-    RoventUtilityInitializationSource, RoventUtilityRequiredNullable, RoventUtilityTrainWindow,
-    canonical_python_version, deserialize_endpoints, deserialize_object, execution_identifier,
-    normalized_absolute, pin_shape,
+    RoventUtilityInitializationSource, RoventUtilityRequiredNullable, canonical_python_version,
+    deserialize_endpoints, deserialize_object, execution_identifier, normalized_absolute,
+    pin_shape,
 };
 use super::registration_cohort::RoventUtilityCohortSourceRegistration;
+use super::window_v2::RoventUtilityTrainWindowV2;
 use crate::ArenaError;
 use crate::rovent_training_process::recovery::{
     RoventHistoricalDatasetRegistration, RoventHistoricalRAuxiliaryDatasetRegistration,
@@ -539,7 +540,7 @@ impl RoventUtilityExecutionRegistrationV2 {
     /// full mixed ancestry and Rules/leakage ownership remain separate checks.
     pub fn join_cohort_window(
         &self,
-        window: &RoventUtilityTrainWindow,
+        window: &RoventUtilityTrainWindowV2,
         preparation: &Value,
     ) -> Result<(), ArenaError> {
         self.validate()?;

@@ -14,12 +14,13 @@ from .generation_data import uint
 from .rovent_utility_training import COHORT_PREPARATION_DOMAIN, normalize_known_pairs
 from .rovent_utility_tensor_training import (_runtime, _validate_actual, _device_roster,
     MAX_UPDATES, save_utility_checkpoint)
-from .rovent_utility_training_window import (validate_window_spec, validate_utility_sampler,
+from .rovent_utility_training_window import (validate_utility_window_v2, validate_utility_sampler,
     next_utility_sample)
 
 
 RESULT_DOMAIN = "rz-rovent-utility-learner-window-result/1"
 UPDATE_DOMAIN = "rz-rovent-utility-learner-update/1"
+WINDOW_DOMAIN = "rz-rovent-utility-train-window/2"
 
 
 def _intake(value):
@@ -77,6 +78,22 @@ def _remaining_output(owner, initial_output_bytes, spec):
     return min(256 * 1024**2, spec["max_output_bytes"] - spent)
 
 
+def _execution_cutoffs(spec, *, started_ns, execution_until_ns):
+    """Reserve final publication inside, never beyond, the original window."""
+    if type(spec) is not dict or spec.get("schema") != WINDOW_DOMAIN:
+        raise ValueError("explicit checkpoint-reserved utility window/2 required")
+    if not all(key in spec for key in ("max_wall_time_ns", "checkpoint_reserve_ns")):
+        raise ValueError("explicit utility wall window and checkpoint reserve required")
+    started, original = uint(started_ns), uint(execution_until_ns)
+    duration, reserve = uint(spec["max_wall_time_ns"]), uint(spec["checkpoint_reserve_ns"])
+    if not 0 < reserve < duration:
+        raise ValueError("positive utility checkpoint reserve below original wall window required")
+    execution = min(original, uint(started + duration))
+    if execution < reserve:
+        raise ValueError("original utility deadline cannot hold its registered checkpoint reserve")
+    return execution, execution - reserve
+
+
 def train_utility_window(owner, intake, spec, *, authority=None, checkpoint_directory=None,
                          execute=False, clock=time.monotonic_ns):
     """Consume only original known route pairs; all-masked work never steps.
@@ -86,7 +103,9 @@ def train_utility_window(owner, intake, spec, *, authority=None, checkpoint_dire
     those contexts, rather than the number of rows or repeated discoveries.
     An interrupted accumulation is discarded with its actual cost retained.
     """
-    checked = validate_window_spec(owner.preparation, spec)
+    checked = validate_utility_window_v2(owner.preparation, spec)
+    if checked["schema"] != WINDOW_DOMAIN:
+        raise ValueError("actual utility loop requires explicit checkpoint-reserved window/2")
     if owner.preparation["schema"] != COHORT_PREPARATION_DOMAIN:
         raise ValueError("actual utility supervision requires explicit cohort preparation/2")
     remaining_updates = MAX_UPDATES - owner.total_updates()
@@ -115,7 +134,10 @@ def train_utility_window(owner, intake, spec, *, authority=None, checkpoint_dire
     lease = authority.begin_window(owner, intake, checked)
     started = clock()
     charged_at = started
-    deadline = min(authority.window_deadline_ns(lease), started + checked["max_wall_time_ns"])
+    deadline, admission_deadline = _execution_cutoffs(checked, started_ns=started,
+        execution_until_ns=authority.window_deadline_ns(lease))
+    # The reserve is inside the unchanged original execution window. It is
+    # never a new lease or permission to run forward/update during cleanup.
     updates, groups, contexts, last_checkpoint = 0, 0, 0, None
     initial_output_bytes = owner.cost["output_bytes"]
     status = "window_limit"
@@ -126,12 +148,12 @@ def train_utility_window(owner, intake, spec, *, authority=None, checkpoint_dire
     try:
         while updates < checked["max_optimizer_updates"]:
             if (groups >= checked["max_groups"] or contexts + checked["accumulation"] > checked["max_contexts"]
-                    or clock() >= deadline or authority.should_stop(lease)):
+                    or clock() >= admission_deadline or authority.should_stop(lease)):
                 break
             samples, denominator = [], 0
             group_started = clock()
             for _ in range(checked["accumulation"]):
-                if clock() >= deadline or authority.should_stop(lease):
+                if clock() >= admission_deadline or authority.should_stop(lease):
                     break
                 index, sampler = next_utility_sample(owner.sampler, context_ids=intake.context_ids,
                     pool_sha256=intake.pool_sha256, run_id=checked["run_id"], seed=checked["training_seed"])
@@ -161,8 +183,11 @@ def train_utility_window(owner, intake, spec, *, authority=None, checkpoint_dire
             for sample, pairs in samples:
                 if not pairs:
                     continue
-                if clock() >= deadline or authority.should_stop(lease):
+                if clock() >= admission_deadline or authority.should_stop(lease):
                     break
+                # These count actual call admissions, including failed calls;
+                # physical completion is independently fenced and attested.
+                owner.cost["forward_calls"] = uint(owner.cost["forward_calls"] + 1)
                 outputs = owner.model(sample["input"].reference_input)
                 logits = outputs.raw_outputs
                 if (logits.shape != (7,) or logits.dtype != torch.float32
@@ -173,9 +198,10 @@ def train_utility_window(owner, intake, spec, *, authority=None, checkpoint_dire
                 loss = torch.stack(terms).sum() / denominator
                 if not bool(torch.isfinite(loss).item()):
                     raise ValueError("utility known-pair loss is nonfinite")
-                owner.cost["forward_calls"] = uint(owner.cost["forward_calls"] + 1)
-                loss.backward()
+                if clock() >= admission_deadline or authority.should_stop(lease):
+                    break
                 owner.cost["backward_calls"] = uint(owner.cost["backward_calls"] + 1)
+                loss.backward()
             else:
                 parameters, _ = _validate_actual(owner.model, owner.preparation, torch)
                 if any(value.grad is None or not bool(torch.isfinite(value.grad).all().item())
@@ -185,7 +211,7 @@ def train_utility_window(owner, intake, spec, *, authority=None, checkpoint_dire
                     float(owner.preparation["recipe"]["optimizer"]["gradient_clip_norm"]), error_if_nonfinite=True)
                 if not bool(torch.isfinite(norm).item()):
                     raise ValueError("utility gradient norm is nonfinite")
-                if clock() >= deadline or authority.should_stop(lease):
+                if clock() >= admission_deadline or authority.should_stop(lease):
                     owner.cost["partial_accumulation_ns"] = uint(owner.cost["partial_accumulation_ns"] + clock() - group_started)
                     owner.optimizer.zero_grad(set_to_none=True)
                     owner.pending_microbatches = 0
@@ -194,6 +220,14 @@ def train_utility_window(owner, intake, spec, *, authority=None, checkpoint_dire
                 if owner.total_updates() >= MAX_UPDATES:
                     raise ValueError("utility cumulative update credit exhausted before optimizer dispatch")
                 before_model_sha256 = runtime[5](owner.model.state_dict())
+                # Measuring the current tensor bytes also costs time. Check
+                # again at the actual optimizer admission boundary.
+                if clock() >= admission_deadline or authority.should_stop(lease):
+                    owner.cost["partial_accumulation_ns"] = uint(owner.cost["partial_accumulation_ns"] + clock() - group_started)
+                    owner.optimizer.zero_grad(set_to_none=True)
+                    owner.pending_microbatches = 0
+                    status = "partial_accumulation_discarded"
+                    break
                 owner.dispatched_updates += 1
                 # This is the only N05 optimizer dispatch. Exceptions before an
                 # original parent completion ACK quarantine the partial owner.
@@ -240,14 +274,15 @@ def train_utility_window(owner, intake, spec, *, authority=None, checkpoint_dire
         charged_at = _charge_wall(owner, charged_at, clock)
         # The final boundary includes skipped/partial sampler progress and its
         # cost even when the last successful update was already checkpointed.
-        if contexts or updates:
-            maximum = _remaining_output(owner, initial_output_bytes, checked)
-            last_checkpoint = save_utility_checkpoint(owner, target / f"utility-final-{checked['window_id']}.pt",
-                sampler_validator=sampler_validator, max_file_bytes=maximum,
-                read_accounting=authority.read_accounting, execute=True)
-            charged_at = _charge_wall(owner, charged_at, clock)
-            last_checkpoint["post_snapshot_cost"] = dict(owner.cost)
-            authority.checkpoint_published(lease, last_checkpoint, owner)
+        if clock() >= deadline:
+            raise TimeoutError("original utility execution deadline expired before final checkpoint")
+        maximum = _remaining_output(owner, initial_output_bytes, checked)
+        last_checkpoint = save_utility_checkpoint(owner, target / f"utility-final-{checked['window_id']}.pt",
+            sampler_validator=sampler_validator, max_file_bytes=maximum,
+            read_accounting=authority.read_accounting, execute=True)
+        charged_at = _charge_wall(owner, charged_at, clock)
+        last_checkpoint["post_snapshot_cost"] = dict(owner.cost)
+        authority.checkpoint_published(lease, last_checkpoint, owner)
         charged_at = _charge_wall(owner, charged_at, clock)
         authority.end_window(lease, owner, status, physical_completion="confirmed",
             dispatched_updates=updates, checkpoint=last_checkpoint)

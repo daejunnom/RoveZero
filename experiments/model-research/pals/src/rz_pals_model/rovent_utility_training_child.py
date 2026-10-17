@@ -53,7 +53,7 @@ def _actual_registration(startup):
 
 def _metadata_inputs(startup, reads):
     from .rovent_utility_training import validate_training_preparation
-    from .rovent_utility_training_window import validate_window_spec
+    from .rovent_utility_training_window import validate_utility_window_v2
     registration = _actual_registration(startup)
     preparation = reads.json(registration["preparation"], maximum=65536)
     if type(preparation) is not dict or preparation.get("schema") != "rz-rovent-utility-training-preparation/2":
@@ -61,7 +61,7 @@ def _metadata_inputs(startup, reads):
     checked = validate_training_preparation(preparation)
     if json.dumps(checked, sort_keys=True, separators=(",", ":"), allow_nan=False) != json.dumps(preparation, sort_keys=True, separators=(",", ":"), allow_nan=False):
         raise ValueError("utility preparation changed from its exact source codec")
-    spec = validate_window_spec(checked, reads.json(registration["window_spec"], maximum=1024**2))
+    spec = validate_utility_window_v2(checked, reads.json(registration["window_spec"], maximum=1024**2))
     if (spec["window_id"] != startup["window_id"]
             or checked["registration"]["trainer_source_sha256"] != registration["trainer_source_sha256"]
             or spec["device"] != registration["resources_policy"]["device"]

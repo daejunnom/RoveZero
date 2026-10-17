@@ -28,7 +28,7 @@ _REPORT_FIELDS = ("cohort_id", "profile_sha256", "usage", "collection_source_sha
     "input_reference_json", "input_sha256", "target_sha256", "submission_target_sha256",
     "utility_context_sha256", "known_pairs", "known_pair_sha256", "all_pair_sha256",
     "frozen_pc_sources", "split", "opening_id", "game_id", "line_genealogy_id",
-    "transposition_sha256", "ancestor_dataset_publication_sha256")
+    "transposition_sha256", "rules_state_sha256", "ancestor_dataset_publication_sha256", "ancestor_datasets")
 _LINEAGE_FIELDS = ("opening_id", "game_id", "line_genealogy_id", "transposition_sha256")
 _MAX_ANCESTORS = 256
 _MAX_LINEAGE_ROWS = 262144
@@ -76,6 +76,7 @@ def _report(value, captured, preparation, publication):
             "resource_profile_sha256", "frozen_base_weights_sha256", "input_sha256", "target_sha256",
             "submission_target_sha256", "utility_context_sha256", "transposition_sha256"):
         sha(value[key])
+    sha(value["rules_state_sha256"])
     for key in ("opening_id", "game_id", "line_genealogy_id"):
         identifier(value[key])
     registration = preparation["registration"]
@@ -104,6 +105,28 @@ def _report(value, captured, preparation, publication):
     ancestors = _pins(value["ancestor_dataset_publication_sha256"], _MAX_ANCESTORS)
     if ancestors != sorted(ancestors):
         raise ValueError("sorted original cohort ancestor publication inventory required")
+    descriptors = value["ancestor_datasets"]
+    if type(descriptors) is not list or len(descriptors) > _MAX_ANCESTORS:
+        raise ValueError("bounded original mixed ancestor descriptors required")
+    declared = set()
+    for descriptor in descriptors:
+        fields(descriptor, ("kind", "publication_sha256", "metadata"), "original mixed ancestor descriptor")
+        kind = descriptor["kind"]
+        if kind in ("pc_legacy", "pc_submitted_input_v1", "r_auxiliary"):
+            names = ("manifest_file_sha256", "index_file_sha256", "canonical_manifest_sha256", "canonical_index_sha256")
+        elif kind == "utility_cohort":
+            names = ("dataset_sha256", "pool_sha256", "preparation_sha256", "context_sha256")
+        else:
+            raise ValueError("explicit original mixed ancestor kind required")
+        fields(descriptor["metadata"], names, "original ancestor kind-specific four seals")
+        for identity in descriptor["metadata"].values():
+            sha(identity)
+        pin = sha(descriptor["publication_sha256"])
+        if pin in declared:
+            raise ValueError("repeated original ancestor descriptor publication")
+        declared.add(pin)
+    if declared != set(ancestors):
+        raise ValueError("original mixed ancestor descriptors differ from full publication coverage")
     sources = value["frozen_pc_sources"]
     if type(sources) is not list or len(sources) != 2:
         raise ValueError("two original frozen P/C source descriptors required")
@@ -130,7 +153,7 @@ def _projection(report, files):
         **{key: copy.deepcopy(report[key]) for key in ("cohort_id", "profile_sha256", "input_sha256",
             "target_sha256", "submission_target_sha256", "utility_context_sha256", "collection_source_sha256",
             "cost_epoch_sha256", "resource_profile_sha256", "frozen_base_weights_sha256", "split",
-            *_LINEAGE_FIELDS, "ancestor_dataset_publication_sha256", "all_pair_sha256", "known_pair_sha256", "known_pairs")},
+            *_LINEAGE_FIELDS, "rules_state_sha256", "ancestor_dataset_publication_sha256", "all_pair_sha256", "known_pair_sha256", "known_pairs")},
         "cost_scope": COST_SCOPE, "execution_authorized": False}
     body["context_sha256"] = digest(CONTEXT_DOMAIN, body)
     return body
@@ -140,9 +163,39 @@ def _lineage_keys(report):
     # Input formats are never retagged. Equality is only a conservative leak
     # edge, not equivalence of tensor meaning or evidence for another target.
     result = {(key, report[key]) for key in _LINEAGE_FIELDS}
+    result.add(("rules_state_sha256", report["rules_state_sha256"]))
     result.update(("input_seal", report[key]) for key in
         ("input_sha256", "target_sha256", "submission_target_sha256", "utility_context_sha256"))
     return result
+
+
+def _ancestor_descriptor(owner):
+    from .rovent_historical_corpus import HistoricalRoventCorpus
+    from .rovent_historical_r_corpus import HistoricalRoventRCorpus
+    from .rovent_corpus_codec import LEGACY_CODEC, SUBMITTED_CODEC
+    if type(owner) is HistoricalUtilityRouteDataset:
+        owner._check()
+        metadata = {"dataset_sha256": owner._dataset_sha256, "pool_sha256": owner._pool_sha256,
+            "preparation_sha256": owner._preparation["preparation_sha256"], "context_sha256": owner._context_ids[0]}
+        kind, publication = "utility_cohort", owner._publication_pin["sha256"]
+    elif type(owner) in (HistoricalRoventCorpus, HistoricalRoventRCorpus):
+        corpus, observed = owner.corpus, owner.observation()
+        metadata = {"manifest_file_sha256": corpus.corpus_sha256, "index_file_sha256": corpus.index_sha256,
+            "canonical_manifest_sha256": corpus.manifest_semantic_sha256, "canonical_index_sha256": corpus.index_semantic_sha256}
+        publication = observed["publication_sha256"]
+        if type(owner) is HistoricalRoventRCorpus:
+            kind = "r_auxiliary"
+        elif owner._codec is LEGACY_CODEC:
+            kind = "pc_legacy"
+        elif owner._codec is SUBMITTED_CODEC:
+            kind = "pc_submitted_input_v1"
+        else:
+            raise ValueError("original P/C ancestor lost its exact source family")
+    else:
+        raise ValueError("original typed PC/R/cohort ancestor owner required")
+    for identity in metadata.values():
+        sha(identity)
+    return {"kind": kind, "publication_sha256": sha(publication), "metadata": metadata}
 
 
 def _ancestor_rows(owner):
@@ -214,6 +267,7 @@ class HistoricalUtilityRouteDataset:
         owner._capture, owner._projection = capture, projection
         owner._context_ids, owner._pool_sha256, owner._dataset_sha256 = context_ids, pool, dataset
         owner._publication_pin, owner._durable_ack_pin = publication, ack
+        owner._publication_metadata, owner._durable_ack_metadata = files.publication(), files.durable_ack()
         owner._state_sha256 = owner._state_digest()
         owner.validate_ancestors(ancestors)
         return owner
@@ -221,13 +275,16 @@ class HistoricalUtilityRouteDataset:
     def _state_digest(self):
         return digest(_OWNER_DOMAIN, [self._preparation, self._report, self._projection,
             list(self._context_ids), self._pool_sha256, self._dataset_sha256,
-            self._publication_pin, self._durable_ack_pin, _capture_projection(self._capture)])
+            self._publication_pin, self._durable_ack_pin, self._publication_metadata,
+            self._durable_ack_metadata, _capture_projection(self._capture)])
 
     def _check(self):
         if type(self._files) is not HistoricalUtilityCohortFiles or self._state_digest() != self._state_sha256:
             raise ValueError("original utility cohort dataset metadata changed")
         if (_raw_pin(self._files, PUBLICATION_FILE) != self._publication_pin
-                or _raw_pin(self._files, ACK_FILE) != self._durable_ack_pin):
+                or _raw_pin(self._files, ACK_FILE) != self._durable_ack_pin
+                or self._files.publication() != self._publication_metadata
+                or self._files.durable_ack() != self._durable_ack_metadata):
             raise ValueError("original utility cohort file owner differs from retained raw pins")
         self._files.raw_file(PUBLICATION_FILE)
         self._files.raw_file(ACK_FILE)
@@ -255,6 +312,10 @@ class HistoricalUtilityRouteDataset:
         self._check()
         return copy.deepcopy(self._durable_ack_pin)
 
+    def source_ancestor_descriptors(self):
+        self._check()
+        return copy.deepcopy(self._report["ancestor_datasets"])
+
     def sample(self, index):
         self._check()
         if type(index) is not int or index != 0 or self._report["split"] != "train":
@@ -275,11 +336,14 @@ class HistoricalUtilityRouteDataset:
         if type(ancestors) not in (list, tuple) or len(ancestors) > _MAX_ANCESTORS:
             raise ValueError("bounded explicit mixed utility ancestor owners required")
         actual, identities, inspected = set(), [], 0
+        declarations = {item["publication_sha256"]: item for item in self._report["ancestor_datasets"]}
         for owner in ancestors:
-            observation = owner.observation()
-            pin = sha(observation["publication_sha256"])
+            descriptor = _ancestor_descriptor(owner)
+            pin = descriptor["publication_sha256"]
             if pin == self._publication_pin["sha256"] or pin in actual:
                 raise ValueError("self or repeated original utility ancestor publication")
+            if descriptor != declarations.get(pin):
+                raise ValueError("original ancestor kind/four seals differ from the retained historical owner")
             actual.add(pin)
             for split, keys in _ancestor_rows(owner):
                 if split not in ("train", "validation", "holdout"):
@@ -346,10 +410,12 @@ class HistoricalUtilityRouteDataset:
             "durable_ack_pin": self.durable_ack_pin, "pool_sha256": self._pool_sha256,
             "preparation_sha256": self._preparation["preparation_sha256"], "context_ids": list(self._context_ids),
             "record_count": 1, "trial_count": publication["trial_count"], "pair_count": publication["pair_count"],
-            **{key: report[key] for key in ("split", *_LINEAGE_FIELDS)},
+            **{key: report[key] for key in ("split", *_LINEAGE_FIELDS, "rules_state_sha256")},
             "unique_known_pairs": len(report["known_pairs"]), "source_kind": "historical_exact_cohort_pins",
             "past_native_authority_reissued": False, "past_physical_completion_reissued": False,
-            "execution_authorized": False, "rules_replay_scope": "original_rust_parent_required",
+            "execution_authorized": False, "training_target_authorized": False,
+            "pair_arithmetic_scope": "original_candidate_values_rust_conditional_certificate_required",
+            "rules_replay_scope": "original_rust_parent_required",
             "frozen_pc_scope": "not_instantiated_pinned_original_source_preserved",
             "collection_io": self._files.durable_ack()["collection_io"],
             "retained_bytes": publication["total_payload_bytes"] + self._publication_pin["bytes"] + self._durable_ack_pin["bytes"],

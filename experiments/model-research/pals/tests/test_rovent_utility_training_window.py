@@ -1,5 +1,7 @@
 """Pure utility window/sampler fixtures; these create no live authority."""
 import copy
+import hashlib
+import json
 import unittest
 
 from rz_pals_model import rovent_utility_training as training
@@ -84,6 +86,60 @@ class UtilityWindowTests(unittest.TestCase):
                        lambda value: value.update(execution_authorized=True)):
             changed = spec(prepared); mutate(changed)
             with self.assertRaises(ValueError): window.validate_window_spec(prepared, changed)
+
+    def test_window_v2_has_an_explicit_positive_reserve_without_extending_old_budgets(self):
+        prepared = preparation(); old = spec(prepared)
+        value = {**old, "schema": "rz-rovent-utility-train-window/2", "checkpoint_reserve_ns": 5000000000}
+        before = copy.deepcopy(value)
+        self.assertEqual(window.validate_utility_window_v2(prepared, value), before)
+        with self.assertRaises(ValueError): window.validate_window_spec(prepared, value)
+        for name in ("max_wall_time_ns", "cleanup_time_ns", "max_read_bytes", "max_output_bytes"):
+            self.assertEqual(value[name], old[name])
+        self.assertEqual(value, before)
+        self.assertNotIn("execution_authorized", value)
+
+    def test_window_v2_rejects_missing_noninteger_zero_and_full_window_reserve(self):
+        prepared = preparation()
+        original = {**spec(prepared), "schema": "rz-rovent-utility-train-window/2", "checkpoint_reserve_ns": 1}
+        for mutate in (lambda value: value.pop("checkpoint_reserve_ns"),
+                       lambda value: value.update(checkpoint_reserve_ns=True),
+                       lambda value: value.update(checkpoint_reserve_ns=1.0),
+                       lambda value: value.update(checkpoint_reserve_ns=0),
+                       lambda value: value.update(checkpoint_reserve_ns=-1),
+                       lambda value: value.update(checkpoint_reserve_ns=value["max_wall_time_ns"]),
+                       lambda value: value.update(checkpoint_reserve_ns=value["max_wall_time_ns"] + 1),
+                       lambda value: value.update(execution_authorized=True)):
+            changed = copy.deepcopy(original); mutate(changed)
+            with self.assertRaises(ValueError): window.validate_utility_window_v2(prepared, changed)
+        boundary = {**original, "checkpoint_reserve_ns": original["max_wall_time_ns"] - 1}
+        self.assertEqual(window.validate_utility_window_v2(prepared, boundary), boundary)
+
+    def test_original_window_v1_bytes_and_parser_do_not_gain_a_reserve_or_auto_upgrade(self):
+        prepared = preparation(); old = spec(prepared)
+        independent = hashlib.sha256(json.dumps(["rz-rovent-utility-train-window/1", old],
+            sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        self.assertEqual(window.utility_window_digest(old), independent)
+        self.assertEqual(window.validate_window_spec(prepared, old), old)
+        with self.assertRaises(ValueError): window.validate_utility_window_v2(prepared, old)
+        old_with_reserve = {**old, "checkpoint_reserve_ns": 1}
+        with self.assertRaises(ValueError): window.validate_window_spec(prepared, old_with_reserve)
+        retagged = {**old, "schema": "rz-rovent-utility-train-window/2"}
+        with self.assertRaises(ValueError): window.validate_utility_window_v2(prepared, retagged)
+        with self.assertRaises(ValueError): window.utility_window_v2_digest(old)
+
+    def test_new_reserve_is_sealed_with_window_v2_domain_and_not_window_v1_domain(self):
+        prepared = preparation()
+        value = {**spec(prepared), "schema": "rz-rovent-utility-train-window/2", "checkpoint_reserve_ns": 2000000000}
+        independent = hashlib.sha256(json.dumps(["rz-rovent-utility-train-window/2", value],
+            sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        wrong_domain = hashlib.sha256(json.dumps(["rz-rovent-utility-train-window/1", value],
+            sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        self.assertEqual(window.utility_window_v2_digest(value), independent)
+        self.assertNotEqual(independent, wrong_domain)
+        self.assertNotEqual(independent, window.utility_window_v2_digest({**value, "checkpoint_reserve_ns": 2000000001}))
+        with self.assertRaises(ValueError): window.utility_window_digest(value)
+        for unknown in ({**value, "schema": "rz-rovent-utility-train-window/3"}, {}, None):
+            with self.assertRaises(ValueError): window.utility_window_v2_digest(unknown)
 
 
 class UtilitySamplerTests(unittest.TestCase):
