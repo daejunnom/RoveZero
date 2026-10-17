@@ -19,6 +19,7 @@ use crate::search_driver::{PalsCheckerRegistration, SearchSessionFailure};
 use rz_contracts::Digest;
 use rz_runtime::adaptive::ControllerConfig;
 use rz_search::external_cpu::{CpuEndpoint, CpuEndpointSelection};
+use rz_search::pals::engine::adaptive_port::profiled_retirement_archive::RegisteredProfiledRetirementSink;
 use rz_search::pals::engine::adaptive_port::{
     AdaptivePortModel, AdaptivePortQuestion, AdaptiveRulesOwnerIssuer,
 };
@@ -51,6 +52,9 @@ pub struct RoventExternalProductStartupRejection {
     pub failure: SearchSessionFailure,
     pub owners: RoventExternalProductStartupOwners,
     pub sources: Arc<RoventPinnedNativeSources>,
+    /// Early failures retain the admitted managed-output capability here.
+    /// A Session/Driver owner already retains it and therefore leaves None.
+    pub retirement_sink: Option<RegisteredProfiledRetirementSink>,
 }
 
 /// Construct the shared session only. Its first live, original go creates the
@@ -59,6 +63,7 @@ pub struct RoventExternalProductStartupRejection {
 pub fn external_researcher_session(
     prepared: PreparedRoventNative<AdaptivePortQuestion>,
     external: RoventPinnedExternalRSource,
+    retirement_sink: RegisteredProfiledRetirementSink,
     clock: ProcessClock,
     owners: Arc<OwnerRegistry>,
     identity: EngineIdentity,
@@ -82,6 +87,7 @@ pub fn external_researcher_session(
             ),
             owners: RoventExternalProductStartupOwners::Prepared { prepared, external },
             sources: pins,
+            retirement_sink: Some(retirement_sink),
         });
     }
     match (pins.lock().manifest.purpose, hooks) {
@@ -93,6 +99,7 @@ pub fn external_researcher_session(
                 ),
                 owners: RoventExternalProductStartupOwners::Prepared { prepared, external },
                 sources: pins,
+                retirement_sink: Some(retirement_sink),
             });
         }
         (_, Some(_)) => {
@@ -103,6 +110,7 @@ pub fn external_researcher_session(
                 ),
                 owners: RoventExternalProductStartupOwners::Prepared { prepared, external },
                 sources: pins,
+                retirement_sink: Some(retirement_sink),
             });
         }
         (_, None) => {}
@@ -117,6 +125,7 @@ pub fn external_researcher_session(
                     rejection,
                 },
                 sources: pins,
+                retirement_sink: Some(retirement_sink),
             });
         }
     };
@@ -288,6 +297,7 @@ pub fn external_researcher_session(
                 failure,
                 owners: RoventExternalProductStartupOwners::PreparedSource { prepared, external },
                 sources: pins,
+                retirement_sink: Some(retirement_sink),
             });
         }
     };
@@ -312,6 +322,7 @@ pub fn external_researcher_session(
         issuer,
         registration,
         profile,
+        retirement_sink,
         None,
         hooks,
     )
@@ -319,6 +330,7 @@ pub fn external_researcher_session(
         failure: rejected.failure.clone(),
         owners: RoventExternalProductStartupOwners::Session(rejected),
         sources: Arc::clone(&pins),
+        retirement_sink: None,
     })?;
     if let Err(failure) =
         driver.register_rovent_root_policy(Arc::new(pins.lock().clone()), root_policy)
@@ -327,6 +339,7 @@ pub fn external_researcher_session(
             failure,
             owners: RoventExternalProductStartupOwners::Driver(Box::new(driver)),
             sources: pins,
+            retirement_sink: None,
         });
     }
     Ok(driver)

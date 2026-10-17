@@ -180,6 +180,9 @@ pub struct ProfiledExternalCurrentRootFence {
 }
 
 impl ProfiledExternalCurrentRootFence {
+    pub(crate) fn shutdown_receipt(&self) -> CheckerShutdown {
+        self.process
+    }
     pub fn source(&self) -> &ProfiledExternalRootSource {
         &self.source
     }

@@ -489,6 +489,24 @@ impl AuthoredWorkerFixture {
             clock.now().unwrap(),
         )
         .unwrap();
+        let original_cleanup_deadline = origin + lifetime + Duration::from_secs(2);
+        assert!(
+            port.register_profiled_external_cleanup_deadline(&source, origin)
+                .is_err()
+        );
+        port.register_profiled_external_cleanup_deadline(&source, original_cleanup_deadline)
+            .unwrap();
+        assert!(
+            port.register_profiled_external_cleanup_deadline(
+                &source,
+                original_cleanup_deadline + Duration::from_secs(1),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            port.profiled_external.original_cleanup_deadline,
+            Some(original_cleanup_deadline)
+        );
         port.prepare_rovent_root_rules(clock.domain(), clock.now().unwrap())
             .unwrap();
         Self {
@@ -824,6 +842,10 @@ fn authored_worker_nodes_only_retry_keeps_raw_constraint_and_publication_once() 
         .release_profiled_external_root(&fixture.source, &fence)
         .unwrap();
     assert_eq!(retirement.retained_questions(), 2);
+    assert_eq!(
+        retirement.original_cleanup_deadline(),
+        Some(fixture.port.limits.deadline + Duration::from_secs(2))
+    );
 }
 
 #[test]

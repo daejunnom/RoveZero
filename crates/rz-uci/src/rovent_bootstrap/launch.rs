@@ -36,6 +36,7 @@ use std::{
     fmt,
     fs::File,
     io::Read,
+    path::{Component, PathBuf},
     sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
@@ -46,10 +47,12 @@ const MAX_LOCK_BYTES: u64 = 1 << 20;
 const MAX_SELECTION_BYTES: u64 = 64 << 10;
 
 mod collection;
+mod evidence;
 use collection::CollectionLaunch;
 pub use collection::{
     RoventCollectionPreparedLaunch, RoventCollectionPreparedNative, run_collection,
 };
+pub use evidence::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 
 #[derive(Debug)]
 pub struct RoventLaunchError {
@@ -79,6 +82,8 @@ struct Arguments {
     input_lock: String,
     native_assets: String,
     external_r_sources: Option<String>,
+    retirement_sink: Option<String>,
+    evidence_root: Option<PathBuf>,
     process_epoch: u64,
     startup_ms: u64,
     root_policy: RoventRootAdmissionPolicy,
@@ -88,6 +93,8 @@ impl Arguments {
         let mut input_lock = None;
         let mut native_assets = None;
         let mut external_r_sources = None;
+        let mut retirement_sink = None;
+        let mut evidence_root = None;
         let mut process_epoch = None;
         let mut startup_ms = None;
         let mut root_policy = None;
@@ -102,6 +109,12 @@ impl Arguments {
                 }
                 "--external-r-sources" if external_r_sources.is_none() => {
                     external_r_sources = Some(private_path(value)?)
+                }
+                "--retirement-sink" if retirement_sink.is_none() => {
+                    retirement_sink = Some(private_path(value)?)
+                }
+                "--evidence-root" if evidence_root.is_none() => {
+                    evidence_root = Some(managed_path(value)?)
                 }
                 "--process-epoch" if process_epoch.is_none() => {
                     process_epoch = Some(number(value, u64::MAX)?)
@@ -129,6 +142,8 @@ impl Arguments {
             native_assets: native_assets
                 .ok_or_else(|| error("Arguments", "--native-assets is required"))?,
             external_r_sources,
+            retirement_sink,
+            evidence_root,
             process_epoch: process_epoch
                 .ok_or_else(|| error("Arguments", "--process-epoch is required"))?,
             startup_ms: startup_ms.ok_or_else(|| error("Arguments", "--startup-ms is required"))?,
@@ -145,6 +160,21 @@ fn private_path(value: &str) -> Result<String, RoventLaunchError> {
         ));
     }
     Ok(value.into())
+}
+fn managed_path(value: &str) -> Result<PathBuf, RoventLaunchError> {
+    let path = PathBuf::from(value);
+    if value.is_empty()
+        || value.len() > 4096
+        || value.contains('\0')
+        || !path.is_absolute()
+        || path.components().any(|part| part == Component::ParentDir)
+    {
+        return Err(error(
+            "Arguments",
+            "explicit absolute managed directory required",
+        ));
+    }
+    Ok(path)
 }
 fn number(value: &str, maximum: u64) -> Result<u64, RoventLaunchError> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -422,6 +452,45 @@ fn run_inner(
         }
         (_, None) => (None, None),
     };
+    let retirement_evidence = match (
+        sources.configuration().fields().execution,
+        arguments.retirement_sink.as_deref(),
+        arguments.evidence_root.as_deref(),
+    ) {
+        (
+            ExecutionConfiguration::ExternalResearcher { .. },
+            Some(registration),
+            Some(managed_root),
+        ) => {
+            Some(
+                LaunchRetirementEvidence::open(
+                    &lock,
+                    &root,
+                    registration,
+                    managed_root,
+                    &cwd,
+                    // This bounds only source admission/FS scanning. Each actual
+                    // root supplies its own original finite persistence window.
+                    control.until,
+                    control.cancellation.as_ref(),
+                )
+                .map_err(|failure| error("RetirementEvidence", failure))?,
+            )
+        }
+        (ExecutionConfiguration::ExternalResearcher { .. }, _, _) => {
+            return Err(error(
+                "RetirementEvidence",
+                "external researcher requires --retirement-sink and --evidence-root",
+            ));
+        }
+        (_, None, None) => None,
+        _ => {
+            return Err(error(
+                "RetirementEvidence",
+                "retirement sink arguments require an external researcher",
+            ));
+        }
+    };
     let cuda_profile = if matches!(lock.manifest.engine.pc.device, RoventDevice::Cuda { .. }) {
         let name = format!(
             "rovent-cuda-profile-{}-{}",
@@ -495,17 +564,20 @@ fn run_inner(
             collection_observer,
         )
         .map_err(|failure| reject_factory(failure, cleanup_until))?;
-        match (external_source, loaded_nnuec) {
-            (Some(external), None) => RoventCollectionPreparedNative::ExternalPcr {
-                prepared: Box::new(prepared),
-                external: Box::new(external),
-            },
-            (None, Some(loaded)) => RoventCollectionPreparedNative::OwnNnuecPcr {
+        match (external_source, loaded_nnuec, retirement_evidence) {
+            (Some(external), None, Some(retirement_evidence)) => {
+                RoventCollectionPreparedNative::ExternalPcr {
+                    prepared: Box::new(prepared),
+                    external: Box::new(external),
+                    retirement_evidence: Box::new(retirement_evidence),
+                }
+            }
+            (None, Some(loaded), None) => RoventCollectionPreparedNative::OwnNnuecPcr {
                 prepared: Box::new(prepared),
                 loaded: Box::new(loaded),
             },
-            (None, None) => RoventCollectionPreparedNative::OwnBoardPcr(Box::new(prepared)),
-            (Some(_), Some(_)) => unreachable!("exclusive own/external source configuration"),
+            (None, None, None) => RoventCollectionPreparedNative::OwnBoardPcr(Box::new(prepared)),
+            _ => unreachable!("exclusive own/external source and evidence configuration"),
         }
     } else {
         let prepared = prepare_launch_native::<PcPortQuestion>(
@@ -606,17 +678,20 @@ fn assemble_native_product(
                 root_policy,
             )
         }
-        RoventCollectionPreparedNative::ExternalPcr { prepared, external } => {
-            RoventNativeProductDriver::external_pcr(
-                *prepared,
-                *external,
-                clock,
-                owners,
-                identity,
-                root_policy,
-                None,
-            )
-        }
+        RoventCollectionPreparedNative::ExternalPcr {
+            prepared,
+            external,
+            retirement_evidence,
+        } => RoventNativeProductDriver::external_pcr(
+            *prepared,
+            *external,
+            *retirement_evidence,
+            clock,
+            owners,
+            identity,
+            root_policy,
+            None,
+        ),
     }
 }
 
@@ -668,7 +743,7 @@ fn reject_product(mut failure: RoventProductStartupRejection, until: Instant) ->
                 completion == Some(crate::search_driver::DriverPhysicalCompletion::Confirmed)
             })
         }
-        RoventProductStartupOwners::ExternalRejected(rejected) => {
+        RoventProductStartupOwners::ExternalRejected { rejected, .. } => {
             match &mut rejected.owners {
                 // These stages own only original dormant descriptors. Keep
                 // the whole rejection alive until native physical cleanup.
@@ -687,6 +762,9 @@ fn reject_product(mut failure: RoventProductStartupRejection, until: Instant) ->
                     })
                 }
             }
+        }
+        RoventProductStartupOwners::ExternalEvidenceMismatch { prepared, .. } => {
+            drain_native(&mut prepared.service, until)
         }
     };
     if !confirmed {

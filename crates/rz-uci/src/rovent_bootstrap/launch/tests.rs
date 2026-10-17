@@ -51,6 +51,8 @@ fn product_arguments_reject_unregistered_paths_and_unbounded_controls() {
         "--startup-ms=+1",
         "--root-policy=legacy-v5",
         "--external-r-sources=../external.json",
+        "--retirement-sink=/tmp/registration.json",
+        "--evidence-root=relative/evidence",
         "--unknown=true",
     ] {
         let mut args = arguments();
@@ -87,6 +89,29 @@ fn external_source_mapping_is_explicit_closed_and_independent_of_native_assets()
     ] {
         assert!(ExternalSelectionWire::parse(bad).is_err());
     }
+}
+
+#[test]
+fn retirement_arguments_keep_the_original_registration_and_explicit_absolute_root() {
+    let root = std::env::current_dir().unwrap().join("managed-evidence");
+    let mut args = arguments();
+    args.push("--retirement-sink=inputs/retirement-registration.json".into());
+    args.push(format!("--evidence-root={}", root.display()));
+    let parsed = Arguments::parse(&args).unwrap();
+    assert_eq!(
+        parsed.retirement_sink.as_deref(),
+        Some("inputs/retirement-registration.json")
+    );
+    assert_eq!(parsed.evidence_root.as_deref(), Some(root.as_path()));
+    for repeated in [
+        "--retirement-sink=inputs/other-registration.json".into(),
+        format!("--evidence-root={}", root.display()),
+    ] {
+        let mut repeated_args = args.clone();
+        repeated_args.push(repeated);
+        assert!(Arguments::parse(&repeated_args).is_err());
+    }
+    assert!(managed_path(root.join("..").join("elsewhere").to_str().unwrap()).is_err());
 }
 
 #[test]

@@ -18,6 +18,7 @@ use rz_search::cpu_checker::CheckerError;
 use rz_search::external_cpu::ProfiledExternalRootSource;
 use rz_search::external_cpu::worker::ExternalWorkerClock;
 use rz_search::pals::engine::adaptive_port::AdaptiveFrontierStartup;
+use rz_search::pals::engine::adaptive_port::profiled_retirement_archive::RegisteredProfiledRetirementSink;
 use rz_search::pals::rovent_engine::RootMoveDomain;
 use rz_search::pals::rovent_frontier::FrontierRegistration;
 use std::fs::File;
@@ -39,6 +40,7 @@ where
     pub failure: SearchSessionFailure,
     pub sources: AdaptiveSessionSources<B>,
     pub external: RoventExternalSessionSource,
+    pub retirement_sink: RegisteredProfiledRetirementSink,
 }
 
 struct DormantExternalSource {
@@ -393,6 +395,15 @@ impl RoventExternalSessionSource {
         }
     }
 
+    /// Historical source identity remains available after actual root/process
+    /// closure. It grants no live admission or root reuse on its own.
+    pub(super) fn retained_root_source(&self) -> Option<&ProfiledExternalRootSource> {
+        match &self.state {
+            ExternalProcessState::Returned(source) => Some(source.current_source()),
+            _ => None,
+        }
+    }
+
     pub(super) fn begin_process_finish(&mut self, until: Instant) {
         match &mut self.state {
             ExternalProcessState::Running(owner) => owner.worker().request_shutdown(until),
@@ -484,6 +495,7 @@ where
         issuer: AdaptiveRulesOwnerIssuer,
         registration: PalsCheckerRegistration,
         profile: RoventPcrSessionProfile,
+        retirement_sink: RegisteredProfiledRetirementSink,
         origin: Option<crate::pals_adaptive::RoventNativeCollectionOrigin>,
         hooks: AdaptiveSessionCollectionHooks<B>,
     ) -> Result<Self, RoventExternalSessionAdmissionRejection<B>> {
@@ -491,6 +503,12 @@ where
         let checked = external
             .validate_declaration(&profile, &common)
             .and_then(|()| {
+                if retirement_sink.admission_closed() {
+                    return Err(failure(
+                        "RoventExternalRetirementSink",
+                        "original durable evidence sink admission is closed",
+                    ));
+                }
                 if origin.is_some() {
                     return Err(failure(
                         "RoventExternalCollectionUnsupported",
@@ -504,6 +522,7 @@ where
                 failure,
                 sources: common,
                 external,
+                retirement_sink,
             });
         }
         let admitted = Self::admit_with_researcher_source(
@@ -523,6 +542,9 @@ where
             Ok(mut driver) => {
                 driver.rovent = Some(profile);
                 driver.rovent_collection_origin = origin;
+                // The cap is moved only at constructor return or while the
+                // same one-slot archive worker owns its retirement payload.
+                driver.profiled_retirement_sink = Mutex::new(Some(retirement_sink));
                 Ok(driver)
             }
             Err((rejected, SessionResearcherSource::ProfiledExternal(external))) => {
@@ -530,6 +552,7 @@ where
                     failure: rejected.failure,
                     sources: rejected.sources,
                     external: *external,
+                    retirement_sink,
                 })
             }
             Err((_, SessionResearcherSource::Legacy)) => unreachable!("typed source preserved"),
@@ -621,6 +644,11 @@ impl RoventPcrSessionProfile {
             clock.domain(),
             clock.now()?,
         )?;
+        // This is the retained actual Start cleanup, registered before the
+        // first question. The port never accepts a second/extended window.
+        manager
+            .driver_mut()
+            .register_profiled_external_cleanup_deadline(source, context.shutdown_deadline)?;
         manager.configure_rovent_external_routing(self.mode, admission.budget, 1)?;
         manager.configure_rovent_peer_followups(self.peers)?;
         Ok(())

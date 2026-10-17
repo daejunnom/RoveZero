@@ -122,7 +122,8 @@ fn fixture(goal: SearchGoal) -> (ActualGoalManager, Arc<NativeFacts>, Instant) {
     let until = clock.origin() + WINDOW;
     let authority = SearchAuthority {
         epoch: ProcessEpoch(717),
-        game: GameGeneration(1),
+        // A freshly constructed semantic owner is in its actual initial game.
+        game: GameGeneration(0),
         root: RootGeneration(1),
         implementation: Digest([91; 32]),
     };

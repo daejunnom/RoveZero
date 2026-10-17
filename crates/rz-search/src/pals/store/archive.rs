@@ -294,15 +294,46 @@ impl StorePins {
 
 /// The optional retirement bound applies before allocating a new unique pin.
 /// Legacy archive expansion uses the same graph traversal without a new bound.
+type PinClosureCheck<'a> = Option<&'a mut dyn FnMut() -> Result<(), StoreError>>;
+
+fn check_pin_closure(check: &mut PinClosureCheck<'_>) -> Result<(), StoreError> {
+    match check {
+        Some(check) => check(),
+        None => Ok(()),
+    }
+}
+
+fn clone_closure_set<T: Ord + Copy>(
+    source: &BTreeSet<T>,
+    check: &mut PinClosureCheck<'_>,
+) -> Result<BTreeSet<T>, StoreError> {
+    check_pin_closure(check)?;
+    let copied = if check.is_none() {
+        source.clone()
+    } else {
+        let mut copied = BTreeSet::new();
+        for id in source {
+            check_pin_closure(check)?;
+            copied.insert(*id);
+            check_pin_closure(check)?;
+        }
+        copied
+    };
+    check_pin_closure(check)?;
+    Ok(copied)
+}
+
 fn insert_closure_pin<T: Ord>(
     set: &mut BTreeSet<T>,
     value: T,
     count: &mut usize,
     maximum: Option<usize>,
+    check: &mut PinClosureCheck<'_>,
 ) -> Result<(), StoreError> {
+    check_pin_closure(check)?;
     if let Some(maximum) = maximum {
         if set.contains(&value) {
-            return Ok(());
+            return check_pin_closure(check);
         }
         let next = count
             .checked_add(1)
@@ -313,7 +344,7 @@ fn insert_closure_pin<T: Ord>(
     } else {
         set.insert(value);
     }
-    Ok(())
+    check_pin_closure(check)
 }
 
 /// A handle proves the live archive owner and committed segment generation.
@@ -2491,6 +2522,17 @@ impl PalsStores {
         codec::write_retirement_wire(writer, &StateWire::encode(id, self.states.get(id)?)?)
     }
 
+    /// Serialize the retirement owner's retained source, including an original
+    /// snapshot that is no longer a current hot lookup. This grants no StateId.
+    pub(crate) fn write_retirement_snapshot<W: Write + ?Sized>(
+        &self,
+        id: StateId,
+        snapshot: &PositionSnapshot,
+        writer: &mut W,
+    ) -> Result<(), StoreError> {
+        codec::write_retirement_wire(writer, &StateWire::encode(id, snapshot)?)
+    }
+
     pub(crate) fn write_retirement_line<W: Write + ?Sized>(
         &self,
         id: LineId,
@@ -2510,6 +2552,16 @@ impl PalsStores {
         )
     }
 
+    /// Unpublished failure evidence remains unpublished; the sink binds this
+    /// exact value to its original retirement custody rather than a new lookup.
+    pub(crate) fn write_retirement_observation_value<W: Write + ?Sized>(
+        &self,
+        value: &Observation,
+        writer: &mut W,
+    ) -> Result<(), StoreError> {
+        codec::write_retirement_wire(writer, &ObservationWire::encode(value)?)
+    }
+
     pub(crate) fn write_retirement_role_record<W: Write + ?Sized>(
         &self,
         record: &crate::pals::engine::RoleRecord,
@@ -2526,6 +2578,9 @@ impl PalsStores {
         codec::write_retirement_external_report(report, writer)
     }
 
+    // Authored equivalence fixtures retain the uncontrolled form; actual
+    // retirement serialization must use the original controlled window below.
+    #[cfg(test)]
     pub(crate) fn retirement_dependency_closure(
         &self,
         pins: &StorePins,
@@ -2534,7 +2589,32 @@ impl PalsStores {
         if pins.count() > max_records {
             return Err(StoreError::Capacity("retirement dependency closure"));
         }
-        self.expand_pins_inner(pins.clone(), Some(max_records), true)
+        self.expand_pins_inner(pins.clone(), Some(max_records), true, None)
+    }
+
+    /// Actual retirement traversal uses the original finite-window/cancel
+    /// check during cloning and graph walks, before any stream footer exists.
+    pub(crate) fn retirement_dependency_closure_controlled(
+        &self,
+        pins: &StorePins,
+        max_records: usize,
+        check: &mut dyn FnMut() -> Result<(), StoreError>,
+    ) -> Result<StorePins, StoreError> {
+        check()?;
+        if pins.count() > max_records {
+            return Err(StoreError::Capacity("retirement dependency closure"));
+        }
+        let mut check = Some(check);
+        check_pin_closure(&mut check)?;
+        let copied = StorePins {
+            states: clone_closure_set(&pins.states, &mut check)?,
+            lines: clone_closure_set(&pins.lines, &mut check)?,
+            observations: clone_closure_set(&pins.observations, &mut check)?,
+            situations: clone_closure_set(&pins.situations, &mut check)?,
+            executions: clone_closure_set(&pins.executions, &mut check)?,
+        };
+        check_pin_closure(&mut check)?;
+        self.expand_pins_inner(copied, Some(max_records), true, check)
     }
 
     pub(crate) fn retirement_dependency_edges(
@@ -2547,6 +2627,15 @@ impl PalsStores {
     }
 
     fn validate_pins(&self, pins: &StorePins) -> Result<(), StoreError> {
+        self.validate_pins_inner(pins, &mut None)
+    }
+
+    fn validate_pins_inner(
+        &self,
+        pins: &StorePins,
+        check: &mut PinClosureCheck<'_>,
+    ) -> Result<(), StoreError> {
+        check_pin_closure(check)?;
         if pins.states.len() > self.limits.states
             || pins.lines.len() > self.limits.line_chunks
             || pins.situations.len() > self.limits.situations
@@ -2556,24 +2645,34 @@ impl PalsStores {
             return Err(StoreError::PinSaturated("pin index"));
         }
         for id in &pins.states {
+            check_pin_closure(check)?;
             self.states.get(*id)?;
+            check_pin_closure(check)?;
         }
         for id in &pins.lines {
+            check_pin_closure(check)?;
             self.lines.get(*id)?;
+            check_pin_closure(check)?;
         }
         for id in &pins.observations {
+            check_pin_closure(check)?;
             self.observations.get(*id)?;
+            check_pin_closure(check)?;
         }
         for id in &pins.situations {
+            check_pin_closure(check)?;
             self.situations.get(*id)?;
+            check_pin_closure(check)?;
         }
         for id in &pins.executions {
+            check_pin_closure(check)?;
             self.tasks.get(*id)?;
+            check_pin_closure(check)?;
         }
-        Ok(())
+        check_pin_closure(check)
     }
     fn expand_pins(&self, pins: StorePins) -> Result<StorePins, StoreError> {
-        self.expand_pins_inner(pins, None, false)
+        self.expand_pins_inner(pins, None, false, None)
     }
 
     fn expand_pins_inner(
@@ -2581,70 +2680,129 @@ impl PalsStores {
         mut pins: StorePins,
         maximum: Option<usize>,
         include_task_consumers: bool,
+        mut check: PinClosureCheck<'_>,
     ) -> Result<StorePins, StoreError> {
+        check_pin_closure(&mut check)?;
         let mut count = pins.count();
         loop {
+            check_pin_closure(&mut check)?;
             let before = pins.count();
-            for id in pins.situations.clone() {
+            for id in clone_closure_set(&pins.situations, &mut check)? {
+                check_pin_closure(&mut check)?;
                 let s = self.situations.get(id)?;
-                insert_closure_pin(&mut pins.states, s.state, &mut count, maximum)?;
-                insert_closure_pin(&mut pins.lines, s.focus, &mut count, maximum)?;
+                insert_closure_pin(&mut pins.states, s.state, &mut count, maximum, &mut check)?;
+                insert_closure_pin(&mut pins.lines, s.focus, &mut count, maximum, &mut check)?;
                 for (line, conclusion) in s.conclusions.iter() {
-                    insert_closure_pin(&mut pins.lines, *line, &mut count, maximum)?;
+                    check_pin_closure(&mut check)?;
+                    insert_closure_pin(&mut pins.lines, *line, &mut count, maximum, &mut check)?;
                     if let Some(o) = conclusion.evidence {
-                        insert_closure_pin(&mut pins.observations, o, &mut count, maximum)?;
+                        insert_closure_pin(
+                            &mut pins.observations,
+                            o,
+                            &mut count,
+                            maximum,
+                            &mut check,
+                        )?;
                     }
                     if let ContinuationStatus::RepairedBy(line) = conclusion.status {
-                        insert_closure_pin(&mut pins.lines, line, &mut count, maximum)?;
+                        insert_closure_pin(&mut pins.lines, line, &mut count, maximum, &mut check)?;
                     }
+                    check_pin_closure(&mut check)?;
                 }
+                check_pin_closure(&mut check)?;
             }
-            for id in pins.lines.clone() {
+            for id in clone_closure_set(&pins.lines, &mut check)? {
+                check_pin_closure(&mut check)?;
                 let line = self.lines.get(id)?;
-                insert_closure_pin(&mut pins.states, line.start_state, &mut count, maximum)?;
+                insert_closure_pin(
+                    &mut pins.states,
+                    line.start_state,
+                    &mut count,
+                    maximum,
+                    &mut check,
+                )?;
                 if let Some(parent) = line.parent {
-                    insert_closure_pin(&mut pins.lines, parent, &mut count, maximum)?;
+                    insert_closure_pin(&mut pins.lines, parent, &mut count, maximum, &mut check)?;
                 }
+                check_pin_closure(&mut check)?;
             }
-            for id in pins.observations.clone() {
+            for id in clone_closure_set(&pins.observations, &mut check)? {
+                check_pin_closure(&mut check)?;
                 let o = self.observations.get(id)?;
-                insert_closure_pin(&mut pins.states, o.state, &mut count, maximum)?;
+                insert_closure_pin(&mut pins.states, o.state, &mut count, maximum, &mut check)?;
                 for line in [o.line, o.cpu_pv].into_iter().flatten() {
-                    insert_closure_pin(&mut pins.lines, line, &mut count, maximum)?;
+                    check_pin_closure(&mut check)?;
+                    insert_closure_pin(&mut pins.lines, line, &mut count, maximum, &mut check)?;
                 }
                 for observation in o
                     .supersedes
                     .into_iter()
                     .chain(o.score.model_dependencies().into_iter().flatten())
                 {
-                    insert_closure_pin(&mut pins.observations, observation, &mut count, maximum)?;
+                    check_pin_closure(&mut check)?;
+                    insert_closure_pin(
+                        &mut pins.observations,
+                        observation,
+                        &mut count,
+                        maximum,
+                        &mut check,
+                    )?;
                 }
                 if let Some(execution) = o.execution {
-                    insert_closure_pin(&mut pins.executions, execution, &mut count, maximum)?;
+                    insert_closure_pin(
+                        &mut pins.executions,
+                        execution,
+                        &mut count,
+                        maximum,
+                        &mut check,
+                    )?;
                 }
+                check_pin_closure(&mut check)?;
             }
-            for id in pins.executions.clone() {
+            for id in clone_closure_set(&pins.executions, &mut check)? {
+                check_pin_closure(&mut check)?;
                 let task = self.tasks.get(id)?;
-                insert_closure_pin(&mut pins.states, task.key.state, &mut count, maximum)?;
+                insert_closure_pin(
+                    &mut pins.states,
+                    task.key.state,
+                    &mut count,
+                    maximum,
+                    &mut check,
+                )?;
                 if let Some(line) = task.key.line {
-                    insert_closure_pin(&mut pins.lines, line, &mut count, maximum)?;
+                    insert_closure_pin(&mut pins.lines, line, &mut count, maximum, &mut check)?;
                 }
                 if let Some(execution) = task.resumed_from {
-                    insert_closure_pin(&mut pins.executions, execution, &mut count, maximum)?;
+                    insert_closure_pin(
+                        &mut pins.executions,
+                        execution,
+                        &mut count,
+                        maximum,
+                        &mut check,
+                    )?;
                 }
                 if include_task_consumers {
                     for consumer in &task.consumers {
+                        check_pin_closure(&mut check)?;
                         insert_closure_pin(
                             &mut pins.situations,
                             consumer.consumer.situation,
                             &mut count,
                             maximum,
+                            &mut check,
                         )?;
+                        check_pin_closure(&mut check)?;
                     }
                 }
                 match task.status {
                     TaskStatus::Completed(o) => {
-                        insert_closure_pin(&mut pins.observations, o, &mut count, maximum)?;
+                        insert_closure_pin(
+                            &mut pins.observations,
+                            o,
+                            &mut count,
+                            maximum,
+                            &mut check,
+                        )?;
                     }
                     TaskStatus::Paused { evidence, .. }
                     | TaskStatus::RetiredPaused { evidence, .. } => {
@@ -2654,22 +2812,43 @@ impl PalsStores {
                                 observation,
                                 &mut count,
                                 maximum,
+                                &mut check,
                             )?;
                         }
                     }
                     _ => {}
                 }
+                check_pin_closure(&mut check)?;
             }
             for (observation, situations) in &self.dependencies.dependents {
-                if situations.iter().any(|s| pins.situations.contains(s)) {
-                    insert_closure_pin(&mut pins.observations, *observation, &mut count, maximum)?;
+                check_pin_closure(&mut check)?;
+                let mut retained = false;
+                for situation in situations {
+                    check_pin_closure(&mut check)?;
+                    if pins.situations.contains(situation) {
+                        retained = true;
+                        break;
+                    }
+                    check_pin_closure(&mut check)?;
                 }
+                if retained {
+                    insert_closure_pin(
+                        &mut pins.observations,
+                        *observation,
+                        &mut count,
+                        maximum,
+                        &mut check,
+                    )?;
+                }
+                check_pin_closure(&mut check)?;
             }
+            check_pin_closure(&mut check)?;
             if pins.count() == before {
                 break;
             }
         }
-        self.validate_pins(&pins)?;
+        self.validate_pins_inner(&pins, &mut check)?;
+        check_pin_closure(&mut check)?;
         Ok(pins)
     }
     fn protected_pins(&self, manager: &ArchiveManager) -> Result<StorePins, StoreError> {

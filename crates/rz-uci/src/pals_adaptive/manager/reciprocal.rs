@@ -147,6 +147,36 @@ where
             let mut held = self.accepted_roles.remove(index);
             let consumed_before = self.counters.consumed_role_outputs;
             let result = self.advance_accepted_role_parent(&mut held);
+            if result.is_err() {
+                if let (Some(ticket), Some(proof), Some(output)) = (
+                    held.binding.ticket,
+                    held.binding.reciprocal_acceptance.as_ref(),
+                    held.binding.delivered.as_ref(),
+                ) {
+                    match self
+                        .driver
+                        .role_consumption_recorded(&ticket, &held.binding.input.view)
+                    {
+                        Ok(true) => {
+                            if !held.binding.consumption_recorded {
+                                if let Err(error) =
+                                    self.record_role_consumption(ticket, held.binding.physical)
+                                {
+                                    self.record_failure(error);
+                                }
+                                held.binding.consumption_recorded = true;
+                            }
+                            self.observe_cpu_pc_head(
+                                &held.binding.input,
+                                proof,
+                                output.proposer_ranking_output(),
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(error) => self.record_failure(error),
+                    }
+                }
+            }
             match result {
                 Ok(true) => {
                     changed = true;
@@ -253,6 +283,7 @@ where
                 self.driver.role_consumed(&source, &work.input.view)?;
                 self.record_role_consumption(source, held.binding.physical)?;
                 held.binding.consumption_recorded = true;
+                self.observe_cpu_pc_head(&held.binding.input, accepted, output);
             }
             let preparation = self.driver.prepare_accepted_role_reciprocal(
                 &work,
@@ -373,6 +404,9 @@ where
         if !held.binding.consumption_recorded {
             self.record_role_consumption(source, held.binding.physical)?;
             held.binding.consumption_recorded = true;
+            if let Some(accepted) = &held.binding.reciprocal_acceptance {
+                self.observe_cpu_pc_head(&held.binding.input, accepted, output);
+            }
         }
         self.resolve(work, StepExecution::Role(source.id), checked)?;
         Ok(true)

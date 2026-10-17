@@ -88,6 +88,12 @@ const MAX_ROLE_PENDING: usize = 16;
 mod admitted;
 mod cleanup;
 mod collection;
+mod cpu_semantic;
+pub use cpu_semantic::{
+    AdaptiveCpuCaptureCustody, AdaptiveCpuCapturePlan, AdaptiveCpuSemanticObserver,
+    AdaptiveCpuSemanticObserverBox, AdaptiveCpuSemanticRetirement,
+    AdaptiveCpuSemanticRetirementParts,
+};
 mod effective_clock;
 mod researcher_resources;
 pub use researcher_resources::AdaptiveResearcherSourceKind;
@@ -193,6 +199,7 @@ pub enum AdaptiveManagerError {
     Frontier(FrontierError),
     GoalLocalBlocked(GoalLocalBlockReason),
     NnuecPreparation(NnuecWorkError),
+    NnuecCapture(Arc<rz_search::pals::engine::adaptive_port::AdaptiveNnuecCaptureError>),
     ProfiledExternal(rz_search::cpu_checker::CheckerError),
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     ProfiledQueryUnsupported(rz_search::pals::engine::adaptive_port::ProfiledExternalUnsupported),
@@ -294,6 +301,54 @@ pub struct CandidateFrame<Q> {
 /// archive I/O, an external pipe drain, or wait for a worker. Archive effects
 /// remain with the independent archive owner and finish after worker fences.
 pub trait AdaptiveSearchDriver<Q> {
+    fn reserve_cpu_nnuec_capture(
+        &self,
+        _: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+        _: Arc<rz_search::cpu_value::nnuec::v2::Model>,
+        _: Arc<rz_search::cpu_value::nnuec::v2::review::BoundNnuecReviewContext>,
+        _: u64,
+        _: rz_search::cpu_value::nnuec::v2::capture::NnuecCaptureLimits,
+    ) -> Result<
+        rz_search::cpu_value::nnuec::v2::capture::NnuecCaptureReservation,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no original R capture factory",
+        ))
+    }
+    fn cpu_semantic_publication_recorded(
+        &self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuSliceReport,
+    ) -> bool {
+        false
+    }
+    fn cpu_semantic_witnesses(
+        &self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuSliceReport,
+        _: &SettledCpuSlice,
+        _: &rz_search::cpu_value::nnuec::v2::capture::NnuecCaptureLineage,
+    ) -> Result<Vec<rz_search::pals::engine::adaptive_port::CpuSemanticWitness>, AdaptiveManagerError>
+    {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual R semantic witness factory",
+        ))
+    }
+    fn selected_cpu_pc_consumption(
+        &self,
+        _: &rz_search::pals::engine::adaptive_port::CpuSemanticWitness,
+        _: &FrameInput<ReviewView, Q>,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+        _: &RoleOutput,
+    ) -> Result<
+        Option<rz_search::pals::engine::adaptive_port::CpuSemanticWitness>,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::Invalid(
+            "driver has no actual selected R observation consumer",
+        ))
+    }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     #[allow(clippy::too_many_arguments)]
     fn prepare_profiled_external(
@@ -1490,6 +1545,7 @@ struct OwnBinding<Q> {
     // returns; a cold Store never turns a reservation into zero work.
     native_frontier: Option<NativeReservation>,
     nnuec: Option<Arc<nnuec::NnuecJobCustody>>,
+    semantic_settlement: Option<SettledCpuSlice>,
 }
 struct OwnSlot<Q> {
     worker: Option<CpuWorker>,
@@ -1707,6 +1763,10 @@ where
     role_call_limit: Option<u64>,
     collection_observer: Option<AdaptiveCollectionObserverBox<Q, B::Output>>,
     collection_admission: Option<RoventCollectionRootAdmission>,
+    cpu_semantic: Option<cpu_semantic::CpuSemanticState<Q>>,
+    // Failed unique prepared-job cleanup retains the same job and grant. No
+    // unverified rejection can refund credit or discard its capture custody.
+    retained_cpu_jobs: Vec<(rz_search::cpu_worker::CpuJob, SliceGrant)>,
     roles: Vec<RoleBinding<Q, B::Output>>,
     acknowledgements: VecDeque<NativeAck>,
     own: Vec<OwnSlot<Q>>,
@@ -1736,6 +1796,7 @@ where
     native_joined: bool,
     native_root_fence: Option<NativeRootFence>,
     close_mode: AdaptiveCloseMode,
+    native_root_quiesce_requested: bool,
     external_finished: Option<bool>,
     external_root_fence: Option<ExternalRootFence>,
     external_startup_observed: bool,
@@ -3071,6 +3132,10 @@ where
         if let Err(error) = self.flush_acks() {
             self.record_failure(error);
         }
+        // Reliable physical owner events above are always processed before an
+        // optional collector callback can fail. Its original capture remains
+        // separate custody and cannot undo an accepted native-ledger receipt.
+        self.poll_cpu_semantic();
         if !self.failures.is_empty() && self.shutdown_until.is_none() {
             self.begin_selected_shutdown(self.cleanup_until()?)?;
         }
@@ -3840,7 +3905,7 @@ where
                     }
                 }
                 TicketNativeEvent::RootQuiesced(fence) => {
-                    if self.close_mode != AdaptiveCloseMode::RootQuiesce
+                    if !self.native_root_quiesce_requested
                         || fence.authority() != self.registration.authority
                         || self.native_root_fence.is_some()
                     {
@@ -4156,6 +4221,25 @@ where
         ))?;
         self.record_role_consumption(ticket, binding.physical)?;
         self.roles[index].consumption_recorded = true;
+        let failures = if let (Some(state), Some(accepted), Some(output)) = (
+            self.cpu_semantic.as_mut(),
+            self.roles[index].reciprocal_acceptance.as_ref(),
+            self.roles[index].delivered.as_ref(),
+        ) {
+            cpu_semantic::promote_selected(
+                state,
+                &self.driver,
+                &self.roles[index].input,
+                accepted,
+                output.proposer_ranking_output(),
+            )
+        } else {
+            Vec::new()
+        };
+        for failure in failures {
+            self.record_cpu_semantic_failure(failure);
+        }
+        self.poll_cpu_semantic();
         Ok(())
     }
     fn record_role_consumption(
@@ -4711,6 +4795,10 @@ where
                         "CPU slice grant echo mismatch",
                     ));
                 }
+                // The same accepted native-ledger receipt remains available
+                // for collection after actual Store consumption. It is never
+                // recreated from reported counters or a global snapshot.
+                binding.semantic_settlement = Some(settled.clone());
                 if let Some(reservation) = binding.native_frontier.take() {
                     self.retain_frontier_settlement(reservation, report.clone(), settled);
                     if let Err(error) = self.flush_frontier_native() {
@@ -5354,7 +5442,15 @@ where
             .iter()
             .any(|held| held.child == Some(binding.work.frame))
         {
-            let digest = self.driver.consume_reciprocal_cpu(&binding.work, report)?;
+            let consumed = self.driver.consume_reciprocal_cpu(&binding.work, report);
+            if consumed.is_ok()
+                || self
+                    .driver
+                    .cpu_semantic_publication_recorded(&binding.work, report)
+            {
+                self.observe_cpu_semantic_use(binding, report);
+            }
+            let digest = consumed?;
             self.release_nnuec_report(&binding.work, report)?;
             self.machine.resolve_reciprocal_cpu_response(
                 StepEvidence {
@@ -5375,7 +5471,15 @@ where
             self.release_accepted_role_waiters(binding.work.frame)?;
             return Ok(());
         }
-        let checked = self.driver.commit_cpu(&binding.work, report)?;
+        let committed = self.driver.commit_cpu(&binding.work, report);
+        if committed.is_ok()
+            || self
+                .driver
+                .cpu_semantic_publication_recorded(&binding.work, report)
+        {
+            self.observe_cpu_semantic_use(binding, report);
+        }
+        let checked = committed?;
         self.release_nnuec_report(&binding.work, report)?;
         self.resolve(
             binding.work.clone(),
@@ -6567,6 +6671,46 @@ where
             self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
             return Err(error);
         }
+        // PonderHit or root control may close future admission during bounded
+        // preparation. Only this actual unqueued owner proof may release the
+        // original grant; an effective clock never refunds it by itself.
+        let admission_error = if !self.can_admit_work() {
+            Some(AdaptiveManagerError::AdmissionClosed)
+        } else if let Some(capture) = nnuec.as_ref().and_then(|custody| custody.capture.as_ref()) {
+            prepared
+                .enable_nnuec_capture(capture.clone())
+                .err()
+                .map(|(error, _same_capture)| AdaptiveManagerError::Cpu(error))
+        } else {
+            None
+        };
+        let admission_error = admission_error
+            .or_else(|| (!self.can_admit_work()).then_some(AdaptiveManagerError::AdmissionClosed));
+        if let Some(error) = admission_error {
+            match self.own[index]
+                .worker
+                .as_ref()
+                .expect("checked owner")
+                .reject_prepared_retaining(prepared, grant)
+            {
+                Ok(rejected) => {
+                    self.release_frontier_before_enqueue(native_frontier, rejected.proof())?;
+                    self.native_ledger_mut()?.retire_unstarted(envelope.id)?;
+                    self.driver
+                        .cpu_rejected(&work, &envelope, rejected.proof())?;
+                    return Err(error);
+                }
+                Err((cleanup_error, original_job)) => {
+                    self.retained_cpu_jobs.push((original_job, grant));
+                    if let Some(reservation) = native_frontier {
+                        self.retain_frontier_unknown(reservation);
+                    }
+                    self.native_ledger_mut()?.quarantine(envelope.id)?;
+                    self.phase = ManagerPhase::Quarantined;
+                    return Err(cleanup_error.into());
+                }
+            }
+        }
         match self.own[index]
             .worker
             .as_ref()
@@ -6581,6 +6725,9 @@ where
                     .cpu_rejected(&work, &envelope, rejected.proof())?;
                 return Err(AdaptiveManagerError::Cpu(rejected.reason().clone()));
             }
+        }
+        if let Some(state) = &mut self.cpu_semantic {
+            state.enqueued(envelope);
         }
         // The manager is the only writer. No worker response is read between
         // successful admission and binding the exact execution to this frame.
@@ -6606,6 +6753,7 @@ where
             reciprocal: None,
             native_frontier,
             nnuec,
+            semantic_settlement: None,
         });
         self.machine
             .bind_cpu(frame, &envelope, &grant, self.clock.domain(), admitted_at)?;
@@ -7115,7 +7263,10 @@ where
         }
         match mode {
             AdaptiveCloseMode::ProcessShutdown => self.native.begin_shutdown(until),
-            AdaptiveCloseMode::RootQuiesce => self.native.begin_root_quiesce(until)?,
+            AdaptiveCloseMode::RootQuiesce => {
+                self.native.begin_root_quiesce(until)?;
+                self.native_root_quiesce_requested = true;
+            }
         }
         self.driver.begin_auxiliary_shutdown(until)?;
         Ok(())
@@ -7311,6 +7462,7 @@ where
             if self.native_credit_outstanding()?
                 || self.own.iter().any(|slot| slot.binding.is_some())
                 || self.foreign.is_some()
+                || !self.retained_cpu_jobs.is_empty()
             {
                 self.phase = ManagerPhase::Quarantined;
             } else {

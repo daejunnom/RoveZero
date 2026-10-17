@@ -6,8 +6,11 @@
 mod checker_metadata;
 pub use checker_metadata::*;
 mod completion_observation;
+mod idle_physical_close;
 #[cfg(feature = "pals-adaptive")]
 mod initial_stop;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod profiled_retirement;
 mod root_admission;
 mod rovent;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -343,6 +346,21 @@ where
         owners: Box<IdleOwners<B>>,
         worker: ArchiveWorker<AdaptivePortModel>,
     },
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    ProfiledRetirementPending {
+        owners: Box<IdleOwners<B>>,
+        worker: ArchiveWorker<AdaptivePortModel>,
+        transfer: ArchiveTransfer,
+        authority: SearchAuthority,
+    },
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    ProfiledRetirementRetained {
+        owners: Box<IdleOwners<B>>,
+        worker: ArchiveWorker<AdaptivePortModel>,
+        payload: Box<
+            rz_search::pals::engine::adaptive_port::archive_worker::PersistProfiledRetirementWork,
+        >,
+    },
     Closed(AdaptiveSessionProcessReceipt),
     // Exists only under the exclusive mutex while moving owners; never a
     // reusable state. Poison/panic is a failed ownership boundary.
@@ -463,6 +481,14 @@ where
     latest_root: Mutex<Option<AdaptiveShutdownReceipt>>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     latest_profiled_root: Mutex<Option<super::ProfiledExternalShutdownReceipt>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    profiled_retirement_sink: Mutex<
+        Option<
+            rz_search::pals::engine::adaptive_port::profiled_retirement_archive::RegisteredProfiledRetirementSink,
+        >,
+    >,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    profiled_retirement_commits: Mutex<VecDeque<serde_json::Value>>,
     rovent: Option<RoventPcrSessionProfile>,
     #[cfg(feature = "pals-adaptive")]
     rovent_root_policy: Option<RoventPcrRootPolicy>,
@@ -1136,6 +1162,10 @@ where
             latest_root: Mutex::new(None),
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             latest_profiled_root: Mutex::new(None),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            profiled_retirement_sink: Mutex::new(None),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            profiled_retirement_commits: Mutex::new(VecDeque::with_capacity(64)),
             rovent: None,
             #[cfg(feature = "pals-adaptive")]
             rovent_root_policy: None,
@@ -1424,6 +1454,24 @@ where
             }
             SessionState::ArchiveJoinedPending { owners, worker } => {
                 snapshot("archive_join_pending", owners, 0, worker.is_busy())
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledRetirementPending { owners, worker, .. } => {
+                snapshot("profiled_retirement_pending", owners, 0, worker.is_busy())
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledRetirementRetained {
+                owners,
+                worker,
+                payload,
+            } => {
+                let _retained = payload.retirement();
+                snapshot(
+                    "profiled_retirement_return_rejected",
+                    owners,
+                    0,
+                    worker.is_busy(),
+                )
             }
             SessionState::Closed(_) => AdaptiveSessionRetention {
                 stage: "process_closed",
@@ -2282,8 +2330,14 @@ where
                 return Err(SearchSessionFailure::physical_completion_unknown());
             }
         }
+        if let Err(error) = self.record_root_fence(&receipt) {
+            *state = SessionState::Idle(owners);
+            return Err(error.unknown_if_unclosed());
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let owners =
+            self.persist_profiled_retirement(&mut state, owners, context.shutdown_deadline)?;
         *state = SessionState::Idle(owners);
-        self.record_root_fence(&receipt)?;
         collection.map_err(|e| SearchSessionFailure::debug("AdaptiveCollectionClosure", &e))?;
         if let Some(error) = retained_failure {
             return Err(SearchSessionFailure::debug("AdaptiveRootFailure", &error));
@@ -2527,6 +2581,8 @@ where
             return Ok(receipt.clone());
         }
         let retained = std::mem::replace(&mut *state, SessionState::Moving);
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let retained = self.finish_retained_profiled_io(&mut state, retained, until)?;
         let retained = match retained {
             SessionState::Manager(mut manager) => {
                 let root_reusable = manager.phase() == ManagerPhase::Finished
@@ -2586,99 +2642,12 @@ where
                 return Err(SearchSessionFailure::physical_completion_unknown());
             }
         };
-        owners.native.begin_shutdown(until);
-        if let Some(external) = &owners.external {
-            external.worker.request_shutdown(until);
-        }
-        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-        if let SessionResearcherSource::ProfiledExternal(source) = &mut owners.researcher_source {
-            source.begin_process_finish(until);
-        }
-        loop {
-            let version = owners.native.signal().version();
-            while let Some(event) = owners.native.poll() {
-                match event {
-                    TicketNativeEvent::Finished {
-                        physical_shutdown_confirmed,
-                    } => owners.native_finished = Some(physical_shutdown_confirmed),
-                    TicketNativeEvent::Ready { .. } | TicketNativeEvent::RootQuiesced(_) => {}
-                    _ => {
-                        *state = SessionState::Idle(owners);
-                        return Err(SearchSessionFailure::physical_completion_unknown());
-                    }
-                }
-            }
-            if !owners.native_joined {
-                match owners.native.try_join() {
-                    Ok(joined) => owners.native_joined = joined,
-                    Err(_) => {
-                        *state = SessionState::Idle(owners);
-                        return Err(SearchSessionFailure::physical_completion_unknown());
-                    }
-                }
-            }
-            if owners.external_finished.is_none() {
-                if let Some(external) = &mut owners.external {
-                    if let Some(result) = external.worker.try_join() {
-                        match result {
-                            Ok(receipt) => owners.external_finished = Some(receipt),
-                            Err(_) => {
-                                *state = SessionState::Idle(owners);
-                                return Err(SearchSessionFailure::physical_completion_unknown());
-                            }
-                        }
-                    }
-                }
-            }
-            let profiled_complete = {
-                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-                {
-                    match &mut owners.researcher_source {
-                        SessionResearcherSource::Legacy => true,
-                        SessionResearcherSource::ProfiledExternal(source) => {
-                            match source.try_process_finish() {
-                                Ok(complete) => {
-                                    owners.external_finished = source.shutdown_receipt();
-                                    complete
-                                }
-                                Err(error) => {
-                                    *state = SessionState::Idle(owners);
-                                    return Err(error.unknown_if_unclosed());
-                                }
-                            }
-                        }
-                    }
-                }
-                #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
-                {
-                    true
-                }
-            };
-            let external_complete = profiled_complete
-                && (owners.external.is_none()
-                    || owners.external_finished.is_some_and(|r| {
-                        r.cleanup_complete && !r.quarantined && !r.ownership_lost
-                    }));
-            if owners.native_joined && owners.native_finished == Some(true) && external_complete {
-                break;
-            }
-            if Instant::now() >= until || owners.native_finished == Some(false) {
-                *state = SessionState::Idle(owners);
-                return Err(SearchSessionFailure::physical_completion_unknown());
-            }
-            owners
-                .native
-                .signal()
-                .wait_changed(version, Duration::from_millis(1));
-        }
-        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-        if owners.profiled_retirement.is_some() {
+        if let Err(error) = self.finish_idle_physical_owners(&mut owners, until) {
             *state = SessionState::Idle(owners);
-            return Err(failure(
-                "RoventExternalEvidencePending",
-                "physical owners closed; the original retired packet/Store evidence is retained",
-            ));
+            return Err(error);
         }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let mut owners = self.persist_profiled_retirement(&mut state, owners, until)?;
         let engine = owners.engine.as_mut().expect("quiescent Search owner");
         let last_authority = engine.last_adaptive_authority();
         let closed = match catch_unwind(AssertUnwindSafe(|| engine.finish_followup_owners(until))) {

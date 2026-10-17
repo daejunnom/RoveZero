@@ -107,6 +107,7 @@ where
             native_joined: false,
             native_root_fence: None,
             close_mode: AdaptiveCloseMode::ProcessShutdown,
+            native_root_quiesce_requested: false,
             external_finished: None,
             external_root_fence: None,
             external_startup_observed: false,
@@ -150,6 +151,8 @@ where
             nnuec_jobs: Vec::with_capacity(CPU_JOB_CAPACITY),
             nnuec_observations: Vec::with_capacity(CPU_JOB_CAPACITY),
             nnuec_observations_omitted: 0,
+            cpu_semantic: None,
+            retained_cpu_jobs: Vec::new(),
         }
     }
 }

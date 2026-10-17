@@ -108,6 +108,19 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
         Ok(())
     }
 
+    /// 실제 부착된 source의 원 cleanup ceiling을 보존한다. 탐색·현재 마감이나
+    /// admission을 갱신하지 않으며, 첫 질문 전 등록 조건은 Core가 검증한다.
+    pub fn register_profiled_external_cleanup_deadline(
+        &mut self,
+        source: &ProfiledExternalRootSource,
+        original: Instant,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.profile_source(source)?;
+        self.hot()?
+            .register_profiled_external_cleanup_deadline(source, original)
+            .map_err(profile_error)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn profile_prepare(
         &mut self,

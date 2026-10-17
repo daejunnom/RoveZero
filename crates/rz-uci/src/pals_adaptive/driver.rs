@@ -630,6 +630,62 @@ fn checked(step: AdaptivePortMaterializedStep) -> CheckedStep<AdaptivePortQuesti
     }
 }
 impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for AdaptivePortDriver<M> {
+    fn reserve_cpu_nnuec_capture(
+        &self,
+        seal: &rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal,
+        model: Arc<rz_search::cpu_value::nnuec::v2::Model>,
+        bound: Arc<rz_search::cpu_value::nnuec::v2::review::BoundNnuecReviewContext>,
+        sequence: u64,
+        limits: rz_search::cpu_value::nnuec::v2::capture::NnuecCaptureLimits,
+    ) -> Result<
+        rz_search::cpu_value::nnuec::v2::capture::NnuecCaptureReservation,
+        AdaptiveManagerError,
+    > {
+        self.port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .reserve_cpu_nnuec_capture(seal, model, bound, sequence, limits)
+            .map_err(|error| AdaptiveManagerError::NnuecCapture(Arc::new(error)))
+    }
+    fn cpu_semantic_publication_recorded(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        report: &CpuSliceReport,
+    ) -> bool {
+        self.port
+            .as_deref()
+            .is_some_and(|port| port.cpu_semantic_publication_recorded(work, report))
+    }
+    fn cpu_semantic_witnesses(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        report: &CpuSliceReport,
+        settled: &SettledCpuSlice,
+        capture: &rz_search::cpu_value::nnuec::v2::capture::NnuecCaptureLineage,
+    ) -> Result<Vec<rz_search::pals::engine::adaptive_port::CpuSemanticWitness>, AdaptiveManagerError>
+    {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .cpu_semantic_witnesses(work, report, settled, capture)
+            .map_err(semantic)
+    }
+    fn selected_cpu_pc_consumption(
+        &self,
+        source: &rz_search::pals::engine::adaptive_port::CpuSemanticWitness,
+        input: &FrameInput<ReviewView, AdaptivePortQuestion>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+    ) -> Result<
+        Option<rz_search::pals::engine::adaptive_port::CpuSemanticWitness>,
+        AdaptiveManagerError,
+    > {
+        self.port
+            .as_deref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?
+            .selected_cpu_pc_consumption(source, input, accepted, output)
+            .map_err(semantic)
+    }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn validate_profiled_external_registration(
         &self,

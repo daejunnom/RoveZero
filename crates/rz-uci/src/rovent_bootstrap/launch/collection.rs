@@ -4,7 +4,7 @@
 //! 경계를 확인한 뒤에만 이 payload를 만든다. 이 모듈은 질문이나 authority를
 //! 만들지 않으며, 동일한 prepared owner와 원 FD의 소유권만 callback에 넘긴다.
 
-use super::RoventLaunchError;
+use super::{LaunchRetirementEvidence, RoventLaunchError};
 use crate::EngineIdentity;
 use crate::engine::{OwnerRegistry, ProcessClock};
 use crate::pals_native::ticketed::VirtualReviewCollectionObserver;
@@ -30,6 +30,7 @@ pub enum RoventCollectionPreparedNative {
     ExternalPcr {
         prepared: Box<PreparedRoventNative<AdaptivePortQuestion>>,
         external: Box<RoventPinnedExternalRSource>,
+        retirement_evidence: Box<LaunchRetirementEvidence>,
     },
 }
 

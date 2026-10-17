@@ -110,6 +110,7 @@ pub struct AdaptiveProfiledForeignPublication {
 pub(super) struct ProfiledExternalPortState {
     entries: HashMap<ContractDigest, ProfiledAdmission>,
     retirement_issued: bool,
+    original_cleanup_deadline: Option<Instant>,
 }
 impl ProfiledExternalPortState {
     pub(super) fn is_empty(&self) -> bool {
@@ -229,6 +230,11 @@ impl ProfiledExternalRootRetirement {
     }
     pub fn retained_questions(&self) -> usize {
         self.state.entries.len()
+    }
+    /// The caller's original root closure ceiling, frozen before the first
+    /// semantic question. A missing legacy registration grants no I/O window.
+    pub fn original_cleanup_deadline(&self) -> Option<Instant> {
+        self.state.original_cleanup_deadline
     }
     pub fn owned_host_bytes(&self) -> Option<u64> {
         self.state
@@ -390,6 +396,39 @@ impl ProfiledAdmission {
 }
 
 impl<M: RoleModel> AdaptiveEnginePort<M> {
+    /// Preserve the actual root owner's original cleanup ceiling. This is
+    /// metadata for closing the existing source, never a renewed admission or
+    /// a change to submitted question / worker deadlines. The UCI owner passes
+    /// its once-registered root boundary immediately after Frontier attachment.
+    pub fn register_profiled_external_cleanup_deadline(
+        &mut self,
+        source: &ProfiledExternalRootSource,
+        original: Instant,
+    ) -> Result<(), PalsError> {
+        if self.next_question != 1
+            || self.root_ranking_pending
+            || !self.profiled_external.entries.is_empty()
+            || self.profiled_external.retirement_issued
+            || self.profiled_external.original_cleanup_deadline.is_some()
+            || original < self.limits.deadline
+            || !self.engine.is_external()
+            || source.authority() != self.authority
+            || source.purpose() != ExternalEnginePurpose::ResearchChecker
+            || source.clock().domain != self.deadline.clock
+            || !self
+                .rovent_frontier()
+                .and_then(|frontier| frontier.external_source())
+                .is_some_and(|actual| actual.same_source(source))
+        {
+            return Err(CheckerError::Invalid(
+                "profiled cleanup boundary differs from original root admission",
+            )
+            .into());
+        }
+        self.profiled_external.original_cleanup_deadline = Some(original);
+        Ok(())
+    }
+
     /// Checks actual current-root ownership; an enum/config alone cannot
     /// authorize external assembly or replace the original Rules/view owner.
     pub fn validate_profiled_external_registration(

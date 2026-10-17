@@ -81,6 +81,7 @@ pub use profiled_external_port::{
     ProfiledExternalUnsupported,
 };
 pub mod archive_worker;
+pub mod profiled_retirement_archive;
 /// The process registry remains owned by UCI. Search cannot invent an owner
 /// from a root generation or reuse one for a separately owned Rules instance.
 pub type AdaptiveRulesOwnerIssuer =

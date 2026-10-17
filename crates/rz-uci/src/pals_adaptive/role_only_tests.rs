@@ -376,6 +376,9 @@ fn role_only_ponder_admission_close_keeps_original_pending_ticket_acceptance() {
             .all(|ticket| ticket.original_deadline == original)
     );
     assert_eq!(facts.accepted.lock().unwrap().len(), 2);
+    // Consuming the last ticket has already issued actual root quiescence.
+    // Escalation may race its historical RootQuiesced packet below.
+    assert_eq!(manager.phase(), ManagerPhase::Draining);
     manager
         .begin_shutdown(until + Duration::from_secs(1))
         .unwrap();
@@ -383,7 +386,13 @@ fn role_only_ponder_admission_close_keeps_original_pending_ticket_acceptance() {
         .run_root_until(until + Duration::from_secs(1), &AtomicBool::new(false))
         .unwrap();
     assert!(receipt.permits_semantic_closure(), "{receipt:?}");
-    assert!(manager.failures().next().is_none());
+    assert!(receipt.native_process_joined);
+    assert!(receipt.native_physical_shutdown_confirmed);
+    assert!(
+        manager.failures().next().is_none(),
+        "{:?}",
+        manager.failures().collect::<Vec<_>>()
+    );
 }
 
 #[test]

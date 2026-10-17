@@ -111,6 +111,7 @@ pub(super) struct NnuecJobCustody {
     pub seal: AdaptiveNnuecReviewSeal,
     pub bound: Arc<BoundNnuecReviewContext>,
     pub receipt: ValueInstallReceipt,
+    pub capture: Option<rz_search::cpu_value::nnuec::v2::capture::NnuecCaptureReservation>,
     // The original actor terminal stays with its exact request/job custody.
     _terminal_ack: NnuecPreparationTerminalAck,
 }
@@ -425,6 +426,7 @@ impl<Q> NnuecWorkPreparation<Q> {
             seal: self.seal,
             bound: self.bound.expect("installed original Bound"),
             receipt: self.receipt.expect("installed actual owner receipt"),
+            capture: None,
             _terminal_ack: self.terminal_ack.expect("original actor terminal"),
         })
     }
@@ -692,6 +694,8 @@ where
         let receipt = match self.shutdown_receipt() {
             Ok(receipt)
                 if self.nnuec.is_some()
+                    && self.cpu_semantic.is_none()
+                    && self.retained_cpu_jobs.is_empty()
                     && self.phase == ManagerPhase::Finished
                     && self.close_mode == AdaptiveCloseMode::RootQuiesce
                     && receipt.permits_root_reuse() =>
@@ -814,9 +818,23 @@ where
             .nnuec_pending
             .take()
             .expect("validated original preparation");
+        let capture = match self.reserve_nnuec_job_capture(
+            work,
+            &pending.seal,
+            pending.bound.as_ref().expect("installed original Bound"),
+        ) {
+            Ok(capture) => capture,
+            Err(error) => {
+                self.nnuec_pending = Some(pending);
+                return Err(error);
+            }
+        };
         let observation = pending.observation();
         let custody = match pending.into_job_custody() {
-            Ok(custody) => Arc::new(custody),
+            Ok(mut custody) => {
+                custody.capture = capture;
+                Arc::new(custody)
+            }
             Err(pending) => {
                 self.nnuec_pending = Some(pending);
                 return Err(AdaptiveManagerError::Invalid(

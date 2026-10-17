@@ -127,6 +127,7 @@ pub struct RoleOnlyShutdownReceipt {
     pub counters: AdaptiveManagerCounters,
     pub review_leases: RoventReviewLeaseObservation,
     native_root_fence: Option<NativeRootFence>,
+    close_mode: AdaptiveCloseMode,
 }
 impl RoleOnlyShutdownReceipt {
     pub fn permits_semantic_closure(&self) -> bool {
@@ -134,10 +135,14 @@ impl RoleOnlyShutdownReceipt {
             && !self.quarantined
             && self.pending_tickets == 0
             && self.retained_outputs == 0
-            && ((self.native_process_joined && self.native_physical_shutdown_confirmed)
-                || self.native_root_fence.is_some_and(|fence| {
+            && match self.close_mode {
+                AdaptiveCloseMode::ProcessShutdown => {
+                    self.native_process_joined && self.native_physical_shutdown_confirmed
+                }
+                AdaptiveCloseMode::RootQuiesce => self.native_root_fence.is_some_and(|fence| {
                     fence.authority() == self.authority && fence.permits_reuse()
-                }))
+                }),
+            }
     }
     pub fn root_fence(&self) -> Option<NativeRootFence> {
         self.native_root_fence
@@ -164,6 +169,7 @@ where
     native_finished: Option<bool>,
     native_joined: bool,
     native_root_fence: Option<NativeRootFence>,
+    root_quiesce_requested: bool,
     close_mode: AdaptiveCloseMode,
     shutdown_until: Option<Instant>,
     cleanup_boundary: Option<CleanupBoundary>,
@@ -262,6 +268,7 @@ where
             native_finished: None,
             native_joined: false,
             native_root_fence: None,
+            root_quiesce_requested: false,
             close_mode: AdaptiveCloseMode::RootQuiesce,
             shutdown_until: None,
             cleanup_boundary: None,
@@ -1078,7 +1085,7 @@ where
                 }
             }
             TicketNativeEvent::RootQuiesced(fence) => {
-                if self.close_mode != AdaptiveCloseMode::RootQuiesce
+                if !self.root_quiesce_requested
                     || fence.authority() != self.registration.authority
                     || !fence.permits_reuse()
                     || self.native_root_fence.is_some()
@@ -1160,7 +1167,10 @@ where
             self.native.cancel(binding.preparation).ok();
         }
         match mode {
-            AdaptiveCloseMode::RootQuiesce => self.native.begin_root_quiesce(until)?,
+            AdaptiveCloseMode::RootQuiesce => {
+                self.native.begin_root_quiesce(until)?;
+                self.root_quiesce_requested = true;
+            }
             AdaptiveCloseMode::ProcessShutdown => self.native.begin_shutdown(until),
         }
         Ok(())
@@ -1231,10 +1241,17 @@ where
                 self.native_joined = self.native.try_join()?;
                 changed |= self.native_joined;
             }
-            let fenced = self
-                .native_root_fence
-                .is_some_and(|fence| fence.permits_reuse())
-                || (self.native_joined && self.native_finished == Some(true));
+            // A historical root fence can arrive after escalation to process
+            // shutdown. Preserve it, but only a real process join closes that
+            // newer command; the process cannot be reused through this fence.
+            let fenced = match self.close_mode {
+                AdaptiveCloseMode::RootQuiesce => self
+                    .native_root_fence
+                    .is_some_and(|fence| fence.permits_reuse()),
+                AdaptiveCloseMode::ProcessShutdown => {
+                    self.native_joined && self.native_finished == Some(true)
+                }
+            };
             if fenced && self.phase != ManagerPhase::Quarantined {
                 if !self.collection_settled {
                     if let Some(observer) = &mut self.collection {
@@ -1300,6 +1317,7 @@ where
             counters: self.counters,
             review_leases: leases,
             native_root_fence: self.native_root_fence,
+            close_mode: self.close_mode,
         })
     }
     pub fn run_root_until(

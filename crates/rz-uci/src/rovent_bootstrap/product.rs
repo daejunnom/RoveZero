@@ -4,6 +4,7 @@
 
 use super::configuration::{ExecutionConfiguration, ResearchValueConfiguration};
 use super::external_session::{RoventExternalProductStartupRejection, external_researcher_session};
+use super::launch::{LaunchRetirementEvidence, LaunchRetirementRegistrationCustody};
 use super::nnuec_session::{
     RoventNnuecCollectionHooks, RoventNnuecSessionDriver, RoventNnuecSessionRejection,
 };
@@ -62,6 +63,7 @@ pub struct RoventNativeProductDriver {
     inner: Arc<ActualProductDriver>,
     sources: Arc<RoventPinnedNativeSources>,
     physically_closed: AtomicBool,
+    retirement_sources: Option<Arc<LaunchRetirementRegistrationCustody>>,
 }
 pub enum RoventProductStartupOwners {
     Pc(PreparedRoventNative<PcPortQuestion>),
@@ -69,7 +71,15 @@ pub enum RoventProductStartupOwners {
     PcrRejected(AdaptiveSessionAdmissionRejection<RoventNativeBackend<AdaptivePortQuestion>>),
     PcrDriver(Box<PcrDriver>),
     NnuecRejected(Box<RoventNnuecSessionRejection>),
-    ExternalRejected(Box<RoventExternalProductStartupRejection>),
+    ExternalRejected {
+        rejected: Box<RoventExternalProductStartupRejection>,
+        registration: Arc<LaunchRetirementRegistrationCustody>,
+    },
+    ExternalEvidenceMismatch {
+        prepared: PreparedRoventNative<AdaptivePortQuestion>,
+        external: RoventPinnedExternalRSource,
+        evidence: LaunchRetirementEvidence,
+    },
 }
 pub struct RoventProductStartupRejection {
     pub failure: SearchSessionFailure,
@@ -85,6 +95,7 @@ impl RoventNativeProductDriver {
     pub fn external_pcr(
         prepared: PreparedRoventNative<AdaptivePortQuestion>,
         external: RoventPinnedExternalRSource,
+        retirement_evidence: LaunchRetirementEvidence,
         clock: ProcessClock,
         owners: Arc<OwnerRegistry>,
         identity: EngineIdentity,
@@ -92,9 +103,25 @@ impl RoventNativeProductDriver {
         hooks: Option<AdaptiveSessionCollectionHooks<RoventNativeBackend<AdaptivePortQuestion>>>,
     ) -> Result<Self, RoventProductStartupRejection> {
         let sources = Arc::clone(prepared.sources());
+        if retirement_evidence.input_lock_digest() != sources.lock_digest() {
+            return Err(RoventProductStartupRejection {
+                failure: failure(
+                    "RoventRetirementSource",
+                    "retirement registration source lock differs",
+                ),
+                owners: RoventProductStartupOwners::ExternalEvidenceMismatch {
+                    prepared,
+                    external,
+                    evidence: retirement_evidence,
+                },
+                sources,
+            });
+        }
+        let (retirement_sink, registration) = retirement_evidence.into_parts();
         let driver = external_researcher_session(
             prepared,
             external,
+            retirement_sink,
             clock,
             owners,
             identity,
@@ -103,13 +130,17 @@ impl RoventNativeProductDriver {
         )
         .map_err(|rejected| RoventProductStartupRejection {
             failure: rejected.failure.clone(),
-            owners: RoventProductStartupOwners::ExternalRejected(Box::new(rejected)),
+            owners: RoventProductStartupOwners::ExternalRejected {
+                rejected: Box::new(rejected),
+                registration: Arc::clone(&registration),
+            },
             sources: Arc::clone(&sources),
         })?;
         Ok(Self {
             inner: Arc::new(ActualProductDriver::Pcr(driver)),
             sources,
             physically_closed: AtomicBool::new(false),
+            retirement_sources: Some(registration),
         })
     }
 
@@ -134,6 +165,7 @@ impl RoventNativeProductDriver {
             inner: Arc::new(ActualProductDriver::Nnuec(driver)),
             sources,
             physically_closed: AtomicBool::new(false),
+            retirement_sources: None,
         })
     }
     #[allow(clippy::too_many_arguments, clippy::result_large_err)]
@@ -165,6 +197,7 @@ impl RoventNativeProductDriver {
             inner: Arc::new(ActualProductDriver::Nnuec(driver)),
             sources,
             physically_closed: AtomicBool::new(false),
+            retirement_sources: None,
         })
     }
 
@@ -187,6 +220,7 @@ impl RoventNativeProductDriver {
             inner: Arc::new(ActualProductDriver::Pc(driver)),
             sources,
             physically_closed: AtomicBool::new(false),
+            retirement_sources: None,
         })
     }
 
@@ -217,6 +251,7 @@ impl RoventNativeProductDriver {
             inner: Arc::new(ActualProductDriver::Pc(driver)),
             sources,
             physically_closed: AtomicBool::new(false),
+            retirement_sources: None,
         })
     }
 
@@ -550,6 +585,7 @@ impl RoventNativeProductDriver {
             inner: Arc::new(ActualProductDriver::Pcr(driver)),
             sources: pins,
             physically_closed: AtomicBool::new(false),
+            retirement_sources: None,
         })
     }
     fn actual(&self) -> &dyn SearchSessionDriver {
@@ -622,6 +658,9 @@ impl Drop for RoventNativeProductDriver {
         if !self.physically_closed.load(Ordering::Acquire) {
             std::mem::forget(Arc::clone(&self.inner));
             std::mem::forget(Arc::clone(&self.sources));
+            if let Some(registration) = &self.retirement_sources {
+                std::mem::forget(Arc::clone(registration));
+            }
         }
     }
 }
