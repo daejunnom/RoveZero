@@ -9,7 +9,7 @@ Known is conditional fixture coverage only. The usual engine path observes
 publication at the next D, which stays not_examined. These bytes do not prove
 execution of the narrow ordinary branch/role-limit path that can be known.
 New closure-consumer cases use only static fixture text and a scoped synthetic
-review registry; no current source pin or production enrollment is changed.
+review registry; no production source pin or enrollment is changed.
 """
 import copy
 import hashlib
@@ -30,8 +30,12 @@ from test_repair_context import RepairFixture
 from test_semantic_verifier import SemanticFixture, tokens
 import test_training as fixtures
 from native_source_review_fixture import (
-    REVIEWED_SOURCE_COMMIT, REVIEWED_TRANSITION_PINS, SYNTHETIC_COMPILED_FACT,
-    fixture_manifest, fixture_review_scope, read_reviewed_fixture_sources,
+    SUCCESSOR_REVIEWED_SOURCE_COMMIT as REVIEWED_SOURCE_COMMIT,
+    SUCCESSOR_REVIEWED_TRANSITION_PINS as REVIEWED_TRANSITION_PINS,
+    SUCCESSOR_SYNTHETIC_COMPILED_FACT as SYNTHETIC_COMPILED_FACT,
+    successor_fixture_manifest as fixture_manifest,
+    successor_fixture_review_scope as fixture_review_scope,
+    read_successor_fixture_sources as read_reviewed_fixture_sources,
 )
 
 
@@ -535,6 +539,54 @@ class NativeSlotClosureConsumerTests(unittest.TestCase):
             retained[slot_witness._SOURCE_PATHS[0]]["sha256"] = "0" * 64
             self.assertEqual(semantic.canonical(slot_witness._reviewed_source_pair(expected)), before)
             lookup.assert_not_called()
+
+
+class ReviewedFixtureSuccessorTests(unittest.TestCase):
+    def test_original_6ca_review_and_api_remain_distinct_from_explicit_successor(self):
+        import native_source_review_fixture as banks
+        old = banks.fixture_profile("default_disabled")
+        current = banks.successor_fixture_profile("default_disabled")
+        engine = slot_witness._SOURCE_PATHS[0]
+        self.assertEqual(banks.REVIEWED_SOURCE_COMMIT, "6ca5946bceb9394d27575b8c3dc7df2ed9a48cb2")
+        self.assertEqual(banks.fixture_manifest()["source_commit"], banks.REVIEWED_SOURCE_COMMIT)
+        self.assertEqual(banks.successor_fixture_manifest()["source_commit"],
+                         "932d7ae7006803dbb655249f7fa10e13483bdc12")
+        self.assertEqual(old["component_pins"][engine], {"bytes": 422725,
+            "sha256": "a86c61bc22dea02d505bc6526d482acc7dc197433b46229d6a3deed5d605e5ed"})
+        self.assertEqual(current["component_pins"][engine], {"bytes": 422913,
+            "sha256": "2729ef10909bdf21182d26b2edc4555f5cad7c17f55ac322111e7d867d8cbf53"})
+        self.assertEqual(len(old["component_pins"]), 14)
+        self.assertEqual(len(current["component_pins"]), 14)
+        self.assertEqual([path for path in old["component_pins"]
+            if old["component_pins"][path] != current["component_pins"][path]], [engine])
+        self.assertNotEqual(old["review_id"], current["review_id"])
+        self.assertNotEqual(old["closure_sha256"], current["closure_sha256"])
+        current["component_pins"][engine]["bytes"] = 1
+        self.assertEqual(banks.fixture_profile("default_disabled"), old)
+        self.assertEqual(banks.successor_fixture_profile("default_disabled")["component_pins"][engine]["bytes"], 422913)
+
+    def test_successor_scope_is_temporary_metadata_only_and_does_not_retag_prior_source(self):
+        import native_source_review_fixture as banks
+        from rz_pals_model import native_source_review as reviewed
+        before = copy.deepcopy(reviewed.REVIEWED_CLOSURE_PROFILES)
+        for lane in ("default_disabled", "legacy_single_reply"):
+            with banks.successor_fixture_review_scope(lane) as profile:
+                proof = reviewed.review_transition_sources(pair=profile["transition_sources"],
+                    manifest=banks.successor_fixture_manifest(),
+                    source={"native": {"search_implementation_sha256": banks.SUCCESSOR_SYNTHETIC_COMPILED_FACT}}, lane=lane)
+                self.assertEqual(proof["review_id"], profile["review_id"])
+                self.assertIs(proof["historical_metadata_only"], True)
+                for name in ("execution_authorized", "original_native_authority_reissued",
+                             "rules_proof_authorized", "training_target_authorized"):
+                    self.assertIs(proof[name], False)
+            self.assertEqual(reviewed.REVIEWED_CLOSURE_PROFILES, before)
+        with banks.fixture_review_scope("default_disabled") as prior:
+            with self.assertRaisesRegex(ValueError, "compiled search closure differs"):
+                reviewed.review_transition_sources(pair=prior["transition_sources"],
+                    manifest=banks.fixture_manifest(),
+                    source={"native": {"search_implementation_sha256": banks.SUCCESSOR_SYNTHETIC_COMPILED_FACT}},
+                    lane="default_disabled")
+        self.assertEqual(reviewed.REVIEWED_CLOSURE_PROFILES, before)
 
 
 class NativeSlotRepairTests(unittest.TestCase):

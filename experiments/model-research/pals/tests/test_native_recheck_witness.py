@@ -27,9 +27,14 @@ from test_repair_context import RepairFixture
 from test_semantic_verifier import SemanticFixture, tokens
 import test_training as fixtures
 from native_source_review_fixture import (
-    REVIEWED_SOURCE_COMMIT, REVIEWED_TRANSITION_PINS, REVIEWED_COMPONENT_PINS,
-    REVIEWED_CLOSURE_SHA256, SYNTHETIC_COMPILED_FACT,
-    fixture_manifest, fixture_review_scope, read_reviewed_fixture_sources,
+    SUCCESSOR_REVIEWED_SOURCE_COMMIT as REVIEWED_SOURCE_COMMIT,
+    SUCCESSOR_REVIEWED_TRANSITION_PINS as REVIEWED_TRANSITION_PINS,
+    SUCCESSOR_REVIEWED_COMPONENT_PINS as REVIEWED_COMPONENT_PINS,
+    SUCCESSOR_REVIEWED_CLOSURE_SHA256 as REVIEWED_CLOSURE_SHA256,
+    SUCCESSOR_SYNTHETIC_COMPILED_FACT as SYNTHETIC_COMPILED_FACT,
+    successor_fixture_manifest as fixture_manifest,
+    successor_fixture_review_scope as fixture_review_scope,
+    read_successor_fixture_sources as read_reviewed_fixture_sources,
 )
 
 

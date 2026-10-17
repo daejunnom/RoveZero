@@ -726,3 +726,41 @@ retirement·projection·closure·completion·export wrapper는 별도 `/2`다. �
 준비 metadata나 저장된 역사 자료만으로 실제 update·checkpoint·export 성공을
 만들지 않는다. 기존 diagnostic 자산은 승격하지 않는다. 이 연결은 소스 구현과
 비학습 검사의 범위이며 실제 optimizer update·학습을 실행하는 승인은 아니다.
+
+## 열네 번째 통합 체크포인트
+
+`d0734df`의 Windows 등록 검사에서는 Linux 대상 workspace 전체 feature·전체 target
+타입 검사, exact9 metadata 7개, UCI intervention 3개가 통과했다. 별도로 neural import를
+차단한 Python metadata·dataset·checkpoint 검사 76개가 통과했으며 실제 update는 0이다.
+이 결과를 Linux FD나 실제 trainer child의 실행 근거로 대신하지 않는다.
+
+같은 SHA의 원격 bindings·모델 CI는 기본 UCI feature에서 선택 의존성 `serde_json`을
+노출한 반환 타입 때문에 실패했다. `137718b`에서 메서드 전체를 실제 생산 caller와 같은
+feature 경계로 제한했다. `932d7ae`의 실제 Linux 기본 UCI 빌드와 workspace 전체 feature·
+전체 target 빌드가 통과해 복구를 확인했다. 새 declaration-only startup metadata example은
+기존 canonical codec을 사용하며 8개 검사가 통과했다. referenced asset이나 provider를
+열지 않으며 lock join·실제 startup·현재 실행 권한은 별도로 남긴다.
+
+`932d7ae`의 Linux intervention 검사 18개와 family 검사 4개가 통과했다. 원 FD 보존,
+symlink 거부, 별도 publication/ACK, 원 trial의 독립 시계와 구형 domain 거부를 포함한다.
+두 suite에 겹치는 항목이 있어 합산하지 않는다. 명시적으로 실행한 wire fixture는 별도
+1개 통과했으며, Rust가 저장한 exact9 원문 5,473 bytes를 Python의 기존 validator와
+numerical-parts validator가 그대로 인수했다. 이 synthetic metadata는 실제 cohort나
+known target, 실행 권한을 만들지 않는다. source inventory와 embedded source 대조도
+1개 통과했다. 마지막 엄격 Clippy는 큰 enum·복잡한 반환 타입 두 곳에서 중단됐으며,
+원 owner를 보존하는 Box·타입 별칭 수정 뒤 새 소스로 재검사한다.
+
+기존 G0 GPU 원자료는 별도 검증 후 회수했다. CUDA DSO는 중복 복사하지 않고 원
+Linux 위치·inode·hash로 참조하며, 모델은 먼저 회수한 CPU 자료를 참조한다. 따라서
+회수본은 부분 scope로 표시하고 완전한 이동식 실행 묶음이라고 보고하지 않는다.
+`5341d90` 이후 다섯 모델 component 중 encoding/runtime/reference/export는 같고,
+model-native에는 `/2` UCI 수명 소비자가 추가됐다. 과거 수치 근거는 원 source에
+그대로 두며 현재 전체 native 실행으로 재태깅하지 않는다.
+
+잔여 감사에서 R 없는 P-C의 NNUEC 공통 문맥 판독이 source 미구현임을 확인했다.
+기존 capability 거부를 무조건 제거하지 않고, 원 NNUEC source·same-owner preparation
+actor·선택된 view에 묶인 판독·terminal/cache-release ACK를 R-free 소비자에 연결한다.
+R worker·TT·PVS·qsearch·SEE·native node ledger는 생성하지 않으며, 판독 값을 P/C
+신경망 WDL이나 Rules mate 증명으로 바꾸지 않는다. baseline의 명시적인 `None` 경로도
+보존한다. 그 뒤 네 모드 UCI·실제 외부 엔진·독립 cohort·현재 trainer의 비학습 수명과
+최종 CI를 각각 인수한다. 실제 학습·대규모 수집·원격 비교·병합은 계속 제외한다.
