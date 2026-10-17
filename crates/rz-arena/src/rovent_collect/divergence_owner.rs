@@ -1188,7 +1188,7 @@ fn verify_visible_history(
         &future.wire.input_sha256,
         &future.wire.native,
     )?;
-    historical_scope::verify_historical_native_fields(
+    historical_scope::verify_historical_submitted_native_fields(
         &input,
         &future.wire.native,
         &manifest.common_registration_projection(),

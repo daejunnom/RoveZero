@@ -19,7 +19,8 @@ use rz_uci::pals_adaptive::{
     AdaptiveSessionCollectionHooks,
 };
 use rz_uci::rovent_bootstrap::launch::{
-    RoventCollectionPreparedLaunch, RoventCollectionPreparedNative, run_collection,
+    RoventCollectionPreparedLaunch, RoventCollectionPreparedNative, RoventLaunchError,
+    run_collection_with_resource_admission,
 };
 use rz_uci::rovent_bootstrap::pc_session::RoventPcCollectionHooks;
 use rz_uci::rovent_bootstrap::product::RoventNativeProductDriver;
@@ -35,6 +36,7 @@ use std::{
 };
 
 pub const ROVENT_COLLECTION_LAUNCH_PLAN: &str = "rz-rovent-collection-launch/1";
+mod resources;
 pub const ROVENT_COLLECTION_USAGE: &str = "rz-rovent-collect --collection-plan=inputs/<plan.json> --collection-plan-sha256=<64 lowercase hex> --collection-plan-bytes=<positive bytes> <original Rovent source/config/FD arguments>";
 
 pub enum RoventCollectionCliParse {
@@ -148,6 +150,8 @@ pub struct RoventCollectionAncestor {
 pub struct RoventCollectionLaunchPlan {
     pub schema: String,
     pub manifest: RoventPublicationFile,
+    /// 원 input lock provenance로 봉인한 OS 자원 계획이다.
+    pub resource_plan: RoventPublicationFile,
     pub metadata: RoventCollectionMetadata,
     pub teacher_sources: Vec<RoventTeacherSourceSelection>,
     pub teacher_slots: Vec<RoventCollectionTeacherSlot>,
@@ -342,6 +346,7 @@ struct RootCaller {
 }
 struct CollectionCaller {
     plan: RoventCollectionLaunchPlan,
+    resource: resources::CollectionResourceCustody,
     manifest: RoventCorpusManifestV2,
     owner: RoventCollectionOwnerV2,
     writer: Option<RoventCorpusWriterV2>,
@@ -700,6 +705,18 @@ pub struct RoventCollectionLaunchReceipt {
     pub records: u64,
     pub teacher_failure_count: usize,
     pub historical_dataset: Arc<VerifiedRoventDataset>,
+    original: Arc<Mutex<CollectionCaller>>,
+}
+impl RoventCollectionLaunchReceipt {
+    /// 같은 resource scope와 원 FD가 성공 뒤에도 보존되어 있다.
+    pub fn resource_observation(&self) -> Result<Value, ArenaError> {
+        Ok(self
+            .original
+            .lock()
+            .map_err(|_| invalid("Collection resource custody poisoned"))?
+            .resource
+            .observation())
+    }
 }
 pub struct RoventCollectionLaunchFailure {
     pub detail: String,
@@ -778,6 +795,14 @@ pub fn run_rovent_collection(
     })?;
     let shared = Arc::new(Mutex::new(CollectionCaller {
         plan: plan.clone(),
+        resource: resources::CollectionResourceCustody::prepare(
+            input_directory,
+            &plan.resource_plan,
+        )
+        .map_err(|error| RoventCollectionLaunchFailure {
+            detail: error.to_string(),
+            original: None,
+        })?,
         manifest,
         owner,
         writer: Some(writer),
@@ -797,10 +822,24 @@ pub fn run_rovent_collection(
         failure: None,
     }));
     let original = Arc::clone(&shared);
-    let result = run_collection(
+    let resource = Arc::clone(&shared);
+    let result = run_collection_with_resource_admission(
         arguments,
         plan.teacher_sources.clone(),
         Box::new(observer),
+        move |lock| {
+            let mut state = resource.lock().map_err(|_| RoventLaunchError {
+                stage: "resource_admission",
+                detail: "Collection resource custody poisoned".into(),
+            })?;
+            state
+                .resource
+                .admit(lock)
+                .map_err(|error| RoventLaunchError {
+                    stage: "resource_admission",
+                    detail: error.to_string(),
+                })
+        },
         move |prepared| {
             let RoventCollectionPreparedLaunch {
                 native,
@@ -915,6 +954,12 @@ pub fn run_rovent_collection(
             }
         },
     );
+    // 실패에도 원 OS scope를 보존하고 가능한 현재 관측을 남긴다. 실제 종료
+    // 후 전체 비교 자료가 부족하면 시작 성공을 취소하지 않고 여기서 HOLD한다.
+    let resource_result = shared
+        .lock()
+        .map_err(|_| invalid("Collection resource custody poisoned"))
+        .and_then(|mut state| state.resource.finish_live());
     let finish = || -> Result<RoventCollectionLaunchReceipt, ArenaError> {
         result.map_err(|error| invalid(error.to_string()))?;
         let mut state = shared
@@ -988,6 +1033,9 @@ pub fn run_rovent_collection(
             ancestors,
             &budget,
         )?);
+        // 종료 후 엄격 비교 HOLD도 이미 퇴역한 원 자료의 내구 게시와 전체
+        // FD 검증을 건너뛰지 않는다. 같은 scope의 원 오류는 caller에 남는다.
+        resource_result?;
         Ok(RoventCollectionLaunchReceipt {
             publication,
             publication_file,
@@ -996,6 +1044,7 @@ pub fn run_rovent_collection(
             records: state.records,
             teacher_failure_count: state.teacher_failures.len(),
             historical_dataset,
+            original: Arc::clone(&shared),
         })
     };
     finish().map_err(|error| RoventCollectionLaunchFailure {

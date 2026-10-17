@@ -7,6 +7,9 @@ use rz_search::external_cpu::{
     ProfiledExternalCurrentRootFence, ProfiledExternalResetProof, ProfiledExternalRootSource,
 };
 use std::sync::Arc;
+fn format_sha(value: Digest) -> String {
+    value.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 /// 실제 source와 원 live RootAdmission Arc를 함께 보존한다. source getter는
 /// 새 실행·ledger credit이나 외부 reported nodes의 native 환산을 발급하지 않는다.
@@ -14,6 +17,7 @@ use std::sync::Arc;
 pub struct RoventAdmittedExternalRootSource {
     root: Arc<RoventRootAdmission>,
     source: ProfiledExternalRootSource,
+    collection_evidence: Arc<serde_json::Value>,
 }
 impl RoventAdmittedExternalRootSource {
     pub fn root_admission(&self) -> &Arc<RoventRootAdmission> {
@@ -21,6 +25,11 @@ impl RoventAdmittedExternalRootSource {
     }
     pub fn worker_source(&self) -> &ProfiledExternalRootSource {
         &self.source
+    }
+    /// 원 owner가 실제 startup과 같은 source를 대조하며 보존한 역사 관측이다.
+    /// 이 JSON을 읽거나 복사해 worker/root 실행 권한을 재발급할 수 없다.
+    pub fn collection_evidence(&self) -> &serde_json::Value {
+        &self.collection_evidence
     }
     pub fn same_source(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.root, &other.root) && self.source.same_source(&other.source)
@@ -80,9 +89,31 @@ impl RoventExternalOwner {
                 "worker source differs from original launch/lock/root/clock",
             ));
         }
+        let registration = self.launch.profile.registration();
+        let process = source.process_identity();
+        let authority = root.authority();
+        let collection_evidence = serde_json::json!({
+            "schema":"rz-rovent-collection-profiled-external-source/1",
+            "root_source_sequence":source.source_sequence(),
+            "worker_owner":source.worker_owner().0,
+            "clock_epoch":clock.domain.0.0,
+            "authority":{"process_epoch":authority.epoch.0,"game_generation":authority.game.0,
+                "root_generation":authority.root.0,"implementation_sha256":format_sha(authority.implementation)},
+            "engine_profile":source.profile(),"purpose":source.purpose(),
+            "process":{"pid":process.pid,"process_group":process.process_group,"proc_start_ticks":process.proc_start_ticks},
+            "profile":profile,"profile_file_sha256":registration.file_sha256,
+            "profile_file_bytes":registration.file_bytes,
+            "profile_canonical_sha256":registration.canonical_sha256,
+            "profile_capability_sha256":self.launch.capability_sha256(),
+            "binary":self.launch.binary(),"startup_input_lock_sha256":startup.input_lock_sha256(),
+            "observed_uci":{"name":startup.observed_uci().name,"author":startup.observed_uci().author},
+            "options_application_observed":startup.options_application_observed(),
+            "model_loading_observed":startup.model_loading_observed(),
+        });
         let joined = RoventAdmittedExternalRootSource {
             root: Arc::clone(root),
             source,
+            collection_evidence: Arc::new(collection_evidence),
         };
         joined.validate_current()?;
         Ok(Some(joined))

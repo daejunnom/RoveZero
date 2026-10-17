@@ -3,15 +3,20 @@
 use super::*;
 use rz_contracts::{Deadline, Digest};
 use rz_position::contracts::ContractState;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+use rz_runtime::contracts::ContractClock as _;
 use rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace;
 use rz_search::pals::rovent_engine::RootMoveDomain;
 use rz_search::pals::rovent_frontier::RoventFrontier;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 pub const ROVENT_COLLECTION_NATIVE_ORIGIN: &str = "rz-rovent-collection-native-origin/1";
 pub const ROVENT_COLLECTION_ROOT_ADMISSION: &str = "rz-rovent-collection-root-admission/1";
+pub const ROVENT_COLLECTION_EXTERNAL_ROOT_ADMISSION: &str = "rz-rovent-collection-root-admission/2";
+pub const ROVENT_COLLECTION_PROFILED_EXTERNAL_SOURCE: &str =
+    "rz-rovent-collection-profiled-external-source/1";
 
 fn reject(message: impl Into<String>) -> AdaptiveCollectionError {
     AdaptiveCollectionError::new(
@@ -207,6 +212,8 @@ pub struct RoventCollectionRootAdmission {
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     root_admission: Arc<crate::rovent_root_admission::RoventRootAdmission>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    external_source: Option<crate::rovent_external_launch::RoventAdmittedExternalRootSource>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     raw: Arc<Value>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     raw_sha256: Arc<str>,
@@ -224,6 +231,95 @@ impl RoventCollectionRootAdmission {
         root_admission: Arc<crate::rovent_root_admission::RoventRootAdmission>,
     ) -> Result<Self, AdaptiveCollectionError> {
         let registration = frontier.registration();
+        if registration.mode.has_native_r() != registration.native_ledger.is_some()
+            || frontier.external_source().is_some()
+        {
+            return Err(reject(
+                "own collection frontier requires the original native ledger assembly",
+            ));
+        }
+        Self::from_attached_scope(
+            original,
+            frontier,
+            input_lock,
+            root_budget,
+            selective_policy,
+            root_admission,
+            None,
+        )
+    }
+    /// 실제 owner가 같은 lock/live RootAdmission과 결합한 외부 source만 받는다.
+    /// 외부 reported work는 native/common node credit으로 바꾸지 않는다.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_attached_external_frontier(
+        original: &RoventNativeCollectionOrigin,
+        frontier: &RoventFrontier,
+        input_lock: Digest,
+        root_budget: Digest,
+        selective_policy: Digest,
+        root_admission: Arc<crate::rovent_root_admission::RoventRootAdmission>,
+        source: &crate::rovent_external_launch::RoventAdmittedExternalRootSource,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        let registration = frontier.registration();
+        source
+            .validate_current()
+            .map_err(|error| reject(error.to_string()))?;
+        let actual = source.worker_source();
+        let raw = source.collection_evidence();
+        let Some(rz_experiments::RoventResearcher::External { profile }) =
+            &original.original_input_lock().manifest.engine.researcher
+        else {
+            return Err(reject(
+                "external collection root has no original external researcher pin",
+            ));
+        };
+        if !registration.mode.has_native_r()
+            || registration.native_ledger.is_some()
+            || !Arc::ptr_eq(source.root_admission(), &root_admission)
+            || !frontier
+                .external_source()
+                .is_some_and(|registered| registered.same_source(actual))
+            || actual.authority() != registration.authority
+            || actual.clock().domain != root_admission.runtime_clock().domain()
+            || actual.clock().origin != root_admission.runtime_clock().origin()
+            || raw["schema"] != ROVENT_COLLECTION_PROFILED_EXTERNAL_SOURCE
+            || raw["startup_input_lock_sha256"] != text_sha(input_lock)
+            || raw["profile_file_sha256"] != profile.profile.sha256
+            || raw["profile_file_bytes"].as_u64() != Some(profile.profile.bytes)
+            || raw["profile_canonical_sha256"] != profile.canonical_sha256
+            || raw["profile_capability_sha256"] != profile.capability_sha256
+            || raw["binary"]
+                != serde_json::to_value(&profile.binary)
+                    .map_err(|error| reject(error.to_string()))?
+            || raw["purpose"] != "research_checker"
+        {
+            return Err(reject(
+                "external collection original worker/source/root/lock differs",
+            ));
+        }
+        Self::from_attached_scope(
+            original,
+            frontier,
+            input_lock,
+            root_budget,
+            selective_policy,
+            root_admission,
+            Some(source),
+        )
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    #[allow(clippy::too_many_arguments)]
+    fn from_attached_scope(
+        original: &RoventNativeCollectionOrigin,
+        frontier: &RoventFrontier,
+        input_lock: Digest,
+        root_budget: Digest,
+        selective_policy: Digest,
+        root_admission: Arc<crate::rovent_root_admission::RoventRootAdmission>,
+        external: Option<&crate::rovent_external_launch::RoventAdmittedExternalRootSource>,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        let registration = frontier.registration();
         let root_state = registration.root_rules.snapshot().identity();
         let loaded = &original.original;
         if input_lock != loaded.input_lock
@@ -234,7 +330,6 @@ impl RoventCollectionRootAdmission {
             || registration.model_namespace.as_ref() != &loaded.namespace
             || registration.root_rules.snapshot().identity()
                 != registration.root_moves.root_identity()
-            || registration.mode.has_native_r() != registration.native_ledger.is_some()
             || !root_admission
                 .original_context()
                 .accepts()
@@ -261,8 +356,13 @@ impl RoventCollectionRootAdmission {
             .descriptor()
             .verify_against(original.original_input_lock())
             .map_err(|error| reject(error.to_string()))?;
-        let raw = json!({
-            "schema":ROVENT_COLLECTION_ROOT_ADMISSION,
+        let domain = if external.is_some() {
+            ROVENT_COLLECTION_EXTERNAL_ROOT_ADMISSION
+        } else {
+            ROVENT_COLLECTION_ROOT_ADMISSION
+        };
+        let mut raw = json!({
+            "schema":domain,
             "native_origin":original.raw_receipt(),
             "native_origin_sha256":original.raw_sha256(),
             "process_epoch":registration.authority.epoch.0,
@@ -283,9 +383,16 @@ impl RoventCollectionRootAdmission {
             "root_descriptor":root_admission.descriptor(),
             "root_descriptor_sha256":text_sha(root_admission.digest()),
         });
-        let raw_sha256 =
-            rz_experiments::pals_data_v3::generation_digest(ROVENT_COLLECTION_ROOT_ADMISSION, &raw)
-                .map_err(|error| reject(error.to_string()))?;
+        if let Some(source) = external {
+            raw["external_source"] = source.collection_evidence().clone();
+            raw["external_source_sha256"] = json!(rz_experiments::pals_data_v3::generation_digest(
+                ROVENT_COLLECTION_PROFILED_EXTERNAL_SOURCE,
+                source.collection_evidence()
+            )
+            .map_err(|error| reject(error.to_string()))?);
+        }
+        let raw_sha256 = rz_experiments::pals_data_v3::generation_digest(domain, &raw)
+            .map_err(|error| reject(error.to_string()))?;
         Ok(Self {
             original: original.clone(),
             authority: registration.authority,
@@ -296,6 +403,7 @@ impl RoventCollectionRootAdmission {
             root_budget,
             selective_policy,
             root_admission,
+            external_source: external.cloned(),
             raw: Arc::new(raw),
             raw_sha256: raw_sha256.into(),
         })
@@ -344,6 +452,12 @@ impl RoventCollectionRootAdmission {
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub fn root_admission(&self) -> &Arc<crate::rovent_root_admission::RoventRootAdmission> {
         &self.root_admission
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn external_source(
+        &self,
+    ) -> Option<&crate::rovent_external_launch::RoventAdmittedExternalRootSource> {
+        self.external_source.as_ref()
     }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     pub fn raw_receipt(&self) -> &Value {

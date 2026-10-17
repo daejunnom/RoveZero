@@ -25,7 +25,11 @@ def _root_join(manifest, record, binding, *, native_domain):
     if submitted.get("schema") != native_domain or retired.get("schema") != native_domain:
         revision = "/2" if native_domain == "rz-rovent-native-owner-event/2" else "/3"
         raise ValueError(f"Collection teacher descriptor requires original native {revision} root data")
-    _root_admission(manifest, record, retired)
+    if native_domain == "rz-rovent-raw-record/3":
+        from .rovent_external_root import validate_submitted_root
+        validate_submitted_root(manifest, record, retired)
+    else:
+        _root_admission(manifest, record, retired)
     root = retired["root_admission"]
     descriptor, descriptor_sha = binding["root_descriptor"], binding["root_descriptor_sha256"]
     inp = validate_root_descriptor(descriptor, descriptor_sha)

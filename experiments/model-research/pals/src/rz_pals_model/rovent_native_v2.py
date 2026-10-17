@@ -96,9 +96,19 @@ def _root_admission(manifest, record, retired):
         "process_epoch", "game_generation", "root_generation", "implementation_sha256", "deadline_clock",
         "deadline_tick", "root_budget_sha256", "selective_policy_sha256", "root_state", "store_root_state",
         "root_moves", "depth_plies", "mate_moves", "requested_nodes", *extra), "native /2 original root admission")
-    native, ticket = record["native"], record["native"]["raw_submission"]["ticket"]
     if root["schema"] != ROOT_DOMAIN or digest(ROOT_DOMAIN, root) != sha(retired["root_admission_sha256"]):
         raise ValueError("native /2 original root admission seal mismatch")
+    _root_admission_common(manifest, record, root, descriptor=descriptor)
+
+
+def _root_admission_common(manifest, record, root, *, descriptor):
+    """Share exact owner/source joins after a codec checks its own wire seal.
+
+    This body does not choose a root schema, project one into another, or issue
+    native authority. The caller preserves its original object and decides the
+    descriptor variant only from that codec's already checked exact roster.
+    """
+    native, ticket = record["native"], record["native"]["raw_submission"]["ticket"]
     for key in ("process_epoch", "game_generation", "root_generation", "deadline_clock", "deadline_tick"):
         if uint(root[key]) != ticket[key]:
             raise ValueError("native /2 root admission crossed original request scope/deadline")

@@ -33,8 +33,9 @@ pub fn verify_historical_submitted_record_evidence(
         )?;
     }
     super::submitted_review_historical::verify_historical_submitted_review(record)?;
-    let scope = historical_scope::verify_historical_native_scope(
-        &common,
+    let scope = historical_scope::verify_historical_submitted_native_fields(
+        &common.input,
+        &record.native,
         &manifest.common_registration_projection(),
     )?;
     divergence_owner::verify_historical_pc_divergence(record, manifest)?;

@@ -399,17 +399,27 @@ def _join_record_assets(registration, record, admissions, runtime_bundles):
     native = record["native"]
     retired = native["raw_retirement"]
     admission = retired.get("root_admission")
-    if type(admission) is not dict or admission.get("schema") != ROOT_DOMAIN:
+    from .rovent_external_root import ROOT_DOMAIN as EXTERNAL_ROOT_DOMAIN, ROOT_FIELDS, join_locked_external_source
+    root_domain = admission.get("schema") if type(admission) is dict else None
+    external = (record.get("schema") == SUBMITTED_CODEC.record_domain
+        and all(native[name].get("schema") == SUBMITTED_CODEC.native_domains[0]
+            for name in ("raw_submission", "raw_completion", "raw_retirement"))
+        and root_domain == EXTERNAL_ROOT_DOMAIN)
+    if root_domain != ROOT_DOMAIN and not external:
         raise ValueError("historical publication requires original root admission body")
+    if external:
+        fields(admission, ROOT_FIELDS, "historical external Collection root /2")
     admission_sha = sha(retired.get("root_admission_sha256"))
     origin = admission.get("native_origin")
-    if (digest(ROOT_DOMAIN, admission) != admission_sha or type(origin) is not dict
+    if (digest(root_domain, admission) != admission_sha or type(origin) is not dict
             or origin.get("schema") != ORIGIN_DOMAIN
             or digest(ORIGIN_DOMAIN, origin) != sha(admission.get("native_origin_sha256"))):
         raise ValueError("historical original root/native origin seal mismatch")
     lock = admissions.get(admission_sha)
     if lock is None or origin.get("input_lock_sha256") != lock["canonical_sha256"]:
         raise ValueError("historical root admission lacks its published original input lock")
+    if external:
+        join_locked_external_source(admission, lock)
     engine = lock["manifest"]["engine"]
     if type(engine) is not dict:
         raise ValueError("historical original lock engine object required")

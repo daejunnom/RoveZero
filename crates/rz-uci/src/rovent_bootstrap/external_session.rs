@@ -90,31 +90,38 @@ pub fn external_researcher_session(
             retirement_sink: Some(retirement_sink),
         });
     }
-    match (pins.lock().manifest.purpose, hooks) {
-        (rz_experiments::RoventPurpose::Collection, _) => {
-            return Err(RoventExternalProductStartupRejection {
-                failure: failure(
-                    "RoventExternalCollectionUnsupported",
-                    "external R requires a separately admitted Collection provenance source",
-                ),
-                owners: RoventExternalProductStartupOwners::Prepared { prepared, external },
-                sources: pins,
-                retirement_sink: Some(retirement_sink),
-            });
+    let collection = match (pins.lock().manifest.purpose, hooks) {
+        (rz_experiments::RoventPurpose::Collection, Some(hooks))
+            if hooks.root_admission.is_some() =>
+        {
+            match prepared.collection_identity() {
+                Ok(origin) => Some((origin, hooks)),
+                Err(error) => {
+                    return Err(RoventExternalProductStartupRejection {
+                        failure: SearchSessionFailure::debug(
+                            "RoventExternalCollectionOrigin",
+                            &error,
+                        ),
+                        owners: RoventExternalProductStartupOwners::Prepared { prepared, external },
+                        sources: pins,
+                        retirement_sink: Some(retirement_sink),
+                    });
+                }
+            }
         }
-        (_, Some(_)) => {
+        (rz_experiments::RoventPurpose::Collection, _) | (_, Some(_)) => {
             return Err(RoventExternalProductStartupRejection {
                 failure: failure(
                     "RoventExternalCollectionHooks",
-                    "a non-Collection startup cannot consume Collection hooks",
+                    "collection purpose and actual root observer must be selected together",
                 ),
                 owners: RoventExternalProductStartupOwners::Prepared { prepared, external },
                 sources: pins,
                 retirement_sink: Some(retirement_sink),
             });
         }
-        (_, None) => {}
-    }
+        (_, None) => None,
+    };
     let external = match RoventExternalSessionSource::from_pinned(external) {
         Ok(source) => source,
         Err(rejection) => {
@@ -302,7 +309,10 @@ pub fn external_researcher_session(
         }
     };
     let (native, _, _) = prepared.into_parts();
-    let hooks = AdaptiveSessionCollectionHooks::default();
+    let (origin, hooks) = collection.map_or_else(
+        || (None, AdaptiveSessionCollectionHooks::default()),
+        |(origin, hooks)| (Some(origin), hooks),
+    );
     let sources = RoventExternalSessionSources {
         common: AdaptiveSessionSources {
             native,
@@ -323,7 +333,7 @@ pub fn external_researcher_session(
         registration,
         profile,
         retirement_sink,
-        None,
+        origin,
         hooks,
     )
     .map_err(|rejected| RoventExternalProductStartupRejection {

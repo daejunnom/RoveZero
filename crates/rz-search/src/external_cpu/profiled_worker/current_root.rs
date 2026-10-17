@@ -52,7 +52,9 @@ impl ProfiledExternalRootSource {
     pub fn authority(&self) -> SearchAuthority {
         self.authority
     }
-    pub(crate) fn source_sequence(&self) -> u64 {
+    /// Historical generation metadata only; this does not construct a source
+    /// capability or grant current admission, root reuse or execution credit.
+    pub fn source_sequence(&self) -> u64 {
         self.source_sequence
     }
     pub fn worker_owner(&self) -> CpuWorkerId {

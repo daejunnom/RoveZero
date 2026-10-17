@@ -560,6 +560,7 @@ fn join_historical_input_lock(
         .root_descriptor
         .verify_against(lock)
         .map_err(|error| invalid(error.to_string()))?;
+    crate::rovent_collect::verify_historical_external_source_input_lock(evidence, lock)?;
     let manifest = &lock.manifest;
     let engine = &manifest.engine;
     let model = match row.role() {

@@ -156,6 +156,158 @@ mod visible_input_json_tests {
     }
 }
 
+pub const ROVENT_EXTERNAL_COLLECTION_ROOT: &str = "rz-rovent-collection-root-admission/2";
+pub const ROVENT_PROFILED_EXTERNAL_SOURCE: &str = "rz-rovent-collection-profiled-external-source/1";
+
+/// raw3 전용 명시 판별이다. 원 root1을 넓히거나 메타데이터에서 실행 권한을
+/// 복원하지 않는다. 공식 엔진 profile과 전체 lock의 대조는 역사 owner가 맡는다.
+pub fn validate_submitted_root_admission(
+    root: &serde_json::Value,
+    expected_sha256: &serde_json::Value,
+) -> Result<(), ManifestError> {
+    let common = [
+        "schema",
+        "native_origin",
+        "native_origin_sha256",
+        "process_epoch",
+        "game_generation",
+        "root_generation",
+        "implementation_sha256",
+        "deadline_clock",
+        "deadline_tick",
+        "root_budget_sha256",
+        "selective_policy_sha256",
+        "root_state",
+        "store_root_state",
+        "root_moves",
+        "depth_plies",
+        "mate_moves",
+        "requested_nodes",
+        "root_descriptor",
+        "root_descriptor_sha256",
+    ];
+    let domain = root["schema"].as_str().unwrap_or("");
+    let mut roster = common.to_vec();
+    match domain {
+        "rz-rovent-collection-root-admission/1" => {}
+        ROVENT_EXTERNAL_COLLECTION_ROOT => {
+            roster.extend(["external_source", "external_source_sha256"]);
+            let source = &root["external_source"];
+            ensure(
+                exact_fields(
+                    source,
+                    &[
+                        "schema",
+                        "root_source_sequence",
+                        "worker_owner",
+                        "clock_epoch",
+                        "authority",
+                        "engine_profile",
+                        "purpose",
+                        "process",
+                        "profile",
+                        "profile_file_sha256",
+                        "profile_file_bytes",
+                        "profile_canonical_sha256",
+                        "profile_capability_sha256",
+                        "binary",
+                        "startup_input_lock_sha256",
+                        "observed_uci",
+                        "options_application_observed",
+                        "model_loading_observed",
+                    ],
+                ),
+                "external collection source exact roster",
+            )?;
+            let authority = &source["authority"];
+            let process = &source["process"];
+            let binary: crate::ArtifactRef = serde_json::from_value(source["binary"].clone())
+                .map_err(|error| ManifestError::Integrity(error.to_string()))?;
+            binary.validate()?;
+            ensure(
+                source["schema"] == ROVENT_PROFILED_EXTERNAL_SOURCE
+                    && root["external_source_sha256"]
+                        == generation_digest(ROVENT_PROFILED_EXTERNAL_SOURCE, source)?
+                    && source["root_source_sequence"].as_u64().is_some()
+                    && source["worker_owner"]
+                        .as_u64()
+                        .is_some_and(|n| n <= u16::MAX as u64)
+                    && source["clock_epoch"] == root["deadline_clock"]
+                    && exact_fields(
+                        authority,
+                        &[
+                            "process_epoch",
+                            "game_generation",
+                            "root_generation",
+                            "implementation_sha256",
+                        ],
+                    )
+                    && [
+                        "process_epoch",
+                        "game_generation",
+                        "root_generation",
+                        "implementation_sha256",
+                    ]
+                    .into_iter()
+                    .all(|field| authority[field] == root[field])
+                    && source["purpose"] == "research_checker"
+                    && source["profile"]["purpose"] == source["purpose"]
+                    && source["profile"]["engine"] == source["engine_profile"]
+                    && matches!(
+                        source["engine_profile"].as_str(),
+                        Some("stockfish19_embedded_nnue" | "reckless090_embedded_nnue")
+                    )
+                    && source["profile"]["identity"]["binary_sha256"] == binary.sha256
+                    && exact_fields(process, &["pid", "process_group", "proc_start_ticks"])
+                    && ["pid", "process_group"].into_iter().all(|field| {
+                        process[field]
+                            .as_u64()
+                            .is_some_and(|n| n > 0 && n <= u32::MAX as u64)
+                    })
+                    && process["proc_start_ticks"].as_u64().is_some_and(|n| n > 0)
+                    && source["profile_file_bytes"]
+                        .as_u64()
+                        .is_some_and(|n| n > 0 && n <= 1 << 20)
+                    && [
+                        "profile_file_sha256",
+                        "profile_canonical_sha256",
+                        "profile_capability_sha256",
+                        "startup_input_lock_sha256",
+                    ]
+                    .into_iter()
+                    .all(|field| source[field].as_str().is_some_and(generation_sha))
+                    && source["startup_input_lock_sha256"]
+                        == root["native_origin"]["input_lock_sha256"]
+                    && exact_fields(&source["observed_uci"], &["name", "author"])
+                    && source["observed_uci"]["name"] == source["profile"]["expected_uci_name"]
+                    && source["observed_uci"]["name"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty() && s.len() <= 256)
+                    && (source["observed_uci"]["author"].is_null()
+                        || source["observed_uci"]["author"]
+                            .as_str()
+                            .is_some_and(|s| s.len() <= 256))
+                    && source["options_application_observed"].is_null()
+                    && source["model_loading_observed"].is_null()
+                    && matches!(
+                        root["native_origin"]["mode"].as_str(),
+                        Some("HybridPcr" | "CpuPcr")
+                    ),
+                "external collection source/root/process/profile evidence join",
+            )?;
+        }
+        _ => {
+            return Err(ManifestError::Integrity(
+                "unsupported raw3 collection root domain".into(),
+            ));
+        }
+    }
+    ensure(
+        exact_fields(root, &roster) && *expected_sha256 == generation_digest(domain, root)?,
+        "raw3 exact collection root roster/domain seal",
+    )
+}
+
 impl RoventNativeLifecycle {
     /// raw/3는 raw/1 또는 raw/2 decoder를 넓히지 않고 독립적으로 선택한다.
     /// 공통 실제 physical owner chain 계산만 기존 구현을 재사용한다.
@@ -244,13 +396,11 @@ impl RoventNativeLifecycle {
             )?;
         }
         let root = &self.raw_retirement["root_admission"];
+        validate_submitted_root_admission(root, &self.raw_retirement["root_admission_sha256"])?;
         ensure(
             matches!(self.head.as_str(), "proposer" | "critic")
                 && self.raw_submission["rules_replay"]["schema"]
                     == "rz-rovent-submitted-rules-replay/1"
-                && root["schema"] == "rz-rovent-collection-root-admission/1"
-                && self.raw_retirement["root_admission_sha256"]
-                    == generation_digest("rz-rovent-collection-root-admission/1", root)?
                 && root["native_origin"]["purpose"] == "collection"
                 && matches!(
                     self.raw_retirement["acceptance_kind"].as_str(),

@@ -81,6 +81,7 @@ pub struct RoventHistoricalRecordEvidence {
     pub weights_sha256: String,
     pub encoding_sha256: String,
     pub root_descriptor: rz_experiments::RoventRootDescriptor,
+    pub external_source: Option<super::external_scope::RoventHistoricalExternalSource>,
 }
 
 /// Historical DTO source joins, full original Rules replay and exact typed
@@ -110,14 +111,57 @@ pub(super) fn verify_historical_native_fields(
     native: &RoventNativeLifecycle,
     manifest: &RoventCorpusManifest,
 ) -> Result<RoventHistoricalRecordEvidence, ArenaError> {
+    verify_historical_native_fields_for_root(generation_input, native, manifest, false)
+}
+
+/// 새 raw3만 root2를 명시 선택한다. 원 root1/raw2 decoder를 확대하지 않는다.
+pub(super) fn verify_historical_submitted_native_fields(
+    generation_input: &GenerationInputV3,
+    native: &RoventNativeLifecycle,
+    manifest: &RoventCorpusManifest,
+) -> Result<RoventHistoricalRecordEvidence, ArenaError> {
+    rz_experiments::rovent_corpus_v2::validate_submitted_root_admission(
+        &native.raw_retirement["root_admission"],
+        &native.raw_retirement["root_admission_sha256"],
+    )?;
+    verify_historical_native_fields_for_root(generation_input, native, manifest, true)
+}
+
+fn verify_historical_native_fields_for_root(
+    generation_input: &GenerationInputV3,
+    native: &RoventNativeLifecycle,
+    manifest: &RoventCorpusManifest,
+    submitted: bool,
+) -> Result<RoventHistoricalRecordEvidence, ArenaError> {
     let retirement = &native.raw_retirement;
     let raw = &retirement["root_admission"];
-    let root: RoventRootAdmissionEvidence = serde_json::from_value(raw.clone())
+    let external = submitted
+        && raw["schema"] == rz_experiments::rovent_corpus_v2::ROVENT_EXTERNAL_COLLECTION_ROOT;
+    let external_source = if external {
+        Some(super::external_scope::RoventHistoricalExternalSource::from_original_root(raw)?)
+    } else {
+        None
+    };
+    // 이 임시 값은 공통 metadata 필드만 읽는다. 원 schema와 실제 raw2/raw3
+    // 본문·SHA를 유지하며 root1로 재태그하거나 별도 artifact로 발행하지 않는다.
+    let mut fields = raw.clone();
+    if external {
+        let object = fields
+            .as_object_mut()
+            .ok_or_else(|| invalid("external root object"))?;
+        object.remove("external_source");
+        object.remove("external_source_sha256");
+    }
+    let root: RoventRootAdmissionEvidence = serde_json::from_value(fields)
         .map_err(|_| invalid("missing/malformed explicit Rovent root admission evidence"))?;
     let origin = &root.native_origin;
     let origin_raw = &raw["native_origin"];
     let origin_domain = "rz-rovent-collection-native-origin/1";
-    let root_domain = "rz-rovent-collection-root-admission/1";
+    let root_domain = if external {
+        rz_experiments::rovent_corpus_v2::ROVENT_EXTERNAL_COLLECTION_ROOT
+    } else {
+        "rz-rovent-collection-root-admission/1"
+    };
     let root_sha = generation_digest(root_domain, raw)?;
     let ticket = &native.raw_submission["ticket"];
     let source = rz_experiments::rovent_source_aggregate_sha256(
@@ -274,6 +318,7 @@ pub(super) fn verify_historical_native_fields(
         weights_sha256: origin.weights_sha256.clone(),
         encoding_sha256: encoding,
         root_descriptor: root.root_descriptor.clone(),
+        external_source,
     })
 }
 

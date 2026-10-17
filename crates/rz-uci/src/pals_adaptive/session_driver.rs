@@ -91,6 +91,12 @@ type ProfiledAdmissionRejection<B> = super::ProfiledExternalManagerAdmissionReje
     B,
     AdaptivePortDriver<AdaptivePortModel>,
 >;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+type SessionExternalRootSource<'a> =
+    Option<&'a crate::rovent_external_launch::RoventAdmittedExternalRootSource>;
+#[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+type SessionExternalRootSource<'a> =
+    Option<&'a rz_search::external_cpu::ProfiledExternalRootSource>;
 
 /// Runs on the actual UCI search owner after a real root fence and before the
 /// manager is dismantled. Collection can seal actual turns/action outcomes.
@@ -571,7 +577,7 @@ where
         manager: &mut SessionManager<B>,
         context: &SearchSessionContext,
         admission: &RoventPcrRootAdmission,
-        _external_source: Option<&rz_search::external_cpu::ProfiledExternalRootSource>,
+        _external_source: SessionExternalRootSource<'_>,
     ) -> Result<(), AdaptiveManagerError> {
         match self.researcher_class {
             SessionResearcherClass::Legacy => profile.attach(
@@ -2038,9 +2044,7 @@ where
         let external_source = {
             #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
             {
-                external_joined
-                    .as_ref()
-                    .map(|joined| joined.worker_source())
+                external_joined.as_ref()
             }
             #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
             {

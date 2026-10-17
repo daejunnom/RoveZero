@@ -124,7 +124,7 @@ pub fn parse_native_resource_cli(
 pub struct RoventNativeResourceRunReceipt {
     pub admission: RoventResourceObservation,
     pub finished_live: RoventResourceObservation,
-    custody: Arc<Mutex<RunCustody>>,
+    custody: Arc<Mutex<NativeResourceCustody>>,
 }
 impl RoventNativeResourceRunReceipt {
     pub fn observation(&self) -> Value {
@@ -151,7 +151,7 @@ impl RoventNativeResourceRunReceipt {
 
 pub struct RoventNativeResourceRunFailure {
     pub detail: String,
-    custody: Option<Arc<Mutex<RunCustody>>>,
+    custody: Option<Arc<Mutex<NativeResourceCustody>>>,
 }
 impl std::fmt::Debug for RoventNativeResourceRunFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -184,7 +184,7 @@ impl RoventNativeResourceRunFailure {
     }
 }
 
-struct RunCustody {
+pub(crate) struct NativeResourceCustody {
     plan: RoventNativeResourceLaunchPlan,
     pin: RoventNativeResourcePlanPin,
     // Hold the exact plan source and output directory through every return.
@@ -196,12 +196,15 @@ struct RunCustody {
     admission: Option<RoventResourceObservation>,
     finished_live: Option<RoventResourceObservation>,
     finished_live_error: Option<String>,
+    admission_attempted: bool,
+    finished_attempted: bool,
 }
-impl RunCustody {
-    fn admit(&mut self, lock: &Arc<RoventInputLock>) -> Result<(), ArenaError> {
-        if self.scope.is_some() || self.failure.is_some() || self.admission.is_some() {
+impl NativeResourceCustody {
+    pub(crate) fn admit(&mut self, lock: &Arc<RoventInputLock>) -> Result<(), ArenaError> {
+        if self.admission_attempted {
             return Err(invalid("native resource callback replay"));
         }
+        self.admission_attempted = true;
         let original: Vec<_> = lock
             .manifest
             .provenance
@@ -245,16 +248,36 @@ impl RunCustody {
             Some(snapshot.write_evidence(&self.directory, Path::new("admission-readback.json"))?);
         snapshot.require_admission(self.plan.profile)
     }
-    fn finish_live(&mut self) -> Result<(), ArenaError> {
-        if let Some(scope) = &self.scope {
-            let snapshot = scope.observe();
-            self.finished_live = Some(
-                snapshot
-                    .write_evidence(&self.directory, Path::new("finished-live-readback.json"))?,
-            );
-            snapshot.require_finished_profile(self.plan.profile)?;
+    pub(crate) fn finish_live(&mut self) -> Result<(), ArenaError> {
+        if self.finished_attempted {
+            return Err(invalid("native resource finished observation replay"));
         }
-        Ok(())
+        self.finished_attempted = true;
+        let result = (|| {
+            if let Some(scope) = &self.scope {
+                let snapshot = scope.observe();
+                self.finished_live =
+                    Some(snapshot.write_evidence(
+                        &self.directory,
+                        Path::new("finished-live-readback.json"),
+                    )?);
+                snapshot.require_finished_profile(self.plan.profile)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            self.finished_live_error = Some(error.to_string());
+        }
+        result
+    }
+    pub(crate) fn observation(&self) -> Value {
+        json!({"schema":"rz-rovent-resource-custody/1","plan_pin":self.pin,
+            "evidence_directory":self.plan.evidence_directory,"profile":self.plan.profile,
+            "admission_attempted":self.admission_attempted,"finished_attempted":self.finished_attempted,
+            "original_plan_descriptor_retained":true,"original_delegated_descriptor_retained":self.delegated.is_some()||self.scope.is_some()||self.failure.is_some(),
+            "original_scope_retained":self.scope.is_some(),"resource_failure":self.failure.as_ref().map(|failure|failure.observation()),
+            "admission":self.admission,"finished_live":self.finished_live,"finished_live_error":self.finished_live_error,
+            "controlled_comparison_accepted":false,"automatic_cleanup":false})
     }
 }
 
@@ -265,51 +288,14 @@ pub fn run_native_with_resources(
     pin: RoventNativeResourcePlanPin,
     arguments: Vec<String>,
 ) -> Result<RoventNativeResourceRunReceipt, RoventNativeResourceRunFailure> {
-    let prepare = || -> Result<RunCustody, ArenaError> {
+    let prepare = || -> Result<NativeResourceCustody, ArenaError> {
         pin.validate()?;
         let root = Dir::open_ambient_dir(
             std::env::current_dir().map_err(|error| invalid(error))?,
             cap_std::ambient_authority(),
         )
         .map_err(|error| invalid(error))?;
-        let (parent, leaf) = parent_and_leaf(&root, &pin.path)?;
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
-        let mut plan_file = parent
-            .open_with(leaf, &options)
-            .map_err(|error| invalid(error))?;
-        if !plan_file
-            .metadata()
-            .map_err(|error| invalid(error))?
-            .is_file()
-        {
-            return Err(invalid("resource plan must be a regular held file"));
-        }
-        let mut bytes = Vec::new();
-        (&mut plan_file)
-            .take(pin.bytes + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| invalid(error))?;
-        if bytes.len() as u64 != pin.bytes || format!("{:x}", Sha256::digest(&bytes)) != pin.sha256
-        {
-            return Err(invalid("original resource plan bytes differ"));
-        }
-        let plan: RoventNativeResourceLaunchPlan =
-            crate::decode_json(std::str::from_utf8(&bytes).map_err(|error| invalid(error))?)?;
-        plan.validate()?;
-        let (delegated, directory) = prepare_native_resource_paths(&plan, &root)?;
-        Ok(RunCustody {
-            plan,
-            pin,
-            _plan_file: plan_file.into_std(),
-            directory,
-            delegated: Some(delegated),
-            scope: None,
-            failure: None,
-            admission: None,
-            finished_live: None,
-            finished_live_error: None,
-        })
+        prepare_resource_custody(&root, pin)
     };
     let state = prepare().map_err(|error| RoventNativeResourceRunFailure {
         detail: error.to_string(),
@@ -333,13 +319,7 @@ pub fn run_native_with_resources(
     let finish = custody
         .lock()
         .map_err(|_| invalid("original resource owner poisoned"))
-        .and_then(|mut state| {
-            let result = state.finish_live();
-            if let Err(error) = &result {
-                state.finished_live_error = Some(error.to_string());
-            }
-            result
-        });
+        .and_then(|mut state| state.finish_live());
     let failure = |detail: String| RoventNativeResourceRunFailure {
         detail,
         custody: Some(Arc::clone(&custody)),
@@ -370,6 +350,54 @@ pub fn run_native_with_resources(
         admission,
         finished_live,
         custody,
+    })
+}
+
+/// Shared pinned preparation for the direct native and Collection upper
+/// callers. Only this original FD/readback owner implements resource lifetime.
+pub(crate) fn prepare_resource_custody(
+    root: &Dir,
+    pin: RoventNativeResourcePlanPin,
+) -> Result<NativeResourceCustody, ArenaError> {
+    pin.validate()?;
+    let (parent, leaf) = parent_and_leaf(root, &pin.path)?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut plan_file = parent
+        .open_with(leaf, &options)
+        .map_err(|error| invalid(error))?;
+    if !plan_file
+        .metadata()
+        .map_err(|error| invalid(error))?
+        .is_file()
+    {
+        return Err(invalid("resource plan must be a regular held file"));
+    }
+    let mut bytes = Vec::new();
+    (&mut plan_file)
+        .take(pin.bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| invalid(error))?;
+    if bytes.len() as u64 != pin.bytes || format!("{:x}", Sha256::digest(&bytes)) != pin.sha256 {
+        return Err(invalid("original resource plan bytes differ"));
+    }
+    let plan: RoventNativeResourceLaunchPlan =
+        crate::decode_json(std::str::from_utf8(&bytes).map_err(|error| invalid(error))?)?;
+    plan.validate()?;
+    let (delegated, directory) = prepare_native_resource_paths(&plan, root)?;
+    Ok(NativeResourceCustody {
+        plan,
+        pin,
+        _plan_file: plan_file.into_std(),
+        directory,
+        delegated: Some(delegated),
+        scope: None,
+        failure: None,
+        admission: None,
+        finished_live: None,
+        finished_live_error: None,
+        admission_attempted: false,
+        finished_attempted: false,
     })
 }
 

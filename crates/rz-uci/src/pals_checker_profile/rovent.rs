@@ -178,6 +178,13 @@ impl RoventExternalProfile {
         Ok(())
     }
 
+    /// 원 profile의 순수 canonical 계산이다. startup/source/worker 또는
+    /// target 권한을 발급하지 않으며 기존 byte 알고리즘을 그대로 사용한다.
+    pub fn canonical_sha256(&self) -> Result<String, CheckerError> {
+        self.validate()?;
+        self.canonical_digest()
+    }
+
     fn canonical_digest(&self) -> Result<String, CheckerError> {
         let value = sorted_value(
             serde_json::to_value(self)

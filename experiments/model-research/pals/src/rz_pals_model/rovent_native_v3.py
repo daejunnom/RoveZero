@@ -7,7 +7,7 @@ they cannot create an old native lease or insert a future counter into input.
 from __future__ import annotations
 
 from .generation_data import fields, sha, uint, _moves
-from .rovent_native_v2 import _COMMON, _submission, _root_admission, validate_position_replay
+from .rovent_native_v2 import _COMMON, _submission, validate_position_replay
 from .rovent_submitted_input import validate_input
 
 NATIVE_DOMAIN = "rz-rovent-raw-record/3"
@@ -191,6 +191,7 @@ def _validate_native_v3_body(manifest, record):
     from .rovent_corpus import _native_common
     _native_common(manifest, record, NATIVE_DOMAIN)
     _submission(record, native["raw_submission"]["rules_replay"])
-    _root_admission(manifest, record, retired)
+    from .rovent_external_root import validate_submitted_root
+    validate_submitted_root(manifest, record, retired)
     validate_submitted_review(record, native["raw_submission"]["submitted_review"])
     return native

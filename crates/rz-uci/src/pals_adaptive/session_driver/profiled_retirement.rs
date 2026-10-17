@@ -133,10 +133,7 @@ where
         // with a startup timeout or a newly registered execution window.
         let (root, same_source) = match &owners.researcher_source {
             SessionResearcherSource::ProfiledExternal(source) => (
-                source
-                    .running_owner()
-                    .and_then(|owner| owner.actual_root_admission())
-                    .cloned(),
+                source.retained_root_admission().cloned(),
                 source
                     .retained_root_source()
                     .is_some_and(|actual| actual.same_source(retirement.source())),

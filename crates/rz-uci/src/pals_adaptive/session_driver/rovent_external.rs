@@ -8,7 +8,8 @@ use super::*;
 use crate::pals_adaptive::ProfiledExternalManagerSource;
 use crate::rovent_bootstrap::{RoventExternalRSourceCustody, RoventPinnedExternalRSource};
 use crate::rovent_external_launch::{
-    PreparedRoventExternalLaunch, RoventExternalOwner, RoventExternalSpawnRejection,
+    PreparedRoventExternalLaunch, RoventAdmittedExternalRootSource, RoventExternalOwner,
+    RoventExternalSpawnRejection,
 };
 use crate::rovent_root_admission::RoventRootAdmission;
 use rz_contracts::pals_adaptive::CpuWorkerId;
@@ -404,6 +405,14 @@ impl RoventExternalSessionSource {
         }
     }
 
+    pub(super) fn retained_root_admission(&self) -> Option<&Arc<RoventRootAdmission>> {
+        match &self.state {
+            ExternalProcessState::Returned(source) => Some(source.root_admission()),
+            ExternalProcessState::Running(owner) => owner.actual_root_admission(),
+            _ => None,
+        }
+    }
+
     pub(super) fn begin_process_finish(&mut self, until: Instant) {
         match &mut self.state {
             ExternalProcessState::Running(owner) => owner.worker().request_shutdown(until),
@@ -509,10 +518,10 @@ where
                         "original durable evidence sink admission is closed",
                     ));
                 }
-                if origin.is_some() {
+                if origin.is_some() != hooks.root_admission.is_some() {
                     return Err(failure(
-                        "RoventExternalCollectionUnsupported",
-                        "external R Collection provenance has no admitted source",
+                        "RoventExternalCollectionHooks",
+                        "Collection origin and actual root observer must be selected together",
                     ));
                 }
                 Ok(())
@@ -568,17 +577,12 @@ impl RoventPcrSessionProfile {
         clock: &ProcessClock,
         collection_origin: Option<&crate::pals_adaptive::RoventNativeCollectionOrigin>,
         admission: &RoventPcrRootAdmission,
-        source: &ProfiledExternalRootSource,
+        joined: &RoventAdmittedExternalRootSource,
     ) -> Result<(), AdaptiveManagerError>
     where
         B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
         B::Output: ProposerRankingOutput,
     {
-        if collection_origin.is_some() {
-            return Err(AdaptiveManagerError::Invalid(
-                "external R Collection requires its separate provenance admission",
-            ));
-        }
         context.goal.validate(self.maximum_goal_plies)?;
         let original = admission
             .original
@@ -586,10 +590,12 @@ impl RoventPcrSessionProfile {
             .ok_or(AdaptiveManagerError::Invalid(
                 "external R requires original root admission",
             ))?;
-        source
+        joined
             .validate_current()
             .map_err(|error| AdaptiveManagerError::Semantic(error.to_string()))?;
+        let source = joined.worker_source();
         if !context.accepts()?
+            || !Arc::ptr_eq(original, joined.root_admission())
             || source.authority() != context.authority
             || source.authority() != original.authority()
             || original.root_budget_digest() != admission.budget
@@ -651,6 +657,25 @@ impl RoventPcrSessionProfile {
             .register_profiled_external_cleanup_deadline(source, context.shutdown_deadline)?;
         manager.configure_rovent_external_routing(self.mode, admission.budget, 1)?;
         manager.configure_rovent_peer_followups(self.peers)?;
+        if let Some(origin) = collection_origin {
+            let frontier = manager
+                .driver()
+                .port()
+                .and_then(|port| port.rovent_frontier())
+                .ok_or(AdaptiveManagerError::Invalid(
+                    "actual external Collection frontier is absent",
+                ))?;
+            let collection = crate::pals_adaptive::RoventCollectionRootAdmission::from_attached_external_frontier(
+                origin,
+                frontier,
+                self.input_lock,
+                admission.budget,
+                self.selective_policy,
+                Arc::clone(original),
+                joined,
+            )?;
+            manager.admit_collection_root(collection)?;
+        }
         Ok(())
     }
 }
