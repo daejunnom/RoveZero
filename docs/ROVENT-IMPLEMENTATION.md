@@ -264,36 +264,6 @@ dependency를 기본 feature에서 참조한 동일 오류였다. 소스에서 f
 수정했으며 원 실패 로그를 보존한다. 이 로컬 컴파일 결과를 새 HEAD의 CI 성공으로
 표시하지 않는다.
 
-실제 Candidate/Counter/Repair admission, retired Fresh, Rules terminal과 명시적
-round 종료를 공통 Frontier에 전달하는 manager hook을 등록했다. 첫 탐색 재검사에서
-**824개 통과·1개 실패·기존 선택 실행 2개 미실행**을 관측했다. 실패는 selection
-seal 전에 전체 완료 depth를 기대한 새 fixture였다. terminal 의무와 전체 선택
-완료를 구분하도록 fixture를 수정하고 재검사하며, 제품 완료 조건을 완화하지 않는다.
-
-같은 등록 단위를 수정 뒤 재실행하여 search **825개 통과·기존 선택 실행 2개
-미실행**, `pals-adaptive,onnx-cpu` UCI **617개 통과**, experiments **236개 통과**를
-확인했다. 관리 빌드의 자식 종료·임시 경로 정리도 확인했다. 기존 준비·corpus의
-9개 Python 모듈은 현재 소스에서 Windows **93개 통과·Linux 전용 9개 미실행**,
-WSL **102개 통과**다. 앞의 95개 소비자 묶음과 겹치는 검사가 있어 두 수를 독립
-검사 총수로 합산하지 않는다. 이는 작업 중인 소스의 CPU 계약 검사이며, 새 제품
-entry·실제 NNUEC R·GPU·학습의 인수로 확대하지 않는다.
-
-남은 실제 조립은 다음과 같다.
-
-- 네 모드 제품 UCI entry, 실제 `go`별 root admission, 초기화·새 게임·ponder·정리.
-- 원 node quota를 먼저 청구한 PCR 전이와 GoalLocal 후속 작업. 일반 검색의 passive
-  mate 전파, 명시 mate의 PCR missing defense, 정확 거리의 UCI 출력도 연결한다.
-- 최초 준비 전후 동일 semantic·ledger·actor·Ready worker를 이동하고, 후속 질문마다
-  실제 view-bound NNUEC 설치·namespace·R 결과의 P/C 소비를 연결한다.
-- actual collection 목적의 명시 startup, 원 Rules replay·teacher·R readout·divergence
-  출처와 durable publication을 연결한다. V-free profile의 task는 미지원/unknown을
-  보존하고 별도 PCV 실행을 추가하지 않는다.
-- trainer CLI와 실제 부모·child, 비학습 tensor 복원·export, 네 모드 신경망·로컬
-  GPU 수치·물리 수명과 최종 SHA CI를 각각 인수한다.
-
-성능·기력 비교와 실제 학습은 이 checkpoint에 포함하지 않는다. O01~O04의 조건부
-후속 연구를 기반 구현의 선행 조건으로 추가하지 않는다.
-
 ## 다섯 번째 통합 체크포인트
 
 원 `go`를 ponder 정규화 전에 보존하고, startup 자산·설정과 매 검색의 실제
@@ -328,3 +298,73 @@ RoleFailure 표현·새 PalsError 분기 누락 두 건을 확인했다. 원 실
 독립 source pin 거부도 각각 구분한다. 누락 파일과 fixture는 보완했고, 고정 pin은
 최종 소스 감사 후 정확한 literal 조합으로 갱신한다. 이를 exact-HEAD CI 성공으로
 표시하지 않는다.
+
+## 여섯 번째 통합 체크포인트
+
+validation 008에서 Linux 네 패키지의 전체 타깃 교차 컴파일과 UCI 기본·
+`onnx-cpu` 단독·`pals-adaptive` 단독 컴파일이 통과했다. 같은 실행의 search는
+원 실패 fixture를 보존하고 수정한 뒤 **848개 통과·기존 선택 실행 2개 미실행**이다.
+실제로 검사된 terminal mate를 단순 depth 종료로 기대한 두 fixture를 보완했고,
+restricted-loss fixture는 전체 합법 수 목록과 실제 부분집합을 구분한다.
+
+UCI는 **635개 통과·2개 실패**였다. 유효하지 않은 all-zero Rules 선언을 사용한
+fixture와 시작점 이전 시계의 거부 검사를 구분해 수정한다. Windows의 미세한
+음수 기간 변환에 의존하지 않도록 원 `Instant` 순서를 직접 검사하며, 원 1ns
+회귀를 삭제하거나 정상 시간으로 바꾸지 않는다. 이 실행은 experiments 단계에
+도달하지 않았으므로 해당 패키지의 신규 통과를 주장하지 않는다.
+
+원 R 자료의 selected anchor와 record별 source history를 분리해 보존하는 최신
+순수 검사 묶음은 Windows·WSL에서 **각각 47개 통과**했다. 실제 Rust serde 입력을
+production Python validator에 전달하는 별도 wire 진입점도 작성했다. 앞의 189개
+묶음과 이력을 단순 합산하지 않으며, 순수 자료 검사는 Rules 재생·native 권한·
+tensor·optimizer 성공의 증거가 아니다.
+
+새 등록 소스에는 private Bound 인스턴스 설치 권한, 동일 준비 actor의 실제 CPU
+evaluator 해제와 별도 cache ack, 원 source snapshot 공유, 순수 historical review
+검증 및 독립 Collection CPU_T worker가 포함된다. 영수증이 View pin을 보유하지
+않으며 같은 의미 digest의 다른 Bound를 인수하지 않도록 한다. 이 단위는
+`f6579e7`의 별도 검사 worktree에서 검증하고, 원 feature worktree의 병렬 구현과
+구분한다. 소스 등록·읽기 감사와 실제 검사 결과를 서로 대체하지 않는다.
+
+빠진 terminal fixture 보정을 별도 커밋한 `d12cc13` 고정 소스에서는 search
+**878개 통과·기존 선택 실행 2개 미실행**, Linux 네 패키지의 전체 타깃 교차
+컴파일 통과, experiments **253개 통과**를 확인했다. 관리 실행의 자식 종료와
+임시 경로 정리도 확인했다. Linux 전용 teacher pipe의 실제 실행이나 이후
+SourceSeal·GoalLocal·제품 entry의 인수 결과는 아니다. 독립 Collection teacher와
+기존 PC corpus의 별도 순수 묶음 47개도 Windows·WSL에서 각각 통과했다.
+이 47개는 위의 R helper 묶음 47개와 서로 다른 실행이며 단순 합산하지 않는다.
+
+다음 인수는 네 모드 제품 입구와 실제 Ponder 시계·출력, 원 depth/mate 의무의
+후속 질문과 native 소비, Q별 NNUEC 종단 수명, 독립 teacher와 R publication,
+학습을 실행하지 않는 tensor·checkpoint·export 및 로컬 GPU 정확성이다. 실제
+학습·원격 성능/기력 비교·Draft PR 병합은 진행하지 않는다.
+
+실제 Candidate/Counter/Repair admission, retired Fresh, Rules terminal과 명시적
+round 종료를 공통 Frontier에 전달하는 manager hook을 등록했다. 첫 탐색 재검사에서
+**824개 통과·1개 실패·기존 선택 실행 2개 미실행**을 관측했다. 실패는 selection
+seal 전에 전체 완료 depth를 기대한 새 fixture였다. terminal 의무와 전체 선택
+완료를 구분하도록 fixture를 수정하고 재검사하며, 제품 완료 조건을 완화하지 않는다.
+
+같은 등록 단위를 수정 뒤 재실행하여 search **825개 통과·기존 선택 실행 2개
+미실행**, `pals-adaptive,onnx-cpu` UCI **617개 통과**, experiments **236개 통과**를
+확인했다. 관리 빌드의 자식 종료·임시 경로 정리도 확인했다. 기존 준비·corpus의
+9개 Python 모듈은 현재 소스에서 Windows **93개 통과·Linux 전용 9개 미실행**,
+WSL **102개 통과**다. 앞의 95개 소비자 묶음과 겹치는 검사가 있어 두 수를 독립
+검사 총수로 합산하지 않는다. 이는 작업 중인 소스의 CPU 계약 검사이며, 새 제품
+entry·실제 NNUEC R·GPU·학습의 인수로 확대하지 않는다.
+
+남은 실제 조립은 다음과 같다.
+
+- 네 모드 제품 UCI entry, 실제 `go`별 root admission, 초기화·새 게임·ponder·정리.
+- 원 node quota를 먼저 청구한 PCR 전이와 GoalLocal 후속 작업. 일반 검색의 passive
+  mate 전파, 명시 mate의 PCR missing defense, 정확 거리의 UCI 출력도 연결한다.
+- 최초 준비 전후 동일 semantic·ledger·actor·Ready worker를 이동하고, 후속 질문마다
+  실제 view-bound NNUEC 설치·namespace·R 결과의 P/C 소비를 연결한다.
+- actual collection 목적의 명시 startup, 원 Rules replay·teacher·R readout·divergence
+  출처와 durable publication을 연결한다. V-free profile의 task는 미지원/unknown을
+  보존하고 별도 PCV 실행을 추가하지 않는다.
+- trainer CLI와 실제 부모·child, 비학습 tensor 복원·export, 네 모드 신경망·로컬
+  GPU 수치·물리 수명과 최종 SHA CI를 각각 인수한다.
+
+성능·기력 비교와 실제 학습은 이 checkpoint에 포함하지 않는다. O01~O04의 조건부
+후속 연구를 기반 구현의 선행 조건으로 추가하지 않는다.
