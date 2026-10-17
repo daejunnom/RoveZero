@@ -38,6 +38,70 @@ const OWNER_WINDOW: Duration = Duration::from_secs(20);
 const OWNER_CLEANUP: Duration = Duration::from_secs(2);
 const OWNER_NODES: u64 = 100_000;
 
+/// Layout-only diagnostic: this does not construct a model, actor, engine or
+/// worker. Keep product owner transport sizes visible without changing thread
+/// stack limits or entering the neural/native execution fixture.
+#[test]
+fn nnuec_owner_inline_layout_observation() {
+    use crate::rovent_bootstrap::nnuec_preparing::{InitialNnuecCleanupOwners, InitialNnuecReady};
+    use rz_search::pals::engine::PalsEngine;
+    use rz_search::pals::engine::adaptive_port::AdaptiveEnginePort;
+    use rz_search::pals::engine::preparing_root::{
+        PreparingRootFinishRejection, PreparingRootHandoff, ResearcherPreparingRoot,
+    };
+    use std::mem::size_of;
+    for (name, bytes) in [
+        (
+            "PalsStores",
+            size_of::<rz_search::pals::store::PalsStores>(),
+        ),
+        ("PalsEngine", size_of::<PalsEngine<AdaptivePortModel>>()),
+        (
+            "ResearcherPreparingOwner",
+            size_of::<ResearcherPreparingOwner<AdaptivePortModel>>(),
+        ),
+        (
+            "ResearcherPreparingRoot",
+            size_of::<ResearcherPreparingRoot<AdaptivePortModel>>(),
+        ),
+        (
+            "PreparingRootHandoff",
+            size_of::<PreparingRootHandoff<AdaptivePortModel>>(),
+        ),
+        (
+            "PreparingRootFinishRejection",
+            size_of::<PreparingRootFinishRejection<AdaptivePortModel>>(),
+        ),
+        (
+            "AdaptiveEnginePort",
+            size_of::<AdaptiveEnginePort<AdaptivePortModel>>(),
+        ),
+        (
+            "InitialNnuecCleanupOwners",
+            size_of::<InitialNnuecCleanupOwners>(),
+        ),
+        ("InitialNnuecPreparing", size_of::<InitialNnuecPreparing>()),
+        ("InitialNnuecReady", size_of::<InitialNnuecReady>()),
+        ("InitialNnuecStep", size_of::<InitialNnuecStep>()),
+        (
+            "AdaptivePortDriver",
+            size_of::<AdaptivePortDriver<AdaptivePortModel>>(),
+        ),
+        (
+            "AdaptiveExecutionManager",
+            size_of::<
+                AdaptiveExecutionManager<
+                    AdaptivePortQuestion,
+                    NativeFixture,
+                    AdaptivePortDriver<AdaptivePortModel>,
+                >,
+            >(),
+        ),
+    ] {
+        eprintln!("NNUEC_OWNER_INLINE {name} {bytes}");
+    }
+}
+
 /// Required numerical configuration and authored parameter data only. This
 /// uses the same tiny shapes as native-owner regressions, through production
 /// Model validation; no alternate evaluator or test-only execution is added.
