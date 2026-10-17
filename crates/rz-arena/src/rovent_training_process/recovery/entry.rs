@@ -8,15 +8,25 @@ use cap_std::fs::{Dir, OpenOptionsExt};
 use cli::{RoventTrainerCliAction, RoventTrainerCliAdmissionRequest, RoventTrainerCliTotalQuota};
 use std::os::unix::fs::MetadataExt;
 
+/// Read-only inspection custody. Its public observation grants no execution
+/// authority; private original descriptors and data owners stay retained for
+/// this result's lifetime without exposing internal FD transport types.
+pub struct RoventRecoveredTrainingInspection {
+    observation: Value,
+    _retained_registration: HeldHistoricalFile,
+    _retained_metadata: Vec<HeldHistoricalFile>,
+    _retained_dataset: Arc<VerifiedRoventDataset>,
+    _retained_checkpoint: Option<Arc<VerifiedRoventCheckpointSource>>,
+    _retained_budget: Arc<RoventRecoveryReadBudget>,
+}
+impl RoventRecoveredTrainingInspection {
+    pub fn observation(&self) -> &Value {
+        &self.observation
+    }
+}
+
 pub enum RoventRecoveredTrainingOutcome {
-    Inspected {
-        observation: Value,
-        _registration: HeldHistoricalFile,
-        _metadata: Vec<HeldHistoricalFile>,
-        _dataset: Arc<VerifiedRoventDataset>,
-        _checkpoint: Option<Arc<VerifiedRoventCheckpointSource>>,
-        _budget: Arc<RoventRecoveryReadBudget>,
-    },
+    Inspected(RoventRecoveredTrainingInspection),
     Completed {
         owner: VerifiedRoventRecoveredTrainingWindow,
         checkpoint_archive: Option<PublishedRoventCheckpointArchive>,
@@ -50,7 +60,7 @@ impl RoventRecoveredTrainingOutcome {
     }
     pub fn observation(&self) -> Value {
         match self {
-            Self::Inspected { observation, .. } => observation.clone(),
+            Self::Inspected(owner) => owner.observation().clone(),
             Self::Completed {
                 owner,
                 checkpoint_archive,
@@ -226,20 +236,22 @@ fn run_after_resource_preparation(
     }
     request.ensure_admission_open()?;
     if command.action == RoventTrainerCliAction::Inspect {
-        return Ok(RoventRecoveredTrainingOutcome::Inspected {
-            observation: json!({"schema":"rz-rovent-recovered-trainer-inspection/1",
+        return Ok(RoventRecoveredTrainingOutcome::Inspected(
+            RoventRecoveredTrainingInspection {
+                observation: json!({"schema":"rz-rovent-recovered-trainer-inspection/1",
                 "execution_id":registration.execution_id,"source_kind":ROVENT_RECOVERY_SOURCE_KIND,
                 "dataset":dataset.observation(),"checkpoint":checkpoint.as_ref().map(|owner|owner.observation()),
                 "window_profile_sha256":window.profile_sha256()?,"read_budget":budget.observation(),
                 "resources_applied":false,"resource_scope":"inspection_read_and_time_budget_only_not_whole_cpu_memory_enforcement",
                 "past_native_authority_reissued":false,"past_physical_completion_reissued":false,
                 "execution_authorized":false,"child_started":false}),
-            _registration: registration_file,
-            _metadata: vec![window_file, recipe_file],
-            _dataset: dataset,
-            _checkpoint: checkpoint,
-            _budget: budget,
-        });
+                _retained_registration: registration_file,
+                _retained_metadata: vec![window_file, recipe_file],
+                _retained_dataset: dataset,
+                _retained_checkpoint: checkpoint,
+                _retained_budget: budget,
+            },
+        ));
     }
     let reclamation = match (&checkpoint, checkpoint_registration) {
         (Some(source), Some(requested)) => Some(VerifiedRoventOldRunReclamation::admit(

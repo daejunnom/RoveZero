@@ -3,6 +3,7 @@
 //! custody/event ordering; Core tests the actual quota-first Rules producer.
 use super::*;
 use rz_contracts::rovent::{ExecutionMode, SearchGoal, SearchRecipient};
+use rz_runtime::Clock;
 use rz_runtime::contracts::ContractClock;
 use rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace;
 use rz_search::pals::rovent_engine::RootMoveDomain;
@@ -51,7 +52,7 @@ fn install_fixture_frontier(manager: &mut Manager) {
         },
         &manager.driver().stores,
         manager.clock.domain(),
-        manager.clock.now().unwrap(),
+        manager.clock.now(),
     )
     .unwrap();
     manager.driver_mut().replay_frontier = Some(frontier);

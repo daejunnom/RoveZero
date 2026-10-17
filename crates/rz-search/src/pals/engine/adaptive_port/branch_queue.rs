@@ -189,6 +189,25 @@ pub(super) struct PendingCounter {
     source: Option<ObservationId>,
     repair_direct: bool,
 }
+#[cfg(test)]
+impl PendingCounter {
+    /// Authored queue metadata only; this grants no accepted observation.
+    pub(super) fn authored_without_observation_for_test(
+        first: BoardMove,
+        proposal: Vec<BoardMove>,
+        counter: Vec<BoardMove>,
+        attack: usize,
+    ) -> Self {
+        Self {
+            first,
+            proposal,
+            counter,
+            attack,
+            source: None,
+            repair_direct: false,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub enum AdaptiveBranchOutcome {
     Complete(FrameCompletionScope),

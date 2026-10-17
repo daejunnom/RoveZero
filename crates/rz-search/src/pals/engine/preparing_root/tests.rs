@@ -1,7 +1,7 @@
 //! Initial quota/owner regressions. These never prepare C, materialize a TT,
 //! start an R worker, search, train or execute a P/C neural model.
 use super::*;
-use crate::contract_time::{ContractClock, InstantClock};
+use crate::contract_time::InstantClock;
 use crate::cpu::{CpuConfig, CpuOrderingPolicy};
 use crate::cpu_value::CpuTrainingState;
 use crate::cpu_value::nnuec::v2::{Checkpoint, Model, RelationParameters, SCHEMA, SEMANTICS};

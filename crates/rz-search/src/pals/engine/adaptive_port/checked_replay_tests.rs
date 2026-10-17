@@ -1,5 +1,6 @@
 // Included by the existing frontier_port fixture module. No new model,
 // platform, worker, acceptance shortcut or test-only question factory.
+use crate::pals::engine::adaptive_port::branch_queue::PendingCounter;
 
 #[test]
 fn checked_replay_reuses_charged_snapshots_and_rejects_unchecked_connect() {
@@ -100,14 +101,12 @@ fn queued_counter_checks_quota_without_publishing_examined_graph_edges() {
     // the common budget before queue bookkeeping runs after its attempt seal.
     port.checked_frontier_line(&counter).unwrap();
     assert!(
-        port.enqueue_counter(PendingCounter {
+        port.enqueue_counter(PendingCounter::authored_without_observation_for_test(
             first,
-            proposal: vec![first, BoardMove::from_uci("e7e5").unwrap()],
-            counter: counter.clone(),
-            attack: 1,
-            source: None,
-            repair_direct: false,
-        })
+            vec![first, BoardMove::from_uci("e7e5").unwrap()],
+            counter.clone(),
+            1,
+        ))
         .unwrap()
     );
     assert_eq!(port.engine.semantic.nodes.len(), nodes);

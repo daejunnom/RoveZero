@@ -55,10 +55,10 @@ pub struct VerifiedRoventRecoveredTrainingWindow {
     pub(super) launch: RoventRecoveredTrainingLaunch,
     pub(super) dataset: Arc<VerifiedRoventDataset>,
     pub(super) checkpoint: Option<Arc<VerifiedRoventCheckpointSource>>,
-    pub(super) reclamation: Option<VerifiedRoventOldRunReclamation>,
+    pub(super) _retained_reclamation: Option<VerifiedRoventOldRunReclamation>,
     pub(super) held: linux::LinuxHeld,
     pub(super) child_identity: RoventHistoricalChildIdentity,
-    pub(super) boundary_archives: Vec<PublishedRoventCheckpointArchive>,
+    pub(super) _retained_boundary_archives: Vec<PublishedRoventCheckpointArchive>,
 }
 impl VerifiedRoventRecoveredTrainingWindow {
     pub fn summary(&self) -> &Value {
@@ -94,9 +94,9 @@ pub struct RoventRecoveredTrainingFailure {
     pub dataset: Arc<VerifiedRoventDataset>,
     pub checkpoint: Option<Arc<VerifiedRoventCheckpointSource>>,
     pub reclamation: Option<VerifiedRoventOldRunReclamation>,
-    pub(super) held: Option<linux::LinuxHeld>,
-    broker: Option<PendingBroker>,
-    shared_held: Arc<Mutex<Option<linux::LinuxHeld>>>,
+    pub(super) _retained_held: Option<linux::LinuxHeld>,
+    _retained_broker: Option<PendingBroker>,
+    _retained_shared_held: Arc<Mutex<Option<linux::LinuxHeld>>>,
     boundary_archives: Arc<Mutex<Vec<PublishedRoventCheckpointArchive>>>,
     boundary_archive_failures: Arc<Mutex<Vec<Box<RoventCheckpointArchiveFailure>>>>,
 }
@@ -1809,14 +1809,14 @@ pub fn run_rovent_training_recovered(
             launch,
             dataset,
             checkpoint,
-            reclamation,
+            _retained_reclamation: reclamation,
             held: held.expect("retained current FDs"),
             child_identity: child_identity
                 .lock()
                 .expect("validated child identity mutex")
                 .take()
                 .expect("admitted current child"),
-            boundary_archives: std::mem::take(
+            _retained_boundary_archives: std::mem::take(
                 &mut *boundary_archives
                     .lock()
                     .expect("validated boundary archive custody"),
@@ -1845,9 +1845,9 @@ pub fn run_rovent_training_recovered(
                 dataset,
                 checkpoint,
                 reclamation,
-                held,
-                broker,
-                shared_held,
+                _retained_held: held,
+                _retained_broker: broker,
+                _retained_shared_held: shared_held,
                 boundary_archives,
                 boundary_archive_failures,
             }))
