@@ -307,6 +307,7 @@ pub struct RoventPcSharedNnuecReadback {
 #[derive(Default)]
 struct SharedNnuecActor {
     actor: Option<PreparationActor>,
+    signal: rz_runtime::CompletionSignal,
     readback: RoventPcSharedNnuecReadback,
 }
 impl SharedNnuecActor {
@@ -320,13 +321,24 @@ impl SharedNnuecActor {
         };
         actor.request_shutdown();
         loop {
+            let observed = self.signal.version();
             match actor.try_join() {
                 Ok(Some(())) => {
                     self.readback.worker_joined = true;
                     self.actor.take();
                     return Ok(());
                 }
-                Ok(None) if Instant::now() < until => std::thread::yield_now(),
+                Ok(None) if Instant::now() < until => {
+                    // The actor notifies for real commands. Thread exit has
+                    // no separate notification, so bounded polling still
+                    // checks the original join without a busy-spin loop.
+                    self.signal.wait_changed(
+                        observed,
+                        until
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(10)),
+                    );
+                }
                 _ => return Err(SearchSessionFailure::physical_completion_unknown()),
             }
         }
@@ -495,6 +507,14 @@ impl RoventPcSessionDriver {
                     },
                     Some(loaded),
                 ) => {
+                    if !declares_shared_nnuec_helper(
+                        &prepared.sources().lock().manifest.resources.pools,
+                    ) {
+                        return Err(failure(
+                            "RoventPcNnuecResources",
+                            "shared readout requires one declared RuntimeHelper thread",
+                        ));
+                    }
                     let actual = loaded.model().registration().map_err(|error| {
                         SearchSessionFailure::debug("RoventPcNnuecRegistration", &error)
                     })?;
@@ -861,9 +881,10 @@ impl RoventPcSessionDriver {
                     self.closed.store(true, Ordering::Release);
                     return Err(SearchSessionFailure::physical_completion_unknown());
                 }
+                let signal = idle.native.service.signal();
                 let created = match PreparationActor::spawn_notified(
                     Arc::clone(owner.loaded.model()),
-                    idle.native.service.signal(),
+                    signal.clone(),
                 ) {
                     Ok(created) => created,
                     Err(error) => {
@@ -874,6 +895,7 @@ impl RoventPcSessionDriver {
                 };
                 actor.readback.spawned_runtime_helpers = 1;
                 actor.readback.worker_thread_id = created.worker_thread_id();
+                actor.signal = signal;
                 actor.actor = Some(created);
             }
         }
@@ -1547,10 +1569,50 @@ fn failure(code: &'static str, detail: &str) -> SearchSessionFailure {
         detail: detail.into(),
     }
 }
+/// Declaration gate only. Existing resource admission remains the owner of
+/// quota, topology and observed OS affinity; this grants none of those facts.
+fn declares_shared_nnuec_helper(pools: &[rz_experiments::RoventThreadPool]) -> bool {
+    pools.iter().any(|pool| {
+        pool.actors
+            .contains(&rz_experiments::RoventActor::RuntimeHelper)
+            && pool.max_threads >= 1
+    })
+}
 fn poisoned() -> ContractError {
     ContractError::new(
         rz_contracts::ErrorCode::BackendFailure,
         rz_contracts::Stage::Output,
         "Rovent P/C observation mutex poisoned",
     )
+}
+
+#[cfg(test)]
+mod shared_nnuec_resource_tests {
+    use super::declares_shared_nnuec_helper;
+    use rz_experiments::{RoventActor, RoventThreadPool};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn shared_readout_rejects_absent_or_zero_thread_helper_declarations() {
+        assert!(!declares_shared_nnuec_helper(&[]));
+        assert!(!declares_shared_nnuec_helper(&[RoventThreadPool {
+            actors: BTreeSet::from([RoventActor::PcCaller]),
+            max_threads: 1,
+            cpu_charge_millicpus: 1_000,
+        }]));
+        assert!(!declares_shared_nnuec_helper(&[RoventThreadPool {
+            actors: BTreeSet::from([RoventActor::RuntimeHelper]),
+            max_threads: 0,
+            cpu_charge_millicpus: 0,
+        }]));
+    }
+
+    #[test]
+    fn shared_readout_accepts_one_declared_helper_in_original_pool() {
+        assert!(declares_shared_nnuec_helper(&[RoventThreadPool {
+            actors: BTreeSet::from([RoventActor::Manager, RoventActor::RuntimeHelper]),
+            max_threads: 1,
+            cpu_charge_millicpus: 1_000,
+        }]));
+    }
 }
