@@ -70,9 +70,20 @@ fn view(policy: ReviewSelectionPolicy) -> (PalsStores, ReviewContextIndex, Revie
 fn sources(stores: &PalsStores, view: &ReviewView) -> Vec<ReviewAnchor> {
     view.records_metadata()
         .iter()
-        .map(|metadata| ReviewAnchor {
-            state: metadata.source_state,
-            snapshot: stores.states.get(metadata.source_state).unwrap().clone(),
+        .zip(view.source_snapshots().iter())
+        .map(|(metadata, snapshot)| {
+            assert!(
+                stores
+                    .states
+                    .get(metadata.source_state)
+                    .unwrap()
+                    .weak_position_identity()
+                    .matches(snapshot)
+            );
+            ReviewAnchor {
+                state: metadata.source_state,
+                snapshot: snapshot.clone(),
+            }
         })
         .collect()
 }

@@ -20,6 +20,10 @@ use sha2::{Digest as _, Sha256};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[path = "nnuec_v2_capture_lineage.rs"]
+mod lineage;
+pub use lineage::NnuecCaptureLineage;
+
 const INPUT_DOMAIN: &[u8] = b"rz-nnuec-actual-r-readout-input/1\0";
 const MAX_CAPTURE_RECORDS: u16 = 64;
 const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
@@ -77,6 +81,7 @@ impl NnuecCaptureLimits {
 }
 
 struct Submission {
+    lineage: NnuecCaptureLineage,
     model: Arc<Model>,
     bound: Arc<BoundNnuecReviewContext>,
     frame: FrameId,
@@ -146,6 +151,15 @@ impl NnuecCaptureReservation {
         let context_sha256 = bound.numeric_context_sha256().to_owned();
         Ok(Self {
             submission: Arc::new(Submission {
+                lineage: NnuecCaptureLineage::new(
+                    work.frame,
+                    work.input.question_digest,
+                    capture_sequence,
+                    work.original_deadline,
+                    binding,
+                    Digest(work.input.view.digest()),
+                    Digest(work.input.view.seal_digest()),
+                ),
                 model,
                 bound,
                 frame: work.frame,
@@ -160,6 +174,13 @@ impl NnuecCaptureReservation {
             state: Arc::new(Mutex::new(State::default())),
             retirement: Arc::new(OnceLock::new()),
         })
+    }
+
+    pub fn lineage(&self) -> NnuecCaptureLineage {
+        self.submission.lineage.clone()
+    }
+    pub fn matches_lineage(&self, lineage: &NnuecCaptureLineage) -> bool {
+        self.submission.lineage.same_authority(lineage)
     }
 
     /// Attach only to a prepared immutable Job. This reserves no native nodes
@@ -240,8 +261,9 @@ impl NnuecCaptureReservation {
             Some(_) if state.clock_origin != Some(clock.origin()) => {
                 return Err(CaptureError::Stale);
             }
-            Some(_) => {}
+            Some(_) => self.submission.lineage.activate(job, owner)?,
             None => {
+                self.submission.lineage.activate(job, owner)?;
                 state.job = Some((job, owner));
                 state.clock_origin = Some(clock.origin());
             }
@@ -597,6 +619,13 @@ pub struct NnuecCaptureRetirement {
     error: Option<CaptureError>,
 }
 impl NnuecCaptureRetirement {
+    /// Exact original activation, never public metadata equality. A known
+    /// unstarted terminal supplies no actual worker/readout semantic witness.
+    pub fn matches_lineage(&self, lineage: &NnuecCaptureLineage) -> bool {
+        self.ending != NnuecCaptureEnding::NotStarted
+            && self.submission.lineage.same_authority(lineage)
+            && lineage.matches_activated_job(self.job, self.owner)
+    }
     pub fn matches_model(&self, model: &Arc<Model>) -> bool {
         Arc::ptr_eq(&self.submission.model, model)
     }

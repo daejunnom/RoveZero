@@ -172,6 +172,10 @@ fn implementation_sha256() -> String {
     for (name, source) in [
         ("cpu_value.rs", include_bytes!("../cpu_value.rs").as_slice()),
         ("nnuec.rs", include_bytes!("nnuec.rs").as_slice()),
+        (
+            "nnuec_rules.rs",
+            include_bytes!("nnuec_rules.rs").as_slice(),
+        ),
         ("nnuec_v2.rs", include_bytes!("nnuec_v2.rs").as_slice()),
         (
             "nnuec_v2_cpu.rs",
@@ -182,8 +186,32 @@ fn implementation_sha256() -> String {
             include_bytes!("nnuec_v2_review.rs").as_slice(),
         ),
         (
+            "nnuec_v2_review_retirement.rs",
+            include_bytes!("nnuec_v2_review_retirement.rs").as_slice(),
+        ),
+        (
             "nnuec_v2_capture.rs",
             include_bytes!("nnuec_v2_capture.rs").as_slice(),
+        ),
+        (
+            "nnuec_v2_capture_lineage.rs",
+            include_bytes!("nnuec_v2_capture_lineage.rs").as_slice(),
+        ),
+        (
+            "nnuec_v2_retirement.rs",
+            include_bytes!("nnuec_v2_retirement.rs").as_slice(),
+        ),
+        (
+            "cpu_worker/prepared_value.rs",
+            include_bytes!("../cpu_worker/prepared_value.rs").as_slice(),
+        ),
+        (
+            "cpu_worker/deferred_value.rs",
+            include_bytes!("../cpu_worker/deferred_value.rs").as_slice(),
+        ),
+        (
+            "cpu_worker/retired_value.rs",
+            include_bytes!("../cpu_worker/retired_value.rs").as_slice(),
         ),
         (
             "nnuec_v2_registration.rs",

@@ -149,6 +149,18 @@ fn reservation(
 ) -> NnuecCaptureReservation {
     NnuecCaptureReservation {
         submission: Arc::new(Submission {
+            lineage: NnuecCaptureLineage::new(
+                FrameId {
+                    authority: job.envelope().id.authority,
+                    sequence: 1,
+                },
+                job.envelope().question,
+                1,
+                job.envelope().hard_deadline,
+                job.envelope().evaluation_namespace,
+                Digest(fixture.bound.view().digest()),
+                Digest(fixture.bound.view().seal_digest()),
+            ),
             model: Arc::clone(&fixture.model),
             bound: Arc::clone(&fixture.bound),
             frame: FrameId {
@@ -218,6 +230,104 @@ fn capture_settings_require_explicit_bounded_nonzero_limits() {
     assert!(NnuecCaptureLimits::new(65, 1, 1).is_err());
     assert!(NnuecCaptureLimits::new(1, 0, 1).is_err());
     assert!(NnuecCaptureLimits::new(1, 1, MAX_CAPTURE_BYTES + 1).is_err());
+}
+
+#[test]
+fn lineage_requires_actual_begin_and_rejects_an_equal_metadata_reservation() {
+    let fixture = fixture();
+    let worker = worker(&fixture);
+    let mut original = job(&fixture, &worker, 1, 1);
+    let envelope = original.envelope();
+    let capture = reservation(
+        &fixture,
+        &original,
+        NnuecCaptureLimits::new(4, 1, 1024 * 1024).unwrap(),
+    );
+    let foreign = reservation(
+        &fixture,
+        &original,
+        NnuecCaptureLimits::new(4, 1, 1024 * 1024).unwrap(),
+    );
+    let lineage = capture.lineage();
+    let foreign_lineage = foreign.lineage();
+    assert!(lineage.matches_reservation(&capture));
+    assert!(!lineage.matches_reservation(&foreign));
+    assert_eq!(lineage.frame(), foreign_lineage.frame());
+    assert_eq!(lineage.question_digest(), foreign_lineage.question_digest());
+    assert_eq!(lineage.binding_digest(), foreign_lineage.binding_digest());
+    assert_eq!(
+        lineage.capture_sequence(),
+        foreign_lineage.capture_sequence()
+    );
+    assert_eq!(
+        lineage.full_view_digest(),
+        Digest(fixture.bound.view().digest())
+    );
+    assert_eq!(
+        lineage.view_seal_digest(),
+        Digest(fixture.bound.view().seal_digest())
+    );
+    assert_eq!(lineage.original_deadline(), envelope.hard_deadline);
+    assert!(!lineage.matches_activated_job(envelope, CpuWorkerId(0)));
+    original
+        .enable_nnuec_capture(capture.clone())
+        .unwrap_or_else(|_| panic!("attach"));
+    assert!(
+        !lineage.matches_activated_job(envelope, CpuWorkerId(0)),
+        "prepared attachment has not entered its actual worker"
+    );
+    let first = grant(&original, 1, 4096);
+    worker.begin(original, first).unwrap();
+    assert!(report(&worker).terminal);
+    assert!(lineage.matches_activated_job(envelope, CpuWorkerId(0)));
+    assert!(!lineage.matches_activated_job(envelope, CpuWorkerId(1)));
+    let mut other = envelope;
+    other.id.sequence += 1;
+    assert!(!lineage.matches_activated_job(other, CpuWorkerId(0)));
+    assert!(!foreign_lineage.matches_activated_job(envelope, CpuWorkerId(0)));
+    let retirement = capture.retirement().unwrap();
+    assert!(retirement.matches_lineage(&lineage));
+    assert!(lineage.matches_retirement(retirement));
+    assert!(!retirement.matches_lineage(&foreign_lineage));
+    worker.shutdown().unwrap();
+}
+
+#[test]
+fn historical_lineage_keeps_no_model_bound_or_review_pin_after_actual_cleanup() {
+    let fixture = fixture();
+    let worker = worker(&fixture);
+    let mut original = job(&fixture, &worker, 1, 1);
+    let envelope = original.envelope();
+    let capture = reservation(
+        &fixture,
+        &original,
+        NnuecCaptureLimits::new(4, 1, 1024 * 1024).unwrap(),
+    );
+    let before = Arc::strong_count(&fixture.bound);
+    let lineage = capture.lineage();
+    let cloned = lineage.clone();
+    assert_eq!(Arc::strong_count(&fixture.bound), before);
+    let model = Arc::downgrade(&fixture.model);
+    let bound = Arc::downgrade(&fixture.bound);
+    original
+        .enable_nnuec_capture(capture.clone())
+        .unwrap_or_else(|_| panic!("attach"));
+    let first = grant(&original, 1, 4096);
+    worker.begin(original, first).unwrap();
+    assert!(report(&worker).terminal);
+    worker.shutdown().unwrap();
+    drop(capture);
+    fixture._actor.shutdown().unwrap();
+    drop(fixture.bound);
+    drop(fixture.model);
+    assert!(bound.upgrade().is_none());
+    assert!(model.upgrade().is_none());
+    assert_eq!(fixture.stores.review_pin_count().unwrap(), 0);
+    assert!(lineage.matches_activated_job(envelope, CpuWorkerId(0)));
+    assert!(
+        cloned.matches_activated_job(envelope, CpuWorkerId(0)),
+        "historical equality remains without reviving any execution authority"
+    );
 }
 
 #[test]
@@ -436,6 +546,7 @@ fn revoked_original_bound_cannot_bind_and_still_allows_known_unstarted_retiremen
     let worker = worker(&fixture);
     let mut job = job(&fixture, &worker, 1, 1);
     let capture = reservation(&fixture, &job, NnuecCaptureLimits::new(1, 1, 1024).unwrap());
+    let lineage = capture.lineage();
     job.enable_nnuec_capture(capture.clone())
         .unwrap_or_else(|_| panic!("attach"));
     fixture.cancel.store(true, Ordering::Release);
@@ -458,6 +569,8 @@ fn revoked_original_bound_cannot_bind_and_still_allows_known_unstarted_retiremen
         )
         .unwrap();
     assert!(capture.retirement().unwrap().readouts().is_empty());
+    assert!(!lineage.matches_activated_job(job.envelope(), CpuWorkerId(0)));
+    assert!(!capture.retirement().unwrap().matches_lineage(&lineage));
     let stopped = worker.shutdown().unwrap();
     assert!(stopped.engine_recoverable);
     assert!(

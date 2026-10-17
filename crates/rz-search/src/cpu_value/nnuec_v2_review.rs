@@ -64,7 +64,7 @@ pub struct Provenance {
 /// alive while queued, preparing, cached, or held by an accepted consumer.
 pub struct Request {
     view: Arc<ReviewView>,
-    sources: Vec<PositionSnapshot>,
+    sources: Arc<[PositionSnapshot]>,
     provenance: Provenance,
     deadline: Instant,
     cancel: Arc<AtomicBool>,
@@ -92,6 +92,7 @@ impl Request {
         if view.records().len() > 64
             || view.records().len() > model.base_checkpoint().config.max_lines
             || view.records_metadata().len() != view.records().len()
+            || view.source_snapshots().len() != view.records().len()
             || view.anchors().is_empty()
             || view.anchors().len() > 4
         {
@@ -107,16 +108,10 @@ impl Request {
         {
             return Err(PreparationError::StaleView);
         }
-        let mut sources = Vec::with_capacity(view.records().len());
-        for metadata in view.records_metadata() {
-            sources.push(
-                stores
-                    .states
-                    .get(metadata.source_state)
-                    .map_err(|_| PreparationError::StaleView)?
-                    .clone(),
-            );
-        }
+        // The selected view already retained these actual bundle sources in
+        // row order. Share that exact immutable array, rather than scanning
+        // the Store again or making another collection of history owners.
+        let sources = Arc::clone(view.source_snapshots());
         let provenance = Provenance {
             root: expected_root,
             generation: expected_generation,
@@ -292,7 +287,7 @@ impl Factory {
                 .records()
                 .iter()
                 .zip(view.records_metadata())
-                .zip(&request.sources)
+                .zip(request.sources.iter())
                 .enumerate()
             {
                 self.control(&request)?;
@@ -403,7 +398,7 @@ impl Factory {
             context,
             numeric_context_sha256,
             view: request.view,
-            source_snapshots: request.sources.into(),
+            source_snapshots: request.sources,
             provenance: request.provenance,
             reused_record_scope,
             deadline: request.deadline,
@@ -948,14 +943,22 @@ mod tests {
             .unwrap();
         assert_ne!(a.digest(), b.digest());
         let protected = index.bundle(bundle).unwrap().protected_consumptions();
-        let prepared_a = factory
-            .prepare(request(&factory, Arc::clone(&a), &stores, state))
-            .unwrap();
+        let original_a = request(&factory, Arc::clone(&a), &stores, state);
+        assert!(Arc::ptr_eq(&original_a.sources, a.source_snapshots()));
+        let prepared_a = factory.prepare(original_a).unwrap();
+        assert!(Arc::ptr_eq(
+            &prepared_a.source_snapshots,
+            a.source_snapshots()
+        ));
         let prepared_b = factory
             .prepare(request(&factory, Arc::clone(&b), &stores, state))
             .unwrap();
         assert!(!prepared_a.reused_record_scope());
         assert!(prepared_b.reused_record_scope());
+        assert!(Arc::ptr_eq(
+            &prepared_b.source_snapshots,
+            b.source_snapshots()
+        ));
         assert!(Arc::ptr_eq(prepared_a.context(), prepared_b.context()));
         assert!(
             !prepared_a
