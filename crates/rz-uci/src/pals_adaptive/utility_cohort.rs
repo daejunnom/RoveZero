@@ -1035,7 +1035,7 @@ impl UtilityTrialPhysicalRetirement {
                 "identity_sha256":hex(w.identity()),"raw_evidence_sha256":hex(w.raw_evidence())})).collect::<Vec<_>>() })),
         "cost":self.cost,"physical_closure":self.physical_closure,"previous_durable_ack":previous_durable_ack,"resolved":self.proof.outcome().is_some_and(|o|o.semantic_consumption_complete())
             &&self.materialized.is_some(),"comparable":self.comparable,
-        "unknown_reason":self.unknown,"support_mask":self.support_mask(),"target_known_mask":[false;7]}),
+        "unknown_reason":self.unknown,"support_mask":self.support_mask(),"target_known_mask":[false,false,false,false,false,false,false]}),
         )
     }
 }

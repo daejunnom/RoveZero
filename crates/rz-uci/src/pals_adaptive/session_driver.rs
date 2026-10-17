@@ -114,6 +114,19 @@ pub type AdaptiveCompletedRootObserver<B> = Arc<
         + Send
         + Sync,
 >;
+/// Receives the original root-local utility action after actual physical closure.
+pub type AdaptiveUtilityRouteCompletionObserver = Arc<
+    dyn Fn(&Arc<super::CompletedUtilityRouteAction>) -> Result<(), AdaptiveManagerError>
+        + Send
+        + Sync,
+>;
+/// Receives the original cohort trial after same-owner physical retirement.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub type AdaptiveUtilityTrialRetirementObserver = Arc<
+    dyn Fn(&Arc<super::UtilityTrialPhysicalRetirement>) -> Result<(), AdaptiveManagerError>
+        + Send
+        + Sync,
+>;
 
 // Declare after taking the session state lock: failure closes admission before
 // that lock is released, including unwinding and an already waiting next go.
@@ -140,24 +153,12 @@ where
     /// Only the Session's actual same-actor engine/cache ACK boundary issues
     /// this cap; an earlier root_closure callback cannot mint whole cost.
     /// The Session retains the original Arc on callback error or unwinding.
-    pub utility_route_completed: Option<
-        Arc<
-            dyn Fn(&Arc<super::CompletedUtilityRouteAction>) -> Result<(), AdaptiveManagerError>
-                + Send
-                + Sync,
-        >,
-    >,
+    pub utility_route_completed: Option<AdaptiveUtilityRouteCompletionObserver>,
     /// Cohort physical retirement is issued only from the original trial
     /// admission and the same actually retired researcher owner. It cannot be
     /// supplied by relabeling a historical root-local Completed action.
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-    pub utility_trial_retired: Option<
-        Arc<
-            dyn Fn(&Arc<super::UtilityTrialPhysicalRetirement>) -> Result<(), AdaptiveManagerError>
-                + Send
-                + Sync,
-        >,
-    >,
+    pub utility_trial_retired: Option<AdaptiveUtilityTrialRetirementObserver>,
     pub external_teacher: Option<AdaptiveExternalTeacherObserver>,
     /// Nonblocking outer-session pump. It does not run inside a native/CPU
     /// worker and cannot change the manager's original execution authority.

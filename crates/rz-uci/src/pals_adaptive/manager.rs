@@ -6178,12 +6178,11 @@ where
             return Ok(changed);
         }
         for _ in 0..64 {
-            if self.roles.len() >= self.role_pending_limit()
-                || !self.role_call_admission_available()
+            if (self.roles.len() >= self.role_pending_limit()
+                || !self.role_call_admission_available())
+                && self.peer_policy.is_none()
             {
-                if self.peer_policy.is_none() {
-                    break;
-                }
+                break;
             }
             let own_available = self
                 .own

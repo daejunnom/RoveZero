@@ -962,20 +962,22 @@ impl RoventNnuecSessionDriver {
                     .min(Duration::from_millis(1)),
             );
         };
-        let mut observations = NnuecInitialCleanupObservations::default();
-        observations.root_cancel_requested = true;
-        observations.ready_shutdown_requested = true;
-        observations.ready_shutdown = Some(shutdown);
-        observations.engine_release_matches_original = Some(
-            retired
-                .engine_release
-                .matches_source(retired.owner.source()),
-        );
-        observations.cache_clears_released_engine = Some(
-            retired
-                .engine_release
-                .matches_cache_release(&retired.cache_release),
-        );
+        let observations = NnuecInitialCleanupObservations {
+            root_cancel_requested: true,
+            ready_shutdown_requested: true,
+            ready_shutdown: Some(shutdown),
+            engine_release_matches_original: Some(
+                retired
+                    .engine_release
+                    .matches_source(retired.owner.source()),
+            ),
+            cache_clears_released_engine: Some(
+                retired
+                    .engine_release
+                    .matches_cache_release(&retired.cache_release),
+            ),
+            ..Default::default()
+        };
         let proof = Arc::new(RoventNnuecInitialRetirementReceipt {
             original_phase: InitialNnuecPhase::AdoptPort,
             original_failure: None,
@@ -1119,10 +1121,7 @@ impl RoventNnuecSessionDriver {
         context: &SearchSessionContext,
         admission: Arc<RoventRootAdmission>,
         progress: &mut dyn FnMut(BoardMove),
-    ) -> Result<
-        (Box<Idle>, SearchSessionReport, Arc<RoventNnuecRootReceipt>),
-        (State, SearchSessionFailure),
-    > {
+    ) -> RootReturn {
         let reset = self.reset_requested.swap(false, Ordering::AcqRel)
             || idle.game != Some(context.authority.game.0);
         if reset {
