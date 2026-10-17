@@ -27,7 +27,14 @@ fn source_port() -> Port {
 }
 
 fn source_port_at(position: Position, root_moves: Option<&[BoardMove]>) -> Port {
-    let mut port = super::super::port_tests::setup(position, 4);
+    // GoalLocal reaches the actual Fresh WDL commit boundary. Use the admitted
+    // model resolver so its value identity is registered by the real engine
+    // constructor; attaching a Frontier alone grants no value registration.
+    let mut port = super::super::port_tests::setup_with_resolver(
+        position,
+        4,
+        ResolverPolicy::ModelWdlRestricted,
+    );
     attach_source_frontier(
         &mut port,
         root_moves,
@@ -555,12 +562,11 @@ fn actual_goal_local_chunks_reach_original_depth_without_new_frames_or_r_work() 
     assert_eq!(snapshot.work.native_nodes, 0);
     assert_eq!(port.counters.cpu_tasks_requested, 0);
     assert_eq!(port.counters.external_checker_tasks, 0);
-    assert!(
-        port.rovent_frontier()
-            .unwrap()
-            .validate_unmet_horizon_question(&old_source)
-            .is_err()
-    );
+    assert!(port
+        .rovent_frontier()
+        .unwrap()
+        .validate_unmet_horizon_question(&old_source)
+        .is_err());
     assert!(matches!(
         port.next_rovent_goal_input(port.deadline.clock, MonotonicTick(0))
             .unwrap(),
@@ -744,9 +750,21 @@ fn original_registry_head_advances_once_and_rejects_changed_output_or_physical_s
         work.checked_transitions
     );
     let mut altered = output.clone();
-    altered.private_latent[0] = 1.0;
-    assert!(
-        port.consume_rovent_goal_input(
+    // AcceptedRoleStep seals the consumed public head. Private latent has its
+    // own shape/numerical validation and is not that head's digest payload.
+    match &mut altered.payload {
+        RolePayload::Proposal {
+            candidate_logits, ..
+        }
+        | RolePayload::Counterexample {
+            candidate_logits, ..
+        } => candidate_logits[0] += 1.0,
+        RolePayload::TaskRanking { .. } => unreachable!("GoalLocal admits only P/C"),
+    }
+    assert!(proof.validates_output(&output));
+    assert!(!proof.validates_output(&altered));
+    assert!(port
+        .consume_rovent_goal_input(
             &original,
             &proof,
             &altered,
@@ -754,14 +772,13 @@ fn original_registry_head_advances_once_and_rejects_changed_output_or_physical_s
             port.deadline.clock,
             MonotonicTick(0)
         )
-        .is_err()
-    );
+        .is_err());
     let changed = AdaptivePortRoleEvidence {
         completed_nn_inputs: Some(2),
         ..evidence
     };
-    assert!(
-        port.consume_rovent_goal_input(
+    assert!(port
+        .consume_rovent_goal_input(
             &original,
             &proof,
             &output,
@@ -769,8 +786,7 @@ fn original_registry_head_advances_once_and_rejects_changed_output_or_physical_s
             port.deadline.clock,
             MonotonicTick(0)
         )
-        .is_err()
-    );
+        .is_err());
     assert!(port.engine.semantic.records.is_empty());
     assert_eq!(port.counters.cpu_tasks_requested, 0);
     assert_eq!(port.counters.cpu_nodes, 0);
@@ -811,10 +827,9 @@ fn one_original_goal_reaches_actual_fresh_leaf_without_promoting_it_to_mate_proo
                 assert!(fresh);
                 assert_eq!(leaf.kind(), GoalLocalLeafKind::FreshBoundary);
                 assert_eq!(Some(leaf.source_key()), source);
-                assert!(
-                    leaf.snapshot()
-                        .same_state(&original.input().question.position.snapshot())
-                );
+                assert!(leaf
+                    .snapshot()
+                    .same_state(&original.input().question.position.snapshot()));
                 assert!(!port.rovent_goal_has_pending());
                 leaf_seen = true;
                 break;
@@ -828,13 +843,12 @@ fn one_original_goal_reaches_actual_fresh_leaf_without_promoting_it_to_mate_proo
     assert_eq!(port.counters.accepted_value_outputs, 1);
     assert_eq!(port.counters.cpu_tasks_requested, 0);
     assert!(port.engine.semantic.records.is_empty());
-    assert!(
-        port.rovent_frontier()
-            .unwrap()
-            .snapshot()
-            .mate_strategy
-            .is_none()
-    );
+    assert!(port
+        .rovent_frontier()
+        .unwrap()
+        .snapshot()
+        .mate_strategy
+        .is_none());
 }
 
 #[test]
