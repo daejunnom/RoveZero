@@ -6,7 +6,9 @@
 //! supplies historical parser input, including deliberately malformed input.
 
 use super::*;
-use crate::pals::engine::adaptive_port::conditional_evidence::tests::{accepted_raw_source, port};
+use crate::pals::engine::adaptive_port::conditional_evidence::tests::{
+    accepted_raw_source, port, port_with_line_plies,
+};
 use crate::pals::engine::adaptive_port::validator_port::{
     BoundedObservationPreimage, ObservationSink,
 };
@@ -355,8 +357,9 @@ fn historical_cpu_basis_requires_the_exact_original_consumed_consumer() {
 
 #[test]
 fn historical_cpu_basis_rejects_a_cpu_tag_on_an_actual_rules_terminal() {
-    let mut port = port(Position::startpos());
-    port.engine.config.line_plies = 8;
+    // The Store derives its line limit at engine construction. Changing only
+    // config afterwards would leave its original four-ply admission intact.
+    let mut port = port_with_line_plies(Position::startpos(), 8);
     let proposal = line("e2e4 e7e5 g1f3 b8c6 f1c4");
     let terminal = line("e2e4 f7f6 f1c4 g7g5 d1h5");
     // The negative fixture deliberately stores a CPU-tagged terminal snapshot.
@@ -375,8 +378,9 @@ fn historical_cpu_basis_rejects_a_cpu_tag_on_an_actual_rules_terminal() {
         },
     )
     .unwrap();
+    let legal = endpoint_position.ordered_legal_moves();
     assert!(matches!(
-        endpoint_position.classify_position().unwrap().play_status,
+        endpoint_position.play_status_from_view(&legal).unwrap(),
         PlayStatus::Terminal { .. }
     ));
     let recipe = ComparisonRecipe {
@@ -395,7 +399,10 @@ fn historical_cpu_basis_rejects_a_cpu_tag_on_an_actual_rules_terminal() {
         &terminal,
         recipe,
     );
-    assert!(case.validate(&case.basis).is_err());
+    assert!(matches!(
+        case.validate(&case.basis),
+        Err(BasisError::Invalid("CPU endpoint is Rules terminal"))
+    ));
 }
 
 #[test]

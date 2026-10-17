@@ -32,7 +32,10 @@ pub(super) mod tests {
         port_with_line_plies(position, 4)
     }
 
-    fn port_with_line_plies(position: Position, line_plies: usize) -> Port {
+    pub(in crate::pals::engine::adaptive_port) fn port_with_line_plies(
+        position: Position,
+        line_plies: usize,
+    ) -> Port {
         let cpu = CpuEngine::new(crate::cpu::CpuConfig {
             tt_entries: 16,
             max_depth: 8,
@@ -1116,8 +1119,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(ReviewError::AnchorMismatch.into());
         }
+        // Conditional support uses exact automatic Rules termination only.
+        // Intended-move draw-claim previews need an extra history slot and do
+        // not change whether this exact endpoint is a terminal or ongoing.
+        let legal = endpoint.position.ordered_legal_moves();
+        let status = endpoint.position.play_status_from_view(&legal)?;
         if let Some((reason, value)) = endpoint.terminal {
-            let status = endpoint.position.classify_position()?.play_status;
             let PlayStatus::Terminal {
                 reason: actual_reason,
                 winner,
@@ -1140,7 +1147,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         }
         // Foreign raw observations and model-resolver estimates are distinct
         // namespaces. Only a separately sealed Fresh pair can compare WDL.
-        if endpoint.position.classify_position()?.play_status != PlayStatus::Ongoing {
+        if status != PlayStatus::Ongoing {
             return Err(StoreError::InvalidEvidence(
                 "adaptive CPU endpoint is an actual Rules terminal",
             )

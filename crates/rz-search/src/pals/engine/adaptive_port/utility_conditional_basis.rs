@@ -1749,10 +1749,10 @@ fn validate_endpoint(
                 },
             )
             .map_err(|_| BasisError::Invalid("Rules endpoint"))?;
+            let legal = position.ordered_legal_moves();
             let PlayStatus::Terminal { winner, .. } = position
-                .classify_position()
+                .play_status_from_view(&legal)
                 .map_err(|_| BasisError::Invalid("Rules terminal classification"))?
-                .play_status
             else {
                 return Err(BasisError::Invalid("Rules endpoint is ongoing"));
             };
@@ -1787,10 +1787,13 @@ fn validate_endpoint(
                 },
             )
             .map_err(|_| BasisError::Invalid("CPU endpoint Rules snapshot"))?;
+            // Only exact automatic termination belongs to this guard. Full
+            // classification also previews intended-move draw claims, which
+            // would require a spare history slot unrelated to this endpoint.
+            let legal = position.ordered_legal_moves();
             if position
-                .classify_position()
+                .play_status_from_view(&legal)
                 .map_err(|_| BasisError::Invalid("CPU endpoint Rules classification"))?
-                .play_status
                 != PlayStatus::Ongoing
             {
                 return Err(BasisError::Invalid("CPU endpoint is Rules terminal"));
