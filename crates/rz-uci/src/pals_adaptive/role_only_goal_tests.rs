@@ -16,6 +16,110 @@ use rz_search::pals::review_context::ReviewIndexLimits;
 use rz_search::pals::rovent_frontier::{FrontierGoalStatus, FrontierLimits, FrontierRegistration};
 use std::num::NonZeroU16;
 
+/// Preserve the real semantic question's public revision in this authored
+/// backend. The generic manager fixture deliberately uses revision zero;
+/// these actual PC goals publish lines and subsequently prepare newer heads.
+struct GoalNativeFixture {
+    inner: NativeFixture,
+}
+impl TicketNativeBackend<ReviewView, PcPortQuestion> for GoalNativeFixture {
+    type Prepared = RepresentationKey;
+    type Output = RoleOutput;
+
+    fn clock(&self) -> ContractSystemClock {
+        <NativeFixture as TicketNativeBackend<ReviewView, PcPortQuestion>>::clock(&self.inner)
+    }
+    fn prepare(
+        &mut self,
+        question: &TicketPreparation<ReviewView, PcPortQuestion>,
+        canceled: &AtomicBool,
+    ) -> Result<(Self::Prepared, RepresentationKey), RoleFailure> {
+        let (mut prepared, mut key) = <NativeFixture as TicketNativeBackend<
+            ReviewView,
+            PcPortQuestion,
+        >>::prepare(&mut self.inner, question, canceled)?;
+        let revision = question.query.context().public_revision;
+        prepared.record_revision = revision;
+        key.record_revision = revision;
+        Ok((prepared, key))
+    }
+    fn prepared_host_bytes(&self, prepared: &Self::Prepared) -> u64 {
+        <NativeFixture as TicketNativeBackend<ReviewView, PcPortQuestion>>::prepared_host_bytes(
+            &self.inner,
+            prepared,
+        )
+    }
+    fn run(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        question: &TicketPreparation<ReviewView, PcPortQuestion>,
+        prepared: &Self::Prepared,
+        canceled: &AtomicBool,
+    ) -> TicketPhysicalResult<Self::Output> {
+        <NativeFixture as TicketNativeBackend<ReviewView, PcPortQuestion>>::run(
+            &mut self.inner,
+            ticket,
+            question,
+            prepared,
+            canceled,
+        )
+    }
+    fn output_host_bytes(&self, output: &Self::Output) -> u64 {
+        <NativeFixture as TicketNativeBackend<ReviewView, PcPortQuestion>>::output_host_bytes(
+            &self.inner,
+            output,
+        )
+    }
+    fn acceptance_output_digest(&self, output: &Self::Output) -> Option<Digest> {
+        <NativeFixture as TicketNativeBackend<ReviewView, PcPortQuestion>>::acceptance_output_digest(
+            &self.inner,
+            output,
+        )
+    }
+    fn execution_evidence(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+    ) -> Option<TicketExecutionEvidence> {
+        <NativeFixture as TicketNativeBackend<ReviewView, PcPortQuestion>>::execution_evidence(
+            &mut self.inner,
+            ticket,
+        )
+    }
+    fn accept(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        question: &TicketPreparation<ReviewView, PcPortQuestion>,
+        prepared: &Self::Prepared,
+        output: &Self::Output,
+    ) -> Result<(), RoleFailure> {
+        <NativeFixture as TicketNativeBackend<ReviewView, PcPortQuestion>>::accept(
+            &mut self.inner,
+            ticket,
+            question,
+            prepared,
+            output,
+        )
+    }
+    fn discard(&mut self, ticket: &RoleTicketEnvelope) -> Result<(), RoleFailure> {
+        <NativeFixture as TicketNativeBackend<ReviewView, PcPortQuestion>>::discard(
+            &mut self.inner,
+            ticket,
+        )
+    }
+    fn quiesce(&mut self, until: Instant) -> bool {
+        <NativeFixture as TicketNativeBackend<ReviewView, PcPortQuestion>>::quiesce(
+            &mut self.inner,
+            until,
+        )
+    }
+    fn finish(&mut self, until: Instant) -> bool {
+        <NativeFixture as TicketNativeBackend<ReviewView, PcPortQuestion>>::finish(
+            &mut self.inner,
+            until,
+        )
+    }
+}
+
 struct ActualGoalDriver {
     inner: PcPortDriver<AdaptivePortModel>,
     submitted: Vec<(RoleTicketEnvelope, FrameInput<ReviewView, PcPortQuestion>)>,
@@ -115,7 +219,8 @@ impl RoleOnlySearchDriver<PcPortQuestion> for ActualGoalDriver {
     }
 }
 
-type ActualGoalManager = RoleOnlyExecutionManager<PcPortQuestion, NativeFixture, ActualGoalDriver>;
+type ActualGoalManager =
+    RoleOnlyExecutionManager<PcPortQuestion, GoalNativeFixture, ActualGoalDriver>;
 
 fn fixture(goal: SearchGoal) -> (ActualGoalManager, Arc<NativeFacts>, Instant) {
     let clock = ContractSystemClock::new(ProcessEpoch(717));
@@ -212,10 +317,12 @@ fn fixture(goal: SearchGoal) -> (ActualGoalManager, Arc<NativeFacts>, Instant) {
     let native_clock = clock.clone();
     let native = TicketedNativeService::spawn(
         move || {
-            Ok(NativeFixture {
-                clock: native_clock,
-                facts: owned_facts,
-                finish_ok: true,
+            Ok(GoalNativeFixture {
+                inner: NativeFixture {
+                    clock: native_clock,
+                    facts: owned_facts,
+                    finish_ok: true,
+                },
             })
         },
         TicketServiceLimits::default(),
@@ -327,6 +434,11 @@ fn no_researcher_manager_consumes_real_missing_origin_through_retired_fresh_head
         .find(|(ticket, _)| *ticket == source)
         .unwrap();
     assert!(input.question.goal_local_origin_digest().is_some());
+    assert!(input.question.context().public_revision > 0);
+    assert_eq!(
+        source.representation.record_revision,
+        input.question.context().public_revision
+    );
     let (_, original) = manager
         .driver()
         .submitted
@@ -395,5 +507,12 @@ fn actual_no_researcher_depth_completion_survives_fence_and_frontier_retirement(
     assert_eq!(snapshot.horizon.completed_depth.unwrap().0, 5);
     assert_eq!(snapshot.completed_frames, snapshot.registered_frames);
     assert!(manager.driver().inner.result().counters.accepted_fresh > 0);
+    assert!(
+        manager
+            .driver()
+            .consumed
+            .iter()
+            .any(|ticket| ticket.representation.record_revision > 0)
+    );
     close_and_recover(manager, until);
 }
