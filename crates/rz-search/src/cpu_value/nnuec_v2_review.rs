@@ -7,7 +7,7 @@ use crate::cpu_value::{CpuValueIdentity, nnuec::NnuecError};
 use crate::cpu_worker::deferred_value::MaterializationOwner;
 use crate::cpu_worker::{
     CpuWorkerError, MaterializationCompletion, MaterializationRequest, MaterializedNnuecEngine,
-    NnuecEngineRetirementCompletion, NnuecEngineRetirementId,
+    NnuecAuthorityRevocation, NnuecEngineRetirementCompletion, NnuecEngineRetirementId,
     NnuecMaterializationReleaseCompletion, NnuecMaterializationReleaseId, RecoveredNnuecEngine,
 };
 use crate::pals::engine::RecordKind;
@@ -233,9 +233,22 @@ impl BoundNnuecReviewContext {
     /// Worker-side authority check without borrowing the single-writer store.
     /// Store/root/original-ticket admission remains required in validates().
     pub fn authority_is_live(&self) -> bool {
-        !self.stopping.load(Ordering::Acquire)
-            && check_control(self.deadline, &self.cancel).is_ok()
-            && self.invalidations.load(Ordering::Acquire) == self.preparation_epoch
+        self.authority_revocation().is_none()
+    }
+    /// Original control only; never infer a stop from a readback, foreign
+    /// actor, allocation failure or caller-provided error string.
+    pub(crate) fn authority_revocation(&self) -> Option<NnuecAuthorityRevocation> {
+        if self.cancel.load(Ordering::Acquire) {
+            Some(NnuecAuthorityRevocation::Cancelled)
+        } else if Instant::now() >= self.deadline {
+            Some(NnuecAuthorityRevocation::Expired)
+        } else if self.stopping.load(Ordering::Acquire) {
+            Some(NnuecAuthorityRevocation::ActorStopped)
+        } else if self.invalidations.load(Ordering::Acquire) != self.preparation_epoch {
+            Some(NnuecAuthorityRevocation::Invalidated)
+        } else {
+            None
+        }
     }
     /// Acceptance must use the original ticket seal, never the latest view.
     /// Preparation does not call ReviewContextIndex::consume.
@@ -655,13 +668,15 @@ impl PreparationActor {
                                     &request.bound().invalidations,
                                     &factory.invalidations,
                                 );
-                            let result = if !same_actor || !request.bound().authority_is_live() {
+                            let result = if !same_actor {
                                 Err((
                                     request,
                                     CpuWorkerError::Invalid(
                                         "foreign or revoked NNUEC preparation actor",
                                     ),
                                 ))
+                            } else if let Some(reason) = request.bound().authority_revocation() {
+                                Err((request, CpuWorkerError::NnuecAuthorityRevoked(reason)))
                             } else {
                                 request.materialize()
                             };
@@ -1370,17 +1385,35 @@ mod tests {
         let cancel = Arc::clone(&request.cancel);
         let mut bound = factory.prepare(request).unwrap();
         assert!(bound.validates(&stores, state, stores.generation(), view.seal_digest()));
+        assert_eq!(bound.authority_revocation(), None);
         cancel.store(true, Ordering::Release);
+        assert_eq!(
+            bound.authority_revocation(),
+            Some(NnuecAuthorityRevocation::Cancelled)
+        );
         assert!(!bound.validates(&stores, state, stores.generation(), view.seal_digest()));
         cancel.store(false, Ordering::Release);
         bound.deadline = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            bound.authority_revocation(),
+            Some(NnuecAuthorityRevocation::Expired)
+        );
         assert!(!bound.validates(&stores, state, stores.generation(), view.seal_digest()));
         bound.deadline = Instant::now() + Duration::from_secs(1);
         factory.invalidations.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            bound.authority_revocation(),
+            Some(NnuecAuthorityRevocation::Invalidated)
+        );
         assert!(!bound.validates(&stores, state, stores.generation(), view.seal_digest()));
         factory.sync_cache_epoch();
         assert!(factory.cached.is_none());
         assert_eq!(factory.invalidation_ack.load(Ordering::Acquire), 1);
+        factory.stopping.store(true, Ordering::Release);
+        assert_eq!(
+            bound.authority_revocation(),
+            Some(NnuecAuthorityRevocation::ActorStopped)
+        );
     }
 
     #[test]

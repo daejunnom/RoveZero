@@ -10,6 +10,7 @@ use crate::cpu_value::nnuec::v2::{Checkpoint, RelationParameters, SCHEMA, SEMANT
 use crate::cpu_value::nnuec::{
     NNUEC_SCHEMA, NNUEC_SEMANTICS, NnuecCheckpoint, NnuecConfig, NnuecParameters,
 };
+use crate::cpu_worker::NnuecAuthorityRevocation;
 use crate::pals::engine::{RecordKind, RoleQueryPurpose, RoleRecord};
 use crate::pals::review_context::{
     ReviewContextIndex, ReviewQuerySequences, ReviewSelectionPolicy, ReviewView,
@@ -431,7 +432,7 @@ fn revocation_before_materialization_returns_the_same_unmaterialized_request() {
         Err((returned, reason)) => {
             assert_eq!(
                 reason,
-                CpuWorkerError::Invalid("deferred NNUEC authority revoked")
+                CpuWorkerError::NnuecAuthorityRevoked(NnuecAuthorityRevocation::Cancelled)
             );
             returned
         }
@@ -461,7 +462,7 @@ fn revocation_after_materialization_returns_the_unsearched_engine_without_a_thre
         Err((returned, reason)) => {
             assert_eq!(
                 reason,
-                CpuWorkerError::Invalid("deferred NNUEC source/binding revoked")
+                CpuWorkerError::NnuecAuthorityRevoked(NnuecAuthorityRevocation::Cancelled)
             );
             assert_eq!(returned.binding_digest(), binding);
             assert_eq!(returned.engine.last_attempt_work(), None);
@@ -578,8 +579,8 @@ fn cancelled_starting_owner_retains_original_bound_and_can_only_be_joined_for_cl
     assert!(weak_view.upgrade().is_some());
     assert_eq!(
         starting.try_ready(),
-        Err(CpuWorkerError::Invalid(
-            "deferred NNUEC ready authority revoked"
+        Err(CpuWorkerError::NnuecAuthorityRevoked(
+            NnuecAuthorityRevocation::Cancelled
         ))
     );
     let mut retained = match starting.accept_ready() {
@@ -587,7 +588,7 @@ fn cancelled_starting_owner_retains_original_bound_and_can_only_be_joined_for_cl
         Err((retained, reason)) => {
             assert_eq!(
                 reason,
-                CpuWorkerError::Invalid("deferred NNUEC ready authority revoked")
+                CpuWorkerError::NnuecAuthorityRevoked(NnuecAuthorityRevocation::Cancelled)
             );
             retained
         }
@@ -617,7 +618,7 @@ fn shutting_down_the_original_preparation_actor_revokes_its_pending_materializat
         Err((returned, reason)) => {
             assert_eq!(
                 reason,
-                CpuWorkerError::Invalid("deferred NNUEC authority revoked")
+                CpuWorkerError::NnuecAuthorityRevoked(NnuecAuthorityRevocation::ActorStopped)
             );
             assert_eq!(returned.provenance(), &provenance);
             assert!(Arc::ptr_eq(&returned.bound, &fixture.bound));
@@ -701,6 +702,98 @@ fn another_preparation_actor_cannot_materialize_the_original_bound_even_with_the
     assert_eq!(registration.provenance(), &provenance);
     assert!(Arc::ptr_eq(&registration.bound, &fixture.bound));
     worker.shutdown().unwrap();
+}
+
+#[test]
+fn matching_actor_reports_actual_cancel_without_materializing_or_losing_the_original_request() {
+    let fixture = fixture();
+    let source = source(&fixture, false);
+    let original = request(&source, &fixture);
+    let identity = fixture.bound.request_identity();
+    let binding = original.binding_digest();
+    fixture.cancel.store(true, Ordering::Release);
+    fixture
+        .actor
+        .try_materialize(original)
+        .unwrap_or_else(|_| panic!("cancelled materialization admission"));
+    let completion = wait_actor_materialized(&fixture.actor);
+    let (returned, error) = completion
+        .result
+        .err()
+        .expect("actual cancellation terminal");
+    assert_eq!(
+        error,
+        CpuWorkerError::NnuecAuthorityRevoked(NnuecAuthorityRevocation::Cancelled)
+    );
+    assert_eq!(returned.binding_digest(), binding);
+    assert!(returned.bound.matches_request(&identity));
+    assert!(fixture.terminal.matches_request(&identity));
+    assert!(fixture.terminal.allows_c_only_cleanup());
+    assert!(Arc::ptr_eq(&returned.bound, &fixture.bound));
+}
+
+#[test]
+fn foreign_actor_rejection_is_not_reclassified_by_cancelled_original_control() {
+    let fixture = fixture();
+    let source = source(&fixture, false);
+    let original = request(&source, &fixture);
+    let foreign = PreparationActor::spawn(Arc::clone(&fixture.model)).unwrap();
+    fixture.cancel.store(true, Ordering::Release);
+    foreign
+        .try_materialize(original)
+        .unwrap_or_else(|_| panic!("foreign materialization admission"));
+    let completion = wait_actor_materialized(&foreign);
+    let (returned, error) = completion.result.err().expect("foreign request rejection");
+    assert_eq!(
+        error,
+        CpuWorkerError::Invalid("foreign or revoked NNUEC preparation actor")
+    );
+    assert!(Arc::ptr_eq(&returned.bound, &fixture.bound));
+    assert!(fixture.terminal.allows_c_only_cleanup());
+    foreign.shutdown().unwrap();
+}
+
+#[test]
+fn cancelled_original_control_cannot_hide_a_foreign_engine_readback() {
+    let fixture = fixture();
+    let source = source(&fixture, false);
+    let mut materialized = materialize(request(&source, &fixture));
+    // Deliberately substitute a real foreign evaluator owner as an invalid
+    // input. It is never accepted as NNUEC or used as a fallback searcher.
+    materialized.engine = CpuEngine::new(config()).unwrap();
+    fixture.cancel.store(true, Ordering::Release);
+    let (returned, error) = source
+        .try_spawn_worker(materialized, CpuWorkerId(0), CompletionSignal::default())
+        .err()
+        .expect("foreign engine must remain rejected");
+    assert_eq!(
+        error,
+        CpuWorkerError::Invalid("deferred NNUEC source/binding revoked")
+    );
+    assert_eq!(returned.engine.last_attempt_work(), None);
+}
+
+#[test]
+fn native_constructor_configuration_failure_remains_a_typed_failure() {
+    let fixture = fixture();
+    let mut source = source(&fixture, false);
+    Arc::get_mut(&mut source.declaration)
+        .unwrap()
+        .plan
+        .config
+        .max_depth = 0;
+    let original = request(&source, &fixture);
+    let (returned, error) = original
+        .materialize()
+        .err()
+        .expect("invalid native declaration");
+    assert_eq!(
+        error,
+        CpuWorkerError::Cpu(CpuError::InvalidConfig("depth must be in 1..=64"))
+    );
+    assert!(fixture.bound.authority_is_live());
+    assert!(Arc::ptr_eq(&returned.bound, &fixture.bound));
+    assert!(fixture.terminal.allows_c_only_cleanup());
 }
 
 #[test]

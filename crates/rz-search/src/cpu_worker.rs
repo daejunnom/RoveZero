@@ -63,9 +63,20 @@ pub const CPU_JOB_CAPACITY: usize = 64;
 pub const CPU_FIXED_SLICE_NODES: u64 = 4096;
 pub const CPU_FIXED_SOFT_LEASE: Duration = Duration::from_millis(8);
 
+/// A read-only observation of the original NNUEC Bound control. This is not
+/// proof of cleanup, nor permission to accept a failed root as a normal stop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NnuecAuthorityRevocation {
+    Cancelled,
+    Expired,
+    ActorStopped,
+    Invalidated,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CpuWorkerError {
     Invalid(&'static str),
+    NnuecAuthorityRevoked(NnuecAuthorityRevocation),
     Capacity,
     UnknownJob,
     AlreadyReserved,

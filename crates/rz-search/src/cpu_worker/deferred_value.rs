@@ -9,13 +9,13 @@ use super::{
     CPU_WORKER_COMMAND_CAPACITY, CpuWorker, CpuWorkerError, CpuWorkerProfile, CpuWorkerShutdown,
 };
 use crate::cpu::{
-    CPU_PAUSED_STACK_MAX_BYTES, CpuConfig, CpuEngine, CpuOrderingPolicy, CpuResumePolicy,
+    CPU_PAUSED_STACK_MAX_BYTES, CpuConfig, CpuEngine, CpuError, CpuOrderingPolicy, CpuResumePolicy,
 };
-use crate::cpu_value::CpuValueEvaluator;
 use crate::cpu_value::nnuec::NnuecError;
 use crate::cpu_value::nnuec::v2::Model;
 use crate::cpu_value::nnuec::v2::cpu::V2CpuValue;
 use crate::cpu_value::nnuec::v2::review::{BoundNnuecReviewContext, Provenance};
+use crate::cpu_value::{CpuValueError, CpuValueEvaluator};
 use crate::pals::store::{PalsStores, StateId};
 use rz_contracts::Digest;
 use rz_contracts::pals_adaptive::CpuWorkerId;
@@ -160,14 +160,20 @@ impl DeferredNnuecRSource {
         owner: CpuWorkerId,
         signal: CompletionSignal,
     ) -> Result<StartingNnuecWorker, (MaterializedNnuecEngine, CpuWorkerError)> {
-        if !Arc::ptr_eq(&self.declaration, &materialized.declaration)
-            || !materialized.bound.authority_is_live()
-            || materialized.engine.job_binding_digest().ok() != Some(Some(materialized.binding))
-        {
+        if !Arc::ptr_eq(&self.declaration, &materialized.declaration) {
             return Err((
                 materialized,
                 CpuWorkerError::Invalid("deferred NNUEC source/binding revoked"),
             ));
+        }
+        if let Err(reason) = validate_materialized_readback(
+            &materialized.engine,
+            &self.declaration.model,
+            &materialized.bound,
+            materialized.binding,
+            "deferred NNUEC source/binding revoked",
+        ) {
+            return Err((materialized, reason));
         }
         let Some(stack_owner_id) = materialized
             .engine
@@ -256,11 +262,8 @@ impl MaterializationRequest {
     // TT/history allocation. A manager facade cannot run this constructor.
     #[allow(clippy::result_large_err)]
     pub(crate) fn materialize(self) -> Result<MaterializedNnuecEngine, (Self, CpuWorkerError)> {
-        if !self.bound.authority_is_live() {
-            return Err((
-                self,
-                CpuWorkerError::Invalid("deferred NNUEC authority revoked"),
-            ));
+        if let Some(reason) = self.bound.authority_revocation() {
+            return Err((self, CpuWorkerError::NnuecAuthorityRevoked(reason)));
         }
         let plan = &self.declaration.plan;
         let value: Arc<dyn CpuValueEvaluator> = self.value.clone();
@@ -281,14 +284,14 @@ impl MaterializationRequest {
         if let Err(error) = engine.set_paused_stack_max_bytes(plan.paused_bytes_limit) {
             return Err((self, error.into()));
         }
-        if engine.job_binding_digest().ok() != Some(Some(self.binding))
-            || engine.value_identity() != self.declaration.model.identity()
-            || !self.bound.authority_is_live()
-        {
-            return Err((
-                self,
-                CpuWorkerError::Invalid("deferred NNUEC materialization readback"),
-            ));
+        if let Err(reason) = validate_materialized_readback(
+            &engine,
+            &self.declaration.model,
+            &self.bound,
+            self.binding,
+            "deferred NNUEC materialization readback",
+        ) {
+            return Err((self, reason));
         }
         self.bound.record_materialized();
         Ok(MaterializedNnuecEngine {
@@ -298,6 +301,44 @@ impl MaterializationRequest {
             binding: self.binding,
         })
     }
+}
+
+/// A live binding readback remains mandatory. If its *specific* StateMismatch
+/// races original cancellation/expiry, the actual immutable V2 owner must also
+/// match before reporting that control revocation. A foreign/malformed owner
+/// or a different error is never converted to a normal-stop observation.
+fn validate_materialized_readback(
+    engine: &CpuEngine,
+    model: &Arc<Model>,
+    bound: &Arc<BoundNnuecReviewContext>,
+    binding: Digest,
+    invalid: &'static str,
+) -> Result<(), CpuWorkerError> {
+    let observed = engine.job_binding_digest();
+    if engine.value_identity() != model.identity() {
+        return Err(CpuWorkerError::Invalid(invalid));
+    }
+    match observed {
+        Ok(Some(actual)) if actual == binding => {}
+        Err(CpuError::Value(CpuValueError::StateMismatch)) => {
+            if let Some(reason) = bound.authority_revocation() {
+                let actual = engine.nnuec_retirement_owner().ok().flatten();
+                if actual.as_ref().is_some_and(|owner| {
+                    owner.matches_model(model)
+                        && owner.matches_bound(bound)
+                        && owner.binding_digest() == binding
+                }) {
+                    return Err(CpuWorkerError::NnuecAuthorityRevoked(reason));
+                }
+            }
+            return Err(CpuWorkerError::Invalid(invalid));
+        }
+        _ => return Err(CpuWorkerError::Invalid(invalid)),
+    }
+    if let Some(reason) = bound.authority_revocation() {
+        return Err(CpuWorkerError::NnuecAuthorityRevoked(reason));
+    }
+    Ok(())
 }
 
 /// Actor-produced, unique, unsearched engine. The declaration authority is
@@ -427,10 +468,8 @@ impl StartingNnuecWorker {
         self.bound.provenance()
     }
     pub fn try_ready(&self) -> Result<Option<CpuWorkerProfile>, CpuWorkerError> {
-        if !self.bound.authority_is_live() {
-            return Err(CpuWorkerError::Invalid(
-                "deferred NNUEC ready authority revoked",
-            ));
+        if let Some(reason) = self.bound.authority_revocation() {
+            return Err(CpuWorkerError::NnuecAuthorityRevoked(reason));
         }
         match self.worker.ready_readback() {
             None => return Ok(None),
