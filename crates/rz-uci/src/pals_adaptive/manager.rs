@@ -2597,6 +2597,11 @@ where
     pub fn counters(&self) -> AdaptiveManagerCounters {
         self.counters
     }
+    /// Borrow the original admitted source; this read grants no new root,
+    /// authority, native execution or collection capability.
+    pub fn collection_root_admission(&self) -> Option<&RoventCollectionRootAdmission> {
+        self.collection_admission.as_ref()
+    }
     /// 실제 수집을 요청한 caller만 root 시작 전에 설치한다. 기존 dispatch
     /// observer와 native owner 입력 observer는 별도 원 소유 경계로 유지한다.
     pub fn set_collection_observer(
