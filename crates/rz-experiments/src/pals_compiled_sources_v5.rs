@@ -722,6 +722,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("experiments/model-research/pals/src/rz_pals_model/native_divergence.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/native_recheck_witness.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/native_slot_repair.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/native_source_review.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/nonzero_training.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/numeric.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/numeric_capture.py"),
@@ -853,9 +854,11 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/rovent_collect.rs"),
             source!("crates/rz-arena/src/rovent_collect/allocation.rs"),
             source!("crates/rz-arena/src/rovent_collect/divergence_owner.rs"),
+            source!("crates/rz-arena/src/rovent_collect/external_scope.rs"),
             source!("crates/rz-arena/src/rovent_collect/historical_scope.rs"),
             source!("crates/rz-arena/src/rovent_collect/historical_v2.rs"),
             source!("crates/rz-arena/src/rovent_collect/launch.rs"),
+            source!("crates/rz-arena/src/rovent_collect/launch/resources.rs"),
             source!("crates/rz-arena/src/rovent_collect/native_capture.rs"),
             source!("crates/rz-arena/src/rovent_collect/observer.rs"),
             source!("crates/rz-arena/src/rovent_collect/producer_v2.rs"),
@@ -874,6 +877,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/rovent_collect/teacher/session.rs"),
             source!("crates/rz-arena/src/rovent_collect/writer_v2.rs"),
             source!("crates/rz-arena/src/rovent_resource_scope.rs"),
+            source!("crates/rz-arena/src/rovent_resource_scope/launch.rs"),
             source!("crates/rz-experiments/Cargo.toml"),
             source!("crates/rz-experiments/src/pals_data_v3.rs"),
             source!("crates/rz-experiments/src/pals_data_v3/targets.rs"),
@@ -895,6 +899,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_corpus_codec.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_divergence.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_divergence_owner.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/rovent_external_root.py"),
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_historical_corpus.py"
             ),
@@ -962,6 +967,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_corpus_codec.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_divergence.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_divergence_owner.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/rovent_external_root.py"),
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_historical_corpus.py"
             ),
@@ -1025,6 +1031,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
                 "experiments/model-research/pals/src/rz_pals_model/rovent_collection_teacher.py"
             ),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_corpus_codec.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/rovent_external_root.py"),
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_historical_checkpoint.py"
             ),
@@ -1102,6 +1109,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("experiments/model-research/pals/src/rz_pals_model/generation_training_cli.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/initialization_evidence.py"),
             source!("experiments/model-research/pals/src/rz_pals_model/rovent_corpus_codec.py"),
+            source!("experiments/model-research/pals/src/rz_pals_model/rovent_external_root.py"),
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_historical_checkpoint.py"
             ),
@@ -1171,6 +1179,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/bin/pals-generation-pipeline.rs"),
             source!("crates/rz-arena/src/bin/pals-selfplay-collect.rs"),
             source!("crates/rz-arena/src/bin/rovent-collect.rs"),
+            source!("crates/rz-arena/src/bin/rovent-native.rs"),
             source!("crates/rz-arena/src/bin/rovent-trainer.rs"),
             source!("crates/rz-arena/src/contract.rs"),
             source!("crates/rz-arena/src/engine_environment.rs"),
@@ -1248,9 +1257,11 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/rovent_collect.rs"),
             source!("crates/rz-arena/src/rovent_collect/allocation.rs"),
             source!("crates/rz-arena/src/rovent_collect/divergence_owner.rs"),
+            source!("crates/rz-arena/src/rovent_collect/external_scope.rs"),
             source!("crates/rz-arena/src/rovent_collect/historical_scope.rs"),
             source!("crates/rz-arena/src/rovent_collect/historical_v2.rs"),
             source!("crates/rz-arena/src/rovent_collect/launch.rs"),
+            source!("crates/rz-arena/src/rovent_collect/launch/resources.rs"),
             source!("crates/rz-arena/src/rovent_collect/native_capture.rs"),
             source!("crates/rz-arena/src/rovent_collect/producer_v2.rs"),
             source!("crates/rz-arena/src/rovent_collect/publication.rs"),
@@ -1267,6 +1278,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-arena/src/rovent_collect/teacher/session.rs"),
             source!("crates/rz-arena/src/rovent_collect/writer_v2.rs"),
             source!("crates/rz-arena/src/rovent_resource_scope.rs"),
+            source!("crates/rz-arena/src/rovent_resource_scope/launch.rs"),
             source!("crates/rz-arena/src/rovent_training_process.rs"),
             source!("crates/rz-arena/src/rovent_training_process/linux.rs"),
             source!("crates/rz-arena/src/rovent_training_process/recovery.rs"),
