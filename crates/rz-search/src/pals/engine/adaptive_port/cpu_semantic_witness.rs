@@ -277,6 +277,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         AdaptivePortQuestion::validate_frontier_input(input, &self.engine.semantic.stores)?;
         let ticket = accepted.ticket();
         self.verify_registered_model_namespace(ticket, output)?;
+        let head_used = if input.question.goal_local.is_some() {
+            self.rovent_goal_consumption_recorded(ticket, &input.view)
+        } else {
+            self.role_consumption_recorded(ticket, &input.view)?
+        };
         if !matches!(ticket.role, Role::Proposer | Role::Critic)
             || !accepted.validates_output(output)
             || ticket.authority != self.authority
@@ -285,7 +290,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             || ticket.original_deadline != self.deadline
             || output.id != ticket.id
             || output.authority != ticket.authority
-            || !self.role_consumption_recorded(ticket, &input.view)?
+            || !head_used
         {
             return Err(RoleError::InvalidOutput.into());
         }

@@ -19,12 +19,14 @@ use rz_contracts::{Deadline, Digest as ContractDigest};
 use rz_position::contracts::{ContractPosition, ContractState};
 use std::collections::{HashMap, VecDeque};
 
+mod attack_source;
 mod frontier_port;
 mod goal_local;
 mod peer_questions;
 mod repair_cycle;
 mod repair_report;
 mod repair_witness;
+pub use attack_source::PcAttackRankedSource;
 pub use frontier_port::PcFrontierStartup;
 use peer_questions::{PcPeerQuestion, PcPeerSource};
 pub use repair_cycle::PcRepairPhase;

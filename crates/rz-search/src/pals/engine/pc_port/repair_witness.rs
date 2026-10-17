@@ -31,6 +31,8 @@ pub struct PcDivergenceSource {
     proposal: Vec<BoardMove>,
     counter: Vec<BoardMove>,
     perspective: Color,
+    attack_ranked_source: Option<Arc<PcAttackRankedSource>>,
+    visible_source_digest: ContractDigest,
     digest: ContractDigest,
 }
 
@@ -80,7 +82,7 @@ fn invalid() -> PalsError {
     RoleError::InvalidOutput.into()
 }
 
-fn accepted_origin(
+pub(super) fn accepted_origin(
     input: &FrameInput<ReviewView, PcPortQuestion>,
     accepted: &AcceptedRoleStep,
     output: &RoleOutput,
@@ -227,6 +229,7 @@ impl PcDivergenceSource {
         hash.update((divergence_ply as u64).to_le_bytes());
         hash_line(&mut hash, &query.proposal)?;
         hash_line(&mut hash, counter)?;
+        let digest = ContractDigest(hash.finalize().into());
         Ok(Self {
             accepted: origin,
             source: Arc::clone(&input.question.source),
@@ -238,8 +241,53 @@ impl PcDivergenceSource {
             proposal: query.proposal.clone(),
             counter: counter.clone(),
             perspective: input.question.position.side_to_move(),
-            digest: ContractDigest(hash.finalize().into()),
+            attack_ranked_source: None,
+            visible_source_digest: digest,
+            digest,
         })
+    }
+    /// 후속 Counter의 원 증거와, Counter가 아직 없었던 실제 입력을 연결한다.
+    /// 원 visible source seal은 보존하고 연결된 증거에만 별도 domain을 쓴다.
+    pub(super) fn with_attack_ranked_source(
+        mut self,
+        attack: Option<Arc<PcAttackRankedSource>>,
+    ) -> Result<Self, PalsError> {
+        if self.attack_ranked_source.is_some() {
+            return Err(invalid());
+        }
+        if let Some(attack) = attack {
+            let original = attack.accepted().ticket();
+            let visible = self.accepted.ticket();
+            if !same_owner(attack.source(), &self.source)
+                || !same_model(original, visible)
+                || original.role != Role::Critic
+                || original.id.epoch != visible.id.epoch
+                || original.id.sequence >= visible.id.sequence
+                || attack.source().sequence >= self.source.sequence
+                || !attack.source().position.same_state(&self.source.position)
+                || attack.root_budget() != self.source.root_budget.ok_or_else(invalid)?
+                || attack.divergence_ply() != self.divergence_ply
+                || attack.original_first_move() != self.first
+                || attack.proposal() != self.proposal
+                || attack.perspective() != self.perspective
+            {
+                return Err(invalid());
+            }
+            let mut hash = Sha256::new();
+            hash.update(b"rz-rovent-pc-divergence-source-with-attack/1\0");
+            hash.update(self.visible_source_digest.0);
+            hash.update(attack.digest().0);
+            self.digest = ContractDigest(hash.finalize().into());
+            self.attack_ranked_source = Some(attack);
+        }
+        Ok(self)
+    }
+    pub fn attack_ranked_source(&self) -> Option<&PcAttackRankedSource> {
+        self.attack_ranked_source.as_deref()
+    }
+    /// The original visible-counter source seal, without an optional causal link.
+    pub fn visible_source_digest(&self) -> ContractDigest {
+        self.visible_source_digest
     }
     pub fn accepted(&self) -> &AcceptedRoleOrigin {
         &self.accepted
@@ -272,10 +320,14 @@ impl PcDivergenceSource {
         self.digest
     }
     pub fn owned_host_bytes(&self) -> Option<u64> {
-        inline_bytes::<Self>()?
+        let bytes = inline_bytes::<Self>()?
             .checked_add(move_capacity(&self.proposal)?)?
             .checked_add(move_capacity(&self.counter)?)?
-            .checked_add(self.source.owned_host_bytes()?)
+            .checked_add(self.source.owned_host_bytes()?)?;
+        match &self.attack_ranked_source {
+            Some(attack) => bytes.checked_add(attack.owned_host_bytes()?),
+            None => Some(bytes),
+        }
     }
 }
 

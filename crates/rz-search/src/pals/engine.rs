@@ -203,6 +203,10 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 include_str!("engine/pc_port/peer_questions.rs"),
             ),
             (
+                "pals/engine/pc_port/attack_source.rs",
+                include_str!("engine/pc_port/attack_source.rs"),
+            ),
+            (
                 "pals/engine/pc_port/repair_cycle.rs",
                 include_str!("engine/pc_port/repair_cycle.rs"),
             ),

@@ -128,11 +128,32 @@ impl ProfiledExternalPortState {
                 return Err(StoreError::StaleConsumer.into());
             }
             let context = &admission.work.input.question.context;
+            let query = &admission.work.input.question;
+            for selected in [
+                Some(&admission.work.input.view),
+                query.frozen_counter.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                merge_profiled_retirement_pins(
+                    &mut pins,
+                    &selected.retirement_protected_pins(stores)?,
+                );
+            }
+            if let Some(legacy) = &query.legacy_full_records {
+                merge_profiled_retirement_pins(
+                    &mut pins,
+                    &legacy.retirement_protected_pins(stores)?,
+                );
+            }
             pins.states.insert(admission.task_key.state);
             pins.situations.insert(context.situation);
             pins.lines.insert(context.focus);
             pins.executions.insert(admission.execution);
             pins.observations.extend(admission.published);
+            pins.observations.extend(query.counter_source);
+            pins.observations.extend(query.paired_repaired);
             if let Some(observation) = &admission.prepared_observation {
                 pins.lines.extend(observation.cpu_pv);
             }
@@ -148,6 +169,13 @@ impl ProfiledExternalPortState {
             .is_empty()
             .then_some(std::mem::size_of::<Self>() as u64)
     }
+}
+fn merge_profiled_retirement_pins(into: &mut StorePins, source: &StorePins) {
+    into.states.extend(&source.states);
+    into.lines.extend(&source.lines);
+    into.observations.extend(&source.observations);
+    into.situations.extend(&source.situations);
+    into.executions.extend(&source.executions);
 }
 
 /// Move-only historical source recovery after actual same-root drain. It

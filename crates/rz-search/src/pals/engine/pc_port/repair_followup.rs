@@ -157,6 +157,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 counter: Some(counter),
                 previous_repair: Some(proposal),
                 target: None,
+                attack_source: None,
                 repair: None,
                 recheck: None,
                 recheck_publication: None,

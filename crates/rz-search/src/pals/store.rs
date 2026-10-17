@@ -2188,6 +2188,23 @@ impl StoreReadPin {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+    /// Read only this original lease's validated seed. This neither joins the
+    /// view union nor creates another lease or retirement/admission authority.
+    pub(crate) fn retirement_seed(&self, stores: &PalsStores) -> Result<StorePins, StoreError> {
+        if !self.owner.matches(stores)
+            || self.generation != stores.generation()
+            || !Arc::ptr_eq(&self.registry, &stores.review_pins)
+        {
+            return Err(StoreError::StaleConsumer);
+        }
+        self.registry
+            .lock()
+            .map_err(|_| StoreError::InvalidConditions("review pin owner poisoned"))?
+            .leases
+            .get(&self.serial)
+            .cloned()
+            .ok_or(StoreError::InvalidHandle("review pin lease"))
+    }
     pub fn reborrow(&self, stores: &PalsStores) -> Result<StoreReadPin, StoreError> {
         if !self.validates(stores) {
             return Err(StoreError::StaleConsumer);

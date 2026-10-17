@@ -205,6 +205,12 @@ impl ReviewView {
     pub(crate) fn consumption_observed(&self) -> bool {
         self.consumed.load(Ordering::Acquire)
     }
+    pub(crate) fn retirement_protected_pins(
+        &self,
+        stores: &PalsStores,
+    ) -> Result<StorePins, ReviewError> {
+        Ok(self.pin.retirement_seed(stores)?)
+    }
     pub fn token_count(&self) -> u16 {
         self.tokens
     }

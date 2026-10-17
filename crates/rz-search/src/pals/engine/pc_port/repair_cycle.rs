@@ -101,6 +101,7 @@ pub(super) struct CycleFacts {
     pub(super) counter: Option<PublishedPcLine>,
     pub(super) previous_repair: Option<PublishedPcLine>,
     pub(super) target: Option<Arc<super::repair_witness::PcDivergenceSource>>,
+    pub(super) attack_source: Option<Arc<PcAttackRankedSource>>,
     pub(super) repair: Option<Arc<super::repair_witness::PcRepairAcceptedLine>>,
     pub(super) recheck: Option<Arc<super::repair_witness::PcRepairAcceptedLine>>,
     pub(super) recheck_publication: Option<PublishedPcLine>,
@@ -208,6 +209,9 @@ impl PcRepairStep {
         // The actual native prepared owner separately accounts the shared
         // selected View. This scalar recipe does not duplicate its tensors.
         Some(bytes)
+    }
+    pub(super) fn is_initial_attack_ranking(&self) -> bool {
+        self.phase == PcRepairPhase::AttackRanking && self.counter.is_none()
     }
     pub(super) fn divergences(&self) -> &[usize] {
         &self.divergences
@@ -405,6 +409,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 counter: None,
                 previous_repair: None,
                 target: None,
+                attack_source: None,
                 repair: None,
                 recheck: None,
                 recheck_publication: None,
@@ -594,6 +599,18 @@ impl<M: RoleModel> PcSemanticPort<M> {
             next.attack = Some(attack);
             next.divergences.clear();
             if step.phase == PcRepairPhase::AttackRanking {
+                let attack_source = PcAttackRankedSource::capture(
+                    input,
+                    accepted,
+                    output,
+                    selected,
+                    &self.owner.semantic.stores,
+                )?;
+                self.repair_cycles
+                    .as_mut()
+                    .and_then(|cycles| cycles.active.get_mut(&step.cycle))
+                    .ok_or(RoleError::InvalidOutput)?
+                    .attack_source = Some(Arc::new(attack_source));
                 next.phase = PcRepairPhase::CounterStart;
                 next.prefix = next.proposal[..attack].to_vec();
                 next.excluded = next.proposal.get(attack).copied();
@@ -632,6 +649,13 @@ impl<M: RoleModel> PcSemanticPort<M> {
                     step.origin.first,
                     &self.owner.semantic.stores,
                 )?;
+                let initial = self
+                    .repair_cycles
+                    .as_ref()
+                    .and_then(|cycles| cycles.active.get(&step.cycle))
+                    .and_then(|facts| facts.attack_source.as_ref())
+                    .map(Arc::clone);
+                let source = source.with_attack_ranked_source(initial)?;
                 self.repair_cycles
                     .as_mut()
                     .and_then(|cycles| cycles.active.get_mut(&step.cycle))

@@ -131,6 +131,12 @@ impl PcRepairReport {
             .contains_key(&cycle)
             .then_some(PcDivergenceResolution::Unknown)
     }
+    pub fn incomplete_attack_ranked_source(&self, cycle: u64) -> Option<&PcAttackRankedSource> {
+        self.cycles
+            .active
+            .get(&cycle)
+            .and_then(|facts| facts.attack_source.as_deref())
+    }
     pub fn incomplete_target(&self, cycle: u64) -> Option<&PcDivergenceSource> {
         self.cycles
             .active
@@ -306,6 +312,9 @@ fn facts_bytes(facts: &CycleFacts) -> Option<u64> {
     let mut bytes = inline::<CycleFacts>()?.checked_add(facts.progress.owned_host_bytes()?)?;
     if let Some(recipe) = &facts.followup {
         bytes = bytes.checked_add(recipe.owned_host_bytes()?)?;
+    }
+    if let Some(source) = &facts.attack_source {
+        bytes = bytes.checked_add(source.owned_host_bytes()?)?;
     }
     if let Some(source) = &facts.target {
         bytes = bytes.checked_add(source.owned_host_bytes()?)?;

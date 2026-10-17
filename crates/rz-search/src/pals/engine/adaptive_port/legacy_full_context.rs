@@ -54,6 +54,12 @@ impl LegacyFullRoleRecords {
     pub fn validates(&self, stores: &PalsStores) -> bool {
         self.pin.validates(stores)
     }
+    pub(crate) fn retirement_protected_pins(
+        &self,
+        stores: &PalsStores,
+    ) -> Result<crate::pals::store::StorePins, PalsError> {
+        Ok(self.pin.retirement_seed(stores)?)
+    }
     /// Known owned snapshot backing, not Store resident bytes or an RSS peak.
     /// Shared copies are conservatively charged per submitted question; no
     /// physical sharing deduction is inferred from the Arc identity.
