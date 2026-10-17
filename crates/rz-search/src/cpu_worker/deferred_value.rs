@@ -96,6 +96,13 @@ struct Declaration {
     plan: DeferredNnuecCpuPlan,
 }
 
+#[path = "unstarted_value.rs"]
+mod unstarted;
+pub use unstarted::{
+    NnuecMaterializationReleaseAck, NnuecMaterializationReleaseCompletion,
+    NnuecMaterializationReleaseId,
+};
+
 /// A typed future native owner. This value contains no CpuEngine, checker,
 /// worker, TT, paused token or substitute evaluator.
 #[derive(Clone)]
@@ -283,6 +290,7 @@ impl MaterializationRequest {
                 CpuWorkerError::Invalid("deferred NNUEC materialization readback"),
             ));
         }
+        self.bound.record_materialized();
         Ok(MaterializedNnuecEngine {
             declaration: self.declaration,
             engine,
@@ -478,6 +486,13 @@ impl StartingNnuecWorker {
     }
     pub fn take_joined_engine(&mut self) -> Result<CpuEngine, CpuWorkerError> {
         self.worker.take_engine()
+    }
+    /// Cleanup only, including a revoked/expired Ready gate. Actual known
+    /// worker join is still required by the same private worker boundary.
+    pub fn take_joined_nnuec_retirement(
+        &mut self,
+    ) -> Result<super::RecoveredNnuecEngine, CpuWorkerError> {
+        self.worker.take_nnuec_retirement()
     }
     /// Blocking recovery belongs outside the manager event loop.
     pub fn shutdown(self) -> Result<CpuWorkerShutdown, CpuWorkerError> {

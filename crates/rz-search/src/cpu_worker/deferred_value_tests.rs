@@ -5,7 +5,7 @@
 use super::*;
 use crate::cpu::CpuProfile;
 use crate::cpu_value::CpuTrainingState;
-use crate::cpu_value::nnuec::v2::review::{PreparationActor, Request};
+use crate::cpu_value::nnuec::v2::review::{NnuecPreparationTerminalAck, PreparationActor, Request};
 use crate::cpu_value::nnuec::v2::{Checkpoint, RelationParameters, SCHEMA, SEMANTICS};
 use crate::cpu_value::nnuec::{
     NNUEC_SCHEMA, NNUEC_SEMANTICS, NnuecCheckpoint, NnuecConfig, NnuecParameters,
@@ -34,6 +34,7 @@ struct Fixture {
     view: Arc<ReviewView>,
     cancel: Arc<AtomicBool>,
     actor: PreparationActor,
+    terminal: NnuecPreparationTerminalAck,
 }
 
 fn checkpoint() -> Checkpoint {
@@ -148,9 +149,12 @@ fn fixture() -> Fixture {
         .try_submit(request)
         .unwrap_or_else(|_| panic!("view preparation admission"));
     let until = Instant::now() + WINDOW;
-    let bound = loop {
+    let (bound, terminal) = loop {
         if let Some(completion) = actor.try_complete().unwrap() {
-            break Arc::new(completion.result.unwrap());
+            break (
+                Arc::new(completion.result.unwrap()),
+                completion.terminal_ack,
+            );
         }
         assert!(Instant::now() < until, "view preparation did not complete");
         std::thread::yield_now();
@@ -162,6 +166,7 @@ fn fixture() -> Fixture {
         view,
         cancel,
         actor,
+        terminal,
     }
 }
 

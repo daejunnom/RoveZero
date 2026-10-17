@@ -190,6 +190,10 @@ fn implementation_sha256() -> String {
             include_bytes!("nnuec_v2_review_retirement.rs").as_slice(),
         ),
         (
+            "nnuec_v2_preparation_terminal.rs",
+            include_bytes!("nnuec_v2_preparation_terminal.rs").as_slice(),
+        ),
+        (
             "nnuec_v2_capture.rs",
             include_bytes!("nnuec_v2_capture.rs").as_slice(),
         ),
@@ -212,6 +216,10 @@ fn implementation_sha256() -> String {
         (
             "cpu_worker/retired_value.rs",
             include_bytes!("../cpu_worker/retired_value.rs").as_slice(),
+        ),
+        (
+            "cpu_worker/unstarted_value.rs",
+            include_bytes!("../cpu_worker/unstarted_value.rs").as_slice(),
         ),
         (
             "nnuec_v2_registration.rs",

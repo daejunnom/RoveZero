@@ -6,6 +6,26 @@ use super::*;
 use crate::cpu_value::nnuec::v2::retirement::{NnuecCacheInvalidation, NnuecCacheReleaseAck};
 use crate::cpu_worker::{CpuWorker, NnuecEngineReleaseAck, RecoveredNnuecEngine};
 
+fn release_materialized(
+    actor: &PreparationActor,
+    engine: MaterializedNnuecEngine,
+) -> NnuecMaterializationReleaseAck {
+    let id = actor
+        .try_release_materialized(engine)
+        .unwrap_or_else(|_| panic!("unique materialization release admission"));
+    let until = Instant::now() + WINDOW;
+    loop {
+        if let Some(completion) = actor.try_released_materialized().unwrap() {
+            assert_eq!(completion.request_id(), &id);
+            return completion
+                .into_result()
+                .unwrap_or_else(|(_, error)| panic!("actual materialization release: {error:?}"));
+        }
+        assert!(Instant::now() < until);
+        std::thread::yield_now();
+    }
+}
+
 fn ready_worker(
     fixture: &Fixture,
     source: &DeferredNnuecRSource,
@@ -359,4 +379,146 @@ fn final_installed_stack_owner_is_released_instead_of_initial_ready_owner() {
         installed.is_installed(),
         "receipt remains without holding view pins"
     );
+}
+
+#[test]
+fn unstarted_materialization_releases_on_same_actor_without_a_worker_or_join() {
+    let fixture = fixture();
+    let source = source(&fixture, false);
+    assert!(fixture.terminal.allows_c_only_cleanup());
+    assert!(
+        fixture
+            .terminal
+            .matches_original(&fixture.model, &fixture.view)
+    );
+    let engine = materialize(request(&source, &fixture));
+    assert!(!fixture.terminal.allows_c_only_cleanup());
+    let binding = engine.binding_digest();
+    let before = Arc::strong_count(&fixture.bound);
+    fixture.cancel.store(true, Ordering::Release);
+    let ack = release_materialized(&fixture.actor, engine);
+    assert!(ack.matches_source(&source));
+    assert_eq!(ack.model_identity(), fixture.model.identity());
+    assert_eq!(ack.provenance(), fixture.bound.provenance());
+    assert_eq!(ack.binding_digest(), binding);
+    assert_eq!(Arc::strong_count(&fixture.bound), before - 2);
+    let ticket = fixture.actor.invalidate_context_cache().unwrap();
+    assert!(ack.matches_cache_release(&cache_release(&fixture.actor, &ticket)));
+    assert!(!fixture.bound.authority_is_live());
+    assert!(
+        !fixture.terminal.allows_c_only_cleanup(),
+        "released TT does not erase historical materialization"
+    );
+}
+
+#[test]
+fn foreign_actor_returns_the_same_unstarted_materialization_and_original_actor_releases_it() {
+    let fixture = fixture();
+    let source = source(&fixture, false);
+    let engine = materialize(request(&source, &fixture));
+    let binding = engine.binding_digest();
+    let owner = engine
+        .engine_for_registration()
+        .paused_stack_snapshot()
+        .unwrap()
+        .owner_id;
+    let foreign = PreparationActor::spawn(Arc::clone(&fixture.model)).unwrap();
+    let id = foreign
+        .try_release_materialized(engine)
+        .unwrap_or_else(|_| panic!("admission"));
+    let until = Instant::now() + WINDOW;
+    let engine = loop {
+        if let Some(completion) = foreign.try_released_materialized().unwrap() {
+            assert_eq!(completion.request_id(), &id);
+            let (engine, error) = completion.into_result().unwrap_err();
+            assert_eq!(
+                error,
+                CpuWorkerError::Invalid("foreign unstarted NNUEC materialization")
+            );
+            break engine;
+        }
+        assert!(Instant::now() < until);
+        std::thread::yield_now();
+    };
+    assert_eq!(engine.binding_digest(), binding);
+    assert_eq!(
+        engine
+            .engine_for_registration()
+            .paused_stack_snapshot()
+            .unwrap()
+            .owner_id,
+        owner
+    );
+    assert_eq!(
+        release_materialized(&fixture.actor, engine).binding_digest(),
+        binding
+    );
+    foreign.shutdown().unwrap();
+}
+
+#[test]
+fn busy_actor_returns_unstarted_owner_unchanged_until_original_prepare_is_collected() {
+    let fixture = fixture();
+    let source = source(&fixture, false);
+    let engine = materialize(request(&source, &fixture));
+    let binding = engine.binding_digest();
+    let preparing = Request::admit(
+        &fixture.model,
+        Arc::clone(&fixture.view),
+        &fixture.stores,
+        fixture.bound.provenance().root,
+        fixture.bound.provenance().generation,
+        Instant::now() + WINDOW,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    fixture
+        .actor
+        .try_submit(preparing)
+        .unwrap_or_else(|_| panic!("prepare"));
+    let (error, engine) = fixture.actor.try_release_materialized(engine).unwrap_err();
+    assert_eq!(
+        error,
+        crate::cpu_value::nnuec::v2::review::PreparationError::Busy
+    );
+    assert_eq!(engine.binding_digest(), binding);
+    let until = Instant::now() + WINDOW;
+    loop {
+        if let Some(completion) = fixture.actor.try_complete().unwrap() {
+            drop(completion.result.unwrap());
+            break;
+        }
+        assert!(Instant::now() < until);
+        std::thread::yield_now();
+    }
+    release_materialized(&fixture.actor, engine);
+}
+
+#[test]
+fn revoked_starting_worker_requires_actual_join_before_cleanup_only_retirement() {
+    let fixture = fixture();
+    let source = source(&fixture, false);
+    let mut starting = start(&source, materialize(request(&source, &fixture)));
+    assert!(matches!(
+        starting.take_joined_nnuec_retirement(),
+        Err(CpuWorkerError::AlreadyReserved)
+    ));
+    fixture.cancel.store(true, Ordering::Release);
+    assert!(starting.try_ready().is_err());
+    starting.request_shutdown();
+    let until = Instant::now() + WINDOW;
+    let joined = loop {
+        if let Some(joined) = starting.try_join().unwrap() {
+            break joined;
+        }
+        assert!(Instant::now() < until);
+        std::thread::yield_now();
+    };
+    assert!(joined.thread_joined && joined.engine_recoverable);
+    let owner = starting.take_joined_nnuec_retirement().unwrap();
+    assert!(owner.matches_source(&source));
+    let ack = release(&fixture.actor, owner);
+    assert!(ack.matches_source(&source));
+    drop(starting);
+    assert!(!fixture.bound.authority_is_live());
 }

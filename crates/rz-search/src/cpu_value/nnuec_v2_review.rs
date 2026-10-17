@@ -6,8 +6,9 @@ use super::{Context, Edge, EdgeKind, LineKind, Model};
 use crate::cpu_value::{CpuValueIdentity, nnuec::NnuecError};
 use crate::cpu_worker::deferred_value::MaterializationOwner;
 use crate::cpu_worker::{
-    CpuWorkerError, MaterializationCompletion, MaterializationRequest,
-    NnuecEngineRetirementCompletion, NnuecEngineRetirementId, RecoveredNnuecEngine,
+    CpuWorkerError, MaterializationCompletion, MaterializationRequest, MaterializedNnuecEngine,
+    NnuecEngineRetirementCompletion, NnuecEngineRetirementId,
+    NnuecMaterializationReleaseCompletion, NnuecMaterializationReleaseId, RecoveredNnuecEngine,
 };
 use crate::pals::engine::RecordKind;
 use crate::pals::review_context::{ReviewView, checked_rebase_offset};
@@ -22,6 +23,9 @@ use std::time::{Duration, Instant};
 
 #[path = "nnuec_v2_review_retirement.rs"]
 mod retirement;
+#[path = "nnuec_v2_preparation_terminal.rs"]
+mod terminal;
+pub use terminal::NnuecPreparationTerminalAck;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreparationError {
@@ -62,7 +66,16 @@ pub struct Provenance {
 
 /// Fields cannot be forged by callers. The view's actual hot pin remains
 /// alive while queued, preparing, cached, or held by an accepted consumer.
+#[derive(Clone, Debug)]
+pub(crate) struct RequestIdentity(Arc<()>);
+impl RequestIdentity {
+    pub(crate) fn same_request(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 pub struct Request {
+    identity: RequestIdentity,
     view: Arc<ReviewView>,
     sources: Arc<[PositionSnapshot]>,
     provenance: Provenance,
@@ -123,6 +136,7 @@ impl Request {
             model: model.identity().clone(),
         };
         Ok(Self {
+            identity: RequestIdentity(Arc::new(())),
             view,
             sources,
             provenance,
@@ -133,13 +147,23 @@ impl Request {
     pub fn provenance(&self) -> &Provenance {
         &self.provenance
     }
+    pub(crate) fn identity(&self) -> RequestIdentity {
+        self.identity.clone()
+    }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct BoundInstanceAuthority(Arc<()>);
+pub(crate) struct BoundInstanceAuthority(Arc<BoundInstanceState>);
+#[derive(Debug, Default)]
+struct BoundInstanceState {
+    materialized: AtomicBool,
+}
 impl BoundInstanceAuthority {
     pub(crate) fn matches(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub(super) fn was_materialized(&self) -> bool {
+        self.0.materialized.load(Ordering::Acquire)
     }
 }
 
@@ -161,6 +185,11 @@ pub struct BoundNnuecReviewContext {
 impl BoundNnuecReviewContext {
     pub(crate) fn instance_authority(&self) -> &BoundInstanceAuthority {
         &self.instance
+    }
+    /// Record an actual typed TT/evaluator construction. This is monotonic
+    /// historical evidence, not permission to construct or resume anything.
+    pub(crate) fn record_materialized(&self) {
+        self.instance.0.materialized.store(true, Ordering::Release);
     }
     /// Original source snapshots in selected-record/metadata order. History
     /// is shared from admission, never inferred from a rebased numeric anchor.
@@ -393,7 +422,7 @@ impl Factory {
             numeric_context_sha256: numeric_context_sha256.clone(),
         });
         Ok(BoundNnuecReviewContext {
-            instance: BoundInstanceAuthority(Arc::new(())),
+            instance: BoundInstanceAuthority(Arc::new(BoundInstanceState::default())),
             root: view.anchors()[0].snapshot.position_identity(),
             context,
             numeric_context_sha256,
@@ -485,11 +514,13 @@ pub struct Completion {
     pub provenance: Provenance,
     pub result: Result<BoundNnuecReviewContext, PreparationError>,
     pub observation: PreparationObservation,
+    pub terminal_ack: NnuecPreparationTerminalAck,
 }
 enum Command {
     Prepare(Request, u64, Instant),
     Materialize(MaterializationRequest),
     RetireEngine(NnuecEngineRetirementId, RecoveredNnuecEngine),
+    ReleaseMaterialized(NnuecMaterializationReleaseId, MaterializedNnuecEngine),
     Wake,
 }
 /// One explicitly accounted preparation worker; no default background thread.
@@ -500,6 +531,7 @@ pub struct PreparationActor {
     receiver: Receiver<Completion>,
     materialized: Receiver<MaterializationCompletion>,
     retired: Receiver<NnuecEngineRetirementCompletion>,
+    released_materialized: Receiver<NnuecMaterializationReleaseCompletion>,
     retirement_authority: Arc<()>,
     retirement_sequence: AtomicU64,
     outstanding: Arc<AtomicUsize>,
@@ -522,6 +554,7 @@ impl PreparationActor {
         let (results, receiver) = mpsc::channel();
         let (materializations, materialized) = mpsc::channel();
         let (retirements, retired) = mpsc::channel();
+        let (materialization_releases, released_materialized) = mpsc::channel();
         let outstanding = Arc::new(AtomicUsize::new(0));
         let worker_outstanding = Arc::clone(&outstanding);
         let stopping = Arc::new(AtomicBool::new(false));
@@ -551,6 +584,8 @@ impl PreparationActor {
                         Command::Wake => {}
                         Command::Prepare(request, epoch, enqueued_at) => {
                             let started_at = Instant::now();
+                            let original_view = Arc::downgrade(&request.view);
+                            let original_request = request.identity();
                             let provenance = request.provenance.clone();
                             let result = if stop.load(Ordering::Acquire) {
                                 Err(PreparationError::Cancelled)
@@ -575,11 +610,26 @@ impl PreparationActor {
                                     .ok()
                                     .map(|bound| bound.reused_record_scope()),
                             };
+                            let terminal_ack = NnuecPreparationTerminalAck::new(
+                                provenance.clone(),
+                                original_request,
+                                factory.model.identity().clone(),
+                                Arc::downgrade(&factory.model),
+                                original_view,
+                                status,
+                                result
+                                    .as_ref()
+                                    .ok()
+                                    .map(|bound| bound.instance_authority().clone()),
+                                Arc::clone(&factory.invalidations),
+                                epoch,
+                            );
                             if results
                                 .send(Completion {
                                     provenance,
                                     result,
                                     observation,
+                                    terminal_ack,
                                 })
                                 .is_err()
                             {
@@ -639,6 +689,20 @@ impl PreparationActor {
                                 break;
                             }
                         }
+                        Command::ReleaseMaterialized(id, engine) => {
+                            let result = engine.release_on_actor(
+                                &factory.model,
+                                &factory.stopping,
+                                &factory.invalidations,
+                            );
+                            factory.sync_cache_epoch();
+                            if materialization_releases
+                                .send(NnuecMaterializationReleaseCompletion::new(id, result))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                     }
                     signal.notify();
                 }
@@ -651,6 +715,7 @@ impl PreparationActor {
             receiver,
             materialized,
             retired,
+            released_materialized,
             retirement_authority: Arc::new(()),
             retirement_sequence: AtomicU64::new(0),
             outstanding,
@@ -1140,8 +1205,10 @@ mod tests {
         };
         let actor = PreparationActor::spawn(Arc::clone(&model)).unwrap();
         let observed_from = Instant::now();
+        let first_request = make_request();
+        let original_request = first_request.identity();
         actor
-            .try_submit(make_request())
+            .try_submit(first_request)
             .unwrap_or_else(|_| panic!("first admission"));
         assert!(matches!(
             actor.try_submit(make_request()),
@@ -1163,6 +1230,20 @@ mod tests {
             PreparationStatus::Completed
         );
         assert_eq!(completion.observation.reused_record_scope(), Some(false));
+        assert_eq!(
+            completion.terminal_ack.status(),
+            PreparationStatus::Completed
+        );
+        assert!(completion.terminal_ack.matches_original(&model, &view));
+        assert!(completion.terminal_ack.allows_c_only_cleanup());
+        assert!(completion.terminal_ack.matches_request(&original_request));
+        let same_view_unsubmitted = make_request();
+        assert_eq!(same_view_unsubmitted.provenance(), &completion.provenance);
+        assert!(
+            !completion
+                .terminal_ack
+                .matches_request(&same_view_unsubmitted.identity())
+        );
         assert_eq!(completion.provenance.view_seal, view.seal_digest());
         assert!(
             completion.observation.queue_wait()
@@ -1248,6 +1329,11 @@ mod tests {
             assert_eq!(completion.provenance, original);
             assert_eq!(completion.observation.status(), status);
             assert_eq!(completion.observation.reused_record_scope(), None);
+            assert_eq!(completion.terminal_ack.provenance(), &original);
+            assert_eq!(completion.terminal_ack.status(), status);
+            assert_eq!(completion.terminal_ack.model_identity(), model.identity());
+            assert!(completion.terminal_ack.matches_original(&model, &view));
+            assert!(completion.terminal_ack.allows_c_only_cleanup());
             assert_eq!(completion.result.err(), Some(expected));
         }
         actor.shutdown().unwrap();

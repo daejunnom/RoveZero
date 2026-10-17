@@ -44,7 +44,9 @@ pub use prepared_value::{
 pub(crate) mod deferred_value;
 pub use deferred_value::{
     DeferredNnuecCpuPlan, DeferredNnuecRSource, MaterializationCompletion, MaterializationHandoff,
-    MaterializationRequest, MaterializedNnuecEngine, NnuecReadyRegistration, StartingNnuecWorker,
+    MaterializationRequest, MaterializedNnuecEngine, NnuecMaterializationReleaseAck,
+    NnuecMaterializationReleaseCompletion, NnuecMaterializationReleaseId, NnuecReadyRegistration,
+    StartingNnuecWorker,
 };
 #[path = "cpu_worker/ledger_registration.rs"]
 mod ledger_registration;

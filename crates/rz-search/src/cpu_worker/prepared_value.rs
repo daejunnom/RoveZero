@@ -522,6 +522,7 @@ impl Owner {
                 .ok_or(CpuWorkerError::Quarantined)?
                 .owner_id,
         };
+        request.payload.bound.record_materialized();
         let old = std::mem::replace(engine, replacement);
         *current_binding = Some(request.payload.binding);
         // An unexpected destructor unwind is quarantined by service; it is

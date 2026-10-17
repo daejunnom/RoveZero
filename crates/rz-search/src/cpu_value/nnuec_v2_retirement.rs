@@ -111,6 +111,9 @@ impl NnuecValueRetirementOwner {
     pub(crate) fn matches_model(&self, model: &Arc<Model>) -> bool {
         Arc::ptr_eq(&self.model, model)
     }
+    pub(crate) fn matches_bound(&self, bound: &Arc<BoundNnuecReviewContext>) -> bool {
+        Arc::ptr_eq(&self.bound, bound)
+    }
     pub(crate) fn matches_preparation_actor(
         &self,
         model: &Arc<Model>,
