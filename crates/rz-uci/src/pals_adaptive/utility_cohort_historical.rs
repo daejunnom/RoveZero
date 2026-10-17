@@ -206,21 +206,7 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
                 "selected_record":w.selected_record().map(|(r,s)|json!({"revision":r,"origin_state":s.0})),
                 "selected_full_view_sha256":w.selected_full_view_digest().map(hex)})
         }).collect();
-        let offers:Vec<_>=snapshot.offers().iter().map(|o|json!({
-            "frame_sequence":o.frame().sequence,"recipient":o.recipient().as_str(),"stage":format!("{:?}",o.stage()),
-            "original_first_move":o.original_first_move().bits(),"question_sha256":hex(o.question()),
-            "view":view(o.view()),"full_view_sha256":hex(o.full_view()),"public_context_sha256":hex(o.public_context()),
-            "semantic_sha256":o.semantic_source().map(|s|hex(s.digest())),
-            "budget":{"role_submissions_remaining":o.budget().role_submissions_remaining,
-                "original_cpu_credit":o.budget().original_cpu_credit,"original_store_byte_limit":o.budget().original_store_byte_limit},
-            "deadline_clock":o.original_deadline().clock.0.0,"deadline_tick":o.original_deadline().at.0})).collect();
-        let credit = snapshot.native_credit();
         let p = input.provenance();
-        let captured_tick = snapshot
-            .captured_at()
-            .checked_duration_since(snapshot.clock().origin())
-            .and_then(|d| u64::try_from(d.as_nanos()).ok())
-            .ok_or_else(|| invalid("cohort original prelude tick overflow"))?;
         let wire = UtilityTrialMaterializedWire {
             schema: UTILITY_COHORT_MATERIALIZATION,
             cohort_id: hex(trial.cohort_id()),
@@ -228,19 +214,8 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
             recipient: trial.recipient().as_str(),
             profile_sha256: hex(trial.profile_digest()),
             source: trial.source_pins().clone(),
-            original_root: snapshot.admission().raw_receipt().clone(),
-            prelude: json!({"captured_tick":captured_tick,
-                "native_credit":{"limit":credit.native_node_limit,"spent":credit.spent_native_nodes,
-                    "reserved":credit.reserved_native_nodes,"highest_job_sequence":credit.highest_job_sequence,
-                    "highest_execution_sequence":credit.highest_execution_sequence},
-                "role_credit":{"spent":snapshot.role_credit().0,"reserved":snapshot.role_credit().1},
-                "counters":counter_value(snapshot.counters()),"offers":offers,
-                "requested_common_nodes":snapshot.requested_common_nodes(),
-                "common_node_work":common_node_value(snapshot.common_node_work()),
-                "ready_group_sha256":hex(trial.ready_group_sha256()),
-                "actual_resource_observations":resource_observation_value(snapshot),
-                "native_thread_readback":format!("{:?}",snapshot.native_thread_observation()),
-                "own_thread_readbacks":format!("{:?}",snapshot.own_thread_observations())}),
+            original_root: trial.original_root().clone(),
+            prelude: trial.ready_prelude().clone(),
             input: json!({"reference_json":original,"bytes":input.input_bytes().len(),
                 "input_sha256":input.input_sha256(),"target_sha256":input.target_sha256(),
                 "submission_target_sha256":input.submission_target_sha256(),"context_sha256":input.context_sha256(),
@@ -279,6 +254,42 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
         })
     }
 }
+pub(super) fn freeze_ready_prelude<Q>(
+    snapshot: &super::UtilityCohortReadySnapshot<Q>,
+    ready_group: rz_contracts::Digest,
+) -> Result<Value, super::AdaptiveManagerError> {
+    let offers:Vec<_>=snapshot.offers().iter().map(|o|json!({
+            "frame_sequence":o.frame().sequence,"recipient":o.recipient().as_str(),"stage":format!("{:?}",o.stage()),
+            "original_first_move":o.original_first_move().bits(),"question_sha256":hex(o.question()),
+            "view":view(o.view()),"full_view_sha256":hex(o.full_view()),"public_context_sha256":hex(o.public_context()),
+            "semantic_sha256":o.semantic_source().map(|s|hex(s.digest())),
+            "budget":{"role_submissions_remaining":o.budget().role_submissions_remaining,
+                "original_cpu_credit":o.budget().original_cpu_credit,"original_store_byte_limit":o.budget().original_store_byte_limit},
+            "deadline_clock":o.original_deadline().clock.0.0,"deadline_tick":o.original_deadline().at.0})).collect();
+    let credit = snapshot.native_credit();
+    let captured_tick = snapshot
+        .captured_at()
+        .checked_duration_since(snapshot.clock().origin())
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        .ok_or_else(|| invalid("cohort original prelude tick overflow"))?;
+    let prelude = json!({"captured_tick":captured_tick,
+                "native_credit":{"limit":credit.native_node_limit,"spent":credit.spent_native_nodes,
+                    "reserved":credit.reserved_native_nodes,"highest_job_sequence":credit.highest_job_sequence,
+                    "highest_execution_sequence":credit.highest_execution_sequence},
+                "role_credit":{"spent":snapshot.role_credit().0,"reserved":snapshot.role_credit().1},
+                "counters":counter_value(snapshot.counters()),"offers":offers,
+                "requested_common_nodes":snapshot.requested_common_nodes(),
+                "common_node_work":common_node_value(snapshot.common_node_work()),
+                "ready_group_sha256":hex(ready_group),
+                "actual_resource_observations":resource_observation_value(snapshot),
+                "native_thread_readback":format!("{:?}",snapshot.native_thread_observation()),
+                "own_thread_readbacks":format!("{:?}",snapshot.own_thread_observations())});
+    // Admission freezes detached metadata while the actual snapshot is live.
+    // Existing execution leases never enter this bounded historical object.
+    let _bounded = bounded_json(&prelude)?;
+    Ok(prelude)
+}
+
 pub(super) fn bounded_json<T: Serialize>(v: &T) -> Result<Vec<u8>, super::AdaptiveManagerError> {
     let mut writer = BoundedBytes(Vec::new());
     serde_json::to_writer(&mut writer, v).map_err(|_| {

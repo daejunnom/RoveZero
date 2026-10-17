@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 
-from .generation_data import digest, fields, identifier, sha, uint
+from .generation_data import digest, fields, identifier, sha
 from .rovent_utility_cohort_files import (HistoricalUtilityCohortFiles,
     PUBLICATION_FILE, ACK_FILE, COST_SCOPE, read_utility_cohort_files)
 from .rovent_utility_input import SubmittedUtilityInputObservation, validate_submitted_utility_input

@@ -95,6 +95,9 @@ impl<Q> UtilityCohortState<Q> {
         (trial, self.materialized, self.materialization_error)
     }
 }
+// A manager selects one trial: binding moves that same admission into Bound,
+// and rejection restores it. Retirement transfers this single custody slot.
+#[allow(clippy::large_enum_variant)]
 pub enum UtilityCohortTrialCustody<Q> {
     Admitted(UtilityTrialAdmission<Q>),
     Bound(UtilityTrialBoundAdmission<Q>),
@@ -598,6 +601,9 @@ where
             .as_ref()
             .is_some_and(|state| state.window.is_some() && !state.cache_attached)
     }
+    // A pending/rejected prelude returns the original Request without a new
+    // failure allocation; a rejected attachment also restores its exact ACK.
+    #[allow(clippy::result_large_err)]
     pub(super) fn attach_cohort_cache_prelude(
         &mut self,
         request: Request,

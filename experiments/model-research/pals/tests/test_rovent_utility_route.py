@@ -378,11 +378,19 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
     def test_execution_sources_match_original_raw_files_and_pc_semantics_independently_of_declared_paths(self):
         files = synthetic_files("execution-source")
         report = report_fixture(files, self.captured, self.preparation)
+        original_report = copy.deepcopy(report)
         owner = self.build(files=files, report=report)
         registered = {"current_dataset": {"publication": {"path": "/relocated/publication.json", **owner.publication_pin},
             "durable_ack": {"path": "/relocated/ack.json", **owner.durable_ack_pin}},
             "frozen_nnuec_base": files.publication()["nnuec_weights"],
-            "frozen_pc_sources": copy.deepcopy(report["frozen_pc_sources"])}
+            "frozen_pc_sources": [{"role": source["role"],
+                "artifact": {key: source["artifact"][key] for key in ("path", "sha256", "bytes")},
+                "model_semantics_sha256": source["model_semantics_sha256"],
+                "model_identity_sha256": source["model_identity_sha256"],
+                "encoding_sha256": source["encoding_sha256"]} for source in report["frozen_pc_sources"]]}
+        for original, current in zip(report["frozen_pc_sources"], registered["frozen_pc_sources"], strict=True):
+            self.assertEqual(set(original["artifact"]), {"path", "sha256", "bytes", "source", "license"})
+            self.assertEqual(set(current["artifact"]), {"path", "sha256", "bytes"})
         self.assertIsNone(owner.validate_execution_sources(registered))
         for mutate in (lambda value: value["current_dataset"]["publication"].update(sha256=seal("wrong-publication")),
                        lambda value: value["current_dataset"]["durable_ack"].update(bytes=1),
@@ -400,6 +408,7 @@ class UtilityRouteAssemblyTests(unittest.TestCase):
         for source in changed["frozen_pc_sources"]:
             source["artifact"]["path"] = "/relocated/" + source["role"] + ".onnx"
         self.assertIsNone(owner.validate_execution_sources(changed))
+        self.assertEqual(report, original_report)
 
     def test_metadata_changes_invalidate_the_owner_instead_of_resealing_it(self):
         mutations = (lambda owner: owner._report.update(profile_sha256=seal("changed-profile")),

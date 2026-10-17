@@ -290,18 +290,26 @@ impl UtilityComparisonCohortOwner {
                         .is_some_and(|o| o.recipient() == requested)
                 })
                 .ok_or_else(|| invalid("requested trial has no actual fair ready selection"))?;
+            let ready_prelude = super::utility_cohort_historical::freeze_ready_prelude(
+                &snapshot,
+                self.shared.offer_group,
+            )?;
+            let original_root = snapshot.admission().raw_receipt().clone();
+            let _bounded_root = super::utility_cohort_historical::bounded_json(&original_root)?;
             let sequence = state.next as u64 + 1;
             state.active = Some(sequence);
             state
                 .original_roots
                 .push(Arc::clone(snapshot.actual_root()));
-            Ok((sequence, selected))
+            Ok((sequence, selected, ready_prelude, original_root))
         })();
         match checked {
-            Ok((sequence, selected)) => Ok(UtilityTrialAdmission {
+            Ok((sequence, selected, ready_prelude, original_root)) => Ok(UtilityTrialAdmission {
                 shared: Arc::clone(&self.shared),
                 snapshot,
                 loaded,
+                ready_prelude,
+                original_root,
                 sequence,
                 selected,
                 armed: None,
@@ -342,11 +350,19 @@ pub struct UtilityTrialAdmission<Q> {
     shared: Arc<Shared>,
     snapshot: UtilityCohortReadySnapshot<Q>,
     loaded: Arc<LoadedRoventNnuecSource>,
+    ready_prelude: Value,
+    original_root: Value,
     sequence: u64,
     selected: usize,
     armed: Option<UtilityTrialWindow>,
 }
 impl<Q> UtilityTrialAdmission<Q> {
+    pub fn original_root(&self) -> &Value {
+        &self.original_root
+    }
+    pub fn ready_prelude(&self) -> &Value {
+        &self.ready_prelude
+    }
     pub fn ready_group_sha256(&self) -> Digest {
         self.shared.offer_group
     }
@@ -665,6 +681,8 @@ pub struct UtilityTrialPhysicalRetirement {
     materialized: Option<super::utility_cohort_historical::UtilityTrialMaterializedSource>,
     cost: UtilityCohortCostWire,
     physical_closure: Value,
+    ready_prelude: Value,
+    original_root: Value,
     checkpoint: Vec<u8>,
     digest: Digest,
     comparable: bool,
@@ -883,6 +901,8 @@ impl<Q> UtilityTrialBoundAdmission<Q> {
             materialized,
             cost,
             physical_closure,
+            ready_prelude: self.trial.ready_prelude.clone(),
+            original_root: self.trial.original_root.clone(),
             checkpoint: Vec::new(),
             digest: Digest([0; 32]),
             comparable: unknown.is_none(),
@@ -1035,7 +1055,7 @@ impl UtilityTrialPhysicalRetirement {
             "actual_dependencies":u.dependencies().len(),"actual_r_pc_consumptions":u.r_pc_consumption().len(),
             "new_witnesses":u.witnesses().iter().map(|w|json!({"observation":w.observation().0,
                 "identity_sha256":hex(w.identity()),"raw_evidence_sha256":hex(w.raw_evidence())})).collect::<Vec<_>>() })),
-        "cost":self.cost,"physical_closure":self.physical_closure,"previous_durable_ack":previous_durable_ack,"resolved":self.proof.outcome().is_some_and(|o|o.semantic_consumption_complete())
+        "cost":self.cost,"original_root":self.original_root,"ready_prelude":self.ready_prelude,"physical_closure":self.physical_closure,"previous_durable_ack":previous_durable_ack,"resolved":self.proof.outcome().is_some_and(|o|o.semantic_consumption_complete())
             &&self.materialized.is_some(),"comparable":self.comparable,
         "unknown_reason":self.unknown,"support_mask":self.support_mask(),"target_known_mask":[false,false,false,false,false,false,false]}),
         )
@@ -1497,6 +1517,8 @@ impl<Q> UtilityTrialAdmission<Q> {
             materialized: None,
             cost,
             physical_closure,
+            ready_prelude: self.ready_prelude.clone(),
+            original_root: self.original_root.clone(),
             checkpoint: Vec::new(),
             digest: Digest([0; 32]),
             comparable: false,
