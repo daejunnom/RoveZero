@@ -1358,6 +1358,24 @@ impl CpuEngine {
         self.validate_frozen_value_namespace()?;
         self.evaluator.job_binding_digest().map_err(CpuError::Value)
     }
+    /// Known joined-owner cleanup keeps original immutable value identity but
+    /// intentionally does not require a live cancellation/deadline authority.
+    pub(crate) fn nnuec_retirement_owner(
+        &self,
+    ) -> Result<Option<crate::cpu_value::nnuec::v2::retirement::NnuecValueRetirementOwner>, CpuError>
+    {
+        self.validate_frozen_value_namespace()?;
+        let owner = self.evaluator.nnuec_retirement_owner();
+        if owner
+            .as_ref()
+            .is_some_and(|owner| owner.model_identity() != self.value_identity.as_ref())
+        {
+            return Err(CpuError::Value(
+                crate::cpu_value::CpuValueError::StateMismatch,
+            ));
+        }
+        Ok(owner)
+    }
 
     pub fn search_conditions(&self) -> String {
         let legacy = format!(

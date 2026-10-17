@@ -156,6 +156,13 @@ impl CpuValueEvaluator for V2CpuValue {
         self.check_live()?;
         Ok(Some(self.binding))
     }
+    fn nnuec_retirement_owner(&self) -> Option<super::retirement::NnuecValueRetirementOwner> {
+        Some(super::retirement::NnuecValueRetirementOwner::new(
+            Arc::clone(&self.model),
+            Arc::clone(&self.bound),
+            self.binding,
+        ))
+    }
 
     fn initialize(&self, position: &Position) -> Result<CpuAccumulator, CpuValueError> {
         self.check_live()?;

@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 
 const WINDOW: Duration = Duration::from_secs(20);
 
+#[path = "retired_value_tests.rs"]
+mod retirement;
+
 struct Fixture {
     model: Arc<Model>,
     bound: Arc<BoundNnuecReviewContext>,

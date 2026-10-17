@@ -326,6 +326,10 @@ pub trait CpuValueEvaluator: Send + Sync {
     fn job_binding_digest(&self) -> Result<Option<rz_contracts::Digest>, CpuValueError> {
         Ok(None)
     }
+    /// Cleanup custody only. It cannot revive a revoked score/resume scope.
+    fn nnuec_retirement_owner(&self) -> Option<nnuec::v2::retirement::NnuecValueRetirementOwner> {
+        None
+    }
     fn initialize(&self, position: &Position) -> Result<CpuAccumulator, CpuValueError>;
     /// Exact context of a position-dependent value. NNUEC additionally seals
     /// the frozen C owner and L anchor; a model/weights identity alone is not a

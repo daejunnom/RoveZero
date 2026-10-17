@@ -514,6 +514,12 @@ pub struct NnuecCapturedReadout {
     context_anchors: Vec<PositionSnapshot>,
 }
 impl NnuecCapturedReadout {
+    pub fn matches_model(&self, model: &Arc<Model>) -> bool {
+        Arc::ptr_eq(&self.submission.model, model)
+    }
+    pub fn context_source_snapshots(&self) -> &[PositionSnapshot] {
+        self.submission.bound.context_source_snapshots()
+    }
     pub fn job(&self) -> CpuJobEnvelope {
         self.job
     }
@@ -591,6 +597,12 @@ pub struct NnuecCaptureRetirement {
     error: Option<CaptureError>,
 }
 impl NnuecCaptureRetirement {
+    pub fn matches_model(&self, model: &Arc<Model>) -> bool {
+        Arc::ptr_eq(&self.submission.model, model)
+    }
+    pub fn context_source_snapshots(&self) -> &[PositionSnapshot] {
+        self.submission.bound.context_source_snapshots()
+    }
     pub fn model_identity(&self) -> &crate::cpu_value::CpuValueIdentity {
         self.submission.model.identity()
     }

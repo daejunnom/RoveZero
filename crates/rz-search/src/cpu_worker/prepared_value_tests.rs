@@ -337,6 +337,8 @@ fn actual_idle_owner_installs_only_after_ack_and_preserves_search_profile() {
     let readback = receipt.result().unwrap();
     assert_eq!(receipt.installation_id(), id);
     assert_eq!(receipt.binding_digest(), binding);
+    assert!(receipt.matches_bound(&fixture.bound));
+    assert_ne!(readback.actual_stack_owner_id(), 0);
     assert_eq!(readback.profile().owner, old.owner);
     assert_eq!(readback.profile().max_depth, old.max_depth);
     assert_eq!(readback.profile().search_conditions, old.search_conditions);
@@ -349,6 +351,50 @@ fn actual_idle_owner_installs_only_after_ack_and_preserves_search_profile() {
     let stopped = worker.shutdown().unwrap();
     assert!(stopped.value_installation_receipt.is_none());
     assert!(stopped.value_installation_error.is_none());
+}
+
+#[test]
+fn equal_question_view_and_binding_do_not_attest_another_preparation_instance() {
+    let fixture = fixture("e2e4");
+    let request = ReviewRequest::admit(
+        &fixture.model,
+        Arc::clone(&fixture.view),
+        &fixture.stores,
+        fixture.bound.provenance().root,
+        fixture.bound.provenance().generation,
+        Instant::now() + WINDOW,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    fixture
+        ._actor
+        .try_submit(request)
+        .unwrap_or_else(|_| panic!("prepare"));
+    let until = Instant::now() + WINDOW;
+    let separate = loop {
+        if let Some(completion) = fixture._actor.try_complete().unwrap() {
+            break Arc::new(completion.result.unwrap());
+        }
+        assert!(Instant::now() < until);
+        std::thread::yield_now();
+    };
+    assert_eq!(separate.provenance(), fixture.bound.provenance());
+    let other = PreparedValueInstallation::from_bound(
+        Arc::clone(&fixture.model),
+        Arc::clone(&separate),
+        &fixture.stores,
+        separate.provenance().view_seal,
+    )
+    .unwrap();
+    let mut worker = CpuWorker::spawn(CpuWorkerId(0), engine(false)).unwrap();
+    worker
+        .try_install_prepared_value(payload(&fixture))
+        .unwrap();
+    let receipt = wait_install(&mut worker);
+    assert_eq!(receipt.binding_digest(), other.binding_digest());
+    assert!(receipt.matches_bound(&fixture.bound));
+    assert!(!receipt.matches_bound(&separate));
+    worker.shutdown().unwrap();
 }
 
 #[test]
@@ -658,6 +704,7 @@ fn private_ack_identity_mismatch_quarantines_instead_of_releasing_pending() {
             id: request.id,
             previous_profile: previous,
             binding: request.payload.binding,
+            bound_authority: request.payload.bound.instance_authority().clone(),
             result: Err(CpuWorkerError::Capacity),
         })
         .unwrap();

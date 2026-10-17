@@ -8,7 +8,9 @@ use super::{
 use crate::cpu_value::nnuec::NnuecError;
 use crate::cpu_value::nnuec::v2::Model;
 use crate::cpu_value::nnuec::v2::cpu::V2CpuValue;
-use crate::cpu_value::nnuec::v2::review::{BoundNnuecReviewContext, Provenance};
+use crate::cpu_value::nnuec::v2::review::{
+    BoundInstanceAuthority, BoundNnuecReviewContext, Provenance,
+};
 use crate::cpu_value::{CpuValueEvaluator, CpuValueIdentity};
 use crate::pals::store::PalsStores;
 use rz_contracts::Digest;
@@ -106,8 +108,12 @@ pub struct ValueInstallReadback {
     profile: CpuWorkerProfile,
     paused_bytes_limit: usize,
     side_scope_preserved: bool,
+    stack_owner_id: u64,
 }
 impl ValueInstallReadback {
+    pub fn actual_stack_owner_id(&self) -> u64 {
+        self.stack_owner_id
+    }
     pub fn profile(&self) -> CpuWorkerProfile {
         self.profile
     }
@@ -133,9 +139,15 @@ pub struct ValueInstallReceipt {
     id: InstallId,
     previous_profile: CpuWorkerProfile,
     binding: Digest,
+    bound_authority: BoundInstanceAuthority,
     result: Result<ValueInstallReadback, CpuWorkerError>,
 }
 impl ValueInstallReceipt {
+    /// This identifies the exact installed Bound instance without retaining
+    /// its ReviewView/Store pin. Equal semantic binding bytes are insufficient.
+    pub fn matches_bound(&self, bound: &Arc<BoundNnuecReviewContext>) -> bool {
+        self.result.is_ok() && self.bound_authority.matches(bound.instance_authority())
+    }
     pub fn installation_id(&self) -> InstallId {
         self.id
     }
@@ -166,11 +178,13 @@ struct Pending {
     id: InstallId,
     previous_profile: CpuWorkerProfile,
     binding: Digest,
+    bound_authority: BoundInstanceAuthority,
 }
 struct Acknowledged {
     id: InstallId,
     binding: Digest,
     profile: CpuWorkerProfile,
+    bound_authority: BoundInstanceAuthority,
 }
 
 pub(super) struct Endpoint {
@@ -242,6 +256,7 @@ impl Endpoint {
         };
         let id = InstallId(sequence);
         let binding = payload.binding;
+        let bound_authority = payload.bound.instance_authority().clone();
         match self.sender.try_send(Request {
             authority: Arc::clone(&self.authority),
             id,
@@ -254,6 +269,7 @@ impl Endpoint {
                     id,
                     previous_profile,
                     binding,
+                    bound_authority,
                 });
                 Ok(id)
             }
@@ -287,6 +303,7 @@ impl Endpoint {
                 && receipt.id == pending.id
                 && receipt.previous_profile == pending.previous_profile
                 && receipt.binding == pending.binding
+                && receipt.bound_authority.matches(&pending.bound_authority)
                 && match &receipt.result {
                     Ok(readback) => {
                         readback.profile.owner == pending.previous_profile.owner
@@ -308,6 +325,7 @@ impl Endpoint {
                 id: receipt.id,
                 binding: receipt.binding,
                 profile,
+                bound_authority: receipt.bound_authority.clone(),
             });
         }
         if matches!(&receipt.result, Err(CpuWorkerError::Quarantined)) {
@@ -321,6 +339,9 @@ impl Endpoint {
             && self.acknowledged.as_ref().is_some_and(|acknowledged| {
                 receipt.id == acknowledged.id
                     && receipt.binding == acknowledged.binding
+                    && receipt
+                        .bound_authority
+                        .matches(&acknowledged.bound_authority)
                     && receipt.installed_profile() == Some(acknowledged.profile)
             })
     }
@@ -363,6 +384,7 @@ impl Owner {
         let id = request.id;
         let previous_profile = request.previous_profile;
         let binding = request.payload.binding;
+        let bound_authority = request.payload.bound.instance_authority().clone();
         let result = catch_unwind(AssertUnwindSafe(|| {
             self.install(
                 request,
@@ -386,6 +408,7 @@ impl Owner {
             id,
             previous_profile,
             binding,
+            bound_authority,
             result,
         };
         let published = match self.sender.try_send(receipt) {
@@ -493,6 +516,11 @@ impl Owner {
             },
             paused_bytes_limit: replacement.paused_stack_max_bytes(),
             side_scope_preserved: side_scope,
+            stack_owner_id: replacement
+                .paused_stack_snapshot()
+                .filter(|snapshot| snapshot.complete && snapshot.owner_id != 0)
+                .ok_or(CpuWorkerError::Quarantined)?
+                .owner_id,
         };
         let old = std::mem::replace(engine, replacement);
         *current_binding = Some(request.payload.binding);

@@ -23,6 +23,8 @@ pub mod capture;
 pub mod cpu;
 #[path = "nnuec_v2_registration.rs"]
 pub mod registration;
+#[path = "nnuec_v2_retirement.rs"]
+pub mod retirement;
 #[path = "nnuec_v2_review.rs"]
 pub mod review;
 #[path = "nnuec_v2_utility.rs"]

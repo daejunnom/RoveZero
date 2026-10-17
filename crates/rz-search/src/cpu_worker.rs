@@ -49,6 +49,12 @@ pub use deferred_value::{
 #[path = "cpu_worker/ledger_registration.rs"]
 mod ledger_registration;
 pub use ledger_registration::CpuLedgerRegistrationObservation;
+#[path = "cpu_worker/retired_value.rs"]
+mod retired_value;
+pub use retired_value::{
+    NnuecEngineReleaseAck, NnuecEngineRetirementCompletion, NnuecEngineRetirementId,
+    RecoveredNnuecEngine,
+};
 
 pub const CPU_WORKER_COMMAND_CAPACITY: usize = 8;
 pub const CPU_JOB_CAPACITY: usize = 64;
@@ -1142,6 +1148,7 @@ pub struct CpuWorker {
     join: Option<JoinHandle<CpuWorkerExit>>,
     recovered_engine: Option<CpuEngine>,
     joined_known: bool,
+    deferred_nnuec_source: Option<DeferredNnuecRSource>,
 }
 
 impl CpuWorker {
@@ -1949,6 +1956,7 @@ impl CpuWorker {
             join: Some(join),
             recovered_engine: None,
             joined_known: false,
+            deferred_nnuec_source: None,
         })
     }
     /// Build a question from the immutable worker profile without copying its

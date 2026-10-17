@@ -111,6 +111,9 @@ impl DeferredNnuecRSource {
     pub fn model(&self) -> &Arc<Model> {
         &self.declaration.model
     }
+    pub fn same_authority(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.declaration, &other.declaration)
+    }
     pub fn cpu_plan(&self) -> &DeferredNnuecCpuPlan {
         &self.declaration.plan
     }
@@ -190,13 +193,16 @@ impl DeferredNnuecRSource {
             ),
         };
         match worker {
-            Ok(worker) => Ok(StartingNnuecWorker {
-                worker,
-                declaration,
-                bound,
-                binding,
-                stack_owner_id,
-            }),
+            Ok(mut worker) => {
+                worker.deferred_nnuec_source = Some(self.clone());
+                Ok(StartingNnuecWorker {
+                    worker,
+                    declaration,
+                    bound,
+                    binding,
+                    stack_owner_id,
+                })
+            }
             Err((engine, error)) => Err((
                 MaterializedNnuecEngine {
                     declaration,

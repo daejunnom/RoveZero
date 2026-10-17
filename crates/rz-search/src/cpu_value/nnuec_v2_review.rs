@@ -5,7 +5,10 @@
 use super::{Context, Edge, EdgeKind, LineKind, Model};
 use crate::cpu_value::{CpuValueIdentity, nnuec::NnuecError};
 use crate::cpu_worker::deferred_value::MaterializationOwner;
-use crate::cpu_worker::{CpuWorkerError, MaterializationCompletion, MaterializationRequest};
+use crate::cpu_worker::{
+    CpuWorkerError, MaterializationCompletion, MaterializationRequest,
+    NnuecEngineRetirementCompletion, NnuecEngineRetirementId, RecoveredNnuecEngine,
+};
 use crate::pals::engine::RecordKind;
 use crate::pals::review_context::{ReviewView, checked_rebase_offset};
 use crate::pals::store::{PalsStores, StateId};
@@ -16,6 +19,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
+
+#[path = "nnuec_v2_review_retirement.rs"]
+mod retirement;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreparationError {
@@ -134,10 +140,20 @@ impl Request {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct BoundInstanceAuthority(Arc<()>);
+impl BoundInstanceAuthority {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 pub struct BoundNnuecReviewContext {
+    instance: BoundInstanceAuthority,
     context: Arc<Context>,
     numeric_context_sha256: String,
     view: Arc<ReviewView>,
+    source_snapshots: Arc<[PositionSnapshot]>,
     root: PositionIdentity,
     provenance: Provenance,
     reused_record_scope: bool,
@@ -148,6 +164,24 @@ pub struct BoundNnuecReviewContext {
     stopping: Arc<AtomicBool>,
 }
 impl BoundNnuecReviewContext {
+    pub(crate) fn instance_authority(&self) -> &BoundInstanceAuthority {
+        &self.instance
+    }
+    /// Original source snapshots in selected-record/metadata order. History
+    /// is shared from admission, never inferred from a rebased numeric anchor.
+    pub fn context_source_snapshots(&self) -> &[PositionSnapshot] {
+        &self.source_snapshots
+    }
+    pub(crate) fn preparation_epoch(&self) -> u64 {
+        self.preparation_epoch
+    }
+    pub(crate) fn matches_preparation_actor(
+        &self,
+        stopping: &Arc<AtomicBool>,
+        invalidations: &Arc<AtomicU64>,
+    ) -> bool {
+        Arc::ptr_eq(&self.stopping, stopping) && Arc::ptr_eq(&self.invalidations, invalidations)
+    }
     pub fn context(&self) -> &Arc<Context> {
         &self.context
     }
@@ -364,10 +398,12 @@ impl Factory {
             numeric_context_sha256: numeric_context_sha256.clone(),
         });
         Ok(BoundNnuecReviewContext {
+            instance: BoundInstanceAuthority(Arc::new(())),
             root: view.anchors()[0].snapshot.position_identity(),
             context,
             numeric_context_sha256,
             view: request.view,
+            source_snapshots: request.sources.into(),
             provenance: request.provenance,
             reused_record_scope,
             deadline: request.deadline,
@@ -415,6 +451,7 @@ pub struct Completion {
 enum Command {
     Prepare(Request, u64),
     Materialize(MaterializationRequest),
+    RetireEngine(NnuecEngineRetirementId, RecoveredNnuecEngine),
     Wake,
 }
 /// One explicitly accounted preparation worker; no default background thread.
@@ -424,6 +461,9 @@ pub struct PreparationActor {
     sender: Option<SyncSender<Command>>,
     receiver: Receiver<Completion>,
     materialized: Receiver<MaterializationCompletion>,
+    retired: Receiver<NnuecEngineRetirementCompletion>,
+    retirement_authority: Arc<()>,
+    retirement_sequence: AtomicU64,
     outstanding: Arc<AtomicUsize>,
     stopping: Arc<AtomicBool>,
     invalidations: Arc<AtomicU64>,
@@ -443,6 +483,7 @@ impl PreparationActor {
         let (sender, commands) = mpsc::sync_channel::<Command>(1);
         let (results, receiver) = mpsc::channel();
         let (materializations, materialized) = mpsc::channel();
+        let (retirements, retired) = mpsc::channel();
         let outstanding = Arc::new(AtomicUsize::new(0));
         let worker_outstanding = Arc::clone(&outstanding);
         let stopping = Arc::new(AtomicBool::new(false));
@@ -518,6 +559,22 @@ impl PreparationActor {
                                 break;
                             }
                         }
+                        Command::RetireEngine(id, owner) => {
+                            // Cancellation/expiry revoke search authority but
+                            // do not prevent same-actor physical cleanup.
+                            let result = owner.release_on_actor(
+                                &factory.model,
+                                &factory.stopping,
+                                &factory.invalidations,
+                            );
+                            factory.sync_cache_epoch();
+                            if retirements
+                                .send(NnuecEngineRetirementCompletion::new(id, result))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                     }
                     signal.notify();
                 }
@@ -529,6 +586,9 @@ impl PreparationActor {
             sender: Some(sender),
             receiver,
             materialized,
+            retired,
+            retirement_authority: Arc::new(()),
+            retirement_sequence: AtomicU64::new(0),
             outstanding,
             stopping,
             invalidations,
@@ -827,6 +887,24 @@ mod tests {
         assert!(!prepared_a.reused_record_scope());
         assert!(prepared_b.reused_record_scope());
         assert!(Arc::ptr_eq(prepared_a.context(), prepared_b.context()));
+        assert!(
+            !prepared_a
+                .instance_authority()
+                .matches(prepared_b.instance_authority())
+        );
+        for prepared in [&prepared_a, &prepared_b] {
+            assert_eq!(
+                prepared.context_source_snapshots().len(),
+                prepared.view().records().len()
+            );
+            for (source, metadata) in prepared
+                .context_source_snapshots()
+                .iter()
+                .zip(prepared.view().records_metadata())
+            {
+                assert!(source.same_state(stores.states.get(metadata.source_state).unwrap()));
+            }
+        }
         assert_eq!(
             prepared_a.numeric_context_sha256(),
             prepared_b.numeric_context_sha256()
@@ -882,6 +960,14 @@ mod tests {
             .unwrap();
         assert_eq!(bound.context().line_count(), 2);
         assert_eq!(bound.context().edge_count(), 1);
+        assert_eq!(bound.context_source_snapshots().len(), 2);
+        assert!(
+            bound
+                .context_source_snapshots()
+                .iter()
+                .all(|source| source.same_state(&Position::startpos().snapshot()))
+        );
+        assert!(!bound.context_source_snapshots()[0].same_state(&view.anchors()[0].snapshot));
         let reference = bound.context().reference_lines();
         assert_eq!(reference[0].moves.len(), 0);
         assert!(reference[0].original_first_move.is_some());

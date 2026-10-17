@@ -25,6 +25,8 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::sync::Arc;
 
+#[path = "nnuec_rules.rs"]
+pub mod rules;
 #[path = "nnuec_v2.rs"]
 pub mod v2;
 
