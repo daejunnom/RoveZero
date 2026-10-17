@@ -900,7 +900,20 @@ mod tests {
         assert!(snapshot.horizon.target_satisfied);
         assert_eq!(snapshot.horizon.completed_depth.unwrap().0, 1);
         assert_eq!(snapshot.horizon.maximum_examined_ply.0, 1);
-        assert_eq!(snapshot.goal, FrontierGoalStatus::DepthSatisfied);
+        assert!(frontier.registration().goal.mate_moves.is_none());
+        // The paid terminal edge also passively proves an exact mate-in-one.
+        // Depth still closes at the actual one ply; it is not fabricated up
+        // to the requested depth and no extra mate question is generated.
+        assert_eq!(snapshot.goal, FrontierGoalStatus::MateSatisfied);
+        let strategy = snapshot.mate_strategy.as_ref().unwrap();
+        assert_eq!(strategy.best_move(), BoardMove::from_uci("g6g7").unwrap());
+        assert!(strategy.validates_root(
+            &port.rules.rules().snapshot(),
+            frontier.root_moves().allowed(),
+        ));
+        assert_eq!(strategy.conclusion().exact_uci_mate(), Some(1));
+        assert_eq!(snapshot.work.checked_transitions, 1);
+        assert_eq!(snapshot.work.native_nodes, 0);
     }
 
     #[test]
