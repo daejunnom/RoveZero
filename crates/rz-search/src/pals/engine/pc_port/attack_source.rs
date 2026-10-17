@@ -96,6 +96,11 @@ impl PcAttackRankedSource {
     pub fn view_seal(&self) -> ReviewViewSeal {
         self.accepted.ticket().view
     }
+    /// Port question issuance order; different from branch FrameId and from
+    /// native request or collector event sequences.
+    pub fn source_sequence(&self) -> u64 {
+        self.source.sequence
+    }
     pub fn divergence_index(&self) -> u16 {
         self.divergence_index
     }
