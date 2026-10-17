@@ -185,6 +185,26 @@ fn strict_provenance_rejects_duplicate_unknown_and_nested_fields() {
             "{location}"
         );
     }
+    // Empty Untrained is a strict shape, not permission to ignore fields
+    // that would be meaningful only for a different training declaration.
+    let mut value = serde_json::to_value(&fixture.body).unwrap();
+    value["training"]["steps"] = Value::from(1);
+    assert!(decode_provenance(&serde_json::to_vec(&value).unwrap()).is_err());
+    let learned = CpuTrainingState::Learned {
+        run_id: "authored-provenance-declaration".into(),
+        steps: 1,
+        dataset_sha256: "a".repeat(64),
+    };
+    let mut value = serde_json::to_value(&fixture.body).unwrap();
+    value["training"] = serde_json::to_value(&learned).unwrap();
+    assert_eq!(
+        decode_provenance(&serde_json::to_vec(&value).unwrap())
+            .unwrap()
+            .training,
+        learned
+    );
+    value["training"]["optimizer"] = Value::Bool(true);
+    assert!(decode_provenance(&serde_json::to_vec(&value).unwrap()).is_err());
 }
 
 #[test]

@@ -31,14 +31,18 @@ use std::sync::atomic::AtomicU64;
 type Port = AdaptiveEnginePort<AdaptivePortModel>;
 type Work = CoordinatorWork<ReviewView, AdaptivePortQuestion>;
 
+mod peer;
+
 const COMPILE_OUTPUT_CAP: u64 = 16 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(5);
 
 // Keep the fixture protocol small. There is no search/evaluator here: the
-// only tested position is startpos after e2e4, for which e7e5 is legal.
+// tested positions are startpos after e2e4 and e2e4 e7e5. These two fixed
+// protocol replies are legal; no search or evaluator chooses them.
 const AUTHORED_UCI: &str = r#"
 use std::io::{self, BufRead, Write};
 fn main() {
+    let mut after_reply = false;
     for line in io::stdin().lock().lines() {
         let line = line.unwrap();
         if line == "uci" {
@@ -53,10 +57,13 @@ fn main() {
             println!("uciok");
         } else if line == "isready" {
             println!("readyok");
+        } else if line.starts_with("position ") {
+            after_reply = line == "position startpos moves e2e4 e7e5";
         } else if line.starts_with("go ") {
             // The real adapter, not this fixture, owns requested/issued limits.
-            println!("info depth 2 seldepth 3 nodes 7 score cp 21 pv e7e5");
-            println!("bestmove e7e5");
+            let movement = if after_reply { "g1f3" } else { "e7e5" };
+            println!("info depth 2 seldepth 3 nodes 7 score cp 21 pv {movement}");
+            println!("bestmove {movement}");
         } else if line == "quit" {
             break;
         }

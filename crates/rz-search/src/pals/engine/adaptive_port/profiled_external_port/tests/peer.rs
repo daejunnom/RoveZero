@@ -1,0 +1,469 @@
+//! Optional P -> external-R round trip through the actual registry and worker.
+//! P heads are authored CPU/mock data, not NN execution evidence. The existing
+//! ELF fixture is likewise a protocol fixture, not an official engine pin.
+use super::*;
+use crate::pals::coordinator::{
+    DependentFrameAdmission, FramePhase, NativeAcceptanceIssuer, PhysicalRoleCompletion,
+    ProposerRankingPublished, RefinementMachine, RoleCompletion, RoleSubmission,
+    RoleTicketRegistry, StepEvidence, StepExecution, TicketPhase,
+};
+use rz_contracts::pals::RepresentationKey;
+use rz_runtime::adaptive::CoordinatorPolicy;
+
+type Registry = RoleTicketRegistry<ReviewView, RoleOutput>;
+
+/// The same real registry producer protocol used by port_tests' ranking
+/// fixture, adapted only to this fixture's explicitly registered namespace.
+fn authored_proposer_submission(
+    registry: &mut Registry,
+    input: &FrameInput<ReviewView, AdaptivePortQuestion>,
+    deadline: Deadline,
+    selected: &str,
+    clock: ClockDomain,
+    now: MonotonicTick,
+) -> (RoleTicketEnvelope, RoleOutput) {
+    let mut candidates = Sha256::new();
+    for movement in &input.view.query().legal {
+        let packed =
+            rz_contracts::pals::Move16::encode(rz_contracts::Move::try_from(*movement).unwrap());
+        candidates.update(packed.bits().to_le_bytes());
+    }
+    let representation = RepresentationKey {
+        input: ContractDigest(input.view.digest()),
+        history: input.view_seal.root_state.semantic,
+        candidates: ContractDigest(candidates.finalize().into()),
+        mask_positions: ContractDigest(
+            Sha256::digest(vec![1_u8; input.view.query().legal.len()]).into(),
+        ),
+        // These are the existing AuthoredWorkerFixture namespace declaration,
+        // not digests inferred from a display name or a native loaded model.
+        model: ContractDigest([5; 32]),
+        encoding: ContractDigest([6; 32]),
+        precision: PrecisionProfile::Fp32,
+        frozen_epoch: 1,
+        record_revision: input.question.context.public_revision,
+        role: Role::Proposer,
+    };
+    let ticket = registry
+        .admit(
+            RoleSubmission {
+                question: input.question_digest,
+                view: input.view_seal,
+                representation,
+                role: Role::Proposer,
+                original_deadline: deadline,
+            },
+            Arc::clone(&input.view),
+            clock,
+            now,
+        )
+        .unwrap();
+    assert_eq!(registry.phase(ticket.id), Some(TicketPhase::Submitted));
+    let dispatched = registry.take_dispatch().unwrap();
+    assert_eq!(dispatched.ticket, ticket);
+    let selected = BoardMove::from_uci(selected).unwrap();
+    assert!(input.view.query().legal.contains(&selected));
+    let output = RoleOutput {
+        id: ticket.id,
+        authority: ticket.authority,
+        key: representation,
+        payload: RolePayload::Proposal {
+            candidate_logits: input
+                .view
+                .query()
+                .legal
+                .iter()
+                .map(|movement| if *movement == selected { 1.0 } else { -1.0 })
+                .collect(),
+            wdl: rz_contracts::Wdl::try_new(0.25, 0.5, 0.25, 0.0).unwrap(),
+        },
+        private_latent: vec![0.0; 16 * 384],
+    };
+    (ticket, output)
+}
+
+fn authored_published_ranking(
+    fixture: &mut AuthoredWorkerFixture,
+) -> (Registry, NativeAcceptanceIssuer, ProposerRankingPublished) {
+    let input = fixture.port.root_input().unwrap();
+    assert_eq!(input.stage, RefinementStage::ProposerRanking);
+    let mut registry = Registry::new(
+        fixture.port.authority,
+        input.view.token_budget(),
+        CoordinatorPolicy::Fixed,
+        1,
+    )
+    .unwrap();
+    let (issuer, verifier) = NativeAcceptanceIssuer::new_pair();
+    registry
+        .register_native_acceptance_verifier(verifier)
+        .unwrap();
+    let clock = fixture.clock.domain();
+    let (ticket, output) = authored_proposer_submission(
+        &mut registry,
+        &input,
+        fixture.port.deadline,
+        "e2e4",
+        clock,
+        fixture.clock.now().unwrap(),
+    );
+    registry
+        .complete_proposer_ranking(RoleCompletion {
+            ticket,
+            physical: PhysicalRoleCompletion::Confirmed,
+            result: Ok(output),
+        })
+        .unwrap();
+    let delivered = registry
+        .take_ready(clock, fixture.clock.now().unwrap())
+        .unwrap();
+    assert!(delivered.logically_eligible && delivered.result.is_ok());
+    assert_eq!(delivered.ticket, ticket);
+    let permit = registry
+        .issue_native_acceptance(&ticket, clock, fixture.clock.now().unwrap())
+        .unwrap();
+    registry
+        .confirm_native_acceptance(
+            issuer.issue_success(permit),
+            clock,
+            fixture.clock.now().unwrap(),
+        )
+        .unwrap();
+    let ranking = registry
+        .accept_proposer_ranking(
+            &ticket,
+            fixture.port.root_rules(),
+            clock,
+            fixture.clock.now().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(registry.phase(ticket.id), Some(TicketPhase::Retired));
+    (registry, issuer, ranking)
+}
+
+#[test]
+fn authored_worker_optional_peer_r_returns_to_original_accepted_parent() {
+    let _serial = EXTERNAL_FIXTURE_LOCK.lock().unwrap();
+    let mut fixture = AuthoredWorkerFixture::new(Duration::from_secs(20), false);
+    let clock = fixture.clock.domain();
+    let root_budget = fixture
+        .port
+        .rovent_frontier()
+        .unwrap()
+        .registration()
+        .root_budget;
+    let (mut registry, issuer, ranking) = authored_published_ranking(&mut fixture);
+    let mut candidates = fixture.port.ranking_published(&ranking).unwrap();
+    assert_eq!(candidates.len(), 1);
+    let candidate = candidates.pop().unwrap();
+    assert_eq!(candidate.input.stage, RefinementStage::ProposalContinuation);
+    assert!(candidate.initialized.is_none());
+    let mut machine =
+        RefinementMachine::new(fixture.port.authority, fixture.port.deadline, 512).unwrap();
+    machine
+        .enable_reciprocal_questions(ExecutionMode::CpuPcr, root_budget)
+        .unwrap();
+    let parent = machine
+        .admit_candidate(
+            &ranking,
+            candidate.first_move,
+            candidate.input.clone(),
+            candidate.budget,
+            clock,
+            fixture.clock.now().unwrap(),
+        )
+        .unwrap();
+    fixture
+        .port
+        .root_candidate_admitted(parent, candidate.first_move, &candidate.input)
+        .unwrap();
+    let source_work = machine
+        .ready_work(parent, clock, fixture.clock.now().unwrap())
+        .unwrap();
+    assert_eq!(
+        source_work.input.question.context.prefix,
+        [BoardMove::from_uci("e2e4").unwrap()]
+    );
+    let (ticket, output) = authored_proposer_submission(
+        &mut registry,
+        &source_work.input,
+        source_work.original_deadline,
+        "e7e5",
+        clock,
+        fixture.clock.now().unwrap(),
+    );
+    machine
+        .bind_role(parent, &ticket, clock, fixture.clock.now().unwrap())
+        .unwrap();
+    registry
+        .complete_reciprocal_role(RoleCompletion {
+            ticket,
+            physical: PhysicalRoleCompletion::Confirmed,
+            result: Ok(output.clone()),
+        })
+        .unwrap();
+    let delivered = registry
+        .take_ready(clock, fixture.clock.now().unwrap())
+        .unwrap();
+    assert!(delivered.logically_eligible && delivered.result.is_ok());
+    assert_eq!(registry.phase(ticket.id), Some(TicketPhase::Delivered));
+    let permit = registry
+        .issue_reciprocal_native_acceptance(&ticket, clock, fixture.clock.now().unwrap())
+        .unwrap();
+    let accepted = registry
+        .accept_reciprocal_native(
+            issuer.issue_success(permit),
+            clock,
+            fixture.clock.now().unwrap(),
+        )
+        .unwrap();
+    assert!(accepted.validates_output(&output));
+    assert_eq!(registry.phase(ticket.id), Some(TicketPhase::Retired));
+    let parent_evidence = StepEvidence {
+        frame: parent,
+        stage: source_work.input.stage,
+        execution: StepExecution::Role(ticket.id),
+        submitted_question: source_work.input.question_digest,
+        submitted_view: source_work.input.view_seal,
+        completed_evidence: accepted.output_digest(),
+    };
+    let original_budget = machine.frame(parent).unwrap().budget;
+    let prepared = fixture
+        .port
+        .prepare_accepted_role_reciprocal(
+            &source_work,
+            &accepted,
+            &output,
+            ReciprocalQuestionId {
+                authority: fixture.port.authority,
+                sequence: 1,
+            },
+            ExecutionMode::CpuPcr,
+            root_budget,
+            SearchRecipient::Researcher,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(prepared.origin.matches(&accepted));
+    assert_eq!(prepared.question.sender, SearchRecipient::Proposer);
+    assert_eq!(prepared.question.recipient, SearchRecipient::Researcher);
+    assert!(prepared.question.parent.is_none());
+    assert_eq!(prepared.input.stage, RefinementStage::CpuValidation);
+    assert_eq!(
+        prepared.input.question.context.prefix,
+        [
+            BoardMove::from_uci("e2e4").unwrap(),
+            BoardMove::from_uci("e7e5").unwrap(),
+        ]
+    );
+    let peer_question = prepared.question;
+    let admission = machine
+        .admit_after_accepted_role(
+            parent_evidence,
+            &accepted,
+            peer_question,
+            prepared.input,
+            0,
+            clock,
+            fixture.clock.now().unwrap(),
+        )
+        .unwrap();
+    let DependentFrameAdmission::Admitted(child) = admission else {
+        panic!("first optional peer must receive one original child frame")
+    };
+    assert_eq!(machine.waiting_on(parent), Some(child));
+    assert_eq!(
+        machine.frame(parent).unwrap().phase,
+        FramePhase::Waiting(parent_evidence.execution)
+    );
+    assert!(
+        machine
+            .ready_work(parent, clock, fixture.clock.now().unwrap())
+            .is_err()
+    );
+    let child_work = machine
+        .ready_work(child, clock, fixture.clock.now().unwrap())
+        .unwrap();
+    let (external, packet) = fixture.dispatch(&child_work, 2);
+    assert_eq!(external.binding.question(), peer_question);
+    assert_eq!(packet.question(), peer_question);
+    assert_eq!(
+        packet.result().as_ref().unwrap().report.raw.best_move,
+        Some(BoardMove::from_uci("g1f3").unwrap())
+    );
+    machine
+        .bind_profiled_external_cpu(
+            child,
+            &external.binding,
+            clock,
+            fixture.clock.now().unwrap(),
+        )
+        .unwrap();
+    let execution = StepExecution::ProfiledExternal {
+        question: peer_question.id,
+        execution: external.binding.execution(),
+    };
+    let bound = machine.bound_work(child, execution).unwrap();
+    assert!(Arc::ptr_eq(
+        &bound.input.question,
+        &child_work.input.question
+    ));
+    assert!(Arc::ptr_eq(&bound.input.view, &child_work.input.view));
+    let committed = fixture
+        .port
+        .commit_profiled_external(
+            &child_work,
+            &fixture.source,
+            external.reservation,
+            &packet,
+            true,
+        )
+        .unwrap();
+    assert!(committed.consumed);
+    let proof = fixture
+        .port
+        .after_profiled_reciprocal_cpu(
+            &child_work,
+            &fixture.source,
+            external.reservation,
+            &packet,
+            &committed,
+        )
+        .unwrap();
+    let evidence = StepEvidence {
+        frame: child,
+        stage: child_work.input.stage,
+        execution,
+        submitted_question: child_work.input.question_digest,
+        submitted_view: child_work.input.view_seal,
+        completed_evidence: proof.evidence(),
+    };
+
+    let other_work = fixture.work(99);
+    let (other_external, other_packet) = fixture.dispatch(&other_work, 9);
+    assert!(!Arc::ptr_eq(&packet, &other_packet));
+    assert!(
+        fixture
+            .port
+            .after_profiled_reciprocal_cpu(
+                &child_work,
+                &fixture.source,
+                external.reservation,
+                &other_packet,
+                &committed,
+            )
+            .is_err()
+    );
+    assert!(
+        fixture
+            .port
+            .after_profiled_reciprocal_cpu(
+                &other_work,
+                &fixture.source,
+                other_external.reservation,
+                &packet,
+                &committed,
+            )
+            .is_err()
+    );
+    let mut changed_evidence = evidence;
+    changed_evidence.frame = parent;
+    assert!(
+        machine
+            .resolve_reciprocal_profiled_external_response(
+                changed_evidence,
+                &proof,
+                clock,
+                fixture.clock.now().unwrap(),
+            )
+            .is_err()
+    );
+    assert_eq!(machine.waiting_on(parent), Some(child));
+    fixture
+        .port
+        .commit_profiled_external(
+            &other_work,
+            &fixture.source,
+            other_external.reservation,
+            &other_packet,
+            false,
+        )
+        .unwrap();
+
+    let response = machine
+        .resolve_reciprocal_profiled_external_response(
+            evidence,
+            &proof,
+            clock,
+            fixture.clock.now().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(response.frame, child);
+    assert_eq!(response.question, child_work.input.question_digest);
+    assert_eq!(response.execution, execution);
+    assert_eq!(machine.waiting_on(parent), None);
+    assert!(machine.frame(child).is_none());
+    assert_eq!(
+        machine.frame(parent).unwrap().phase,
+        FramePhase::Waiting(parent_evidence.execution)
+    );
+    let resumed = machine
+        .bound_work(parent, parent_evidence.execution)
+        .unwrap();
+    assert_eq!(resumed.frame, source_work.frame);
+    assert_eq!(resumed.original_deadline, source_work.original_deadline);
+    assert_eq!(resumed.original_first_move, source_work.original_first_move);
+    assert_eq!(resumed.budget, original_budget);
+    assert!(Arc::ptr_eq(
+        &resumed.input.question,
+        &source_work.input.question
+    ));
+    assert!(Arc::ptr_eq(&resumed.input.view, &source_work.input.view));
+    assert!(
+        machine
+            .resolve_reciprocal_profiled_external_response(
+                evidence,
+                &proof,
+                clock,
+                fixture.clock.now().unwrap(),
+            )
+            .is_err()
+    );
+    assert_eq!(machine.frame(parent).unwrap().budget, original_budget);
+    assert_eq!(registry.phase(ticket.id), Some(TicketPhase::Retired));
+    assert_eq!(fixture.port.counters.role_calls, 2); // Root ranking plus original P, once each.
+    assert_eq!(fixture.port.counters.consumed_external_checker_tasks, 1);
+    assert_eq!(fixture.port.counters.cpu_nodes, 0);
+    assert_eq!(fixture.port.counters.completed_cpu_tasks, 0);
+    let raw = fixture
+        .port
+        .engine
+        .semantic
+        .stores
+        .observations
+        .get(committed.observation)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .port
+            .engine
+            .semantic
+            .stores
+            .tasks
+            .get(raw.execution.unwrap())
+            .unwrap()
+            .status,
+        TaskStatus::Failed
+    );
+    assert!(matches!(
+        raw.scope,
+        EvidenceScope::ProfiledExternalUci { .. }
+    ));
+    assert!(matches!(raw.score, RawScore::ExternalUci { .. }));
+    let fence = fixture.quiesce();
+    let retirement = fixture
+        .port
+        .release_profiled_external_root(&fixture.source, &fence)
+        .unwrap();
+    assert_eq!(retirement.retained_questions(), 2);
+}

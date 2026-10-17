@@ -186,9 +186,47 @@ struct NnuecProvenance {
     configuration_sha256: String,
     context_namespace_policy_sha256: String,
     local_namespace_policy_sha256: String,
+    #[serde(deserialize_with = "deserialize_strict_training")]
     training: CpuTrainingState,
     diagnostic: bool,
     provenance: Vec<ArtifactRef>,
+}
+
+/// Provenance has a strict field contract of its own. Serde's internally
+/// tagged *unit* variants may ignore payload fields, even when their enum
+/// carries deny_unknown_fields. Empty struct variants enforce the same valid
+/// wire shape without changing legacy CpuTrainingState/model parsers.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum StrictTrainingDeclaration {
+    Bootstrap {},
+    Untrained {},
+    Learned {
+        run_id: String,
+        steps: u64,
+        dataset_sha256: String,
+    },
+}
+
+fn deserialize_strict_training<'de, D>(deserializer: D) -> Result<CpuTrainingState, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match StrictTrainingDeclaration::deserialize(deserializer)? {
+            StrictTrainingDeclaration::Bootstrap {} => CpuTrainingState::Bootstrap,
+            StrictTrainingDeclaration::Untrained {} => CpuTrainingState::Untrained,
+            StrictTrainingDeclaration::Learned {
+                run_id,
+                steps,
+                dataset_sha256,
+            } => CpuTrainingState::Learned {
+                run_id,
+                steps,
+                dataset_sha256,
+            },
+        },
+    )
 }
 
 fn decode_provenance(bytes: &[u8]) -> Result<NnuecProvenance, BackendError> {
