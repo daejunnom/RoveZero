@@ -36,6 +36,7 @@ pub enum PeerFollowupDisposition {
     NoEligibleQuestion,
     NoProgress,
     ViewLeaseCapacity,
+    AdmissionClosed,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerFollowupObservation {
@@ -205,7 +206,9 @@ where
                     "accepted peer parent disappeared",
                 ))?
                 .budget;
-            let unsupported = if !self.role_call_admission_available() {
+            let unsupported = if !self.can_admit_work() {
+                Some(PeerFollowupDisposition::AdmissionClosed)
+            } else if !self.role_call_admission_available() {
                 Some(PeerFollowupDisposition::RoleCreditExhausted)
             } else if recipient == SearchRecipient::Researcher {
                 self.native_peer_unavailable(config.mode)?

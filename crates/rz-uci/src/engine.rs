@@ -708,6 +708,8 @@ struct ActiveBinding {
     authority: Option<SearchAuthority>,
     driver_output: Option<Arc<DriverOutputEnvelope>>,
     driver_output_until: Option<Instant>,
+    driver_start: Option<Arc<DriverStartSource>>,
+    ponder_clock: Option<crate::rovent_ponder::RoventPonderClockOwner>,
 }
 type FailedPublication = Arc<Mutex<Option<Box<UndeliveredWorkerFailure>>>>;
 struct Worker {
@@ -828,6 +830,7 @@ impl Owner {
         bool,
         Option<DriverOutputPublication>,
     ) {
+        let dispatched_at = Instant::now();
         let parsed = crate::parser::parse_with_zero_node_limit(
             line,
             session.parser_limits(),
@@ -855,6 +858,34 @@ impl Owner {
                     message: error.to_string(),
                 });
                 return (rejected, false, None);
+            }
+            if original_go.ponder && driver.supports_ponder_clock() {
+                let mut normal = original_go.as_ref().clone();
+                normal.ponder = false;
+                normal.infinite = false;
+                let side = match session.snapshot().rules_position().side_to_move() {
+                    rz_position::Color::White => crate::bridge::SideToMove::White,
+                    rz_position::Color::Black => crate::bridge::SideToMove::Black,
+                };
+                // The allocation's duration is fixed by the received go. A
+                // future hit cannot make an oversized clock legal; reject it
+                // before the old search is canceled or a new ticket exists.
+                if let Err(error) = crate::bridge::PreparedSearchBinding::prepare(
+                    &normal,
+                    side,
+                    dispatched_at,
+                    self.settings.search,
+                    driver.search_goal_capability(),
+                    crate::bridge::NodeBudgetSemantics::RoventPositionVisits,
+                ) {
+                    let mut rejected = SessionResult::default();
+                    rejected.accepted = false;
+                    rejected.diagnostics.push(Diagnostic {
+                        code: "PonderClockRejected",
+                        message: error.to_string(),
+                    });
+                    return (rejected, false, None);
+                }
             }
         }
         let enabled = matches!(
@@ -903,6 +934,14 @@ impl Owner {
                     self.admitted_ponder_report = None;
                     self.ponder = Some((self.session_owner.lifecycle_scope(), limits.nodes));
                 }
+            }
+            Ok(Command::PonderHit)
+                if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.ponder_clock.is_some()) =>
+            {
+                return self.hit_rovent_ponder(session, dispatched_at);
             }
             Ok(Command::PonderHit) => {
                 if !self
@@ -975,6 +1014,117 @@ impl Owner {
             }
         }
         (out, from_driver_report, released_output)
+    }
+
+    fn hit_rovent_ponder(
+        &mut self,
+        session: &mut Session<RulesUciPort>,
+        hit_at: Instant,
+    ) -> (
+        SessionResult<RulesSearchPosition>,
+        bool,
+        Option<DriverOutputPublication>,
+    ) {
+        let mut out = SessionResult::default();
+        let current_scope = self.session_owner.lifecycle_scope();
+        let hit = (|| {
+            if !self
+                .ponder
+                .as_ref()
+                .is_some_and(|(scope, _)| *scope == current_scope)
+            {
+                return Err(failure(
+                    contract::ErrorCode::Stale,
+                    "no current actual ponder Start",
+                ));
+            }
+            let active = self.active.as_mut().ok_or_else(|| {
+                failure(contract::ErrorCode::Stale, "actual ponder Start is absent")
+            })?;
+            let original = active.driver_start.as_ref().ok_or_else(|| {
+                failure(
+                    contract::ErrorCode::IdentityMismatch,
+                    "actual ponder source is absent",
+                )
+            })?;
+            let mut normal = original.original_go().as_ref().clone();
+            normal.ponder = false;
+            normal.infinite = false;
+            let side = match session.snapshot().rules_position().side_to_move() {
+                rz_position::Color::White => crate::bridge::SideToMove::White,
+                rz_position::Color::Black => crate::bridge::SideToMove::Black,
+            };
+            let prepared = crate::bridge::PreparedSearchBinding::prepare(
+                &normal,
+                side,
+                hit_at,
+                self.settings.search,
+                self.driver
+                    .as_ref()
+                    .and_then(|driver| driver.search_goal_capability()),
+                crate::bridge::NodeBudgetSemantics::RoventPositionVisits,
+            )
+            .map_err(|_| {
+                failure(
+                    contract::ErrorCode::InvalidInput,
+                    "normal ponder-hit time allocation is invalid",
+                )
+            })?;
+            let disposition = active
+                .ponder_clock
+                .as_mut()
+                .ok_or_else(|| {
+                    failure(
+                        contract::ErrorCode::IdentityMismatch,
+                        "actual ponder clock owner is absent",
+                    )
+                })?
+                .hit(
+                    &active.ticket,
+                    current_scope,
+                    hit_at,
+                    &prepared,
+                    Instant::now(),
+                )?;
+            Ok((active.ticket.clone(), disposition))
+        })();
+        let (ticket, disposition) = match hit {
+            Ok(value) => value,
+            Err(error) => {
+                out.accepted = false;
+                out.diagnostics.push(Diagnostic {
+                    code: "PonderHitRejected",
+                    message: error.to_string(),
+                });
+                return (out, false, None);
+            }
+        };
+        self.ponder = None;
+        if session.active_ticket().as_ref() == Some(&ticket) {
+            append_contract_result(
+                &mut out,
+                self.session_owner.release_ponder_hit(session, &ticket),
+            );
+            // A hit cannot reopen the expired original resource wall. Only
+            // this terminal case follows the same ticket's normal stop path.
+            if disposition == crate::rovent_ponder::HitDisposition::NoLiveWork
+                && session.active_ticket().as_ref() == Some(&ticket)
+            {
+                append_contract_result(
+                    &mut out,
+                    self.session_owner
+                        .handle_line(session, "stop", |s| Ok(s.state.snapshot().side_to_move())),
+                );
+            }
+        } else if self.held_ponder_bestmove.is_none() {
+            out.accepted = false;
+            out.diagnostics.push(Diagnostic {
+                code: "StalePonderHit",
+                message: "the original Start has neither live work nor a held result".into(),
+            });
+        }
+        let (reported, publication) = self.release_ponder_output(Some(&ticket), &mut out);
+        (out, reported, publication)
     }
     fn release_ponder_output(
         &mut self,
@@ -1533,6 +1683,9 @@ impl Owner {
     fn cancel(&self) {
         if let Some(active) = &self.active {
             active.control.cancel();
+            if let Some(clock) = &active.ponder_clock {
+                clock.close();
+            }
             if let Some(authority) = &active.authority {
                 authority.cancel();
             }
@@ -1710,6 +1863,7 @@ impl Owner {
                         authority: search_authority,
                         original_go,
                         original_start: None,
+                        effective_clock: None,
                         original_time_budget: self
                             .session_owner
                             .active_binding()
@@ -1742,6 +1896,27 @@ impl Owner {
                         shutdown_deadline,
                         current: Arc::clone(&self.scope),
                     };
+                    let ponder_clock = if driver.supports_ponder_clock()
+                        && context.original_go.as_ref().is_some_and(|go| go.ponder)
+                    {
+                        let original_budget = context.original_time_budget.ok_or_else(|| {
+                            failure(
+                                contract::ErrorCode::IdentityMismatch,
+                                "actual ponder Start has no original TimeBudget",
+                            )
+                        })?;
+                        let (owner, handle) = crate::rovent_ponder::RoventPonderClockOwner::new(
+                            ticket.clone(),
+                            search_authority,
+                            original_budget,
+                            shutdown_deadline,
+                            &self.clock,
+                        )?;
+                        context.effective_clock = Some(handle);
+                        Some(owner)
+                    } else {
+                        None
+                    };
                     let original_start = DriverStartSource::from_start(
                         &ticket,
                         snapshot.rules_position(),
@@ -1767,6 +1942,8 @@ impl Owner {
                         authority: None,
                         driver_output: Some(Arc::clone(&driver_output)),
                         driver_output_until: Some(shutdown_deadline),
+                        driver_start: Some(original_start),
+                        ponder_clock,
                     });
                     let driver = Arc::clone(driver);
                     let events = sender.clone();
@@ -1889,6 +2066,8 @@ impl Owner {
                     authority: Some(authority.clone()),
                     driver_output: None,
                     driver_output_until: None,
+                    driver_start: None,
+                    ponder_clock: None,
                 });
                 let profile = factory.profile();
                 let config = rz_search::contracts::ContractSearchConfig {
@@ -3604,6 +3783,8 @@ mod tests {
             authority: None,
             driver_output: None,
             driver_output_until: None,
+            driver_start: None,
+            ponder_clock: None,
         });
         assert_eq!(
             owner.deadline_ticket(None, control.deadline),
@@ -5283,6 +5464,8 @@ mod tests {
                 authority: None,
                 driver_output: None,
                 driver_output_until: None,
+                driver_start: None,
+                ponder_clock: None,
             });
             owner.handle(
                 &mut session,

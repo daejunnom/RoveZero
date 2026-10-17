@@ -544,6 +544,7 @@ impl PreparedAdaptiveProcessV5 {
             original_go: None,
             original_time_budget: None,
             original_start: None,
+            effective_clock: None,
             requested_nodes: None,
             control: rz_search::driver::SearchControl::new(hard_deadline, self.cpu_nodes_limit),
             cancellation: CancelToken::new(),
@@ -777,6 +778,7 @@ fn prepare_actual(
                         root_admission: Some(hooks.root_admission),
                         root_closure: Some(hooks.root_closure),
                         external_teacher: Some(hooks.teacher_observer),
+                        cooperative: None,
                     },
                 )
             }

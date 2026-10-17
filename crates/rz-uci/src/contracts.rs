@@ -234,6 +234,36 @@ impl ContractSessionOwner {
         self.current.as_ref().map(|c| &c.deadlines)
     }
 
+    /// Rovent's effective clock is held by the actual Start owner. The common
+    /// binding and every submitted request keep their original deadlines; this
+    /// method releases only the same ticket's infinite output hold.
+    pub(crate) fn release_ponder_hit<P: PositionPort>(
+        &mut self,
+        session: &mut Session<P>,
+        ticket: &SearchTicket,
+    ) -> ContractSessionOutcome<P::Snapshot> {
+        if let Err(err) = self.ensure_session(session) {
+            return rejected(err);
+        }
+        let Some(current) = self.matching_current(ticket) else {
+            return stale(None);
+        };
+        if current.binding.node_budget_semantics() != NodeBudgetSemantics::RoventPositionVisits
+            || !current.infinite
+        {
+            return rejected(error(
+                ErrorCode::UnsupportedContract,
+                "normal ponder hit requires the actual Rovent Start",
+            ));
+        }
+        let out = session.release_ponder_hit(ticket);
+        if out.accepted {
+            current.infinite = false;
+        }
+        self.synchronize(session);
+        out.into()
+    }
+
     /// Registry replacement is explicit and idle-only. Caller must provide the
     /// live handles/backend while preserving this owner's game/root counters.
     pub fn set_registry<P: PositionPort>(

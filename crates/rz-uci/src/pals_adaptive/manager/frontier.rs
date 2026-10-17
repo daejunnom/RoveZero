@@ -186,6 +186,7 @@ where
     ) -> Result<bool, AdaptiveManagerError> {
         match result {
             Ok(()) => Ok(true),
+            Err(AdaptiveManagerError::AdmissionClosed) => Ok(false),
             Err(AdaptiveManagerError::Frontier(FrontierError::NodesReserved)) => Ok(false),
             Err(AdaptiveManagerError::Frontier(FrontierError::NodeBudget)) => {
                 // Common visits include checked Rules transitions and are not

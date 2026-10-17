@@ -208,3 +208,7 @@ mod tests;
 #[cfg(test)]
 #[path = "driver_output/ponder_tests.rs"]
 mod ponder_tests;
+
+#[cfg(all(test, feature = "pals-adaptive"))]
+#[path = "driver_output/rovent_ponder_tests.rs"]
+mod rovent_ponder_tests;

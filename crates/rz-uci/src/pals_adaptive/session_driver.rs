@@ -113,6 +113,9 @@ where
     pub root_admission: Option<AdaptiveRootAdmissionObserver<B>>,
     pub root_closure: Option<AdaptiveCompletedRootObserver<B>>,
     pub external_teacher: Option<AdaptiveExternalTeacherObserver>,
+    /// Nonblocking outer-session pump. It does not run inside a native/CPU
+    /// worker and cannot change the manager's original execution authority.
+    pub cooperative: Option<Arc<dyn Fn() -> Result<(), AdaptiveManagerError> + Send + Sync>>,
 }
 impl<B> Default for AdaptiveSessionCollectionHooks<B>
 where
@@ -124,6 +127,7 @@ where
             root_admission: None,
             root_closure: None,
             external_teacher: None,
+            cooperative: None,
         }
     }
 }
@@ -199,6 +203,7 @@ struct IdleOwners<B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>> {
     #[cfg(feature = "pals-adaptive")]
     rovent_idle_custody: RoventPcrIdleCustody,
 }
+
 // Retained process owners stay on the heap while failure/root transitions move
 // the state. Empty variants must not reserve every possible engine payload on
 // the caller's stack, and a failed transition keeps the same exclusive owner.
@@ -1419,6 +1424,9 @@ where
                         "Rovent original cleanup boundary differs",
                     ));
                 }
+                if let Some(clock) = &context.effective_clock {
+                    manager.register_effective_clock(clock.clone())?;
+                }
                 profile.attach(
                     &mut manager,
                     context,
@@ -1463,11 +1471,7 @@ where
                 drain_root(&mut manager, context.shutdown_deadline)?;
                 manager.shutdown_receipt()
             } else {
-                let close_at = context
-                    .control
-                    .soft_deadline
-                    .min(context.control.admission_deadline);
-                if Instant::now() >= close_at || !context.accepts().unwrap_or(false) {
+                if context.soft_expired(Instant::now()) || !context.accepts().unwrap_or(false) {
                     manager.begin_root_quiesce(context.shutdown_deadline)?;
                     drain_root(&mut manager, context.shutdown_deadline)?;
                     return manager.shutdown_receipt();
@@ -1481,11 +1485,14 @@ where
                     &context.control.cancellation,
                     &mut |manager| {
                         if manager.phase() == ManagerPhase::Running
-                            && (Instant::now() >= close_at
+                            && (context.soft_expired(Instant::now())
                                 || !context.accepts().unwrap_or(false)
                                 || self.rovent_should_quiesce(manager)?)
                         {
                             manager.begin_root_quiesce(context.shutdown_deadline)?;
+                        }
+                        if let Some(pump) = &self.collection_hooks.cooperative {
+                            pump()?;
                         }
                         let current = manager.driver().port().map(|port| port.counters());
                         if context.accepts().unwrap_or(false)
@@ -2057,6 +2064,16 @@ where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    fn supports_ponder_clock(&self) -> bool {
+        #[cfg(feature = "pals-adaptive")]
+        {
+            self.rovent_root_policy.is_some()
+        }
+        #[cfg(not(feature = "pals-adaptive"))]
+        {
+            false
+        }
+    }
     fn kind(&self) -> SearchKind {
         if self.rovent.is_some() {
             SearchKind::Rovent

@@ -34,6 +34,7 @@ pub(crate) struct DriverStartSource {
     current: Arc<Mutex<SessionScope>>,
     runtime_clock: ContractSystemClock,
     cleanup: Instant,
+    effective_clock: Option<crate::rovent_ponder::RoventPonderClockHandle>,
 }
 impl DriverStartSource {
     /// Only the engine's actual Effect::Start branch can call this constructor.
@@ -76,6 +77,7 @@ impl DriverStartSource {
             current: Arc::clone(&context.current),
             runtime_clock: clock.runtime_clock(),
             cleanup: context.shutdown_deadline,
+            effective_clock: context.effective_clock.clone(),
         }))
     }
 
@@ -108,6 +110,7 @@ impl DriverStartSource {
                 .shares_cancellation_with(&context.cancellation)
             || !Arc::ptr_eq(&self.current, &context.current)
             || self.cleanup != context.shutdown_deadline
+            || !same_effective_clock(&self.effective_clock, &context.effective_clock)
             || current_clock.domain() != self.runtime_clock.domain()
             || current_clock.origin() != self.runtime_clock.origin()
         {
@@ -119,6 +122,19 @@ impl DriverStartSource {
     }
     pub(crate) fn ticket(&self) -> &SearchTicket {
         &self.ticket
+    }
+    pub(super) fn original_go(&self) -> &Arc<GoLimits> {
+        &self.original_go
+    }
+}
+fn same_effective_clock(
+    a: &Option<crate::rovent_ponder::RoventPonderClockHandle>,
+    b: &Option<crate::rovent_ponder::RoventPonderClockHandle>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.shares_clock_with(b),
+        _ => false,
     }
 }
 fn same_moves(a: &Option<Arc<[BoardMove]>>, b: &Option<Arc<[BoardMove]>>) -> bool {

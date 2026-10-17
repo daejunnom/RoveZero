@@ -167,6 +167,7 @@ where
     close_mode: AdaptiveCloseMode,
     shutdown_until: Option<Instant>,
     cleanup_boundary: Option<CleanupBoundary>,
+    effective_clock: Option<crate::rovent_ponder::RoventPonderClockHandle>,
     counters: AdaptiveManagerCounters,
     accounting: AdaptiveNativeAccountingSnapshot,
     review_leases: RoventReviewLeaseObservation,
@@ -264,6 +265,7 @@ where
             close_mode: AdaptiveCloseMode::RootQuiesce,
             shutdown_until: None,
             cleanup_boundary: None,
+            effective_clock: None,
             counters: AdaptiveManagerCounters::default(),
             accounting: AdaptiveNativeAccountingSnapshot::default(),
             review_leases: RoventReviewLeaseObservation::new(registration.role_tickets_max),
@@ -306,6 +308,42 @@ where
     }
     pub fn registered_cleanup_deadline(&self) -> Option<Instant> {
         self.cleanup_boundary.map(CleanupBoundary::original)
+    }
+    pub fn register_effective_clock(
+        &mut self,
+        handle: crate::rovent_ponder::RoventPonderClockHandle,
+    ) -> Result<(), AdaptiveManagerError> {
+        if self.phase != ManagerPhase::Running
+            || self.counters.native_preparations != 0
+            || self.pending_input.is_some()
+            || self.pending_preparation.is_some()
+            || self.effective_clock.is_some()
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "P/C effective clock startup order",
+            ));
+        }
+        effective_clock::admit(
+            &handle,
+            self.registration.authority,
+            &self.clock,
+            self.deadline,
+            self.cleanup_boundary,
+        )?;
+        self.effective_clock = Some(handle);
+        Ok(())
+    }
+    pub fn can_admit_work(&self) -> bool {
+        let now = Instant::now();
+        self.effective_clock
+            .as_ref()
+            .is_none_or(|handle| handle.snapshot(now).can_admit(now))
+    }
+    fn effective_hard_expired(&self) -> bool {
+        let now = Instant::now();
+        self.effective_clock
+            .as_ref()
+            .is_some_and(|handle| handle.snapshot(now).hard_expired(now))
     }
     /// Observe its version before polling this manager and the caller's
     /// controls, then wait on that same version to avoid a lost wakeup.
@@ -427,6 +465,9 @@ where
             .ok_or(AdaptiveManagerError::Invalid("P/C original ticket binding"))
     }
     fn schedule(&mut self) -> Result<bool, AdaptiveManagerError> {
+        if !self.can_admit_work() {
+            return Ok(false);
+        }
         let mut changed = false;
         while self.phase == ManagerPhase::Running && self.bindings.len() < self.pending_limit()? {
             let reserved = self
@@ -519,6 +560,7 @@ where
     }
     fn dispatch(&mut self) -> Result<bool, AdaptiveManagerError> {
         if !self.native_ready
+            || !self.can_admit_work()
             || self.phase != ManagerPhase::Running
             || !self.failures.is_empty()
             || self.now().is_err()
@@ -1058,6 +1100,7 @@ where
         if self.phase != ManagerPhase::Running
             || self.shutdown_until.is_some()
             || !self.failures.is_empty()
+            || self.effective_hard_expired()
         {
             return Err(AdaptiveManagerError::Invalid(
                 "satisfied goal cannot replace prior root termination",
@@ -1128,6 +1171,9 @@ where
     pub fn tick(&mut self) -> Result<bool, AdaptiveManagerError> {
         if self.phase == ManagerPhase::Finished {
             return Ok(false);
+        }
+        if self.phase == ManagerPhase::Running && self.effective_hard_expired() {
+            self.begin_root_quiesce(self.cleanup_until()?)?;
         }
         let mut changed = false;
         for _ in 0..MAX_EVENT_DRAIN {

@@ -126,6 +126,17 @@ fn role_only_fixture(
     Instant,
 ) {
     let clock = ContractSystemClock::new(ProcessEpoch(517));
+    role_only_fixture_on_clock(block, clock)
+}
+
+fn role_only_fixture_on_clock(
+    block: bool,
+    clock: ContractSystemClock,
+) -> (
+    RoleOnlyExecutionManager<u64, NativeFixture, RoleOnlyFixture>,
+    Arc<NativeFacts>,
+    Instant,
+) {
     let until = clock.origin() + WINDOW;
     let authority = SearchAuthority {
         epoch: ProcessEpoch(517),
@@ -246,6 +257,157 @@ fn role_only_fixture(
     )
     .unwrap_or_else(|rejected| panic!("NoR admission: {}", rejected.error));
     (manager, facts, until)
+}
+
+/// The actual Session issues this source's Start. The manager/native fixture
+/// uses that same process origin; no readonly handle can mint a new root.
+fn ponder_role_fixture() -> (
+    RoleOnlyExecutionManager<u64, NativeFixture, RoleOnlyFixture>,
+    Arc<NativeFacts>,
+    crate::rovent_ponder::RoventPonderClockOwner,
+    crate::rovent_ponder::RoventPonderClockHandle,
+    crate::SearchTicket,
+    crate::engine::ProcessClock,
+    Instant,
+) {
+    use crate::bridge::BuildSearchSettings;
+    use crate::engine::{ProcessClock, driver_start_fixture};
+    use crate::parser::GoLimits;
+    let clock = ProcessClock::new(ProcessEpoch(517));
+    let runtime = clock.runtime_clock();
+    let (mut manager, facts, until) = role_only_fixture_on_clock(true, runtime.clone());
+    let start = match driver_start_fixture::issue_start(
+        &Position::startpos(),
+        GoLimits {
+            ponder: true,
+            ..GoLimits::default()
+        },
+        manager.driver().registration.authority,
+        &clock,
+        runtime.origin(),
+        BuildSearchSettings {
+            untimed_limit: WINDOW + Duration::from_millis(10),
+            time_config: rz_search::time::TimeBudgetConfig::default(),
+            max_simulations: 1024,
+        },
+        Duration::from_secs(1),
+    )
+    .unwrap()
+    {
+        driver_start_fixture::FixtureStart::Started(context) => context,
+        _ => panic!("nonterminal actual Rules must issue Start"),
+    };
+    let original = start.original_time_budget.unwrap();
+    assert_eq!(original.hard_deadline, until);
+    let ticket = start.original_start.as_ref().unwrap().ticket().clone();
+    let (owner, handle) = crate::rovent_ponder::RoventPonderClockOwner::new(
+        ticket.clone(),
+        manager.driver().registration.authority,
+        original,
+        start.shutdown_deadline,
+        &clock,
+    )
+    .unwrap();
+    manager
+        .register_cleanup_deadline(start.shutdown_deadline)
+        .unwrap();
+    manager.register_effective_clock(handle.clone()).unwrap();
+    (manager, facts, owner, handle, ticket, clock, until)
+}
+
+#[test]
+fn role_only_ponder_admission_close_keeps_original_pending_ticket_acceptance() {
+    use crate::bridge::{
+        BuildSearchSettings, NodeBudgetSemantics, PreparedSearchBinding, SideToMove,
+    };
+    use crate::contracts::SessionScope;
+    use crate::parser::GoLimits;
+    let (mut manager, facts, mut owner, handle, ticket, clock, until) = ponder_role_fixture();
+    while (manager.pending_tickets() < 2 || facts.started.lock().unwrap().is_empty())
+        && Instant::now() < until
+    {
+        manager.tick().unwrap();
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(manager.pending_tickets(), 2);
+    let hit_at = Instant::now();
+    let normal = PreparedSearchBinding::prepare(
+        &GoLimits {
+            movetime_ms: Some(1000),
+            ..GoLimits::default()
+        },
+        SideToMove::White,
+        hit_at,
+        BuildSearchSettings {
+            time_config: rz_search::time::TimeBudgetConfig::default(),
+            max_simulations: 1024,
+            untimed_limit: WINDOW,
+        },
+        None,
+        NodeBudgetSemantics::RoventPositionVisits,
+    )
+    .unwrap();
+    owner
+        .hit(
+            &ticket,
+            SessionScope::Search(manager.driver().registration.authority),
+            hit_at,
+            &normal,
+            hit_at,
+        )
+        .unwrap();
+    let gate = handle.snapshot(hit_at).budget().admission_deadline;
+    assert!(!handle.snapshot(gate).can_admit(gate));
+    assert!(!handle.snapshot(gate).hard_expired(gate));
+    assert!(!manager.can_admit_work());
+    facts.child_gate.store(true, Ordering::Release);
+    while manager.driver().consumed.len() != 2 && Instant::now() < until {
+        manager.tick().unwrap();
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(manager.driver().consumed.len(), 2);
+    let original = clock.deadline(until).unwrap();
+    assert!(
+        facts
+            .accepted
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|ticket| ticket.original_deadline == original)
+    );
+    assert_eq!(facts.accepted.lock().unwrap().len(), 2);
+    manager
+        .begin_shutdown(until + Duration::from_secs(1))
+        .unwrap();
+    let receipt = manager
+        .run_root_until(until + Duration::from_secs(1), &AtomicBool::new(false))
+        .unwrap();
+    assert!(receipt.permits_semantic_closure(), "{receipt:?}");
+    assert!(manager.failures().next().is_none());
+}
+
+#[test]
+fn role_only_ponder_effective_hard_closes_before_any_late_head_consumption() {
+    let (mut manager, facts, _owner, handle, _ticket, _clock, until) = ponder_role_fixture();
+    while (manager.pending_tickets() < 2 || facts.started.lock().unwrap().is_empty())
+        && Instant::now() < until
+    {
+        manager.tick().unwrap();
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(manager.pending_tickets(), 2);
+    // A real handle's monotonic observation closes this boundary for every
+    // later manager read, including a read with an older event timestamp.
+    assert!(handle.snapshot(until).hard_expired(until));
+    manager.tick().unwrap();
+    facts.child_gate.store(true, Ordering::Release);
+    let receipt = manager
+        .run_root_until(until + Duration::from_secs(1), &AtomicBool::new(false))
+        .unwrap();
+    assert!(receipt.permits_semantic_closure(), "{receipt:?}");
+    assert_eq!(manager.driver().consumed.len(), 0);
+    assert_eq!(facts.accepted.lock().unwrap().len(), 0);
+    assert!(manager.driver().revoked);
 }
 
 #[test]

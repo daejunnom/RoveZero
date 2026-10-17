@@ -5,7 +5,8 @@ use super::*;
 use rz_contracts::Digest;
 use rz_search::cpu_value::nnuec::v2::Model;
 use rz_search::cpu_value::nnuec::v2::review::{
-    BoundNnuecReviewContext, Completion, PreparationActor, PreparationError, Provenance, Request,
+    BoundNnuecReviewContext, Completion, NnuecPreparationTerminalAck, PreparationActor,
+    PreparationError, PreparationObservation, Provenance, Request,
 };
 use rz_search::cpu_worker::{
     CpuWorker, CpuWorkerError, CpuWorkerProfile, CpuWorkerShutdown, InstallId,
@@ -22,6 +23,21 @@ pub enum NnuecWorkError {
     Preparation(PreparationError),
     Worker(CpuWorkerError),
     Invalid(&'static str),
+}
+
+/// Same-question preparation telemetry. Actor wall service is distinct from
+/// process/thread CPU time and from every P/C ticket or native node charge.
+#[derive(Clone, Debug)]
+pub struct NnuecPreparationRecord {
+    pub frame: FrameId,
+    pub question: Digest,
+    pub view: ReviewViewSeal,
+    pub owner: CpuWorkerId,
+    pub submitted: bool,
+    pub actor_terminal: Option<PreparationObservation>,
+    pub cpu_thread_time: Option<Duration>,
+    pub cancellation_requested: bool,
+    pub manager_error: Option<NnuecWorkError>,
 }
 
 /// The same joined worker's engine, to be moved to the Session's retained actor.
@@ -41,6 +57,8 @@ where
     pub driver: D,
     pub continuation: AdaptiveSequenceContinuation,
     pub receipt: AdaptiveShutdownReceipt,
+    pub preparation_observations: Vec<NnuecPreparationRecord>,
+    pub preparation_observations_omitted: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +85,7 @@ pub(super) struct NnuecWorkPreparation<Q> {
     pub selection:
         rz_runtime::adaptive::ReadySelection<FrameId, rz_contracts::pals::Move16, Digest>,
     pub slot: usize,
+    owner: CpuWorkerId,
     pub seal: AdaptiveNnuecReviewSeal,
     expected: Provenance,
     canceled: Arc<AtomicBool>,
@@ -83,12 +102,17 @@ pub(super) struct NnuecWorkPreparation<Q> {
     unmatched_completion: Option<Completion>,
     failure: Option<NnuecWorkError>,
     attested: bool,
+    submitted: bool,
+    observation: Option<PreparationObservation>,
+    terminal_ack: Option<NnuecPreparationTerminalAck>,
 }
 
 pub(super) struct NnuecJobCustody {
     pub seal: AdaptiveNnuecReviewSeal,
     pub bound: Arc<BoundNnuecReviewContext>,
     pub receipt: ValueInstallReceipt,
+    // The original actor terminal stays with its exact request/job custody.
+    _terminal_ack: NnuecPreparationTerminalAck,
 }
 
 impl<Q> NnuecWorkPreparation<Q> {
@@ -100,6 +124,7 @@ impl<Q> NnuecWorkPreparation<Q> {
             Digest,
         >,
         slot: usize,
+        owner: CpuWorkerId,
         original: AdaptiveNnuecReviewRequest,
         canceled: Arc<AtomicBool>,
     ) -> Result<Self, NnuecWorkError> {
@@ -125,6 +150,7 @@ impl<Q> NnuecWorkPreparation<Q> {
             work,
             selection,
             slot,
+            owner,
             seal,
             expected,
             canceled,
@@ -139,14 +165,21 @@ impl<Q> NnuecWorkPreparation<Q> {
             unmatched_completion: None,
             failure: None,
             attested: false,
+            submitted: false,
+            observation: None,
+            terminal_ack: None,
         })
     }
 
     /// Encoding and C forward occur only on the Session-owned actor. A full
     /// actor returns the same original Request and selected-view pin.
-    pub fn pump_actor(&mut self, actor: &PreparationActor) -> Result<bool, NnuecWorkError> {
+    pub fn pump_actor(
+        &mut self,
+        actor: &PreparationActor,
+        may_submit: bool,
+    ) -> Result<bool, NnuecWorkError> {
         if self.phase == Phase::Unsubmitted {
-            if self.canceled.load(Ordering::Acquire) {
+            if !may_submit || self.canceled.load(Ordering::Acquire) {
                 return Ok(false);
             }
             let request = self.request.take().ok_or(NnuecWorkError::Invalid(
@@ -155,6 +188,7 @@ impl<Q> NnuecWorkPreparation<Q> {
             match actor.try_submit(request) {
                 Ok(()) => {
                     self.actor_outstanding = true;
+                    self.submitted = true;
                     self.phase = Phase::Submitted;
                     return Ok(true);
                 }
@@ -185,6 +219,8 @@ impl<Q> NnuecWorkPreparation<Q> {
             return Err(error);
         }
         self.actor_outstanding = false;
+        self.observation = Some(completion.observation);
+        self.terminal_ack = Some(completion.terminal_ack);
         match completion.result {
             Ok(bound) => {
                 if bound.provenance() != &self.expected {
@@ -354,7 +390,7 @@ impl<Q> NnuecWorkPreparation<Q> {
     }
 
     pub fn job_ready(&self) -> bool {
-        self.attested && self.installed().is_some()
+        self.attested && self.installed().is_some() && self.terminal_ack.is_some()
     }
 
     pub fn cleanup_settled(&self) -> bool {
@@ -366,6 +402,20 @@ impl<Q> NnuecWorkPreparation<Q> {
     pub fn failure(&self) -> Option<&NnuecWorkError> {
         self.failure.as_ref()
     }
+    pub fn observation(&self) -> NnuecPreparationRecord {
+        NnuecPreparationRecord {
+            frame: self.work.frame,
+            question: self.work.input.question_digest,
+            view: self.work.input.view_seal,
+            owner: self.owner,
+            submitted: self.submitted,
+            actor_terminal: self.observation,
+            // No thread/process CPU clock witness is available here.
+            cpu_thread_time: None,
+            cancellation_requested: self.canceled.load(Ordering::Acquire),
+            manager_error: self.failure.clone(),
+        }
+    }
 
     pub fn into_job_custody(self) -> Result<NnuecJobCustody, Self> {
         if !self.job_ready() {
@@ -375,6 +425,7 @@ impl<Q> NnuecWorkPreparation<Q> {
             seal: self.seal,
             bound: self.bound.expect("installed original Bound"),
             receipt: self.receipt.expect("installed actual owner receipt"),
+            _terminal_ack: self.terminal_ack.expect("original actor terminal"),
         })
     }
 
@@ -431,11 +482,12 @@ where
         &mut self,
         actor: &PreparationActor,
     ) -> Result<bool, AdaptiveManagerError> {
+        let may_submit = self.phase == ManagerPhase::Running && self.can_admit_work();
         let Some(pending) = &mut self.nnuec_pending else {
             return Ok(false);
         };
         let closing = self.phase != ManagerPhase::Running;
-        let mut changed = match pending.pump_actor(actor) {
+        let mut changed = match pending.pump_actor(actor, may_submit) {
             Ok(changed) => changed,
             Err(NnuecWorkError::Preparation(
                 PreparationError::Cancelled | PreparationError::Expired,
@@ -453,7 +505,9 @@ where
                 && self.driver.prepare_semantic_commit()?
             {
                 self.driver.release_cpu_nnuec_installation(&pending.seal)?;
+                let observation = pending.observation();
                 self.nnuec_pending = None;
+                self.retain_nnuec_observation(observation);
                 changed = true;
             }
             return Ok(changed);
@@ -461,7 +515,7 @@ where
         if !self.driver.semantic_owner_available() || !self.driver.prepare_semantic_commit()? {
             return Ok(changed);
         }
-        if let Some(bound) = pending.prepared_bound().cloned() {
+        if let Some(bound) = pending.prepared_bound().filter(|_| may_submit).cloned() {
             let model = Arc::clone(
                 &self
                     .nnuec
@@ -491,9 +545,11 @@ where
         let worker = slot.worker.as_mut().ok_or(AdaptiveManagerError::Invalid(
             "NNUEC selected owner missing",
         ))?;
-        changed |= pending
-            .try_install(worker)
-            .map_err(AdaptiveManagerError::NnuecPreparation)?;
+        if may_submit {
+            changed |= pending
+                .try_install(worker)
+                .map_err(AdaptiveManagerError::NnuecPreparation)?;
+        }
         changed |= pending
             .poll_installation(worker)
             .map_err(AdaptiveManagerError::NnuecPreparation)?;
@@ -554,6 +610,14 @@ where
                 work.clone(),
                 selection,
                 slot,
+                self.own[slot]
+                    .worker
+                    .as_ref()
+                    .ok_or(AdaptiveManagerError::Invalid(
+                        "NNUEC original owner missing",
+                    ))?
+                    .profile()
+                    .owner,
                 request,
                 Arc::clone(&original.canceled),
             )
@@ -593,6 +657,29 @@ where
         self.nnuec_pending
             .as_ref()
             .and_then(NnuecWorkPreparation::failure)
+    }
+    /// Bounded scalar/error records only. No view, bound, model, or large
+    /// statistics snapshot is cloned by the manager event loop.
+    pub fn nnuec_preparation_observations(
+        &self,
+    ) -> impl Iterator<Item = NnuecPreparationRecord> + '_ {
+        self.nnuec_observations.iter().cloned().chain(
+            self.nnuec_pending
+                .as_ref()
+                .map(NnuecWorkPreparation::observation),
+        )
+    }
+    /// An explicit telemetry gap, never an additional search or preparation
+    /// budget. Admission is independent of this bounded detail buffer.
+    pub fn nnuec_preparation_observations_omitted(&self) -> u64 {
+        self.nnuec_observations_omitted
+    }
+    fn retain_nnuec_observation(&mut self, observation: NnuecPreparationRecord) {
+        if self.nnuec_observations.len() == CPU_JOB_CAPACITY {
+            self.nnuec_observations.remove(0);
+            self.nnuec_observations_omitted = self.nnuec_observations_omitted.saturating_add(1);
+        }
+        self.nnuec_observations.push(observation);
     }
 
     /// This transfer does not mark the evaluator/cache released. The Session
@@ -679,6 +766,8 @@ where
             driver: self.driver,
             continuation,
             receipt,
+            preparation_observations: self.nnuec_observations,
+            preparation_observations_omitted: self.nnuec_observations_omitted,
         })
     }
 
@@ -725,6 +814,7 @@ where
             .nnuec_pending
             .take()
             .expect("validated original preparation");
+        let observation = pending.observation();
         let custody = match pending.into_job_custody() {
             Ok(custody) => Arc::new(custody),
             Err(pending) => {
@@ -734,6 +824,7 @@ where
                 ));
             }
         };
+        self.retain_nnuec_observation(observation);
         self.nnuec_jobs.push(Arc::clone(&custody));
         Ok(Some(custody))
     }
@@ -750,6 +841,8 @@ where
         self.nnuec_jobs.clear();
         if let Some(pending) = &self.nnuec_pending {
             self.driver.release_cpu_nnuec_installation(&pending.seal)?;
+            let observation = pending.observation();
+            self.retain_nnuec_observation(observation);
         }
         self.nnuec_pending = None;
         Ok(())

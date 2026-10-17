@@ -49,6 +49,9 @@ pub struct SearchSessionContext {
     /// Private immutable custody issued only by the actual Session Start.
     /// Legacy consumers have no native Rovent work authority through `None`.
     pub(crate) original_start: Option<Arc<crate::engine::DriverStartSource>>,
+    /// Read-only same-Start effective admission/stop clock. It never replaces
+    /// the immutable deadlines of an already submitted role or CPU job.
+    pub effective_clock: Option<crate::rovent_ponder::RoventPonderClockHandle>,
     /// Canonical root-only subset. Child legal/policy order remains Rules-owned.
     pub root_moves: Option<Arc<[BoardMove]>>,
     pub goal: rz_contracts::rovent::SearchGoal,
@@ -60,6 +63,13 @@ pub struct SearchSessionContext {
     pub(crate) current: Arc<Mutex<SessionScope>>,
 }
 impl SearchSessionContext {
+    pub fn soft_expired(&self, now: Instant) -> bool {
+        self.effective_clock
+            .as_ref()
+            .map_or(now >= self.control.soft_deadline, |clock| {
+                clock.snapshot(now).soft_expired(now)
+            })
+    }
     /// Called at a task/commit boundary. An old root cannot mutate a new root.
     pub fn accepts(&self) -> Result<bool, ContractError> {
         let current = self.current.lock().map_err(|_| {
@@ -1871,6 +1881,11 @@ impl std::error::Error for SearchSessionFailure {}
 /// from `run` acknowledges bounded completion/drain, not just logical cancel.
 /// Progress is advisory: UCI checks its exact root legal set and authority.
 pub trait SearchSessionDriver: Send + Sync + 'static {
+    /// Opt in only when the actual root owner consumes the effective clock.
+    /// Legacy hit-to-stop behavior remains a separate compatibility path.
+    fn supports_ponder_clock(&self) -> bool {
+        false
+    }
     /// The node unit is explicit. Legacy simulation limits are not reused as
     /// Rovent position-visit limits or converted into role/NN call counts.
     fn node_budget_semantics(&self) -> crate::bridge::NodeBudgetSemantics {
@@ -2320,6 +2335,7 @@ mod tests {
                 original_go: None,
                 original_time_budget: None,
                 original_start: None,
+                effective_clock: None,
                 requested_nodes: None,
                 control,
                 cancellation: CancelToken::new(),
@@ -2578,6 +2594,7 @@ mod tests {
             original_go: None,
             original_time_budget: None,
             original_start: None,
+            effective_clock: None,
             requested_nodes: None,
             control,
             cancellation: CancelToken::new(),

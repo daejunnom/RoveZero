@@ -307,6 +307,29 @@ impl<P: PositionPort> Session<P> {
         self.active.as_ref().map(|a| a.ticket.clone())
     }
 
+    /// Same-ticket concrete-owner transition. Only output ownership changes:
+    /// no new worker, root, credit or deadline is created. A result already
+    /// consumed while pondering is released once without canceling its work.
+    pub(crate) fn release_ponder_hit(
+        &mut self,
+        ticket: &SearchTicket,
+    ) -> SessionResult<P::Snapshot> {
+        if self.closed || !self.matches(ticket) {
+            return stale();
+        }
+        let active = self.active.as_mut().expect("matching original ticket");
+        if !active.infinite {
+            return stale();
+        }
+        active.infinite = false;
+        let completed = active.completion_consumed;
+        let mut out = SessionResult::default();
+        if completed {
+            self.finish(&mut out, None);
+        }
+        out
+    }
+
     pub fn handle_line(&mut self, line: &str) -> SessionResult<P::Snapshot> {
         if self.closed {
             return SessionResult::reject("SessionClosed", "UCI session is closed");

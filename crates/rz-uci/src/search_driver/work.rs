@@ -587,6 +587,7 @@ mod tests {
             original_go: None,
             original_time_budget: None,
             original_start: None,
+            effective_clock: None,
             requested_nodes: None,
             control: SearchControl::new(until, 10),
             cancellation: CancelToken::new(),

@@ -74,6 +74,7 @@ fn context<M: RoleModel + 'static>(driver: &RoventSessionDriver<M>) -> SearchSes
         original_go: None,
         original_time_budget: None,
         original_start: None,
+        effective_clock: None,
         requested_nodes: None,
         control: SearchControl::new(deadline, 4096),
         cancellation: CancelToken::new(),

@@ -157,6 +157,7 @@ pub(crate) fn issue_start(
         original_go: Some(Arc::new(original_go)),
         original_time_budget: Some(*binding.budget()),
         original_start: None,
+        effective_clock: None,
         root_moves,
         goal: binding.goal(),
         requested_nodes: limits.nodes,

@@ -87,6 +87,7 @@ const MAX_ROLE_PENDING: usize = 16;
 
 mod cleanup;
 mod collection;
+mod effective_clock;
 mod frontier;
 mod goal_local;
 mod goals;
@@ -97,7 +98,9 @@ mod role_only;
 use cleanup::{CleanupBoundary, automatic_cleanup_deadline};
 pub use collection::*;
 pub use frontier::{RoventNativeAccountingObservation, RoventReviewLeaseObservation};
-pub use nnuec::{AdaptiveNnuecRetiredOwner, AdaptiveNnuecRootParts, NnuecWorkError};
+pub use nnuec::{
+    AdaptiveNnuecRetiredOwner, AdaptiveNnuecRootParts, NnuecPreparationRecord, NnuecWorkError,
+};
 pub use reciprocal::{
     PeerFollowupDisposition, PeerFollowupObservation, RoventPeerFollowupPolicy,
     RoventReciprocalPolicy,
@@ -165,6 +168,7 @@ pub enum AdaptiveManagerError {
     Frontier(FrontierError),
     GoalLocalBlocked(GoalLocalBlockReason),
     NnuecPreparation(NnuecWorkError),
+    AdmissionClosed,
     ReviewLeaseBackpressure {
         current: usize,
         capacity: usize,
@@ -1583,6 +1587,7 @@ where
     native_accounting: AdaptiveNativeAccountingSnapshot,
     shutdown_until: Option<Instant>,
     cleanup_boundary: Option<CleanupBoundary>,
+    effective_clock: Option<crate::rovent_ponder::RoventPonderClockHandle>,
     native_ready: bool,
     native_verifier_registered: bool,
     retained_native_permits: Vec<NativeAcceptancePermit>,
@@ -1617,6 +1622,8 @@ where
     nnuec: Option<nnuec::NnuecRootPreparation>,
     nnuec_pending: Option<nnuec::NnuecWorkPreparation<Q>>,
     nnuec_jobs: Vec<Arc<nnuec::NnuecJobCustody>>,
+    nnuec_observations: Vec<NnuecPreparationRecord>,
+    nnuec_observations_omitted: u64,
 }
 
 impl<Q, B, D> AdaptiveExecutionManager<Q, B, D>
@@ -1995,6 +2002,7 @@ where
             native_accounting: AdaptiveNativeAccountingSnapshot::default(),
             shutdown_until: None,
             cleanup_boundary,
+            effective_clock: None,
             native_ready,
             native_verifier_registered,
             retained_native_permits: Vec::with_capacity(limits.role_tickets_max),
@@ -2027,6 +2035,8 @@ where
             nnuec: None,
             nnuec_pending: None,
             nnuec_jobs: Vec::with_capacity(CPU_JOB_CAPACITY),
+            nnuec_observations: Vec::with_capacity(CPU_JOB_CAPACITY),
+            nnuec_observations_omitted: 0,
         })
     }
     pub fn new_continued(
@@ -2780,6 +2790,9 @@ where
         input: FrameInput<ReviewView, Q>,
         purpose: RolePurpose,
     ) -> Result<PreparationId, AdaptiveManagerError> {
+        if !self.can_admit_work() {
+            return Err(AdaptiveManagerError::AdmissionClosed);
+        }
         if let Some(scope) = &self.exclusive_scope {
             let allowed = match purpose {
                 RolePurpose::RootRanking | RolePurpose::RoventGoalLocal => false,
@@ -2867,6 +2880,9 @@ where
     pub fn tick(&mut self) -> Result<bool, AdaptiveManagerError> {
         if self.phase == ManagerPhase::Finished {
             return Ok(false);
+        }
+        if self.phase == ManagerPhase::Running && self.effective_hard_expired() {
+            self.begin_selected_shutdown(self.cleanup_until()?)?;
         }
         let mut changed = false;
         match self.driver.poll_auxiliary() {
@@ -3023,6 +3039,7 @@ where
     }
     fn schedule_root_round(&mut self) -> Result<bool, AdaptiveManagerError> {
         if !self.root_started
+            || !self.can_admit_work()
             || self.ordinary_pending_work()
             || !self.failures.is_empty()
             || self.exclusive_scope.is_some()
@@ -3095,7 +3112,10 @@ where
         Ok(())
     }
     fn record_failure(&mut self, error: AdaptiveManagerError) {
-        if matches!(error, AdaptiveManagerError::AuxiliaryPending) {
+        if matches!(
+            error,
+            AdaptiveManagerError::AuxiliaryPending | AdaptiveManagerError::AdmissionClosed
+        ) {
             return;
         }
         if let AdaptiveManagerError::ReviewLeaseBackpressure {
@@ -4168,7 +4188,7 @@ where
         Ok(changed)
     }
     fn dispatch_roles(&mut self) -> Result<bool, AdaptiveManagerError> {
-        if !self.native_ready {
+        if !self.native_ready || !self.can_admit_work() {
             return Ok(false);
         }
         while let Some(dispatch) = self.registry.take_dispatch() {
@@ -5393,6 +5413,9 @@ where
             return Ok(false);
         }
         let peers_changed = self.drive_accepted_role_parents()?;
+        if !self.can_admit_work() {
+            return Ok(peers_changed);
+        }
         let reciprocal_changed = self.admit_waiting_reciprocal_questions()?;
         let now = self.check_running()?;
         let now_duration = Duration::from_nanos(now.0);
@@ -5684,17 +5707,16 @@ where
                     .set_dependencies_ready(&id, eligible)
                     .map_err(|_| AdaptiveManagerError::Invalid("ready dependency update"))?;
             }
-            let selected = if let Some(pending) = self
-                .nnuec_pending
-                .as_ref()
-                .filter(|pending| pending.job_ready())
-            {
-                Some(pending.selection.clone())
-            } else {
-                self.ready
-                    .select(now_duration, None)
-                    .map_err(|_| AdaptiveManagerError::Invalid("ready fairness selector"))?
-            };
+            let selected =
+                if let Some(pending) = self.nnuec_pending.as_ref().filter(|pending| {
+                    pending.job_ready() && pending.slot < usize::from(advice.workers)
+                }) {
+                    Some(pending.selection.clone())
+                } else {
+                    self.ready
+                        .select(now_duration, None)
+                        .map_err(|_| AdaptiveManagerError::Invalid("ready fairness selector"))?
+                };
             let Some(selected) = selected else {
                 break;
             };
@@ -6260,7 +6282,10 @@ where
                 role_service,
                 yield_overhead,
                 backlog,
-                waiting_cpu_jobs: self.ready.len(),
+                waiting_cpu_jobs: self
+                    .ready
+                    .len()
+                    .saturating_add(usize::from(self.nnuec_pending.is_some())),
                 // Typed S forecast is distinct from realized benefit/witness.
                 selected_progress: selected.map(|selection| WorkerProgress {
                     has_new_consistent_progress: true,
@@ -6277,6 +6302,9 @@ where
         requested_credit: u64,
         requested_lease: Duration,
     ) -> Result<(), AdaptiveManagerError> {
+        if !self.can_admit_work() {
+            return Err(AdaptiveManagerError::AdmissionClosed);
+        }
         let profile = self.own[index]
             .worker
             .as_ref()
@@ -6472,6 +6500,9 @@ where
         credit: u64,
         lease: Duration,
     ) -> Result<(), AdaptiveManagerError> {
+        if !self.can_admit_work() {
+            return Err(AdaptiveManagerError::AdmissionClosed);
+        }
         if self.own[index].worker.is_none() {
             return Err(AdaptiveManagerError::Invalid("paused CPU worker joined"));
         }
@@ -6686,6 +6717,9 @@ where
         work: CoordinatorWork<ReviewView, Q>,
         question: ForeignCpuQuestion,
     ) -> Result<(), AdaptiveManagerError> {
+        if !self.can_admit_work() {
+            return Err(AdaptiveManagerError::AdmissionClosed);
+        }
         if self.registration.endpoints.cpu_r != CpuEndpoint::ExternalUci
             && self.registration.endpoints.cpu_t != CpuEndpoint::ExternalUci
         {

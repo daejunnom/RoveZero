@@ -40,6 +40,7 @@ pub mod process_receipts;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 pub mod rovent_bootstrap;
 pub mod rovent_driver;
+pub mod rovent_ponder;
 #[cfg(feature = "pals-adaptive")]
 pub mod rovent_external_launch;
 #[cfg(feature = "pals-adaptive")]
