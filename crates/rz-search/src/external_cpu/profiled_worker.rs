@@ -23,6 +23,12 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+mod current_root;
+pub use current_root::{
+    ExternalRootSource, ProfiledExternalCurrentRootFence, ProfiledExternalResetProof,
+    ProfiledExternalRootSource,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProfiledExternalScope {
     pub question: ReciprocalQuestionId,
@@ -230,6 +236,17 @@ struct RootState {
     fence_sequence: u64,
     execution_high_water: u64,
     last_question: Option<QuestionEnvelope>,
+    source_sequence: u64,
+    process: Option<ExternalProcessIdentity>,
+    accepted_jobs: u64,
+    terminal_controls: u64,
+    drained_terminals: u64,
+    lifecycle_failure: Option<CheckerError>,
+    quiesce: Option<current_root::QuiesceRequest>,
+    quiesce_result: Option<Result<ProfiledExternalCurrentRootFence, CheckerError>>,
+    initial_reset: Option<ProfiledExternalResetProof>,
+    current_reset: Option<ProfiledExternalResetProof>,
+    reset_sequence: u64,
 }
 
 #[derive(Debug)]
@@ -316,14 +333,7 @@ impl ProfiledExternalWorker {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_deadline = Arc::new(Mutex::new(None));
         let startup = Arc::new(Mutex::new(None));
-        let roots = Arc::new(Mutex::new(RootState {
-            authority: initial_root,
-            transition: None,
-            result: None,
-            fence_sequence: 0,
-            execution_high_water: 0,
-            last_question: None,
-        }));
+        let roots = Arc::new(Mutex::new(RootState::new(initial_root)));
         let diagnostics = Arc::new(Mutex::new(None));
         let worker_diagnostics = diagnostics.clone();
         let (
@@ -344,6 +354,10 @@ impl ProfiledExternalWorker {
         let thread = std::thread::Builder::new()
             .name(format!("rz-profiled-external-{}", owner.0))
             .spawn(move || {
+                let _admission = current_root::WorkerAdmissionGuard {
+                    shutdown: Arc::clone(&worker_shutdown),
+                    mailbox: worker_mailbox.clone(),
+                };
                 run_worker(
                     worker_config,
                     profile,
@@ -451,6 +465,12 @@ impl ProfiledExternalWorker {
             process,
             root_restriction: external_root_restriction_digest(job.root_moves.as_deref()),
         };
+        let accepted_jobs = roots
+            .accepted_jobs
+            .checked_add(1)
+            .ok_or(CheckerError::Invalid(
+                "profiled accepted job count overflow",
+            ))?;
         self.mailbox
             .admit(
                 TimedJob {
@@ -467,12 +487,20 @@ impl ProfiledExternalWorker {
             })?;
         roots.execution_high_water = dispatch.scope.execution.sequence;
         roots.last_question = Some(dispatch.question);
+        roots.accepted_jobs = accepted_jobs;
         Ok(dispatch)
     }
 
     pub fn take_completion(&self) -> Option<ProfiledExternalCompletion> {
         let result = self.mailbox.take_reliable();
         if result.is_some() {
+            let mut roots = self.roots.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(next) = roots.drained_terminals.checked_add(1) {
+                roots.drained_terminals = next;
+            } else {
+                roots.lifecycle_failure = Some(error("profiled_root", "terminal_count_overflow"));
+            }
+            drop(roots);
             self.mailbox.signal().notify();
         }
         result
@@ -498,6 +526,12 @@ impl ProfiledExternalWorker {
             .roots
             .lock()
             .map_err(|_| error("profiled_root", "state_poisoned"))?;
+        if roots.lifecycle_failure.is_some() {
+            return Err(error("profiled_root", "lifecycle_accounting_failed"));
+        }
+        if roots.quiesce.is_some() && !matches!(&roots.quiesce_result, Some(Ok(_))) {
+            return Err(error("profiled_root", "current_quiesce_not_completed"));
+        }
         if next.epoch != roots.authority.epoch
             || next.implementation != roots.authority.implementation
             || next.game.0 < roots.authority.game.0
@@ -527,6 +561,8 @@ impl ProfiledExternalWorker {
                 until,
             });
             roots.result = None;
+            roots.quiesce = None;
+            roots.quiesce_result = None;
         }
         drop(roots);
         self.mailbox.signal().notify();
@@ -662,6 +698,8 @@ fn validate_root_admission(
     job: &ProfiledExternalJob,
 ) -> Result<(), CheckerError> {
     if roots.transition.is_some()
+        || roots.quiesce.is_some()
+        || roots.lifecycle_failure.is_some()
         || roots.authority != job.question.id.authority
         || job.execution.sequence <= roots.execution_high_water
         || roots.last_question.is_some_and(|previous| {
@@ -721,8 +759,7 @@ fn physical_fence(
     let root = roots
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .transition
-        .map(|t| t.until);
+        .physical_deadline();
     match (shutdown, root) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -750,8 +787,7 @@ impl ExternalControl for JobControl {
             .roots
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .transition
-            .is_some()
+            .is_revoked()
         {
             (0, ExternalControlAction::Revoked)
         } else if let Some(sequence) = snapshot.pending_yield() {
@@ -857,9 +893,35 @@ fn run_worker(
     let mut checker = ExternalUciCpuChecker::create_profiled(config.clone(), profile, purpose)?;
     checker.launch_pin = launch_pin;
     let evaluation_namespace = external_evaluation_namespace(&config.identity)?;
+    let startup_started = Instant::now();
     let startup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let read_fence = || physical_fence(&shutdown_deadline, &roots);
-        checker.start_with_cleanup_fence(startup_deadline, &shutdown, Some(&read_fence))
+        checker.start_with_cleanup_fence(startup_deadline, &shutdown, Some(&read_fence))?;
+        let mut attempt = checker.last_attempt().cloned();
+        let result = checker
+            .reset_game_with_fence(startup_deadline, &shutdown, Some(&read_fence))
+            .and_then(|()| {
+                current_root::register_initial_reset(
+                    &mut checker,
+                    &roots,
+                    &shutdown,
+                    owner,
+                    clock,
+                    profile,
+                    purpose,
+                )
+            });
+        if let Some(attempt) = attempt.as_mut() {
+            attempt.elapsed = startup_started.elapsed();
+            if let Some(external) = attempt.external.as_mut() {
+                external.process = checker
+                    .owner
+                    .as_ref()
+                    .map_or(external.process, |process| process.evidence());
+            }
+        }
+        checker.last_attempt = attempt;
+        result
     }))
     .unwrap_or_else(|_| {
         checker.failed = true;
@@ -905,7 +967,7 @@ fn run_worker(
                     let root = roots
                         .lock()
                         .map_err(|_| error("profiled_admission", "root_state_poisoned"))?;
-                    if root.transition.is_some() || root.authority != job.question.id.authority {
+                    if root.is_revoked() || root.authority != job.question.id.authority {
                         return Err(error("profiled_admission", "root_revoked_before_go"));
                     }
                     drop(root);
@@ -1021,6 +1083,13 @@ fn run_worker(
                 }
             }
             let controls = job.control.seal_terminal();
+            {
+                let mut root = roots.lock().unwrap_or_else(|p| p.into_inner());
+                root.terminal_controls = root
+                    .terminal_controls
+                    .checked_add(1)
+                    .ok_or_else(|| error("profiled_worker", "terminal_control_count_overflow"))?;
+            }
             let mut retained_timing = *timing.lock().unwrap_or_else(|p| p.into_inner());
             retained_timing.returned_at = Some(Instant::now());
             let completion = ProfiledExternalCompletion {
@@ -1068,6 +1137,19 @@ fn run_worker(
         if shutdown.load(Ordering::Acquire) {
             break;
         }
+        if current_root::poll_quiesce(
+            &mut checker,
+            &roots,
+            &shutdown,
+            &shutdown_deadline,
+            &mailbox,
+            owner,
+            clock,
+            profile,
+            purpose,
+        ) {
+            continue;
+        }
         let transition = {
             let root = roots.lock().unwrap_or_else(|p| p.into_inner());
             root.result.is_none().then_some(root.transition).flatten()
@@ -1085,6 +1167,10 @@ fn run_worker(
             if occupancy.commands == 0
                 && occupancy.reliable_queued == 0
                 && occupancy.reliable_reserved == 0
+                && roots
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .terminals_drained()
             {
                 mailbox.take_progress();
                 let read_fence = || physical_fence(&shutdown_deadline, &roots);
@@ -1100,7 +1186,10 @@ fn run_worker(
                         checker.ready_with_fence(transition.until, &shutdown, Some(&read_fence))?;
                     }
                     let process = checker.owner()?.evidence();
-                    if !reusable_process(process) {
+                    if !reusable_process(process)
+                        || process.process_identity
+                            != roots.lock().unwrap_or_else(|p| p.into_inner()).process
+                    {
                         return Err(error("profiled_root", "owner_not_reusable"));
                     }
                     Ok(process)
@@ -1118,6 +1207,12 @@ fn run_worker(
                     }) {
                         return Err(error("profiled_root", "late_or_replaced_ready"));
                     }
+                    if root.lifecycle_failure.is_some()
+                        || root.accepted_jobs != root.terminal_controls
+                        || root.accepted_jobs != root.drained_terminals
+                    {
+                        return Err(error("profiled_root", "terminal_accounting_incomplete"));
+                    }
                     Ok(ProfiledExternalRootFence {
                         previous: transition.previous,
                         next: transition.next,
@@ -1130,8 +1225,28 @@ fn run_worker(
                 });
                 if result.is_ok() {
                     root.authority = transition.next;
+                    root.source_sequence = transition.sequence;
                     root.transition = None;
                     root.last_question = None;
+                    root.current_reset = None;
+                    if reset {
+                        if let Err(failure) = current_root::register_transition_reset(
+                            &roots,
+                            &shutdown,
+                            &mut root,
+                            transition.previous,
+                            owner,
+                            clock,
+                            profile,
+                            purpose,
+                        ) {
+                            root.lifecycle_failure = Some(failure.clone());
+                            root.result = Some(Err(failure));
+                            drop(root);
+                            mailbox.signal().notify();
+                            continue;
+                        }
+                    }
                 }
                 root.result = Some(result);
                 drop(root);
@@ -1332,14 +1447,7 @@ mod tests {
     #[test]
     fn old_go_and_mutated_same_question_cannot_reuse_admission() {
         let (mut job, _, _) = fixture();
-        let mut roots = RootState {
-            authority: job.question.id.authority,
-            transition: None,
-            result: None,
-            fence_sequence: 0,
-            execution_high_water: 0,
-            last_question: None,
-        };
+        let mut roots = RootState::new(job.question.id.authority);
         assert!(validate_root_admission(&roots, &job).is_ok());
         roots.execution_high_water = job.execution.sequence;
         roots.last_question = Some(job.question);

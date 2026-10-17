@@ -32,6 +32,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 mod actual_root;
+mod frontier_source;
+pub use frontier_source::RoventAdmittedExternalRootSource;
 mod collection_teacher;
 pub use collection_teacher::RoventCollectionTeacherOwner;
 
@@ -183,6 +185,19 @@ impl PreparedRoventExternalLaunch {
     pub fn binary(&self) -> &ArtifactRef {
         &self.binary
     }
+    /// 선언된 설정만 반환한다. 원 FD 검증·startup·actual root·target의 증거가 아니다.
+    pub fn configuration(
+        &self,
+    ) -> Result<rz_search::external_cpu::ExternalCpuConfig, CheckerError> {
+        self.profile.configuration()
+    }
+    /// 기존 unstarted checker를 metadata 대조에 재사용한다. 이 호출은
+    /// 프로세스/pipe를 시작하지 않으며 실제 worker는 별도 원 FD를 소비한다.
+    pub fn checker_declaration(
+        &self,
+    ) -> Result<rz_search::external_cpu::ExternalUciCpuChecker, CheckerError> {
+        self.profile.checker()
+    }
 
     pub fn require_query(
         &self,
@@ -308,6 +323,9 @@ impl PreparedRoventExternalLaunch {
 }
 
 impl RoventExternalOwner {
+    pub fn launch(&self) -> &PreparedRoventExternalLaunch {
+        &self.launch
+    }
     pub fn worker(&self) -> &ProfiledExternalWorker {
         &self.worker
     }

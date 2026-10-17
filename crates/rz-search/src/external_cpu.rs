@@ -24,11 +24,13 @@ use std::time::{Duration, Instant};
 
 pub mod adaptive;
 pub mod collection_teacher;
+mod profiled_researcher;
 pub mod profiled_worker;
 pub mod profiles;
 pub mod worker;
 
 pub use adaptive::*;
+pub use profiled_researcher::ProfiledResearcherAdmission;
 pub use profiled_worker::*;
 pub use profiles::*;
 
