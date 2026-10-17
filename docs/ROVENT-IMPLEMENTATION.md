@@ -552,3 +552,44 @@ CaptureError 표시 변환 오류가 발견돼 전체 통과로 표시하지 않
 utility checkpoint/export 연결, 총괄의 최신 Rust·형식·CI 및 최종 source literal
 검사다. optimizer를 호출하지 않는 tensor 검사와 실제 모델·로컬 GPU 수명 인수는
 순수 검사의 통과 수와 별도로 관리한다. 실제 학습·원격 비교·PR 병합은 실행하지 않는다.
+
+
+## 열한 번째 통합 체크포인트
+
+`4fa43c2`의 Linux 대상 workspace 전체 feature·전체 target 타입 검사와 형식 검사가
+통과했다. 같은 소스의 runtime 82개, search 971개, UCI 712개 검사도 통과했다.
+search의 기존 선택 실행 2개는 미실행이다. 신경망 import·optimizer를 차단한 Windows
+순수 소비자 검사는 462개 통과했다. suite 간 중복이 있으므로 이 수를 합산하지 않는다.
+같은 소스의 Clippy는 UCI 구조·기계적 지적으로 실패했으며, 후속 수정의 통과를 이
+원 실행에 소급하지 않는다.
+
+`bfe9037`은 선택형 cohort의 실제 Ready inventory, 원 trial admission, 강제 recipient의
+원 offer 선택, 같은 actor의 cache ACK와 물리 퇴역·PinZero를 연결한 WIP다.
+trial마다 새 native product를 준비하며 원 authority·시계·입력·자원 근거를 보존한다.
+서로 다른 trial의 절대 tick이나 마지막 publication의 clock을 수치로 비교하지 않는다.
+trial 간 순서는 원 durable ACK와 등록 sequence로만 연결한다. 이 고정 소스의 후속
+검사는 진행 중이며 첫 전체 feature 빌드는 JSON macro 안의 배열 문법으로 실패했다.
+이를 정상 실행이나 cohort 양성 인수로 표시하지 않는다.
+
+원 Store 관측의 기존 binary framing은 일부 conditional comparison basis를 전부
+포함하지 않는다. SHA·known flag·종료 bool만으로 과거 원 근거를 복구하지 않는다.
+새 cohort의 양성 효용을 위해 실제 owner에서 별도 basis를 봉인하고 원 observation·
+witness·publication과 대조한다. 근거가 빠진 과거 자료는 계속 unknown/masked다.
+기존 framing·codec·canonical bytes와 이미 게시된 기록은 바꾸지 않는다.
+
+계속 병렬 진행하는 잔여는 다음과 같다.
+
+1. CPU·Core·Manager·E: 별도 conditional basis와 실제 cohort 상위 실행기·bounded
+   materialization·durable publication·역사 reader를 끝까지 연결한다. 실제 물리
+   퇴역 전에 원 View·Bound·자료 owner를 해제하지 않는다.
+2. MF·F: tagged PC/R/utility 조상과 현재 cohort의 원 FD 소비, 다섯 상태 checkpoint,
+   export 및 재개 소비자를 연결한다. 신규 utility window의 명시 checkpoint 여유로
+   새 forward/update admission을 일찍 닫되 원 hard deadline은 늘리지 않는다.
+3. 총괄: 최신 고정 SHA의 전체 feature·기본 feature·순수 검사·Clippy를 재검증하고,
+   실제 source closure와 literal review profile 및 CI를 확인한다.
+4. 별도 실행 인수: optimizer를 호출하지 않는 실제 tensor·checkpoint·export와
+   local RTX 4050의 수치·물리 수명·정상 종료를 확인한다. 로컬 자료를 원격 성능·
+   기력 비교나 실제 학습 완료로 사용하지 않는다.
+
+실제 optimizer update·본학습·원격 비교·PR 병합은 실행하지 않았으며 이번 목표에서
+실제 학습을 제외하는 사용자 지시는 유지한다. 목표는 계속 진행한다.
