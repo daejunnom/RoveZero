@@ -593,3 +593,67 @@ witness·publication과 대조한다. 근거가 빠진 과거 자료는 계속 u
 
 실제 optimizer update·본학습·원격 비교·PR 병합은 실행하지 않았으며 이번 목표에서
 실제 학습을 제외하는 사용자 지시는 유지한다. 목표는 계속 진행한다.
+
+## 열두 번째 통합 체크포인트
+
+`bbb0675`의 Linux 대상 workspace 전체 feature·전체 target 타입 검사와 Clippy가
+통과했다. Windows에서 실제로 실행한 UCI 723개, arena 299개, 조건부 근거 8개,
+취소된 permit 1개, 기존 backend 식별 byte 호환 1개 검사도 통과했다. 검사 프로세스
+종료와 관리 scratch 정리를 확인했다. 서로 겹치는 suite의 통과 수는 합산하지 않는다.
+
+`5341d90`에는 저장된 수치 자료만 검증하는 명시 CLI를 추가했다. 같은 원 FD의
+크기·SHA와 변조 상태를 검사하고 기존 numerical admission validator를 호출한다.
+현재 native 권한·readiness·GPU 물리 완료를 새로 발급하지 않는다. 시간 검사는
+기존 streamed hash·validator의 호출 경계와 작은 read에서 수행하며 내부 강제
+선점을 제공한다고 표시하지 않는다. inode의 동시 쓰기를 동결하는 장치도 아니다.
+Linux 기본 feature 3개·인수 feature 5개, Windows 기본 3개·인수 4개 검사가
+통과했다. 같은 소스의 compiled inventory 검사와 실제 Linux 실행 파일 빌드,
+Linux 대상 전체 Clippy도 통과했다.
+
+실제 비학습 모델 검사는 다음 두 실행을 구분한다.
+
+- `024f303`의 단순 초기화·P/C export·Python 수치 검사는 성공했지만 원 G0
+  initialization evidence가 없는 진단 실행이다. 이 자료를 정식 G0로 재표기하지 않는다.
+- `5341d90`에서는 새 디렉터리에서 실제 `initialize_g0_with_evidence`를 호출했다.
+  seed 23의 미학습 checkpoint, V-free P/C export, CPU Torch reference와 실제
+  Rust·ORT CPU raw를 생성했다. 기존 validator가 Fresh B1·FP32·TF32 off의
+  12그룹·100사례와 입력 tensor 974,988 bytes를 대조해 통과했다. 실제 native
+  NN 입력 완료는 public/role을 합쳐 200개이며, 사례 수·탐색 소비·방문 수와 다르다.
+
+원 raw에서 재계산한 최대 절대 차이는 logits `2.1457672119140625e-6`, policy
+`2.3100085400074022e-8`, WDL `2.0932634803294548e-7`이다. 기존 절대·상대
+허용 오차를 유지했다. Rust native worker join과 외부 process exit 0을 보존했다.
+optimizer·backward 호출 및 시도는 모두 0회다. 이는 tensor 수치·기본 수명 인수이며,
+독립 Rules 인코더·현재 GPU·대국·성능·기력·학습 인수로 확대하지 않는다.
+
+### N05의 별도 개입 정책
+
+기존 `/1`은 이미 실제로 Ready인 작업 중에서 선택한다. 보통 같은 first의 P→R→C는
+한 frame의 순차 transition이며, reciprocal 진행 중의 원 custody는 clean snapshot
+조건을 만족하지 않는다. 서로 다른 first의 P/R offer를 같은 target의 비교로 묶을 수
+없다. 따라서 `/1` 실행 선언과 CPU 검사만으로 실제 P/C/R 비교 쌍이 만들어졌다고
+표시하지 않는다.
+
+사용자의 추가 선택에 따라 `/2`는 기본 탐색과 분리한 선택형 실험 정책이다.
+`RoventUtilityInterventionCohortV2`와 `FrozenProposalReviewV1`을 명시하고,
+같은 bounded prelude에서 실제로 만든 공통 target bundle과 원 NNUEC 입력을
+고정한다. 독립 root마다 실제 P 제안 연장, C divergence 또는 own R 검증 중 하나를
+발주한다. 처음 정책은 실제 counter 근거 없는 Repair를 만들지 않는다.
+
+공통 target·Rules 전체 이력·선택 records·관계·first·NNUEC 입력의 seal과, 각 arm의
+실제 purpose별 query/view seal은 별도로 보존한다. 기존 Ready offer·accepted role
+출처를 위조하거나 서로 다른 role query를 같은 full view라고 부르지 않는다. Search가
+발행한 move-only target/candidate를 coordinator의 별도 admission으로 소비한다.
+원 source frame의 이중 실행을 막고 그 원문·증거는 root 물리 종료까지 보존한다.
+
+profile은 `rz-rovent-utility-comparison-cohort/2`, target은
+`rz-rovent-utility-intervention-target/1`, trial·pair는 각각 기존과 다른 `/2`
+domain이다. `/1` canonical bytes·parser·역사 기록은 그대로 유지한다. 최소 두 개의
+선언 arm이 필요하며 실제 전제가 없는 arm은 명시적인 unsupported/미해결이다.
+원 shared credit·deadline·실제 비용·같은 actor의 release/cache ACK·PinZero·durable
+publication을 보존한다. 선언이나 역직렬화 자체는 실행 권한을 발급하지 않는다.
+
+남은 병렬 작업은 `/2`의 Search·manager·Arena·엄격 FD reader 연결과 실제 독립
+trial 인수, 네 모드의 실제 UCI 및 외부 교사 연결, 현재 source/binary/CI 확인이다.
+로컬 RTX 4050 수치·물리 수명·정상 종료는 별도로 진행하며 성능 자료로 사용하지 않는다.
+실제 학습·대규모 수집·원격 성능/기력 비교·PR 병합은 이번 목표에서 제외한다.
