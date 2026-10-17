@@ -30,12 +30,12 @@ from test_repair_context import RepairFixture
 from test_semantic_verifier import SemanticFixture, tokens
 import test_training as fixtures
 from native_source_review_fixture import (
-    SUCCESSOR_REVIEWED_SOURCE_COMMIT as REVIEWED_SOURCE_COMMIT,
-    SUCCESSOR_REVIEWED_TRANSITION_PINS as REVIEWED_TRANSITION_PINS,
-    SUCCESSOR_SYNTHETIC_COMPILED_FACT as SYNTHETIC_COMPILED_FACT,
-    successor_fixture_manifest as fixture_manifest,
-    successor_fixture_review_scope as fixture_review_scope,
-    read_successor_fixture_sources as read_reviewed_fixture_sources,
+    PC_SHARED_REVIEWED_SOURCE_COMMIT as REVIEWED_SOURCE_COMMIT,
+    PC_SHARED_REVIEWED_TRANSITION_PINS as REVIEWED_TRANSITION_PINS,
+    PC_SHARED_SYNTHETIC_COMPILED_FACT as SYNTHETIC_COMPILED_FACT,
+    pc_shared_fixture_manifest as fixture_manifest,
+    pc_shared_fixture_review_scope as fixture_review_scope,
+    read_pc_shared_fixture_sources as read_reviewed_fixture_sources,
 )
 
 
@@ -542,6 +542,43 @@ class NativeSlotClosureConsumerTests(unittest.TestCase):
 
 
 class ReviewedFixtureSuccessorTests(unittest.TestCase):
+    def test_pc_shared_bank_preserves_both_earlier_banks_and_requires_its_own_fact(self):
+        import native_source_review_fixture as banks
+        from rz_pals_model import native_source_review as reviewed
+        prior = banks.fixture_profile("default_disabled")
+        successor = banks.successor_fixture_profile("default_disabled")
+        pc_shared = banks.pc_shared_fixture_profile("default_disabled")
+        engine = slot_witness._SOURCE_PATHS[0]
+        self.assertEqual(banks.pc_shared_fixture_manifest()["source_commit"],
+                         "47b602087de810dbe77c1489a7459202de3dfc9f")
+        self.assertEqual(pc_shared["component_pins"][engine], {"bytes": 423219,
+            "sha256": "6f89838c7e95ff067bac86432c36ee221cf29acc334fe16d0f4f2b96c2d825d7"})
+        self.assertEqual(len(pc_shared["component_pins"]), 14)
+        self.assertEqual([path for path in successor["component_pins"]
+            if successor["component_pins"][path] != pc_shared["component_pins"][path]], [engine])
+        self.assertEqual(pc_shared["component_pins"][engine]["bytes"]
+                         - successor["component_pins"][engine]["bytes"], 306)
+        self.assertEqual(len({prior["review_id"], successor["review_id"], pc_shared["review_id"]}), 3)
+        before = copy.deepcopy(reviewed.REVIEWED_CLOSURE_PROFILES)
+        for lane in ("default_disabled", "legacy_single_reply"):
+            with banks.pc_shared_fixture_review_scope(lane) as profile:
+                source = {"native": {"search_implementation_sha256": banks.PC_SHARED_SYNTHETIC_COMPILED_FACT}}
+                proof = reviewed.review_transition_sources(pair=profile["transition_sources"],
+                    manifest=banks.pc_shared_fixture_manifest(), source=source, lane=lane)
+                self.assertEqual(proof["closure_sha256"], banks.PC_SHARED_REVIEWED_CLOSURE_SHA256)
+                self.assertIs(proof["historical_metadata_only"], True)
+                for name in ("execution_authorized", "original_native_authority_reissued",
+                             "rules_proof_authorized", "training_target_authorized"):
+                    self.assertIs(proof[name], False)
+                for old_fact in (banks.SYNTHETIC_COMPILED_FACT, banks.SUCCESSOR_SYNTHETIC_COMPILED_FACT):
+                    with self.assertRaisesRegex(ValueError, "compiled search closure differs"):
+                        reviewed.review_transition_sources(pair=profile["transition_sources"],
+                            manifest=banks.pc_shared_fixture_manifest(),
+                            source={"native": {"search_implementation_sha256": old_fact}}, lane=lane)
+            self.assertEqual(reviewed.REVIEWED_CLOSURE_PROFILES, before)
+        self.assertEqual(banks.fixture_profile("default_disabled"), prior)
+        self.assertEqual(banks.successor_fixture_profile("default_disabled"), successor)
+
     def test_original_6ca_review_and_api_remain_distinct_from_explicit_successor(self):
         import native_source_review_fixture as banks
         old = banks.fixture_profile("default_disabled")
