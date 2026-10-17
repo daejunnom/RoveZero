@@ -504,6 +504,9 @@ pub struct RoventFrontier {
     work: FrontierNodeWork,
     selection_sealed: bool,
     stop: Option<FrontierStop>,
+    // WorkBudget remains the first reported stop, but later revoke/unknown
+    // still closes consumption of an already paid in-flight selection.
+    consumption_stop: Option<FrontierStop>,
     pins: StorePins,
     pin: StoreReadPin,
     store_owner: StoreReadOwner,
@@ -633,6 +636,7 @@ impl RoventFrontier {
             },
             selection_sealed: false,
             stop,
+            consumption_stop: None,
             pins,
             pin,
             store_owner: stores.read_owner(),
@@ -799,6 +803,41 @@ impl RoventFrontier {
         now: MonotonicTick,
     ) -> Result<(), FrontierError> {
         self.check_control(clock, now)
+    }
+
+    /// Recheck a physically retired question's use of existing paid Rules
+    /// work. This never admits a model call or node and never refunds credit.
+    /// Exact budget fill can preserve consumption, while cancellation, source
+    /// reclamation, deadline and unknown native custody always reject it.
+    pub(crate) fn admit_existing_consumption(
+        &mut self,
+        stores: &PalsStores,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), FrontierError> {
+        self.check_store(stores)?;
+        if clock != self.registration.original_deadline.clock {
+            return Err(FrontierError::ForeignRoot);
+        }
+        if self
+            .registration
+            .original_deadline
+            .accepts(clock, now)
+            .is_err()
+        {
+            self.interrupt(FrontierStop::Deadline);
+        }
+        if !self.work.native_usage_known {
+            return Err(FrontierError::NativeUnknown);
+        }
+        if let Some(stop) = self.consumption_stop {
+            return Err(match stop {
+                FrontierStop::NativeUnknown => FrontierError::NativeUnknown,
+                FrontierStop::Deadline => FrontierError::Deadline,
+                _ => FrontierError::Revoked,
+            });
+        }
+        Ok(())
     }
 
     /// The actual port calls this only after observing its original hard
@@ -2046,6 +2085,9 @@ impl RoventFrontier {
         Ok(())
     }
     fn interrupt(&mut self, stop: FrontierStop) {
+        if stop != FrontierStop::WorkBudget && self.consumption_stop.is_none() {
+            self.consumption_stop = Some(stop);
+        }
         if self.stop.is_some() {
             return;
         }

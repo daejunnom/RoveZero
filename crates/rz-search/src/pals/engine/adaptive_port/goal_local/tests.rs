@@ -39,7 +39,11 @@ fn source_port_at(position: Position, root_moves: Option<&[BoardMove]>) -> Port 
     port
 }
 
-fn attach_source_frontier(port: &mut Port, root_moves: Option<&[BoardMove]>, goal: SearchGoal) {
+fn attach_source_frontier(
+    port: &mut Port,
+    root_moves: Option<&[BoardMove]>,
+    goal: SearchGoal,
+) -> CpuCreditLedger {
     let namespace = AdaptiveModelNamespace::new(
         port.engine.semantic.model.value_identity().unwrap().clone(),
         ContractDigest([5; 32]),
@@ -84,7 +88,10 @@ fn attach_source_frontier(port: &mut Port, root_moves: Option<&[BoardMove]>, goa
     )
     .unwrap();
     port.engine.semantic.rovent_frontier = Some(Box::new(frontier));
+    ledger
 }
+
+include!("lifecycle_tests.rs");
 
 fn input(port: &mut Port) -> GoalLocalInput {
     match port

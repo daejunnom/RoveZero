@@ -628,9 +628,10 @@ impl GoalLocalRetiredCustody {
     pub(in crate::pals::engine) fn owned_host_bytes(&self) -> Option<u64> {
         let mut bytes = u64::try_from(std::mem::size_of::<Self>()).ok()?;
         bytes = bytes.checked_add(self.state.owned_host_bytes()?)?;
-        if let Ok(pins) = &self.pins {
-            bytes = bytes.checked_add(pin_backing_bytes(pins)?)?;
-        }
+        // Failed projection may retain dynamic backend/archive diagnostics.
+        // Preserve it, but do not invent a complete backing count for it.
+        let pins = self.pins.as_ref().ok()?;
+        bytes = bytes.checked_add(pin_backing_bytes(pins)?)?;
         Some(bytes)
     }
 }
@@ -1238,6 +1239,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if self.goal_local.admission_closed {
             return Err(RoleError::Canceled.into());
         }
+        self.with_rovent_frontier(|frontier, stores| {
+            frontier.admit_existing_consumption(stores, clock, now)
+        })?
+        .ok_or(FrontierError::StoreUnavailable)?;
         self.prepare_goal_local_selection(input, accepted, output, physical, clock, now)?;
         self.goal_local.attempts.retain(|_, entry| {
             entry.question.strong_count() != 0
@@ -1307,6 +1312,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let started = Instant::now();
         let actual = input.input();
         let ticket = accepted.ticket();
+        self.with_rovent_frontier(|frontier, stores| {
+            let tick = frontier.original_tick_after_elapsed(clock, now, started.elapsed())?;
+            frontier.admit_existing_consumption(stores, clock, tick)
+        })?
+        .ok_or(FrontierError::StoreUnavailable)?;
         self.accepted.insert(ticket.id);
         let old_question = self
             .committed_role_questions
