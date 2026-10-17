@@ -92,7 +92,6 @@ required-features = ["pals-collection"]
 rz-experiments = { workspace = true, features = ["pals-content-types"] }
 rz-contracts.workspace = true
 rz-eval.workspace = true
-rz-runtime.workspace = true
 rz-native-loader.workspace = true
 rz-search.workspace = true
 rz-position = { workspace = true, features = ["contracts"] }

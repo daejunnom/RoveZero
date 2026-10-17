@@ -316,7 +316,6 @@ impl TrialCaller {
                 )?);
             }
         }
-        use rz_runtime::contracts::ContractClock;
         let cleanup = admission.root_admission().cleanup_deadline();
         let until = admission
             .root_admission()
@@ -385,7 +384,6 @@ impl TrialCaller {
             self.r_archive_io.is_none(),
             "cohort original R archive attempt is already retained",
         )?;
-        use rz_runtime::contracts::ContractClock;
         let root = self
             .admission
             .as_ref()
@@ -394,13 +392,13 @@ impl TrialCaller {
             .clone();
         let start = root
             .runtime_clock()
-            .now()
+            .try_now()
             .map_err(|error| invalid(format!("{error:?}")))?
             .0;
         let result = self.publish_r_inner(timeout_ms);
         let end = root
             .runtime_clock()
-            .now()
+            .try_now()
             .map_err(|error| invalid(format!("{error:?}")));
         if let Err(error) = result {
             self.r_archive_error = Some(error);
@@ -1116,7 +1114,6 @@ impl CohortCaller {
         ),
         ArenaError,
     > {
-        use rz_runtime::contracts::ContractClock;
         let trials: Vec<_> = self.writer.original_trials().cloned().collect();
         check(
             !trials.is_empty()
@@ -1161,7 +1158,7 @@ impl CohortCaller {
             .ok_or_else(|| invalid("cohort original final root absent"))?;
         let clock = final_root.root_admission().runtime_clock();
         let started_tick_ns = clock
-            .now()
+            .try_now()
             .map_err(|error| invalid(format!("{error:?}")))?
             .0;
         let until = Instant::now()
@@ -1335,7 +1332,7 @@ impl CohortCaller {
             .ok_or_else(|| invalid("cohort publication write overflow"))?;
         directories += 1;
         let finished_tick_ns = clock
-            .now()
+            .try_now()
             .map_err(|error| invalid(format!("{error:?}")))?
             .0;
         self.durable_ack = Some(RoventUtilityCohortDurableAck {

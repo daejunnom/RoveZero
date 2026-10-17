@@ -11,7 +11,6 @@ use super::{
     invalid,
 };
 use rz_contracts::pals::SearchAuthority;
-use rz_runtime::contracts::ContractClock as _;
 use rz_search::cpu_value::nnuec::v2::capture::{NnuecCaptureEnding, NnuecCaptureLineage};
 use rz_uci::pals_adaptive::UtilityTrialPhysicalRetirement;
 use rz_uci::rovent_bootstrap::nnuec_source::LoadedRoventNnuecSource;

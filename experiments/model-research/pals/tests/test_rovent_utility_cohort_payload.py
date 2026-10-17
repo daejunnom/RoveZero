@@ -340,6 +340,11 @@ def full_cohort_case(*, resource_known=True, materialized=True, change_trial=Non
                 "start_fen": rules["fen"], "moves": []})
         legacy_origin = copy.deepcopy(original["semantic"]["pc_consumption"][0]["origin"])
         legacy = legacy_origin["ticket"]
+        # The root-local fixture deliberately gives its capture a separate
+        # policy label. This new cohort fixture seals one immutable Request:
+        # its materialized capture and original selected Ready view must name
+        # that same policy before either the trial or source is registered.
+        inp["provenance"]["policy_sha256"] = legacy["context_policy"]
         legacy.update(process_epoch=epoch, deadline_clock=epoch, question_digest=h("synthetic cohort question " + str(ordinal)),
             view_digest=inp["provenance"]["view_seal_sha256"], view_sequence=inp["provenance"]["sequence"])
         legacy["representation"].update(model=pc_artifact["sha256"], encoding=origin["encoding_sha256"], frozen_epoch=origin["frozen_epoch"])
@@ -753,6 +758,17 @@ class UtilityCohortPayloadStrictTests(unittest.TestCase):
             self.assertEqual(expected["pair"]["target_known_mask"], [False] * 7)
             self.assertTrue(all(trial["resolved"] and trial["comparable"] for trial in expected["trials"]))
             self.assertTrue(all(trial["unknown_reason"] is None for trial in expected["trials"]))
+            for trial in expected["trials"]:
+                materialized = json.loads(trial["materialized_json"])
+                provenance = materialized["input"]["provenance"]
+                selected = next(offer for offer in trial["ready_prelude"]["offers"]
+                    if offer["recipient"] == trial["recipient"])
+                self.assertEqual(provenance["root_state"], trial["original_root"]["store_root_state"])
+                self.assertEqual(provenance["generation"], trial["original_root"]["root_generation"])
+                self.assertEqual(provenance["sequence"], selected["view"]["sequence"])
+                self.assertEqual(provenance["view_seal_sha256"], selected["view"]["view_digest"])
+                self.assertEqual(provenance["full_view_sha256"], selected["full_view_sha256"])
+                self.assertEqual(provenance["policy_sha256"], selected["view"]["context_policy_sha256"])
             source = expected["source"]
             self.assertEqual(report["cohort_id"], files.publication()["cohort_id"])
             self.assertEqual(report["profile_sha256"], expected["profile_sha256"])

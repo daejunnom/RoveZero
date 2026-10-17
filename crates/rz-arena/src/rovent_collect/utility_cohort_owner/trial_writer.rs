@@ -3,7 +3,6 @@
 use super::*;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::Dir;
-use rz_runtime::contracts::ContractClock;
 use rz_uci::pals_adaptive::{
     RoventCollectionRootAdmission, UtilityCohortDurableAck, UtilityComparisonCohortOwner,
     UtilityTrialPhysicalRetirement,
@@ -109,7 +108,7 @@ impl RoventUtilityCohortTrialWriter {
         )?;
         let clock = admission.root_admission().runtime_clock();
         let started_tick_ns = clock
-            .now()
+            .try_now()
             .map_err(|error| invalid(format!("{error:?}")))?
             .0;
         let ordinal = original.trial_sequence() - 1;
@@ -169,7 +168,7 @@ impl RoventUtilityCohortTrialWriter {
         // original cap and ACK remain available even if that final join fails.
         entry.ack = Some(Arc::clone(&actual_ack));
         let finished_tick_ns = clock
-            .now()
+            .try_now()
             .map_err(|error| invalid(format!("{error:?}")))?
             .0;
         let materialized_bytes = entry.materialization.as_ref().map_or(0, |pin| pin.bytes);
