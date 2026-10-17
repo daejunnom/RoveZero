@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub mod adaptive;
+pub mod collection_teacher;
 pub mod profiled_worker;
 pub mod profiles;
 pub mod worker;
@@ -2533,7 +2534,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(target_os = "linux")]
     fn fixture_mode(name: &str) -> bool {
@@ -2580,12 +2581,12 @@ mod tests {
                     .iter()
                     .position(|word| *word == "depth")
                     .map(|at| words[at + 1])
-                    .unwrap();
+                    .unwrap_or("2");
                 let requested: u64 = words
                     .iter()
                     .position(|word| *word == "nodes")
                     .map(|at| words[at + 1].parse().unwrap())
-                    .unwrap();
+                    .unwrap_or(10);
                 let best = words
                     .iter()
                     .position(|word| *word == "searchmoves")
@@ -3546,7 +3547,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn fixture_config(mode: &str) -> ExternalCpuConfig {
+    pub(super) fn fixture_config(mode: &str) -> ExternalCpuConfig {
         let program = std::env::current_exe().unwrap();
         let arguments = vec![
             "--exact".into(),
