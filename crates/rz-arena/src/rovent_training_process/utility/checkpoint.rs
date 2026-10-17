@@ -24,8 +24,8 @@ use crate::process::{CleanupStatus, ProcessReceipt, ProcessStop};
 use crate::rovent_collect::RoventPublicationFile;
 use crate::rovent_training_process::RoventTrainingFilePin;
 use crate::rovent_training_process::recovery::{
-    CheckpointArchiveIo, HeldHistoricalFile, RoventCheckpointArchiveTarget,
-    RoventHistoricalChildIdentity, RoventRecoveryReadBudget, VerifiedHistoricalUnresolvedScopes,
+    CheckpointArchiveIo, HeldHistoricalFile, RoventHistoricalChildIdentity,
+    RoventRecoveryReadBudget, VerifiedHistoricalUnresolvedScopes,
 };
 use rz_experiments::pals_data_v3::{generation_digest, generation_identifier, generation_sha};
 use serde::de::{MapAccess, Visitor, value::MapAccessDeserializer};

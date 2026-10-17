@@ -1378,18 +1378,19 @@ impl CohortCaller {
             &mut self.held_payload,
             until,
         )?;
-        // The original externally pinned bytes are read again by the same
-        // closed historical codecs. This never creates a current trial ACK.
+        // put_final_raw already compared every original byte through its
+        // retained FD. Decode that same buffer without another unaccounted
+        // publication read. This never creates a current trial ACK.
         RoventUtilityCohortPublication::from_json_historical(
-            std::str::from_utf8(&read_pin(&self.directory, &publication_file, 64 << 10)?)
+            std::str::from_utf8(&publication_raw)
                 .map_err(|_| invalid("cohort publication readback UTF8"))?,
         )?;
         RoventUtilityCohortDurableAck::from_json_historical(
-            std::str::from_utf8(&read_pin(&self.directory, &ack_file, 64 << 10)?)
-                .map_err(|_| invalid("cohort ACK readback UTF8"))?,
+            std::str::from_utf8(&ack_raw).map_err(|_| invalid("cohort ACK readback UTF8"))?,
             publication,
             &publication_file,
         )?;
+        ack.validate_original_trial_io(publication, &self.payloads)?;
         Ok((publication_file, ack_file, historical?))
     }
 }

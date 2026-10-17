@@ -413,6 +413,68 @@ impl RoventUtilityCohortDurableAck {
             "utility cohort original publication/collection I/O receipt",
         )
     }
+
+    /// 각 원 trial의 시계 안에서만 게시 I/O가 실제 pin0 뒤인지 조인한다.
+    /// 원 FD/pin과 전체 trial proof는 호출자의 별도 역사 검증을 유지한다.
+    /// 서로 다른 Product의 tick 숫자는 비교하지 않는다.
+    pub fn validate_original_trial_io(
+        &self,
+        publication: &RoventUtilityCohortPublication,
+        payloads: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), ArenaError> {
+        self.validate_historical(publication, &self.publication)?;
+        for (ordinal, (pin, ack)) in publication
+            .trials
+            .iter()
+            .zip(&self.trial_acknowledgements)
+            .enumerate()
+        {
+            let raw = payloads
+                .get(&pin.path)
+                .ok_or_else(|| invalid("utility cohort original trial bytes missing"))?;
+            check(
+                raw.len() as u64 == pin.bytes
+                    && hex(Digest(Sha256::digest(raw).into())) == pin.sha256,
+                "utility cohort I/O original trial file pin differs",
+            )?;
+            let text = std::str::from_utf8(raw)
+                .map_err(|_| invalid("utility cohort I/O original trial UTF8"))?;
+            let trial: Value = rz_experiments::decode_json(text)?;
+            let domain = "rz-rovent-utility-cohort-trial/1";
+            let mut native = Sha256::new();
+            native.update(domain.as_bytes());
+            native.update([0]);
+            native.update((raw.len() as u64).to_le_bytes());
+            native.update(raw);
+            check(
+                trial.is_object()
+                    && trial["schema"] == domain
+                    && trial["cohort_id"] == self.cohort_id
+                    && trial["trial_sequence"].as_u64() == Some(ack.trial_sequence)
+                    && hex(Digest(native.finalize().into())) == ack.native_trial_sha256,
+                "utility cohort I/O original checkpoint identity differs",
+            )?;
+            let clock = trial["cost"]["clock_epoch"]
+                .as_u64()
+                .ok_or_else(|| invalid("utility cohort original trial cost clock unavailable"))?;
+            let pin_zero = trial["cost"]["physical_pin_zero_tick"]
+                .as_u64()
+                .ok_or_else(|| invalid("utility cohort original trial pin0 unavailable"))?;
+            check(
+                ack.collection_io.clock_epoch == clock
+                    && ack.collection_io.started_tick_ns >= pin_zero,
+                "utility cohort checkpoint I/O precedes original pin0 or changes clock",
+            )?;
+            if ordinal + 1 == publication.trials.len() {
+                check(
+                    self.collection_io.clock_epoch == clock
+                        && self.collection_io.started_tick_ns >= ack.collection_io.finished_tick_ns,
+                    "utility cohort final I/O precedes last original ACK or changes clock",
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn payload_ordinal(path: &str, directory: &str) -> Result<usize, ArenaError> {
@@ -430,8 +492,11 @@ fn payload_ordinal(path: &str, directory: &str) -> Result<usize, ArenaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn historical_io_shape_preserves_independent_trial_clock_domains() {
+    fn synthetic_io_fixture() -> (
+        RoventUtilityCohortPublication,
+        RoventPublicationFile,
+        RoventUtilityCohortDurableAck,
+    ) {
         // 명시 합성 file pins: 현재 source/ACK/실행 권한을 만들지 않는다.
         let pin = |path: &str, bytes| RoventPublicationFile {
             path: path.into(),
@@ -489,6 +554,12 @@ mod tests {
                 })
                 .collect(),
         };
+        (publication, publication_file, ack)
+    }
+
+    #[test]
+    fn historical_io_shape_preserves_independent_trial_clock_domains() {
+        let (publication, publication_file, ack) = synthetic_io_fixture();
         ack.validate_historical(&publication, &publication_file)
             .unwrap();
         let mut reversed = ack;
@@ -498,6 +569,75 @@ mod tests {
         assert!(
             reversed
                 .validate_historical(&publication, &publication_file)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn historical_io_joins_each_original_clock_and_pin_zero() {
+        let (mut publication, _, mut ack) = synthetic_io_fixture();
+        let mut payloads = BTreeMap::new();
+        for ordinal in 0..publication.trials.len() {
+            // 원 실행/Rules proof가 없는 명시 합성 IO projection이다.
+            // 전체 historical helper나 live trial 권한을 대체하지 않는다.
+            let raw = serde_json::to_vec(&serde_json::json!({
+                "schema":"rz-rovent-utility-cohort-trial/1",
+                "cohort_id":publication.cohort_id,
+                "trial_sequence":ordinal as u64+1,
+                "cost":{"clock_epoch":700+ordinal as u64,
+                    "physical_pin_zero_tick":999-ordinal as u64*900}
+            }))
+            .unwrap();
+            let pin = &mut publication.trials[ordinal];
+            pin.bytes = raw.len() as u64;
+            pin.sha256 = hex(Digest(Sha256::digest(&raw).into()));
+            let entry = &mut ack.trial_acknowledgements[ordinal];
+            entry.checkpoint = pin.clone();
+            entry.collection_io.written_bytes = pin.bytes;
+            entry.collection_io.readback_bytes = 2 * pin.bytes;
+            let mut native = Sha256::new();
+            native.update(b"rz-rovent-utility-cohort-trial/1\0");
+            native.update(pin.bytes.to_le_bytes());
+            native.update(&raw);
+            entry.native_trial_sha256 = hex(Digest(native.finalize().into()));
+            payloads.insert(pin.path.clone(), raw);
+        }
+        publication.total_payload_bytes =
+            6 + publication.trials.iter().map(|p| p.bytes).sum::<u64>();
+        ack.collection_io.readback_bytes = publication.total_payload_bytes + ack.publication.bytes;
+        ack.collection_io.clock_epoch = 701;
+        ack.collection_io.started_tick_ns = 201;
+        ack.collection_io.finished_tick_ns = 202;
+        ack.validate_original_trial_io(&publication, &payloads)
+            .unwrap();
+
+        let mut wrong_clock = ack.clone();
+        wrong_clock.trial_acknowledgements[0]
+            .collection_io
+            .clock_epoch = 701;
+        assert!(
+            wrong_clock
+                .validate_original_trial_io(&publication, &payloads)
+                .is_err()
+        );
+        let mut before_pin_zero = ack.clone();
+        before_pin_zero.trial_acknowledgements[0]
+            .collection_io
+            .started_tick_ns = 998;
+        before_pin_zero.trial_acknowledgements[0]
+            .collection_io
+            .finished_tick_ns = 1098;
+        assert!(
+            before_pin_zero
+                .validate_original_trial_io(&publication, &payloads)
+                .is_err()
+        );
+        let mut before_last_ack = ack;
+        before_last_ack.collection_io.started_tick_ns = 199;
+        before_last_ack.collection_io.finished_tick_ns = 200;
+        assert!(
+            before_last_ack
+                .validate_original_trial_io(&publication, &payloads)
                 .is_err()
         );
     }

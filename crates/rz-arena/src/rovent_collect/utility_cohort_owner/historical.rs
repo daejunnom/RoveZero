@@ -6,7 +6,10 @@ use crate::rovent_collect::historical_scope::{
     RoventNativeOriginEvidence, RoventRootAdmissionEvidence,
 };
 use rz_contracts::pals::Move16;
-use rz_experiments::{RoventInputLock, RoventPurpose, RoventUtilityComparisonCohort};
+use rz_experiments::rovent_utility_cohort::{
+    RoventUtilityCohortRecipient, RoventUtilityCohortUsage, RoventUtilityComparisonCohort,
+};
+use rz_experiments::{RoventInputLock, RoventPurpose};
 use rz_search::cpu_value::nnuec::{rules, v2};
 use rz_uci::pals_adaptive::{UtilityCohortFrozenDecision, UtilityCohortSourcePins};
 use serde::Deserialize;
@@ -18,6 +21,9 @@ const SOURCE_DOMAIN: &str = "rz-rovent-utility-cohort-collection-source/1";
 const TRIAL_DOMAIN: &str = "rz-rovent-utility-cohort-trial/1";
 const MATERIALIZATION_DOMAIN: &str = "rz-rovent-utility-cohort-materialization/1";
 const PAIR_DOMAIN: &str = "rz-rovent-utility-cohort-pair/1";
+
+#[cfg(test)]
+mod tests;
 
 fn error(message: impl std::fmt::Display) -> ArenaError {
     invalid(format!("utility cohort historical: {message}"))
@@ -313,7 +319,7 @@ fn route(value: &str) -> Result<u8, ArenaError> {
     }
 }
 fn requested_routes(profile: &RoventUtilityComparisonCohort) -> Vec<u8> {
-    use rz_experiments::RoventUtilityCohortRecipient as R;
+    use RoventUtilityCohortRecipient as R;
     profile
         .input
         .requested_recipients
@@ -1514,6 +1520,30 @@ fn verify_reference_input(
         submission_target_sha256,
         context_sha256,
     })
+}
+
+/// Same submitted Request that bound the actual selected work. Numerical
+/// input identity alone deliberately excludes these process-local fields;
+/// retain and compare their original source instead of treating a matching
+/// tensor as permission to relabel a different Ready view.
+fn verify_submitted_input_source(
+    input: &Value,
+    selected_offer: &Value,
+    root: &RoventRootAdmissionEvidence,
+) -> Result<(), ArenaError> {
+    let provenance = &input["provenance"];
+    let view = &selected_offer["view"];
+    ensure(
+        number(provenance, "root_state")? == root.store_root_state as u64
+            && number(provenance, "generation")? == root.root_generation
+            && number(provenance, "sequence")? == number(view, "sequence")?
+            && hash_field(provenance, "view_seal_sha256")? == hash_field(view, "view_digest")?
+            && hash_field(provenance, "full_view_sha256")?
+                == hash_field(selected_offer, "full_view_sha256")?
+            && hash_field(provenance, "policy_sha256")?
+                == hash_field(view, "context_policy_sha256")?,
+        "submitted input differs from original selected Ready view/root",
+    )
 }
 
 struct Physical {
@@ -3092,6 +3122,7 @@ fn verify_trial(
             .filter(|o| o["recipient"] == wire["recipient"])
             .collect::<Vec<_>>();
         ensure(selected.len() == 1, "one original selected route offer")?;
+        verify_submitted_input_source(&body["input"], selected[0], &root)?;
         for key in [
             "frame_sequence",
             "question_sha256",
@@ -3150,7 +3181,6 @@ fn verify_trial(
         )?;
     }
     if comparable {
-        use rz_experiments::RoventUtilityCohortUsage;
         ensure(
             profile.input.usage == RoventUtilityCohortUsage::CollectionCandidate
                 && resolved
@@ -3517,8 +3547,8 @@ pub(super) fn verify_historical_utility_cohort(
         cohort_id: publication.cohort_id.clone(),
         profile_sha256: hex(profile.digest()?),
         usage: match profile.input.usage {
-            rz_experiments::RoventUtilityCohortUsage::ValidationOnly => "validation_only",
-            rz_experiments::RoventUtilityCohortUsage::CollectionCandidate => "collection_candidate",
+            RoventUtilityCohortUsage::ValidationOnly => "validation_only",
+            RoventUtilityCohortUsage::CollectionCandidate => "collection_candidate",
         }
         .into(),
         collection_source_sha256: source.source_pins.source_sha256.clone(),

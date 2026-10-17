@@ -1154,7 +1154,7 @@ fn initial_source_identity(
     utility_raw: &[u8],
     preparation: &Value,
 ) -> Result<InitialSourceIdentity, ArenaError> {
-    use rz_search::cpu_value::nnuec_v2::{Checkpoint, Model, utility};
+    use rz_search::cpu_value::nnuec::v2::{Checkpoint, Model, utility};
     let base: Checkpoint = decode(base_raw)?;
     base.validate().map_err(|e| invalid(e.to_string()))?;
     let frozen_weights = base.weights_sha256().map_err(|e| invalid(e.to_string()))?;
@@ -1456,7 +1456,7 @@ pub fn run_rovent_utility_from_cli(
         {
             let (file, raw) = own(
                 utility,
-                rz_search::cpu_value::nnuec_v2::utility::MAX_BYTES as u64,
+                rz_search::cpu_value::nnuec::v2::utility::MAX_BYTES as u64,
                 true,
                 &budget,
             )?;
@@ -1896,7 +1896,7 @@ pub fn run_rovent_utility_from_cli(
             )?;
             let (file, raw) = own(
                 &exported,
-                rz_search::cpu_value::nnuec_v2::utility::MAX_BYTES as u64,
+                rz_search::cpu_value::nnuec::v2::utility::MAX_BYTES as u64,
                 true,
                 &budget,
             )?;
@@ -1909,10 +1909,11 @@ pub fn run_rovent_utility_from_cli(
                         .ok_or_else(|| invalid("actual learned projection absent"))?,
                 "utility export differs from original acknowledged completion lineage",
             )?;
-            let base: rz_search::cpu_value::nnuec_v2::Checkpoint = decode(&base_raw)?;
-            let base = rz_search::cpu_value::nnuec_v2::Model::new(base)
+            let base: rz_search::cpu_value::nnuec::v2::Checkpoint = decode(&base_raw)?;
+            let base = rz_search::cpu_value::nnuec::v2::Model::new(base)
                 .map_err(|error| invalid(error.to_string()))?;
-            let exported_model: rz_search::cpu_value::nnuec_v2::utility::Checkpoint = decode(&raw)?;
+            let exported_model: rz_search::cpu_value::nnuec::v2::utility::Checkpoint =
+                decode(&raw)?;
             exported_model
                 .validate(&base)
                 .map_err(|error| invalid(error.to_string()))?;

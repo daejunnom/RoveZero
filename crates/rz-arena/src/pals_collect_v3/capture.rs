@@ -11,6 +11,9 @@ use rz_search::pals::review_context::ReviewView;
 /// 원 Rules repetition identity의 기존 generation grouping domain이다.
 /// 모델/평가 캐시 또는 Rules semantic state digest와 혼용하지 않는다.
 pub(crate) fn generation_transposition_sha256(position: &Position) -> String {
+    use sha2::{Digest, Sha256};
+    use std::hash::{Hash, Hasher};
+
     struct IdentityHash(Sha256);
     impl Hasher for IdentityHash {
         fn finish(&self) -> u64 {
@@ -246,8 +249,6 @@ pub(crate) fn capture_submitted_review_common_fields(
     input: &PalsVirtualReviewInput,
     context: &GenerationCaptureContextV3,
 ) -> Result<GenerationInputV3, ArenaError> {
-    use sha2::{Digest, Sha256};
-    use std::hash::{Hash, Hasher};
     check(
         ticket.view.view_digest.0 == view.seal_digest()
             && ticket.view.view_sequence == view.sequence()

@@ -209,6 +209,7 @@ impl VerifiedUtilityDataset {
             total == publication.total_payload_bytes,
             "cohort payload coverage/count mismatch",
         )?;
+        durable_ack.validate_original_trial_io(&publication, &payloads)?;
         // Exact same raw buffers verified through the held descriptors are
         // borrowed here. Value reserialization cannot replace native seals.
         let evidence = verify_historical_utility_cohort(&publication, &payloads)?;

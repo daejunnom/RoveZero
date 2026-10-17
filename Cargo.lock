@@ -440,6 +440,7 @@ dependencies = [
  "rz-experiments",
  "rz-native-loader",
  "rz-position",
+ "rz-runtime",
  "rz-search",
  "rz-uci",
  "serde",
