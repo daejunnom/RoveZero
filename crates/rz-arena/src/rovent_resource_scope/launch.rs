@@ -253,7 +253,7 @@ impl NativeResourceCustody {
             return Err(invalid("native resource finished observation replay"));
         }
         self.finished_attempted = true;
-        let result = (|| {
+        let result: Result<(), ArenaError> = (|| {
             if let Some(scope) = &self.scope {
                 let snapshot = scope.observe();
                 self.finished_live =
