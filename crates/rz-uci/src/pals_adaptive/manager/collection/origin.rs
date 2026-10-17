@@ -50,6 +50,7 @@ struct LoadedOrigin {
 /// process/source hash can manufacture a new native-service lifetime.
 /// The actual PreparedNative issuer is a separate registration boundary.
 pub struct RoventNativeProductLifetime {
+    _private: (),
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     first_root: OnceLock<Arc<crate::rovent_root_admission::RoventRootAdmission>>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
@@ -89,6 +90,7 @@ impl RoventNativeProductLifetime {
             .model_namespace()
             .map_err(|error| reject(error.to_string()))?;
         Ok(Arc::new(Self {
+            _private: (),
             first_root: OnceLock::new(),
             sources: Arc::downgrade(sources),
             clock,
