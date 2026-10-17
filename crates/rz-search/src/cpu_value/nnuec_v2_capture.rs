@@ -152,6 +152,8 @@ impl NnuecCaptureReservation {
         Ok(Self {
             submission: Arc::new(Submission {
                 lineage: NnuecCaptureLineage::new(
+                    bound.instance_authority().clone(),
+                    bound.request_identity(),
                     work.frame,
                     work.input.question_digest,
                     capture_sequence,

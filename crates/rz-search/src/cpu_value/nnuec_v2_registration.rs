@@ -202,6 +202,10 @@ fn implementation_sha256() -> String {
             include_bytes!("nnuec_v2_capture_lineage.rs").as_slice(),
         ),
         (
+            "nnuec_v2_utility_capture.rs",
+            include_bytes!("nnuec_v2_utility_capture.rs").as_slice(),
+        ),
+        (
             "nnuec_v2_retirement.rs",
             include_bytes!("nnuec_v2_retirement.rs").as_slice(),
         ),

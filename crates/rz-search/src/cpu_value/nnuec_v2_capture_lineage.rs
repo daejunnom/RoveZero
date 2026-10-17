@@ -4,6 +4,7 @@
 //! mutex, or Submission alive. It proves only the original activation and can
 //! never submit, resume, evaluate, consume feedback, or issue a training target.
 
+use super::super::review::{BoundInstanceAuthority, RequestIdentity};
 use super::{CaptureError, NnuecCaptureReservation, NnuecCaptureRetirement};
 use crate::pals::coordinator::FrameId;
 use rz_contracts::pals_adaptive::{CpuJobEnvelope, CpuWorkerId};
@@ -19,6 +20,8 @@ struct Activation {
 #[derive(Clone)]
 pub struct NnuecCaptureLineage {
     authority: Arc<Activation>,
+    bound: BoundInstanceAuthority,
+    request: RequestIdentity,
     frame: FrameId,
     question: Digest,
     capture_sequence: u64,
@@ -39,6 +42,8 @@ impl std::fmt::Debug for NnuecCaptureLineage {
 }
 impl NnuecCaptureLineage {
     pub(super) fn new(
+        bound: BoundInstanceAuthority,
+        request: RequestIdentity,
         frame: FrameId,
         question: Digest,
         capture_sequence: u64,
@@ -51,6 +56,8 @@ impl NnuecCaptureLineage {
             authority: Arc::new(Activation {
                 original_job: OnceLock::new(),
             }),
+            bound,
+            request,
             frame,
             question,
             capture_sequence,
@@ -117,6 +124,13 @@ impl NnuecCaptureLineage {
     }
     pub(super) fn same_authority(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.authority, &other.authority)
+    }
+    pub(crate) fn matches_original_bound(
+        &self,
+        bound: &BoundInstanceAuthority,
+        request: &RequestIdentity,
+    ) -> bool {
+        self.bound.matches(bound) && self.request.same_request(request)
     }
     pub fn matches_reservation(&self, reservation: &NnuecCaptureReservation) -> bool {
         reservation.matches_lineage(self)

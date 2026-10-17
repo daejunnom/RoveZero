@@ -12,7 +12,7 @@ use crate::cpu_worker::{
 };
 use crate::pals::engine::RecordKind;
 use crate::pals::review_context::{ReviewView, checked_rebase_offset};
-use crate::pals::store::{PalsStores, StateId};
+use crate::pals::store::{PalsStores, StateId, StoreReadOwner};
 use rz_position::{MAX_UCI_REPLAY_PLIES, Position, PositionIdentity, PositionSnapshot};
 use rz_runtime::CompletionSignal;
 use std::sync::Arc;
@@ -76,6 +76,8 @@ impl RequestIdentity {
 
 pub struct Request {
     identity: RequestIdentity,
+    store_owner: StoreReadOwner,
+    utility_target: Option<u16>,
     view: Arc<ReviewView>,
     sources: Arc<[PositionSnapshot]>,
     provenance: Provenance,
@@ -137,6 +139,8 @@ impl Request {
         };
         Ok(Self {
             identity: RequestIdentity(Arc::new(())),
+            store_owner: stores.read_owner(),
+            utility_target: None,
             view,
             sources,
             provenance,
@@ -149,6 +153,32 @@ impl Request {
     }
     pub(crate) fn identity(&self) -> RequestIdentity {
         self.identity.clone()
+    }
+    pub(crate) fn matches_view(&self, view: &Arc<ReviewView>) -> bool {
+        Arc::ptr_eq(&self.view, view)
+    }
+    /// Select one original whole bundle before this unique Request reaches
+    /// the actor. Failure returns that same Request with its old choice intact.
+    #[allow(clippy::result_large_err)]
+    pub fn with_utility_input_capture(
+        mut self,
+        target_record: u16,
+    ) -> Result<Self, (PreparationError, Self)> {
+        let checked = (|| {
+            if self.utility_target.is_some() {
+                return Err(PreparationError::InvalidView(
+                    "utility input capture already selected",
+                ));
+            }
+            check_control(self.deadline, &self.cancel)?;
+            super::utility_capture::target_record_ids(&self.view, target_record)?;
+            Ok(())
+        })();
+        if let Err(error) = checked {
+            return Err((error, self));
+        }
+        self.utility_target = Some(target_record);
+        Ok(self)
     }
 }
 
@@ -167,9 +197,31 @@ impl BoundInstanceAuthority {
     }
 }
 
+/// Only this actor factory can issue the transport, after consuming an
+/// explicit selection on the original Request. Metadata alone cannot mint it.
+pub(super) struct UtilityInputPreparationSource<'a> {
+    model: &'a Arc<Model>,
+    bound: &'a BoundNnuecReviewContext,
+    store: StoreReadOwner,
+    target_record: u16,
+}
+impl<'a> UtilityInputPreparationSource<'a> {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        &'a Arc<Model>,
+        &'a BoundNnuecReviewContext,
+        StoreReadOwner,
+        u16,
+    ) {
+        (self.model, self.bound, self.store, self.target_record)
+    }
+}
+
 pub struct BoundNnuecReviewContext {
     instance: BoundInstanceAuthority,
     request: RequestIdentity,
+    utility_input: Option<Arc<super::utility_capture::NnuecUtilityInputCapture>>,
     context: Arc<Context>,
     numeric_context_sha256: String,
     view: Arc<ReviewView>,
@@ -184,6 +236,26 @@ pub struct BoundNnuecReviewContext {
     stopping: Arc<AtomicBool>,
 }
 impl BoundNnuecReviewContext {
+    pub fn utility_input_capture(
+        &self,
+    ) -> Option<&Arc<super::utility_capture::NnuecUtilityInputCapture>> {
+        self.utility_input.as_ref()
+    }
+    pub(super) fn source_snapshots_arc(&self) -> &Arc<[PositionSnapshot]> {
+        &self.source_snapshots
+    }
+    pub(super) fn original_hard_deadline(&self) -> Instant {
+        self.deadline
+    }
+    pub(super) fn original_cancellation(&self) -> &Arc<AtomicBool> {
+        &self.cancel
+    }
+    pub(super) fn actor_stopping(&self) -> &Arc<AtomicBool> {
+        &self.stopping
+    }
+    pub(super) fn actor_invalidations(&self) -> &Arc<AtomicU64> {
+        &self.invalidations
+    }
     pub(crate) fn matches_request(&self, request: &RequestIdentity) -> bool {
         self.request.same_request(request)
     }
@@ -441,9 +513,12 @@ impl Factory {
             context: Arc::clone(&context),
             numeric_context_sha256: numeric_context_sha256.clone(),
         });
-        Ok(BoundNnuecReviewContext {
+        let utility_target = request.utility_target;
+        let store_owner = request.store_owner;
+        let mut bound = BoundNnuecReviewContext {
             instance: BoundInstanceAuthority(Arc::new(BoundInstanceState::default())),
             request: request.identity,
+            utility_input: None,
             root: view.anchors()[0].snapshot.position_identity(),
             context,
             numeric_context_sha256,
@@ -456,7 +531,26 @@ impl Factory {
             invalidations: Arc::clone(&self.invalidations),
             preparation_epoch: epoch,
             stopping: Arc::clone(&self.stopping),
-        })
+        };
+        if let Some(target_record) = utility_target {
+            let captured = super::utility_capture::NnuecUtilityInputCapture::from_prepared(
+                UtilityInputPreparationSource {
+                    model: &self.model,
+                    bound: &bound,
+                    store: store_owner,
+                    target_record,
+                },
+            )
+            .map_err(|error| match bound.authority_revocation() {
+                Some(NnuecAuthorityRevocation::Cancelled) => PreparationError::Cancelled,
+                Some(NnuecAuthorityRevocation::Expired) => PreparationError::Expired,
+                Some(NnuecAuthorityRevocation::ActorStopped) => PreparationError::WorkerStopped,
+                Some(NnuecAuthorityRevocation::Invalidated) => PreparationError::StaleView,
+                None => PreparationError::Neural(error),
+            })?;
+            bound.utility_input = Some(Arc::new(captured));
+        }
+        Ok(bound)
     }
 }
 fn same_numeric_scope(first: &ReviewView, second: &ReviewView) -> bool {
@@ -1413,6 +1507,200 @@ mod tests {
         assert_eq!(
             bound.authority_revocation(),
             Some(NnuecAuthorityRevocation::ActorStopped)
+        );
+    }
+
+    #[test]
+    fn utility_capture_selection_is_explicit_bounded_and_failure_atomic() {
+        let (stores, mut index, state, _) = setup();
+        let view = Arc::new(
+            index
+                .select(
+                    &stores,
+                    state,
+                    query(RoleQueryPurpose::ProposePolicy),
+                    ReviewSelectionPolicy::default(),
+                )
+                .unwrap(),
+        );
+        let mut factory = factory();
+        let plain = factory
+            .prepare(request(&factory, Arc::clone(&view), &stores, state))
+            .unwrap();
+        assert!(plain.utility_input_capture().is_none());
+        let original = request(&factory, Arc::clone(&view), &stores, state);
+        let identity = original.identity();
+        let (error, original) = original
+            .with_utility_input_capture(64)
+            .err()
+            .expect("out-of-range selection");
+        assert!(matches!(error, PreparationError::Neural(_)));
+        assert!(original.identity().same_request(&identity));
+        assert!(original.utility_target.is_none());
+        let original = original
+            .with_utility_input_capture(0)
+            .unwrap_or_else(|_| panic!("actual target selection"));
+        let (_, original) = original
+            .with_utility_input_capture(1)
+            .err()
+            .expect("second selection cannot replace original");
+        assert_eq!(original.utility_target, Some(0));
+        let bound = Arc::new(factory.prepare(original).unwrap());
+        let captured = bound.utility_input_capture().unwrap();
+        assert!(captured.matches_request(&identity));
+        assert!(captured.matches_bound(&bound));
+        assert_eq!(captured.target_record_ids(), &[0, 1]);
+        assert_eq!(captured.target_record(), 0);
+        assert_eq!(
+            captured.original_first_move(),
+            "e2e4".parse::<BoardMove>().unwrap()
+        );
+        assert!(captured.validates(&stores, state, stores.generation(), &view));
+        assert!(!captured.validates(
+            &PalsStores::new(StoreLimits::default()),
+            state,
+            stores.generation(),
+            &view
+        ));
+        assert_eq!(
+            serde_json::to_vec(captured.reference()).unwrap(),
+            captured.input_bytes()
+        );
+    }
+
+    #[test]
+    fn same_actor_captures_original_utility_input_without_future_records_or_view_pins() {
+        let (stores, mut index, state, _) = setup();
+        let model = Arc::clone(&factory().model);
+        let view = Arc::new(
+            index
+                .select(
+                    &stores,
+                    state,
+                    query(RoleQueryPurpose::ProposePolicy),
+                    ReviewSelectionPolicy::default(),
+                )
+                .unwrap(),
+        );
+        let weak_view = Arc::downgrade(&view);
+        let actor = PreparationActor::spawn(Arc::clone(&model)).unwrap();
+        let mut bounds = Vec::new();
+        for _ in 0..2 {
+            let request = Request::admit(
+                &model,
+                Arc::clone(&view),
+                &stores,
+                state,
+                stores.generation(),
+                Instant::now() + Duration::from_secs(10),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap()
+            .with_utility_input_capture(0)
+            .unwrap_or_else(|_| panic!("utility capture selection"));
+            actor
+                .try_submit(request)
+                .unwrap_or_else(|_| panic!("actual actor admission"));
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(completion) = actor.try_complete().unwrap() {
+                    bounds.push(Arc::new(completion.result.unwrap()));
+                    break;
+                }
+                assert!(Instant::now() < until);
+                thread::yield_now();
+            }
+        }
+        let captured = Arc::clone(bounds[0].utility_input_capture().unwrap());
+        let second = Arc::clone(bounds[1].utility_input_capture().unwrap());
+        assert!(Arc::ptr_eq(bounds[0].context(), bounds[1].context()));
+        assert!(captured.matches_bound(&bounds[0]));
+        assert!(!captured.matches_bound(&bounds[1]));
+        assert_eq!(captured.input_sha256(), second.input_sha256());
+        assert_eq!(captured.input_bytes(), second.input_bytes());
+        assert_eq!(captured.reference().base_input.context_lines.len(), 2);
+        assert!(captured.reference().base_input.local_line.moves.is_empty());
+        assert!(
+            captured
+                .root_snapshot()
+                .same_state(&Position::startpos().snapshot())
+        );
+        assert!(captured.matches_original_model(&model));
+        let foreign_model = Arc::new(Model::new(super::super::tests::checkpoint()).unwrap());
+        assert_eq!(foreign_model.identity(), model.identity());
+        assert!(!captured.matches_original_model(&foreign_model));
+        let before = captured.input_bytes().to_vec();
+        index
+            .publish(
+                &stores,
+                &record(state, 3, RecordKind::Repair, "e2e4 c7c5", Some(2)),
+                None,
+            )
+            .unwrap();
+        assert_eq!(captured.reference().base_input.context_lines.len(), 2);
+        assert_eq!(captured.input_bytes(), before);
+        let weak_bound = Arc::downgrade(&bounds[0]);
+        actor.shutdown().unwrap();
+        assert!(!captured.validates(&stores, state, stores.generation(), &view));
+        drop(bounds);
+        drop(view);
+        assert!(weak_bound.upgrade().is_none());
+        assert!(weak_view.upgrade().is_none());
+        assert_eq!(stores.review_pin_count().unwrap(), 0);
+        assert_eq!(captured.records_metadata().len(), 2);
+        assert_eq!(captured.source_snapshots().len(), 2);
+        assert_eq!(captured.input_bytes(), before);
+    }
+
+    #[test]
+    fn utility_capture_rebased_bundle_keeps_original_move_and_current_global_empty_local_input() {
+        let (mut stores, mut index, _, bundle) = setup();
+        let mut actual = Position::startpos();
+        actual
+            .make_move("e2e4".parse::<BoardMove>().unwrap())
+            .unwrap();
+        let situation = stores.focus_actual_moves(actual.snapshot()).unwrap();
+        let state = stores.situations.get(situation).unwrap().state;
+        let view = Arc::new(
+            index
+                .select(
+                    &stores,
+                    state,
+                    query(RoleQueryPurpose::ReplyPolicy),
+                    ReviewSelectionPolicy {
+                        required_bundle: Some(bundle),
+                        ..ReviewSelectionPolicy::default()
+                    },
+                )
+                .unwrap(),
+        );
+        let mut factory = factory();
+        let original = request(&factory, Arc::clone(&view), &stores, state)
+            .with_utility_input_capture(0)
+            .unwrap_or_else(|_| panic!("rebased target selection"));
+        let bound = factory.prepare(original).unwrap();
+        let captured = bound.utility_input_capture().unwrap();
+        assert!(captured.root_snapshot().same_state(&actual.snapshot()));
+        assert_eq!(
+            captured.reference().base_input.board_features,
+            super::super::super::rules::reference_board_features(&actual)
+        );
+        assert!(captured.reference().base_input.local_line.moves.is_empty());
+        assert!(
+            captured.reference().base_input.context_lines[0]
+                .moves
+                .is_empty()
+        );
+        assert_eq!(
+            captured.original_first_move(),
+            "e2e4".parse::<BoardMove>().unwrap()
+        );
+        assert_eq!(captured.target_record_ids(), &[0, 1]);
+        assert!(
+            captured
+                .source_snapshots()
+                .iter()
+                .all(|source| source.same_state(&Position::startpos().snapshot()))
         );
     }
 

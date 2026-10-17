@@ -9,7 +9,7 @@ use crate::cpu_value::nnuec::v2::review::{PreparationActor, Request};
 use crate::cpu_worker::{
     CpuJob, CpuSliceReport, CpuWorker, CpuWorkerError, CpuWorkerEvent, cpu_root_restriction_digest,
 };
-use crate::pals::engine::RoleQueryPurpose;
+use crate::pals::engine::{RecordKind, RoleQueryPurpose, RoleRecord};
 use crate::pals::review_context::{
     ReviewContextIndex, ReviewQuerySequences, ReviewSelectionPolicy,
 };
@@ -34,6 +34,10 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with_utility_target(false)
+}
+
+fn fixture_with_utility_target(capture_utility: bool) -> Fixture {
     let clock = InstantClock::new(ClockDomain(ProcessEpoch(301)), Instant::now());
     let model = Arc::new(Model::new(super::super::tests::checkpoint()).unwrap());
     let mut stores = PalsStores::new(StoreLimits::default());
@@ -41,8 +45,31 @@ fn fixture() -> Fixture {
         .focus_actual_moves(Position::startpos().snapshot())
         .unwrap();
     let root = stores.situations.get(situation).unwrap().state;
+    let mut index = ReviewContextIndex::default();
+    if capture_utility {
+        index
+            .publish(
+                &stores,
+                &RoleRecord {
+                    revision: 1,
+                    parent_revision: None,
+                    supersedes_revision: None,
+                    origin_state: root,
+                    kind: RecordKind::Proposal,
+                    line: vec!["e2e4".parse().unwrap()],
+                    value: None,
+                    completed_depth: 0,
+                    score_scope: None,
+                    cpu_observation: None,
+                    perspective: rz_position::Color::White,
+                    critical: true,
+                },
+                None,
+            )
+            .unwrap();
+    }
     let view = Arc::new(
-        ReviewContextIndex::default()
+        index
             .select(
                 &stores,
                 root,
@@ -69,6 +96,13 @@ fn fixture() -> Fixture {
         Arc::clone(&cancel),
     )
     .unwrap();
+    let request = if capture_utility {
+        request
+            .with_utility_input_capture(0)
+            .unwrap_or_else(|_| panic!("utility source selection"))
+    } else {
+        request
+    };
     let actor = PreparationActor::spawn(Arc::clone(&model)).unwrap();
     actor
         .try_submit(request)
@@ -150,6 +184,8 @@ fn reservation(
     NnuecCaptureReservation {
         submission: Arc::new(Submission {
             lineage: NnuecCaptureLineage::new(
+                fixture.bound.instance_authority().clone(),
+                fixture.bound.request_identity(),
                 FrameId {
                     authority: job.envelope().id.authority,
                     sequence: 1,
@@ -230,6 +266,55 @@ fn capture_settings_require_explicit_bounded_nonzero_limits() {
     assert!(NnuecCaptureLimits::new(65, 1, 1).is_err());
     assert!(NnuecCaptureLimits::new(1, 0, 1).is_err());
     assert!(NnuecCaptureLimits::new(1, 1, MAX_CAPTURE_BYTES + 1).is_err());
+}
+
+#[test]
+fn utility_source_matches_only_the_same_original_bound_and_request_r_lineage() {
+    let fixture = fixture_with_utility_target(true);
+    let foreign = fixture_with_utility_target(true);
+    let utility = Arc::clone(fixture.bound.utility_input_capture().unwrap());
+    let worker = worker(&fixture);
+    let mut original = job(&fixture, &worker, 1, 1);
+    let capture = reservation(
+        &fixture,
+        &original,
+        NnuecCaptureLimits::new(4, 1, 1 << 20).unwrap(),
+    );
+    let foreign_capture = reservation(
+        &foreign,
+        &original,
+        NnuecCaptureLimits::new(4, 1, 1 << 20).unwrap(),
+    );
+    assert!(utility.matches_capture_lineage(&capture.lineage()));
+    assert!(!utility.matches_capture_lineage(&foreign_capture.lineage()));
+    assert!(
+        !capture
+            .lineage()
+            .matches_activated_job(original.envelope(), CpuWorkerId(0)),
+        "shared C source alone proves no execution"
+    );
+    original
+        .enable_nnuec_capture(capture.clone())
+        .unwrap_or_else(|_| panic!("actual capture attachment"));
+    let first = grant(&original, 1, 4096);
+    worker.begin(original, first).unwrap();
+    assert!(report(&worker).terminal);
+    let retired = capture.retirement().unwrap();
+    assert!(retired.matches_lineage(&capture.lineage()));
+    assert!(utility.matches_capture_lineage(&capture.lineage()));
+    assert!(utility.reference().base_input.local_line.moves.is_empty());
+    fixture.cancel.store(true, Ordering::Release);
+    assert!(!utility.validates(
+        &fixture.stores,
+        fixture.bound.provenance().root,
+        fixture.stores.generation(),
+        fixture.bound.view()
+    ));
+    assert!(
+        utility.matches_capture_lineage(&capture.lineage()),
+        "historical matching never revives action authority"
+    );
+    worker.shutdown().unwrap();
 }
 
 #[test]

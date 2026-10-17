@@ -29,6 +29,8 @@ pub mod retirement;
 pub mod review;
 #[path = "nnuec_v2_utility.rs"]
 pub mod utility;
+#[path = "nnuec_v2_utility_capture.rs"]
+pub mod utility_capture;
 
 pub const SCHEMA: &str = "rz-nnuec-fp32-v2";
 pub const SEMANTICS: &str =
