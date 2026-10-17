@@ -8,7 +8,7 @@ use super::{DeferredNnuecRSource, MaterializedNnuecEngine};
 use crate::cpu_value::CpuValueIdentity;
 use crate::cpu_value::nnuec::v2::Model;
 use crate::cpu_value::nnuec::v2::retirement::NnuecCacheReleaseAck;
-use crate::cpu_value::nnuec::v2::review::Provenance;
+use crate::cpu_value::nnuec::v2::review::{Provenance, RequestIdentity};
 use crate::cpu_worker::CpuWorkerError;
 use rz_contracts::Digest;
 use std::sync::{
@@ -66,6 +66,7 @@ impl NnuecMaterializationReleaseCompletion {
 pub struct NnuecMaterializationReleaseAck {
     source: DeferredNnuecRSource,
     binding: Digest,
+    request: RequestIdentity,
     provenance: Provenance,
     actor_authority: Arc<AtomicU64>,
     preparation_epoch: u64,
@@ -81,6 +82,9 @@ impl std::fmt::Debug for NnuecMaterializationReleaseAck {
     }
 }
 impl NnuecMaterializationReleaseAck {
+    pub(crate) fn matches_request(&self, request: &RequestIdentity) -> bool {
+        self.request.same_request(request)
+    }
     pub fn matches_source(&self, source: &DeferredNnuecRSource) -> bool {
         self.source.same_authority(source)
     }
@@ -142,6 +146,7 @@ impl MaterializedNnuecEngine {
             bound,
             binding,
         } = self;
+        let request = bound.request_identity();
         let provenance = bound.provenance().clone();
         let preparation_epoch = bound.preparation_epoch();
         let started = Instant::now();
@@ -151,6 +156,7 @@ impl MaterializedNnuecEngine {
         Ok(NnuecMaterializationReleaseAck {
             source: DeferredNnuecRSource { declaration },
             binding,
+            request,
             provenance,
             actor_authority: Arc::clone(invalidations),
             preparation_epoch,

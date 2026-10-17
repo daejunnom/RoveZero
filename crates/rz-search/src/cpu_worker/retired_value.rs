@@ -8,7 +8,7 @@ use crate::cpu::CpuEngine;
 use crate::cpu_value::CpuValueIdentity;
 use crate::cpu_value::nnuec::v2::Model;
 use crate::cpu_value::nnuec::v2::retirement::{NnuecCacheReleaseAck, NnuecValueRetirementOwner};
-use crate::cpu_value::nnuec::v2::review::Provenance;
+use crate::cpu_value::nnuec::v2::review::{Provenance, RequestIdentity};
 use rz_contracts::Digest;
 use rz_contracts::pals_adaptive::CpuWorkerId;
 use std::sync::{
@@ -134,6 +134,7 @@ impl RecoveredNnuecEngine {
             stack_owner_id,
         } = self;
         let binding = value_owner.binding_digest();
+        let request = value_owner.request_identity();
         let provenance = value_owner.provenance().clone();
         let preparation_epoch = value_owner.preparation_epoch();
         let started = Instant::now();
@@ -145,6 +146,7 @@ impl RecoveredNnuecEngine {
             profile,
             stack_owner_id,
             binding,
+            request,
             provenance,
             release_time,
             actor_authority: Arc::clone(invalidations),
@@ -230,6 +232,7 @@ pub struct NnuecEngineReleaseAck {
     profile: CpuWorkerProfile,
     stack_owner_id: u64,
     binding: Digest,
+    request: RequestIdentity,
     provenance: Provenance,
     release_time: Duration,
     actor_authority: Arc<AtomicU64>,
@@ -246,6 +249,9 @@ impl std::fmt::Debug for NnuecEngineReleaseAck {
     }
 }
 impl NnuecEngineReleaseAck {
+    pub(crate) fn matches_request(&self, request: &RequestIdentity) -> bool {
+        self.request.same_request(request)
+    }
     pub fn matches_source(&self, source: &DeferredNnuecRSource) -> bool {
         self.source.same_authority(source)
     }

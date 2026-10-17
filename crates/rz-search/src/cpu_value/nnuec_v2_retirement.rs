@@ -4,7 +4,7 @@
 //! no score, resume, new delta, source conversion, or view consumption rights.
 
 use super::Model;
-use super::review::{BoundNnuecReviewContext, Provenance};
+use super::review::{BoundNnuecReviewContext, Provenance, RequestIdentity};
 use crate::cpu_value::CpuValueIdentity;
 use rz_contracts::Digest;
 use std::sync::{
@@ -107,6 +107,9 @@ impl NnuecValueRetirementOwner {
     }
     pub(crate) fn preparation_epoch(&self) -> u64 {
         self.bound.preparation_epoch()
+    }
+    pub(crate) fn request_identity(&self) -> RequestIdentity {
+        self.bound.request_identity()
     }
     pub(crate) fn matches_model(&self, model: &Arc<Model>) -> bool {
         Arc::ptr_eq(&self.model, model)

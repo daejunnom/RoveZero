@@ -169,6 +169,7 @@ impl BoundInstanceAuthority {
 
 pub struct BoundNnuecReviewContext {
     instance: BoundInstanceAuthority,
+    request: RequestIdentity,
     context: Arc<Context>,
     numeric_context_sha256: String,
     view: Arc<ReviewView>,
@@ -183,6 +184,12 @@ pub struct BoundNnuecReviewContext {
     stopping: Arc<AtomicBool>,
 }
 impl BoundNnuecReviewContext {
+    pub(crate) fn matches_request(&self, request: &RequestIdentity) -> bool {
+        self.request.same_request(request)
+    }
+    pub(crate) fn request_identity(&self) -> RequestIdentity {
+        self.request.clone()
+    }
     pub(crate) fn instance_authority(&self) -> &BoundInstanceAuthority {
         &self.instance
     }
@@ -423,6 +430,7 @@ impl Factory {
         });
         Ok(BoundNnuecReviewContext {
             instance: BoundInstanceAuthority(Arc::new(BoundInstanceState::default())),
+            request: request.identity,
             root: view.anchors()[0].snapshot.position_identity(),
             context,
             numeric_context_sha256,
@@ -1252,9 +1260,13 @@ mod tests {
                 <= observed_from.elapsed()
         );
         let bound = completion.result.unwrap();
+        assert!(bound.matches_request(&original_request));
+        assert!(!bound.matches_request(&same_view_unsubmitted.identity()));
         assert!(bound.validates(&stores, state, stores.generation(), view.seal_digest()));
+        let second_request = make_request();
+        let second_identity = second_request.identity();
         actor
-            .try_submit(make_request())
+            .try_submit(second_request)
             .unwrap_or_else(|_| panic!("second admission"));
         let reused = loop {
             if let Some(completion) = actor.try_complete().unwrap() {
@@ -1266,10 +1278,11 @@ mod tests {
         assert_eq!(reused.observation.status(), PreparationStatus::Completed);
         assert_eq!(reused.observation.reused_record_scope(), Some(true));
         assert_eq!(reused.provenance.view_seal, view.seal_digest());
-        assert!(Arc::ptr_eq(
-            bound.context(),
-            reused.result.unwrap().context()
-        ));
+        let rebound = reused.result.unwrap();
+        assert!(Arc::ptr_eq(bound.context(), rebound.context()));
+        assert!(rebound.matches_request(&second_identity));
+        assert!(!rebound.matches_request(&original_request));
+        assert!(!bound.matches_request(&second_identity));
         actor.shutdown().unwrap();
     }
 

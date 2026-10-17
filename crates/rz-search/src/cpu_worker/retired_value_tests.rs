@@ -6,6 +6,22 @@ use super::*;
 use crate::cpu_value::nnuec::v2::retirement::{NnuecCacheInvalidation, NnuecCacheReleaseAck};
 use crate::cpu_worker::{CpuWorker, NnuecEngineReleaseAck, RecoveredNnuecEngine};
 
+fn distinct_request_identity(
+    fixture: &Fixture,
+) -> crate::cpu_value::nnuec::v2::review::RequestIdentity {
+    Request::admit(
+        &fixture.model,
+        Arc::clone(&fixture.view),
+        &fixture.stores,
+        fixture.view.root_state(),
+        fixture.stores.generation(),
+        Instant::now() + WINDOW,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap()
+    .identity()
+}
+
 fn release_materialized(
     actor: &PreparationActor,
     engine: MaterializedNnuecEngine,
@@ -87,6 +103,8 @@ fn cache_release(
 fn actual_joined_engine_releases_original_evaluator_but_not_other_view_custody() {
     let fixture = fixture();
     let source = source(&fixture, false);
+    let original_request = fixture.bound.request_identity();
+    let other_request = distinct_request_identity(&fixture);
     let (mut worker, registration) = ready_worker(&fixture, &source);
     let profile = registration.profile();
     let stack = registration.actual_stack_owner_id();
@@ -100,6 +118,8 @@ fn actual_joined_engine_releases_original_evaluator_but_not_other_view_custody()
     let before = Arc::strong_count(&fixture.bound);
     let ack = release(&fixture.actor, owner);
     assert!(ack.matches_source(&source));
+    assert!(ack.matches_request(&original_request));
+    assert!(!ack.matches_request(&other_request));
     assert_eq!(ack.profile(), profile);
     assert_eq!(ack.binding_digest(), binding);
     assert_eq!(ack.actual_stack_owner_id(), stack);
@@ -385,6 +405,8 @@ fn final_installed_stack_owner_is_released_instead_of_initial_ready_owner() {
 fn unstarted_materialization_releases_on_same_actor_without_a_worker_or_join() {
     let fixture = fixture();
     let source = source(&fixture, false);
+    let original_request = fixture.bound.request_identity();
+    let other_request = distinct_request_identity(&fixture);
     assert!(fixture.terminal.allows_c_only_cleanup());
     assert!(
         fixture
@@ -398,6 +420,8 @@ fn unstarted_materialization_releases_on_same_actor_without_a_worker_or_join() {
     fixture.cancel.store(true, Ordering::Release);
     let ack = release_materialized(&fixture.actor, engine);
     assert!(ack.matches_source(&source));
+    assert!(ack.matches_request(&original_request));
+    assert!(!ack.matches_request(&other_request));
     assert_eq!(ack.model_identity(), fixture.model.identity());
     assert_eq!(ack.provenance(), fixture.bound.provenance());
     assert_eq!(ack.binding_digest(), binding);
