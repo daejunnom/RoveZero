@@ -12,7 +12,7 @@ const MAX_CYCLES: usize = super::super::frozen_recheck::MAX_PENDING_REPAIRS;
 const MAX_PER_FIRST: u8 = super::super::frozen_recheck::MAX_REPAIRS_PER_FIRST;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum PcRepairPhase {
+pub enum PcRepairPhase {
     Proposal,
     AttackRanking,
     CounterStart,
@@ -26,7 +26,7 @@ pub(super) enum PcRepairPhase {
     FreshCounter,
 }
 
-struct PcRepairOrigin {
+pub(super) struct PcRepairOrigin {
     owner: Arc<()>,
     authority: SearchAuthority,
     deadline: Deadline,
@@ -67,31 +67,38 @@ pub(super) struct PublishedPcLine {
 
 /// Mutable cycle facts are single-writer port state. Every stored head came
 /// from the port's actual one-use AcceptedRoleStep consumption boundary.
-struct CycleFacts {
-    phase: PcRepairPhase,
-    counter: Option<PublishedPcLine>,
-    target: Option<Arc<super::repair_witness::PcDivergenceSource>>,
-    repair: Option<Arc<super::repair_witness::PcRepairAcceptedLine>>,
-    recheck: Option<Arc<super::repair_witness::PcRepairAcceptedLine>>,
-    repair_endpoint: Option<super::repair_witness::PcAcceptedFreshEndpoint>,
-    counter_endpoint: Option<super::repair_witness::PcAcceptedFreshEndpoint>,
+pub(super) struct CycleFacts {
+    pub(super) phase: PcRepairPhase,
+    pub(super) progress: super::repair_report::PcRepairProgress,
+    pub(super) last_accepted: Option<AcceptedPeerSourceSeal>,
+    pub(super) counter: Option<PublishedPcLine>,
+    pub(super) target: Option<Arc<super::repair_witness::PcDivergenceSource>>,
+    pub(super) repair: Option<Arc<super::repair_witness::PcRepairAcceptedLine>>,
+    pub(super) recheck: Option<Arc<super::repair_witness::PcRepairAcceptedLine>>,
+    pub(super) repair_endpoint: Option<super::repair_witness::PcAcceptedFreshEndpoint>,
+    pub(super) counter_endpoint: Option<super::repair_witness::PcAcceptedFreshEndpoint>,
 }
 
 pub(super) struct PcRepairCycles {
-    policy: PostRepairRecheckPolicy,
-    next_cycle: u64,
-    next_event: u64,
-    per_first: HashMap<BoardMove, u8>,
-    active: HashMap<u64, CycleFacts>,
-    witnesses: VecDeque<super::repair_witness::PcDivergenceWitness>,
+    pub(super) policy: PostRepairRecheckPolicy,
+    pub(super) root_budget: ContractDigest,
+    pub(super) next_cycle: u64,
+    pub(super) next_event: u64,
+    pub(super) per_first: HashMap<BoardMove, u8>,
+    pub(super) active: HashMap<u64, CycleFacts>,
+    pub(super) witnesses: VecDeque<super::repair_witness::PcDivergenceWitness>,
 }
 impl PcRepairCycles {
-    pub(super) fn new(policy: PostRepairRecheckPolicy) -> Result<Self, PalsError> {
+    pub(super) fn new(
+        policy: PostRepairRecheckPolicy,
+        root_budget: ContractDigest,
+    ) -> Result<Self, PalsError> {
         if policy != PostRepairRecheckPolicy::IterativeFrozenModelWdlV2 {
             return Err(PalsError::InvalidConfig);
         }
         Ok(Self {
             policy,
+            root_budget,
             next_cycle: 1,
             next_event: 1,
             per_first: HashMap::new(),
@@ -101,7 +108,62 @@ impl PcRepairCycles {
     }
 }
 
+impl super::repair_report::PcRepairProgress {
+    pub(super) fn capture(step: &PcRepairStep) -> Self {
+        Self {
+            cycle: step.cycle,
+            phase: step.phase,
+            first: step.origin.first,
+            model: step.origin.model.clone(),
+            root_source: step.origin.initial_source.clone(),
+            prefix: step.prefix.clone(),
+            proposal: step.proposal.clone(),
+            counter: step.counter.clone(),
+            repaired: step.repaired.clone(),
+        }
+    }
+}
 impl PcRepairStep {
+    pub(super) fn owned_host_bytes(&self) -> Option<u64> {
+        use super::repair_report::{line_bytes, model_bytes, optional_line_bytes};
+        let mut bytes = u64::try_from(std::mem::size_of::<Self>())
+            .ok()?
+            .checked_add(u64::try_from(std::mem::size_of::<PcRepairOrigin>()).ok()?)?
+            .checked_add(model_bytes(&self.origin.model)?)?
+            .checked_add(line_bytes(&self.prefix)?)?
+            .checked_add(line_bytes(&self.proposal)?)?
+            .checked_add(optional_line_bytes(&self.counter)?)?
+            .checked_add(optional_line_bytes(&self.repaired)?)?
+            .checked_add(
+                u64::try_from(
+                    self.divergences
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<usize>())?,
+                )
+                .ok()?,
+            )?
+            .checked_add(
+                u64::try_from(
+                    self.responsibilities
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<PcResponsibilitySource>())?,
+                )
+                .ok()?,
+            )?;
+        for duty in &self.responsibilities {
+            bytes = bytes
+                .checked_add(line_bytes(&duty.prefix)?)?
+                .checked_add(u64::try_from(duty.parent.retained_history_bytes()?).ok()?)?
+                .checked_add(u64::try_from(duty.snapshot.retained_history_bytes()?).ok()?)?
+                .checked_add(duty.source.owned_host_bytes()?)?;
+        }
+        if let Some(context) = &self.frozen_context {
+            bytes = bytes.checked_add(line_bytes(&context.prefix)?)?;
+        }
+        // The actual native prepared owner separately accounts the shared
+        // selected View. This scalar recipe does not duplicate its tensors.
+        Some(bytes)
+    }
     pub(super) fn divergences(&self) -> &[usize] {
         &self.divergences
     }
@@ -172,20 +234,26 @@ impl<M: RoleModel> PcSemanticPort<M> {
         &mut self,
         policy: PostRepairRecheckPolicy,
     ) -> Result<(), PalsError> {
-        if self.next_question != 1 || !self.pending.is_empty() || self.repair_cycles.is_some() {
+        if self.next_question != 1
+            || !self.pending.is_empty()
+            || self.repair_cycles.is_some()
+            || self.post_repair_recheck != PostRepairRecheckPolicy::Disabled
+        {
             return Err(PalsError::InvalidConfig);
         }
         if policy == PostRepairRecheckPolicy::Disabled {
             return Ok(());
         }
-        self.repair_cycles = Some(PcRepairCycles::new(policy)?);
+        let budget = self
+            .original_root_budget()
+            .ok_or(PalsError::InvalidConfig)?;
+        self.repair_cycles = Some(PcRepairCycles::new(policy, budget)?);
+        self.post_repair_recheck = policy;
         Ok(())
     }
 
     pub fn post_repair_recheck(&self) -> PostRepairRecheckPolicy {
-        self.repair_cycles
-            .as_ref()
-            .map_or(PostRepairRecheckPolicy::Disabled, |cycles| cycles.policy)
+        self.post_repair_recheck
     }
 
     pub fn divergence_witnesses(
@@ -280,6 +348,8 @@ impl<M: RoleModel> PcSemanticPort<M> {
             id,
             CycleFacts {
                 phase: step.phase,
+                progress: super::repair_report::PcRepairProgress::capture(&step),
+                last_accepted: None,
                 counter: None,
                 target: None,
                 repair: None,
@@ -340,13 +410,20 @@ impl<M: RoleModel> PcSemanticPort<M> {
             counter: step.counter.clone(),
             repair: Some(Arc::new(step)),
         });
-        self.repair_cycles
+        let facts = self
+            .repair_cycles
             .as_mut()
             .ok_or(PalsError::InvalidConfig)?
             .active
             .get_mut(&id)
-            .ok_or(RoleError::InvalidOutput)?
-            .phase = phase;
+            .ok_or(RoleError::InvalidOutput)?;
+        facts.phase = phase;
+        facts.progress = super::repair_report::PcRepairProgress::capture(
+            self.ready
+                .back()
+                .and_then(|plan| plan.repair.as_deref())
+                .ok_or(RoleError::InvalidOutput)?,
+        );
         Ok(())
     }
 
@@ -411,6 +488,19 @@ impl<M: RoleModel> PcSemanticPort<M> {
             return Err(RoleError::InvalidOutput.into());
         }
         self.consume_pc_head_once(input, accepted, physical)?;
+        let origin = accepted
+            .origin(
+                input.question.frontier_frame(),
+                input.question.reciprocal_question(),
+            )
+            .map_err(|_| RoleError::InvalidOutput)?;
+        let sealed = AcceptedPeerSourceSeal::freeze(origin, &input.view, output)
+            .map_err(|_| RoleError::InvalidOutput)?;
+        self.repair_cycles
+            .as_mut()
+            .and_then(|cycles| cycles.active.get_mut(&step.cycle))
+            .ok_or(RoleError::InvalidOutput)?
+            .last_accepted = Some(sealed);
         if matches!(
             step.phase,
             PcRepairPhase::FreshRepair | PcRepairPhase::FreshCounter
@@ -735,17 +825,21 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 .try_reserve(1)
                 .map_err(|_| PalsError::Capacity)?;
         }
+        let event = cycles.next_event;
+        let next_event = event.checked_add(1).ok_or(PalsError::Capacity)?;
         let facts = cycles.active.remove(&id).ok_or(RoleError::InvalidOutput)?;
         if let Some(source) = facts.target {
-            if cycles.witnesses.len() >= MAX_CYCLES {
-                return Err(PalsError::Capacity);
-            }
-            let event = cycles.next_event;
-            cycles.next_event = event.checked_add(1).ok_or(PalsError::Capacity)?;
+            cycles.next_event = next_event;
             cycles
                 .witnesses
-                .push_back(super::repair_witness::PcDivergenceWitness::unknown(
-                    source, event, reason,
+                .push_back(super::repair_witness::PcDivergenceWitness::unresolved(
+                    source,
+                    facts.repair,
+                    facts.recheck,
+                    facts.repair_endpoint,
+                    facts.counter_endpoint,
+                    event,
+                    reason,
                 ));
         }
         Ok(())

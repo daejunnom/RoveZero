@@ -203,6 +203,14 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 include_str!("engine/pc_port/repair_witness.rs"),
             ),
             (
+                "pals/engine/pc_port/repair_report.rs",
+                include_str!("engine/pc_port/repair_report.rs"),
+            ),
+            (
+                "pals/engine/pc_port/repair_cycle_tests.rs",
+                include_str!("engine/pc_port/repair_cycle_tests.rs"),
+            ),
+            (
                 "pals/engine/frozen_recheck.rs",
                 include_str!("engine/frozen_recheck.rs"),
             ),

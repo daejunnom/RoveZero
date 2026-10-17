@@ -9,6 +9,8 @@ use std::num::NonZeroU16;
 
 #[path = "peer_tests.rs"]
 mod peer_tests;
+#[path = "repair_cycle_tests.rs"]
+mod repair_cycle_tests;
 
 type GoalPort = PcSemanticPort<AdaptivePortModel>;
 

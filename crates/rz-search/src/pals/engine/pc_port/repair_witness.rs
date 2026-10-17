@@ -135,6 +135,17 @@ fn hash_line(hash: &mut Sha256, line: &[BoardMove]) -> Result<(), PalsError> {
     Ok(())
 }
 
+fn inline_bytes<T>() -> Option<u64> {
+    u64::try_from(std::mem::size_of::<T>()).ok()
+}
+fn move_capacity(line: &Vec<BoardMove>) -> Option<u64> {
+    u64::try_from(
+        line.capacity()
+            .checked_mul(std::mem::size_of::<BoardMove>())?,
+    )
+    .ok()
+}
+
 impl PcDivergenceSource {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn capture(
@@ -260,6 +271,12 @@ impl PcDivergenceSource {
     pub fn digest(&self) -> ContractDigest {
         self.digest
     }
+    pub fn owned_host_bytes(&self) -> Option<u64> {
+        inline_bytes::<Self>()?
+            .checked_add(move_capacity(&self.proposal)?)?
+            .checked_add(move_capacity(&self.counter)?)?
+            .checked_add(self.source.owned_host_bytes()?)
+    }
 }
 
 impl PcRepairAcceptedLine {
@@ -341,6 +358,11 @@ impl PcRepairAcceptedLine {
     }
     pub fn digest(&self) -> ContractDigest {
         self.digest
+    }
+    pub fn owned_host_bytes(&self) -> Option<u64> {
+        inline_bytes::<Self>()?
+            .checked_add(move_capacity(&self.moves)?)?
+            .checked_add(self.source.owned_host_bytes()?)
     }
 }
 
@@ -444,33 +466,65 @@ impl PcAcceptedFreshEndpoint {
     pub fn digest(&self) -> ContractDigest {
         self.digest
     }
+    pub fn owned_host_bytes(&self) -> Option<u64> {
+        let mut bytes = inline_bytes::<Self>()?
+            .checked_add(move_capacity(&self.line)?)?
+            .checked_add(self.source.owned_host_bytes()?)?;
+        for text in [
+            &self.model.semantics,
+            &self.model.model,
+            &self.model.encoding,
+            &self.model.precision,
+        ] {
+            bytes = bytes.checked_add(u64::try_from(text.capacity()).ok()?)?;
+        }
+        Some(bytes)
+    }
 }
 
 impl PcDivergenceWitness {
-    pub(super) fn unknown(
+    /// 실제로 이미 존재한 부분 증거를 보존한다. 미완료 사실은 known label이나
+    /// 새로운 acceptance가 되지 않으며, 없는 endpoint를 합성하지 않는다.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn unresolved(
         source: Arc<PcDivergenceSource>,
+        repair: Option<Arc<PcRepairAcceptedLine>>,
+        recheck: Option<Arc<PcRepairAcceptedLine>>,
+        repaired_endpoint: Option<PcAcceptedFreshEndpoint>,
+        counter_endpoint: Option<PcAcceptedFreshEndpoint>,
         event_sequence: u64,
         reason: &'static str,
     ) -> Self {
         let mut hash = Sha256::new();
-        hash.update(b"rz-rovent-pc-divergence-witness/1\0");
+        hash.update(b"rz-rovent-pc-divergence-unresolved/1\0");
         hash.update(source.digest.0);
+        for digest in [
+            repair.as_ref().map(|v| v.digest),
+            recheck.as_ref().map(|v| v.digest),
+            repaired_endpoint.as_ref().map(|v| v.digest),
+            counter_endpoint.as_ref().map(|v| v.digest),
+        ] {
+            hash.update([u8::from(digest.is_some())]);
+            if let Some(digest) = digest {
+                hash.update(digest.0);
+            }
+        }
         hash.update(event_sequence.to_le_bytes());
-        hash.update([PcDivergenceResolution::Unknown as u8]);
         hash.update((reason.len() as u64).to_le_bytes());
         hash.update(reason.as_bytes());
         Self {
             source,
-            repair: None,
-            recheck: None,
-            repaired_endpoint: None,
-            counter_endpoint: None,
+            repair,
+            recheck,
+            repaired_endpoint,
+            counter_endpoint,
             resolution: PcDivergenceResolution::Unknown,
             event_sequence,
             reason,
             digest: ContractDigest(hash.finalize().into()),
         }
     }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_frozen_pair(
         source: Arc<PcDivergenceSource>,
@@ -614,5 +668,20 @@ impl PcDivergenceWitness {
             self.resolution,
             PcDivergenceResolution::Supported | PcDivergenceResolution::Refuted
         )
+    }
+    /// 공유 Arc의 원 allocation은 보수적으로 중복 계수한다. 원 view나 latent를
+    /// 보유하지 않으며 이 값은 실제 allocator peak 관측을 대신하지 않는다.
+    pub fn owned_host_bytes(&self) -> Option<u64> {
+        let mut bytes = inline_bytes::<Self>()?.checked_add(self.source.owned_host_bytes()?)?;
+        for fact in [&self.repair, &self.recheck].into_iter().flatten() {
+            bytes = bytes.checked_add(fact.owned_host_bytes()?)?;
+        }
+        for endpoint in [&self.repaired_endpoint, &self.counter_endpoint]
+            .into_iter()
+            .flatten()
+        {
+            bytes = bytes.checked_add(endpoint.owned_host_bytes()?)?;
+        }
+        Some(bytes)
     }
 }

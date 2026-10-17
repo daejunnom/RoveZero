@@ -23,10 +23,13 @@ mod frontier_port;
 mod goal_local;
 mod peer_questions;
 mod repair_cycle;
+mod repair_report;
 mod repair_witness;
 pub use frontier_port::PcFrontierStartup;
 use peer_questions::{PcPeerQuestion, PcPeerSource};
+pub use repair_cycle::PcRepairPhase;
 use repair_cycle::{PcRepairCycles, PcRepairStep, PublishedPcLine};
+pub use repair_report::{PcRepairProgress, PcRepairReport};
 pub use repair_witness::{
     PcAcceptedFreshEndpoint, PcDivergenceResolution, PcDivergenceSource, PcDivergenceWitness,
     PcRepairAcceptedLine,
@@ -181,6 +184,15 @@ fn responsibility_digest(sources: &[PcResponsibilitySource]) -> Result<ContractD
     Ok(ContractDigest(hash.finalize().into()))
 }
 
+impl PcQuestionSource {
+    fn owned_host_bytes(&self) -> Option<u64> {
+        u64::try_from(
+            std::mem::size_of::<Self>().checked_add(self.position.retained_history_bytes()?)?,
+        )
+        .ok()
+    }
+}
+
 impl PcPortQuestion {
     pub fn position(&self) -> &Position {
         &self.position
@@ -274,7 +286,11 @@ impl PcPortQuestion {
                     .capacity()
                     .checked_mul(std::mem::size_of::<BoardMove>())?,
             )?;
-        u64::try_from(bytes).ok()
+        let mut bytes = u64::try_from(bytes).ok()?;
+        if let Some(step) = &self.repair {
+            bytes = bytes.checked_add(step.owned_host_bytes()?)?;
+        }
+        Some(bytes)
     }
 
     /// The controller consumes the real source question and original view.
@@ -478,6 +494,7 @@ pub struct PcSemanticPort<M: RoleModel> {
     frontier_state: Option<frontier_port::PcFrontierState>,
     retired_strategy: Option<crate::pals::rovent_frontier::FrontierMateStrategy>,
     repair_cycles: Option<PcRepairCycles>,
+    post_repair_recheck: PostRepairRecheckPolicy,
 }
 
 impl<M: RoleModel> PcSemanticPort<M> {
@@ -564,6 +581,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
             frontier_state: None,
             retired_strategy: None,
             repair_cycles: None,
+            post_repair_recheck: PostRepairRecheckPolicy::Disabled,
             counters: PcPortCounters {
                 completed_nn_inputs: Some(0),
                 ..PcPortCounters::default()
@@ -582,7 +600,13 @@ impl<M: RoleModel> PcSemanticPort<M> {
     pub fn owner(&self) -> &PcSemanticOwner<M> {
         &self.owner
     }
-    pub fn into_owner(self) -> PcSemanticOwner<M> {
+    pub fn into_owner(mut self) -> PcSemanticOwner<M> {
+        // Admission required an empty retired slot, and no mutable owner
+        // accessor exists while this port is alive. Move unclaimed history
+        // into that SAME owner instead of dropping it at the port boundary.
+        if let Some(report) = self.detach_repair_report() {
+            self.owner.semantic.retired_pc_repair = Some(report);
+        }
         self.owner
     }
     pub fn authority(&self) -> SearchAuthority {
