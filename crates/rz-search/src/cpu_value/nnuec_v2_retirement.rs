@@ -74,6 +74,11 @@ impl NnuecCacheReleaseAck {
     pub(crate) fn clears(&self, authority: &Arc<AtomicU64>, original_epoch: u64) -> bool {
         Arc::ptr_eq(&self.authority, authority) && self.epoch > original_epoch
     }
+    /// Exact actor/epoch only. A prelude issuer must additionally consume this
+    /// ACK before submitting its unique Request and verify the cache is empty.
+    pub(crate) fn prepares(&self, authority: &Arc<AtomicU64>, preparation_epoch: u64) -> bool {
+        Arc::ptr_eq(&self.authority, authority) && self.epoch == preparation_epoch
+    }
 }
 
 /// Constructed only by the actual V2 evaluator; numeric/profile declarations

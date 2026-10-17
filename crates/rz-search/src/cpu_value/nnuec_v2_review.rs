@@ -78,6 +78,7 @@ pub struct Request {
     identity: RequestIdentity,
     store_owner: StoreReadOwner,
     utility_target: Option<u16>,
+    utility_cache_prelude: Option<super::retirement::NnuecCacheReleaseAck>,
     view: Arc<ReviewView>,
     sources: Arc<[PositionSnapshot]>,
     provenance: Provenance,
@@ -141,6 +142,7 @@ impl Request {
             identity: RequestIdentity(Arc::new(())),
             store_owner: stores.read_owner(),
             utility_target: None,
+            utility_cache_prelude: None,
             view,
             sources,
             provenance,
@@ -180,6 +182,37 @@ impl Request {
         self.utility_target = Some(target_record);
         Ok(self)
     }
+    /// Move the actual actor ACK into this exact selected Request before
+    /// submission. This alone grants no cache classification: only the actor
+    /// can verify its authority, epoch and absence of an intervening prepare.
+    /// Failure preserves the same Request and the unused, move-only ACK.
+    #[allow(clippy::result_large_err)]
+    pub fn with_utility_cache_prelude(
+        mut self,
+        release: super::retirement::NnuecCacheReleaseAck,
+    ) -> Result<
+        Self,
+        (
+            PreparationError,
+            Self,
+            super::retirement::NnuecCacheReleaseAck,
+        ),
+    > {
+        let checked = (|| {
+            check_control(self.deadline, &self.cancel)?;
+            if self.utility_target.is_none() || self.utility_cache_prelude.is_some() {
+                return Err(PreparationError::InvalidView(
+                    "utility cache prelude requires one selected original Request",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = checked {
+            return Err((error, self, release));
+        }
+        self.utility_cache_prelude = Some(release);
+        Ok(self)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +237,7 @@ pub(super) struct UtilityInputPreparationSource<'a> {
     bound: &'a BoundNnuecReviewContext,
     store: StoreReadOwner,
     target_record: u16,
+    cache_prelude: Option<super::retirement::NnuecCacheReleaseAck>,
 }
 impl<'a> UtilityInputPreparationSource<'a> {
     pub(super) fn into_parts(
@@ -213,8 +247,15 @@ impl<'a> UtilityInputPreparationSource<'a> {
         &'a BoundNnuecReviewContext,
         StoreReadOwner,
         u16,
+        Option<super::retirement::NnuecCacheReleaseAck>,
     ) {
-        (self.model, self.bound, self.store, self.target_record)
+        (
+            self.model,
+            self.bound,
+            self.store,
+            self.target_record,
+            self.cache_prelude,
+        )
     }
 }
 
@@ -394,6 +435,16 @@ impl Factory {
         if &request.provenance.model != self.model.identity() {
             return Err(PreparationError::StaleView);
         }
+        if let Some(release) = &request.utility_cache_prelude {
+            if request.utility_target.is_none()
+                || !release.prepares(&self.invalidations, epoch)
+                || self.cached.is_some()
+            {
+                return Err(PreparationError::InvalidView(
+                    "utility cache prelude is not the first same-actor epoch preparation",
+                ));
+            }
+        }
         let view = &request.view;
         let cached = self.cached.as_ref().filter(|cached| {
             cached.digest == request.provenance.record_scope_digest
@@ -514,6 +565,7 @@ impl Factory {
             numeric_context_sha256: numeric_context_sha256.clone(),
         });
         let utility_target = request.utility_target;
+        let cache_prelude = request.utility_cache_prelude;
         let store_owner = request.store_owner;
         let mut bound = BoundNnuecReviewContext {
             instance: BoundInstanceAuthority(Arc::new(BoundInstanceState::default())),
@@ -539,6 +591,7 @@ impl Factory {
                     bound: &bound,
                     store: store_owner,
                     target_record,
+                    cache_prelude,
                 },
             )
             .map_err(|error| match bound.authority_revocation() {
@@ -1749,6 +1802,240 @@ mod tests {
             thread::yield_now();
         }
         assert!(actor.try_complete().unwrap().is_none());
+        actor.shutdown().unwrap();
+    }
+
+    fn actual_cache_prelude_ack(
+        actor: &PreparationActor,
+    ) -> super::super::retirement::NnuecCacheReleaseAck {
+        let ticket = actor.invalidate_context_cache().unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(release) = actor.try_context_cache_release(&ticket).unwrap() {
+                return release;
+            }
+            assert!(Instant::now() < until, "actual prelude cache ACK timed out");
+            thread::yield_now();
+        }
+    }
+    fn actual_utility_request(
+        actor_model: &Model,
+        view: &Arc<ReviewView>,
+        stores: &PalsStores,
+        state: StateId,
+    ) -> Request {
+        Request::admit(
+            actor_model,
+            Arc::clone(view),
+            stores,
+            state,
+            stores.generation(),
+            Instant::now() + Duration::from_secs(10),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap()
+        .with_utility_input_capture(0)
+        .unwrap_or_else(|_| panic!("explicit target selection"))
+    }
+    fn actual_actor_prepare(
+        actor: &PreparationActor,
+        request: Request,
+    ) -> Result<BoundNnuecReviewContext, PreparationError> {
+        actor
+            .try_submit(request)
+            .unwrap_or_else(|_| panic!("actual prelude Request admission"));
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(completion) = actor.try_complete().unwrap() {
+                return completion.result;
+            }
+            assert!(Instant::now() < until, "actual preparation timed out");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn utility_cache_prelude_uses_original_ack_request_and_bound_without_retaining_view() {
+        let (mut stores, mut index, state, _) = setup();
+        let model = Arc::clone(&factory().model);
+        let view = Arc::new(
+            index
+                .select(
+                    &stores,
+                    state,
+                    query(RoleQueryPurpose::ProposePolicy),
+                    ReviewSelectionPolicy::default(),
+                )
+                .unwrap(),
+        );
+        let weak_view = Arc::downgrade(&view);
+        let actor = PreparationActor::spawn(Arc::clone(&model)).unwrap();
+        let ack = actual_cache_prelude_ack(&actor);
+        let epoch = ack.epoch();
+        let request = actual_utility_request(&model, &view, &stores, state)
+            .with_utility_cache_prelude(ack)
+            .unwrap_or_else(|_| panic!("move actual ACK before submission"));
+        let identity = request.identity();
+        let bound = Arc::new(actual_actor_prepare(&actor, request).unwrap());
+        assert!(!bound.reused_record_scope());
+        let captured = Arc::clone(bound.utility_input_capture().unwrap());
+        let prelude = captured.cache_prelude().expect("actual first C prelude");
+        assert_eq!(prelude.epoch(), epoch);
+        assert!(prelude.matches_input(&captured));
+        assert!(captured.matches_request(&identity));
+        assert!(captured.matches_original_store(&stores));
+        assert!(!captured.matches_original_store(&PalsStores::new(StoreLimits::default())));
+
+        // Same public input and same C cache are not the first Request again.
+        let second = Arc::new(
+            actual_actor_prepare(
+                &actor,
+                actual_utility_request(&model, &view, &stores, state),
+            )
+            .unwrap(),
+        );
+        let other = second.utility_input_capture().unwrap();
+        assert!(second.reused_record_scope());
+        assert_eq!(captured.input_bytes(), other.input_bytes());
+        assert!(other.cache_prelude().is_none());
+        assert!(!prelude.matches_input(other));
+        actor.shutdown().unwrap();
+        drop(second);
+        drop(bound);
+        drop(view);
+        assert!(weak_view.upgrade().is_none());
+        assert_eq!(stores.review_pin_count().unwrap(), 0);
+        assert!(
+            prelude.matches_input(&captured),
+            "past evidence is still readable"
+        );
+        stores
+            .focus_actual_moves(Position::startpos().snapshot())
+            .unwrap();
+        assert!(
+            !captured.matches_original_store(&stores),
+            "new generation is not the original Store scope"
+        );
+    }
+
+    #[test]
+    fn utility_cache_prelude_rejects_foreign_actor_and_intervening_preparation() {
+        let (stores, mut index, state, _) = setup();
+        let model = Arc::clone(&factory().model);
+        let view = Arc::new(
+            index
+                .select(
+                    &stores,
+                    state,
+                    query(RoleQueryPurpose::ProposePolicy),
+                    ReviewSelectionPolicy::default(),
+                )
+                .unwrap(),
+        );
+        let actor = PreparationActor::spawn(Arc::clone(&model)).unwrap();
+        let foreign = PreparationActor::spawn(Arc::clone(&model)).unwrap();
+        // Equal epoch numbers and the same actual model cannot replace the actor.
+        let foreign_ack = actual_cache_prelude_ack(&foreign);
+        let own_ack = actual_cache_prelude_ack(&actor);
+        assert_eq!(foreign_ack.epoch(), own_ack.epoch());
+        let request = actual_utility_request(&model, &view, &stores, state)
+            .with_utility_cache_prelude(foreign_ack)
+            .unwrap_or_else(|_| panic!("Request custody only"));
+        assert!(matches!(
+            actual_actor_prepare(&actor, request),
+            Err(PreparationError::InvalidView(
+                "utility cache prelude is not the first same-actor epoch preparation"
+            ))
+        ));
+        let intervening = actual_actor_prepare(
+            &actor,
+            actual_utility_request(&model, &view, &stores, state),
+        )
+        .unwrap();
+        assert!(
+            intervening
+                .utility_input_capture()
+                .unwrap()
+                .cache_prelude()
+                .is_none()
+        );
+        let request = actual_utility_request(&model, &view, &stores, state)
+            .with_utility_cache_prelude(own_ack)
+            .unwrap_or_else(|_| panic!("original ACK custody"));
+        assert!(matches!(
+            actual_actor_prepare(&actor, request),
+            Err(PreparationError::InvalidView(
+                "utility cache prelude is not the first same-actor epoch preparation"
+            ))
+        ));
+        actor.shutdown().unwrap();
+        foreign.shutdown().unwrap();
+    }
+
+    #[test]
+    fn utility_cache_prelude_rejects_superseded_epoch_and_returns_unused_ack_on_selection_error() {
+        let (stores, mut index, state, _) = setup();
+        let model = Arc::clone(&factory().model);
+        let view = Arc::new(
+            index
+                .select(
+                    &stores,
+                    state,
+                    query(RoleQueryPurpose::ProposePolicy),
+                    ReviewSelectionPolicy::default(),
+                )
+                .unwrap(),
+        );
+        let actor = PreparationActor::spawn(Arc::clone(&model)).unwrap();
+        let ack = actual_cache_prelude_ack(&actor);
+        let plain = Request::admit(
+            &model,
+            Arc::clone(&view),
+            &stores,
+            state,
+            stores.generation(),
+            Instant::now() + Duration::from_secs(10),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let identity = plain.identity();
+        let (error, plain, ack) = match plain.with_utility_cache_prelude(ack) {
+            Err(originals) => originals,
+            Ok(_) => panic!("prelude without a selected target was accepted"),
+        };
+        assert_eq!(
+            error,
+            PreparationError::InvalidView(
+                "utility cache prelude requires one selected original Request"
+            )
+        );
+        assert!(plain.identity().same_request(&identity));
+        let old_epoch = ack.epoch();
+        let current = actual_cache_prelude_ack(&actor);
+        assert!(current.epoch() > old_epoch);
+        let request = plain
+            .with_utility_input_capture(0)
+            .unwrap_or_else(|_| panic!("same Request target selection"))
+            .with_utility_cache_prelude(ack)
+            .unwrap_or_else(|_| panic!("old ACK moved, not reissued"));
+        assert!(matches!(
+            actual_actor_prepare(&actor, request),
+            Err(PreparationError::InvalidView(
+                "utility cache prelude is not the first same-actor epoch preparation"
+            ))
+        ));
+        // The failed old epoch did not consume the current ACK or fill C cache.
+        let request = actual_utility_request(&model, &view, &stores, state)
+            .with_utility_cache_prelude(current)
+            .unwrap_or_else(|_| panic!("actual current ACK"));
+        let bound = actual_actor_prepare(&actor, request).unwrap();
+        assert!(
+            bound
+                .utility_input_capture()
+                .unwrap()
+                .cache_prelude()
+                .is_some()
+        );
         actor.shutdown().unwrap();
     }
 }

@@ -2,6 +2,7 @@
 //! actor. This is neither a utility forward nor an R-node readout, action
 //! allocation, policy decision, semantic witness or known training target.
 
+use super::retirement::NnuecCacheReleaseAck;
 use super::review::{
     BoundInstanceAuthority, BoundNnuecReviewContext, Provenance, RequestIdentity,
     UtilityInputPreparationSource,
@@ -24,6 +25,28 @@ pub const INPUT_CAPTURE_DOMAIN: &str = "rz-nnuec-submitted-utility-input/1";
 pub const TARGET_CAPTURE_DOMAIN: &str = "rz-nnuec-submitted-utility-target/1";
 pub const SUBMISSION_TARGET_CAPTURE_DOMAIN: &str = "rz-nnuec-submitted-utility-submission-target/1";
 pub const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// The original move-only ACK travelled through this Request before its first
+/// same-actor C preparation. This historical evidence retains no model/View,
+/// has no public constructor/Clone, and says nothing about TT/GPU/P-C caches.
+#[derive(Debug)]
+pub struct NnuecUtilityCachePrelude {
+    release: NnuecCacheReleaseAck,
+    request: RequestIdentity,
+    instance: BoundInstanceAuthority,
+}
+impl NnuecUtilityCachePrelude {
+    pub fn epoch(&self) -> u64 {
+        self.release.epoch()
+    }
+    /// Compare the original Request and Bound instance, not public hashes.
+    /// Historical matching never restores live preparation/action authority.
+    pub fn matches_input(&self, input: &NnuecUtilityInputCapture) -> bool {
+        self.request.same_request(&input.request)
+            && self.instance.matches(&input.instance)
+            && self.release.prepares(&input.invalidations, input.epoch)
+    }
+}
 
 /// Immutable input from exactly one selected Request. The weak original
 /// model/View and small request/Bound authorities cannot keep a Store pin or
@@ -52,6 +75,7 @@ pub struct NnuecUtilityInputCapture {
     stopping: Arc<AtomicBool>,
     invalidations: Arc<AtomicU64>,
     epoch: u64,
+    cache_prelude: Option<NnuecUtilityCachePrelude>,
 }
 
 pub(crate) fn target_record_ids(
@@ -102,8 +126,14 @@ impl NnuecUtilityInputCapture {
     pub(super) fn from_prepared(
         source: UtilityInputPreparationSource<'_>,
     ) -> Result<Self, NnuecError> {
-        let (model, bound, store, target_record) = source.into_parts();
+        let (model, bound, store, target_record, cache_prelude) = source.into_parts();
         if !bound.authority_is_live() || bound.provenance().model != *model.identity() {
+            return Err(NnuecError::StateMismatch);
+        }
+        if cache_prelude.as_ref().is_some_and(|release| {
+            !release.prepares(bound.actor_invalidations(), bound.preparation_epoch())
+                || bound.reused_record_scope()
+        }) {
             return Err(NnuecError::StateMismatch);
         }
         model.check_context(bound.context())?;
@@ -188,6 +218,11 @@ impl NnuecUtilityInputCapture {
         if !bound.authority_is_live() {
             return Err(NnuecError::StateMismatch);
         }
+        let cache_prelude = cache_prelude.map(|release| NnuecUtilityCachePrelude {
+            release,
+            request: bound.request_identity(),
+            instance: bound.instance_authority().clone(),
+        });
         Ok(Self {
             request: bound.request_identity(),
             instance: bound.instance_authority().clone(),
@@ -212,6 +247,7 @@ impl NnuecUtilityInputCapture {
             stopping: Arc::clone(bound.actor_stopping()),
             invalidations: Arc::clone(bound.actor_invalidations()),
             epoch: bound.preparation_epoch(),
+            cache_prelude,
         })
     }
     pub fn provenance(&self) -> &Provenance {
@@ -255,6 +291,14 @@ impl NnuecUtilityInputCapture {
     }
     pub fn source_snapshots(&self) -> &[PositionSnapshot] {
         &self.sources
+    }
+    /// Same original weak Store owner and generation only. No time check,
+    /// view reselection, pin creation, or retired/live authority conversion.
+    pub fn matches_original_store(&self, stores: &PalsStores) -> bool {
+        self.store.matches(stores) && stores.generation() == self.provenance.generation
+    }
+    pub fn cache_prelude(&self) -> Option<&NnuecUtilityCachePrelude> {
+        self.cache_prelude.as_ref()
     }
     pub fn matches_original_model(&self, model: &Arc<Model>) -> bool {
         self.model.ptr_eq(&Arc::downgrade(model)) && self.identity == *model.identity()
