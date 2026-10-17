@@ -428,6 +428,7 @@ where
             || self.profiled_busy()
             || !self.deferred.is_empty()
             || self.registry.occupancy() != 0
+            || self.native.occupancy() != 0
             || self.native_credit_outstanding()?
             || self.nnuec_pending.is_some()
             || !self.driver.semantic_owner_available()
@@ -682,9 +683,6 @@ where
         let Some(state) = self.utility_route.as_mut().filter(|state| state.is_open()) else {
             return Ok(());
         };
-        if state.committed.contains(&execution) {
-            return Ok(());
-        }
         self.driver.commit_utility_route_step(
             state
                 .action
@@ -698,7 +696,9 @@ where
                 ))?,
             work,
         )?;
-        state.committed.push(execution);
+        if !state.committed.contains(&execution) {
+            state.committed.push(execution);
+        }
         Ok(())
     }
     pub(super) fn utility_await_committed(

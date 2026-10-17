@@ -952,8 +952,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         Ok(())
     }
 
-    /// Only the exact original hot commit may contribute a witness. Raw
-    /// published PV, high depth or another frame's head does not qualify.
+    /// Only the exact original hot commit may contribute a witness. Repeating
+    /// this same guard after deferred semantic materialization refreshes only
+    /// the unread observation suffix, without recording another CPU action.
+    /// Raw PV, depth or another frame's head does not qualify.
     pub fn commit_utility_route_step(
         &self,
         action: &mut UtilityRouteAction,
@@ -979,6 +981,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             || end < guard.first_observation
             || end - guard.first_observation > MAX_ACTION_WITNESSES
             || action.committed.contains(&guard.execution)
+                && action.committed_sources.get(&guard.execution)
+                    != Some(&(guard.frame, guard.question))
         {
             return Err(RoleError::InvalidOutput.into());
         }
@@ -1121,9 +1125,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             || end < first_observation
             || end - first_observation > MAX_ACTION_WITNESSES
             || refresh
-                && (!matches!(guard.execution, StepExecution::Role(_))
-                    || action.committed_sources.get(&guard.execution)
-                        != Some(&(guard.frame, guard.question)))
+                && action.committed_sources.get(&guard.execution)
+                    != Some(&(guard.frame, guard.question))
             || matches!(guard.execution, StepExecution::Role(_)) != consumption.is_some()
         {
             return Err(RoleError::InvalidOutput.into());
@@ -1261,11 +1264,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let original = preparation
             .source_view
             .upgrade()
-            .ok_or(RoleError::InvalidOutput)?;
+            .ok_or_else(|| PalsError::from(RoleError::InvalidOutput))?;
         let original_query = preparation
             .source_query
             .upgrade()
-            .ok_or(RoleError::InvalidOutput)?;
+            .ok_or_else(|| PalsError::from(RoleError::InvalidOutput))?;
         if preparation.id.authority != self.authority
             || preparation.id.frame != work.frame
             || preparation.id.question != work.input.question_digest
@@ -1355,7 +1358,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             rz_contracts::rovent::ExecutionMode::CpuPc => 3,
         }]);
         hash.update((frontier.root_moves().allowed().len() as u64).to_le_bytes());
-        for movement in frontier.root_moves().allowed() {
+        for movement in frontier.root_moves().allowed().iter() {
             hash.update(Move16::pack(*movement)?.bits().to_le_bytes());
         }
         let sequence = self.engine.semantic_sequence_config();

@@ -9,7 +9,7 @@ use rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace;
 use rz_search::pals::rovent_engine::RootMoveDomain;
 use rz_search::pals::rovent_frontier::RoventFrontier;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 pub const ROVENT_COLLECTION_NATIVE_ORIGIN: &str = "rz-rovent-collection-native-origin/1";
@@ -385,11 +385,13 @@ impl RoventCollectionRootAdmission {
         });
         if let Some(source) = external {
             raw["external_source"] = source.collection_evidence().clone();
-            raw["external_source_sha256"] = json!(rz_experiments::pals_data_v3::generation_digest(
-                ROVENT_COLLECTION_PROFILED_EXTERNAL_SOURCE,
-                source.collection_evidence()
-            )
-            .map_err(|error| reject(error.to_string()))?);
+            raw["external_source_sha256"] = json!(
+                rz_experiments::pals_data_v3::generation_digest(
+                    ROVENT_COLLECTION_PROFILED_EXTERNAL_SOURCE,
+                    source.collection_evidence()
+                )
+                .map_err(|error| reject(error.to_string()))?
+            );
         }
         let raw_sha256 = rz_experiments::pals_data_v3::generation_digest(domain, &raw)
             .map_err(|error| reject(error.to_string()))?;

@@ -15,6 +15,7 @@ import math
 
 RECIPE_DOMAIN = "rz-rovent-utility-training-recipe/1"
 PREPARATION_DOMAIN = "rz-rovent-utility-training-preparation/1"
+COHORT_PREPARATION_DOMAIN = "rz-rovent-utility-training-preparation/2"
 RECIPE_VERSION = "actual-route-known-pairwise-logistic/1"
 ROUTE_ACTIONS = (4, 5, 6)
 PARAMETER_FIELDS = ("hidden_weights", "hidden_bias", "output_weights", "output_bias")
@@ -25,6 +26,7 @@ UTILITY_SCHEMA = "rz-nnuec-utility-fp32-v1"
 UTILITY_SEMANTICS = "nnuec-v2-targetbundle-risk-route-shadow-fp32-v1"
 COST_SCOPE = "exclusive_submitted_global_target_route_and_descendants_with_required_drain"
 COST_OBJECTIVE = "exclusive_wall_nanoseconds"
+COHORT_COST_SCOPE = "cohort_route_with_bounded_materialization_and_physical_pin_zero_excluding_durable_dataset_io_v1"
 MAX_PREPARATION_BYTES = 64 * 1024
 MAX_CONTEXTS = 8192
 MAX_PAIR_ENTRIES_PER_CONTEXT = 64
@@ -230,7 +232,7 @@ def route_pairwise_loss(logits_rows, pairs_rows):
             "loss_weight": "1.0", "performed_optimizer_updates": 0, "execution_authorized": False}
 
 
-def _registration(value, spec, optimizer_owner):
+def _registration(value, spec, optimizer_owner, *, cost_scope=COST_SCOPE):
     _fields(value, ("collection_source_sha256", "trainer_source_sha256", "cost_epoch_sha256",
                     "resource_profile_sha256", "cost_scope", "objective", "frozen_base", "utility"),
             "utility source registration")
@@ -238,7 +240,7 @@ def _registration(value, spec, optimizer_owner):
     _sha(value["trainer_source_sha256"])
     _sha(value["cost_epoch_sha256"])
     _sha(value["resource_profile_sha256"])
-    if value["cost_scope"] != COST_SCOPE or value["objective"] != COST_OBJECTIVE:
+    if value["cost_scope"] != cost_scope or value["objective"] != COST_OBJECTIVE:
         raise ValueError("registered exclusive whole-route/drain cost scope and wall-nanosecond objective required")
     frozen = _fields(value["frozen_base"], ("schema", "semantics", "weights_sha256", "config"), "frozen V2 base")
     if frozen["schema"] != BASE_SCHEMA or frozen["semantics"] != BASE_SEMANTICS:
@@ -258,23 +260,55 @@ def _registration(value, spec, optimizer_owner):
     return _copy(value)
 
 
-def prepare_training(recipe, registration, spec):
-    """Seal checkpoint/export preparation metadata; never create either tensor artifact."""
+def _prepare_training(recipe, registration, spec, *, domain, cost_scope):
     checked_recipe = validate_recipe(recipe)
     owner = checked_recipe["optimizer_owner"]
-    checked_registration = _registration(registration, spec, owner)
+    checked_registration = _registration(registration, spec, owner, cost_scope=cost_scope)
     config = checked_registration["frozen_base"]["config"]
     checked_spec = validate_parameter_membership(spec, config, owner)
     result = {
-        "schema": PREPARATION_DOMAIN, "status": "prepared_metadata_only",
+        "schema": domain, "status": "prepared_metadata_only",
         "recipe": checked_recipe, "recipe_sha256": recipe_sha256(checked_recipe),
         "registration": checked_registration,
-        "registration_sha256": _digest(PREPARATION_DOMAIN, {"kind": "source_registration", "value": checked_registration}),
+        "registration_sha256": _digest(domain, {"kind": "source_registration", "value": checked_registration}),
         "parameter_spec": checked_spec, "parameter_spec_sha256": parameter_spec_sha256(checked_spec, config, owner),
         "optimizer_owner": owner, "prepared_artifacts": ["checkpoint_metadata", "export_metadata"],
         "tensor_membership_verified": False, "source_authority_verified": False,
         "optimizer_state_present": False, "checkpoint_tensor_present": False, "export_tensor_present": False,
         "performed_optimizer_updates": 0, "execution_authorized": False,
     }
-    result["preparation_sha256"] = _digest(PREPARATION_DOMAIN, result)
+    result["preparation_sha256"] = _digest(domain, result)
     return _copy(result)
+
+
+def prepare_training(recipe, registration, spec):
+    """Read/seal the original V1 declaration without retagging its cost scope."""
+    return _prepare_training(recipe, registration, spec, domain=PREPARATION_DOMAIN, cost_scope=COST_SCOPE)
+
+
+def prepare_cohort_training(recipe, registration, spec):
+    """Seal the distinct cohort-only supervision domain, without live rights.
+
+    Parameter membership and loss arithmetic have unchanged meanings. That
+    does not make root-local cost observations a cohort target. The current
+    parent must additionally verify original cohort/trial/physical-release
+    evidence; this metadata parser cannot issue a known-pair capability.
+    """
+    return _prepare_training(recipe, registration, spec,
+        domain=COHORT_PREPARATION_DOMAIN, cost_scope=COHORT_COST_SCOPE)
+
+
+def validate_training_preparation(value):
+    """Explicit V1/V2 parser dispatch; never fill, retag, or resign a record."""
+    if type(value) is not dict:
+        raise ValueError("explicit utility training preparation object required")
+    schema = value.get("schema")
+    if schema == PREPARATION_DOMAIN:
+        checked = prepare_training(value.get("recipe"), value.get("registration"), value.get("parameter_spec"))
+    elif schema == COHORT_PREPARATION_DOMAIN:
+        checked = prepare_cohort_training(value.get("recipe"), value.get("registration"), value.get("parameter_spec"))
+    else:
+        raise ValueError("registered explicit utility preparation V1/V2 domain required")
+    if _json(value) != _json(checked):
+        raise ValueError("utility training preparation differs from its original exact codec")
+    return checked
