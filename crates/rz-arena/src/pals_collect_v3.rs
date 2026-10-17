@@ -23,6 +23,8 @@ mod capture;
 #[cfg(feature = "pals-collection")]
 pub use capture::*;
 #[cfg(feature = "pals-collection")]
+pub(crate) use capture::capture_submitted_review_common_fields;
+#[cfg(feature = "pals-collection")]
 mod action_driver;
 #[cfg(feature = "pals-collection")]
 pub use action_driver::*;

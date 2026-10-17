@@ -245,6 +245,7 @@ impl PublishedRoventRecord {
 /// Single-writer collector. It neither runs engines nor initiates collection.
 /// Its local sequence is independent of Store revisions/native request IDs.
 pub struct RoventCorpusProducer {
+    native_domain: &'static str,
     manifest: RoventCorpusManifest,
     manifest_sha256: String,
     sequence: u64,
@@ -274,6 +275,7 @@ impl RoventCorpusProducer {
     pub fn new(manifest: RoventCorpusManifest) -> Result<Self, ArenaError> {
         let manifest_sha256 = manifest.sha256()?;
         Ok(Self {
+            native_domain: NATIVE_RAW_RULES_V2_DOMAIN,
             manifest,
             manifest_sha256,
             sequence: 0,
@@ -461,9 +463,8 @@ impl RoventCorpusProducer {
             hex(native_acceptance_output_digest(output).map_err(|e| invalid(format!("{e:?}")))?);
         let completed = self.next()?;
         let pending = self.pending.get_mut(&key).expect("checked pending");
-        let submission_sha =
-            generation_digest(NATIVE_RAW_RULES_V2_DOMAIN, &pending.raw_submission)?;
-        let raw = json!({"schema":NATIVE_RAW_RULES_V2_DOMAIN,"kind":"completed","sequence":completed,
+        let submission_sha = generation_digest(self.native_domain, &pending.raw_submission)?;
+        let raw = json!({"schema":self.native_domain,"kind":"completed","sequence":completed,
             "process_epoch":t.id.epoch.0,"game_generation":t.authority.game.0,"root_generation":t.authority.root.0,
             "request_sequence":t.id.sequence,"source_sha256":self.manifest.source_sha256,"head":role_name(t.role),
             "input_sha256":pending.input_sha256,"submitted_sha256":submission_sha,
@@ -495,7 +496,7 @@ impl RoventCorpusProducer {
             accepted_retired: false,
             raw_submission: pending.raw_submission.clone(),
             raw_submission_sha256: submission_sha,
-            raw_completion_sha256: generation_digest(NATIVE_RAW_RULES_V2_DOMAIN, &raw)?,
+            raw_completion_sha256: generation_digest(self.native_domain, &raw)?,
             raw_completion: raw,
             raw_retirement: Value::Null,
             raw_retirement_sha256: String::new(),
@@ -573,14 +574,14 @@ impl RoventCorpusProducer {
         let retired = self.next()?;
         let pending = self.pending.remove(&key).expect("checked pending");
         let mut native = pending.completed.expect("checked completed");
-        let raw = json!({"schema":NATIVE_RAW_RULES_V2_DOMAIN,"kind":"retired","sequence":retired,
+        let raw = json!({"schema":self.native_domain,"kind":"retired","sequence":retired,
             "process_epoch":t.id.epoch.0,"game_generation":t.authority.game.0,"root_generation":t.authority.root.0,
             "request_sequence":t.id.sequence,"head":role_name(t.role),"source_sha256":self.manifest.source_sha256,
             "input_sha256":pending.input_sha256,"submitted_sha256":native.raw_submission_sha256,
             "completed_sha256":native.raw_completion_sha256,"output_digest":native.output_digest,
             "accepted_retired":true,"ticket":ticket_json(&t),"acceptance_kind":acceptance_kind,
             "root_admission":admission.raw_receipt(),"root_admission_sha256":admission.raw_sha256()});
-        native.raw_retirement_sha256 = generation_digest(NATIVE_RAW_RULES_V2_DOMAIN, &raw)?;
+        native.raw_retirement_sha256 = generation_digest(self.native_domain, &raw)?;
         native.raw_retirement = raw;
         native.retired_sequence = retired;
         native.accepted_retired = true;
@@ -898,15 +899,32 @@ impl RoventCorpusWriter {
                     == *row.admission.raw_receipt(),
             "writer requires the original published root admission",
         )?;
-        let admission_sha = row.admission.raw_sha256().to_owned();
-        let source_sha = row.admission.native_origin().raw_sha256().to_owned();
+        let mut bytes = serde_json::to_vec(&row.record).map_err(|e| invalid(e.to_string()))?;
+        bytes.push(b'\n');
+        self.append_original_parts(
+            &row.admission,
+            &row.record.record_sha256,
+            RoventCorpusOrigin::from_record(&row.record),
+            bytes,
+        )
+    }
+    /// 호출 형식의 전체 검증 뒤 원 admission과 정확 serialized bytes를 이동한다.
+    /// metadata decoder가 이 private 경로를 호출하여 PublishedRecord를 발급할 수 없다.
+    fn append_original_parts(
+        &mut self,
+        admission: &RoventCollectionRootAdmission,
+        record_sha256: &str,
+        origin: RoventCorpusOrigin,
+        bytes: Vec<u8>,
+    ) -> Result<(), ArenaError> {
+        let admission_sha = admission.raw_sha256().to_owned();
+        let source_sha = admission.native_origin().raw_sha256().to_owned();
         // Read/serialize original source metadata once per native origin, then
         // share equal source payloads across process/root occurrences.
         let (source, new_payload) = match self.publication_sources.get(&source_sha) {
             Some(source) => (std::sync::Arc::clone(source), None),
             None => {
-                let snapshot =
-                    publication::RoventPublicationSourceSnapshot::capture(&row.admission)?;
+                let snapshot = publication::RoventPublicationSourceSnapshot::capture(admission)?;
                 let key = snapshot.payload_key();
                 match self.publication_payloads.get(&key) {
                     Some(original) => {
@@ -926,9 +944,6 @@ impl RoventCorpusWriter {
                 "root admission changed its original source",
             )?;
         }
-        let mut bytes = serde_json::to_vec(&row.record).map_err(|e| invalid(e.to_string()))?;
-        bytes.push(b'\n');
-        let origin = RoventCorpusOrigin::from_record(&row.record);
         let origin_bytes = serde_json::to_vec(&origin)
             .map_err(|e| invalid(e.to_string()))?
             .len() as u64
@@ -941,8 +956,7 @@ impl RoventCorpusWriter {
         let admission_bytes = if self.admissions.contains_key(&admission_sha) {
             0
         } else {
-            1024 + row
-                .admission
+            1024 + admission
                 .root_admission()
                 .allocation_clock_canonical_bytes()
                 .len() as u64
@@ -964,11 +978,11 @@ impl RoventCorpusWriter {
                     .total_bytes
                     .checked_add(added)
                     .is_some_and(|n| n <= 18 * 1024 * 1024 * 1024)
-                && !self.record_seals.contains(&row.record.record_sha256),
+                && !self.record_seals.contains(record_sha256),
             "corpus output cap/duplicate; flush full chunk explicitly",
         )?;
-        self.allocations.retain(&row)?;
-        self.record_seals.insert(row.record.record_sha256.clone());
+        self.allocations.retain_admission(admission)?;
+        self.record_seals.insert(record_sha256.to_owned());
         if let Some(key) = new_payload {
             self.publication_payloads
                 .insert(key, std::sync::Arc::clone(&source));
@@ -1050,6 +1064,22 @@ pub use publication::{
     ROVENT_PUBLICATION_INDEX, ROVENT_PUBLICATION_MANIFEST, RoventCorpusPublication,
     RoventPublicationAdmission, RoventPublicationFile,
 };
+mod publication_v2;
+pub use publication_v2::{ROVENT_CORPUS_PUBLICATION_V2, RoventCorpusPublicationV2};
+mod submitted_v3;
+pub use submitted_v3::{
+    PublishedRoventRecordV2, RoventRetiredRecordV2, RoventSubmittedRecordMetadata,
+    RoventSubmittedReviewEvidence, capture_rovent_submitted_input,
+};
+mod producer_v2;
+pub use producer_v2::{
+    RoventCapturedInputV2, RoventCorpusProducerV2, RoventInputCaptureReservationV2,
+};
+mod writer_v2;
+pub use writer_v2::{FinishedRoventCorpusV2, RoventCorpusWriterV2};
+mod historical_v2;
+mod submitted_review_historical;
+pub use historical_v2::verify_historical_submitted_record_evidence;
 mod r_readout;
 pub use r_readout::*;
 mod r_publication;

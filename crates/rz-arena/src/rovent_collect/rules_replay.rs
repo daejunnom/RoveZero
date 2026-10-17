@@ -212,6 +212,40 @@ pub fn verify_historical_record_rules(record: &RoventTrainingRecord) -> Result<(
     let replay: RoventSubmittedRulesReplay =
         serde_json::from_value(record.native.raw_submission["rules_replay"].clone())
             .map_err(|_| invalid("missing/malformed submitted Rules replay"))?;
+    let indices = input
+        .divergence_record_ids
+        .iter()
+        .map(|id| {
+            input
+                .selected_view
+                .records
+                .iter()
+                .position(|row| &row.record_id == id)
+                .ok_or_else(|| invalid("divergence record absent"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    verify_historical_rules_fields(input, &record.native, &replay, &indices)?;
+    for name in ["wdl", "nnuec_wdl"] {
+        let target = if name == "wdl" {
+            record.targets.wdl.as_ref()
+        } else {
+            record.nnuec_wdl.as_ref()
+        };
+        if let Some(target) = target {
+            verify_wdl_replay(record, name, target)?;
+        }
+    }
+    Ok(())
+}
+
+/// 명시 형식 검증을 통과한 입력에만 사용하는 원 Rules/encoder 계산이다.
+/// indices는 호출 형식의 실제 의미대로 전달하며 입력이나 raw domain을 재태그하지 않는다.
+pub(super) fn verify_historical_rules_fields(
+    input: &GenerationInputV3,
+    native: &RoventNativeLifecycle,
+    replay: &RoventSubmittedRulesReplay,
+    indices: &[usize],
+) -> Result<(), ArenaError> {
     check(
         replay.schema == ROVENT_SUBMITTED_RULES_REPLAY
             && replay.selected_anchors.len() == input.selected_view.anchors.len()
@@ -316,22 +350,10 @@ pub fn verify_historical_record_rules(record: &RoventTrainingRecord) -> Result<(
         candidates.update(movement.to_le_bytes());
     }
     check(
-        record.native.raw_submission["ticket"]["representation"]["candidates"]
+        native.raw_submission["ticket"]["representation"]["candidates"]
             == hex(Digest(candidates.finalize().into())),
         "historical candidate order differs from original native key",
     )?;
-    let indices = input
-        .divergence_record_ids
-        .iter()
-        .map(|id| {
-            input
-                .selected_view
-                .records
-                .iter()
-                .position(|row| &row.record_id == id)
-                .ok_or_else(|| invalid("divergence record absent"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let proposal = query
         .proposal
         .iter()
@@ -340,7 +362,7 @@ pub fn verify_historical_record_rules(record: &RoventTrainingRecord) -> Result<(
     let divergences = rz_uci::pals_native::virtual_encoding::encode_review_divergences(
         &anchors[0],
         &proposal,
-        &indices,
+        indices,
     )
     .map_err(|error| invalid(error.to_string()))?;
     let encoded = input.encoded_model_input["divergences"]
@@ -360,16 +382,6 @@ pub fn verify_historical_record_rules(record: &RoventTrainingRecord) -> Result<(
             }),
         "historical divergence input differs from original Rules encoder",
     )?;
-    for name in ["wdl", "nnuec_wdl"] {
-        let target = if name == "wdl" {
-            record.targets.wdl.as_ref()
-        } else {
-            record.nnuec_wdl.as_ref()
-        };
-        if let Some(target) = target {
-            verify_wdl_replay(record, name, target)?;
-        }
-    }
     Ok(())
 }
 

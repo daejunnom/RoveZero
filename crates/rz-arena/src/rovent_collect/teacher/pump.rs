@@ -6,8 +6,78 @@ use std::{
     time::{Duration, Instant},
 };
 
+enum PumpRow {
+    Legacy(RoventRetiredRecord),
+    SubmittedV1(RoventRetiredRecordV2),
+}
+impl PumpRow {
+    fn input_sha256(&self) -> &str {
+        match self {
+            Self::Legacy(row) => row.input_sha256(),
+            Self::SubmittedV1(row) => row.input_sha256(),
+        }
+    }
+    fn actor(&self) -> Option<&str> {
+        match self {
+            Self::Legacy(row) => row.record.lineage.teacher_actor_id.as_deref(),
+            Self::SubmittedV1(row) => row.record.lineage.teacher_actor_id.as_deref(),
+        }
+    }
+    fn has_candidates(&self) -> bool {
+        match self {
+            Self::Legacy(row) => !row.record.input.legal_moves.is_empty(),
+            Self::SubmittedV1(row) => !row.record.input.legal_moves.is_empty(),
+        }
+    }
+}
+enum PumpOwner {
+    Legacy(RoventCollectionOwner),
+    SubmittedV1(RoventCollectionOwnerV2),
+}
+impl PumpOwner {
+    fn take_retired(&self) -> Result<Option<PumpRow>, ArenaError> {
+        match self {
+            Self::Legacy(owner) => owner.take_retired().map(|r| r.map(PumpRow::Legacy)),
+            Self::SubmittedV1(owner) => owner.take_retired().map(|r| r.map(PumpRow::SubmittedV1)),
+        }
+    }
+    fn attach(
+        &self,
+        session: &RoventCollectionTeacherSession,
+        row: &mut PumpRow,
+        completed: &RoventCollectionTeacherCompleted,
+    ) -> Result<(), ArenaError> {
+        match (self, row) {
+            (Self::Legacy(owner), PumpRow::Legacy(row)) => {
+                owner.with_producer(|p| session.attach_policy(p, row, completed))
+            }
+            (Self::SubmittedV1(owner), PumpRow::SubmittedV1(row)) => {
+                owner.with_producer(|p| session.attach_policy_submitted_input_v1(p, row, completed))
+            }
+            _ => Err(invalid("Collection pump refuses mixed corpus family")),
+        }
+    }
+    fn submit(
+        &self,
+        session: &mut RoventCollectionTeacherSession,
+        row: &PumpRow,
+        constraint: rz_search::external_cpu::ExternalGoConstraint,
+        quantum: Duration,
+    ) -> Result<rz_search::external_cpu::collection_teacher::TeacherJobId, ArenaError> {
+        match (self, row) {
+            (Self::Legacy(owner), PumpRow::Legacy(row)) => {
+                owner.with_producer(|p| session.submit_retired(p, row, constraint, quantum))
+            }
+            (Self::SubmittedV1(owner), PumpRow::SubmittedV1(row)) => owner.with_producer(|p| {
+                session.submit_retired_submitted_input_v1(p, row, constraint, quantum)
+            }),
+            _ => Err(invalid("Collection pump refuses mixed corpus family")),
+        }
+    }
+}
+
 struct WaitingRow {
-    row: RoventRetiredRecord,
+    row: PumpRow,
     issued: bool,
 }
 pub struct RoventCollectionTeacherFailure {
@@ -23,18 +93,67 @@ impl RoventCollectionTeacherFailure {
     }
 }
 pub struct RoventCollectionTeacherPump {
-    owner: RoventCollectionOwner,
+    owner: PumpOwner,
     session: RoventCollectionTeacherSession,
     waiting: BTreeMap<String, WaitingRow>,
-    ready: VecDeque<RoventRetiredRecord>,
+    ready: VecDeque<PumpRow>,
     failures: VecDeque<RoventCollectionTeacherFailure>,
-    quarantined_rows: VecDeque<RoventRetiredRecord>,
+    quarantined_rows: VecDeque<PumpRow>,
     closed: bool,
 }
 impl RoventCollectionTeacherPump {
+    pub fn new_submitted_input_v1(
+        owner: RoventCollectionOwnerV2,
+        session: RoventCollectionTeacherSession,
+    ) -> Self {
+        Self {
+            owner: PumpOwner::SubmittedV1(owner),
+            session,
+            waiting: BTreeMap::new(),
+            ready: VecDeque::new(),
+            failures: VecDeque::new(),
+            quarantined_rows: VecDeque::new(),
+            closed: false,
+        }
+    }
+    pub fn poll_submitted_input_v1(
+        &mut self,
+        manifest: &rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2,
+        constraint: rz_search::external_cpu::ExternalGoConstraint,
+        quantum: Duration,
+    ) -> Result<usize, ArenaError> {
+        check(
+            matches!(self.owner, PumpOwner::SubmittedV1(_)),
+            "submitted-input poll refuses legacy owner",
+        )?;
+        manifest.validate()?;
+        self.poll(
+            &manifest.common_registration_projection(),
+            constraint,
+            quantum,
+        )
+    }
+    pub fn take_ready_submitted_input_v1(&mut self) -> Option<RoventRetiredRecordV2> {
+        if !matches!(self.ready.front(), Some(PumpRow::SubmittedV1(_))) {
+            return None;
+        }
+        self.ready.pop_front().map(|row| match row {
+            PumpRow::SubmittedV1(row) => row,
+            _ => unreachable!("checked submitted-input"),
+        })
+    }
+    pub fn take_quarantined_submitted_input_v1(&mut self) -> Option<RoventRetiredRecordV2> {
+        if !matches!(self.quarantined_rows.front(), Some(PumpRow::SubmittedV1(_))) {
+            return None;
+        }
+        self.quarantined_rows.pop_front().map(|row| match row {
+            PumpRow::SubmittedV1(row) => row,
+            _ => unreachable!("checked submitted-input"),
+        })
+    }
     pub fn new(owner: RoventCollectionOwner, session: RoventCollectionTeacherSession) -> Self {
         Self {
-            owner,
+            owner: PumpOwner::Legacy(owner),
             session,
             waiting: BTreeMap::new(),
             ready: VecDeque::new(),
@@ -74,9 +193,7 @@ impl RoventCollectionTeacherPump {
                     "duplicate original teacher input occurrence retained",
                 ));
             }
-            if row.record.lineage.teacher_actor_id.is_none()
-                || row.record.input.legal_moves.is_empty()
-            {
+            if row.actor().is_none() || !row.has_candidates() {
                 self.ready.push_back(row);
             } else {
                 self.waiting.insert(sha, WaitingRow { row, issued: false });
@@ -97,10 +214,9 @@ impl RoventCollectionTeacherPump {
                     });
                     return Err(invalid("orphan Collection completion retained"));
                 };
-                let result = self.owner.with_producer(|producer| {
-                    self.session
-                        .attach_policy(producer, &mut waiting.row, &completed)
-                });
+                let result = self
+                    .owner
+                    .attach(&self.session, &mut waiting.row, &completed);
                 if let Err(error) = result {
                     self.failures.push_back(RoventCollectionTeacherFailure {
                         input_sha256: sha,
@@ -127,16 +243,14 @@ impl RoventCollectionTeacherPump {
             let has_pending = self
                 .waiting
                 .values()
-                .any(|v| v.issued && v.row.record.lineage.teacher_actor_id.as_ref() == Some(actor));
+                .any(|v| v.issued && v.row.actor() == Some(actor.as_str()));
             if has_pending {
                 continue;
             }
             let next = self
                 .waiting
                 .iter()
-                .find(|(_, v)| {
-                    !v.issued && v.row.record.lineage.teacher_actor_id.as_ref() == Some(actor)
-                })
+                .find(|(_, v)| !v.issued && v.row.actor() == Some(actor.as_str()))
                 .map(|(sha, _)| sha.clone());
             let Some(sha) = next else {
                 continue;
@@ -145,10 +259,10 @@ impl RoventCollectionTeacherPump {
                 .waiting
                 .get_mut(&sha)
                 .ok_or_else(|| invalid("Collection waiting row disappeared"))?;
-            match self.owner.with_producer(|producer| {
-                self.session
-                    .submit_retired(producer, &waiting.row, constraint, quantum)
-            }) {
+            match self
+                .owner
+                .submit(&mut self.session, &waiting.row, constraint, quantum)
+            {
                 Ok(_) => {
                     waiting.issued = true;
                     changed += 1;
@@ -172,13 +286,25 @@ impl RoventCollectionTeacherPump {
         Ok(changed)
     }
     pub fn take_ready(&mut self) -> Option<RoventRetiredRecord> {
-        self.ready.pop_front()
+        if !matches!(self.ready.front(), Some(PumpRow::Legacy(_))) {
+            return None;
+        }
+        self.ready.pop_front().map(|row| match row {
+            PumpRow::Legacy(row) => row,
+            _ => unreachable!("checked legacy"),
+        })
     }
     pub fn take_failure(&mut self) -> Option<RoventCollectionTeacherFailure> {
         self.failures.pop_front()
     }
     pub fn take_quarantined_row(&mut self) -> Option<RoventRetiredRecord> {
-        self.quarantined_rows.pop_front()
+        if !matches!(self.quarantined_rows.front(), Some(PumpRow::Legacy(_))) {
+            return None;
+        }
+        self.quarantined_rows.pop_front().map(|row| match row {
+            PumpRow::Legacy(row) => row,
+            _ => unreachable!("checked legacy"),
+        })
     }
     pub fn request_shutdown(&mut self, until: Instant) {
         self.closed = true;

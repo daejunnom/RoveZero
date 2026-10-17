@@ -21,7 +21,8 @@ def validate_submitted_record_metadata(snapshot, value):
         raise ValueError("raw /3 original selected metadata allocation differs")
     for index, metadata in enumerate(value):
         fields(metadata, ("local_index", "record_revision", "parent_revision", "supersedes_revision", "origin_state", "source_state",
-            "source_revision", "source_line_offset", "original_first_move"), "raw /3 submitted selected-record metadata")
+            "source_revision", "source_line_offset", "original_first_move", "value", "completed_depth", "score_scope", "critical"),
+            "raw /3 submitted selected-record metadata")
         if uint(metadata["local_index"], 63) != index:
             raise ValueError("raw /3 original selected metadata order differs")
         for key in ("record_revision", "origin_state", "source_state", "source_revision"):
@@ -31,6 +32,21 @@ def validate_submitted_record_metadata(snapshot, value):
             raise ValueError("raw /3 selected suffix exceeds its complete line bound")
         if metadata["original_first_move"] is not None:
             _moves([metadata["original_first_move"]], 1)
+        raw_value = metadata["value"]
+        if raw_value is not None and (type(raw_value) is not int or not -(2**31) <= raw_value < 2**31):
+            raise ValueError("raw /3 selected original value must be a nullable i32")
+        uint(metadata["completed_depth"], 65535)
+        scope = metadata["score_scope"]
+        if scope is not None and (type(scope) is not str or scope not in
+                ("FrontierOnly", "CompletedIteration", "RulesTerminal")):
+            raise ValueError("raw /3 selected original score scope is not an exact supported variant")
+        if type(metadata["critical"]) is not bool:
+            raise ValueError("raw /3 selected original critical flag must be a bool")
+        # This one flag is copied directly from the original CPU scope by the
+        # encoder. rules_terminal instead comes from Rules replay and must not
+        # be inferred from score_scope or the original raw value/depth.
+        if records[index]["completed_iteration"] != (scope == "CompletedIteration"):
+            raise ValueError("raw /3 selected completed-iteration flag differs from its original score scope")
     # Validate every entry before following original relation references.
     for index, metadata in enumerate(value):
         for relation in ("parent", "supersedes"):
@@ -52,7 +68,7 @@ def validate_submitted_record_metadata(snapshot, value):
 def validate_submitted_review(record, value):
     """Join original view metadata without recomputing Rules or view hashes."""
     fields(value, ("schema", "sequence", "generation", "root_state", "policy", "input_sha256", "view_seal_sha256",
-        "record_scope_sha256", "source_anchors", "record_metadata"), "raw /3 original submitted ReviewView evidence")
+        "record_scope_sha256", "anchor_states", "source_anchors", "record_metadata"), "raw /3 original submitted ReviewView evidence")
     if value["schema"] != REVIEW_DOMAIN:
         raise ValueError("raw /3 original submitted ReviewView evidence domain required")
     snapshot, native = record["input"], record["native"]
@@ -86,6 +102,16 @@ def validate_submitted_review(record, value):
     for anchor in anchors:
         validate_position_replay(anchor)
     validate_submitted_record_metadata(snapshot, value["record_metadata"])
+    states = value["anchor_states"]
+    if type(states) is not list or len(states) != len(view["anchors"]):
+        raise ValueError("raw /3 submitted anchor StateId allocation differs from selected anchor order/count")
+    for state in states:
+        uint(state)
+    if states[0] != value["root_state"]:
+        raise ValueError("raw /3 submitted anchor zero StateId differs from its original Store root")
+    for selected, metadata in zip(view["records"], value["record_metadata"], strict=True):
+        if metadata["origin_state"] != states[selected["anchor"]]:
+            raise ValueError("raw /3 selected record origin StateId differs from its explicit original anchor")
     return value
 
 

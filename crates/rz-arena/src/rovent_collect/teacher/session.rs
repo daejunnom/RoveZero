@@ -30,6 +30,7 @@ struct Pending {
 /// startup 관측만으로 이 session을 재구성하는 경로는 없다.
 pub struct RoventCollectionTeacherSession {
     manifest_sha256: String,
+    registration_metadata_sha256: String,
     admission: RoventCollectionRootAdmission,
     actors: BTreeMap<String, ActorOwner>,
     pending: BTreeMap<(u32, u64), Pending>,
@@ -69,6 +70,17 @@ pub struct RoventCollectionTeacherShutdown {
     pub error: Option<String>,
 }
 impl RoventCollectionTeacherSession {
+    /// 새 closed family의 실제 corpus seal은 /2로 유지하고 공통 actor 등록
+    /// metadata 검사만 공유한다. 공통 projection 문서를 파일로 게시하지 않는다.
+    pub fn new_submitted_input_v1(
+        manifest: &rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2,
+        admission: RoventCollectionRootAdmission,
+    ) -> Result<Self, ArenaError> {
+        manifest.validate()?;
+        let mut session = Self::new(&manifest.common_registration_projection(), admission)?;
+        session.manifest_sha256 = manifest.sha256()?;
+        Ok(session)
+    }
     pub fn new(
         manifest: &RoventCorpusManifest,
         admission: RoventCollectionRootAdmission,
@@ -82,6 +94,7 @@ impl RoventCollectionTeacherSession {
         )?;
         Ok(Self {
             manifest_sha256: manifest.sha256()?,
+            registration_metadata_sha256: manifest.sha256()?,
             admission,
             actors: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -107,7 +120,7 @@ impl RoventCollectionTeacherSession {
     ) -> Result<(), ArenaError> {
         check(
             !self.shutdown_requested
-                && manifest.sha256()? == self.manifest_sha256
+                && manifest.sha256()? == self.registration_metadata_sha256
                 && !self.actors.contains_key(actor_id)
                 && !self
                     .actors
@@ -201,7 +214,7 @@ impl RoventCollectionTeacherSession {
     /// 바꾸지 않으며, options applied/NNUE loaded의 독립 관측도 주장하지 않는다.
     pub fn startup_ready(&self, manifest: &RoventCorpusManifest) -> Result<bool, ArenaError> {
         check(
-            manifest.sha256()? == self.manifest_sha256
+            manifest.sha256()? == self.registration_metadata_sha256
                 && self.actors.keys().eq(manifest.teachers.keys()),
             "Collection teacher actual owner coverage differs from frozen manifest",
         )?;
@@ -382,6 +395,61 @@ impl RoventCollectionTeacherSession {
         for actor in self.actors.values() {
             actor.owner.worker().request_shutdown(until);
         }
+    }
+    pub fn attach_policy_submitted_input_v1(
+        &self,
+        producer: &mut RoventCorpusProducerV2,
+        row: &mut RoventRetiredRecordV2,
+        completed: &RoventCollectionTeacherCompleted,
+    ) -> Result<(), ArenaError> {
+        let actor = self
+            .actors
+            .get(&completed.actor)
+            .ok_or_else(|| invalid("Collection teacher owner retired before head attachment"))?;
+        check(
+            row.manifest_sha256 == self.manifest_sha256,
+            "raw3 Collection teacher row manifest",
+        )?;
+        producer.attach_collection_teacher_policy(
+            row,
+            completed.binding.clone(),
+            &actor.owner,
+            &completed.dispatch,
+            &completed.completion,
+        )
+    }
+    pub fn submit_retired_submitted_input_v1(
+        &mut self,
+        producer: &RoventCorpusProducerV2,
+        row: &RoventRetiredRecordV2,
+        constraint: rz_search::external_cpu::ExternalGoConstraint,
+        soft_quantum: Duration,
+    ) -> Result<TeacherJobId, ArenaError> {
+        check(
+            !row.record.input.legal_moves.is_empty(),
+            "raw3 teacher policy has no legal candidates",
+        )?;
+        let actor = row
+            .record
+            .lineage
+            .teacher_actor_id
+            .as_deref()
+            .ok_or_else(|| invalid("raw3 row has no frozen teacher actor"))?;
+        let replay: RoventSubmittedRulesReplay =
+            serde_json::from_value(row.record.native.raw_submission["rules_replay"].clone())
+                .map_err(|error| invalid(error.to_string()))?;
+        let position =
+            replay.original_query_position(&row.record.input.common_validation_projection())?;
+        self.submit(
+            producer.original_teacher_producer(),
+            &row.submitted_input_seal(),
+            actor,
+            position,
+            None,
+            constraint,
+            row.ticket.original_deadline,
+            soft_quantum,
+        )
     }
     pub fn poll_shutdown(&mut self) -> Vec<RoventCollectionTeacherShutdown> {
         self.actors

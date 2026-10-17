@@ -27,7 +27,8 @@ finally:
 def metadata_fixture():
     return {"local_index": 0, "record_revision": 23, "parent_revision": None,
         "supersedes_revision": None, "origin_state": 17, "source_state": 18,
-        "source_revision": 23, "source_line_offset": 0, "original_first_move": 192}
+        "source_revision": 23, "source_line_offset": 0, "original_first_move": 192,
+        "value": -17, "completed_depth": 8, "score_scope": "CompletedIteration", "critical": True}
 
 
 def native_fixture():
@@ -50,6 +51,7 @@ def native_fixture():
             "max_records": 64, "max_anchors": 4, "required_bundle": None},
         "input_sha256": h("ReviewView semantic input distinct from numeric native input"),
         "view_seal_sha256": ticket["view_digest"], "record_scope_sha256": h("record scope"),
+        "anchor_states": [native["raw_retirement"]["root_admission"]["store_root_state"]],
         "source_anchors": [], "record_metadata": []}
     for name in ("raw_submission", "raw_completion", "raw_retirement"):
         if name != "raw_submission":
@@ -58,6 +60,31 @@ def native_fixture():
             native[name]["completed_sha256"] = native["raw_completion_sha256"]
         native[name + "_sha256"] = data.digest(submitted.NATIVE_DOMAIN, native[name])
     return manifest, record
+
+
+def anchored_review_fixture():
+    """Explicit historical StateIds; identical FENs cannot reconstruct them."""
+    _manifest, record = native_fixture()
+    snapshot = input_fixture(selected_counter=True)
+    view, payload = snapshot["selected_view"], snapshot["encoded_model_input"]
+    view["anchors"].extend(copy.deepcopy(view["anchors"][0]) for _ in range(2))
+    payload["anchors"].extend(copy.deepcopy(payload["anchors"][0]) for _ in range(2))
+    view["records"][0]["anchor"] = payload["records"][0]["anchor"] = 1
+    second = copy.deepcopy(view["records"][0])
+    second.update(record_id="second-explicit-old-idea", kind="repair", anchor=2, moves=[320])
+    view["records"].append(second)
+    encoded_second = copy.deepcopy(payload["records"][0])
+    encoded_second.update(kind="repair", anchor=2, line=[[0, 5, 0]])
+    payload["records"].append(encoded_second)
+    snapshot["view_sha256"] = data.view_digest(view)
+    record["input"] = snapshot
+    review = record["native"]["raw_submission"]["submitted_review"]
+    original_replay = record["native"]["raw_submission"]["rules_replay"]["actual_root"]
+    review.update(anchor_states=[review["root_state"], 17, 19],
+        source_anchors=[copy.deepcopy(original_replay) for _ in view["records"]],
+        record_metadata=[metadata_fixture(), {**metadata_fixture(), "local_index": 1,
+            "record_revision": 29, "source_revision": 29, "origin_state": 19, "original_first_move": 320}])
+    return record, review
 
 
 class SubmittedNativeTests(unittest.TestCase):
@@ -147,6 +174,127 @@ class SubmittedNativeTests(unittest.TestCase):
         for change in ({"generation": review["generation"] + 1}, {"root_state": review["root_state"] + 1}):
             with self.subTest(change=tuple(change)), self.assertRaisesRegex(ValueError, "Store generation/root"):
                 submitted.validate_submitted_review(record, {**review, **change})
+
+    def test_anchor_states_are_required_without_fen_or_record_id_inference(self):
+        record, review = anchored_review_fixture()
+        before = copy.deepcopy((record, review))
+        self.assertIs(submitted.validate_submitted_review(record, review), review)
+        self.assertEqual((record, review), before)
+        missing = copy.deepcopy(review)
+        missing.pop("anchor_states")
+        with self.assertRaisesRegex(ValueError, "ReviewView evidence fields mismatch"):
+            submitted.validate_submitted_review(record, missing)
+        # Same anchor boards and arbitrary record IDs do not supply StateIds.
+        changed = copy.deepcopy(review)
+        changed["anchor_states"] = [review["root_state"], 991, 997]
+        with self.assertRaisesRegex(ValueError, "record origin StateId"):
+            submitted.validate_submitted_review(record, changed)
+        changed["record_metadata"][0]["origin_state"] = 991
+        changed["record_metadata"][1]["origin_state"] = 997
+        self.assertIs(submitted.validate_submitted_review(record, changed), changed)
+
+    def test_anchor_state_list_has_exact_selected_anchor_count_and_plain_container(self):
+        record, review = anchored_review_fixture()
+        submitted.validate_submitted_review(record, review)
+        for states in (None, tuple(review["anchor_states"]), [], review["anchor_states"][:-1],
+                       [*review["anchor_states"], 23]):
+            with self.subTest(states=states), self.assertRaisesRegex(ValueError, "anchor StateId allocation"):
+                submitted.validate_submitted_review(record, {**review, "anchor_states": states})
+
+    def test_anchor_state_ids_reject_bool_negative_overflow_and_noninteger(self):
+        record, review = anchored_review_fixture()
+        submitted.validate_submitted_review(record, review)
+        for state in (True, False, -1, 2**64, 17.0, "17", None):
+            bad = copy.deepcopy(review)
+            bad["anchor_states"][1] = state
+            with self.subTest(state=state), self.assertRaisesRegex(ValueError, "invalid bounded unsigned integer"):
+                submitted.validate_submitted_review(record, bad)
+        maximum = copy.deepcopy(review)
+        maximum["anchor_states"][1] = maximum["record_metadata"][0]["origin_state"] = 2**64 - 1
+        self.assertIs(submitted.validate_submitted_review(record, maximum), maximum)
+
+    def test_anchor_state_zero_joins_store_root_and_nonroot_order_joins_record_origin(self):
+        record, review = anchored_review_fixture()
+        submitted.validate_submitted_review(record, review)
+        wrong_root = copy.deepcopy(review)
+        wrong_root["anchor_states"][0] += 1
+        with self.assertRaisesRegex(ValueError, "anchor zero StateId"):
+            submitted.validate_submitted_review(record, wrong_root)
+        swapped = copy.deepcopy(review)
+        swapped["anchor_states"][1:] = reversed(swapped["anchor_states"][1:])
+        with self.assertRaisesRegex(ValueError, "record origin StateId"):
+            submitted.validate_submitted_review(record, swapped)
+        wrong_origin = copy.deepcopy(review)
+        wrong_origin["record_metadata"][0]["origin_state"] += 1
+        with self.assertRaisesRegex(ValueError, "record origin StateId"):
+            submitted.validate_submitted_review(record, wrong_origin)
+
+    def test_record_origin_state_ids_keep_strict_u64_type_before_anchor_lookup(self):
+        record, review = anchored_review_fixture()
+        submitted.validate_submitted_review(record, review)
+        for state in (True, -1, 2**64):
+            bad = copy.deepcopy(review)
+            bad["record_metadata"][0]["origin_state"] = state
+            with self.subTest(state=state), self.assertRaisesRegex(ValueError, "invalid bounded unsigned integer"):
+                submitted.validate_submitted_review(record, bad)
+
+    def test_original_selected_metadata_requires_all_thirteen_exact_fields(self):
+        snapshot = input_fixture(selected_counter=True)
+        original = metadata_fixture()
+        submitted.validate_submitted_record_metadata(snapshot, [original])
+        for field in ("value", "completed_depth", "score_scope", "critical"):
+            bad = copy.deepcopy(original)
+            bad.pop(field)
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "selected-record metadata fields mismatch"):
+                submitted.validate_submitted_record_metadata(snapshot, [bad])
+        with self.assertRaisesRegex(ValueError, "selected-record metadata fields mismatch"):
+            submitted.validate_submitted_record_metadata(snapshot, [{**original, "derived_wdl": [0.0, 1.0, 0.0]}])
+
+    def test_raw_value_depth_scope_and_critical_keep_exact_original_types(self):
+        snapshot = input_fixture(selected_counter=True)
+        original = metadata_fixture()
+        cases = (("value", True, "nullable i32"), ("value", -(2**31) - 1, "nullable i32"),
+                 ("value", 2**31, "nullable i32"), ("value", 1.0, "nullable i32"),
+                 ("completed_depth", True, "bounded unsigned integer"),
+                 ("completed_depth", -1, "bounded unsigned integer"),
+                 ("completed_depth", 65536, "bounded unsigned integer"),
+                 ("score_scope", "completed_iteration", "exact supported variant"),
+                 ("score_scope", True, "exact supported variant"),
+                 ("score_scope", {}, "exact supported variant"),
+                 ("critical", 0, "must be a bool"), ("critical", None, "must be a bool"))
+        for field, value, message in cases:
+            with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, message):
+                submitted.validate_submitted_record_metadata(snapshot, [{**original, field: value}])
+        for value in (None, -(2**31), 2**31 - 1):
+            valid = {**original, "value": value, "completed_depth": 65535, "critical": False}
+            self.assertEqual(submitted.validate_submitted_record_metadata(snapshot, [valid]), [valid])
+
+    def test_completed_iteration_is_the_original_scope_flag_without_changing_numeric_input(self):
+        snapshot = input_fixture(selected_counter=True)
+        original = metadata_fixture()
+        for scope in (None, "FrontierOnly", "RulesTerminal"):
+            changed = {**original, "score_scope": scope}
+            with self.subTest(scope=scope), self.assertRaisesRegex(ValueError, "completed-iteration flag"):
+                submitted.validate_submitted_record_metadata(snapshot, [changed])
+            value = copy.deepcopy(snapshot)
+            value["selected_view"]["records"][0]["completed_iteration"] = False
+            value["encoded_model_input"]["records"][0]["completed_iteration"] = False
+            value["view_sha256"] = data.view_digest(value["selected_view"])
+            before = copy.deepcopy(value)
+            self.assertEqual(submitted.validate_submitted_record_metadata(value, [changed]), [changed])
+            self.assertEqual(value, before)
+
+    def test_rules_terminal_is_independent_of_raw_cpu_score_scope_and_value(self):
+        for scope, rules_terminal in ((None, True), ("RulesTerminal", False), ("FrontierOnly", True)):
+            snapshot = input_fixture(selected_counter=True)
+            for record in (snapshot["selected_view"]["records"][0], snapshot["encoded_model_input"]["records"][0]):
+                record.update(completed_iteration=False, rules_terminal=rules_terminal)
+            snapshot["view_sha256"] = data.view_digest(snapshot["selected_view"])
+            original = {**metadata_fixture(), "score_scope": scope, "value": None, "completed_depth": 0}
+            before = copy.deepcopy(snapshot)
+            with self.subTest(scope=scope, rules_terminal=rules_terminal):
+                self.assertEqual(submitted.validate_submitted_record_metadata(snapshot, [original]), [original])
+                self.assertEqual(snapshot, before)
 
 
 if __name__ == "__main__":

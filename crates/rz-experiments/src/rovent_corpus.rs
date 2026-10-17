@@ -370,7 +370,7 @@ impl RoventNativeLifecycle {
             "explicit /2 actual admission and Rules replay body/seal",
         )
     }
-    fn validate_domain(
+    pub(crate) fn validate_domain(
         &self,
         manifest: &RoventCorpusManifest,
         domain: &str,

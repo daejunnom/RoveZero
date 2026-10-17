@@ -203,7 +203,9 @@ def submitted_fixture(*, role="proposer"):
         "policy": {"mode": "anchored_compact", "token_budget": snapshot["selected_view"]["token_budget"],
             "max_records": 64, "max_anchors": 4, "required_bundle": None},
         "input_sha256": h("synthetic original ReviewView semantic input"), "view_seal_sha256": ticket["view_digest"],
-        "record_scope_sha256": h("synthetic original ReviewView scope"), "source_anchors": [], "record_metadata": []}
+        "record_scope_sha256": h("synthetic original ReviewView scope"),
+        "anchor_states": [native["raw_retirement"]["root_admission"]["store_root_state"]],
+        "source_anchors": [], "record_metadata": []}
     output = native["raw_completion"]["output"]
     output["representation"]["input"] = native["input_digest"]
     if role == "critic":

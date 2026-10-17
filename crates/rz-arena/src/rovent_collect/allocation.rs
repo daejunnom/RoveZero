@@ -83,9 +83,6 @@ impl RoventAllocationSupplementCapture {
             entries: BTreeMap::new(),
         }
     }
-    pub(super) fn retain(&mut self, record: &PublishedRoventRecord) -> Result<u64, ArenaError> {
-        self.retain_admission(&record.admission)
-    }
     pub(super) fn retain_admission(
         &mut self,
         admission: &RoventCollectionRootAdmission,
@@ -140,6 +137,7 @@ impl RoventAllocationSupplementCapture {
             manifest.sha256()?,
             index.sha256()?,
             index.record_count,
+            false,
             until,
             cancel,
         )
@@ -159,6 +157,27 @@ impl RoventAllocationSupplementCapture {
             manifest.sha256()?,
             index.sha256()?,
             index.record_count,
+            false,
+            until,
+            cancel,
+        )
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn publish_submitted(
+        &self,
+        directory: &cap_std::fs::Dir,
+        manifest: &rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2,
+        index: &rz_experiments::rovent_corpus_v2::RoventCorpusIndexV2,
+        until: std::time::Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<RoventAllocationSupplement, ArenaError> {
+        self.publish_base(
+            directory,
+            "publication.json",
+            manifest.sha256()?,
+            index.sha256()?,
+            index.record_count,
+            true,
             until,
             cancel,
         )
@@ -172,6 +191,7 @@ impl RoventAllocationSupplementCapture {
         manifest_sha: String,
         index_sha: String,
         record_count: u64,
+        submitted_family: bool,
         until: std::time::Instant,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<RoventAllocationSupplement, ArenaError> {
@@ -204,7 +224,17 @@ impl RoventAllocationSupplementCapture {
         )?;
         let text = std::str::from_utf8(&raw).map_err(|_| invalid("base publication UTF8"))?;
         let (base_manifest, base_index, base_count, base_admissions, base_bytes) =
-            if base_path == "publication.json" {
+            if base_path == "publication.json" && submitted_family {
+                let base: RoventCorpusPublicationV2 = rz_experiments::decode_json(text)?;
+                base.validate()?;
+                (
+                    base.canonical_manifest_sha256,
+                    base.canonical_index_sha256,
+                    base.record_count,
+                    base.native_admission_sha256,
+                    base.total_payload_bytes,
+                )
+            } else if base_path == "publication.json" {
                 let base: RoventCorpusPublication = rz_experiments::decode_json(text)?;
                 base.validate()?;
                 (

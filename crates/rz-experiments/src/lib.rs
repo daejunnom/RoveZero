@@ -18,6 +18,8 @@ mod pals_manifest_v5;
 mod pals_source_pins_v5;
 mod pals_startup_v5;
 pub mod rovent_corpus;
+pub mod rovent_corpus_v2;
+pub mod rovent_submitted_input;
 mod rovent_manifest;
 pub mod rovent_r_readout;
 mod rovent_root_allocation;

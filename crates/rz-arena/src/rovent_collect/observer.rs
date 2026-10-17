@@ -13,6 +13,118 @@ use std::sync::{Arc, Mutex};
 
 const CAPACITY: usize = 16;
 
+// 하나의 원 manager hook을 공유하되 형식별 입력 예약과 퇴역 row는 끝까지
+// 구분한다. legacy caller가 새 row를 받거나 schema를 바꾸어 게시하지 못한다.
+enum CollectionProducerFamily {
+    Legacy(Box<RoventCorpusProducer>),
+    SubmittedV1(Box<RoventCorpusProducerV2>),
+}
+enum CollectionRetiredFamily {
+    Legacy(RoventRetiredRecord),
+    SubmittedV1(RoventRetiredRecordV2),
+}
+impl CollectionProducerFamily {
+    fn epochs(&self) -> (u64, u64) {
+        match self {
+            Self::Legacy(p) => (p.manifest().model_epoch, p.manifest().context_epoch),
+            Self::SubmittedV1(p) => (p.manifest().model_epoch, p.manifest().context_epoch),
+        }
+    }
+    fn validate_admission(
+        &self,
+        admission: &RoventCollectionRootAdmission,
+    ) -> Result<(), ArenaError> {
+        match self {
+            Self::Legacy(p) => p.validate_admission(admission),
+            Self::SubmittedV1(p) => p.validate_admission(admission),
+        }
+    }
+    fn incomplete_capture_count(&self) -> usize {
+        match self {
+            Self::Legacy(p) => p.incomplete_capture_count(),
+            Self::SubmittedV1(p) => p.incomplete_capture_count(),
+        }
+    }
+    fn discard_reserved_input(&mut self, sequence: u64) -> bool {
+        match self {
+            Self::Legacy(p) => p.discard_reserved_input(sequence),
+            Self::SubmittedV1(p) => p.discard_reserved_input(sequence),
+        }
+    }
+    fn discard_unpublished(&mut self, id: RequestId) -> bool {
+        match self {
+            Self::Legacy(p) => p.discard_unpublished(id),
+            Self::SubmittedV1(p) => p.discard_unpublished(id),
+        }
+    }
+    fn reserve_and_register(
+        &mut self,
+        registration: &RoventNativeCaptureRegistration,
+        ticket: &RoleTicketEnvelope,
+        context: GenerationCaptureContextV3,
+        lineage: RoventLineage,
+    ) -> Result<u64, ArenaError> {
+        let (sequence, result) = match self {
+            Self::Legacy(p) => {
+                let reservation = p.reserve_input(context, lineage)?;
+                let sequence = reservation.sequence();
+                (sequence, registration.register(ticket, reservation))
+            }
+            Self::SubmittedV1(p) => {
+                let reservation = p.reserve_input(context, lineage)?;
+                let sequence = reservation.sequence();
+                (
+                    sequence,
+                    registration.register_submitted_input_v1(ticket, reservation),
+                )
+            }
+        };
+        if let Err(error) = result {
+            self.discard_reserved_input(sequence);
+            return Err(error);
+        }
+        Ok(sequence)
+    }
+    fn observe_native_event<O: ProposerRankingOutput>(
+        &mut self,
+        event: &TicketNativeEvent<O>,
+    ) -> Result<(), ArenaError> {
+        match self {
+            Self::Legacy(p) => p.observe_native_event(event),
+            Self::SubmittedV1(p) => p.observe_native_event(event),
+        }
+    }
+    fn retire_accepted(
+        &mut self,
+        admission: &RoventCollectionRootAdmission,
+        accepted: &AcceptedRoleStep,
+        output: &RoleOutput,
+    ) -> Result<CollectionRetiredFamily, ArenaError> {
+        match self {
+            Self::Legacy(p) => p
+                .retire_accepted(admission, accepted, output)
+                .map(CollectionRetiredFamily::Legacy),
+            Self::SubmittedV1(p) => p
+                .retire_accepted(admission, accepted, output)
+                .map(CollectionRetiredFamily::SubmittedV1),
+        }
+    }
+    fn retire_root_ranking(
+        &mut self,
+        accepted: &RoventRootRankingAcceptance,
+        output: &RoleOutput,
+    ) -> Result<CollectionRetiredFamily, ArenaError> {
+        match self {
+            Self::Legacy(p) => p
+                .retire_root_ranking(accepted, output)
+                .map(CollectionRetiredFamily::Legacy),
+            Self::SubmittedV1(p) => p
+                .retire_root_ranking(accepted, output)
+                .map(CollectionRetiredFamily::SubmittedV1),
+        }
+    }
+}
+
 /// 실제 수집 실행에서 사전 등록한 식별자다. 이 값만으로 native·교사·학습
 /// 권한을 발급하지 않으며, 원 root admission과 실제 ticket을 추가로 요구한다.
 #[derive(Clone)]
@@ -24,7 +136,7 @@ pub struct RoventCollectionMetadata {
 }
 
 struct CollectionState {
-    producer: RoventCorpusProducer,
+    producer: CollectionProducerFamily,
     registration: RoventNativeCaptureRegistration,
     receiver: RoventCapturedInputReceiver,
     metadata: RoventCollectionMetadata,
@@ -32,7 +144,7 @@ struct CollectionState {
     actual_position: Option<Position>,
     actual_history: Vec<BoardMove>,
     slots: BTreeMap<RequestId, u64>,
-    retired: VecDeque<RoventRetiredRecord>,
+    retired: VecDeque<CollectionRetiredFamily>,
     failure: Option<AdaptiveCollectionError>,
 }
 
@@ -41,6 +153,84 @@ struct CollectionState {
 #[derive(Clone)]
 pub struct RoventCollectionOwner {
     state: Arc<Mutex<CollectionState>>,
+}
+
+/// 새 형식의 명시 제품 hook owner다. 기존 owner와 manager 처리 코드를 공유하며
+/// 원 native observer의 /3 입력만 새 producer/writer에 전달한다.
+#[derive(Clone)]
+pub struct RoventCollectionOwnerV2 {
+    original: RoventCollectionOwner,
+}
+impl RoventCollectionOwnerV2 {
+    pub fn new(
+        manifest: rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2,
+        metadata: RoventCollectionMetadata,
+    ) -> Result<(Self, RoventNativeInputObserver), ArenaError> {
+        check(
+            generation_identifier(&metadata.game_id)
+                && generation_identifier(&metadata.opening_id)
+                && generation_identifier(&metadata.line_genealogy_id)
+                && manifest.opening_splits.contains_key(&metadata.opening_id),
+            "submitted-input collection metadata/opening not registered",
+        )?;
+        let producer = RoventCorpusProducerV2::new(manifest)?;
+        let (registration, observer, receiver) = rovent_native_capture_channel();
+        let original = RoventCollectionOwner {
+            state: Arc::new(Mutex::new(CollectionState {
+                producer: CollectionProducerFamily::SubmittedV1(Box::new(producer)),
+                registration,
+                receiver,
+                metadata,
+                admission: None,
+                actual_position: None,
+                actual_history: Vec::new(),
+                slots: BTreeMap::new(),
+                retired: VecDeque::new(),
+                failure: None,
+            })),
+        };
+        Ok((Self { original }, observer))
+    }
+    pub fn observer<Q: 'static, O: ProposerRankingOutput + 'static>(
+        &self,
+    ) -> Box<dyn AdaptiveCollectionObserver<Q, O>> {
+        self.original.observer()
+    }
+    pub fn with_producer<T>(
+        &self,
+        action: impl FnOnce(&mut RoventCorpusProducerV2) -> Result<T, ArenaError>,
+    ) -> Result<T, ArenaError> {
+        let mut state = self
+            .original
+            .state
+            .lock()
+            .map_err(|_| invalid("submitted-input collection owner poisoned"))?;
+        match &mut state.producer {
+            CollectionProducerFamily::SubmittedV1(p) => action(p),
+            _ => Err(invalid("submitted-input borrow refuses legacy producer")),
+        }
+    }
+    pub fn take_retired(&self) -> Result<Option<RoventRetiredRecordV2>, ArenaError> {
+        let mut state = self
+            .original
+            .state
+            .lock()
+            .map_err(|_| invalid("submitted-input collection owner poisoned"))?;
+        check(
+            !matches!(
+                state.retired.front(),
+                Some(CollectionRetiredFamily::Legacy(_))
+            ),
+            "submitted-input read refuses legacy row",
+        )?;
+        Ok(state.retired.pop_front().map(|row| match row {
+            CollectionRetiredFamily::SubmittedV1(row) => row,
+            _ => unreachable!("checked submitted-input"),
+        }))
+    }
+    pub fn failure(&self) -> Result<Option<AdaptiveCollectionError>, ArenaError> {
+        self.original.failure()
+    }
 }
 
 impl RoventCollectionOwner {
@@ -60,7 +250,7 @@ impl RoventCollectionOwner {
         Ok((
             Self {
                 state: Arc::new(Mutex::new(CollectionState {
-                    producer,
+                    producer: CollectionProducerFamily::Legacy(Box::new(producer)),
                     registration,
                     receiver,
                     metadata,
@@ -95,7 +285,12 @@ impl RoventCollectionOwner {
             .state
             .lock()
             .map_err(|_| invalid("collection owner poisoned"))?;
-        action(&mut state.producer)
+        match &mut state.producer {
+            CollectionProducerFamily::Legacy(producer) => action(producer),
+            _ => Err(invalid(
+                "legacy producer borrow refuses submitted-input owner",
+            )),
+        }
     }
 
     pub fn take_retired(&self) -> Result<Option<RoventRetiredRecord>, ArenaError> {
@@ -103,7 +298,17 @@ impl RoventCollectionOwner {
             .state
             .lock()
             .map_err(|_| invalid("collection owner poisoned"))?;
-        Ok(state.retired.pop_front())
+        check(
+            !matches!(
+                state.retired.front(),
+                Some(CollectionRetiredFamily::SubmittedV1(_))
+            ),
+            "legacy retired read refuses submitted-input owner",
+        )?;
+        Ok(state.retired.pop_front().map(|row| match row {
+            CollectionRetiredFamily::Legacy(row) => row,
+            _ => unreachable!("checked legacy"),
+        }))
     }
 
     pub fn failure(&self) -> Result<Option<AdaptiveCollectionError>, ArenaError> {
@@ -123,12 +328,19 @@ struct RoventManagerCollectionObserver<Q, O> {
 
 impl CollectionState {
     fn drain_captures(&mut self) -> Result<(), ArenaError> {
-        self.receiver.admit_available(&mut self.producer)?;
+        match &mut self.producer {
+            CollectionProducerFamily::Legacy(producer) => {
+                self.receiver.admit_available(producer)?;
+            }
+            CollectionProducerFamily::SubmittedV1(producer) => {
+                self.receiver.admit_available_submitted_input_v1(producer)?;
+            }
+        }
         Ok(())
     }
     fn cancel_collector_copy(&mut self, ticket: &RoleTicketEnvelope) -> Result<(), ArenaError> {
-        if let Some(reservation) = self.registration.cancel_unstarted(ticket.id)? {
-            self.producer.discard_reserved_input(reservation.sequence());
+        if let Some(sequence) = self.registration.cancel_sequence(ticket.id)? {
+            self.producer.discard_reserved_input(sequence);
         }
         if let Some(sequence) = self.slots.remove(&ticket.id) {
             self.producer.discard_reserved_input(sequence);
@@ -228,13 +440,13 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserver<Q, O>
                     && input.question_digest == ticket.question,
                 "collection dispatch scope/queue capacity",
             )?;
-            let manifest = state.producer.manifest();
+            let (model_epoch, context_epoch) = state.producer.epochs();
             let context = GenerationCaptureContextV3 {
                 game_id: state.metadata.game_id.clone(),
                 opening_id: state.metadata.opening_id.clone(),
                 line_genealogy_id: state.metadata.line_genealogy_id.clone(),
-                model_epoch: manifest.model_epoch,
-                context_epoch: manifest.context_epoch,
+                model_epoch,
+                context_epoch,
                 capture_sequence: 0,
                 work_scope: GenerationCaptureWorkScopeV3::from_native_ticket(ticket),
                 actual_position: state
@@ -245,14 +457,12 @@ impl<Q, O: ProposerRankingOutput> AdaptiveCollectionObserver<Q, O>
                 actual_history: state.actual_history.clone(),
                 action_support: GenerationActionSupportV3::non_validator(),
             };
-            let reservation = state
-                .producer
-                .reserve_input(context, state.metadata.lineage.clone())?;
-            let sequence = reservation.sequence();
-            if let Err(error) = state.registration.register(ticket, reservation) {
-                state.producer.discard_reserved_input(sequence);
-                return Err(error);
-            }
+            let sequence = state.producer.reserve_and_register(
+                &state.registration,
+                ticket,
+                context,
+                state.metadata.lineage.clone(),
+            )?;
             state.slots.insert(ticket.id, sequence);
             Ok(())
         })

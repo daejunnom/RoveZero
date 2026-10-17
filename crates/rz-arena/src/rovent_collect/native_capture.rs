@@ -10,16 +10,22 @@ use rz_uci::pals_native::ticketed::{
 use std::cell::Cell;
 use std::sync::{Arc, Mutex, mpsc};
 
-type Registrations = Arc<Mutex<BTreeMap<RequestId, RoventInputCaptureReservation>>>;
+enum RegisteredInputCapture {
+    Legacy(RoventInputCaptureReservation),
+    SubmittedV1(RoventInputCaptureReservationV2),
+}
+type Registrations = Arc<Mutex<BTreeMap<RequestId, RegisteredInputCapture>>>;
 pub struct RoventNativeCaptureRegistration {
     registered: Registrations,
 }
 pub struct RoventNativeInputObserver {
     registered: Registrations,
     sender: mpsc::SyncSender<RoventCapturedInput>,
+    submitted_sender: mpsc::SyncSender<RoventCapturedInputV2>,
 }
 pub struct RoventCapturedInputReceiver {
     receiver: mpsc::Receiver<RoventCapturedInput>,
+    submitted_receiver: mpsc::Receiver<RoventCapturedInputV2>,
     disconnected: Cell<bool>,
 }
 pub fn rovent_native_capture_channel() -> (
@@ -29,13 +35,19 @@ pub fn rovent_native_capture_channel() -> (
 ) {
     let registered = Arc::new(Mutex::new(BTreeMap::new()));
     let (sender, receiver) = mpsc::sync_channel(16);
+    let (submitted_sender, submitted_receiver) = mpsc::sync_channel(16);
     (
         RoventNativeCaptureRegistration {
             registered: Arc::clone(&registered),
         },
-        RoventNativeInputObserver { registered, sender },
+        RoventNativeInputObserver {
+            registered,
+            sender,
+            submitted_sender,
+        },
         RoventCapturedInputReceiver {
             receiver,
+            submitted_receiver,
             disconnected: Cell::new(false),
         },
     )
@@ -55,7 +67,23 @@ impl RoventNativeCaptureRegistration {
             registered.len() < 16 && !registered.contains_key(&ticket.id),
             "capture input registration duplicate/cap",
         )?;
-        registered.insert(ticket.id, reservation);
+        registered.insert(ticket.id, RegisteredInputCapture::Legacy(reservation));
+        Ok(())
+    }
+    pub fn register_submitted_input_v1(
+        &self,
+        ticket: &RoleTicketEnvelope,
+        reservation: RoventInputCaptureReservationV2,
+    ) -> Result<(), ArenaError> {
+        let mut registered = self
+            .registered
+            .lock()
+            .map_err(|_| invalid("Rovent capture registration poisoned"))?;
+        check(
+            registered.len() < 16 && !registered.contains_key(&ticket.id),
+            "capture input registration duplicate/cap",
+        )?;
+        registered.insert(ticket.id, RegisteredInputCapture::SubmittedV1(reservation));
         Ok(())
     }
     /// 아직 native owner가 읽지 않은 예약만 반환한다. 반환 sequence는
@@ -64,11 +92,32 @@ impl RoventNativeCaptureRegistration {
         &self,
         id: RequestId,
     ) -> Result<Option<RoventInputCaptureReservation>, ArenaError> {
+        let mut registered = self
+            .registered
+            .lock()
+            .map_err(|_| invalid("Rovent capture registration poisoned"))?;
+        check(
+            !matches!(
+                registered.get(&id),
+                Some(RegisteredInputCapture::SubmittedV1(_))
+            ),
+            "legacy cancel refuses submitted-input reservation",
+        )?;
+        Ok(registered.remove(&id).map(|value| match value {
+            RegisteredInputCapture::Legacy(value) => value,
+            _ => unreachable!("checked legacy"),
+        }))
+    }
+    pub(super) fn cancel_sequence(&self, id: RequestId) -> Result<Option<u64>, ArenaError> {
         Ok(self
             .registered
             .lock()
             .map_err(|_| invalid("Rovent capture registration poisoned"))?
-            .remove(&id))
+            .remove(&id)
+            .map(|value| match value {
+                RegisteredInputCapture::Legacy(value) => value.sequence(),
+                RegisteredInputCapture::SubmittedV1(value) => value.sequence(),
+            }))
     }
 }
 impl RoventCapturedInputReceiver {
@@ -98,6 +147,26 @@ impl RoventCapturedInputReceiver {
         }
         Ok(admitted)
     }
+    pub fn admit_available_submitted_input_v1(
+        &self,
+        producer: &mut RoventCorpusProducerV2,
+    ) -> Result<usize, ArenaError> {
+        let mut admitted = 0;
+        loop {
+            match self.submitted_receiver.try_recv() {
+                Ok(input) => {
+                    producer.admit_captured_input(input)?;
+                    admitted += 1;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.disconnected.set(true);
+                    break;
+                }
+            }
+        }
+        Ok(admitted)
+    }
 }
 impl VirtualReviewCollectionObserver for RoventNativeInputObserver {
     fn submitted(
@@ -121,22 +190,30 @@ impl VirtualReviewCollectionObserver for RoventNativeInputObserver {
                     "Rovent native input lacks original manager reservation".into(),
                 )
             })?;
-        let captured = reservation
-            .capture(
-                *ticket,
-                &preparation.view,
-                &prepared.input,
-                &prepared.identity,
-            )
-            .map_err(|e| RoleFailure::Backend(e.to_string()))?;
-        self.sender.try_send(captured).map_err(|e| {
-            RoleFailure::Backend(match e {
-                mpsc::TrySendError::Full(_) => "Rovent captured input channel full".into(),
-                mpsc::TrySendError::Disconnected(_) => {
-                    "Rovent captured input owner disconnected".into()
-                }
-            })
-        })
+        match reservation {
+            RegisteredInputCapture::Legacy(reservation) => {
+                let captured = reservation
+                    .capture(
+                        *ticket,
+                        &preparation.view,
+                        &prepared.input,
+                        &prepared.identity,
+                    )
+                    .map_err(|e| RoleFailure::Backend(e.to_string()))?;
+                self.sender.try_send(captured).map_err(send_error)
+            }
+            RegisteredInputCapture::SubmittedV1(reservation) => {
+                let captured = reservation
+                    .capture(
+                        *ticket,
+                        &preparation.view,
+                        &prepared.input,
+                        &prepared.identity,
+                    )
+                    .map_err(|e| RoleFailure::Backend(e.to_string()))?;
+                self.submitted_sender.try_send(captured).map_err(send_error)
+            }
+        }
     }
     fn completed(
         &mut self,
@@ -154,4 +231,11 @@ impl VirtualReviewCollectionObserver for RoventNativeInputObserver {
         // 수락·퇴역은 원 registry의 AcceptedRoleStep을 따로 빌려 검증한다.
         Ok(())
     }
+}
+
+fn send_error<T>(error: mpsc::TrySendError<T>) -> RoleFailure {
+    RoleFailure::Backend(match error {
+        mpsc::TrySendError::Full(_) => "Rovent captured input channel full".into(),
+        mpsc::TrySendError::Disconnected(_) => "Rovent captured input owner disconnected".into(),
+    })
 }

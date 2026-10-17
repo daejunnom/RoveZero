@@ -91,6 +91,15 @@ pub fn verify_historical_record_evidence(
 ) -> Result<RoventHistoricalRecordEvidence, ArenaError> {
     record.validate_rules_replay_v2(manifest)?;
     super::rules_replay::verify_historical_record_rules(record)?;
+    verify_historical_native_scope(record, manifest)
+}
+
+/// 각 명시 형식의 전체 검증 뒤에만 호출하는 공통 native/source 계산이다.
+/// projection을 legacy record로 발행하거나 raw schema를 재태그하지 않는다.
+pub(super) fn verify_historical_native_scope(
+    record: &RoventTrainingRecord,
+    manifest: &RoventCorpusManifest,
+) -> Result<RoventHistoricalRecordEvidence, ArenaError> {
     let retirement = &record.native.raw_retirement;
     let raw = &retirement["root_admission"];
     let root: RoventRootAdmissionEvidence = serde_json::from_value(raw.clone())

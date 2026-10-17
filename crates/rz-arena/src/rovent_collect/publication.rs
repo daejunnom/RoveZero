@@ -400,203 +400,246 @@ impl FinishedRoventCorpus {
         until: std::time::Instant,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<RoventCorpusPublication, ArenaError> {
-        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-        use std::io::Read;
-        fn io(error: std::io::Error) -> ArenaError {
-            ArenaError::Io(error.to_string())
-        }
-        let active = || -> Result<(), ArenaError> {
-            check(
-                !cancel.load(std::sync::atomic::Ordering::Acquire)
-                    && std::time::Instant::now() < until,
-                "publication canceled/expired; partial output preserved",
-            )
-        };
-        active()?;
-        fn put(
-            directory: &cap_std::fs::Dir,
-            path: &str,
-            bytes: &[u8],
-        ) -> Result<RoventPublicationFile, ArenaError> {
-            use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-            use std::io::Write;
-            check(
-                relative_file(path) && !bytes.is_empty(),
-                "publication owned relative payload",
-            )?;
-            let mut options = cap_std::fs::OpenOptions::new();
-            options
-                .write(true)
-                .create_new(true)
-                .follow(FollowSymlinks::No);
-            let mut file = directory.open_with(path, &options).map_err(io)?;
-            file.write_all(bytes)
-                .and_then(|_| file.sync_all())
-                .map_err(io)?;
-            check(
-                file.metadata().map_err(io)?.is_file(),
-                "publication payload is not regular",
-            )?;
-            Ok(RoventPublicationFile {
-                path: path.into(),
-                sha256: hex(Digest(Sha256::digest(bytes).into())),
-                bytes: bytes.len() as u64,
-            })
-        }
         let manifest_bytes =
             serde_json::to_vec(&self.manifest).map_err(|error| invalid(error.to_string()))?;
         let index_bytes =
             serde_json::to_vec(&self.index).map_err(|error| invalid(error.to_string()))?;
-        let mut payload_bytes = manifest_bytes.len() as u64 + index_bytes.len() as u64;
-        let mut chunks = Vec::with_capacity(self.index.chunks.len());
-        for chunk in &self.index.chunks {
+        publish_original_payloads(
+            directory,
+            until,
+            cancel,
+            RoventPublicationMaterial {
+                manifest_bytes: &manifest_bytes,
+                index_bytes: &index_bytes,
+                chunks: &self.index.chunks,
+                admissions: &self.admissions,
+            },
+            |manifest, index, chunks, admissions, payload_bytes| {
+                let publication = RoventCorpusPublication {
+                    schema: ROVENT_CORPUS_PUBLICATION.into(),
+                    manifest,
+                    index,
+                    chunks,
+                    canonical_manifest_sha256: self.manifest.sha256()?,
+                    canonical_index_sha256: self.index.sha256()?,
+                    source_commit: self.manifest.source_commit.clone(),
+                    source_sha256: self.manifest.source_sha256.clone(),
+                    runtime_sha256: self.manifest.runtime_sha256.clone(),
+                    record_count: self.index.record_count,
+                    total_payload_bytes: payload_bytes,
+                    native_admission_sha256: self.native_admission_sha256.clone(),
+                    admissions,
+                };
+                publication.validate()?;
+                Ok(publication)
+            },
+        )
+    }
+}
+
+/// 기존 내구성 I/O만 공유한다. 원 writer의 private admission source와 형식별
+/// validator를 요구하며 공개 metadata를 live 권한으로 되살리지 않는다.
+#[cfg(target_os = "linux")]
+pub(super) struct RoventPublicationMaterial<'a> {
+    pub manifest_bytes: &'a [u8],
+    pub index_bytes: &'a [u8],
+    pub chunks: &'a [RoventCorpusChunk],
+    pub admissions: &'a BTreeMap<String, Arc<RoventPublicationSourceSnapshot>>,
+}
+#[cfg(target_os = "linux")]
+pub(super) fn publish_original_payloads<P: serde::Serialize>(
+    directory: &cap_std::fs::Dir,
+    until: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+    material: RoventPublicationMaterial<'_>,
+    build: impl FnOnce(
+        RoventPublicationFile,
+        RoventPublicationFile,
+        Vec<RoventPublicationFile>,
+        Vec<RoventPublicationAdmission>,
+        u64,
+    ) -> Result<P, ArenaError>,
+) -> Result<P, ArenaError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    use std::io::Read;
+    fn io(error: std::io::Error) -> ArenaError {
+        ArenaError::Io(error.to_string())
+    }
+    let active = || -> Result<(), ArenaError> {
+        check(
+            !cancel.load(std::sync::atomic::Ordering::Acquire) && std::time::Instant::now() < until,
+            "publication canceled/expired; partial output preserved",
+        )
+    };
+    active()?;
+    fn put(
+        directory: &cap_std::fs::Dir,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<RoventPublicationFile, ArenaError> {
+        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+        use std::io::Write;
+        check(
+            relative_file(path) && !bytes.is_empty(),
+            "publication owned relative payload",
+        )?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut file = directory.open_with(path, &options).map_err(io)?;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(io)?;
+        check(
+            file.metadata().map_err(io)?.is_file(),
+            "publication payload is not regular",
+        )?;
+        Ok(RoventPublicationFile {
+            path: path.into(),
+            sha256: hex(Digest(Sha256::digest(bytes).into())),
+            bytes: bytes.len() as u64,
+        })
+    }
+    let mut payload_bytes =
+        material.manifest_bytes.len() as u64 + material.index_bytes.len() as u64;
+    let mut chunks = Vec::with_capacity(material.chunks.len());
+    for chunk in material.chunks {
+        active()?;
+        let pin = RoventPublicationFile {
+            path: chunk.path.clone(),
+            sha256: chunk.sha256.clone(),
+            bytes: chunk.bytes,
+        };
+        pin.validate()?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = directory.open_with(&pin.path, &options).map_err(io)?;
+        let metadata = file.metadata().map_err(io)?;
+        check(
+            metadata.is_file()
+                && metadata.len() == pin.bytes
+                && pin.bytes <= MAX_CHUNK_BYTES as u64,
+            "original publication chunk type/size",
+        )?;
+        let mut hash = Sha256::new();
+        let mut bounded = Read::take(&mut file, pin.bytes + 1);
+        let mut buffer = [0u8; 64 * 1024];
+        let mut copied = 0u64;
+        loop {
             active()?;
-            let pin = RoventPublicationFile {
-                path: chunk.path.clone(),
-                sha256: chunk.sha256.clone(),
-                bytes: chunk.bytes,
-            };
-            pin.validate()?;
-            let mut options = cap_std::fs::OpenOptions::new();
-            options.read(true).follow(FollowSymlinks::No);
-            let mut file = directory.open_with(&pin.path, &options).map_err(io)?;
-            let metadata = file.metadata().map_err(io)?;
-            check(
-                metadata.is_file()
-                    && metadata.len() == pin.bytes
-                    && pin.bytes <= MAX_CHUNK_BYTES as u64,
-                "original publication chunk type/size",
-            )?;
-            let mut hash = Sha256::new();
-            let mut bounded = Read::take(&mut file, pin.bytes + 1);
-            let mut buffer = [0u8; 64 * 1024];
-            let mut copied = 0u64;
-            loop {
-                active()?;
-                let count = bounded.read(&mut buffer).map_err(io)?;
-                if count == 0 {
-                    break;
-                }
-                copied = copied
-                    .checked_add(count as u64)
-                    .ok_or_else(|| invalid("publication chunk read overflow"))?;
-                hash.update(&buffer[..count]);
+            let count = bounded.read(&mut buffer).map_err(io)?;
+            if count == 0 {
+                break;
             }
-            check(
-                copied == pin.bytes && hex(Digest(hash.finalize().into())) == pin.sha256,
-                "original publication chunk bytes changed",
-            )?;
-            file.sync_all().map_err(io)?;
-            payload_bytes = payload_bytes
-                .checked_add(pin.bytes)
-                .ok_or_else(|| invalid("publication payload overflow"))?;
-            chunks.push(pin);
+            copied = copied
+                .checked_add(count as u64)
+                .ok_or_else(|| invalid("publication chunk read overflow"))?;
+            hash.update(&buffer[..count]);
         }
-        directory.create_dir("input-locks").map_err(io)?;
-        if self
-            .admissions
-            .values()
-            .any(|source| source.bundle.is_some())
-        {
-            directory.create_dir("runtime-bundles").map_err(io)?;
-        }
-        let mut locks: BTreeMap<String, RoventPublicationFile> = BTreeMap::new();
-        let mut bundles: BTreeMap<String, RoventPublicationFile> = BTreeMap::new();
-        let mut admissions = Vec::with_capacity(self.admissions.len());
-        for (native_sha, source) in &self.admissions {
-            active()?;
-            let canonical = &source.lock.canonical_sha256;
-            let input_lock = match locks.get(canonical) {
+        check(
+            copied == pin.bytes && hex(Digest(hash.finalize().into())) == pin.sha256,
+            "original publication chunk bytes changed",
+        )?;
+        file.sync_all().map_err(io)?;
+        payload_bytes = payload_bytes
+            .checked_add(pin.bytes)
+            .ok_or_else(|| invalid("publication payload overflow"))?;
+        chunks.push(pin);
+    }
+    directory.create_dir("input-locks").map_err(io)?;
+    if material
+        .admissions
+        .values()
+        .any(|source| source.bundle.is_some())
+    {
+        directory.create_dir("runtime-bundles").map_err(io)?;
+    }
+    let mut locks: BTreeMap<String, RoventPublicationFile> = BTreeMap::new();
+    let mut bundles: BTreeMap<String, RoventPublicationFile> = BTreeMap::new();
+    let mut admissions = Vec::with_capacity(material.admissions.len());
+    for (native_sha, source) in material.admissions {
+        active()?;
+        let canonical = &source.lock.canonical_sha256;
+        let input_lock = match locks.get(canonical) {
+            Some(pin) => pin.clone(),
+            None => {
+                let pin = put(
+                    directory,
+                    &format!("input-locks/{canonical}.json"),
+                    &source.lock_bytes,
+                )?;
+                payload_bytes = payload_bytes
+                    .checked_add(pin.bytes)
+                    .ok_or_else(|| invalid("publication payload overflow"))?;
+                locks.insert(canonical.clone(), pin.clone());
+                pin
+            }
+        };
+        let runtime_bundle_manifest = if let Some((original, bytes)) = &source.bundle {
+            Some(match bundles.get(&original.sha256) {
                 Some(pin) => pin.clone(),
                 None => {
                     let pin = put(
                         directory,
-                        &format!("input-locks/{canonical}.json"),
-                        &source.lock_bytes,
+                        &format!("runtime-bundles/{}.json", original.sha256),
+                        bytes,
+                    )?;
+                    check(
+                        pin.sha256 == original.sha256 && pin.bytes == original.bytes,
+                        "original runtime bundle publication bytes changed",
                     )?;
                     payload_bytes = payload_bytes
                         .checked_add(pin.bytes)
                         .ok_or_else(|| invalid("publication payload overflow"))?;
-                    locks.insert(canonical.clone(), pin.clone());
+                    bundles.insert(original.sha256.clone(), pin.clone());
                     pin
                 }
-            };
-            let runtime_bundle_manifest = if let Some((original, bytes)) = &source.bundle {
-                Some(match bundles.get(&original.sha256) {
-                    Some(pin) => pin.clone(),
-                    None => {
-                        let pin = put(
-                            directory,
-                            &format!("runtime-bundles/{}.json", original.sha256),
-                            bytes,
-                        )?;
-                        check(
-                            pin.sha256 == original.sha256 && pin.bytes == original.bytes,
-                            "original runtime bundle publication bytes changed",
-                        )?;
-                        payload_bytes = payload_bytes
-                            .checked_add(pin.bytes)
-                            .ok_or_else(|| invalid("publication payload overflow"))?;
-                        bundles.insert(original.sha256.clone(), pin.clone());
-                        pin
-                    }
-                })
-            } else {
-                None
-            };
-            admissions.push(RoventPublicationAdmission {
-                native_admission_sha256: native_sha.clone(),
-                input_lock,
-                canonical_input_lock_sha256: canonical.clone(),
-                runtime_bundle_manifest,
-            });
-        }
-        check(payload_bytes <= MAX_CORPUS_BYTES, "publication output cap")?;
-        let manifest = put(directory, ROVENT_PUBLICATION_MANIFEST, &manifest_bytes)?;
-        active()?;
-        let index = put(directory, ROVENT_PUBLICATION_INDEX, &index_bytes)?;
-        let publication = RoventCorpusPublication {
-            schema: ROVENT_CORPUS_PUBLICATION.into(),
-            manifest,
-            index,
-            chunks,
-            canonical_manifest_sha256: self.manifest.sha256()?,
-            canonical_index_sha256: self.index.sha256()?,
-            source_commit: self.manifest.source_commit.clone(),
-            source_sha256: self.manifest.source_sha256.clone(),
-            runtime_sha256: self.manifest.runtime_sha256.clone(),
-            record_count: self.index.record_count,
-            total_payload_bytes: payload_bytes,
-            native_admission_sha256: self.native_admission_sha256.clone(),
-            admissions,
+            })
+        } else {
+            None
         };
-        publication.validate()?;
-        let raw = serde_json::to_vec(&publication).map_err(|error| invalid(error.to_string()))?;
-        check(
-            raw.len() <= 16 * 1024 * 1024,
-            "publication commit metadata cap",
-        )?;
-        let pending = "publication.pending.json";
-        active()?;
-        put(directory, pending, &raw)?;
-        let original_directory =
-            crate::pals_collect_v3::training_process::directory_file(directory)?;
-        for name in ["chunks", "input-locks", "runtime-bundles"] {
-            if name == "runtime-bundles" && bundles.is_empty() {
-                continue;
-            }
-            let subdirectory = directory.open_dir(name).map_err(io)?;
-            crate::pals_collect_v3::training_process::directory_file(&subdirectory)?
-                .sync_all()
-                .map_err(io)?;
-        }
-        original_directory.sync_all().map_err(io)?;
-        active()?;
-        directory
-            .hard_link(pending, directory, ROVENT_PUBLICATION_FILE)
-            .map_err(io)?;
-        directory.remove_file(pending).map_err(io)?;
-        original_directory.sync_all().map_err(io)?;
-        Ok(publication)
+        admissions.push(RoventPublicationAdmission {
+            native_admission_sha256: native_sha.clone(),
+            input_lock,
+            canonical_input_lock_sha256: canonical.clone(),
+            runtime_bundle_manifest,
+        });
     }
+    check(payload_bytes <= MAX_CORPUS_BYTES, "publication output cap")?;
+    let manifest = put(
+        directory,
+        ROVENT_PUBLICATION_MANIFEST,
+        material.manifest_bytes,
+    )?;
+    active()?;
+    let index = put(directory, ROVENT_PUBLICATION_INDEX, material.index_bytes)?;
+    let publication = build(manifest, index, chunks, admissions, payload_bytes)?;
+    let raw = serde_json::to_vec(&publication).map_err(|error| invalid(error.to_string()))?;
+    check(
+        raw.len() <= 16 * 1024 * 1024,
+        "publication commit metadata cap",
+    )?;
+    let pending = "publication.pending.json";
+    active()?;
+    put(directory, pending, &raw)?;
+    let original_directory = crate::pals_collect_v3::training_process::directory_file(directory)?;
+    for name in ["chunks", "input-locks", "runtime-bundles"] {
+        if name == "runtime-bundles" && bundles.is_empty() {
+            continue;
+        }
+        let subdirectory = directory.open_dir(name).map_err(io)?;
+        crate::pals_collect_v3::training_process::directory_file(&subdirectory)?
+            .sync_all()
+            .map_err(io)?;
+    }
+    original_directory.sync_all().map_err(io)?;
+    active()?;
+    directory
+        .hard_link(pending, directory, ROVENT_PUBLICATION_FILE)
+        .map_err(io)?;
+    directory.remove_file(pending).map_err(io)?;
+    original_directory.sync_all().map_err(io)?;
+    Ok(publication)
 }
