@@ -181,12 +181,45 @@ pub struct AdaptivePortQuestion {
     frozen_counter: Option<Arc<ReviewView>>,
     paired_repaired: Option<ObservationId>,
     paired_fresh_seal: Option<FreshPairSeal>,
+    question_sequence: u64,
     question_digest: ContractDigest,
     frontier_source: frontier_port::FrontierQuestionSource,
     goal_local: Option<Arc<goal_local::GoalLocalOrigin>>,
     // Observer-only inline Copy metadata. Never hashed, encoded, selected or
     // consulted by Rules, a cache, acceptance, scheduling or the model.
     diagnostic_repair_line: Option<AdaptiveRepairLineProvenance>,
+}
+/// Read-only hash preimage. Equal bytes neither recreate the original Question
+/// Arc nor grant a frame, native request, or acceptance authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdaptiveQuestionDigestPreimage {
+    pub sequence: u64,
+    pub stage_code: u8,
+    pub view_digest: ContractDigest,
+    pub view_seal_digest: ContractDigest,
+    pub focus_prefix_sha256: ContractDigest,
+    pub goal_local_sha256: Option<ContractDigest>,
+    pub legacy_full_records_sha256: Option<ContractDigest>,
+}
+impl AdaptiveQuestionDigestPreimage {
+    pub fn digest(&self) -> ContractDigest {
+        let mut hash = Sha256::new();
+        hash.update(b"rz-pals-adaptive-checked-question/1\0");
+        hash.update(self.sequence.to_le_bytes());
+        hash.update([self.stage_code]);
+        hash.update(self.view_digest.0);
+        hash.update(self.view_seal_digest.0);
+        hash.update(self.focus_prefix_sha256.0);
+        if let Some(origin) = self.goal_local_sha256 {
+            hash.update(b"goal-local-rules-origin\0");
+            hash.update(origin.0);
+        }
+        if let Some(records) = self.legacy_full_records_sha256 {
+            hash.update(b"legacy-full-raw-snapshot\0");
+            hash.update(records.0);
+        }
+        ContractDigest(hash.finalize().into())
+    }
 }
 impl AdaptivePortQuestion {
     /// Conservative known owned host backing, never an RSS/physical peak.
@@ -1957,22 +1990,18 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let sequence = self.next_question;
         self.next_question = sequence.checked_add(1).ok_or(PalsError::Capacity)?;
         let legacy_full_records = self.prepare_legacy_full_records(&context, &view)?;
-        let mut hash = Sha256::new();
-        hash.update(b"rz-pals-adaptive-checked-question/1\0");
-        hash.update(sequence.to_le_bytes());
-        hash.update([stage as u8]);
-        hash.update(view.digest());
-        hash.update(view.seal_digest());
-        hash.update(context.focus_prefix_sha256());
-        if let Some(origin) = &goal_local {
-            hash.update(b"goal-local-rules-origin\0");
-            hash.update(origin.digest().0);
+        let question_digest = AdaptiveQuestionDigestPreimage {
+            sequence,
+            stage_code: stage as u8,
+            view_digest: ContractDigest(view.digest()),
+            view_seal_digest: ContractDigest(view.seal_digest()),
+            focus_prefix_sha256: ContractDigest(context.focus_prefix_sha256()),
+            goal_local_sha256: goal_local.as_ref().map(|origin| origin.digest()),
+            legacy_full_records_sha256: legacy_full_records
+                .as_ref()
+                .map(|records| ContractDigest(records.digest())),
         }
-        if let Some(records) = &legacy_full_records {
-            hash.update(b"legacy-full-raw-snapshot\0");
-            hash.update(records.digest());
-        }
-        let question_digest = ContractDigest(hash.finalize().into());
+        .digest();
         let frontier_source = frontier_port::FrontierQuestionSource::new(
             self.authority,
             self.deadline,
@@ -2002,6 +2031,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             frozen_counter: None,
             paired_repaired,
             paired_fresh_seal: None,
+            question_sequence: sequence,
             question_digest,
             frontier_source,
             goal_local,

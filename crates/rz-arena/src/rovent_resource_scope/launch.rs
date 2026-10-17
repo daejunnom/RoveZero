@@ -363,14 +363,8 @@ pub(crate) fn prepare_resource_custody(
     let (parent, leaf) = parent_and_leaf(root, &pin.path)?;
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
-    let mut plan_file = parent
-        .open_with(leaf, &options)
-        .map_err(invalid)?;
-    if !plan_file
-        .metadata()
-        .map_err(invalid)?
-        .is_file()
-    {
+    let mut plan_file = parent.open_with(leaf, &options).map_err(invalid)?;
+    if !plan_file.metadata().map_err(invalid)?.is_file() {
         return Err(invalid("resource plan must be a regular held file"));
     }
     let mut bytes = Vec::new();
@@ -412,9 +406,7 @@ pub(crate) fn prepare_native_resource_paths(
     let delegated = RoventTrainingResources::open_native_delegation(&plan.delegated_cgroup_path)?;
     let (parent, leaf) = parent_and_leaf(original_private_root, &plan.evidence_directory)?;
     parent.create_dir(leaf).map_err(invalid)?;
-    let directory = parent
-        .open_dir_nofollow(leaf)
-        .map_err(invalid)?;
+    let directory = parent.open_dir_nofollow(leaf).map_err(invalid)?;
     Ok((delegated, directory))
 }
 
@@ -438,9 +430,7 @@ fn parent_and_leaf<'a>(
         if parts.peek().is_none() {
             return Ok((parent, part));
         }
-        parent = parent
-            .open_dir_nofollow(part)
-            .map_err(invalid)?;
+        parent = parent.open_dir_nofollow(part).map_err(invalid)?;
     }
     Err(invalid("original basename missing"))
 }

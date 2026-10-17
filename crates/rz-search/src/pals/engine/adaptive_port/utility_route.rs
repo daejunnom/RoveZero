@@ -13,6 +13,7 @@ use std::sync::Weak;
 use validator_port::{ActionWitnessKind, MAX_ACTION_WITNESSES};
 
 mod conditional_witness;
+mod intervention;
 pub use super::utility_conditional_basis::{
     UtilityConditionalWitnessBasis, UtilityConditionalWitnessBasisUnavailable,
     UtilityWitnessBasisError, UtilityWitnessBasisExpectation, UtilityWitnessBasisMetadata,
@@ -28,6 +29,13 @@ pub use conditional_witness::{UtilityConditionalWitnessBodies, UtilityConditiona
 pub use conditional_witness::{
     UtilityWitnessPreimageError, UtilityWitnessPreimageExpectation,
     validate_utility_witness_preimage,
+};
+pub use intervention::{
+    UTILITY_INTERVENTION_TARGET_DOMAIN, UtilityInterventionAdmission,
+    UtilityInterventionBindRejection, UtilityInterventionCandidate, UtilityInterventionTarget,
+    UtilityInterventionTargetBindRejection, UtilityInterventionTargetDigestPreimage,
+    UtilityInterventionUnavailable, utility_intervention_arm_question_preimage,
+    utility_intervention_target_digest, utility_intervention_target_digest_preimage,
 };
 
 /// Array indices belong to NNUEC utility, not the legacy seven V tasks.
@@ -203,6 +211,7 @@ pub struct UtilityRouteAction {
     witnessed: HashSet<ContractDigest>,
     r_pc_consumption: Vec<CpuSemanticWitness>,
     failed: bool,
+    intervention: Option<intervention::UtilityInterventionSource>,
 }
 /// An original accepted P/C head that this exact source owner consumed.
 /// It retains no ReviewView, output tensor or private model latent state.
@@ -649,26 +658,36 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 error,
             });
         }
-        let frozen_context = utility_route_frozen_context(&preparation, &input);
-        Ok(UtilityRouteAction {
-            preparation,
-            input,
-            frozen_context,
-            committed: HashSet::new(),
-            committed_sources: HashMap::new(),
-            witness_watermarks: HashMap::new(),
-            authorized: Vec::new(),
-            r_parents: Vec::new(),
-            pc_consumed: BTreeSet::new(),
-            pc_origins: Vec::new(),
-            native_executions: BTreeSet::new(),
-            witnesses: Vec::new(),
-            witnessed: HashSet::new(),
-            r_pc_consumption: Vec::new(),
-            failed: false,
-        })
+        Ok(new_utility_route_action(preparation, input))
     }
+}
 
+fn new_utility_route_action(
+    preparation: UtilityRoutePreparation,
+    input: Arc<NnuecUtilityInputCapture>,
+) -> UtilityRouteAction {
+    let frozen_context = utility_route_frozen_context(&preparation, &input);
+    UtilityRouteAction {
+        preparation,
+        input,
+        frozen_context,
+        committed: HashSet::new(),
+        committed_sources: HashMap::new(),
+        witness_watermarks: HashMap::new(),
+        authorized: Vec::new(),
+        r_parents: Vec::new(),
+        pc_consumed: BTreeSet::new(),
+        pc_origins: Vec::new(),
+        native_executions: BTreeSet::new(),
+        witnesses: Vec::new(),
+        witnessed: HashSet::new(),
+        r_pc_consumption: Vec::new(),
+        failed: false,
+        intervention: None,
+    }
+}
+
+impl<M: RoleModel> AdaptiveEnginePort<M> {
     /// Read-only gate for the original actual work. Additional questions need
     /// a separately validated private dependency, never frame equality alone.
     pub fn validate_utility_route_work(
@@ -1348,9 +1367,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .preparation
                 .store
                 .matches(&self.engine.semantic.stores)
-            || !action
+            || !(action
                 .input
                 .matches_capture_lineage(witness.capture_lineage())
+                || action.intervention.as_ref().is_some_and(|source| {
+                    source.matches_arm_capture_lineage(witness.capture_lineage())
+                }))
             || !action
                 .native_executions
                 .contains(&witness.native_execution())

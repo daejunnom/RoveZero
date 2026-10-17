@@ -369,6 +369,10 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 include_str!("engine/adaptive_port/utility_route.rs"),
             ),
             (
+                "pals/engine/adaptive_port/utility_route/intervention.rs",
+                include_str!("engine/adaptive_port/utility_route/intervention.rs"),
+            ),
+            (
                 "pals/engine/adaptive_port/utility_route/conditional_witness.rs",
                 include_str!("engine/adaptive_port/utility_route/conditional_witness.rs"),
             ),

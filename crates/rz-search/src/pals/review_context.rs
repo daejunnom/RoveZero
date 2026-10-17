@@ -943,7 +943,7 @@ impl ReviewContextIndex {
             Ok((first, second))
         }
     }
-    fn fork_query(
+    pub(in crate::pals) fn fork_query(
         &mut self,
         stores: &PalsStores,
         source: &ReviewView,
@@ -1122,7 +1122,9 @@ fn write_moves(hash: &mut Sha256, moves: &[BoardMove]) -> Result<(), ReviewError
     }
     Ok(())
 }
-fn snapshot_digest(snapshot: &PositionSnapshot) -> Result<[u8; 32], ReviewError> {
+pub(in crate::pals) fn snapshot_digest(
+    snapshot: &PositionSnapshot,
+) -> Result<[u8; 32], ReviewError> {
     let trace = snapshot
         .uci_replay(MAX_UCI_REPLAY_PLIES)
         .map_err(|_| ReviewError::AnchorMismatch)?;

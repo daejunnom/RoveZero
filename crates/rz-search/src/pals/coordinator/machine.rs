@@ -333,6 +333,22 @@ pub struct CoordinatorWork<V, Q> {
     pub budget: FrameBudget,
     pub input: FrameInput<V, Q>,
 }
+
+/// The original machine's move-only Ready custody for an opt-in intervention.
+/// Public Work metadata, equal authority numbers or cloned view Arcs cannot
+/// recreate the private machine owner. This cap alone grants no execution.
+pub struct UtilityInterventionReadySource<Q> {
+    owner: Arc<()>,
+    work: CoordinatorWork<crate::pals::review_context::ReviewView, Q>,
+}
+impl<Q> UtilityInterventionReadySource<Q> {
+    pub fn work(&self) -> &CoordinatorWork<crate::pals::review_context::ReviewView, Q> {
+        &self.work
+    }
+    pub(crate) fn matches_owner(&self, owner: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.owner, owner)
+    }
+}
 impl<V, Q> Clone for CoordinatorWork<V, Q> {
     fn clone(&self) -> Self {
         Self {
@@ -499,6 +515,10 @@ pub struct RefinementMachine<V, Q> {
     next_sequence: u64,
     admission_open: bool,
     frames: VecDeque<CoordinatorFrame<V, Q>>,
+    // One opt-in intervention may replace an exact unexecuted source frame.
+    // Its original evidence and view owners stay here until actual worker join.
+    intervention_sources: Vec<CoordinatorFrame<V, Q>>,
+    intervention_owner: Option<Arc<()>>,
     repair_counts: Vec<(Move16, u8)>,
     repair_questions: VecDeque<(Move16, Digest, Digest)>,
     frame_genealogy: Vec<(FrameId, Move16)>,
@@ -537,6 +557,8 @@ impl<V, Q> RefinementMachine<V, Q> {
             next_sequence: 1,
             admission_open: true,
             frames: VecDeque::with_capacity(MAX_COORDINATOR_FRAMES),
+            intervention_sources: Vec::new(),
+            intervention_owner: None,
             repair_counts: Vec::with_capacity(256),
             repair_questions: VecDeque::with_capacity(MAX_COORDINATOR_FRAMES),
             frame_genealogy: Vec::with_capacity(MAX_FRAME_GENEALOGY),
@@ -559,6 +581,9 @@ impl<V, Q> RefinementMachine<V, Q> {
     }
     pub fn frame(&self, id: FrameId) -> Option<&CoordinatorFrame<V, Q>> {
         self.frames.iter().find(|frame| frame.id == id)
+    }
+    pub fn intervention_source_count(&self) -> usize {
+        self.intervention_sources.len()
     }
     pub fn history_usage(&self) -> CoordinatorHistoryUsage {
         CoordinatorHistoryUsage {
@@ -651,7 +676,7 @@ impl<V, Q> RefinementMachine<V, Q> {
             .view_seal
             .validate(self.authority, self.token_budget)?;
         first_move.decode()?;
-        if self.frames.len() == MAX_COORDINATOR_FRAMES {
+        if self.frames.len() + self.intervention_sources.len() >= MAX_COORDINATOR_FRAMES {
             return Err(CoordinatorError::Capacity("pending coordinator frames"));
         }
         if self.frame_genealogy.len() == MAX_FRAME_GENEALOGY {
@@ -1487,6 +1512,8 @@ impl<V, Q> RefinementMachine<V, Q> {
         // before dropping these query/view owners and issuing a receipt.
         self.admission_open = false;
         self.frames.clear();
+        self.intervention_sources.clear();
+        self.intervention_owner = None;
         self.frame_genealogy.clear();
         self.queued_rechecks.clear();
         self.ranking_fanouts.clear();
@@ -1535,6 +1562,139 @@ pub enum ValidatorActionAdmission {
 }
 
 impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
+    pub fn capture_intervention_source(
+        &mut self,
+        id: FrameId,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<UtilityInterventionReadySource<Q>, CoordinatorError> {
+        let work = self.ready_work(id, clock, now)?;
+        let source = self.frame(id).ok_or(CoordinatorError::UnknownRequest)?;
+        if !self.intervention_sources.is_empty()
+            || source.cpu_owner.is_some()
+            || source.fresh_pair.is_some()
+            || source.rules_terminal_pair.is_some()
+            || self
+                .dependencies
+                .iter()
+                .any(|edge| edge.waiter == id || edge.dependency == id)
+            || self
+                .dependent_credit_owners
+                .iter()
+                .any(|(child, parent)| *child == id || *parent == id)
+            || self.queued_rechecks.keys().any(|(parent, _)| *parent == id)
+        {
+            return Err(CoordinatorError::InvalidTransition(
+                "independent unstarted intervention source",
+            ));
+        }
+        let owner = Arc::clone(self.intervention_owner.get_or_insert_with(|| Arc::new(())));
+        Ok(UtilityInterventionReadySource { owner, work })
+    }
+    /// A separately declared experimental arm receives a real fresh frame.
+    /// It replaces, rather than dispatches, its exact Ready neutral source.
+    /// Credit is transferred unchanged; the source evidence is retained until
+    /// the root's existing physical fence/worker-join retirement.
+    #[allow(clippy::result_large_err)]
+    pub fn admit_intervention(
+        &mut self,
+        candidate: crate::pals::engine::adaptive_port::utility_route::UtilityInterventionCandidate<
+            Q,
+        >,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<
+        (
+            FrameId,
+            crate::pals::engine::adaptive_port::utility_route::UtilityInterventionAdmission<Q>,
+        ),
+        (
+            CoordinatorError,
+            crate::pals::engine::adaptive_port::utility_route::UtilityInterventionCandidate<Q>,
+        ),
+    > {
+        let checked = (|| {
+            self.check_control(clock, now)?;
+            if !self.intervention_sources.is_empty() {
+                return Err(CoordinatorError::Capacity("one intervention per root"));
+            }
+            let source_id = candidate.source_frame();
+            let work = self.ready_work(source_id, clock, now)?;
+            let source = self
+                .frame(source_id)
+                .ok_or(CoordinatorError::UnknownRequest)?;
+            if !candidate.validates_source(&work)
+                || self
+                    .intervention_owner
+                    .as_ref()
+                    .is_none_or(|owner| !candidate.matches_source_owner(owner))
+                || candidate.original_deadline() != self.hard_deadline
+                || source.cpu_owner.is_some()
+                || source.fresh_pair.is_some()
+                || source.rules_terminal_pair.is_some()
+                || self
+                    .dependencies
+                    .iter()
+                    .any(|edge| edge.waiter == source_id || edge.dependency == source_id)
+                || self
+                    .dependent_credit_owners
+                    .iter()
+                    .any(|(child, parent)| *child == source_id || *parent == source_id)
+                || self
+                    .queued_rechecks
+                    .keys()
+                    .any(|(parent, _)| *parent == source_id)
+            {
+                return Err(CoordinatorError::IdentityMismatch(
+                    "original independent Ready intervention source",
+                ));
+            }
+            candidate
+                .input()
+                .view_seal
+                .validate(self.authority, self.token_budget)?;
+            super::ranking::validate_actual_view(
+                &candidate.input().view,
+                candidate.input().view_seal,
+            )?;
+            candidate.first_move().decode()?;
+            let ranking_source = source.ranking_source;
+            self.intervention_sources
+                .try_reserve_exact(1)
+                .map_err(|_| CoordinatorError::Capacity("retained intervention source"))?;
+            Ok(ranking_source)
+        })();
+        let ranking_source = match checked {
+            Ok(source) => source,
+            Err(error) => return Err((error, candidate)),
+        };
+        let frame = match self.admit_internal(
+            candidate.first_move(),
+            candidate.input().clone(),
+            candidate.budget(),
+            FrameLineage::default(),
+            clock,
+            now,
+        ) {
+            Ok(frame) => frame,
+            Err(error) => return Err((error, candidate)),
+        };
+        self.match_frame_mut(frame)
+            .expect("new intervention frame")
+            .ranking_source = ranking_source;
+        let source_index = self
+            .frames
+            .iter()
+            .position(|source| source.id == candidate.source_frame())
+            .expect("checked original source remains until this single-writer transaction");
+        let source = self
+            .frames
+            .remove(source_index)
+            .expect("checked intervention source");
+        self.intervention_sources.push(source);
+        Ok((frame, candidate.admitted(frame)))
+    }
+
     /// The opaque port binding retains the actual single-limit question and
     /// source. It never constructs a CpuJobId or reserves native credit.
     pub fn bind_profiled_external_cpu(

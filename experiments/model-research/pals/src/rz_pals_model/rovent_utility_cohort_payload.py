@@ -819,7 +819,7 @@ def _semantic_core(scope):
     return identities
 
 
-def _witness_bodies(scope):
+def _witness_bodies(scope, *, original_store_byte_limit=None):
     semantic = scope["materialization"]["semantic"]
     if "witness_preimages" not in semantic:
         raise UnsupportedCohortPayload("cohort_original_conditional_witness_wire_not_registered")
@@ -861,9 +861,13 @@ def _witness_bodies(scope):
         if (not raw.startswith(prefix) or len(raw) <= len(prefix)
                 or hashlib.sha256(raw).hexdigest() != sha(body["raw_evidence_sha256"])):
             raise ValueError("utility cohort original conditional witness binary frame/raw seal differs")
-    selected = next(offer for offer in scope["materialization"]["prelude"]["offers"]
-        if offer["recipient"] == scope["trial"]["recipient"])
-    if total > min(selected["budget"]["original_store_byte_limit"], 16 << 20):
+    if original_store_byte_limit is None:
+        selected = next(offer for offer in scope["materialization"]["prelude"]["offers"]
+            if offer["recipient"] == scope["trial"]["recipient"])
+        original_store_byte_limit = selected["budget"]["original_store_byte_limit"]
+    # /2 callers pass the separately checked actual arm budget. They never
+    # insert an alternative arm into the original neutral Ready offers.
+    if total > min(uint(original_store_byte_limit), 16 << 20):
         raise ValueError("utility cohort original witness body budget exceeded")
     # The Rust parent alone consumes the remaining observation traversal and
     # replays its conditional Rules certificate before admitting a learner.
@@ -970,7 +974,7 @@ def _basis_pc_origin(value, observation, scope, authority):
     return model
 
 
-def _basis_metadata(value, scope, witness):
+def _basis_metadata(value, scope, witness, *, original_store_byte_limit=None):
     """Join original metadata, not the Core conditional comparison proof.
 
     The original JSON remains sealed as bytes. Nested observation scores,
@@ -1001,9 +1005,11 @@ def _basis_metadata(value, scope, witness):
     _moves(value["line"], 256)
     if value["line"] != witness["line"]:
         raise ValueError("utility cohort original basis witness line differs")
-    selected = next(offer for offer in scope["materialization"]["prelude"]["offers"]
-        if offer["recipient"] == scope["trial"]["recipient"])
-    if uint(value["original_store_byte_limit"]) != selected["budget"]["original_store_byte_limit"]:
+    if original_store_byte_limit is None:
+        selected = next(offer for offer in scope["materialization"]["prelude"]["offers"]
+            if offer["recipient"] == scope["trial"]["recipient"])
+        original_store_byte_limit = selected["budget"]["original_store_byte_limit"]
+    if uint(value["original_store_byte_limit"]) != uint(original_store_byte_limit):
         raise ValueError("utility cohort original basis Store byte limit differs")
     snapshot = _basis_snapshot(value["root"])
     rules = scope["materialization"]["input"]["root_rules"]
@@ -1040,7 +1046,7 @@ def _basis_metadata(value, scope, witness):
         raise UnsupportedCohortPayload("cohort_original_conditional_basis_variant_not_registered")
 
 
-def _witness_basis(scope):
+def _witness_basis(scope, *, original_store_byte_limit=None):
     """Check original raw basis seals/metadata; unavailable stays masked."""
     semantic = scope["materialization"]["semantic"]
     rows = semantic["witness_basis"]
@@ -1088,11 +1094,14 @@ def _witness_basis(scope):
         # do not reserialize parsed FP spellings before this comparison.
         if hashlib.sha256(raw).hexdigest() != basis["sha256"]:
             raise ValueError("utility cohort original basis raw byte SHA differs")
-        _basis_metadata(_decode(raw, 16 << 20, source_operands=True), scope, witness)
+        _basis_metadata(_decode(raw, 16 << 20, source_operands=True), scope, witness,
+            original_store_byte_limit=original_store_byte_limit)
         total += len(raw)
-    selected = next(offer for offer in scope["materialization"]["prelude"]["offers"]
-        if offer["recipient"] == scope["trial"]["recipient"])
-    if total > min(selected["budget"]["original_store_byte_limit"], 16 << 20):
+    if original_store_byte_limit is None:
+        selected = next(offer for offer in scope["materialization"]["prelude"]["offers"]
+            if offer["recipient"] == scope["trial"]["recipient"])
+        original_store_byte_limit = selected["budget"]["original_store_byte_limit"]
+    if total > min(uint(original_store_byte_limit), 16 << 20):
         raise ValueError("utility cohort original shared witness/basis body budget exceeded")
     return complete
 

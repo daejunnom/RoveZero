@@ -628,7 +628,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::pals::engine::adaptive_port) mod tests {
     // Authored CPU/mock native receipts exercise contract custody only. None
     // of these fixtures runs a role model or establishes GPU/Fresh execution.
     use super::*;
@@ -674,7 +674,7 @@ mod tests {
         }
     }
 
-    fn controller(port: &Port) -> RoventFrontier {
+    pub(in crate::pals::engine::adaptive_port) fn controller(port: &Port) -> RoventFrontier {
         let domain = Arc::new(RootMoveDomain::new(&port.rules, None).unwrap());
         let value = port.engine.semantic.model.value_identity().unwrap().clone();
         let namespace = Arc::new(

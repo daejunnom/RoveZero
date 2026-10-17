@@ -105,6 +105,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             ),
             source!("crates/rz-search/src/pals/engine/adaptive_port/utility_dependencies.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/utility_route.rs"),
+            source!("crates/rz-search/src/pals/engine/adaptive_port/utility_route/intervention.rs"),
             source!(
                 "crates/rz-search/src/pals/engine/adaptive_port/utility_route/conditional_witness.rs"
             ),
@@ -255,6 +256,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             ),
             source!("crates/rz-search/src/pals/engine/adaptive_port/utility_dependencies.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/utility_route.rs"),
+            source!("crates/rz-search/src/pals/engine/adaptive_port/utility_route/intervention.rs"),
             source!(
                 "crates/rz-search/src/pals/engine/adaptive_port/utility_route/conditional_witness.rs"
             ),
@@ -1177,6 +1179,18 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             ),
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_utility_cohort_payload.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_files.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_payload.py"
+            ),
+            source!(
+                "experiments/model-research/pals/src/rz_pals_model/rovent_utility_intervention_preparation.py"
             ),
             source!(
                 "experiments/model-research/pals/src/rz_pals_model/rovent_utility_historical_checkpoint.py"
