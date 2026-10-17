@@ -111,7 +111,7 @@ pub fn capture_rovent_submitted_input(
             .filter(|(_, (record, metadata))| {
                 record.kind == rz_search::pals::engine::RecordKind::Counterexample
                     && record.line == *counter
-                    && metadata.anchor == query.anchors[2]
+                    && metadata.anchor == input.query.anchors[2]
             });
         let one = matching.next()?;
         if matching.next().is_some() {
