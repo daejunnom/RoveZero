@@ -29,6 +29,7 @@ from .rovent_nnuec_training_state import nnuec_is_unmodified, nnuec_known_update
 WINDOW_DOMAIN = "rz-rovent-train-window/1"
 SAMPLER_DOMAIN = "rz-rovent-native-stage-sampler/1"
 JOURNAL_DOMAIN = "rz-rovent-original-learner-journal/1"
+RECOVERED_JOURNAL_DOMAIN = "rz-rovent-recovered-learner-journal/1"
 HEADS = ("policy", "wdl", "divergence", "task", "nnuec_wdl")
 
 
@@ -111,6 +112,9 @@ class StagedLearnerResume:
 
 
 def validate_window_spec(recipe, value):
+    if type(value) is dict and value.get("schema") == "rz-rovent-train-window/2":
+        from .rovent_training_window_v2 import validate_window_spec as validate_v2
+        return validate_v2(recipe, value)
     fields(value, ("schema", "window_id", "recipe_sha256", "stage_id", "source_sha256", "runtime_sha256",
         "model_semantics_sha256", "nnuec_collection_model_sha256", "nnuec_semantics",
         "model_epoch", "context_epoch", "phase", "frozen_pc_sha256", "device", "precision", "tf32",
@@ -172,9 +176,39 @@ def validate_window_spec(recipe, value):
 
 def training_profile_digest(spec):
     """Window renewal may change limits; model/training semantics stay fixed."""
+    if spec.get("schema") == "rz-rovent-train-window/2":
+        from .rovent_training_window_v2 import training_profile_digest as profile_v2
+        return profile_v2(spec)
     renewal = {"window_id", "max_updates", "max_groups", "max_samples", "max_wall_ns", "max_output_bytes", "checkpoint_interval",
                "phase", "model_epoch", "frozen_pc_sha256", "nnuec_collection_model_sha256"}
     return digest("rz-rovent-fixed-training-profile/1", {name: value for name, value in spec.items() if name not in renewal})
+
+
+def _collection_namespace(spec):
+    """Explicit projection into the existing corpus contract, never /1 JSON."""
+    if spec["schema"] == "rz-rovent-train-window/2":
+        return {"source_sha256": spec["collection_source_sha256"],
+            "runtime_sha256": spec["collection_runtime_library_sha256"],
+            "model_semantics_sha256": spec["collection_model_semantics_sha256"],
+            "model_epoch": spec["collection_model_epoch"], "context_epoch": spec["collection_context_epoch"]}
+    return {name: spec[name] for name in ("source_sha256", "runtime_sha256", "model_semantics_sha256", "model_epoch", "context_epoch")}
+
+
+def _journal_domain(spec):
+    return RECOVERED_JOURNAL_DOMAIN if spec["schema"] == "rz-rovent-train-window/2" else JOURNAL_DOMAIN
+
+
+def _update_domain(spec):
+    return "rz-rovent-recovered-learner-update/1" if spec["schema"] == "rz-rovent-train-window/2" else "rz-rovent-original-learner-update/1"
+
+
+def _phase_source(spec, corpus_sha256):
+    namespace = _collection_namespace(spec)
+    result = {"corpus_sha256": corpus_sha256, "nnuec_model_sha256": spec["nnuec_collection_model_sha256"],
+        "model_epoch": namespace["model_epoch"], "context_epoch": namespace["context_epoch"], "samplers": {}}
+    if spec["schema"] == "rz-rovent-train-window/2":
+        result["training_model_epoch"] = spec["training_model_epoch"]
+    return result
 
 
 class StageSampler:
@@ -223,12 +257,11 @@ def _read_admission(owner, intake, spec):
     from .rovent_corpus import RoventTrainingCorpus
     if type(intake) is not RoventTrainingCorpus:
         raise ValueError("original teacher-aware native corpus owner required; legacy/metadata receipts are not an intake")
-    admission = intake.admit_stage(owner.recipe, owner.stage_id, spec["model_epoch"], spec["context_epoch"],
+    namespace = _collection_namespace(spec)
+    admission = intake.admit_stage(owner.recipe, owner.stage_id, namespace["model_epoch"], namespace["context_epoch"],
         list(owner.inherited_input_sha256), list(owner.inherited_origin_sha256))
     for name, expected in (("recipe_sha256", owner.recipe.sha256), ("stage_id", owner.stage_id),
-            ("source_sha256", spec["source_sha256"]), ("runtime_sha256", spec["runtime_sha256"]),
-            ("model_semantics_sha256", spec["model_semantics_sha256"]),
-            ("model_epoch", spec["model_epoch"]), ("context_epoch", spec["context_epoch"])):
+            *namespace.items()):
         if not _typed_equal(admission.get(name), expected):
             raise ValueError("native admission differs from registered window: " + name)
     sha(admission["corpus_sha256"])
@@ -239,9 +272,14 @@ def _read_admission(owner, intake, spec):
 
 def _journal(owner, spec, admission):
     value = owner.samplers
-    fields(value, ("schema", "recipe_sha256", "stage_id", "profile_sha256", "phase_inputs",
-        "updates", "head_counts", "frozen_pc_sha256", "resume_cost_receipts"), "original learner journal")
-    fixed = {"schema": JOURNAL_DOMAIN, "recipe_sha256": owner.recipe.sha256, "stage_id": owner.stage_id,
+    recovered = spec["schema"] == "rz-rovent-train-window/2"
+    journal_fields = ("schema", "recipe_sha256", "stage_id", "profile_sha256", "phase_inputs",
+        "updates", "head_counts", "frozen_pc_sha256", "resume_cost_receipts")
+    fields(value, journal_fields + (("recovery_cost_state",) if recovered else ()), "original learner journal")
+    if recovered and value["recovery_cost_state"] is not None:
+        from .rovent_training_recovery import validate_recovered_cost
+        validate_recovered_cost(value["recovery_cost_state"])
+    fixed = {"schema": _journal_domain(spec), "recipe_sha256": owner.recipe.sha256, "stage_id": owner.stage_id,
         "profile_sha256": training_profile_digest(spec)}
     if any(not _typed_equal(value.get(name), item) for name, item in fixed.items()):
         raise ValueError("learner journal changed its pinned corpus/profile/epoch")
@@ -254,17 +292,19 @@ def _journal(owner, spec, admission):
     if type(phases) is not dict or not phases or set(phases) - {"pc", "v"} or spec["phase"] not in phases:
         raise ValueError("fresh phase source must be explicitly prepared before dispatch")
     for source in phases.values():
-        fields(source, ("corpus_sha256", "nnuec_model_sha256", "model_epoch", "context_epoch", "samplers"), "retained phase collection")
+        fields(source, ("corpus_sha256", "nnuec_model_sha256", "model_epoch", "context_epoch", "samplers")
+            + (("training_model_epoch",) if recovered else ()), "retained phase collection")
         sha(source["corpus_sha256"])
         sha(source["nnuec_model_sha256"])
         uint(source["model_epoch"])
         uint(source["context_epoch"])
+        if recovered:
+            uint(source["training_model_epoch"])
         if type(source["samplers"]) is not dict:
             raise ValueError("phase sampler owner map required")
     source = phases[spec["phase"]]
-    if any(not _typed_equal(source[name], expected) for name, expected in
-           (("corpus_sha256", admission["corpus_sha256"]), ("nnuec_model_sha256", spec["nnuec_collection_model_sha256"]),
-            ("model_epoch", spec["model_epoch"]), ("context_epoch", spec["context_epoch"]))):
+    if any(not _typed_equal(source[name], expected) for name, expected in _phase_source(spec, admission["corpus_sha256"]).items()
+           if name != "samplers"):
         raise ValueError("phase collection changed its original model/context/corpus identity")
     counted, heads = dict.fromkeys(ROLES, 0), dict.fromkeys(HEADS, 0)
     retained_inputs, retained_origins = set(owner.inherited_input_sha256), set(owner.inherited_origin_sha256)
@@ -277,7 +317,7 @@ def _journal(owner, spec, admission):
             raise ValueError("unknown original learner update role")
         counted[role] += 1
         phase = "v" if role == "validator" else "pc"
-        if (event["schema"] != "rz-rovent-original-learner-update/1" or event["stage_id"] != owner.stage_id
+        if (event["schema"] != _update_domain(spec) or event["stage_id"] != owner.stage_id
                 or event["completed_role_updates"] != counted[role] or event["phase"] != phase
                 or event["profile_sha256"] != fixed["profile_sha256"]
                 or event["corpus_sha256"] != phases[phase]["corpus_sha256"]):
@@ -318,12 +358,13 @@ def initial_training_journal(recipe, spec, admission):
     """Plain initial state only; this function issues no native authority."""
     validate_window_spec(recipe, spec)
     sha(admission["corpus_sha256"])
-    return {"schema": JOURNAL_DOMAIN, "recipe_sha256": recipe.sha256, "stage_id": spec["stage_id"],
-        "profile_sha256": training_profile_digest(spec), "phase_inputs": {spec["phase"]: {
-            "corpus_sha256": admission["corpus_sha256"], "model_epoch": spec["model_epoch"],
-            "nnuec_model_sha256": spec["nnuec_collection_model_sha256"], "context_epoch": spec["context_epoch"], "samplers": {}}},
+    journal = {"schema": _journal_domain(spec), "recipe_sha256": recipe.sha256, "stage_id": spec["stage_id"],
+        "profile_sha256": training_profile_digest(spec), "phase_inputs": {spec["phase"]: _phase_source(spec, admission["corpus_sha256"])},
         "updates": [], "head_counts": dict.fromkeys(HEADS, 0), "frozen_pc_sha256": spec["frozen_pc_sha256"],
         "resume_cost_receipts": []}
+    if spec["schema"] == "rz-rovent-train-window/2":
+        journal["recovery_cost_state"] = None
+    return journal
 
 
 def prepare_frozen_v_journal(owner, native_intake, window_spec):
@@ -341,11 +382,9 @@ def prepare_frozen_v_journal(owner, native_intake, window_spec):
     if journal["profile_sha256"] != training_profile_digest(spec) or journal["frozen_pc_sha256"] != spec["frozen_pc_sha256"]:
         raise ValueError("new V source cannot change the frozen P/C model/training profile")
     admission = _read_admission(owner, native_intake, spec)
-    if "v" in journal["phase_inputs"] or spec["model_epoch"] <= journal["phase_inputs"]["pc"]["model_epoch"]:
+    if "v" in journal["phase_inputs"] or _collection_namespace(spec)["model_epoch"] <= journal["phase_inputs"]["pc"]["model_epoch"]:
         raise ValueError("V collection must be new and use a later frozen P/C epoch")
-    journal["phase_inputs"]["v"] = {"corpus_sha256": admission["corpus_sha256"],
-        "nnuec_model_sha256": spec["nnuec_collection_model_sha256"], "model_epoch": spec["model_epoch"],
-        "context_epoch": spec["context_epoch"], "samplers": {}}
+    journal["phase_inputs"]["v"] = _phase_source(spec, admission["corpus_sha256"])
     return journal
 
 
@@ -394,6 +433,10 @@ def _stage_rovent_checkpoint(path, expected_sha256, template, recipe, membership
     register a fresh full checkpoint before learned export; its old byte pin
     continues to identify the unmodified source, not the recovered state.
     """
+    if type(window_spec) is dict and window_spec.get("schema") == "rz-rovent-train-window/2":
+        from .rovent_recovered_training_window import _stage_recovered_checkpoint
+        return _stage_recovered_checkpoint(path, expected_sha256, template, recipe, membership, native_intake,
+            window_spec, execution_authority=execution_authority, max_file_bytes=max_file_bytes, purpose=purpose, execute=execute)
     spec = copy.deepcopy(validate_window_spec(recipe, window_spec))
     if purpose not in ("resume", "export"):
         raise ValueError("explicit raw-export or training-resume checkpoint purpose required")
@@ -496,8 +539,9 @@ def _source_fork_journal(value, *, recipe, source_stage, completed):
     to the previous original window by validate_checkpoint_state.
     """
     fields(value, ("schema", "recipe_sha256", "stage_id", "profile_sha256", "phase_inputs",
-        "updates", "head_counts", "frozen_pc_sha256", "resume_cost_receipts"), "source fork journal")
-    if (value["schema"] != JOURNAL_DOMAIN or value["recipe_sha256"] != recipe.sha256
+        "updates", "head_counts", "frozen_pc_sha256", "resume_cost_receipts")
+        + (("recovery_cost_state",) if value.get("schema") == RECOVERED_JOURNAL_DOMAIN else ()), "source fork journal")
+    if (value["schema"] not in (JOURNAL_DOMAIN, RECOVERED_JOURNAL_DOMAIN) or value["recipe_sha256"] != recipe.sha256
             or value["stage_id"] != source_stage or type(value["updates"]) is not list
             or len(value["updates"]) != sum(completed.values())):
         raise ValueError("fork source journal changed its original stage/update boundaries")
@@ -514,6 +558,10 @@ def stage_rovent_fork(path, expected_sha256, template, recipe, membership, nativ
     binds only the separately collected target corpus; no old targets/optimizer
     moments are relabelled as a teacher-specific child.
     """
+    if type(window_spec) is dict and window_spec.get("schema") == "rz-rovent-train-window/2":
+        from .rovent_recovered_training_window import stage_recovered_rovent_fork
+        return stage_recovered_rovent_fork(path, expected_sha256, template, recipe, membership, native_intake,
+            window_spec, execution_authority=execution_authority, max_file_bytes=max_file_bytes, execute=execute)
     from .rovent_tensor_training import stage_tensor_fork
     spec = copy.deepcopy(validate_window_spec(recipe, window_spec))
     target = recipe.stage(spec["stage_id"])
@@ -591,6 +639,9 @@ def admit_learned_export(owner, checkpoint, request):
     admission is obtained from the live original authority, never loaded as a
     serialized eligibility flag or used to waive numerical/GPU acceptance.
     """
+    if type(request) is LearnedExportRequest and request.window_spec.get("schema") == "rz-rovent-train-window/2":
+        from .rovent_recovered_training_window import admit_recovered_learned_export
+        return admit_recovered_learned_export(owner, checkpoint, request)
     if type(request) is not LearnedExportRequest or not isinstance(request.execution_authority, OriginalTrainerAuthority):
         raise OriginalTrainingAuthorityRequired("live original trainer authority required for learned export")
     spec = validate_window_spec(owner.recipe, request.window_spec)
@@ -666,12 +717,15 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
     if execute is not True:
         if execute is not False:
             raise ValueError("explicit bool execution selector required")
-        return {"schema": WINDOW_DOMAIN, "recipe_sha256": owner.recipe.sha256, "stage_id": owner.stage_id,
+        return {"schema": spec["schema"], "recipe_sha256": owner.recipe.sha256, "stage_id": owner.stage_id,
             "admission": admission, "training_profile_sha256": training_profile_digest(spec),
             "actual_training_executed": False, "optimizer_updates": 0, "execution_authorized": False,
             "arena_eligible": False}
     if not isinstance(execution_authority, OriginalTrainerAuthority):
         raise OriginalTrainingAuthorityRequired("original host/producer training authority required; JSON admission is insufficient")
+    read_accounting = None
+    if spec["schema"] == "rz-rovent-train-window/2":
+        read_accounting = execution_authority._read_budget
     if not callable(cancelled):
         raise ValueError("original cancellation observation callable required")
     if execution_until_ns is not None:
@@ -833,7 +887,7 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
                     owner.pending_microbatches = 0
                     charge_wall()
                     owner.rng = capture_rng(owner.cuda_devices)
-                    event = {"schema": "rz-rovent-original-learner-update/1", "window_id": spec["window_id"],
+                    event = {"schema": _update_domain(spec), "window_id": spec["window_id"],
                         "stage_id": owner.stage_id, "role": role, "completed_role_updates": owner.completed[role],
                         "profile_sha256": training_profile_digest(spec), "corpus_sha256": admission["corpus_sha256"],
                         "phase": spec["phase"],
@@ -862,7 +916,7 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
                     owner.rng = capture_rng(owner.cuda_devices)
                     remaining = spec["max_output_bytes"] - (owner.cost["output_bytes"] - start_output)
                     pin = save_tensor_checkpoint(owner, directory / (spec["window_id"] + "-" + str(sum(owner.completed.values())) + ".pt"),
-                        sampler_validator=validate_sampler, max_file_bytes=remaining, execute=True)
+                        sampler_validator=validate_sampler, max_file_bytes=remaining, execute=True, read_accounting=read_accounting)
                     execution_authority.checkpoint_published(lease, pin, owner)
                     checkpoints.append(pin)
             else:
@@ -875,7 +929,7 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
             tensor_payload(owner, sampler_validator=validate_sampler, execute=True)
             remaining = spec["max_output_bytes"] - (owner.cost["output_bytes"] - start_output)
             final = save_tensor_checkpoint(owner, directory / (spec["window_id"] + "-final.pt"),
-                sampler_validator=validate_sampler, max_file_bytes=remaining, execute=True)
+                sampler_validator=validate_sampler, max_file_bytes=remaining, execute=True, read_accounting=read_accounting)
             execution_authority.checkpoint_published(lease, final, owner)
             checkpoints.append(final)
         except BaseException:
@@ -915,7 +969,7 @@ def train_rovent_window(owner, native_intake, window_spec, checkpoint_directory,
                     restore_rng(original_rng, owner.cuda_devices)
             if cleanup_error is not None:
                 raise cleanup_error
-    return {"schema": WINDOW_DOMAIN, "window_id": spec["window_id"], "status": status,
+    return {"schema": spec["schema"], "window_id": spec["window_id"], "status": status,
         "recipe_sha256": owner.recipe.sha256, "stage_id": owner.stage_id,
         "training_profile_sha256": training_profile_digest(spec), "admission": admission,
         "completed_updates": dict(owner.completed), "actual_optimizer_updates": sum(owner.completed.values()) - start_updates,

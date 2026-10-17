@@ -50,6 +50,9 @@ class _WindowLease:
 
 
 class ParentSocketTrainerAuthority(OriginalTrainerAuthority):
+    STARTUP_SCHEMA = "rz-rovent-original-trainer-startup/1"
+    RPC_SCHEMA = RPC_SCHEMA
+    ACK_SCHEMA = ACK_SCHEMA
     def __init__(self, token, stream, startup, startup_sha256, clock):
         if token is not _CONNECTED:
             raise OriginalTrainingAuthorityRequired("live original parent socket handshake required")
@@ -69,7 +72,7 @@ class ParentSocketTrainerAuthority(OriginalTrainerAuthority):
                 or hashlib.sha256(raw_startup).hexdigest() != expected_sha256
                 or strict_json(raw_startup.decode("utf-8", "strict")) != startup):
             raise ValueError("original socket startup byte pin differs")
-        if startup.get("schema") != "rz-rovent-original-trainer-startup/1":
+        if startup.get("schema") != cls.STARTUP_SCHEMA:
             raise ValueError("new original Rovent startup domain required")
         control = fields(startup["control"], ("socket_path", "parent_pid", "parent_start_ticks", "control_device", "control_inode"), "original private control")
         path = Path(control["socket_path"])
@@ -122,7 +125,7 @@ class ParentSocketTrainerAuthority(OriginalTrainerAuthority):
                 raise OriginalTrainingAuthorityRequired("failed original trainer connection is quarantined")
             try:
                 sequence = self._sequence + 1
-                request = {"schema": RPC_SCHEMA, "window_id": self._startup["window_id"],
+                request = {"schema": self.RPC_SCHEMA, "window_id": self._startup["window_id"],
                     "startup_sha256": self._startup_sha256, "sequence": sequence, "operation": operation, "payload": payload}
                 raw = (json.dumps(request, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
                 if len(raw) > FRAME_BYTES:
@@ -146,7 +149,7 @@ class ParentSocketTrainerAuthority(OriginalTrainerAuthority):
                         raise ValueError("original trainer ack exceeded one bounded frame")
                 ack = strict_json(bytes(received).decode("utf-8", "strict"))
                 fields(ack, ("schema", "window_id", "sequence", "operation", "accepted", "payload"), "original trainer acknowledgement")
-                if (ack["schema"] != ACK_SCHEMA or ack["window_id"] != self._startup["window_id"]
+                if (ack["schema"] != self.ACK_SCHEMA or ack["window_id"] != self._startup["window_id"]
                         or type(ack["sequence"]) is not int or ack["sequence"] != sequence or ack["operation"] != operation
                         or type(ack["accepted"]) is not bool or type(ack["payload"]) is not dict):
                     raise ValueError("original trainer ack changed window/order/operation")

@@ -133,6 +133,15 @@ def _validate_teachers(recipe, stage, manifest):
 
 
 def _native(manifest, record):
+    native = record.get("native")
+    raw = native.get("raw_submission") if type(native) is dict else None
+    if type(raw) is dict and raw.get("schema") == "rz-rovent-native-owner-event/2":
+        from .rovent_native_v2 import validate_native_v2
+        return validate_native_v2(manifest, record)
+    return _native_common(manifest, record, NATIVE_RAW_DOMAIN)
+
+
+def _native_common(manifest, record, raw_domain):
     native = fields(record["native"], ("head", "source_sha256", "model_sha256", "encoding_sha256", "input_digest",
         "view_digest", "output_digest", "process_epoch", "game_generation", "root_generation", "request_sequence",
         "execution_epoch", "execution_sequence", "completed_nn_inputs", "submitted_sequence", "completed_sequence",
@@ -158,10 +167,10 @@ def _native(manifest, record):
         raise ValueError("original native lifecycle changed the sealed submitted input/view")
     for name, kind in (("raw_submission", "submitted"), ("raw_completion", "completed"), ("raw_retirement", "retired")):
         raw = native[name]
-        if (type(raw) is not dict or raw.get("schema") != NATIVE_RAW_DOMAIN or raw.get("kind") != kind
+        if (type(raw) is not dict or raw.get("schema") != raw_domain or raw.get("kind") != kind
                 or raw.get("process_epoch") != native["process_epoch"]
                 or raw.get("request_sequence") != native["request_sequence"]
-                or digest(NATIVE_RAW_DOMAIN, raw) != sha(native[name + "_sha256"])):
+                or digest(raw_domain, raw) != sha(native[name + "_sha256"])):
             raise ValueError("original native raw owner body/seal/request mismatch")
     submitted, completed, retired = (native[name] for name in ("raw_submission", "raw_completion", "raw_retirement"))
     if (submitted.get("model_sha256") != native["model_sha256"]
@@ -513,8 +522,13 @@ def _teacher_head(manifest, record, source, label):
 
 
 def _rules_head(record, source, label):
-    raw = fields(source["raw_receipt"], ("schema", "kind", "input_sha256", "anchor", "trajectory", "rules_receipt"),
+    native_v2 = record["native"]["raw_submission"].get("schema") == "rz-rovent-native-owner-event/2"
+    extra = ("rules_replay",) if native_v2 else ()
+    raw = fields(source["raw_receipt"], ("schema", "kind", "input_sha256", "anchor", "trajectory", "rules_receipt", *extra),
                  "original actual Rules outcome body")
+    if native_v2:
+        from .rovent_native_v2 import validate_wdl_replay_v2
+        validate_wdl_replay_v2(record, raw, label)
     authority = raw["trajectory"]
     if (raw["kind"] != "rules_wdl" or source["source"] != "rules_selfplay_trajectory"
             or source["binary_sha256"] is not None or source["profile_sha256"] is not None
@@ -704,7 +718,7 @@ def _identity(info):
             info.st_mtime_ns, info.st_ctime_ns)
 
 
-def _read_pinned_bytes(path, expected_sha256, expected_bytes, maximum, *, suffixes=(".json",)):
+def _read_pinned_bytes(path, expected_sha256, expected_bytes, maximum, *, suffixes=(".json",), read_accounting=None):
     """Pin raw bytes through one descriptor before payload decoding."""
     sha(expected_sha256)
     expected_bytes = uint(expected_bytes, maximum)
@@ -714,26 +728,47 @@ def _read_pinned_bytes(path, expected_sha256, expected_bytes, maximum, *, suffix
     before = path.lstat()
     if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size != expected_bytes:
         raise ValueError("original corpus is not a bounded single-link regular file")
+    lease = None
+    if read_accounting is not None:
+        if not all(callable(getattr(read_accounting, name, None)) for name in
+                   ("reserve_external", "charge_external", "finish_external", "fail_external")):
+            raise ValueError("local original corpus read accounting callbacks required")
+        # A one-byte probe proves EOF while bounding a growing-file failure.
+        lease = read_accounting.reserve_external(expected_bytes + 1)
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    with os.fdopen(descriptor, "rb") as source:
-        opened = os.fstat(source.fileno())
-        if _identity(opened) != _identity(before):
-            raise ValueError("original corpus file changed before read")
-        chunks, observed, total = [], hashlib.sha256(), 0
-        while block := source.read(min(1024 * 1024, maximum + 1 - total)):
-            total += len(block)
-            if total > maximum:
-                raise ValueError("original corpus byte limit exceeded")
-            observed.update(block)
-            chunks.append(block)
-        after_fd = os.fstat(source.fileno())
-    after_path = path.lstat()
-    if (_identity(before) != _identity(after_fd) or _identity(before) != _identity(after_path)
-            or total != expected_bytes or observed.hexdigest() != expected_sha256):
-        raise ValueError("original corpus raw byte pin/identity mismatch")
-    _regular_path(path, suffixes=suffixes)
-    return b"".join(chunks)
+    try:
+        descriptor = os.open(path, flags)
+        # Unbuffered reads keep returned block lengths equal to descriptor read
+        # work for the accounting path, including the one-byte growth probe.
+        # The legacy None path preserves its original buffering behavior.
+        with os.fdopen(descriptor, "rb", buffering=0 if read_accounting is not None else -1) as source:
+            opened = os.fstat(source.fileno())
+            if _identity(opened) != _identity(before):
+                raise ValueError("original corpus file changed before read")
+            chunks, observed, total = [], hashlib.sha256(), 0
+            read_maximum = expected_bytes if read_accounting is not None else maximum
+            while block := source.read(min(1024 * 1024, read_maximum + 1 - total)):
+                if read_accounting is not None:
+                    read_accounting.charge_external(lease, len(block))
+                total += len(block)
+                if total > read_maximum:
+                    raise ValueError("original corpus byte limit exceeded")
+                observed.update(block)
+                chunks.append(block)
+            after_fd = os.fstat(source.fileno())
+        after_path = path.lstat()
+        if (_identity(before) != _identity(after_fd) or _identity(before) != _identity(after_path)
+                or total != expected_bytes or observed.hexdigest() != expected_sha256):
+            raise ValueError("original corpus raw byte pin/identity mismatch")
+        _regular_path(path, suffixes=suffixes)
+        payload = b"".join(chunks)
+        if read_accounting is not None:
+            read_accounting.finish_external(lease, expected_bytes=expected_bytes)
+        return payload
+    except BaseException:
+        if read_accounting is not None:
+            read_accounting.fail_external(lease)
+        raise
 
 
 def _decode_json(raw):
@@ -744,12 +779,14 @@ def _decode_json(raw):
         raise ValueError("original corpus strict UTF-8 JSON required") from error
 
 
-def _read_pinned_json(path, expected_sha256, expected_bytes, maximum):
-    return _decode_json(_read_pinned_bytes(path, expected_sha256, expected_bytes, maximum))
+def _read_pinned_json(path, expected_sha256, expected_bytes, maximum, *, read_accounting=None):
+    return _decode_json(_read_pinned_bytes(path, expected_sha256, expected_bytes, maximum,
+                                          read_accounting=read_accounting))
 
 
-def _read_pinned_records(path, expected_sha256, expected_bytes, maximum, expected_records):
-    raw = _read_pinned_bytes(path, expected_sha256, expected_bytes, maximum, suffixes=(".jsonl",))
+def _read_pinned_records(path, expected_sha256, expected_bytes, maximum, expected_records, *, read_accounting=None):
+    raw = _read_pinned_bytes(path, expected_sha256, expected_bytes, maximum, suffixes=(".jsonl",),
+                             read_accounting=read_accounting)
     lines = raw.split(b"\n")
     if lines[-1] == b"":
         lines.pop()
@@ -807,7 +844,7 @@ class RoventTrainingCorpus:
     """
     @classmethod
     def from_files(cls, manifest_path, *, manifest_sha256, index_path, index_sha256,
-                   ancestors=(), limits=CorpusLimits()):
+                   ancestors=(), limits=CorpusLimits(), read_accounting=None):
         if type(limits) is not CorpusLimits:
             raise ValueError("validated original corpus limits required")
         manifest_path, index_path = _regular_path(manifest_path), _regular_path(index_path)
@@ -815,9 +852,10 @@ class RoventTrainingCorpus:
         if used > limits.max_total_bytes:
             raise ValueError("original corpus aggregate byte limit exceeded")
         manifest = _read_pinned_json(manifest_path, manifest_sha256, manifest_path.stat().st_size,
-                                     limits.max_file_bytes)
+                                     limits.max_file_bytes, read_accounting=read_accounting)
         _manifest(manifest, limits)
-        index = _read_pinned_json(index_path, index_sha256, index_path.stat().st_size, limits.max_file_bytes)
+        index = _read_pinned_json(index_path, index_sha256, index_path.stat().st_size, limits.max_file_bytes,
+                                  read_accounting=read_accounting)
         fields(index, ("schema", "manifest_sha256", "record_count", "chunks", "origins"),
                "original Rovent corpus index")
         if index["schema"] != INDEX_DOMAIN or index["manifest_sha256"] != digest(MANIFEST_DOMAIN, manifest):
@@ -849,7 +887,8 @@ class RoventTrainingCorpus:
                 raise ValueError("original corpus aggregate byte/record limit exceeded")
             if count == 0:
                 raise ValueError("nonempty original corpus chunk required")
-            payload = _read_pinned_records(path, chunk["sha256"], chunk["bytes"], chunk_limit, count)
+            payload = _read_pinned_records(path, chunk["sha256"], chunk["bytes"], chunk_limit, count,
+                                            read_accounting=read_accounting)
             for record in payload:
                 identity = record.get("record_sha256") if type(record) is dict else None
                 if identity not in by_record or identity in seen_records:

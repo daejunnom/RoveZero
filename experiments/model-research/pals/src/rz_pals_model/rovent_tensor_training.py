@@ -384,7 +384,7 @@ def tensor_payload(owner, *, sampler_validator, execute=False):
             "inherited_origin_sha256": list(owner.inherited_origin_sha256)}
 
 
-def save_tensor_checkpoint(owner, path, *, sampler_validator, max_file_bytes, execute=False):
+def save_tensor_checkpoint(owner, path, *, sampler_validator, max_file_bytes, execute=False, read_accounting=None):
     """Use the existing bounded atomic torch serializer; no update dispatch."""
     runtime = _runtime(execute)
     maximum = uint(max_file_bytes, MAX_BYTES)
@@ -401,7 +401,7 @@ def save_tensor_checkpoint(owner, path, *, sampler_validator, max_file_bytes, ex
         payload = tensor_payload(owner, sampler_validator=sampler_validator, execute=True)
         try:
             atomic_checkpoint(target, payload, max_file_bytes=maximum)
-            actual, size = _hash_file(target, maximum)
+            actual, size = _hash_file(target, maximum, read_accounting=read_accounting)
             owner.cost["output_bytes"] = payload["ledger"]["cost"]["output_bytes"]
             owner.source_checkpoint_sha256, owner.source_checkpoint_path = actual, str(target)
             owner.source_model_state_sha256 = runtime[5](payload["model"])
@@ -417,13 +417,17 @@ def save_tensor_checkpoint(owner, path, *, sampler_validator, max_file_bytes, ex
             raise
 
 
-def _load_pinned_tensor_file(path, expected_sha256, maximum, torch):
+def _load_pinned_tensor_file(path, expected_sha256, maximum, torch, *, read_accounting=None, snapshot_directory=None):
     source = Path(path)
     if not source.is_absolute() or source.suffix != ".pt" or source.is_symlink():
         raise ValueError("explicit pinned original .pt input required")
     sha(expected_sha256)
-    with tempfile.TemporaryFile(mode="w+b", prefix="rz-rovent-pinned-", dir=source.parent) as snapshot:
-        identity, size = _hash_file(source, maximum, snapshot=snapshot)
+    directory = source.parent if snapshot_directory is None else Path(snapshot_directory)
+    if snapshot_directory is not None and (not directory.is_absolute() or directory.resolve(strict=True) != directory
+            or directory.is_symlink() or not directory.is_dir()):
+        raise ValueError("explicit original owned snapshot directory required")
+    with tempfile.TemporaryFile(mode="w+b", prefix="rz-rovent-pinned-", dir=directory) as snapshot:
+        identity, size = _hash_file(source, maximum, snapshot=snapshot, read_accounting=read_accounting)
         if identity != expected_sha256:
             raise ValueError("original tensor checkpoint byte pin mismatch")
         snapshot.flush()
@@ -536,13 +540,14 @@ def _restore_scratch(payload, template, recipe, membership, *, sampler_validator
 
 
 def stage_tensor_resume(path, expected_sha256, template, recipe, membership, *, sampler_validator,
-                        max_file_bytes, expected_stage_id, execute=False):
+                        max_file_bytes, expected_stage_id, execute=False, read_accounting=None, snapshot_directory=None):
     """Return a fully checked new owner. Original model/global RNG are intact."""
     runtime = _runtime(execute)
     maximum = uint(max_file_bytes, MAX_BYTES)
     if not maximum:
         raise ValueError("positive checkpoint input byte credit required")
-    payload, _ = _load_pinned_tensor_file(path, expected_sha256, maximum, runtime[0])
+    payload, _ = _load_pinned_tensor_file(path, expected_sha256, maximum, runtime[0], read_accounting=read_accounting,
+        snapshot_directory=snapshot_directory)
     owner = _restore_scratch(payload, template, recipe, membership, sampler_validator=sampler_validator, runtime=runtime)
     if owner.stage_id != expected_stage_id:
         raise ValueError("resume cannot change stage/teacher lineage")
@@ -556,7 +561,7 @@ def stage_tensor_resume(path, expected_sha256, template, recipe, membership, *, 
 
 def stage_tensor_fork(path, expected_sha256, template, recipe, membership, *, source_sampler_validator,
                       target_sampler_validator, target_stage_id, reset_seed, reset_samplers, reset_bucket,
-                      max_file_bytes, execute=False):
+                      max_file_bytes, execute=False, read_accounting=None, snapshot_directory=None):
     """Load the pinned completed parent; retain weights, reset all child state.
 
     Both teacher branches can name this one common checkpoint byte pin. Parent
@@ -570,7 +575,8 @@ def stage_tensor_fork(path, expected_sha256, template, recipe, membership, *, so
         raise ValueError("common initialization is not a checkpoint fork")
     parent = stage_tensor_resume(path, expected_sha256, template, recipe, membership,
         sampler_validator=source_sampler_validator, max_file_bytes=max_file_bytes,
-        expected_stage_id=target.parent_stage_id, execute=True)
+        expected_stage_id=target.parent_stage_id, execute=True, read_accounting=read_accounting,
+        snapshot_directory=snapshot_directory)
     source_stage = recipe.stage(parent.stage_id)
     if parent.completed != dict(zip(ROLES, source_stage.role_updates)):
         raise ValueError("fork requires a completed declared parent checkpoint")
@@ -642,7 +648,7 @@ class TensorOwnerSlot:
 
 
 def export_tensor_owner(owner, directory, *, kind, rules_profile_json, initialization_declaration=None,
-                        learned_request=None, sampler_validator, max_output_bytes, execute=False):
+                        learned_request=None, sampler_validator, max_output_bytes, execute=False, read_accounting=None):
     """Invoke the original PC and NNUEC writers from a pinned lifecycle owner.
 
     Untrained declarations remain declarations. Learned export additionally
@@ -676,7 +682,10 @@ def export_tensor_owner(owner, directory, *, kind, rules_profile_json, initializ
         if (owner.source_checkpoint_path is None or owner.source_checkpoint_sha256 is None
                 or owner.source_payload_state_sha256 != runtime[5](payload)):
             raise ValueError("export requires an unchanged saved/resumed original tensor checkpoint")
-        actual, checkpoint_bytes = _hash_file(Path(owner.source_checkpoint_path), MAX_BYTES)
+        recovered = learned_request is not None and learned_request.window_spec.get("schema") == "rz-rovent-train-window/2"
+        if recovered and read_accounting is None:
+            read_accounting = learned_request.execution_authority._read_budget
+        actual, checkpoint_bytes = _hash_file(Path(owner.source_checkpoint_path), MAX_BYTES, read_accounting=read_accounting)
         if actual != owner.source_checkpoint_sha256:
             raise ValueError("original checkpoint changed before export")
         original_training = None
@@ -721,28 +730,28 @@ def export_tensor_owner(owner, directory, *, kind, rules_profile_json, initializ
                 name = graph["file"]
                 if type(name) is not str or Path(name).name != name:
                     raise ValueError("PC exporter graph must be one owned regular filename")
-                identity, size = _hash_file(output / "pc" / name, maximum)
+                identity, size = _hash_file(output / "pc" / name, maximum, read_accounting=read_accounting)
                 if identity != graph["sha256"]:
                     raise ValueError("actual PC graph changed after exporter publication")
                 graph_pins.append({"role": graph["role"], "file": "pc/" + name, "sha256": identity, "bytes": size})
-            manifest_identity, manifest_size = _hash_file(output / "pc" / "export.json", maximum)
+            manifest_identity, manifest_size = _hash_file(output / "pc" / "export.json", maximum, read_accounting=read_accounting)
             if nnuec_reserve > maximum - written:
                 raise ValueError("insufficient remaining NNUEC JSON export credit")
             nnuec = scratch.nnuec.write_checkpoint(output / "nnuec.json", training=nnuec_training)
-            identity, size = _hash_file(output / "nnuec.json", nnuec_reserve)
+            identity, size = _hash_file(output / "nnuec.json", nnuec_reserve, read_accounting=read_accounting)
             if identity != nnuec["sha256"] or size != nnuec["bytes"]:
                 raise ValueError("actual NNUEC JSON writer byte receipt mismatch")
             charge(size)
             sha(nnuec["weights_sha256"])
             if nnuec["schema"] != payload["nnuec_metadata"]["model_schema"]:
                 raise ValueError("NNUEC writer changed its independently registered model domain")
-            receipt = {"schema": "rz-rovent-tensor-lifecycle-export/1", "eligibility": ELIGIBILITY if original_training is None
+            receipt = {"schema": "rz-rovent-tensor-lifecycle-export/2" if recovered else "rz-rovent-tensor-lifecycle-export/1", "eligibility": ELIGIBILITY if original_training is None
                     else "actual_training_pending_numeric_and_gpu_acceptance",
                 "kind": kind, "recipe_sha256": owner.recipe.sha256, "stage_id": owner.stage_id,
                 "checkpoint": {"sha256": actual, "bytes": checkpoint_bytes},
                 "membership_sha256": membership_digest(owner.membership),
                 "initialization_declaration": copy.deepcopy(initialization_declaration),
-                "original_training_admission": original_training,
+                ("historical_training_admission" if recovered else "original_training_admission"): original_training,
                 "pc": {"roles": wanted_roles, "validator_present": "validator" in wanted_roles,
                     "manifest": {"file": "pc/export.json", "sha256": manifest_identity, "bytes": manifest_size},
                     "graphs": graph_pins},

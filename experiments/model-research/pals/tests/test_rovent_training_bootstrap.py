@@ -87,6 +87,212 @@ def validate(value, *, raw=None, **changes):
     return bootstrap.validate_startup(raw, **arguments)
 
 
+def recovered_fixture():
+    """Explicit new DTO, with collection/exec/Torch pins deliberately distinct."""
+    value = fixture()
+    old = value["registration"]
+    for item in value["source_files"]:
+        if item["relative_path"] == bootstrap.MODULE_RELATIVE + "rovent_training_child.py":
+            item["relative_path"] = bootstrap.MODULE_RELATIVE + "rovent_recovered_training_child.py"
+    source_inventory = {item["relative_path"]: {key: item[key] for key in ("bytes", "sha256")} for item in value["source_files"]}
+    endpoints = [{"name": "torch.__file__", "artifact": pin("/tmp/rovent-fixture-dependencies/torch/init.py", b"Torch Python endpoint")},
+        {"name": "torch._C.__file__", "artifact": pin("/tmp/rovent-fixture-dependencies/torch/native.so", b"Torch native endpoint")}]
+    dataset = {"root": "/tmp/rovent-fixture-history", "publication": pin("/tmp/rovent-fixture-history/publication.json", b"historical dataset publication"),
+        "collection_source_commit": "d" * 40, "collection_source_sha256": hashlib.sha256(b"collection native source").hexdigest(),
+        "collection_runtime_library_sha256": hashlib.sha256(b"collection ORT library").hexdigest(),
+        "model_semantics_sha256": hashlib.sha256(b"shared architecture semantics").hexdigest(), "model_epoch": 2, "context_epoch": 3,
+        "recipe_sha256": hashlib.sha256(b"historical canonical recipe").hexdigest(), "stage_id": "common",
+        "role_bindings": {"proposer": {"model_semantics_sha256": hashlib.sha256(b"shared architecture semantics").hexdigest(),
+            "model_identity_sha256": hashlib.sha256(b"historical proposer model").hexdigest(),
+            "weights_sha256": hashlib.sha256(b"historical proposer weights").hexdigest(),
+            "encoding_sha256": hashlib.sha256(b"historical encoder").hexdigest()}}}
+    registration = {"schema": bootstrap.RECOVERED_REGISTRATION_DOMAIN, "execution_id": old["execution_id"],
+        "action": "train", "export_request": None, "recipe": old["recipe"], "membership": old["membership"], "window_spec": old["window_spec"],
+        "trainer_source_sha256": bootstrap._digest(bootstrap.RECOVERED_SOURCE_DOMAIN, source_inventory), "trainer_python_version": "3.12.3",
+        "trainer_python_executable": pin("/tmp/rovent-fixture-python", b"actual new trainer Python image"),
+        "trainer_dependency_set_sha256": bootstrap.recovered_dependency_set_digest(endpoints), "runtime_endpoints": endpoints,
+        "current_dataset": dataset, "ancestor_datasets": [], "initialization_source": {"kind": "initialize",
+            "pc_checkpoint": pin("/tmp/rovent-fixture-input/initial-pc.pt", b"initial P C tensors"),
+            "nnuec_checkpoint": pin("/tmp/rovent-fixture-input/initial-nnuec.json", b"initial NNUEC tensors")},
+        "rules_profile": old["rules_profile"], "expected_initial_completed": old["expected_initial_completed"],
+        "expected_ancestor_completed": old["expected_ancestor_completed"], "resources_policy": old["resources_policy"],
+        "require_total_quota": old["require_total_quota"], "output_root": old["output_root"], "control_root": old["control_root"],
+        "checkpoint_directory": old["checkpoint_directory"], "receipt_path": old["receipt_path"],
+        "max_rpc_messages": old["max_rpc_messages"], "max_rpc_bytes": old["max_rpc_bytes"],
+        "max_read_bytes": old["max_read_bytes"], "max_child_read_bytes": old["max_read_bytes"] // 2,
+        "max_output_bytes": old["max_output_bytes"], "max_artifact_files": 4096}
+    value.update(schema=bootstrap.RECOVERED_STARTUP_DOMAIN, registration=registration,
+        runtime_module_pins=[copy.deepcopy(endpoint["artifact"]) for endpoint in endpoints],
+        python_runtime={"version": registration["trainer_python_version"], "executable": registration["trainer_python_executable"]},
+        collection_admission={"schema": "rz-rovent-recovered-dataset-set/1", "current_publication_sha256": dataset["publication"]["sha256"],
+            "ancestor_publication_sha256": [], "past_native_authority_reissued": False,
+            "past_physical_completion_reissued": False, "historical_evidence_only": True, "execution_authorized": False},
+        checkpoint_admission=None, child_read_credit={"reserved_bytes": registration["max_child_read_bytes"],
+            "scope": "charged_in_parent_shared_budget_no_refund"},
+        artifact_watch_profile={"schema": "rz-rovent-training-artifact-watch/1",
+            "maximum_total_bytes": registration["max_output_bytes"] - min(registration["max_output_bytes"] // 8, 64 << 20),
+            "maximum_file_bytes": 2 << 30, "maximum_files": registration["max_artifact_files"],
+            "scope": "new_trainer_owned_output_tree_only"})
+    return value
+
+
+def recovered_resume(value):
+    value = copy.deepcopy(value)
+    publication = pin("/tmp/rovent-fixture-prior-checkpoint/publication.json", b"historical tensor publication")
+    value["registration"]["initialization_source"] = {"kind": "resume", "checkpoint": {
+        "root": "/tmp/rovent-fixture-prior-checkpoint", "publication": publication,
+        "reclamation": pin("/tmp/rovent-fixture-prior-checkpoint/closure.json", b"historical closure bytes")}}
+    value["checkpoint_admission"] = {"schema": "rz-rovent-historical-checkpoint-metadata-admission/1",
+        "publication_sha256": publication["sha256"], "tensor_sha256": hashlib.sha256(b"prior tensor").hexdigest(),
+        "update_chain_sha256": hashlib.sha256(b"prior original update receipts").hexdigest(),
+        "snapshot_completed_updates": dict.fromkeys(("proposer", "critic", "validator"), 0),
+        "post_snapshot_optimizer_updates": dict.fromkeys(("proposer", "critic", "validator"), 0),
+        "recorded_tail_cost": {"status": "unknown", "reason": "fixture historical scope only", "evidence": None},
+        "recorded_closure_classification": "unresolved", "historical_window_schema": "rz-rovent-train-window/2",
+        "historical_window_identity_scope": "explicit_v2_recorded_pins",
+        "historical_metadata_integrity_only": True, "tensor_state_validated": False,
+        "past_native_authority_reissued": False, "past_physical_completion_reissued": False, "execution_authorized": False}
+    return value
+
+
+def validate_recovered(value, **changes):
+    raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+    arguments = {"expected_sha256": hashlib.sha256(raw).hexdigest(), "expected_bytes": len(raw),
+        "execution_until_ns": 10000, "whole_until_ns": 11000, "now_ns": 200}
+    arguments.update(changes)
+    return bootstrap.validate_recovered_startup(raw, **arguments)
+
+
+class RoventRecoveredBootstrapProjectionTests(unittest.TestCase):
+    def setUp(self):
+        self.guard = NeuralImportsForbidden()
+        sys.meta_path.insert(0, self.guard)
+
+    def tearDown(self):
+        sys.meta_path.remove(self.guard)
+
+    def test_new_projection_has_distinct_data_python_dependency_and_source_namespaces(self):
+        value = recovered_fixture()
+        with mock.patch.object(os, "open", side_effect=AssertionError("projection performs no file IO")):
+            checked = validate_recovered(value)
+        self.assertEqual(checked, value)
+        registration = checked["registration"]
+        self.assertEqual(len({registration["current_dataset"]["collection_source_sha256"],
+            registration["current_dataset"]["collection_runtime_library_sha256"], registration["trainer_source_sha256"],
+            registration["trainer_python_executable"]["sha256"], registration["trainer_dependency_set_sha256"]}), 5)
+        self.assertFalse(checked["collection_admission"]["execution_authorized"])
+        self.assertFalse(checked["collection_admission"]["past_native_authority_reissued"])
+        self.assertFalse(checked["collection_admission"]["past_physical_completion_reissued"])
+
+    def test_new_and_original_codecs_reject_each_other_instead_of_converting(self):
+        with self.assertRaises(ValueError):
+            validate(recovered_fixture())
+        with self.assertRaises(ValueError):
+            validate_recovered(fixture())
+        value = recovered_fixture()
+        value["registration"]["python_runtime_sha256"] = value["registration"]["trainer_python_executable"]["sha256"]
+        with self.assertRaisesRegex(ValueError, "fields mismatch"):
+            validate_recovered(value)
+
+    def test_endpoint_digest_sorts_semantic_names_but_startup_preserves_original_artifact_order(self):
+        value = recovered_fixture()
+        endpoints = value["registration"]["runtime_endpoints"]
+        self.assertEqual(bootstrap.recovered_dependency_set_digest(endpoints),
+            bootstrap.recovered_dependency_set_digest(list(reversed(endpoints))))
+        value["runtime_module_pins"].reverse()
+        with self.assertRaisesRegex(ValueError, "endpoint order"):
+            validate_recovered(value)
+
+    def test_python_image_cannot_be_relabelled_as_collection_ort_or_another_dependency(self):
+        value = recovered_fixture()
+        # Replace only the startup projection, keeping the registration's
+        # independent exact Python executable pin unchanged.
+        value["python_runtime"]["executable"] = {**value["python_runtime"]["executable"],
+            "sha256": value["registration"]["current_dataset"]["collection_runtime_library_sha256"]}
+        with self.assertRaisesRegex(ValueError, "trainer Python image"):
+            validate_recovered(value)
+
+    def test_source_inventory_requires_the_new_domain_without_retagging_old_source_hashes(self):
+        value = recovered_fixture()
+        inventory = {item["relative_path"]: {key: item[key] for key in ("bytes", "sha256")} for item in value["source_files"]}
+        value["registration"]["trainer_source_sha256"] = bootstrap._digest(bootstrap.SOURCE_DOMAIN, inventory)
+        with self.assertRaisesRegex(ValueError, "separately registered digest domain"):
+            validate_recovered(value)
+
+    def test_tagged_initialization_rejects_old_mode_aliases_and_borrowed_checkpoint_admissions(self):
+        for changes in ({"kind": "initialize", "checkpoint_mode": "initialize"}, {"kind": "unknown"}):
+            value = recovered_fixture()
+            value["registration"]["initialization_source"].update(changes)
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                validate_recovered(value)
+        value = recovered_fixture()
+        value["registration"]["expected_initial_completed"]["proposer"] = 1
+        with self.assertRaisesRegex(ValueError, "existing stage updates"):
+            validate_recovered(value)
+        value = recovered_resume(recovered_fixture())
+        self.assertEqual(validate_recovered(value), value)
+        value["checkpoint_admission"]["tensor_state_validated"] = True
+        with self.assertRaisesRegex(ValueError, "cannot reissue"):
+            validate_recovered(value)
+
+    def test_historical_admissions_cannot_promote_past_native_or_physical_permission(self):
+        for name in ("past_native_authority_reissued", "past_physical_completion_reissued", "execution_authorized"):
+            value = recovered_resume(recovered_fixture())
+            value["checkpoint_admission"][name] = True
+            with self.subTest(checkpoint=name), self.assertRaisesRegex(ValueError, "cannot reissue"):
+                validate_recovered(value)
+            value = recovered_fixture()
+            value["collection_admission"][name] = True
+            with self.subTest(collection=name), self.assertRaisesRegex(ValueError, "cannot reissue"):
+                validate_recovered(value)
+
+    def test_child_read_credit_is_an_exact_nonrefundable_slice_of_the_parent_budget(self):
+        for change in ({"reserved_bytes": 1}, {"scope": "metadata_claims_free_reading"}):
+            value = recovered_fixture()
+            value["child_read_credit"].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                validate_recovered(value)
+        value = recovered_fixture()
+        value["registration"]["max_child_read_bytes"] = value["registration"]["max_read_bytes"] + 1
+        with self.assertRaises(ValueError):
+            validate_recovered(value)
+
+    def test_owned_output_file_profile_matches_the_new_registered_parent_watch(self):
+        for count in (0, True, 32769):
+            value = recovered_fixture()
+            value["registration"]["max_artifact_files"] = count
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                validate_recovered(value)
+        for key, bad in (("maximum_total_bytes", 1), ("maximum_files", True),
+                         ("maximum_file_bytes", 2**31 - 1), ("scope", "unbounded_global_output")):
+            value = recovered_fixture()
+            value["artifact_watch_profile"][key] = bad
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_recovered(value)
+
+    def test_new_window_join_uses_only_v2_fields_and_stays_a_non_authoritative_projection(self):
+        value = recovered_fixture()
+        registration = value["registration"]
+        dataset = registration["current_dataset"]
+        window = {"schema": bootstrap.RECOVERED_WINDOW_DOMAIN, "window_id": value["window_id"],
+            "trainer_source_sha256": registration["trainer_source_sha256"],
+            "trainer_python_executable_sha256": registration["trainer_python_executable"]["sha256"],
+            "trainer_dependency_set_sha256": registration["trainer_dependency_set_sha256"],
+            "trainer_dependency_scope": bootstrap.DEPENDENCY_SCOPE,
+            "collection_source_sha256": dataset["collection_source_sha256"],
+            "collection_runtime_library_sha256": dataset["collection_runtime_library_sha256"],
+            "collection_model_semantics_sha256": dataset["model_semantics_sha256"],
+            "collection_model_epoch": dataset["model_epoch"], "collection_context_epoch": dataset["context_epoch"],
+            "recipe_sha256": dataset["recipe_sha256"], "stage_id": dataset["stage_id"], "device": "cpu",
+            "max_output_bytes": 1024, "training_model_semantics_sha256": dataset["model_semantics_sha256"]}
+        checked = bootstrap.validate_recovered_window_binding(value, window)
+        self.assertFalse(checked["execution_authorized"])
+        self.assertEqual(checked["transitive_loaded_native_mappings"], "unknown")
+        window["schema"] = "rz-rovent-train-window/1"
+        with self.assertRaisesRegex(ValueError, "only explicit train-window /2"):
+            bootstrap.validate_recovered_window_binding(value, window)
+
+
 class RoventTrainingBootstrapProjectionTests(unittest.TestCase):
     def setUp(self):
         self.guard = NeuralImportsForbidden()
@@ -183,6 +389,31 @@ class RoventTrainingBootstrapProjectionTests(unittest.TestCase):
         expired = bootstrap.PinnedReadBudget(10, until_ns=200, clock=lambda: 200)
         with self.assertRaises(TimeoutError):
             expired.account_external(1)
+
+    def test_external_block_callbacks_charge_actual_bytes_and_close_only_known_unused_probe_credit(self):
+        budget = bootstrap.PinnedReadBudget(11, until_ns=1000, clock=lambda: 200)
+        lease = budget.reserve_external(11)
+        self.assertTrue(budget.observation()["unknown"])
+        self.assertEqual(budget.charge_external(lease, 4), 4)
+        self.assertEqual(budget.charge_external(lease, 6), 10)
+        closed = budget.finish_external(lease, expected_bytes=10)
+        self.assertEqual(closed, {"charged_bytes": 10, "known_unused_reserved_bytes": 1})
+        self.assertEqual(budget.observation(), {"charged_bytes": 10, "unknown": False, "maximum_bytes": 11})
+        self.assertEqual(budget.account_external(1), 11)
+        with self.assertRaisesRegex(ValueError, "owner or lifetime"):
+            budget.charge_external(lease, 0)
+
+    def test_failed_external_callback_keeps_unknown_reserved_credit_and_returned_bytes(self):
+        now = [200]
+        budget = bootstrap.PinnedReadBudget(11, until_ns=1000, clock=lambda: now[0])
+        lease = budget.reserve_external(11)
+        now[0] = 1000
+        with self.assertRaises(TimeoutError):
+            budget.charge_external(lease, 3)
+        self.assertEqual(budget.observation(), {"charged_bytes": 3, "unknown": True, "maximum_bytes": 11})
+        budget.fail_external(lease)
+        with self.assertRaisesRegex(ValueError, "quarantined"):
+            budget.reserve_external(1)
 
 
 @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "O_NOFOLLOW"), "actual nofollow fixture uses Linux")

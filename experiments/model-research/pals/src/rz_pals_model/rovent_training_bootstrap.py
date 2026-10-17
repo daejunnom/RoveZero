@@ -29,6 +29,12 @@ STARTUP_DOMAIN = "rz-rovent-original-trainer-startup/1"
 REGISTRATION_DOMAIN = "rz-rovent-original-training-registration/1"
 RESOURCE_DOMAIN = "rz-rovent-training-resource-startup/1"
 SOURCE_DOMAIN = "rz-rovent-trainer-source-bundle/1"
+RECOVERED_STARTUP_DOMAIN = "rz-rovent-recovered-training-startup/1"
+RECOVERED_REGISTRATION_DOMAIN = "rz-rovent-recovered-training-registration/1"
+RECOVERED_SOURCE_DOMAIN = "rz-rovent-recovered-trainer-source-bundle/1"
+RECOVERED_WINDOW_DOMAIN = "rz-rovent-train-window/2"
+DEPENDENCY_DOMAIN = "rz-rovent-trainer-dependency-set/1"
+DEPENDENCY_SCOPE = "declared_pinned_endpoints_only"
 MAX_JSON_BYTES = 16 << 20
 MAX_SOURCE_BYTES = 4 << 20
 MAX_SOURCE_TOTAL_BYTES = 32 << 20
@@ -369,6 +375,345 @@ def validate_startup(raw, *, expected_sha256, expected_bytes, execution_until_ns
     return copy.deepcopy(value)
 
 
+def _historical_dataset_request(value):
+    """Strict caller request, never a reconstructed native collection owner."""
+    _fields(value, ("root", "publication", "collection_source_commit", "collection_source_sha256",
+        "collection_runtime_library_sha256", "model_semantics_sha256", "model_epoch", "context_epoch",
+        "recipe_sha256", "stage_id", "role_bindings"), "historical dataset registration")
+    root = _absolute(value["root"])
+    _pin(value["publication"])
+    if _absolute(value["publication"]["path"]) != root / "publication.json":
+        raise ValueError("historical dataset must pin the registered publication.json")
+    if type(value["collection_source_commit"]) is not str or re.fullmatch(r"[0-9a-f]{40}", value["collection_source_commit"]) is None:
+        raise ValueError("full historical collection commit required")
+    for name in ("collection_source_sha256", "collection_runtime_library_sha256", "model_semantics_sha256", "recipe_sha256"):
+        _sha(value[name])
+    _identifier(value["stage_id"])
+    _uint(value["model_epoch"])
+    _uint(value["context_epoch"])
+    roles = value["role_bindings"]
+    if type(roles) is not dict or not 1 <= len(roles) <= 3 or not set(roles) <= set(_ROLES):
+        raise ValueError("explicit bounded historical role bindings required")
+    for binding in roles.values():
+        _fields(binding, ("model_semantics_sha256", "model_identity_sha256", "weights_sha256", "encoding_sha256"), "historical role binding")
+        for identity in binding.values():
+            _sha(identity)
+    return value
+
+
+def _historical_checkpoint_request(value):
+    _fields(value, ("root", "publication", "reclamation"), "historical checkpoint registration")
+    _absolute(value["root"])
+    _pin(value["publication"])
+    _pin(value["reclamation"])
+    _child_path(value["root"], value["publication"]["path"], "historical checkpoint publication")
+    # The original closure file is an input for the new OS owner.  Neither its
+    # pin nor this projection grants numeric PID/signal/reap/GPU authority.
+    return value
+
+
+def recovered_dependency_set_digest(endpoints):
+    """Location-independent sorted endpoint digest, independent of Python/ORT."""
+    if type(endpoints) is not list or not 2 <= len(endpoints) <= 64:
+        raise ValueError("finite explicit recovered runtime endpoint inventory required")
+    names, inventory = set(), []
+    for endpoint in endpoints:
+        _fields(endpoint, ("name", "artifact"), "recovered trainer endpoint")
+        name = endpoint["name"]
+        if type(name) is not str or not 1 <= len(name.encode()) <= 256 or any(ord(char) < 32 for char in name) or name in names:
+            raise ValueError("bounded unique logical recovered endpoint name required")
+        names.add(name)
+        pin = _pin(endpoint["artifact"], MAX_RUNTIME_MODULE_BYTES)
+        inventory.append({"name": name, "sha256": pin["sha256"], "bytes": pin["bytes"]})
+    if not {"torch.__file__", "torch._C.__file__"} <= names:
+        raise ValueError("explicit Torch Python and native endpoint pins required")
+    return _digest(DEPENDENCY_DOMAIN, sorted(inventory, key=lambda item: item["name"]))
+
+
+def validate_recovered_registration(value):
+    """Validate the distinct recovered DTO without converting an original /1."""
+    _fields(value, ("schema", "execution_id", "action", "export_request", "recipe", "membership", "window_spec",
+        "trainer_source_sha256", "trainer_python_version", "trainer_python_executable", "trainer_dependency_set_sha256",
+        "runtime_endpoints", "current_dataset", "ancestor_datasets", "initialization_source", "rules_profile",
+        "expected_initial_completed", "expected_ancestor_completed", "resources_policy", "require_total_quota",
+        "output_root", "control_root", "checkpoint_directory", "receipt_path", "max_rpc_messages", "max_rpc_bytes",
+        "max_read_bytes", "max_child_read_bytes", "max_output_bytes", "max_artifact_files"), "recovered Rovent training registration")
+    if value["schema"] != RECOVERED_REGISTRATION_DOMAIN:
+        raise ValueError("separate recovered registration domain required; original conversion forbidden")
+    _identifier(value["execution_id"])
+    for name in ("recipe", "membership", "window_spec", "rules_profile"):
+        _pin(value[name])
+    _sha(value["trainer_source_sha256"])
+    _pin(value["trainer_python_executable"], MAX_RUNTIME_MODULE_BYTES)
+    if (type(value["trainer_python_version"]) is not str
+            or re.fullmatch(r"3\.[0-9]{1,2}\.[0-9]{1,3}", value["trainer_python_version"]) is None
+            or any(str(int(part)) != part for part in value["trainer_python_version"].split("."))):
+        raise ValueError("explicit recovered Python version required")
+    if _sha(value["trainer_dependency_set_sha256"]) != recovered_dependency_set_digest(value["runtime_endpoints"]):
+        raise ValueError("recovered declared dependency endpoint digest differs")
+    _historical_dataset_request(value["current_dataset"])
+    ancestors = value["ancestor_datasets"]
+    if type(ancestors) is not list or len(ancestors) > 256:
+        raise ValueError("bounded recovered historical dataset ancestry required")
+    seen = {value["current_dataset"]["publication"]["sha256"]}
+    for ancestor in ancestors:
+        _historical_dataset_request(ancestor)
+        identity = ancestor["publication"]["sha256"]
+        if identity in seen:
+            raise ValueError("duplicate/current historical dataset publication in ancestors")
+        seen.add(identity)
+    for name in ("expected_initial_completed", "expected_ancestor_completed"):
+        _fields(value[name], _ROLES, "recovered exact role counts")
+        for count in value[name].values():
+            _uint(count, 65536)
+    action = value["action"]
+    if type(action) is not str or action not in ("train", "export"):
+        raise ValueError("explicit recovered train or export action required")
+    source = value["initialization_source"]
+    if type(source) is not dict:
+        raise ValueError("tagged recovered initialization_source required")
+    kind = source.get("kind")
+    if kind == "initialize":
+        _fields(source, ("kind", "pc_checkpoint", "nnuec_checkpoint"), "recovered initialize source")
+        _pin(source["pc_checkpoint"], MAX_RUNTIME_MODULE_BYTES)
+        _pin(source["nnuec_checkpoint"], MAX_RUNTIME_MODULE_BYTES)
+        if action != "train" or any(value["expected_initial_completed"].values()):
+            raise ValueError("recovered initialize cannot export or claim existing stage updates")
+    elif kind == "resume":
+        _fields(source, ("kind", "checkpoint"), "recovered resume source")
+        _historical_checkpoint_request(source["checkpoint"])
+    elif kind == "fork":
+        _fields(source, ("kind", "checkpoint", "parent_stage_id"), "recovered fork source")
+        _historical_checkpoint_request(source["checkpoint"])
+        _identifier(source["parent_stage_id"])
+        if action != "train" or any(value["expected_initial_completed"].values()):
+            raise ValueError("recovered fork requires fresh current-stage counts and train action")
+    else:
+        raise ValueError("unregistered recovered initialization source")
+    if action == "train":
+        if value["export_request"] is not None:
+            raise ValueError("recovered train cannot carry an export request")
+    else:
+        _pin(value["export_request"])
+        if kind != "resume":
+            raise ValueError("recovered export requires an explicitly resumed checkpoint")
+    _policy(value["resources_policy"])
+    if type(value["require_total_quota"]) is not bool:
+        raise ValueError("recovered total-quota requirement must be an exact boolean")
+    output, control = _absolute(value["output_root"]), _absolute(value["control_root"])
+    if type(output) is not type(control) or output.is_relative_to(control) or control.is_relative_to(output):
+        raise ValueError("recovered output/control owners overlap")
+    _child_path(value["output_root"], value["checkpoint_directory"], "recovered checkpoint directory")
+    _child_path(value["output_root"], value["receipt_path"], "recovered terminal receipt")
+    _uint(value["max_rpc_messages"], 2000000, positive=True)
+    _uint(value["max_rpc_bytes"], 18 << 30, positive=True)
+    _uint(value["max_read_bytes"], MAX_READ_BYTES, positive=True)
+    _uint(value["max_child_read_bytes"], value["max_read_bytes"], positive=True)
+    _uint(value["max_output_bytes"], 18 << 30, positive=True)
+    _uint(value["max_artifact_files"], 32768, positive=True)
+    return copy.deepcopy(value)
+
+
+def validate_recovered_window_binding(startup, window):
+    """Join a separately validated /2 window; old field aliases are rejected.
+
+    Full recipe/control validation belongs to ``rovent_training_window_v2``.
+    This stdlib-only projection compares collection identities to historical
+    data and trainer identities to this new process's declared files.
+    """
+    registration = validate_recovered_registration(startup["registration"])
+    if type(window) is not dict or window.get("schema") != RECOVERED_WINDOW_DOMAIN:
+        raise ValueError("new recovered child admits only explicit train-window /2")
+    dataset = registration["current_dataset"]
+    expected = {"window_id": startup["window_id"], "trainer_source_sha256": registration["trainer_source_sha256"],
+        "trainer_python_executable_sha256": registration["trainer_python_executable"]["sha256"],
+        "trainer_dependency_set_sha256": registration["trainer_dependency_set_sha256"], "trainer_dependency_scope": DEPENDENCY_SCOPE,
+        "collection_source_sha256": dataset["collection_source_sha256"],
+        "collection_runtime_library_sha256": dataset["collection_runtime_library_sha256"],
+        "collection_model_semantics_sha256": dataset["model_semantics_sha256"],
+        "collection_model_epoch": dataset["model_epoch"], "collection_context_epoch": dataset["context_epoch"],
+        "recipe_sha256": dataset["recipe_sha256"], "stage_id": dataset["stage_id"],
+        "device": registration["resources_policy"]["device"]}
+    if any(name not in window or type(window[name]) is not type(expected_value) or window[name] != expected_value
+            for name, expected_value in expected.items()):
+        raise ValueError("recovered window changed collection/trainer/resource identity namespace")
+    if (type(window.get("max_output_bytes")) is not int or not 0 < window["max_output_bytes"] <= registration["max_output_bytes"]):
+        raise ValueError("recovered window exceeds its original output credit")
+    if window.get("training_model_semantics_sha256") != dataset["model_semantics_sha256"]:
+        raise ValueError("recovered architecture compatibility needs a separately registered policy")
+    return {"schema": "rz-rovent-recovered-window-binding/1", "window_schema": RECOVERED_WINDOW_DOMAIN,
+        "trainer_dependency_scope": DEPENDENCY_SCOPE, "transitive_loaded_native_mappings": "unknown",
+        "past_native_authority_reissued": False, "past_physical_completion_reissued": False, "execution_authorized": False}
+
+
+def _publication_metadata_file(value):
+    _fields(value, ("path", "sha256", "bytes"), "historical relative publication file")
+    path = value["path"]
+    if (type(path) is not str or not 1 <= len(path.encode()) <= 4096 or "\\" in path
+            or PurePosixPath(path).is_absolute() or any(part in ("", ".", "..") for part in path.split("/"))):
+        raise ValueError("plain bounded historical publication-relative path required")
+    _absolute("/" + path)
+    _sha(value["sha256"])
+    _uint(value["bytes"], MAX_JSON_BYTES, positive=True)
+
+
+def _checkpoint_metadata_admission(value, initialization):
+    if initialization["kind"] == "initialize":
+        if value is not None:
+            raise ValueError("new initialization cannot borrow a historical checkpoint admission")
+        return
+    _fields(value, ("schema", "publication_sha256", "tensor_sha256", "update_chain_sha256", "snapshot_completed_updates",
+        "post_snapshot_optimizer_updates", "recorded_tail_cost", "recorded_closure_classification",
+        "historical_window_schema", "historical_window_identity_scope", "historical_metadata_integrity_only", "tensor_state_validated",
+        "past_native_authority_reissued", "past_physical_completion_reissued", "execution_authorized"), "historical checkpoint metadata admission")
+    if (value["schema"] != "rz-rovent-historical-checkpoint-metadata-admission/1"
+            or value["historical_metadata_integrity_only"] is not True or value["tensor_state_validated"] is not False
+            or any(value[name] is not False for name in ("past_native_authority_reissued", "past_physical_completion_reissued", "execution_authorized"))):
+        raise ValueError("historical checkpoint metadata cannot reissue tensor/native/physical/execution authority")
+    for name in ("publication_sha256", "tensor_sha256", "update_chain_sha256"):
+        _sha(value[name])
+    if value["publication_sha256"] != initialization["checkpoint"]["publication"]["sha256"]:
+        raise ValueError("historical checkpoint admission changed its registered publication")
+    for name in ("snapshot_completed_updates", "post_snapshot_optimizer_updates"):
+        _fields(value[name], _ROLES, "historical checkpoint role counts")
+        for count in value[name].values():
+            _uint(count, 65536)
+    schema_scopes = {"rz-rovent-train-window/1": "original_v1_unseparated",
+        "rz-rovent-train-window/2": "explicit_v2_recorded_pins"}
+    if (value["recorded_closure_classification"] not in ("recorded_closed", "unresolved")
+            or type(value["historical_window_schema"]) is not str or value["historical_window_schema"] not in schema_scopes
+            or value["historical_window_identity_scope"] != schema_scopes[value["historical_window_schema"]]):
+        raise ValueError("explicit historical closure classification and identity scope required")
+    tail = value["recorded_tail_cost"]
+    if type(tail) is not dict:
+        raise ValueError("explicit historical known/unknown tail-cost record required")
+    if tail.get("status") == "known":
+        _fields(tail, ("status", "delta", "evidence"), "known historical tail cost")
+        if type(tail["delta"]) is not dict or not 1 <= len(tail["delta"]) <= 64:
+            raise ValueError("finite historical tail-cost counters required")
+        for name, amount in tail["delta"].items():
+            _identifier(name)
+            _uint(amount)
+        _publication_metadata_file(tail["evidence"])
+    elif tail.get("status") == "unknown":
+        _fields(tail, ("status", "reason", "evidence"), "unknown historical tail cost")
+        if type(tail["reason"]) is not str or not 1 <= len(tail["reason"].encode()) <= 4096 or any(ord(char) < 32 for char in tail["reason"]):
+            raise ValueError("bounded explicit historical unknown-cost reason required")
+        if tail["evidence"] is not None:
+            _publication_metadata_file(tail["evidence"])
+    else:
+        raise ValueError("unregistered historical tail-cost status")
+
+
+def validate_recovered_startup(raw, *, expected_sha256, expected_bytes, execution_until_ns, whole_until_ns, now_ns):
+    """Strict recovered startup; it never converts an original /1 envelope."""
+    _sha(expected_sha256)
+    _uint(expected_bytes, MAX_JSON_BYTES, positive=True)
+    if type(raw) is not bytes or len(raw) != expected_bytes or hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("recovered startup exact bytes or SHA-256 differ")
+    value = _strict_json(raw)
+    _fields(value, ("schema", "execution_id", "window_id", "registration_sha256", "registration", "control",
+        "original_started_ns", "execution_until_ns", "whole_until_ns", "source_root", "package_root", "source_files",
+        "dependency_directories", "runtime_module_pins", "python_runtime", "resources", "collection_admission",
+        "checkpoint_admission", "child_read_credit", "artifact_watch_profile"), "recovered Rovent startup")
+    if value["schema"] != RECOVERED_STARTUP_DOMAIN:
+        raise ValueError("separate recovered startup domain required; original conversion forbidden")
+    _identifier(value["execution_id"])
+    _identifier(value["window_id"])
+    _sha(value["registration_sha256"])
+    registration = validate_recovered_registration(value["registration"])
+    if value["execution_id"] != registration["execution_id"]:
+        raise ValueError("recovered execution differs from original registered request")
+    for number in (value["original_started_ns"], value["execution_until_ns"], value["whole_until_ns"], execution_until_ns, whole_until_ns, now_ns):
+        _uint(number)
+    if (value["execution_until_ns"] != execution_until_ns or value["whole_until_ns"] != whole_until_ns
+            or not value["original_started_ns"] <= now_ns < execution_until_ns < whole_until_ns
+            or execution_until_ns - value["original_started_ns"] > MAX_WALL_NS
+            or whole_until_ns - execution_until_ns > MAX_CLEANUP_NS):
+        raise ValueError("recovered startup deadline mismatch, renewal or expiration")
+    control = _fields(value["control"], ("socket_path", "parent_pid", "parent_start_ticks", "control_device", "control_inode"), "recovered current control startup")
+    endpoint = _child_path(registration["control_root"], control["socket_path"], "recovered current control socket")
+    if endpoint.parent != _absolute(registration["control_root"]) or len(control["socket_path"].encode()) >= 104:
+        raise ValueError("bounded direct recovered control socket required")
+    _uint(control["parent_pid"], 2**31 - 1, positive=True)
+    _uint(control["parent_start_ticks"], positive=True)
+    _uint(control["control_device"])
+    _uint(control["control_inode"], positive=True)
+    source_root = _child_path(registration["output_root"], value["source_root"], "recovered private source root")
+    if source_root != _absolute(registration["output_root"]) / "source" or _absolute(value["package_root"]) != source_root / PACKAGE_RELATIVE:
+        raise ValueError("recovered source/package layout differs from its original installer")
+    sources = value["source_files"]
+    if type(sources) is not list or not 1 <= len(sources) <= 128:
+        raise ValueError("bounded recovered source inventory required")
+    inventory, source_bytes = {}, 0
+    for item in sources:
+        _fields(item, ("relative_path", "sha256", "bytes"), "recovered source inventory entry")
+        relative = item["relative_path"]
+        if (type(relative) is not str or not relative.startswith(MODULE_RELATIVE) or not relative.endswith(".py")
+                or "\\" in relative or any(part in ("", ".", "..") for part in relative.split("/")) or relative in inventory):
+            raise ValueError("recovered source escaped its private Python package")
+        _absolute(str(source_root / relative))
+        _sha(item["sha256"])
+        source_bytes += _uint(item["bytes"], MAX_SOURCE_BYTES, positive=True)
+        inventory[relative] = {"bytes": item["bytes"], "sha256": item["sha256"]}
+    if source_bytes > MAX_SOURCE_TOTAL_BYTES or _digest(RECOVERED_SOURCE_DOMAIN, inventory) != registration["trainer_source_sha256"]:
+        raise ValueError("recovered source inventory must use its separately registered digest domain")
+    required = {MODULE_RELATIVE + name for name in ("__init__.py", "rovent_recovered_training_child.py", "rovent_training_bootstrap.py")}
+    if not required <= inventory.keys():
+        raise ValueError("recovered entry/bootstrap/package pins are absent")
+    dependencies = value["dependency_directories"]
+    if type(dependencies) is not list or not 1 <= len(dependencies) <= 8:
+        raise ValueError("finite registered recovered dependency directories required")
+    paths, identities = set(), set()
+    for dependency in dependencies:
+        _fields(dependency, ("path", "device", "inode"), "recovered dependency directory")
+        path = _absolute(dependency["path"])
+        identity = (_uint(dependency["device"]), _uint(dependency["inode"], positive=True))
+        if str(path) in paths or identity in identities or path.is_relative_to(source_root) or source_root.is_relative_to(path):
+            raise ValueError("duplicate/aliased recovered dependency directory")
+        paths.add(str(path))
+        identities.add(identity)
+    runtime = _fields(value["python_runtime"], ("version", "executable"), "recovered actual Python runtime")
+    if runtime["version"] != registration["trainer_python_version"] or runtime["executable"] != registration["trainer_python_executable"]:
+        raise ValueError("recovered runtime must use the registered trainer Python image, not collection ORT")
+    _pin(runtime["executable"], MAX_RUNTIME_MODULE_BYTES)
+    modules = value["runtime_module_pins"]
+    expected_modules = [endpoint["artifact"] for endpoint in registration["runtime_endpoints"]]
+    if modules != expected_modules:
+        raise ValueError("recovered runtime module pins changed the registered endpoint order or bytes")
+    for module in modules:
+        _pin(module, MAX_RUNTIME_MODULE_BYTES)
+    required_read = source_bytes + runtime["executable"]["bytes"] + sum(module["bytes"] for module in modules)
+    credit = _fields(value["child_read_credit"], ("reserved_bytes", "scope"), "current child read reservation")
+    if (type(credit["reserved_bytes"]) is not int or credit["reserved_bytes"] != registration["max_child_read_bytes"]
+            or credit["scope"] != "charged_in_parent_shared_budget_no_refund"):
+        raise ValueError("child read credit differs from the original parent's whole reservation")
+    if required_read >= credit["reserved_bytes"]:
+        raise ValueError("recovered bootstrap pins exceed original aggregate read credit")
+    profile = _fields(value["artifact_watch_profile"], ("schema", "maximum_total_bytes", "maximum_file_bytes",
+        "maximum_files", "scope"), "new trainer owned-output artifact watch")
+    for name in ("maximum_total_bytes", "maximum_file_bytes", "maximum_files"):
+        _uint(profile[name], positive=True)
+    control_reserve = min(registration["max_output_bytes"] // 8, 64 << 20)
+    if profile != {"schema": "rz-rovent-training-artifact-watch/1",
+            "maximum_total_bytes": registration["max_output_bytes"] - control_reserve,
+            "maximum_file_bytes": 2 << 30, "maximum_files": registration["max_artifact_files"],
+            "scope": "new_trainer_owned_output_tree_only"}:
+        raise ValueError("registered new trainer artifact-watch profile differs")
+    _policy(value["resources"]["policy"])
+    _resources(value["resources"], registration["resources_policy"])
+    admission = _fields(value["collection_admission"], ("schema", "current_publication_sha256", "ancestor_publication_sha256",
+        "past_native_authority_reissued", "past_physical_completion_reissued", "historical_evidence_only", "execution_authorized"), "historical collection-set admission")
+    expected_ancestors = sorted(dataset["publication"]["sha256"] for dataset in registration["ancestor_datasets"])
+    if (admission["schema"] != "rz-rovent-recovered-dataset-set/1"
+            or admission["current_publication_sha256"] != registration["current_dataset"]["publication"]["sha256"]
+            or admission["ancestor_publication_sha256"] != expected_ancestors or admission["historical_evidence_only"] is not True
+            or any(admission[name] is not False for name in ("past_native_authority_reissued", "past_physical_completion_reissued", "execution_authorized"))):
+        raise ValueError("recovered collection data cannot reissue historical native/physical/execution authority")
+    _checkpoint_metadata_admission(value["checkpoint_admission"], registration["initialization_source"])
+    return copy.deepcopy(value)
+
+
 def _require_linux_nofollow():
     if (sys.platform != "linux" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
             or os.open not in os.supports_dir_fd or not hasattr(os, "sched_setaffinity")
@@ -414,18 +759,33 @@ def _open_file(path):
         os.close(directory)
 
 
+class _ExternalReadLease:
+    __slots__ = ("owner", "maximum", "charged", "remaining", "closed")
+
+    def __init__(self, owner, maximum):
+        self.owner, self.maximum = owner, maximum
+        self.charged, self.remaining, self.closed = 0, maximum, False
+
+
 class PinnedReadBudget:
     """One finite read account shared by bootstrap and subsequent metadata IO.
 
-    Failed reads remain charged.  This account is local child evidence; it does
+    Failed reads remain charged.  In the recovered codec this is the child's
+    source/runtime/dataset/tensor file-read account.  Startup stdin, stdout and
+    RPC have separate original-parent bounds and are not added to this account.
+    This account is local child evidence; it does
     not replace the independent parent descriptor/read account or its authority.
     """
-    def __init__(self, maximum, *, until_ns, clock=time.monotonic_ns):
+    def __init__(self, maximum, *, until_ns, clock=time.monotonic_ns, strict_growth_credit=False):
         self.maximum = _uint(maximum, MAX_READ_BYTES, positive=True)
         self.until_ns = _uint(until_ns, positive=True)
         if not callable(clock):
             raise ValueError("monotonic read clock required")
         self.clock, self.spent, self.failed = clock, 0, False
+        self._external_reserved = 0
+        if type(strict_growth_credit) is not bool:
+            raise ValueError("exact strict growth-probe credit flag required")
+        self.strict_growth_credit = strict_growth_credit
 
     def _check(self):
         if self.failed:
@@ -442,15 +802,78 @@ class PinnedReadBudget:
         """
         self._check()
         _uint(count, MAX_READ_BYTES)
-        if count > self.maximum - self.spent:
+        if count > self.maximum - self.spent - self._external_reserved:
             raise ValueError("external loader exceeds original aggregate read credit")
         self.spent += count
         return self.spent
 
+    def reserve_external(self, count):
+        """Reserve one exact loader ceiling; a lease is never execution authority."""
+        self._check()
+        _uint(count, MAX_READ_BYTES, positive=True)
+        if count > self.maximum - self.spent - self._external_reserved:
+            raise ValueError("external loader reservation exceeds original aggregate read credit")
+        self._external_reserved += count
+        return _ExternalReadLease(self, count)
+
+    def _external_lease(self, lease, *, closed=False):
+        if type(lease) is not _ExternalReadLease or lease.owner is not self or lease.closed and not closed:
+            raise ValueError("original read reservation owner or lifetime differs")
+        return lease
+
+    def charge_external(self, lease, count):
+        """Convert only actually returned block bytes from reservation to charge."""
+        lease = self._external_lease(lease)
+        _uint(count, MAX_READ_BYTES)
+        if count > lease.remaining:
+            self.failed = True
+            raise ValueError("external read exceeded its reserved byte ceiling")
+        lease.remaining -= count
+        lease.charged += count
+        self._external_reserved -= count
+        self.spent += count
+        if self.spent + self._external_reserved > self.maximum:
+            self.failed = True
+            raise ValueError("external read exceeded original aggregate credit")
+        if self.clock() >= self.until_ns:
+            self.failed = True
+            raise TimeoutError("original read deadline expired after the charged block")
+        if self.failed:
+            raise ValueError("failed original read account is quarantined after charging the returned block")
+        return lease.charged
+
+    def finish_external(self, lease, *, expected_bytes=None):
+        """Close a validated EOF/hash boundary and release only known unused IO.
+
+        A caller may reserve ``pin.bytes + 1`` for a growth probe.  After exact
+        identity/size/hash and EOF checks, ``expected_bytes=pin.bytes`` closes the
+        unused probe capacity; no actually read byte is refunded.
+        """
+        self._check()
+        lease = self._external_lease(lease)
+        expected = lease.maximum if expected_bytes is None else _uint(expected_bytes, lease.maximum)
+        if lease.charged != expected:
+            self.failed = True
+            raise ValueError("external exact read completion differs from the pinned byte count")
+        unused = lease.remaining
+        self._external_reserved -= unused
+        lease.remaining, lease.closed = 0, True
+        return {"charged_bytes": lease.charged, "known_unused_reserved_bytes": unused}
+
+    def fail_external(self, lease):
+        """Keep unread reservation on uncertain failure; never retry/refund it."""
+        self._external_lease(lease, closed=True)
+        self.failed = True
+
+    def observation(self):
+        """Current child accounting only; the parent keeps its whole reservation."""
+        return {"charged_bytes": self.spent, "unknown": self.failed or self._external_reserved != 0,
+            "maximum_bytes": self.maximum}
+
     def _read(self, pin, *, maximum, retain):
         self._check()
         _pin(pin, maximum)
-        if pin["bytes"] > self.maximum - self.spent:
+        if pin["bytes"] + int(self.strict_growth_credit) > self.maximum - self.spent - self._external_reserved:
             raise ValueError("original aggregate read credit exhausted")
         fd = None
         try:
@@ -813,6 +1236,24 @@ def bootstrap_original_child(startup, *, until_ns, clock=time.monotonic_ns):
     deadlines.  It returns a live shared read budget for subsequent metadata IO.
     A failed migration is never rolled back or hidden by a resource fallback.
     """
+    return _bootstrap_child_material(startup, until_ns=until_ns, clock=clock,
+        validator=validate_startup, entry_basename="rovent_training_child.py", executable_maximum=MAX_EXECUTABLE_BYTES,
+        report_domain="rz-rovent-original-trainer-bootstrap-readback/1", recovered=False)
+
+
+def bootstrap_recovered_child(startup, *, until_ns, clock=time.monotonic_ns):
+    """Bootstrap only the new recovered codec before any neural import.
+
+    This function does not load a tensor, observe an old process, or signal a
+    historical PID.  The current parent owns reclamation, the new execution
+    peer and each resulting process/physical-completion lifetime.
+    """
+    return _bootstrap_child_material(startup, until_ns=until_ns, clock=clock,
+        validator=validate_recovered_startup, entry_basename="rovent_recovered_training_child.py", executable_maximum=MAX_RUNTIME_MODULE_BYTES,
+        report_domain="rz-rovent-recovered-trainer-bootstrap-readback/1", recovered=True)
+
+
+def _bootstrap_child_material(startup, *, until_ns, clock, validator, entry_basename, executable_maximum, report_domain, recovered):
     _require_linux_nofollow()
     if not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode):
         raise OriginalBootstrapUnavailable("original learner requires explicit -I -S -B")
@@ -822,10 +1263,11 @@ def bootstrap_original_child(startup, *, until_ns, clock=time.monotonic_ns):
         allow_nan=False, separators=(",", ":")).encode("utf-8")
     # This is structural revalidation only.  The externally pinned original raw
     # SHA was already checked by the caller and must remain its socket binding.
-    validate_startup(raw_projection, expected_sha256=hashlib.sha256(raw_projection).hexdigest(),
+    validator(raw_projection, expected_sha256=hashlib.sha256(raw_projection).hexdigest(),
         expected_bytes=len(raw_projection), execution_until_ns=until_ns,
         whole_until_ns=startup["whole_until_ns"], now_ns=clock())
-    budget = PinnedReadBudget(startup["registration"]["max_read_bytes"], until_ns=until_ns, clock=clock)
+    maximum = startup["child_read_credit"]["reserved_bytes"] if recovered else startup["registration"]["max_read_bytes"]
+    budget = PinnedReadBudget(maximum, until_ns=until_ns, clock=clock, strict_growth_credit=recovered)
     source_root = Path(startup["source_root"])
     source_readbacks = []
     inventory_paths = set()
@@ -837,12 +1279,13 @@ def bootstrap_original_child(startup, *, until_ns, clock=time.monotonic_ns):
     main = sys.modules.get("__main__")
     entry = getattr(main, "__file__", None)
     if (type(entry) is not str or str(Path(entry).absolute()) not in inventory_paths
-            or Path(entry).name != "rovent_training_child.py"
+            or Path(entry).name != entry_basename
             or str(Path(__file__).absolute()) not in inventory_paths):
         raise ValueError("executing original entry/bootstrap files are absent from the pinned source inventory")
-    executable = budget.verify(startup["python_runtime"]["executable"], maximum=MAX_EXECUTABLE_BYTES)
+    executable = budget.verify(startup["python_runtime"]["executable"], maximum=executable_maximum)
     mapped = os.stat("/proc/" + str(os.getpid()) + "/exe")
-    if (sys.version.split()[0] != startup["python_runtime"]["version"]
+    actual_version = ".".join(str(part) for part in sys.version_info[:3]) if recovered else sys.version.split()[0]
+    if (actual_version != startup["python_runtime"]["version"]
             or (mapped.st_dev, mapped.st_ino) != (executable["device"], executable["inode"])):
         raise ValueError("actual mapped Python interpreter/version differs from original runtime pin")
     runtime_modules = [budget.verify(pin, maximum=MAX_RUNTIME_MODULE_BYTES) for pin in startup["runtime_module_pins"]]
@@ -857,7 +1300,7 @@ def bootstrap_original_child(startup, *, until_ns, clock=time.monotonic_ns):
         sys.path.insert(0, package)
     for dependency in dependencies:
         sys.path.append(dependency["path"])
-    return BootstrapReadback({"schema": "rz-rovent-original-trainer-bootstrap-readback/1",
+    report = {"schema": report_domain,
         "source_files": source_readbacks, "runtime_module_pins": runtime_modules,
         "python_runtime": {"version": sys.version, "executable": executable,
             "mapped_executable_identity": {"device": mapped.st_dev, "inode": mapped.st_ino}},
@@ -866,4 +1309,9 @@ def bootstrap_original_child(startup, *, until_ns, clock=time.monotonic_ns):
         "runtime_environment": environment,
         "read_bytes": budget.spent, "original_read_limit_bytes": budget.maximum,
         "registration_projection_scope": "original_parent_raw_registration_pin_not_child_byte_reconstruction",
-        "execution_authorized": False, "physical_completion": "not_started"}, budget)
+        "execution_authorized": False, "physical_completion": "not_started"}
+    if recovered:
+        # Startup carries the declared parent watch.  Its concrete ownership,
+        # admission and final observation remain with the current Rust parent.
+        report["artifact_watch_profile"] = copy.deepcopy(startup["artifact_watch_profile"])
+    return BootstrapReadback(report, budget)

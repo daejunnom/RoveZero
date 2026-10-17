@@ -17,6 +17,8 @@ ANCESTOR_DOMAIN = "rz-rovent-nnuec-tensor-training-ancestor/1"
 SOURCE_DOMAIN = "rz-rovent-nnuec-initial-source-declaration/1"
 _JOURNAL_DOMAIN = "rz-rovent-original-learner-journal/1"
 _UPDATE_DOMAIN = "rz-rovent-original-learner-update/1"
+_RECOVERED_JOURNAL_DOMAIN = "rz-rovent-recovered-learner-journal/1"
+_RECOVERED_UPDATE_DOMAIN = "rz-rovent-recovered-learner-update/1"
 _HEADS = ("policy", "wdl", "divergence", "task", "nnuec_wdl")
 _ROLES = ("proposer", "critic", "validator")
 _COSTS = ("forward_calls", "backward_calls", "samples", "wall_time_ns", "partial_accumulation_ns",
@@ -148,10 +150,15 @@ def _head_counts(value):
 
 def _journal_groups(value):
     """Validate original-shaped journal data, without verifying its authority."""
+    recovered = type(value) is dict and value.get("schema") == _RECOVERED_JOURNAL_DOMAIN
     _fields(value, ("schema", "recipe_sha256", "stage_id", "profile_sha256", "phase_inputs", "updates", "head_counts",
-                    "frozen_pc_sha256", "resume_cost_receipts"), "NNUEC original learner journal")
-    if value["schema"] != _JOURNAL_DOMAIN:
+                    "frozen_pc_sha256", "resume_cost_receipts") + (("recovery_cost_state",) if recovered else ()),
+            "NNUEC original learner journal")
+    if value["schema"] not in (_JOURNAL_DOMAIN, _RECOVERED_JOURNAL_DOMAIN):
         raise ValueError("explicit original learner journal domain required")
+    if recovered and value["recovery_cost_state"] is not None:
+        from .rovent_training_recovery import validate_recovered_cost
+        validate_recovered_cost(value["recovery_cost_state"])
     _sha(value["recipe_sha256"])
     _sha(value["profile_sha256"])
     _identifier(value["stage_id"])
@@ -159,12 +166,15 @@ def _journal_groups(value):
     if type(phases) is not dict or not phases or set(phases) - {"pc", "v"}:
         raise ValueError("bounded original learner phases required")
     for phase, source in phases.items():
-        _fields(source, ("corpus_sha256", "nnuec_model_sha256", "model_epoch", "context_epoch", "samplers"),
+        _fields(source, ("corpus_sha256", "nnuec_model_sha256", "model_epoch", "context_epoch", "samplers")
+                + (("training_model_epoch",) if recovered else ()),
                 "NNUEC original collection phase")
         _sha(source["corpus_sha256"])
         _sha(source["nnuec_model_sha256"])
         _uint(source["model_epoch"])
         _uint(source["context_epoch"])
+        if recovered:
+            _uint(source["training_model_epoch"])
         roles = {"validator"} if phase == "v" else {"proposer", "critic"}
         if type(source["samplers"]) is not dict or set(source["samplers"]) - roles:
             raise ValueError("original learner phase has a foreign role sampler")
@@ -181,7 +191,7 @@ def _journal_groups(value):
             raise ValueError("registered original learner event role required")
         counted[role] += 1
         phase = "v" if role == "validator" else "pc"
-        if (event["schema"] != _UPDATE_DOMAIN or event["stage_id"] != value["stage_id"]
+        if (event["schema"] != (_RECOVERED_UPDATE_DOMAIN if recovered else _UPDATE_DOMAIN) or event["stage_id"] != value["stage_id"]
                 or _uint(event["completed_role_updates"]) != counted[role] or event["phase"] != phase
                 or phase not in phases or event["profile_sha256"] != value["profile_sha256"]
                 or event["corpus_sha256"] != phases[phase]["corpus_sha256"]):
