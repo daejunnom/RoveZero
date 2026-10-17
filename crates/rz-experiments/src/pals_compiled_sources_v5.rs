@@ -576,6 +576,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
     (
         "manifest_v5",
         &[
+            source!("crates/rz-uci/examples/rovent_startup_metadata.rs"),
             source!("crates/rz-experiments/Cargo.toml"),
             source!("crates/rz-experiments/src/artifact.rs"),
             source!("crates/rz-experiments/src/cli/numerical_scope.rs"),
