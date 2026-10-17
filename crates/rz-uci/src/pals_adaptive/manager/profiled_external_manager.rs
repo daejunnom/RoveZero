@@ -219,6 +219,9 @@ where
             source: source.current_source().clone(),
             native_root_fence: self.native_root_fence,
             external_root_fence: source.root_fence().cloned(),
+            process_close_proof: source
+                .process_close_proof()
+                .map_err(AdaptiveManagerError::ProfiledExternal)?,
             native_process_joined: self.native_joined,
             native_physical_shutdown_confirmed: self.native_finished == Some(true),
             external_process_joined,

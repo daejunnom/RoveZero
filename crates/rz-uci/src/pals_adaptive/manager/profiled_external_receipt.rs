@@ -1,7 +1,9 @@
 //! Closure evidence for the actual profiled external source kind. There is no
 //! native CPU ledger field: absence cannot be represented as a zero charge.
 use super::*;
-use rz_search::external_cpu::{ProfiledExternalCurrentRootFence, ProfiledExternalRootSource};
+use rz_search::external_cpu::{
+    ProfiledExternalCurrentRootFence, ProfiledExternalProcessCloseProof, ProfiledExternalRootSource,
+};
 use rz_search::pals::rovent_frontier::FrontierExternalWork;
 
 #[derive(Clone, Debug)]
@@ -10,6 +12,7 @@ pub struct ProfiledExternalShutdownReceipt {
     pub(super) source: ProfiledExternalRootSource,
     pub(super) native_root_fence: Option<NativeRootFence>,
     pub(super) external_root_fence: Option<ProfiledExternalCurrentRootFence>,
+    pub(super) process_close_proof: Option<ProfiledExternalProcessCloseProof>,
     pub(super) native_process_joined: bool,
     pub(super) native_physical_shutdown_confirmed: bool,
     pub(super) external_process_joined: bool,
@@ -38,6 +41,9 @@ impl ProfiledExternalShutdownReceipt {
     }
     pub fn external_root_fence(&self) -> Option<&ProfiledExternalCurrentRootFence> {
         self.external_root_fence.as_ref()
+    }
+    pub fn process_close_proof(&self) -> Option<&ProfiledExternalProcessCloseProof> {
+        self.process_close_proof.as_ref()
     }
     pub fn counters(&self) -> AdaptiveManagerCounters {
         self.counters
@@ -77,6 +83,9 @@ impl ProfiledExternalShutdownReceipt {
     }
     pub fn permits_root_reuse(&self) -> bool {
         self.settled()
+            && !self.native_process_joined
+            && !self.external_process_joined
+            && self.process_close_proof.is_none()
             && self
                 .native_root_fence
                 .is_some_and(|fence| fence.authority() == self.authority && fence.permits_reuse())
@@ -91,6 +100,11 @@ impl ProfiledExternalShutdownReceipt {
             && self.native_process_joined
             && self.native_physical_shutdown_confirmed
             && self.external_process_joined
+            && self.process_close_proof.as_ref().is_some_and(|proof| {
+                proof.source().same_source(&self.source)
+                    && proof.authority() == self.authority
+                    && proof.permits_semantic_closure()
+            })
     }
     pub fn permits_semantic_closure(&self) -> bool {
         self.permits_root_reuse() || self.permits_archive_close()

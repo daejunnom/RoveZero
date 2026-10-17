@@ -198,3 +198,59 @@ fn pure_worker_exit_guard_closes_admission_without_physical_completion_claim() {
     assert!(shutdown.load(Ordering::Acquire));
     assert!(mailbox.occupancy().closed);
 }
+
+#[test]
+fn pure_process_close_requires_exit_both_drains_and_original_process() {
+    let (_roots, _shutdown, source) = state();
+    let mut process = CheckerShutdown {
+        process_identity: Some(source.process_identity()),
+        exit_observed: true,
+        stdout_drained: true,
+        stderr_drained: true,
+        cleanup_complete: true,
+        ..Default::default()
+    };
+    assert!(completed_process_close(process, source.process_identity()));
+    for missing in 0..4 {
+        let mut incomplete = process;
+        match missing {
+            0 => incomplete.exit_observed = false,
+            1 => incomplete.stdout_drained = false,
+            2 => incomplete.stderr_drained = false,
+            _ => incomplete.cleanup_complete = false,
+        }
+        assert!(!completed_process_close(
+            incomplete,
+            source.process_identity()
+        ));
+    }
+    process.process_identity.as_mut().unwrap().proc_start_ticks += 1;
+    assert!(!completed_process_close(process, source.process_identity()));
+}
+
+#[test]
+fn pure_closed_process_does_not_replace_terminal_reclamation_with_exit() {
+    let (_roots, _shutdown, source) = state();
+    let mut proof = ProfiledExternalProcessCloseProof {
+        process: CheckerShutdown {
+            process_identity: Some(source.process_identity()),
+            exit_observed: true,
+            stdout_drained: true,
+            stderr_drained: true,
+            cleanup_complete: true,
+            ..Default::default()
+        },
+        source,
+        accepted_jobs: 2,
+        terminal_controls: 2,
+        drained_terminals: 1,
+    };
+    assert!(!proof.permits_semantic_closure());
+    proof.drained_terminals = 2;
+    assert!(proof.permits_semantic_closure());
+    proof.process.ownership_lost = true;
+    assert!(!proof.permits_semantic_closure());
+    proof.process.ownership_lost = false;
+    proof.process.quarantined = true;
+    assert!(!proof.permits_semantic_closure());
+}

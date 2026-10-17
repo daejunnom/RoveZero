@@ -704,6 +704,19 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         self.profile_observe(work, source, reservation, packet)
     }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn consume_profiled_reciprocal_cpu(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        source: &rz_search::external_cpu::ProfiledExternalRootSource,
+        reservation: rz_search::pals::rovent_frontier::FrontierExternalReservation,
+        packet: &Arc<rz_search::external_cpu::ProfiledExternalCompletion>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::CheckedProfiledExternalResponse,
+        AdaptiveManagerError,
+    > {
+        self.profile_consume_reciprocal(work, source, reservation, packet)
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn reject_profiled_external(
         &mut self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,

@@ -399,6 +399,20 @@ where
         &self,
         mode: ExecutionMode,
     ) -> Result<Option<PeerFollowupDisposition>, AdaptiveManagerError> {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let ResearcherResources::ProfiledExternal(source) = &self.researcher {
+            if !mode.has_native_r() {
+                return Ok(Some(PeerFollowupDisposition::ModeUnsupported));
+            }
+            source
+                .current_source()
+                .validate_current()
+                .map_err(AdaptiveManagerError::ProfiledExternal)?;
+            // A busy external owner cannot block its ancestor CPU stack: this
+            // source has no paused native stack. Admit the sealed dependency;
+            // the normal ready queue waits for that same owner's actual seat.
+            return Ok(None);
+        }
         if self.researcher_source_kind() != AdaptiveResearcherSourceKind::Native {
             return Ok(Some(PeerFollowupDisposition::ModeUnsupported));
         }

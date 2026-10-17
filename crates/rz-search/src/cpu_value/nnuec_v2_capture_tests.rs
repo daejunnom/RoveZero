@@ -7,7 +7,7 @@ use crate::cpu::{CpuConfig, CpuOrderingPolicy, CpuProfile, CpuResumePolicy};
 use crate::cpu_value::nnuec::v2::cpu::V2CpuValue;
 use crate::cpu_value::nnuec::v2::review::{PreparationActor, Request};
 use crate::cpu_worker::{
-    CpuJob, CpuSliceReport, CpuWorker, CpuWorkerEvent, cpu_root_restriction_digest,
+    CpuJob, CpuSliceReport, CpuWorker, CpuWorkerError, CpuWorkerEvent, cpu_root_restriction_digest,
 };
 use crate::pals::engine::RoleQueryPurpose;
 use crate::pals::review_context::{
@@ -634,4 +634,108 @@ fn definite_unqueued_rejection_retires_original_without_claiming_cpu_execution()
     assert!(retirement.readouts().is_empty());
     let stopped = worker.shutdown().unwrap();
     assert!(stopped.events.is_empty());
+}
+
+#[test]
+fn prepared_rejection_retains_the_same_job_until_actual_fence_attests_not_started() {
+    let fixture = fixture();
+    let worker = worker(&fixture);
+    let mut original = job(&fixture, &worker, 1, 1);
+    let capture = reservation(
+        &fixture,
+        &original,
+        NnuecCaptureLimits::new(2, 1, 1 << 20).unwrap(),
+    );
+    let lineage = capture.lineage();
+    original
+        .enable_nnuec_capture(capture.clone())
+        .unwrap_or_else(|_| panic!("capture attach"));
+    let mailbox = Arc::clone(&original.mailbox);
+    let valid = grant(&original, 1, 1);
+    let mut foreign = valid;
+    foreign.owner = CpuWorkerId(1);
+    let (error, original) = worker
+        .reject_prepared_retaining(original, foreign)
+        .err()
+        .expect("foreign scope rejection");
+    assert_eq!(
+        error,
+        CpuWorkerError::Invalid("CPU prepared rejection scope mismatch")
+    );
+    assert!(Arc::ptr_eq(&mailbox, &original.mailbox));
+    assert!(capture.retirement().is_none());
+    let mut invalid = valid;
+    invalid.node_credit = 0;
+    let (error, original) = worker
+        .reject_prepared_retaining(original, invalid)
+        .err()
+        .expect("invalid grant rejection");
+    assert_eq!(
+        error,
+        CpuWorkerError::Invalid("CPU submission owner or grant mismatch")
+    );
+    assert!(Arc::ptr_eq(&mailbox, &original.mailbox));
+    assert!(capture.retirement().is_none());
+    let rejected = worker
+        .reject_prepared_retaining(original, valid)
+        .unwrap_or_else(|_| panic!("actual unqueued fence"));
+    assert!(rejected.proof().is_verified_unqueued());
+    let retirement = capture.retirement().expect("original capture retired");
+    assert_eq!(retirement.ending(), NnuecCaptureEnding::NotStarted);
+    assert_eq!(retirement.attempted(), 0);
+    assert!(retirement.readouts().is_empty());
+    assert!(!retirement.matches_lineage(&lineage));
+    let (_, _, original) = rejected.into_parts();
+    let original = original.expect("same rejected Job");
+    assert!(Arc::ptr_eq(&mailbox, &original.mailbox));
+    let (error, original) = worker
+        .reject_prepared_retaining(original, valid)
+        .err()
+        .expect("same execution cannot issue another proof");
+    assert_eq!(error, CpuWorkerError::Duplicate);
+    assert!(Arc::ptr_eq(&mailbox, &original.mailbox));
+    assert!(capture.error().unwrap().is_none());
+    assert!(worker.shutdown().unwrap().thread_joined);
+}
+
+#[test]
+fn an_enqueued_execution_cannot_attest_not_started_for_another_prepared_capture() {
+    let fixture = fixture();
+    let worker = worker(&fixture);
+    let first = job(&fixture, &worker, 1, 1);
+    let first_grant = grant(&first, 1, 4096);
+    worker.begin(first, first_grant).unwrap();
+    let completed = report(&worker);
+    assert!(!completed.admission_rejected);
+    let mut original = job(&fixture, &worker, 2, 1);
+    let capture = reservation(
+        &fixture,
+        &original,
+        NnuecCaptureLimits::new(2, 1, 1 << 20).unwrap(),
+    );
+    original
+        .enable_nnuec_capture(capture.clone())
+        .unwrap_or_else(|_| panic!("capture attach"));
+    let mailbox = Arc::clone(&original.mailbox);
+    let repeated_execution = grant(&original, first_grant.execution.sequence, 1);
+    let (error, original) = worker
+        .reject_prepared_retaining(original, repeated_execution)
+        .err()
+        .expect("actual queue already owns execution");
+    assert_eq!(error, CpuWorkerError::Duplicate);
+    assert!(Arc::ptr_eq(&mailbox, &original.mailbox));
+    assert!(capture.retirement().is_none());
+    let next = grant(&original, first_grant.execution.sequence + 1, 1);
+    assert!(
+        worker
+            .reject_prepared_retaining(original, next)
+            .unwrap_or_else(|_| panic!("fresh actual unqueued rejection"))
+            .proof()
+            .is_verified_unqueued()
+    );
+    assert_eq!(
+        capture.retirement().unwrap().ending(),
+        NnuecCaptureEnding::NotStarted
+    );
+    assert!(worker.shutdown().unwrap().thread_joined);
 }

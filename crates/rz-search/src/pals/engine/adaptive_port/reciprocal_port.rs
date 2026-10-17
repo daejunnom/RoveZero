@@ -573,6 +573,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             return Ok(None);
         };
         if pending.request.is_some()
+            || pending.origin.is_none()
             || pending.envelope.recipient != SearchRecipient::Researcher
             || pending.envelope.original_first_move != Some(work.original_first_move)
             || pending.envelope.original_deadline != work.original_deadline
@@ -581,6 +582,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             || !Arc::ptr_eq(&pending.input.view, &work.input.view)
             || !pending
                 .anchor
+                .rules()
                 .snapshot()
                 .same_state(&work.input.question.position.snapshot())
         {

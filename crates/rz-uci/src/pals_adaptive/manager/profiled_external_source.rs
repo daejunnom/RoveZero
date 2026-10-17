@@ -20,8 +20,8 @@ use rz_search::external_cpu::worker::ExternalWorkerStartup;
 use rz_search::external_cpu::{
     ExternalCpuConfig, ExternalEnginePurpose, ExternalGoConstraint, ProfiledExternalCompletion,
     ProfiledExternalCurrentRootFence, ProfiledExternalDiagnostics, ProfiledExternalDispatch,
-    ProfiledExternalJob, ProfiledExternalProgress, ProfiledExternalRootSource,
-    ProfiledExternalScope,
+    ProfiledExternalJob, ProfiledExternalProcessCloseProof, ProfiledExternalProgress,
+    ProfiledExternalRootSource, ProfiledExternalScope,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -386,8 +386,11 @@ impl ProfiledExternalManagerSource {
         Some(checked)
     }
 
+    /// Preserve an already issued root fence as historical evidence after a
+    /// confirmed process close. Its presence does not permit a closed worker
+    /// to serve another root; live reuse is separately gated by root_drained.
     pub fn root_fence(&self) -> Option<&ProfiledExternalCurrentRootFence> {
-        (self.phase == Phase::RootDrained)
+        matches!(self.phase, Phase::RootDrained | Phase::ProcessClosed)
             .then_some(self.root_fence.as_ref())
             .flatten()
     }
@@ -553,6 +556,21 @@ impl ProfiledExternalManagerSource {
 
     pub fn shutdown_snapshot(&self) -> Option<&Result<CheckerShutdown, CheckerError>> {
         self.joined.as_ref()
+    }
+
+    /// The original worker may certify semantic closure after actual join and
+    /// terminal drain. This proof grants neither readiness nor root reuse and
+    /// is distinct from a historical current-root fence. Preserve low-level
+    /// join/cleanup errors even when this wrapper remains quarantined.
+    pub fn process_close_proof(
+        &self,
+    ) -> Result<Option<ProfiledExternalProcessCloseProof>, CheckerError> {
+        let proof = self.owner.worker().process_close_proof()?;
+        Ok(if self.phase == Phase::ProcessClosed {
+            proof
+        } else {
+            None
+        })
     }
 
     pub fn take_diagnostics_after_join(&mut self) -> Option<ProfiledExternalDiagnostics> {

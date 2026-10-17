@@ -365,6 +365,23 @@ pub trait AdaptiveSearchDriver<Q> {
         ))
     }
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn consume_profiled_reciprocal_cpu(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: rz_search::pals::rovent_frontier::FrontierExternalReservation,
+        _: &Arc<rz_search::external_cpu::ProfiledExternalCompletion>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::CheckedProfiledExternalResponse,
+        AdaptiveManagerError,
+    > {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no actual profiled reciprocal consumer",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     fn reject_profiled_external(
         &mut self,
         _: &CoordinatorWork<ReviewView, Q>,

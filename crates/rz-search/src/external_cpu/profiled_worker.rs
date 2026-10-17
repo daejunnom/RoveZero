@@ -25,8 +25,8 @@ use std::thread::JoinHandle;
 
 mod current_root;
 pub use current_root::{
-    ExternalRootSource, ProfiledExternalCurrentRootFence, ProfiledExternalResetProof,
-    ProfiledExternalRootSource,
+    ExternalRootSource, ProfiledExternalCurrentRootFence, ProfiledExternalProcessCloseProof,
+    ProfiledExternalResetProof, ProfiledExternalRootSource,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

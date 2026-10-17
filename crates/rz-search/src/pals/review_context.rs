@@ -200,6 +200,11 @@ impl ReviewView {
     pub(crate) fn selected_bundle_ids(&self) -> &[u64] {
         &self.bundles
     }
+    /// Historical observation only; it does not replace the actual index's
+    /// original view/Store checks or authorize another consumption.
+    pub(crate) fn consumption_observed(&self) -> bool {
+        self.consumed.load(Ordering::Acquire)
+    }
     pub fn token_count(&self) -> u16 {
         self.tokens
     }

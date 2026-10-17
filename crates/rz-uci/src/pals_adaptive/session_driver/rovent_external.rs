@@ -7,7 +7,9 @@
 use super::*;
 use crate::pals_adaptive::ProfiledExternalManagerSource;
 use crate::rovent_bootstrap::{RoventExternalRSourceCustody, RoventPinnedExternalRSource};
-use crate::rovent_external_launch::{PreparedRoventExternalLaunch, RoventExternalOwner};
+use crate::rovent_external_launch::{
+    PreparedRoventExternalLaunch, RoventExternalOwner, RoventExternalSpawnRejection,
+};
 use crate::rovent_root_admission::RoventRootAdmission;
 use rz_contracts::pals_adaptive::CpuWorkerId;
 use rz_experiments::RoventExternalPurpose;
@@ -65,8 +67,12 @@ enum RejectedExternalSource {
 enum ExternalProcessState {
     Dormant(DormantExternalSource),
     Running(RoventExternalOwner),
-    /// A consuming startup failed. Its old descriptors and worker are never
-    /// replaced by reopening a path or creating a second process implicitly.
+    /// The retaining startup entry guarantees that no physical worker was
+    /// created on this path. Preserve its actual error and original FDs rather
+    /// than retrying by reopening paths or calling this an unknown live worker.
+    SpawnRejected(RoventExternalSpawnRejection),
+    /// Exclusive ownership is being transferred. A panic cannot turn this
+    /// unknown boundary into permission to reopen paths or start a new worker.
     Failed,
     /// Returned by the common manager. The helper still owns its original
     /// process/custody until its actual fence permits extracting them.
@@ -212,19 +218,31 @@ impl RoventExternalSessionSource {
                 domain: clock.domain(),
                 origin: clock.runtime_clock().origin(),
             };
-            let owner = pending
-                .launch
-                .spawn_pinned(
-                    pending.executable,
-                    pending.working_directory,
-                    CpuWorkerId(1),
-                    worker_clock,
-                    root.authority(),
-                    root.original_context().control.deadline,
-                    &root.original_context().control.cancellation,
-                )
-                .map_err(|error| SearchSessionFailure::debug("RoventExternalSpawn", &error))?;
+            let started = pending.launch.spawn_pinned_retaining(
+                pending.executable,
+                pending.working_directory,
+                CpuWorkerId(1),
+                worker_clock,
+                root.authority(),
+                root.original_context().control.deadline,
+                &root.original_context().control.cancellation,
+            );
+            let owner = match started {
+                Ok(owner) => owner,
+                Err(rejected) => {
+                    let error =
+                        SearchSessionFailure::debug("RoventExternalSpawn", &rejected.failure);
+                    self.state = ExternalProcessState::SpawnRejected(rejected);
+                    return Err(error);
+                }
+            };
             self.state = ExternalProcessState::Running(owner);
+        }
+        if let ExternalProcessState::SpawnRejected(rejected) = &self.state {
+            return Err(SearchSessionFailure::debug(
+                "RoventExternalSpawn",
+                &rejected.failure,
+            ));
         }
         let ExternalProcessState::Running(owner) = &mut self.state else {
             return Err(SearchSessionFailure::physical_completion_unknown());
@@ -379,13 +397,17 @@ impl RoventExternalSessionSource {
         match &mut self.state {
             ExternalProcessState::Running(owner) => owner.worker().request_shutdown(until),
             ExternalProcessState::Returned(source) => source.request_shutdown(until),
-            ExternalProcessState::Dormant(_) | ExternalProcessState::Failed => {}
+            ExternalProcessState::Dormant(_)
+            | ExternalProcessState::SpawnRejected(_)
+            | ExternalProcessState::Failed => {}
         }
     }
 
     pub(super) fn try_process_finish(&mut self) -> Result<bool, SearchSessionFailure> {
         let joined = match &mut self.state {
-            ExternalProcessState::Dormant(_) => return Ok(true),
+            ExternalProcessState::Dormant(_) | ExternalProcessState::SpawnRejected(_) => {
+                return Ok(true);
+            }
             ExternalProcessState::Running(owner) => owner.try_join(),
             ExternalProcessState::Returned(source) => source.try_join(),
             ExternalProcessState::Failed => {

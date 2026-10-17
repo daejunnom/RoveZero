@@ -154,6 +154,7 @@ fn actual_pc_repair_recheck_freezes_two_endpoints_and_emits_conditional_witness(
     assert_eq!(std::mem::size_of_val(port.researcher()), 0);
     let mut calls = 0;
     let mut visible_source = None;
+    let mut initial_source = None;
     let mut repair_acceptance = None;
     let mut recheck_acceptance = None;
     let mut frozen_scope = None;
@@ -190,6 +191,11 @@ fn actual_pc_repair_recheck_freezes_two_endpoints_and_emits_conditional_witness(
         } else {
             [0.25, 0.50, 0.25]
         };
+        if cycle && purpose == RoleQueryPurpose::DivergencePolicy && query.counterexample.is_none()
+        {
+            assert_eq!(query.proposal, proposal);
+            initial_source = Some((input.question_digest, input.view_seal));
+        }
         if cycle && purpose == RoleQueryPurpose::DivergencePolicy && query.counterexample.is_some()
         {
             assert!(query.prefix.is_empty());
@@ -215,6 +221,21 @@ fn actual_pc_repair_recheck_freezes_two_endpoints_and_emits_conditional_witness(
         }
         let (accepted, output) =
             accepted_scripted(&mut port, &input, calls, selected, probabilities);
+        if cycle && purpose == RoleQueryPurpose::DivergencePolicy && query.counterexample.is_none()
+        {
+            assert!(query.divergences.len() > 1);
+            assert!(
+                PcAttackRankedSource::capture(
+                    &input,
+                    &accepted,
+                    &output,
+                    1,
+                    &port.owner.semantic.stores,
+                )
+                .is_err(),
+                "a different selected D slot cannot reuse the actual acceptance"
+            );
+        }
         if cycle && purpose == RoleQueryPurpose::RepairPolicy && query.prefix.len() == 5 {
             repair_acceptance = Some(accepted.ticket().id);
         }
@@ -269,6 +290,17 @@ fn actual_pc_repair_recheck_freezes_two_endpoints_and_emits_conditional_witness(
     assert_eq!(witness.source().accepted().ticket().view, view);
     assert_eq!(witness.source().counter_revision(), revision);
     assert_eq!(witness.source().divergence_ply(), 1);
+    let attack = witness.source().attack_ranked_source().unwrap();
+    let (initial_question, initial_view) = initial_source.unwrap();
+    assert_eq!(attack.question_digest(), initial_question);
+    assert_eq!(attack.view_seal(), initial_view);
+    assert_eq!(attack.proposal(), proposal);
+    assert_eq!(attack.divergence_ply(), 1);
+    assert_ne!(attack.question_digest(), question);
+    assert_ne!(attack.view_seal(), view);
+    assert!(
+        attack.accepted().ticket().id.sequence < witness.source().accepted().ticket().id.sequence
+    );
     assert_eq!(witness.repair().unwrap().moves(), repaired);
     assert_eq!(
         witness.repair().unwrap().accepted().ticket().id,
@@ -304,6 +336,11 @@ fn actual_pc_repair_recheck_freezes_two_endpoints_and_emits_conditional_witness(
     assert_eq!(successor.parent_cycle(), Some(1));
     assert_eq!(successor.phase(), PcRepairPhase::VisibleCounterReview);
     assert!(report.incomplete_target(successor.cycle()).is_none());
+    assert!(
+        report
+            .incomplete_attack_ranked_source(successor.cycle())
+            .is_none()
+    );
     assert!(report.owned_host_bytes().unwrap() > 0);
     assert!(port.take_repair_report().unwrap().is_none());
     port.retire_rovent_frontier().unwrap();
@@ -483,6 +520,7 @@ fn actual_unknown_frozen_frontiers_iterate_three_repairs_with_the_original_scope
         let query = input.view.query();
         let purpose = input.question.context.purpose;
         let selected = if let Some(step) = input.question.repair.as_ref() {
+            let step = step.fixture_scope();
             assert!(
                 (1..=3).contains(&step.cycle),
                 "a fourth Repair was admitted"
@@ -491,12 +529,12 @@ fn actual_unknown_frozen_frontiers_iterate_three_repairs_with_the_original_scope
                 step.parent_cycle,
                 (step.cycle > 1).then_some(step.cycle - 1)
             );
-            assert_eq!(step.origin.authority, authority);
-            assert_eq!(step.origin.deadline, deadline);
-            assert_eq!(Some(step.origin.root_budget), budget);
-            assert_eq!(step.origin.first, first);
-            assert_eq!(step.origin.end, 10);
-            frames.insert(step.origin.frame);
+            assert_eq!(step.authority, authority);
+            assert_eq!(step.deadline, deadline);
+            assert_eq!(Some(step.root_budget), budget);
+            assert_eq!(step.first, first);
+            assert_eq!(step.end, 10);
+            frames.insert(step.frame);
             seen.insert(step.cycle);
             let index = usize::try_from(step.cycle - 1).unwrap();
             if purpose == RoleQueryPurpose::ValueFresh {
@@ -555,6 +593,17 @@ fn actual_unknown_frozen_frontiers_iterate_three_repairs_with_the_original_scope
         assert_eq!(witness.resolution(), PcDivergenceResolution::Unknown);
         assert!(!witness.target_known());
         assert_eq!(witness.source().divergence_ply(), index * 2 + 1);
+        if index == 0 {
+            assert_eq!(
+                witness.source().attack_ranked_source().unwrap().proposal(),
+                proposal
+            );
+        } else {
+            assert!(
+                witness.source().attack_ranked_source().is_none(),
+                "a successor cannot be relabeled as an initial None-counter ranking"
+            );
+        }
         let repair = witness.repair().unwrap();
         let recheck = witness.recheck().unwrap();
         assert_eq!(repair.moves(), repairs[index]);

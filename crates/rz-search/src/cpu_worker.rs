@@ -2223,6 +2223,22 @@ impl CpuWorker {
         job: CpuJob,
         grant: SliceGrant,
     ) -> Result<CpuSubmissionRejected, CpuWorkerError> {
+        // Preserve the legacy caller's error-only disposition. New cleanup
+        // consumers retain the original Job through the boundary below.
+        self.reject_prepared_retaining(job, grant)
+            .map_err(|(error, _job)| error)
+    }
+    /// Actual worker/fence rejection of a unique prepared Job. Validation or
+    /// fence failure returns that same Job without retiring its capture. Only
+    /// the successful, definitely unqueued branch may publish NotStarted.
+    /// This is not a ledger refund; the caller still settles the original
+    /// reservation using the resulting CpuAdmissionRejection proof.
+    #[allow(clippy::result_large_err)]
+    pub fn reject_prepared_retaining(
+        &self,
+        job: CpuJob,
+        grant: SliceGrant,
+    ) -> Result<CpuSubmissionRejected, (CpuWorkerError, CpuJob)> {
         if grant.owner != self.owner
             || grant.job != job.envelope.id
             || job.mailbox.scope()
@@ -2233,15 +2249,18 @@ impl CpuWorker {
             || job.envelope.evaluation_namespace != self.evaluation_namespace
             || job.envelope.search_conditions != self.search_conditions
         {
-            return Err(CpuWorkerError::Invalid(
-                "CPU prepared rejection scope mismatch",
+            return Err((
+                CpuWorkerError::Invalid("CPU prepared rejection scope mismatch"),
+                job,
             ));
         }
-        let mut fence = self
-            .submission
-            .lock()
-            .map_err(|_| CpuWorkerError::Quarantined)?;
-        fence.claim(self.owner, grant)?;
+        let mut fence = match self.submission.lock() {
+            Ok(fence) => fence,
+            Err(_) => return Err((CpuWorkerError::Quarantined, job)),
+        };
+        if let Err(error) = fence.claim(self.owner, grant) {
+            return Err((error, job));
+        }
         Ok(CpuSubmissionRejected::from_command(
             CpuWorkerError::Invalid("CPU prepared question declined before enqueue"),
             CpuCommand::Begin(Box::new(job), grant),

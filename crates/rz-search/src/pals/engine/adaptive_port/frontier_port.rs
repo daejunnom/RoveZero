@@ -51,6 +51,20 @@ pub(super) struct FrontierQuestionSource {
     goal_origin: Option<ContractDigest>,
 }
 
+/// Read-only historical projection for the bounded retirement writer. This
+/// cannot reconstruct the original private source or mint a selected view.
+pub(crate) struct AdaptiveRetirementFrontierSource<'a> {
+    pub authority: SearchAuthority,
+    pub original_deadline: Deadline,
+    pub deadline: Instant,
+    pub position: &'a PositionSnapshot,
+    pub context: ContractDigest,
+    pub view: ReviewViewSeal,
+    /// None: absent; Some(Err): original Weak expired, never a fabricated digest.
+    pub legacy_digest_or_expired: Option<Result<ContractDigest, ()>>,
+    pub goal_origin: Option<ContractDigest>,
+}
+
 impl FrontierQuestionSource {
     pub(super) fn new(
         authority: SearchAuthority,
@@ -76,6 +90,23 @@ impl FrontierQuestionSource {
 }
 
 impl AdaptivePortQuestion {
+    pub(crate) fn retirement_frontier_source(&self) -> AdaptiveRetirementFrontierSource<'_> {
+        let source = &self.frontier_source;
+        AdaptiveRetirementFrontierSource {
+            authority: source.authority,
+            original_deadline: source.original_deadline,
+            deadline: source.deadline,
+            position: &source.position,
+            context: source.context,
+            view: source.view,
+            legacy_digest_or_expired: source.legacy.as_ref().map(|weak| {
+                weak.upgrade()
+                    .map(|live| ContractDigest(live.digest()))
+                    .ok_or(())
+            }),
+            goal_origin: source.goal_origin,
+        }
+    }
     /// Check the actual private producer seal. Frame liveness/role acceptance
     /// remains with the machine; root-to-prefix replay stays with Frontier.
     pub fn validate_frontier_source(

@@ -61,6 +61,21 @@ pub(super) struct PcRepairStep {
     pub(super) responsibilities: Vec<PcResponsibilitySource>,
 }
 
+/// Test-only scalar observation. It grants no live question or acceptance
+/// authority and is absent from production builds.
+#[cfg(test)]
+pub(super) struct PcRepairFixtureScope {
+    pub(super) cycle: u64,
+    pub(super) parent_cycle: Option<u64>,
+    pub(super) phase: PcRepairPhase,
+    pub(super) authority: SearchAuthority,
+    pub(super) deadline: Deadline,
+    pub(super) root_budget: ContractDigest,
+    pub(super) first: BoardMove,
+    pub(super) frame: u64,
+    pub(super) end: usize,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct PublishedPcLine {
     pub(super) line: LineId,
@@ -140,6 +155,20 @@ impl super::repair_report::PcRepairProgress {
     }
 }
 impl PcRepairStep {
+    #[cfg(test)]
+    pub(super) fn fixture_scope(&self) -> PcRepairFixtureScope {
+        PcRepairFixtureScope {
+            cycle: self.cycle,
+            parent_cycle: self.parent_cycle,
+            phase: self.phase,
+            authority: self.origin.authority,
+            deadline: self.origin.deadline,
+            root_budget: self.origin.root_budget,
+            first: self.origin.first,
+            frame: self.origin.frame,
+            end: self.origin.end,
+        }
+    }
     pub(super) fn owned_host_bytes(&self) -> Option<u64> {
         use super::repair_report::{line_bytes, model_bytes, optional_line_bytes};
         let mut bytes = u64::try_from(std::mem::size_of::<Self>())

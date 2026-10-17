@@ -8,7 +8,7 @@ use rz_contracts::{ExecutionId, rovent::ReciprocalQuestionId};
 use rz_search::cpu_checker::CheckerError;
 use rz_search::external_cpu::{
     ExternalGoConstraint, ProfiledExternalCompletion, ProfiledExternalCurrentRootFence,
-    ProfiledExternalDispatch, ProfiledExternalRootSource,
+    ProfiledExternalDispatch, ProfiledExternalProcessCloseProof, ProfiledExternalRootSource,
 };
 use rz_search::pals::engine::adaptive_port::{
     AdaptiveProfiledExternalAdmission, AdaptiveProfiledExternalCommit,
@@ -24,7 +24,12 @@ pub(super) struct ProfiledDriverState {
     pub(super) permit: Option<(Digest, ProfiledForeignAppendPermit)>,
     pub(super) committed: HashMap<Digest, RetainedProfiledCommit>,
     retirement: Option<ProfiledExternalRootRetirement>,
-    retirement_fence: Option<ProfiledExternalCurrentRootFence>,
+    retirement_boundary: Option<ProfiledRetirementBoundary>,
+}
+
+enum ProfiledRetirementBoundary {
+    Root(ProfiledExternalCurrentRootFence),
+    Process(ProfiledExternalProcessCloseProof),
 }
 
 pub(super) struct RetainedProfiledCommit {
@@ -287,6 +292,27 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
         Ok(())
     }
 
+    pub(super) fn profile_consume_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        source: &ProfiledExternalRootSource,
+        reservation: FrontierExternalReservation,
+        completion: &Arc<ProfiledExternalCompletion>,
+    ) -> Result<
+        rz_search::pals::engine::adaptive_port::CheckedProfiledExternalResponse,
+        AdaptiveManagerError,
+    > {
+        let committed = self.profile_raw(work, source, reservation, completion, true)?;
+        // The semantic owner binds this actual packet to the accepted parent's
+        // original peer question. No ordinary refinement transition runs here.
+        let response = self
+            .hot()?
+            .after_profiled_reciprocal_cpu(work, source, reservation, completion, &committed)
+            .map_err(profile_error)?;
+        self.profiled.committed.remove(&work.input.question_digest);
+        Ok(response)
+    }
+
     pub(super) fn profile_reject(
         &mut self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
@@ -394,15 +420,17 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
         if self.profiled.retirement.is_some() {
             return if self
                 .profiled
-                .retirement_fence
+                .retirement_boundary
                 .as_ref()
-                .is_some_and(|original| {
-                    original.source().same_source(source)
-                        && original.source().same_source(fence.source())
-                        && original.authority() == fence.authority()
-                        && original.sequence() == fence.sequence()
-                        && original.process_identity() == fence.process_identity()
-                        && fence.permits_reuse()
+                .is_some_and(|boundary| {
+                    matches!(boundary, ProfiledRetirementBoundary::Root(original) if
+                        original.source().same_source(source)
+                            && original.source().same_source(fence.source())
+                            && original.authority() == fence.authority()
+                            && original.sequence() == fence.sequence()
+                            && original.process_identity() == fence.process_identity()
+                            && fence.permits_reuse()
+                    )
                 }) {
                 Ok(())
             } else {
@@ -416,7 +444,60 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
             .release_profiled_external_root(source, fence)
             .map_err(profile_error)?;
         self.profiled.retirement = Some(retirement);
-        self.profiled.retirement_fence = Some(fence.clone());
+        self.profiled.retirement_boundary = Some(ProfiledRetirementBoundary::Root(fence.clone()));
+        self.profiled.committed.clear();
+        Ok(())
+    }
+
+    fn profile_release_closed(
+        &mut self,
+        source: &ProfiledExternalRootSource,
+        proof: &ProfiledExternalProcessCloseProof,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.profile_source(source)?;
+        if self.transfer.is_some()
+            || self.profiled.transfer_question.is_some()
+            || self.profiled.permit.is_some()
+        {
+            return Err(AdaptiveManagerError::AuxiliaryPending);
+        }
+        if !proof.source().same_source(source)
+            || proof.authority() != self.authority
+            || !proof.permits_semantic_closure()
+        {
+            return Err(invalid(
+                "profiled closed process proof belongs to another owner",
+            ));
+        }
+        if self.profiled.retirement.is_some() {
+            return if self
+                .profiled
+                .retirement_boundary
+                .as_ref()
+                .is_some_and(|boundary| {
+                    matches!(boundary, ProfiledRetirementBoundary::Process(original) if
+                        original.source().same_source(proof.source())
+                            && original.shutdown_receipt() == proof.shutdown_receipt()
+                            && original.accepted_jobs() == proof.accepted_jobs()
+                            && original.terminal_controls() == proof.terminal_controls()
+                            && original.drained_terminals() == proof.drained_terminals()
+                            && original.permits_semantic_closure()
+                    )
+                }) {
+                Ok(())
+            } else {
+                Err(invalid(
+                    "profiled retirement retry replaced its closed process proof",
+                ))
+            };
+        }
+        let retirement = self
+            .hot()?
+            .release_profiled_external_closed_root(source, proof)
+            .map_err(profile_error)?;
+        self.profiled.retirement = Some(retirement);
+        self.profiled.retirement_boundary =
+            Some(ProfiledRetirementBoundary::Process(proof.clone()));
         self.profiled.committed.clear();
         Ok(())
     }
@@ -443,13 +524,18 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
         {
             return Err((self, AdaptiveManagerError::PhysicalUnknown));
         }
-        let Some(fence) = receipt.external_root_fence() else {
-            return Err((
-                self,
-                invalid("profiled semantic closure lacks original current-root fence"),
-            ));
+        // 닫힌 process를 재사용 가능한 root로 표시하지 않는다. 이미 발급된 원
+        // current fence 또는 실제 join 전용 proof 중 그 시점의 원 증거만 소비한다.
+        let release = if let Some(proof) = receipt.process_close_proof() {
+            self.profile_release_closed(receipt.source(), proof)
+        } else if let Some(fence) = receipt.external_root_fence() {
+            self.profile_release(receipt.source(), fence)
+        } else {
+            Err(invalid(
+                "profiled semantic closure lacks actual root or process-close proof",
+            ))
         };
-        if let Err(error) = self.profile_release(receipt.source(), fence) {
+        if let Err(error) = release {
             return Err((self, error));
         }
         let Some(port) = self.port.take() else {

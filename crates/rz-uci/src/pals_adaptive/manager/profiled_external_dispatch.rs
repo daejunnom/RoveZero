@@ -198,6 +198,33 @@ where
                 packet,
             );
         }
+        if self
+            .accepted_roles
+            .iter()
+            .any(|held| held.child == Some(binding.work.frame))
+        {
+            let response = self.driver.consume_profiled_reciprocal_cpu(
+                &binding.work,
+                &binding.source,
+                reservation,
+                packet,
+            )?;
+            self.machine.resolve_reciprocal_profiled_external_response(
+                StepEvidence {
+                    frame: binding.work.frame,
+                    stage: binding.work.input.stage,
+                    execution,
+                    submitted_question: binding.work.input.question_digest,
+                    submitted_view: binding.work.input.view_seal,
+                    completed_evidence: response.evidence(),
+                },
+                &response,
+                self.clock.domain(),
+                self.check_running()?,
+            )?;
+            self.release_accepted_role_waiters(binding.work.frame)?;
+            return Ok(());
+        }
         let checked = self.driver.commit_profiled_external(
             &binding.work,
             &binding.source,

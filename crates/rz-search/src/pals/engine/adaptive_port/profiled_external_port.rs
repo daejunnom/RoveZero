@@ -5,7 +5,8 @@ use crate::external_cpu::worker::external_root_restriction_digest;
 use crate::external_cpu::{
     ExternalCpuConfig, ExternalEnginePurpose, ExternalGoConstraint, ExternalGoIssue,
     ProfiledExternalCompletion, ProfiledExternalCurrentRootFence, ProfiledExternalDispatch,
-    ProfiledExternalJob, ProfiledExternalRootSource, ProfiledExternalScope,
+    ProfiledExternalJob, ProfiledExternalProcessCloseProof, ProfiledExternalRootSource,
+    ProfiledExternalScope,
 };
 use crate::pals::coordinator::CheckedProfiledExternalBinding;
 use crate::pals::rovent_frontier::{FrontierExternalReservation, FrontierExternalWork};
@@ -20,6 +21,15 @@ use rz_contracts::{ClockDomain, MonotonicTick};
 use rz_runtime::{CompletionSignal, adaptive::ControlMailbox};
 
 const PROFILED_QUESTION_CAPACITY: usize = 64;
+fn profiled_question_hex(digest: ContractDigest) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in digest.0 {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 15) as usize] as char);
+    }
+    output
+}
 #[cfg(test)]
 mod tests;
 
@@ -43,6 +53,52 @@ pub struct AdaptiveProfiledExternalAdmission {
 pub struct AdaptiveProfiledExternalCommit {
     pub observation: ObservationId,
     pub consumed: bool,
+}
+
+/// Only this actual Store consumer can mint a peer R answer. A public raw
+/// report, completion flag or caller-supplied digest cannot construct it.
+pub struct CheckedProfiledExternalResponse {
+    frame: FrameId,
+    stage: RefinementStage,
+    first: rz_contracts::pals::Move16,
+    deadline: Deadline,
+    question: QuestionEnvelope,
+    execution: rz_contracts::ExecutionId,
+    input_digest: ContractDigest,
+    public_context: ContractDigest,
+    evidence: ContractDigest,
+}
+impl CheckedProfiledExternalResponse {
+    pub fn evidence(&self) -> ContractDigest {
+        self.evidence
+    }
+    pub(crate) fn validates<Q>(
+        &self,
+        evidence: &crate::pals::coordinator::StepEvidence,
+        frame: FrameId,
+        first: rz_contracts::pals::Move16,
+        deadline: Deadline,
+        input: &FrameInput<ReviewView, Q>,
+    ) -> bool {
+        self.frame == frame
+            && self.first == first
+            && self.deadline == deadline
+            && self.stage == input.stage
+            && self.question.question_digest == input.question_digest
+            && self.question.view == input.view_seal
+            && self.input_digest == ContractDigest(input.view.digest())
+            && self.public_context == input.public_context
+            && self.evidence == evidence.completed_evidence
+            && evidence.frame == frame
+            && evidence.stage == input.stage
+            && evidence.submitted_question == input.question_digest
+            && evidence.submitted_view == input.view_seal
+            && evidence.execution
+                == crate::pals::coordinator::StepExecution::ProfiledExternal {
+                    question: self.question.id,
+                    execution: self.execution,
+                }
+    }
 }
 
 pub struct AdaptiveProfiledForeignPublication {
@@ -99,12 +155,17 @@ impl ProfiledExternalPortState {
 /// packet, failed append, Work/view pin and known Store handle for its consumer.
 pub struct ProfiledExternalRootRetirement {
     identity: ProfiledExternalRetirementIdentity,
+    boundary: ProfiledRetirementBoundary,
     authority: SearchAuthority,
     source: ProfiledExternalRootSource,
     owner: StoreReadOwner,
     generation: u64,
     pins: Result<StorePins, PalsError>,
     state: ProfiledExternalPortState,
+}
+enum ProfiledRetirementBoundary {
+    Root(ProfiledExternalCurrentRootFence),
+    Process(ProfiledExternalProcessCloseProof),
 }
 #[derive(Clone, Debug)]
 pub struct ProfiledExternalRetirementIdentity(Arc<()>);
@@ -114,6 +175,18 @@ impl ProfiledExternalRetirementIdentity {
     }
 }
 impl ProfiledExternalRootRetirement {
+    pub(crate) fn root_fence(&self) -> Option<&ProfiledExternalCurrentRootFence> {
+        match &self.boundary {
+            ProfiledRetirementBoundary::Root(fence) => Some(fence),
+            _ => None,
+        }
+    }
+    pub(crate) fn process_close_proof(&self) -> Option<&ProfiledExternalProcessCloseProof> {
+        match &self.boundary {
+            ProfiledRetirementBoundary::Process(proof) => Some(proof),
+            _ => None,
+        }
+    }
     pub fn identity(&self) -> ProfiledExternalRetirementIdentity {
         self.identity.clone()
     }
@@ -393,6 +466,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         work.input
             .question
             .position
+            .snapshot()
             .uci_replay(config.max_prefix_plies)?;
         if let Some(original) = self
             .profiled_external
@@ -508,7 +582,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             "{};profiled-R/1;profile={:?};question={};requested={};deadline={}",
             self.engine.researcher.cpu_registered_condition,
             source.profile(),
-            hex_digest(work.input.question_digest),
+            profiled_question_hex(work.input.question_digest),
             serde_json::to_string(&requested).map_err(|_| PalsError::InvalidConfig)?,
             self.deadline.at.0
         );
@@ -1170,15 +1244,109 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         Ok(step)
     }
 
+    /// Return an actual optional peer R observation to its retained accepted
+    /// parent. This does not take the ordinary fixed refinement transition or
+    /// issue a native CPU receipt, paused-stack reply, depth or mate proof.
+    pub fn after_profiled_reciprocal_cpu(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        source: &ProfiledExternalRootSource,
+        reservation: FrontierExternalReservation,
+        packet: &Arc<ProfiledExternalCompletion>,
+        committed: &AdaptiveProfiledExternalCommit,
+    ) -> Result<CheckedProfiledExternalResponse, PalsError> {
+        self.check_work(work)?;
+        let question = self
+            .profiled_reciprocal_question(work)?
+            .ok_or(RoleError::InvalidOutput)?;
+        let original = self
+            .profiled_external
+            .entries
+            .get(&work.input.question_digest)
+            .ok_or(RoleError::InvalidOutput)?;
+        if !committed.consumed
+            || !original.matches(work)
+            || !original.source.same_source(source)
+            || original.job.question != question
+            || original.reservation != Some(reservation)
+            || !original
+                .completion
+                .as_ref()
+                .is_some_and(|same| Arc::ptr_eq(same, packet))
+            || !self.profiled_external_observation_consumed(work, committed.observation)
+        {
+            return Err(StoreError::InvalidEvidence(
+                "peer profiled R needs its exact consumed observation",
+            )
+            .into());
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"rz-rovent-consumed-profiled-peer-R-observation/1\0");
+        hash.update(work.input.question_digest.0);
+        hash.update(work.input.view_seal.view_digest.0);
+        hash.update(original.job.execution.sequence.to_le_bytes());
+        hash.update(question.id.sequence.to_le_bytes());
+        hash.update((committed.observation.0 as u64).to_le_bytes());
+        Ok(CheckedProfiledExternalResponse {
+            frame: work.frame,
+            stage: work.input.stage,
+            first: work.original_first_move,
+            deadline: work.original_deadline,
+            question,
+            execution: original.job.execution,
+            input_digest: ContractDigest(work.input.view.digest()),
+            public_context: work.input.public_context,
+            evidence: ContractDigest(hash.finalize().into()),
+        })
+    }
+
     pub fn release_profiled_external_root(
         &mut self,
         source: &ProfiledExternalRootSource,
         fence: &ProfiledExternalCurrentRootFence,
     ) -> Result<ProfiledExternalRootRetirement, PalsError> {
         if !fence.source().same_source(source)
-            || self.profiled_external.retirement_issued
             || fence.authority() != self.authority
             || !fence.permits_reuse()
+        {
+            return Err(
+                CheckerError::Invalid("profiled root lacks actual original drain fence").into(),
+            );
+        }
+        self.retire_profiled_external_state(source, ProfiledRetirementBoundary::Root(fence.clone()))
+    }
+
+    /// Known process exit/drain is a close-only proof. It cannot synthesize a
+    /// ready barrier, same-process reuse or a subsequent root admission.
+    pub fn release_profiled_external_closed_root(
+        &mut self,
+        source: &ProfiledExternalRootSource,
+        proof: &ProfiledExternalProcessCloseProof,
+    ) -> Result<ProfiledExternalRootRetirement, PalsError> {
+        if !proof.source().same_source(source)
+            || proof.authority() != self.authority
+            || proof.worker_owner() != source.owner()
+            || proof.process_identity() != source.process_identity()
+            || proof.clock().domain != source.clock().domain
+            || proof.clock().origin != source.clock().origin
+            || !proof.permits_semantic_closure()
+        {
+            return Err(
+                CheckerError::Invalid("profiled root lacks actual process close proof").into(),
+            );
+        }
+        self.retire_profiled_external_state(
+            source,
+            ProfiledRetirementBoundary::Process(proof.clone()),
+        )
+    }
+
+    fn retire_profiled_external_state(
+        &mut self,
+        source: &ProfiledExternalRootSource,
+        boundary: ProfiledRetirementBoundary,
+    ) -> Result<ProfiledExternalRootRetirement, PalsError> {
+        if self.profiled_external.retirement_issued
             || !self
                 .rovent_frontier()
                 .and_then(|f| f.external_source())
@@ -1200,6 +1368,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         self.profiled_external.retirement_issued = true;
         Ok(ProfiledExternalRootRetirement {
             identity: ProfiledExternalRetirementIdentity(Arc::new(())),
+            boundary,
             authority: self.authority,
             source: source.clone(),
             owner: self.engine.semantic.stores.read_owner(),

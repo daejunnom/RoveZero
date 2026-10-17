@@ -750,6 +750,34 @@ impl<V, Q> RefinementMachine<V, Q> {
     }
 }
 
+impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
+    /// A foreign peer reply requires the opaque actual Store consumer proof;
+    /// a raw UCI packet or public completed-evidence digest is insufficient.
+    pub fn resolve_reciprocal_profiled_external_response(
+        &mut self,
+        evidence: StepEvidence,
+        proof: &crate::pals::engine::adaptive_port::CheckedProfiledExternalResponse,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<DependentFrameResponse, CoordinatorError> {
+        let frame = self
+            .frame(evidence.frame)
+            .ok_or(CoordinatorError::UnknownRequest)?;
+        if !proof.validates(
+            &evidence,
+            frame.id,
+            frame.original_first_move,
+            frame.original_deadline,
+            &frame.input,
+        ) {
+            return Err(CoordinatorError::IdentityMismatch(
+                "profiled peer actual Store consumption",
+            ));
+        }
+        self.resolve_reciprocal_response_checked(evidence, clock, now)
+    }
+}
+
 #[cfg(test)]
 #[path = "reciprocal_tests.rs"]
 mod tests;

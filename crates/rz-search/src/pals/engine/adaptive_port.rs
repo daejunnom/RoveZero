@@ -76,8 +76,9 @@ pub(in crate::pals::engine) use profiled_external_port::ProfiledExternalRetiredC
 pub use profiled_external_port::{
     AdaptiveProfiledExternalAdmission, AdaptiveProfiledExternalCommit,
     AdaptiveProfiledExternalPreparation, AdaptiveProfiledForeignPublication,
-    ProfiledExternalRetiredPacket, ProfiledExternalRetirementIdentity,
-    ProfiledExternalRootRetirement, ProfiledExternalUnsupported,
+    CheckedProfiledExternalResponse, ProfiledExternalRetiredPacket,
+    ProfiledExternalRetirementIdentity, ProfiledExternalRootRetirement,
+    ProfiledExternalUnsupported,
 };
 pub mod archive_worker;
 /// The process registry remains owned by UCI. Search cannot invent an owner

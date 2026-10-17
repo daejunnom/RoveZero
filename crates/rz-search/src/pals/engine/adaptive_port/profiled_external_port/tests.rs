@@ -97,9 +97,19 @@ impl AuthoredElf {
         fs::write(&source, AUTHORED_UCI).unwrap();
         let cpus = first_two_allowed_cpus();
         let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-        let mut command = Command::new("taskset");
+        let mut command = Command::new("prlimit");
         command
-            .arg("-c")
+            .arg(format!("--fsize={COMPILE_OUTPUT_CAP}"))
+            .args([
+                "--cpu=10",
+                "--",
+                "timeout",
+                "--signal=TERM",
+                "--kill-after=1s",
+                "10s",
+                "taskset",
+                "-c",
+            ])
             .arg(cpus)
             .arg(compiler)
             .arg("--edition=2021")
@@ -116,32 +126,35 @@ impl AuthoredElf {
             .stdout(Stdio::from(File::create(&stdout).unwrap()))
             .stderr(Stdio::from(File::create(&stderr).unwrap()))
             .process_group(0);
-        // SAFETY: pre-exec only invokes the async-signal-safe setrlimit syscall.
-        // The aggregate file check and wall fence below additionally bound the
-        // compiler and any linker child in this test-owned process group.
-        unsafe {
-            command.pre_exec(|| {
-                let cap = libc::rlimit {
-                    rlim_cur: COMPILE_OUTPUT_CAP as libc::rlim_t,
-                    rlim_max: COMPILE_OUTPUT_CAP as libc::rlim_t,
-                };
-                if libc::setrlimit(libc::RLIMIT_FSIZE, &cap) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = command.spawn().expect("bounded authored ELF compiler");
+        // OS tools retain the resource fence without a Rust pre-exec/FFI hook.
+        // Missing timeout/taskset/rustc is an explicit setup failure captured
+        // below; none of the guards silently falls back to an unbounded run.
+        let mut child = command
+            .spawn()
+            .expect("authored ELF setup requires prlimit, timeout, taskset and rustc");
+        let group = child.id();
+        assert!(group > 0 && group <= i32::MAX as u32);
         let until = Instant::now() + Duration::from_secs(10);
         let status = loop {
             let bytes = owned_output_bytes(&fixture.root);
             if Instant::now() >= until || bytes > COMPILE_OUTPUT_CAP {
-                // SAFETY: process_group(0) made this spawned child's positive
-                // PID its own group ID; no other test/process joins that group.
-                unsafe {
-                    libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                // process_group(0) made the validated positive child PID its
+                // own group ID. Pass it as one OS-command argument, not shell
+                // source, so only this original group can receive the signal.
+                let killed = Command::new("kill")
+                    .args(["-KILL", "--"])
+                    .arg(format!("-{group}"))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                if !killed.as_ref().is_ok_and(|status| status.success()) {
+                    // The safe direct-child kill is a final reap fallback.
+                    // GNU timeout still owns its one-second descendant fence.
+                    let _ = child.kill();
                 }
                 let _ = child.wait();
+                assert!(killed.is_ok(), "authored ELF setup requires OS kill");
                 panic!("authored ELF compile exceeded ten seconds or 16MiB output");
             }
             if let Some(status) = child.try_wait().unwrap() {

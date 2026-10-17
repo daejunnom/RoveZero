@@ -52,6 +52,9 @@ impl ProfiledExternalRootSource {
     pub fn authority(&self) -> SearchAuthority {
         self.authority
     }
+    pub(crate) fn source_sequence(&self) -> u64 {
+        self.source_sequence
+    }
     pub fn worker_owner(&self) -> CpuWorkerId {
         self.owner
     }
@@ -212,6 +215,62 @@ impl ProfiledExternalCurrentRootFence {
     }
 }
 
+/// 같은 실제 worker의 join·process exit·pipe drain을 확인한 close 전용 증거다.
+/// ready barrier나 root 재사용을 증명하지 않으며, 공개 shutdown DTO로 생성할 수 없다.
+#[derive(Clone, Debug)]
+pub struct ProfiledExternalProcessCloseProof {
+    source: ProfiledExternalRootSource,
+    process: CheckerShutdown,
+    accepted_jobs: u64,
+    terminal_controls: u64,
+    drained_terminals: u64,
+}
+
+impl ProfiledExternalProcessCloseProof {
+    pub fn source(&self) -> &ProfiledExternalRootSource {
+        &self.source
+    }
+    pub fn authority(&self) -> SearchAuthority {
+        self.source.authority()
+    }
+    pub fn process_identity(&self) -> ExternalProcessIdentity {
+        self.source.process_identity()
+    }
+    pub fn worker_owner(&self) -> CpuWorkerId {
+        self.source.worker_owner()
+    }
+    pub fn clock(&self) -> ExternalWorkerClock {
+        self.source.clock()
+    }
+    pub fn accepted_jobs(&self) -> u64 {
+        self.accepted_jobs
+    }
+    pub fn terminal_controls(&self) -> u64 {
+        self.terminal_controls
+    }
+    pub fn drained_terminals(&self) -> u64 {
+        self.drained_terminals
+    }
+    pub fn shutdown_receipt(&self) -> CheckerShutdown {
+        self.process
+    }
+    pub fn permits_semantic_closure(&self) -> bool {
+        completed_process_close(self.process, self.source.process_identity())
+            && self.accepted_jobs == self.terminal_controls
+            && self.accepted_jobs == self.drained_terminals
+    }
+}
+
+fn completed_process_close(process: CheckerShutdown, original: ExternalProcessIdentity) -> bool {
+    process.process_identity == Some(original)
+        && process.exit_observed
+        && process.stdout_drained
+        && process.stderr_drained
+        && process.cleanup_complete
+        && !process.quarantined
+        && !process.ownership_lost
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct QuiesceRequest {
     authority: SearchAuthority,
@@ -291,6 +350,67 @@ fn source_for(
 }
 
 impl ProfiledExternalWorker {
+    /// take_completion으로 원 terminal을 모두 회수하고 실제 try_join이 성공한
+    /// 뒤에만 close 증거를 돌려준다. root quiesce·ready를 대신 발급하지 않는다.
+    pub fn process_close_proof(
+        &self,
+    ) -> Result<Option<ProfiledExternalProcessCloseProof>, CheckerError> {
+        let Some(joined) = self.joined.as_ref() else {
+            return Ok(None);
+        };
+        let process = *joined.as_ref().map_err(Clone::clone)?;
+        if self.thread.is_some() || !self.shutdown.load(Ordering::Acquire) {
+            return Err(error(
+                "profiled_close",
+                "worker_not_joined_or_admission_open",
+            ));
+        }
+        let occupancy = self.mailbox.occupancy();
+        if !occupancy.closed
+            || occupancy.commands != 0
+            || occupancy.reliable_queued != 0
+            || occupancy.reliable_reserved != 0
+        {
+            return Ok(None);
+        }
+        let root = self
+            .roots
+            .lock()
+            .map_err(|_| error("profiled_close", "state_poisoned"))?;
+        if !root.terminals_drained() {
+            if root.lifecycle_failure.is_some()
+                || root.terminal_controls > root.accepted_jobs
+                || root.drained_terminals > root.terminal_controls
+            {
+                return Err(error(
+                    "profiled_close",
+                    "original_terminal_accounting_inconsistent",
+                ));
+            }
+            // reliable dequeue와 원 counter 갱신 사이를 실제 failure로 오인하지 않는다.
+            return Ok(None);
+        }
+        let source = source_for(
+            &self.roots,
+            &self.shutdown,
+            &root,
+            self.owner,
+            self.clock,
+            self.profile,
+            self.purpose,
+        )?;
+        if !completed_process_close(process, source.process_identity()) {
+            return Err(error("profiled_close", "original_process_cleanup_unknown"));
+        }
+        Ok(Some(ProfiledExternalProcessCloseProof {
+            source,
+            process,
+            accepted_jobs: root.accepted_jobs,
+            terminal_controls: root.terminal_controls,
+            drained_terminals: root.drained_terminals,
+        }))
+    }
+
     pub fn current_root_source(&self) -> Result<Option<ProfiledExternalRootSource>, CheckerError> {
         let Some(startup) = self.startup_report() else {
             return Ok(None);
