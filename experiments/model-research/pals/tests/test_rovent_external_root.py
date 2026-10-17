@@ -326,7 +326,7 @@ class ExternalCollectionRootTests(unittest.TestCase):
             ("dotdot", lambda p: p.update(program="/bin/../stockfish"), "normalized absolute Linux path"),
             ("threads", lambda p: p["identity"]["options"].update(Threads="0"), "registered bounds"),
             ("thread_spelling", lambda p: p["identity"]["options"].update(Threads="01"), "registered bounds"),
-            ("thread_type", lambda p: p["identity"]["options"].update(Threads=1), "exact decimal string"),
+            ("thread_type", lambda p: p["identity"]["options"].update(Threads=1), "bounded teacher option declaration required"),
             ("hash", lambda p: p["identity"]["options"].update(Hash="262145"), "registered bounds"),
             ("multipv", lambda p: p["identity"]["options"].update(MultiPV="5"), "registered bounds"),
             ("ponder", lambda p: p["identity"]["options"].update(Ponder="true"), "required option profile"),
