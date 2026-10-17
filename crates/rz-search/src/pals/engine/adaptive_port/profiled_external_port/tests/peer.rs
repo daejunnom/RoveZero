@@ -137,7 +137,7 @@ fn authored_published_ranking(
             fixture.clock.now().unwrap(),
         )
         .unwrap();
-    assert_eq!(registry.phase(ticket.id), Some(TicketPhase::Retired));
+    assert_eq!(registry.phase(ticket.id), None);
     (registry, issuer, ranking)
 }
 
@@ -218,7 +218,7 @@ fn authored_worker_optional_peer_r_returns_to_original_accepted_parent() {
         )
         .unwrap();
     assert!(accepted.validates_output(&output));
-    assert_eq!(registry.phase(ticket.id), Some(TicketPhase::Retired));
+    assert_eq!(registry.phase(ticket.id), None);
     let parent_evidence = StepEvidence {
         frame: parent,
         stage: source_work.input.stage,
@@ -430,7 +430,7 @@ fn authored_worker_optional_peer_r_returns_to_original_accepted_parent() {
             .is_err()
     );
     assert_eq!(machine.frame(parent).unwrap().budget, original_budget);
-    assert_eq!(registry.phase(ticket.id), Some(TicketPhase::Retired));
+    assert_eq!(registry.phase(ticket.id), None);
     assert_eq!(fixture.port.counters.role_calls, 2); // Root ranking plus original P, once each.
     assert_eq!(fixture.port.counters.consumed_external_checker_tasks, 1);
     assert_eq!(fixture.port.counters.cpu_nodes, 0);
