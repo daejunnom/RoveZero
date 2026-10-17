@@ -5,7 +5,6 @@ fn fresh_goal_use_preserves_once_consumption_and_failed_protection_tombstone() {
     let mut port = super::super::port_tests::setup(Position::startpos(), 4);
     let source =
         super::super::port_tests::work(&mut port, "e2e4", RefinementStage::ProposalContinuation, 1);
-    let endpoint = fresh_descendant(&mut port, &source);
     port.engine.semantic.rovent_frontier = Some(Box::new(controller(&port)));
     let clock = port.deadline.clock;
     port.rovent_frame_admitted(
@@ -15,6 +14,9 @@ fn fresh_goal_use_preserves_once_consumption_and_failed_protection_tombstone() {
         MonotonicTick(0),
     )
     .unwrap();
+    // Like the real producer, create the descendant only after the original
+    // controller is attached, so replay_node first pays its Rules path.
+    let endpoint = fresh_descendant(&mut port, &source);
     let (accepted, output) = accepted(&endpoint);
     let physical = AdaptivePortRoleEvidence {
         execution: Some(ExecutionId::new(port.authority.epoch, 1)),
@@ -32,17 +34,21 @@ fn fresh_goal_use_preserves_once_consumption_and_failed_protection_tombstone() {
         .consume(&endpoint.input.view, &port.engine.semantic.stores)
         .unwrap();
     for _ in 0..2 {
-        assert!(matches!(
-            port.rovent_fresh_accepted(
-                &endpoint,
-                &accepted,
-                &output,
-                physical,
-                clock,
-                MonotonicTick(0)
+        let result = port.rovent_fresh_accepted(
+            &endpoint,
+            &accepted,
+            &output,
+            physical,
+            clock,
+            MonotonicTick(0),
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(PalsError::Review(ReviewError::AlreadyConsumed)),
             ),
-            Err(PalsError::Review(ReviewError::AlreadyConsumed)),
-        ));
+            "actual Fresh protection failure changed: {result:?}"
+        );
         assert!(
             port.role_consumption_recorded(accepted.ticket(), &endpoint.input.view)
                 .unwrap()

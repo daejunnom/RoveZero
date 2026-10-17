@@ -1079,7 +1079,6 @@ mod tests {
             RefinementStage::ProposalContinuation,
             1,
         );
-        let endpoint = fresh_descendant(&mut port, &work);
         let frontier = controller(&port);
         port.engine.semantic.rovent_frontier = Some(Box::new(frontier));
         let clock = port.deadline.clock;
@@ -1098,6 +1097,9 @@ mod tests {
             port.rovent_frontier().unwrap().snapshot().registered_frames,
             1
         );
+        // This models the actual selected continuation producer: charge the
+        // descendant through the attached controller before submitting Fresh.
+        let endpoint = fresh_descendant(&mut port, &work);
         let mut changed = work.clone();
         Arc::make_mut(&mut changed.input.question)
             .context
