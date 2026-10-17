@@ -8,6 +8,7 @@ use rz_search::cpu_value::nnuec::v2;
 use rz_search::cpu_value::nnuec::{NNUEC_MAX_BYTES, NnuecModel};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -102,11 +103,14 @@ fn bounded_file(path: &Path, maximum: usize) -> Result<Vec<u8>, String> {
 
 fn run() -> Result<(), String> {
     let arguments: Vec<_> = std::env::args_os().collect();
+    if arguments.len() == 3 && arguments[1] == "--v2-registration" {
+        return v2_registration(Path::new(&arguments[2]));
+    }
     if arguments.len() == 4 && arguments[1] == "--v2" {
         return run_v2(Path::new(&arguments[2]), Path::new(&arguments[3]));
     }
     if arguments.len() != 3 {
-        return Err("usage: nnuec_numeric_probe [--v2] CHECKPOINT_JSON REQUEST_JSON".into());
+        return Err("usage: nnuec_numeric_probe [--v2] CHECKPOINT_JSON REQUEST_JSON; or --v2-registration CHECKPOINT_JSON".into());
     }
     let checkpoint = bounded_file(Path::new(&arguments[1]), NNUEC_MAX_BYTES)?;
     let model = NnuecModel::from_reader(checkpoint.as_slice()).map_err(|e| e.to_string())?;
@@ -165,6 +169,28 @@ fn run() -> Result<(), String> {
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, &record).map_err(|e| e.to_string())?;
     stdout.write_all(b"\n").map_err(|e| e.to_string())
+}
+
+/// Metadata-only actual parser/readback. This branch neither constructs a
+/// board/context/local accumulator nor calls an encoder, head, or forward.
+/// Its serialized descriptor is not an original loaded Collection capability.
+fn v2_registration(checkpoint_path: &Path) -> Result<(), String> {
+    let checkpoint = bounded_file(checkpoint_path, NNUEC_MAX_BYTES)?;
+    let model = v2::Model::from_reader(checkpoint.as_slice()).map_err(|error| error.to_string())?;
+    let registration = model.registration().map_err(|error| error.to_string())?;
+    let record = json!({
+        "domain":"rz-nnuec-v2-asset-registration-readback/1",
+        "weights_raw_sha256":format!("{:x}",Sha256::digest(&checkpoint)),
+        "weights_bytes":checkpoint.len(),
+        "registration":registration,
+        "neural_forwards":0,
+        "optimizer_updates":0,
+        "numeric_acceptance_granted":false,
+        "collection_origin_granted":false,
+    });
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &record).map_err(|error| error.to_string())?;
+    stdout.write_all(b"\n").map_err(|error| error.to_string())
 }
 
 /// The explicit V2 path uses the actual Rules encoder and relation accumulator.
