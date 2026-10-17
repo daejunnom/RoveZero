@@ -462,3 +462,57 @@ launch를 등록했다. 초기 `counter=None`의 실제 AttackRanking과 나중 
   수명을 확인한다. 이 로컬 실행은 성능·기력 자료로 사용하지 않는다.
 
 실제 학습·원격 성능 및 기력 비교·PR 병합은 이번 체크포인트에서 실행하지 않는다.
+
+## 아홉 번째 통합 체크포인트
+
+고정 소스 `c865391`의 Linux 대상 네 crate 전체 타깃 타입 검사와 공통 계약 15개가
+통과했다. Windows에서 search는 961개 통과·기존 선택 실행 2개 미실행,
+experiments는 267개 통과, arena는 286개 통과다. UCI는 704개 통과·2개 실패이며
+전체 성공으로 표시하지 않는다. 두 실패는 실제 PC 질문의 공개 revision 증가와
+테스트 평가기의 고정 `record_revision=0`이 충돌한 경우다. `913fb5e`에서 전용
+fixture가 원 질문 revision을 봉인하도록 수정했으며 제품 수락 guard는 유지한다.
+수정 후 재검증 결과는 이 원 실행과 별도로 기록한다.
+
+원 소스와 빌드·실행 증거를 연결하는 경계도 보완했다.
+
+- `742b8cc`의 source review는 명시적으로 검토한 helper closure·실제 compiled
+  search 사실·원 binary/build/manifest pin을 요구한다. 현재 HEAD를 자동 승인하는
+  registry는 두지 않으며, 최종 literal profile 등록과 실제 소비자 검사는 남아 있다.
+- `6998950` 이후 native upper는 원 resource plan의 FD·bytes·SHA와 같은 lock으로
+  모델 준비 전에 자원 scope를 적용한다. 시작 admission과 종료 후 엄격 비교를
+  분리하며, 불명확한 ancestry·역할별 thread·peak는 실제 적용 성공으로 바꾸지 않는다.
+- `4b4cd23`의 외부 Collection은 원 joined worker source와 같은 RootAdmission을
+  `/2` admission 및 raw3 소비자에 연결한다. own `/1`·기존 raw2 bytes는 유지한다.
+  보고된 외부 nodes를 native credit으로 환산하지 않는다. 엄격 자원 HOLD보다
+  원 corpus 게시·FD 무결성 확인을 먼저 수행한다. 실제 수집 종단 인수는 미실행이다.
+- `57b4723`은 compiled search source 목록의 실제 production child 13개 누락을
+  보완한다. 새 search·resolver implementation pin을 등록하며 과거 pin·semantic
+  revision·기록을 재작성하지 않는다. V5 JSON/Rust 목록도 같은 생산 경로를 등록한다.
+- 확실한 Windows 프로세스 미시작 오류는 원 `CreateProcessW` 실패 코드와 함께
+  보존하고 소유 lease·scratch만 회수한다. 시작 여부가 불명확한 실패에는 적용하지
+  않는다. 전용 저장소 검사 18개 통과·Linux 전용 3개 미실행이며, 최초 오류 193의
+  환경 원인이 규명됐다는 뜻은 아니다.
+
+신경망 import와 optimizer를 차단한 자료 소비자 검사는 `c865391`에서 Windows·WSL
+각각 264개가 통과했다. `639eb32`의 명시적 미학습 NNUEC initializer 검사까지 더한
+순수 Windows 검사는 271개가 통과했다. 실제 초기화·독립 수치 대조·LoadedCollection
+원 발급·GPU·학습·성능 인수는 서로 다른 단계다. Torch 의존 slot/recheck suite는
+순수 실행기의 import 차단에 걸렸으므로 이 통과 수에 넣지 않는다.
+
+잔여 작업과 병렬 책임은 다음과 같다.
+
+1. 총괄·Historical: UCI 두 실패 수정, 최신 Linux 타입·feature·형식·CI와 최종 source
+   literal profile을 확인한다. 독립 NNUEC 수치 대조는 비교기 자체의 실패도 보존한다.
+2. E·N·F: 실제 native R observer 설치, 원 semantic retirement 회수, 원 R publication과
+   연결한 별도 semantic 부속 자료 및 엄격 소비자를 닫는다. 실제 Collection에서
+   게시·재개·FD 검증까지 관측하기 전에는 종단 완료로 표시하지 않는다.
+3. CPU·Manager·Core·F: N05의 원 utility 입력·실제 descendant·새 witness·같은 비용
+   조건을 연결한다. manager fence만으로 whole cost를 닫지 않고 같은 actor의 필수
+   release/cache ACK까지 확인한다. 알려지지 않은 비용·효용은 마스킹하며 실제
+   보존/재방문 ablation이 없는 앞 네 축의 target을 만들지 않는다.
+4. 총괄·N·F: 실제 미학습 P/C source와 NNUEC 자산의 등록·reference·checkpoint·export
+   소비를 검사하고, local RTX 4050에서 수치·물리 수명·정상 종료를 확인한다.
+   이 로컬 검증을 원격 성능·기력 자료로 사용하지 않는다.
+
+실제 optimizer update·본학습·원격 비교·PR 병합은 이번 목표의 완료 조건에 추가하지
+않는다. 소스 준비·CPU 통과·실제 모델/GPU 인수를 분리하고 목표는 계속 진행한다.
