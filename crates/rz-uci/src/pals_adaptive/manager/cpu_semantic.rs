@@ -2,7 +2,7 @@
 //! tickets, NN-input counters, CPU credit and complete-action cost targets.
 use super::*;
 use rz_search::cpu_value::nnuec::v2::capture::{
-    NnuecCaptureLimits, NnuecCaptureReservation, NnuecCaptureRetirement,
+    NnuecCaptureEnding, NnuecCaptureLimits, NnuecCaptureReservation, NnuecCaptureRetirement,
 };
 use rz_search::cpu_value::nnuec::v2::review::BoundNnuecReviewContext;
 use rz_search::pals::engine::adaptive_port::AdaptiveNnuecReviewSeal;
@@ -290,9 +290,11 @@ impl<Q> CpuSemanticState<Q> {
                 index += 1;
                 continue;
             };
-            if !retirement.matches_lineage(&held.reservation.lineage())
-                || held.job.is_some_and(|job| job != retirement.job())
-            {
+            let same_original = match retirement.ending() {
+                NnuecCaptureEnding::NotStarted => held.reservation.matches_retirement(retirement),
+                _ => retirement.matches_lineage(&held.reservation.lineage()),
+            };
+            if !same_original || held.job.is_some_and(|job| job != retirement.job()) {
                 held.delivery_failed = true;
                 failures.push(collection_error(
                     "CpuCaptureRetirementMismatch",

@@ -281,6 +281,17 @@ impl NnuecCaptureReservation {
     pub fn retirement(&self) -> Option<&NnuecCaptureRetirement> {
         self.retirement.get()
     }
+    /// The same OnceLock/submission owns this terminal, including a definite
+    /// unqueued NotStarted. This does not assert worker activation or grant a
+    /// semantic witness; those still require matches_lineage after bind_job.
+    pub fn matches_retirement(&self, retirement: &NnuecCaptureRetirement) -> bool {
+        self.retirement.get().is_some_and(|original| {
+            std::ptr::eq(original, retirement)
+                && Arc::ptr_eq(&self.submission, &retirement.submission)
+                && original.job == retirement.job
+                && original.owner == retirement.owner
+        })
+    }
     pub fn error(&self) -> Result<Option<CaptureError>, CaptureError> {
         self.state
             .try_lock()

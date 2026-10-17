@@ -373,6 +373,9 @@ fn lineage_requires_actual_begin_and_rejects_an_equal_metadata_reservation() {
     let retirement = capture.retirement().unwrap();
     assert!(retirement.matches_lineage(&lineage));
     assert!(lineage.matches_retirement(retirement));
+    assert!(capture.matches_retirement(retirement));
+    assert!(capture.clone().matches_retirement(retirement));
+    assert!(!foreign.matches_retirement(retirement));
     assert!(!retirement.matches_lineage(&foreign_lineage));
     worker.shutdown().unwrap();
 }
@@ -707,6 +710,8 @@ fn definite_unqueued_rejection_retires_original_without_claiming_cpu_execution()
     let worker = worker(&fixture);
     let mut job = job(&fixture, &worker, 1, 1);
     let capture = reservation(&fixture, &job, NnuecCaptureLimits::new(1, 1, 1024).unwrap());
+    let equal_metadata = reservation(&fixture, &job, NnuecCaptureLimits::new(1, 1, 1024).unwrap());
+    let lineage = capture.lineage();
     job.enable_nnuec_capture(capture.clone())
         .unwrap_or_else(|_| panic!("attach"));
     let grant = grant(&job, 1, 1);
@@ -715,6 +720,10 @@ fn definite_unqueued_rejection_retires_original_without_claiming_cpu_execution()
     assert!(rejected.proof().is_verified_unqueued());
     let retirement = capture.retirement().expect("known unqueued retirement");
     assert_eq!(retirement.ending(), NnuecCaptureEnding::NotStarted);
+    assert!(capture.matches_retirement(retirement));
+    assert!(!equal_metadata.matches_retirement(retirement));
+    assert!(!retirement.matches_lineage(&lineage));
+    assert!(!lineage.matches_activated_job(retirement.job(), retirement.owner()));
     assert_eq!(retirement.attempted(), 0);
     assert!(retirement.readouts().is_empty());
     let stopped = worker.shutdown().unwrap();
