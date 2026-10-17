@@ -141,6 +141,22 @@ pub enum NnuecRootRetirementError {
     Invalid(&'static str),
 }
 
+impl std::fmt::Display for NnuecRootRetirementError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The original typed payload remains in the retained failure. This
+        // projection reports the actual source rather than a generic release
+        // error; it grants no release, recovery or physical completion proof.
+        match self {
+            Self::Preparation(error) => write!(f, "preparation: {error:?}"),
+            Self::Worker(error) => write!(f, "worker: {error:?}"),
+            Self::Store(error) => write!(f, "store: {error:?}"),
+            Self::Semantic(error) => write!(f, "semantic: {error:?}"),
+            Self::UtilityRoute(error) => write!(f, "utility route: {error:?}"),
+            Self::Invalid(reason) => write!(f, "invalid retirement: {reason}"),
+        }
+    }
+}
+
 struct ExpectedEngineRelease {
     profile: CpuWorkerProfile,
     stack_owner: u64,
@@ -168,24 +184,6 @@ struct RetirementOwners {
     utility_route_rejection: Option<Box<UtilityRouteFinalizationRejection<AdaptivePortQuestion>>>,
 }
 
-/// Opaque original custody for the parent's failure/deadline state. Holding or
-/// dropping this object never joins the actor or destroys an unknown engine.
-#[must_use = "retain original NNUEC cleanup custody until explicit recovery"]
-pub struct NnuecRootRetained {
-    retirement: NnuecRootRetirement,
-    error: Option<NnuecRootRetirementError>,
-}
-
-impl NnuecRootRetained {
-    pub fn phase(&self) -> NnuecRootRetirementPhase {
-        self.retirement.phase()
-    }
-
-    pub fn error(&self) -> Option<&NnuecRootRetirementError> {
-        self.error.as_ref()
-    }
-}
-
 #[must_use = "a retirement failure still owns the same engine/actor custody"]
 pub struct NnuecRootRetirementFailure {
     retirement: NnuecRootRetirement,
@@ -199,13 +197,6 @@ impl NnuecRootRetirementFailure {
 
     pub fn error(&self) -> &NnuecRootRetirementError {
         &self.error
-    }
-
-    pub fn into_retained(self) -> NnuecRootRetained {
-        NnuecRootRetained {
-            retirement: self.retirement,
-            error: Some(self.error),
-        }
     }
 }
 
@@ -305,13 +296,6 @@ impl NnuecRootRetirement {
         }
         owners.utility_route_pending = Some(Box::new(pending));
         Ok(())
-    }
-
-    pub fn into_retained(self) -> NnuecRootRetained {
-        NnuecRootRetained {
-            retirement: self,
-            error: None,
-        }
     }
 
     fn owners(&self) -> &RetirementOwners {

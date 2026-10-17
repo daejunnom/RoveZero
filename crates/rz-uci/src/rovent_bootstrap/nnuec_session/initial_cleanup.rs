@@ -115,26 +115,6 @@ struct Custody {
 pub struct NnuecInitialCleanupRetained {
     custody: Option<Box<Custody>>,
 }
-impl NnuecInitialCleanupRetained {
-    pub fn original_phase(&self) -> InitialNnuecPhase {
-        self.custody().original_phase
-    }
-    pub fn original_failure(&self) -> Option<&InitialNnuecFailure> {
-        self.custody().original_failure.as_ref()
-    }
-    pub fn owners(&self) -> &InitialNnuecCleanupOwners {
-        &self.custody().owners
-    }
-    pub fn observations(&self) -> &NnuecInitialCleanupObservations {
-        &self.custody().observations
-    }
-    pub fn selected_release(&self) -> Option<&InitialResearcherRelease> {
-        self.custody().selected_release.as_ref()
-    }
-    fn custody(&self) -> &Custody {
-        self.custody.as_deref().expect("retained actual custody")
-    }
-}
 impl Drop for NnuecInitialCleanupRetained {
     fn drop(&mut self) {
         // No successful semantic release attests these pins. Any failed physical
@@ -184,17 +164,6 @@ impl NnuecInitialCleanup {
             })),
         }
     }
-    pub fn phase(&self) -> NnuecInitialCleanupPhase {
-        self.phase
-    }
-    pub fn observations(&self) -> &NnuecInitialCleanupObservations {
-        &self
-            .custody
-            .as_deref()
-            .expect("pending actual custody")
-            .observations
-    }
-
     /// No wait loop, fresh deadline, replacement owner, or destructor-based
     /// engine release. Errors advance to retained closure, preserving evidence.
     pub fn step(mut self) -> NnuecInitialCleanupStep {

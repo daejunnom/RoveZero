@@ -937,12 +937,17 @@ impl RoventNnuecSessionDriver {
                 NnuecRootRetirementStep::Pending(pending) => retirement = pending,
                 NnuecRootRetirementStep::Ready(retired) => break retired,
                 NnuecRootRetirementStep::RetainedFailure(failed) => {
+                    let detail = format!(
+                        "actual initial engine/cache release failed in {:?}: {}; original owners retained",
+                        failed.phase(),
+                        failed.error(),
+                    );
                     return Err(self.retain(
                         (
                             native, failed, worker, ledger, root_moves, shutdown, frontier,
                         ),
                         "RoventNnuecAdoptedRelease",
-                        "actual initial engine/cache release failed; original owners retained",
+                        &detail,
                     ));
                 }
             }
@@ -1751,10 +1756,15 @@ impl RoventNnuecSessionDriver {
                 NnuecRootRetirementStep::Pending(pending) => retirement = pending,
                 NnuecRootRetirementStep::Ready(retired) => break retired,
                 NnuecRootRetirementStep::RetainedFailure(failed) => {
+                    let detail = format!(
+                        "same-actor release failed in {:?}: {}; original owners retained",
+                        failed.phase(),
+                        failed.error(),
+                    );
                     return Err(self.retain(
                         (parts.native, failed),
                         "RoventNnuecRetirement",
-                        "same-actor release failed; original owners retained",
+                        &detail,
                     ));
                 }
             }
