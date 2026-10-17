@@ -89,4 +89,32 @@ where
     ) -> Result<&mut CpuCreditLedger, AdaptiveManagerError> {
         Ok(&mut self.researcher.native_mut()?.ledger)
     }
+    pub(super) fn native_credit_outstanding(&self) -> Result<bool, AdaptiveManagerError> {
+        match &self.researcher {
+            ResearcherResources::Native(native) => Ok(native.ledger.global_usage()?.1 != 0),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            ResearcherResources::ProfiledExternal(_) => Ok(false),
+        }
+    }
+    pub(super) fn profiled_owner_closed(&self) -> bool {
+        match &self.researcher {
+            ResearcherResources::Native(_) => true,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            ResearcherResources::ProfiledExternal(source) => match self.close_mode {
+                AdaptiveCloseMode::RootQuiesce => source.root_drained(),
+                AdaptiveCloseMode::ProcessShutdown => {
+                    source.shutdown_snapshot().is_some_and(|result| {
+                        result.as_ref().is_ok_and(|receipt| {
+                            receipt.cleanup_complete
+                                && receipt.exit_observed
+                                && receipt.stdout_drained
+                                && receipt.stderr_drained
+                                && !receipt.quarantined
+                                && !receipt.ownership_lost
+                        })
+                    })
+                }
+            },
+        }
+    }
 }

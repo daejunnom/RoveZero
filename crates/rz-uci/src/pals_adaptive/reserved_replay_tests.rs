@@ -158,7 +158,8 @@ fn original_retired_heads_wait_for_real_native_settlement_without_reexecution_or
         facts.child_gate.store(true, Ordering::Release);
         manager.prepare_root_ranking(root).unwrap();
         pump(&mut manager, until, |manager| {
-            manager.own[0].binding.is_some() && manager.ledger.global_usage().unwrap().1 != 0
+            manager.own[0].binding.is_some()
+                && manager.native_ledger().unwrap().global_usage().unwrap().1 != 0
         });
         manager.driver_mut().block_replay_while_reserved = true;
         let original_job = manager.own[0].binding.as_ref().unwrap().envelope.id;
@@ -198,7 +199,14 @@ fn original_retired_heads_wait_for_real_native_settlement_without_reexecution_or
             manager.own[0].binding.as_ref().unwrap().envelope.id,
             original_job
         );
-        while manager.ledger.usage(original_job).unwrap().1 != 0 {
+        while manager
+            .native_ledger()
+            .unwrap()
+            .usage(original_job)
+            .unwrap()
+            .1
+            != 0
+        {
             assert!(
                 Instant::now() < until,
                 "actual CPU owner terminal timed out"
@@ -229,7 +237,7 @@ fn original_retired_heads_wait_for_real_native_settlement_without_reexecution_or
             1
         );
         assert_eq!(facts.started.lock().unwrap().len(), nn_before);
-        let (spent, reserved) = manager.ledger.global_usage().unwrap();
+        let (spent, reserved) = manager.native_ledger().unwrap().global_usage().unwrap();
         let work = manager
             .driver()
             .replay_frontier

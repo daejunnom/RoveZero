@@ -392,6 +392,9 @@ where
         &self,
         mode: ExecutionMode,
     ) -> Result<Option<PeerFollowupDisposition>, AdaptiveManagerError> {
+        if self.researcher_source_kind() != AdaptiveResearcherSourceKind::Native {
+            return Ok(Some(PeerFollowupDisposition::ModeUnsupported));
+        }
         let (spent, reserved) = self.native_ledger()?.global_usage()?;
         Ok(if !mode.has_native_r() {
             Some(PeerFollowupDisposition::ModeUnsupported)

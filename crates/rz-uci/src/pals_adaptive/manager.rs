@@ -104,6 +104,12 @@ mod profiled_external_receipt;
 pub use profiled_external_receipt::{
     ProfiledExternalPersistentParts, ProfiledExternalShutdownReceipt,
 };
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod profiled_external_manager;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use profiled_external_manager::{
+    ProfiledExternalExecutionManager, ProfiledExternalManagerAdmissionRejection,
+};
 mod frontier;
 mod goal_local;
 mod goals;
@@ -184,6 +190,7 @@ pub enum AdaptiveManagerError {
     Frontier(FrontierError),
     GoalLocalBlocked(GoalLocalBlockReason),
     NnuecPreparation(NnuecWorkError),
+    ProfiledExternal(rz_search::cpu_checker::CheckerError),
     AdmissionClosed,
     ReviewLeaseBackpressure {
         current: usize,
@@ -282,6 +289,24 @@ pub struct CandidateFrame<Q> {
 /// archive I/O, an external pipe drain, or wait for a worker. Archive effects
 /// remain with the independent archive owner and finish after worker fences.
 pub trait AdaptiveSearchDriver<Q> {
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn validate_profiled_external_registration(
+        &self,
+        _: &rz_search::external_cpu::ProfiledExternalRootSource,
+        _: &Arc<crate::rovent_root_admission::RoventRootAdmission>,
+    ) -> Result<(), AdaptiveManagerError> {
+        Err(AdaptiveManagerError::ProfiledExternal(
+            rz_search::cpu_checker::CheckerError::Unsupported(
+                "driver has no original profiled external source registration",
+            ),
+        ))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    fn profiled_external_work(
+        &self,
+    ) -> Option<rz_search::pals::rovent_frontier::FrontierExternalWork> {
+        None
+    }
     fn root_rules(&self) -> Arc<ContractState>;
     fn validate_cpu_nnuec_model(
         &self,
@@ -5935,24 +5960,24 @@ where
                         .filter_map(|slot| slot.worker.as_ref().map(CpuWorker::profile))
                         .collect()
                 };
-                let question = self
-                    .driver
-                    .cpu_question(
-                        &work,
-                        &profiles,
-                        self.external.as_ref().map(|external| &external.config),
-                        self.registration.endpoints,
-                        physical_budget_exhausted,
-                    )
-                    .map_err(|error| match error {
-                        AdaptiveManagerError::Semantic(detail) => {
-                            let usage = self.native_ledger()?.global_usage();
-                            AdaptiveManagerError::Semantic(format!(
-                                "CPU question dispatch manager_spent_reserved={usage:?}; {detail}"
-                            ))
-                        }
-                        other => other,
-                    })?;
+                let question = match self.driver.cpu_question(
+                    &work,
+                    &profiles,
+                    self.external.as_ref().map(|external| &external.config),
+                    self.registration.endpoints,
+                    physical_budget_exhausted,
+                ) {
+                    Ok(question) => question,
+                    Err(AdaptiveManagerError::Semantic(detail)) => {
+                        let usage = self
+                            .native_ledger()
+                            .and_then(|ledger| ledger.global_usage().map_err(Into::into));
+                        return Err(AdaptiveManagerError::Semantic(format!(
+                            "CPU question dispatch manager_spent_reserved={usage:?}; {detail}"
+                        )));
+                    }
+                    Err(other) => return Err(other),
+                };
                 match question {
                     CpuQuestion::OwnBudgetExhausted {
                         semantic_limit,
@@ -6931,6 +6956,8 @@ where
                     })?,
             }
         }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        self.begin_profiled_close(until, mode)?;
         // Prepared/running logical cancellation never releases a GPU buffer.
         for role in &self.roles {
             self.native.cancel(role.preparation).ok();
@@ -6948,6 +6975,10 @@ where
             let until = self.cleanup_until()?;
             self.begin_selected_shutdown(until)?;
             changed = true;
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        {
+            changed |= self.poll_profiled_close()?;
         }
         for index in 0..self.own.len() {
             if self.own[index].joined {
@@ -7126,8 +7157,7 @@ where
             self.ready_ids.clear();
             self.validator_waiting.clear();
             self.root_ranking_proof = None;
-            let (_, reserved) = self.native_ledger()?.global_usage()?;
-            if reserved != 0
+            if self.native_credit_outstanding()?
                 || self.own.iter().any(|slot| slot.binding.is_some())
                 || self.foreign.is_some()
             {
@@ -7192,16 +7222,20 @@ where
         })
     }
     fn external_owner_closed(&self) -> bool {
-        self.external
-            .as_ref()
-            .is_none_or(|external| match self.close_mode {
-                AdaptiveCloseMode::ProcessShutdown => self.external_finished == Some(true),
-                AdaptiveCloseMode::RootQuiesce => self.external_root_fence.is_some_and(|fence| {
-                    fence.authority() == self.registration.authority
-                        && fence.owner() == external.owner
-                        && fence.permits_reuse()
-                }),
-            })
+        self.profiled_owner_closed()
+            && self
+                .external
+                .as_ref()
+                .is_none_or(|external| match self.close_mode {
+                    AdaptiveCloseMode::ProcessShutdown => self.external_finished == Some(true),
+                    AdaptiveCloseMode::RootQuiesce => {
+                        self.external_root_fence.is_some_and(|fence| {
+                            fence.authority() == self.registration.authority
+                                && fence.owner() == external.owner
+                                && fence.permits_reuse()
+                        })
+                    }
+                })
     }
     /// Caller chooses and renews a finite window. There is no user-visible
     /// hidden infinite retry or manager spin loop. Notification shares the CPU
@@ -7242,6 +7276,15 @@ where
         canceled: &AtomicBool,
         observer: &mut dyn FnMut(&mut Self) -> Result<(), AdaptiveManagerError>,
     ) -> Result<AdaptiveShutdownReceipt, AdaptiveManagerError> {
+        self.run_owner_until_observed(until, canceled, observer)?;
+        self.shutdown_receipt()
+    }
+    fn run_owner_until_observed(
+        &mut self,
+        until: Instant,
+        canceled: &AtomicBool,
+        observer: &mut dyn FnMut(&mut Self) -> Result<(), AdaptiveManagerError>,
+    ) -> Result<(), AdaptiveManagerError> {
         let until = self
             .cleanup_boundary
             .map_or(until, |boundary| boundary.cap(until));
@@ -7265,12 +7308,12 @@ where
                 self.begin_selected_shutdown(self.cleanup_until()?)?;
             }
             if self.phase == ManagerPhase::Finished {
-                return self.shutdown_receipt();
+                return Ok(());
             }
             if Instant::now() >= until {
                 self.begin_selected_shutdown(until)?;
                 self.tick()?;
-                return self.shutdown_receipt();
+                return Ok(());
             }
             if !changed {
                 // The closing poll bounds the scheduling gap between final

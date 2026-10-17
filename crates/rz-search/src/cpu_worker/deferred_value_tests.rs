@@ -558,7 +558,10 @@ fn cancelled_starting_owner_retains_original_bound_and_can_only_be_joined_for_cl
         view,
         cancel,
         actor,
+        terminal,
     } = fixture();
+    assert!(terminal.matches_original(&model, &view));
+    assert!(terminal.allows_c_only_cleanup());
     let source = DeferredNnuecRSource::new(Arc::clone(&model), plan(false));
     let weak_bound = Arc::downgrade(&bound);
     let weak_view = Arc::downgrade(&view);
@@ -568,6 +571,7 @@ fn cancelled_starting_owner_retains_original_bound_and_can_only_be_joined_for_cl
     drop(bound);
     drop(view);
     let starting = start(&source, materialize(request));
+    assert!(!terminal.allows_c_only_cleanup());
     cancel.store(true, Ordering::Release);
     actor.shutdown().unwrap();
     assert!(weak_bound.upgrade().is_some());
@@ -598,6 +602,7 @@ fn cancelled_starting_owner_retains_original_bound_and_can_only_be_joined_for_cl
     drop(retained);
     assert!(weak_bound.upgrade().is_none());
     assert!(weak_view.upgrade().is_none());
+    drop(terminal);
 }
 
 #[test]

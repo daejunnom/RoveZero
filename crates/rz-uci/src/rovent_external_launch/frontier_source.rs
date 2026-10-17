@@ -69,9 +69,12 @@ impl RoventExternalOwner {
                 .map(digest)
                 .transpose()?
                 != Some(root.startup_lock_digest())
-            || !self
-                .worker
-                .configuration_matches(&self.launch.configuration()?)
+            || !self.worker.configuration_matches(
+                &self.launch.configuration()?,
+                profile.engine,
+                profile.purpose,
+                source.worker_owner(),
+            )
         {
             return Err(invalid(
                 "worker source differs from original launch/lock/root/clock",

@@ -343,7 +343,10 @@ fn actual_reciprocal_native_acceptance_resumes_the_same_cpu_owner_and_settles_on
     assert_eq!(manager.driver().reciprocal_replies, 1);
     assert_eq!(manager.driver().consumed.len(), 3);
     let actual = manager.driver().actual_cpu[0].cumulative_nodes;
-    assert_eq!(manager.ledger.global_usage().unwrap(), (actual, 0));
+    assert_eq!(
+        manager.native_ledger().unwrap().global_usage().unwrap(),
+        (actual, 0)
+    );
     assert_eq!(manager.counters().cpu_yields, 0);
     assert_eq!(facts.accepted.lock().unwrap().len(), 3);
     assert!(shutdown(&mut manager, until).permits_archive_close());
@@ -405,7 +408,7 @@ fn actual_r_to_critic_reply_preserves_the_original_owner_and_root_budget() {
         1
     );
     assert_eq!(
-        manager.ledger.global_usage().unwrap(),
+        manager.native_ledger().unwrap().global_usage().unwrap(),
         (manager.driver().actual_cpu[0].cumulative_nodes, 0)
     );
     assert!(shutdown(&mut manager, until).permits_archive_close());
@@ -434,7 +437,15 @@ fn root_revoke_retains_waiting_cpu_token_until_actual_discard_and_never_consumes
         })
     });
     let pending_job = manager.own[0].binding.as_ref().unwrap().envelope.id;
-    assert_eq!(manager.ledger.usage(pending_job).unwrap().1, 0);
+    assert_eq!(
+        manager
+            .native_ledger()
+            .unwrap()
+            .usage(pending_job)
+            .unwrap()
+            .1,
+        0
+    );
     assert_eq!(
         manager
             .native_peer_unavailable(ExecutionMode::CpuPcr)
@@ -450,7 +461,10 @@ fn root_revoke_retains_waiting_cpu_token_until_actual_discard_and_never_consumes
     assert!(receipt.permits_archive_close());
     assert_eq!(manager.driver().reciprocal_replies, 0);
     assert!(manager.driver().actual_cpu.is_empty());
-    assert_eq!(manager.ledger.global_usage().unwrap().1, 0);
+    assert_eq!(
+        manager.native_ledger().unwrap().global_usage().unwrap().1,
+        0
+    );
     assert!(manager.own[0].binding.is_none());
 }
 
@@ -559,6 +573,9 @@ fn repeated_optional_peer_questions_close_as_typed_no_progress_and_commit_the_so
     assert_eq!(manager.driver().consumed.len(), 5);
     assert_eq!(facts.accepted.lock().unwrap().len(), 5);
     assert!(manager.accepted_roles.is_empty());
-    assert_eq!(manager.ledger.global_usage().unwrap().1, 0);
+    assert_eq!(
+        manager.native_ledger().unwrap().global_usage().unwrap().1,
+        0
+    );
     assert!(shutdown(&mut manager, until).permits_archive_close());
 }

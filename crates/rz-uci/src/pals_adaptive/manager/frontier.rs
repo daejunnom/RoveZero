@@ -147,7 +147,8 @@ where
         if !matches!(
             error,
             AdaptiveManagerError::Frontier(FrontierError::NodesReserved)
-        ) || self.phase != ManagerPhase::Running
+        ) || self.researcher_source_kind() != AdaptiveResearcherSourceKind::Native
+            || self.phase != ManagerPhase::Running
             || !self.quarantined_cpu_receipts.is_empty()
             || self
                 .native_frontier_events
