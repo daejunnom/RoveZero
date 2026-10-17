@@ -2557,6 +2557,21 @@ impl OwnPalsOnnxCollectionDriver {
             ),
         };
         checked_source(&description)?;
+        // Split legacy search helpers are a compiled-source observation too.
+        // A reader must still match an independent closed review profile and
+        // the original build/manifest/binary pins; this fact enrolls nothing.
+        if let Some(facts) = description
+            .native
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            facts.insert(
+                "search_implementation_sha256".into(),
+                serde_json::json!(hex(
+                    rz_search::pals::engine::compiled_search_implementation_sha256()
+                )),
+            );
+        }
         let sink = Arc::new(Mutex::new(Sink {
             context: None,
             source: description.clone(),
