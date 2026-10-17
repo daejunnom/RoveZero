@@ -1555,13 +1555,21 @@ impl LineageEntry {
             pc_genealogy: r.lineage.pc_genealogy.clone(),
         }
     }
-    fn from_pc(r: &RoventTrainingRecord, c: &RoventCorpusManifest) -> Self {
+    fn from_pc(
+        r: &RoventTrainingRecord,
+        c: &RoventCorpusManifest,
+        producer_manifest_sha256: &str,
+    ) -> Self {
         Self {
             source: PC_SOURCE,
             record_sha256: r.record_sha256.clone(),
             origin_sha256: r.origin_sha256.clone(),
             input_sha256: r.input_sha256.clone(),
-            producer_sha256: r.manifest_sha256.clone(),
+            // The P/C record has no manifest field. F's original lineage
+            // projection uses the owner's canonical manifest seal, not the
+            // distinct native source aggregate. The caller supplies the exact
+            // seal already joined to the original external publication.
+            producer_sha256: producer_manifest_sha256.to_owned(),
             stage_id: c.stage_id.clone(),
             round_id: c.round_id.clone(),
             teacher_actor_id: r.lineage.teacher_actor_id.clone(),
@@ -1657,7 +1665,11 @@ fn global_training_rows(
                         && seen.insert(row.record_sha256.clone()),
                     "R PC original row/index occurrence mismatch",
                 )?;
-                push(LineageEntry::from_pc(&row, &owner.manifest))?;
+                push(LineageEntry::from_pc(
+                    &row,
+                    &owner.manifest,
+                    &owner.publication.canonical_manifest_sha256,
+                ))?;
                 count += 1;
             }
             check(count == chunk.records, "R PC original lineage chunk count")?;

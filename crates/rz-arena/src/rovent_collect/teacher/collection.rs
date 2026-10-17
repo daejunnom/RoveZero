@@ -50,6 +50,11 @@ pub struct RoventCollectionTeacherBinding {
     root_admission: Arc<rz_uci::rovent_root_admission::RoventRootAdmission>,
     raw: Value,
 }
+impl RoventCollectionTeacherBinding {
+    pub fn input_sha256(&self) -> &str {
+        &self.input_sha256
+    }
+}
 impl RoventCorpusProducer {
     /// 실제 원 입력 seal의 read-only projection이다. 반환 metadata만으로
     /// worker 완료·학습 target을 만들 수 없고 아래 opaque binding이 별도 필요하다.

@@ -375,6 +375,11 @@ impl CollectionTeacherWorker {
     pub fn signal(&self) -> CompletionSignal {
         self.mailbox.signal()
     }
+    /// A control channel alone grants neither admission nor teacher authority.
+    /// Returning it here keeps upper collectors independent of runtime details.
+    pub fn control_mailbox(&self, id: TeacherJobId) -> ControlMailbox<TeacherJobId> {
+        ControlMailbox::new(id, self.signal())
+    }
     pub fn occupancy(&self) -> MailboxOccupancy {
         self.mailbox.occupancy()
     }

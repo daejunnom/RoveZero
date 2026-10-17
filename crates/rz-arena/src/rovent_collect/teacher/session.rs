@@ -47,7 +47,7 @@ impl RoventCollectionTeacherCompleted {
         &self.completion
     }
     pub fn input_sha256(&self) -> &str {
-        &self.binding.input_sha256
+        self.binding.input_sha256()
     }
     pub fn actor_id(&self) -> &str {
         &self.actor
