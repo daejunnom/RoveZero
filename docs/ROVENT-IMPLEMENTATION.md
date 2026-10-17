@@ -368,3 +368,43 @@ entry·실제 NNUEC R·GPU·학습의 인수로 확대하지 않는다.
 
 성능·기력 비교와 실제 학습은 이 checkpoint에 포함하지 않는다. O01~O04의 조건부
 후속 연구를 기반 구현의 선행 조건으로 추가하지 않는다.
+
+## 일곱 번째 통합 체크포인트
+
+검사는 별도 검증 worktree의 고정 SHA에서 수행하고, 병렬 작업 중인 소스와
+구분한다. 다음 수치는 서로 겹치는 suite가 있으므로 합산하지 않는다.
+
+| 고정 소스·실제 검사 | 결과와 한계 |
+|---|---|
+| `3792d7d`, Linux 네 crate 전체 target 타입 검사 | 통과. `pals-collection-onnx`와 그 의존 feature 조합이며 실제 ELF·신경망 실행은 아님 |
+| 같은 소스, 공통 계약 | 15개 통과 |
+| 같은 소스, search | 903개 통과·5개 실패·기존 선택 실행 2개 미실행 |
+| `e7e488b`, Linux 타입·공통 계약 | 통과·15개 통과 |
+| 같은 소스, search | 906개 통과·4개 실패·기존 선택 실행 2개 미실행. UCI·experiments 단계에는 도달하지 않음 |
+| `45cc094`, 제출 입력·기존/새 corpus·teacher·R ancestry 순수 검사 | Windows·WSL 각각 215개 통과. neural import를 차단했으며 forward·optimizer 실행 없음 |
+| `fb777dc`, R auxiliary 순수 검사 | Windows·WSL 각각 83개 통과. 위 suite와 중복됨 |
+| 같은 소스, native build bundle 순수 검사 | Windows 7개 통과·Linux 전용 3개 미실행, WSL 10개 통과 |
+
+search 실패 자료는 보존한다. 잘못된 fixture의 미청구 Rules 경로와 모델 value 등록을
+수정하되 제품 guard를 완화하지 않는다. 새 CPU observation의 실제 출처는 동기 경로에도
+연결하며, 십진 f32 고정 WDL의 오차는 허용 오차를 늘리지 않고 정확한 입력으로 고친다.
+이 후속 수정과 새 제품 세션의 검사는 위 결과 이후에 별도로 수행한다.
+
+새 소스는 다음 경계를 연결했다. 이것은 최종 인수표가 아니다.
+
+- 원 selected view의 source snapshot 배열을 공유하고, 실제 worker가 활성화한
+  capture lineage와 Job 수준의 raw/검색 소비/P-C view 소비 witness를 구분한다.
+- 이미 지불한 GoalLocal 전이를 재시도할 때에도 취소·마감·불명확한 native 수명을
+  검사한다. 미회수 입력과 Repair 보고서는 같은 semantic owner에 보존한다.
+- 같은 ticket의 Ponder 시계와 출력, 초기 C·미착수 materialization·종료한 worker의
+  서로 다른 cleanup 권한, 명시 startup configuration `/2`를 연결한다.
+- 외부 R의 실제 current-root source·stop/drain·reset proof를 별도 타입으로 제공한다.
+  외부 reported nodes를 native credit으로 환산하지 않는다.
+- submitted input `/1`, raw `/3`, corpus `/2`를 별도 형식으로 소비하고 원 형식의
+  canonical과 ancestry를 유지한다. known divergence의 실제 owner 근거 연결은 남았다.
+
+남은 필수 작업은 네 모드의 제품 실행·정상 종료, 초기 C 중단 후 같은 owner 회수,
+외부 R의 실제 발주·Store·receipt, raw3 수집·퇴역·publication의 종단 연결, 실제
+Repair/teacher/R 출처 검증, 비학습 tensor·checkpoint·export 및 로컬 4050 정확성이다.
+최종 source closure·고정 source pin·동일 SHA CI도 확인해야 한다. 실제 학습은
+이번 목표에서 제외하며, 로컬 검증 결과를 원격 성능·기력 비교로 보고하지 않는다.
