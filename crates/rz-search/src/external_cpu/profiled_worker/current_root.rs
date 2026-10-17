@@ -73,10 +73,16 @@ impl ProfiledExternalRootSource {
     /// 원 출처의 동일성이다. 취소·퇴역 후 cleanup에서도 비교할 수 있으며 현재
     /// admission이 열려 있다는 의미는 별도 validate_current로만 검사한다.
     pub fn same_source(&self, other: &Self) -> bool {
-        self.roots.ptr_eq(&other.roots)
-            && self.shutdown.ptr_eq(&other.shutdown)
+        self.same_worker(other)
             && self.authority == other.authority
             && self.source_sequence == other.source_sequence
+    }
+    /// 다음 root의 source를 같은 실제 worker에 재결합할 때의 opaque 비교다.
+    /// authority·source sequence만 제외하며, 공개 PID나 owner 숫자의 일치만으로
+    /// 다른 worker를 채택하지 않는다. 현재 admission의 liveness와는 별도다.
+    pub fn same_worker(&self, other: &Self) -> bool {
+        self.roots.ptr_eq(&other.roots)
+            && self.shutdown.ptr_eq(&other.shutdown)
             && self.owner == other.owner
             && same_clock(self.clock, other.clock)
             && self.profile == other.profile

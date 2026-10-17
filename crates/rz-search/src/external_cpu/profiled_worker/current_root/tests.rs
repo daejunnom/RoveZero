@@ -95,6 +95,7 @@ fn pure_same_numeric_process_and_root_cannot_join_another_worker() {
     assert_eq!(source.authority(), other.authority());
     assert_eq!(source.process_identity(), other.process_identity());
     assert!(!source.same_source(&other));
+    assert!(!source.same_worker(&other));
 }
 
 #[test]
@@ -171,6 +172,7 @@ fn pure_reset_proof_never_follows_new_root_or_changes_initial_classification() {
     next.authority.root.0 += 1;
     next.source_sequence += 1;
     assert!(!proof.matches_source(&next));
+    assert!(source.same_worker(&next));
     let reset = ProfiledExternalResetProof {
         source: next.clone(),
         previous: Some(source.authority()),
