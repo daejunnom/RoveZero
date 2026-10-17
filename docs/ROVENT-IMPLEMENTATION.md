@@ -722,7 +722,7 @@ retirement·projection·closure·completion·export wrapper는 별도 `/2`다. �
 
 `ValidatedUtilityNumericalParts`와 private typed family를 통해 검증된 수학 부분과
 감독·FD·resource·socket·ACK·atomic 저장 기계만 공유한다. 새 원 dataset/authority가
-현재 peer·lease·읽기 예산·원 update journal·completion을 별도로 보유해야 한다。
+현재 peer·lease·읽기 예산·원 update journal·completion을 별도로 보유해야 한다.
 준비 metadata나 저장된 역사 자료만으로 실제 update·checkpoint·export 성공을
 만들지 않는다. 기존 diagnostic 자산은 승격하지 않는다. 이 연결은 소스 구현과
 비학습 검사의 범위이며 실제 optimizer update·학습을 실행하는 승인은 아니다.

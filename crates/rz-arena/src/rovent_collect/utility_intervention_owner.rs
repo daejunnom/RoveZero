@@ -54,6 +54,9 @@ pub struct RoventHistoricalUtilityInterventionEvidence {
     pub input_sha256: String,
     pub target_sha256: String,
     pub neutral_target_sha256: String,
+    /// Only actual issued and independently checked /2 arms are projected.
+    pub role_queries:
+        Vec<rz_experiments::rovent_utility_intervention_preparation::RoventInterventionRoleQuery>,
     pub submission_target_sha256: String,
     pub utility_context_sha256: String,
     pub known_pairs: Vec<[u8; 2]>,

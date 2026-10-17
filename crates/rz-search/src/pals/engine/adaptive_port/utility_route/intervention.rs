@@ -701,6 +701,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if record.kind != RecordKind::Proposal
             || record.line.is_empty()
             || record.line.len() > 256
+            || record.line.len() > self.engine.config.line_plies
             || metadata.anchor != 0
             || record.line.first() != Some(&action.preparation.first)
             || !view
@@ -721,20 +722,31 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     .root_snapshot()
                     .known_history_len()
                     .checked_add(record.line.len())
+                    // Rules terminal classification also checks one legal
+                    // child with make/unmake; it is bounded scratch, not
+                    // another proposal ply or a larger search allowance.
+                    .and_then(|positions| positions.checked_add(1))
                     .ok_or(PalsError::Capacity)?
                     .max(1),
                 ..rz_position::PositionLimits::default()
             },
         )?;
         let mut has_divergence = false;
+        let mut first_terminal = false;
         let root_side = endpoint.side_to_move();
-        for movement in &record.line {
+        for (ply, movement) in record.line.iter().enumerate() {
             has_divergence |= endpoint.side_to_move() != root_side
                 && matches!(
                     endpoint.classify_position()?.play_status,
                     PlayStatus::Ongoing
                 );
             endpoint.make_move(*movement)?;
+            if ply == 0 {
+                first_terminal = !matches!(
+                    endpoint.classify_position()?.play_status,
+                    PlayStatus::Ongoing
+                );
+            }
         }
         let terminal = !matches!(
             endpoint.classify_position()?.play_status,
@@ -756,11 +768,16 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             unavailable[0] = Some(UtilityInterventionUnavailable::MissingRoleCredit);
             unavailable[1] = Some(UtilityInterventionUnavailable::MissingRoleCredit);
         }
-        if record.line.len() >= self.engine.config.line_plies {
+        // An explicit P intervention re-proposes from the original first
+        // endpoint. A normal completed L-ply Proposal is still a valid target;
+        // neither its neutral record nor its model input is shortened.
+        if self.engine.config.line_plies <= 1 {
             unavailable[0] = Some(UtilityInterventionUnavailable::ProposalAlreadyAtLimit);
         }
-        if terminal {
+        if first_terminal {
             unavailable[0] = Some(UtilityInterventionUnavailable::TerminalProposal);
+        }
+        if terminal {
             unavailable[2] = Some(UtilityInterventionUnavailable::TerminalProposal);
         }
         if !has_divergence {
@@ -805,18 +822,17 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             {
                 return Err(RoleError::InvalidOutput.into());
             }
-            let endpoint = self.replay_node(&target.proposal)?;
             let (node, stage, prefix) = match recipient {
                 UtilityRouteRecipient::Proposer => (
-                    endpoint,
+                    self.replay_node(&[target.preparation.first])?,
                     RefinementStage::ProposalContinuation,
-                    target.proposal.clone(),
+                    vec![target.preparation.first],
                 ),
                 UtilityRouteRecipient::Critic => {
                     (self.root, RefinementStage::CriticDivergence, Vec::new())
                 }
                 UtilityRouteRecipient::Researcher => (
-                    endpoint,
+                    self.replay_node(&target.proposal)?,
                     RefinementStage::CpuValidation,
                     target.proposal.clone(),
                 ),
@@ -957,14 +973,17 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
 
 #[cfg(test)]
 mod tests {
-    // Authored public proposal and real tiny CPU NNUEC preparation. These
-    // component tests run neither P/C neural inference nor an R search and
+    // Production proposal publication with authored accepted role outputs,
+    // followed by real tiny CPU NNUEC preparation. These component tests run
+    // neither P/C neural inference nor an R search and
     // do not attest a manager's native role/installed-owner acceptance.
     use super::*;
     use crate::contract_time::InstantClock;
     use crate::cpu_value::nnuec::v2::review::{BoundNnuecReviewContext, PreparationActor};
     use crate::cpu_worker::CpuCreditLedger;
-    use crate::pals::coordinator::{CoordinatorError, RefinementMachine};
+    use crate::pals::coordinator::{
+        CoordinatorError, ProposerRankingPublished, RefinementMachine, StepEvidence,
+    };
     use crate::pals::rovent_engine::RootMoveDomain;
     use crate::pals::rovent_frontier::{FrontierLimits, FrontierRegistration};
     use rz_contracts::MonotonicTick;
@@ -975,6 +994,13 @@ mod tests {
     type Work = CoordinatorWork<ReviewView, AdaptivePortQuestion>;
     type Machine = RefinementMachine<ReviewView, AdaptivePortQuestion>;
 
+    struct SourceReplay {
+        ranking: ProposerRankingPublished,
+        initial: Work,
+        ticket: RoleTicketEnvelope,
+        completed_evidence: ContractDigest,
+    }
+
     fn fixture() -> (
         Port,
         Machine,
@@ -982,14 +1008,17 @@ mod tests {
         UtilityInterventionTarget,
         Arc<BoundNnuecReviewContext>,
         PreparationActor,
+        SourceReplay,
     ) {
         let value = LegalOrderRoleMock.value_identity().unwrap().clone();
+        let model_key = ContractDigest(Sha256::digest(value.model.as_bytes()).into());
+        let encoding_key = ContractDigest(Sha256::digest(value.encoding.as_bytes()).into());
         let namespace = AdaptiveModelNamespace::new(
             value.clone(),
-            ContractDigest([5; 32]),
-            ContractDigest([6; 32]),
+            model_key,
+            encoding_key,
             rz_contracts::PrecisionProfile::Fp32,
-            1,
+            0,
         )
         .unwrap();
         let model =
@@ -997,10 +1026,11 @@ mod tests {
                 .unwrap();
         let mut port = super::super::super::port_tests::setup_with_model(
             Position::startpos(),
-            4,
+            2,
             ResolverPolicy::OwnRawRestricted,
             model,
         );
+        port.engine.config.beam_width = 1;
         let clock = port.deadline.clock;
         let root_moves = Arc::new(RootMoveDomain::new(&port.rules, None).unwrap());
         let ledger = CpuCreditLedger::new(
@@ -1049,42 +1079,68 @@ mod tests {
         .unwrap();
         port.prepare_rovent_root_rules(clock, MonotonicTick(0))
             .unwrap();
-        let line = ["e2e4", "e7e5"].map(|text| BoardMove::from_uci(text).unwrap());
-        port.replay_node(&line).unwrap();
-        port.record_hot(RecordKind::Proposal, &line, None).unwrap();
-        let input = port
-            .input(
-                port.root,
-                RefinementStage::ProposerRanking,
-                Some(line[0]),
-                Vec::new(),
-                line.to_vec(),
-                None,
-                None,
-                None,
-                false,
-                None,
-                None,
-            )
-            .unwrap();
-        let budget = FrameBudget {
-            role_submissions_remaining: 8,
-            original_cpu_credit: port.limits.max_cpu_nodes,
-            original_store_byte_limit: 8 * 1024 * 1024,
-        };
+        // Follow the production make_root_candidate -> continuation ->
+        // completed Proposal path. An authored short record could hide the
+        // fact that ordinary proposals are published only at L/terminal.
+        let (ranking, _registry) =
+            super::super::super::port_tests::accepted_root_ranking(&mut port);
+        let candidate = port.ranking_published(&ranking).unwrap().pop().unwrap();
+        assert_eq!(candidate.input.stage, RefinementStage::ProposalContinuation);
         let mut machine = Machine::new(port.authority, port.deadline, 512).unwrap();
         let frame = machine
-            .admit(
-                ContractMove16::encode(rz_contracts::Move::try_from(line[0]).unwrap()),
-                input,
-                budget,
-                port.deadline.clock,
-                MonotonicTick(0),
+            .admit_candidate(
+                &ranking,
+                candidate.first_move,
+                candidate.input.clone(),
+                candidate.budget,
+                clock,
+                MonotonicTick(4),
             )
             .unwrap();
-        let work = machine
-            .ready_work(frame, port.deadline.clock, MonotonicTick(0))
+        port.root_candidate_admitted(frame, candidate.first_move, &candidate.input)
             .unwrap();
+        let initial = machine.ready_work(frame, clock, MonotonicTick(4)).unwrap();
+        let (mut ticket, mut output) = super::super::super::port_tests::output(&initial, 2);
+        ticket.representation.model = model_key;
+        ticket.representation.encoding = encoding_key;
+        ticket.representation.frozen_epoch = 0;
+        output.key = ticket.representation;
+        machine
+            .bind_role(frame, &ticket, clock, MonotonicTick(4))
+            .unwrap();
+        let running = machine
+            .bound_work(frame, StepExecution::Role(ticket.id))
+            .unwrap();
+        let step = port.commit_role(&running, &ticket, &output, None).unwrap();
+        port.role_consumed(&ticket, &running.input.view).unwrap();
+        let step = port.materialize_step(step).unwrap();
+        let completed_evidence = step.evidence;
+        machine
+            .resolve(
+                StepEvidence {
+                    frame,
+                    stage: running.input.stage,
+                    execution: StepExecution::Role(ticket.id),
+                    submitted_question: running.input.question_digest,
+                    submitted_view: running.input.view_seal,
+                    completed_evidence: step.evidence,
+                },
+                step.transition,
+                clock,
+                MonotonicTick(4),
+            )
+            .unwrap();
+        assert_eq!(port.counters.proposals, 1);
+        let work = machine
+            .ready_work(frame, port.deadline.clock, MonotonicTick(4))
+            .unwrap();
+        assert_eq!(work.input.stage, RefinementStage::CpuValidation);
+        let line = work.input.question.proposal.clone();
+        assert_eq!(
+            line.len(),
+            port.engine.config.line_plies,
+            "ordinary completed L-ply Proposal"
+        );
         let target = work
             .input
             .view
@@ -1126,13 +1182,26 @@ mod tests {
             .unwrap();
         let target = port
             .bind_utility_intervention_target(preparation, source, input)
-            .unwrap_or_else(|_| panic!("actual same-Request target"));
-        (port, machine, work, target, bound, actor)
+            .unwrap_or_else(|rejected| panic!("actual same-Request target: {:?}", rejected.error));
+        (
+            port,
+            machine,
+            work,
+            target,
+            bound,
+            actor,
+            SourceReplay {
+                ranking,
+                initial,
+                ticket,
+                completed_evidence,
+            },
+        )
     }
 
     #[test]
     fn historical_target_codec_matches_actual_capture_without_new_authority_or_pins() {
-        let (port, mut machine, work, target, _bound, actor) = fixture();
+        let (port, mut machine, work, target, _bound, actor, _replay) = fixture();
         let capture = target.input_capture();
         let before_pins = port.engine.semantic.stores.review_pin_count().unwrap();
         let metadata = utility_intervention_target_digest_preimage(capture).unwrap();
@@ -1188,7 +1257,8 @@ mod tests {
             UtilityRouteRecipient::Proposer,
             UtilityRouteRecipient::Critic,
         ] {
-            let (mut port, mut machine, work, target, bound, actor) = fixture();
+            let (mut port, mut machine, work, target, bound, actor, _replay) = fixture();
+            let full_proposal = work.input.question.proposal.clone();
             assert_eq!(
                 target.supported_recipients().collect::<Vec<_>>(),
                 [
@@ -1230,12 +1300,20 @@ mod tests {
             let preimage = utility_intervention_arm_question_preimage(&arm).unwrap();
             assert_eq!(preimage.digest(), arm.input.question_digest);
             assert_ne!(arm.input.question_digest, work.input.question_digest);
+            assert_eq!(arm.input.view.query().proposal, full_proposal);
             assert_eq!(
-                arm.input.view.query().proposal,
-                [
-                    BoardMove::from_uci("e2e4").unwrap(),
-                    BoardMove::from_uci("e7e5").unwrap()
-                ]
+                full_proposal.len(),
+                port.engine.config.line_plies,
+                "normal completed Proposal remains the full neutral target"
+            );
+            assert_eq!(
+                arm.input.view.query().prefix,
+                if recipient == UtilityRouteRecipient::Proposer {
+                    vec![full_proposal[0]]
+                } else {
+                    Vec::new()
+                },
+                "only P restarts its bounded proposal from the original first endpoint"
             );
             assert_eq!(
                 arm.input.view.query().counterexample,
@@ -1279,7 +1357,7 @@ mod tests {
 
     #[test]
     fn intervention_admission_closed_returns_original_candidate_and_retains_source() {
-        let (mut port, mut machine, work, target, _bound, actor) = fixture();
+        let (mut port, mut machine, work, target, _bound, actor, _replay) = fixture();
         let candidate = port
             .prepare_utility_intervention(target, UtilityRouteRecipient::Critic)
             .unwrap_or_else(|_| panic!("actual C candidate"));
@@ -1300,18 +1378,37 @@ mod tests {
 
     #[test]
     fn intervention_rejects_another_machine_even_with_the_same_work_arcs_and_authority() {
-        let (mut port, mut original, work, target, _bound, actor) = fixture();
+        let (mut port, mut original, work, target, _bound, actor, replay) = fixture();
         let candidate = port
             .prepare_utility_intervention(target, UtilityRouteRecipient::Critic)
             .unwrap_or_else(|_| panic!("actual candidate"));
         let mut foreign = Machine::new(port.authority, port.deadline, 512).unwrap();
         let frame = foreign
-            .admit(
-                work.original_first_move,
-                work.input.clone(),
-                work.budget,
+            .admit_candidate(
+                &replay.ranking,
+                replay.initial.original_first_move,
+                replay.initial.input.clone(),
+                replay.initial.budget,
                 port.deadline.clock,
-                MonotonicTick(0),
+                MonotonicTick(4),
+            )
+            .unwrap();
+        foreign
+            .bind_role(frame, &replay.ticket, port.deadline.clock, MonotonicTick(4))
+            .unwrap();
+        foreign
+            .resolve(
+                StepEvidence {
+                    frame,
+                    stage: replay.initial.input.stage,
+                    execution: StepExecution::Role(replay.ticket.id),
+                    submitted_question: replay.initial.input.question_digest,
+                    submitted_view: replay.initial.input.view_seal,
+                    completed_evidence: replay.completed_evidence,
+                },
+                FrameTransition::Continue(work.input.clone()),
+                port.deadline.clock,
+                MonotonicTick(4),
             )
             .unwrap();
         assert_eq!(
@@ -1350,7 +1447,7 @@ mod tests {
 
     #[test]
     fn intervention_expiry_keeps_original_cap_and_does_not_issue_a_frame() {
-        let (mut port, mut machine, work, target, _bound, actor) = fixture();
+        let (mut port, mut machine, work, target, _bound, actor, _replay) = fixture();
         let candidate = port
             .prepare_utility_intervention(target, UtilityRouteRecipient::Critic)
             .unwrap_or_else(|_| panic!("actual C candidate"));

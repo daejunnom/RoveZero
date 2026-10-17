@@ -3,7 +3,7 @@
 use super::*;
 use crate::pals_adaptive::utility_intervention::*;
 use rz_search::cpu_value::nnuec::v2::retirement::{NnuecCacheInvalidation, NnuecCacheReleaseAck};
-use rz_search::cpu_value::nnuec::v2::review::{BoundNnuecReviewContext, PreparationActor, Request};
+use rz_search::cpu_value::nnuec::v2::review::{BoundNnuecReviewContext, PreparationActor};
 use rz_search::pals::engine::adaptive_port::utility_route::{
     UtilityInterventionAdmission, UtilityInterventionCandidate, UtilityInterventionTarget,
     UtilityRouteRecipient,

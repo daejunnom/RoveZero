@@ -179,8 +179,8 @@ pub(super) fn output(work: &Work, id: u64) -> (RoleTicketEnvelope, RoleOutput) {
 
 /// This CPU/mock owner crosses the real linear registry acceptance boundary.
 /// Its authored output is not native neural execution or GPU acceptance proof.
-fn accepted_root_ranking(
-    port: &mut Port,
+pub(in crate::pals::engine::adaptive_port) fn accepted_root_ranking<M: RoleModel>(
+    port: &mut AdaptiveEnginePort<M>,
 ) -> (
     ProposerRankingPublished,
     RoleTicketRegistry<ReviewView, RoleOutput>,

@@ -6,6 +6,7 @@ use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptionsExt};
 use std::{
     fs::File,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -13,6 +14,7 @@ use std::{
 struct OriginalFile {
     pin: RoventPublicationFile,
     file: File,
+    identity: Option<(u64, u64)>,
 }
 /// 성공과 실패 모두 원 directory/FD/budget을 보존한다. JSON은 실행 권한이 아니다.
 pub struct RoventHistoricalUtilityInterventionFiles {
@@ -188,24 +190,65 @@ impl RoventHistoricalUtilityInterventionFiles {
         self.held.push(OriginalFile {
             pin: pin.clone(),
             file,
+            identity: None,
         });
         let held = self
             .held
-            .last()
+            .last_mut()
             .expect("original FD retained before validation");
-        check(
-            held.file
-                .metadata()
-                .map_err(|e| ArenaError::Io(e.to_string()))?
-                .is_file(),
-            "original /2 payload must be regular",
-        )?;
+        let metadata = held
+            .file
+            .metadata()
+            .map_err(|e| ArenaError::Io(e.to_string()))?;
+        held.identity = Some((metadata.dev(), metadata.ino()));
+        check(metadata.is_file(), "original /2 payload must be regular")?;
         let absolute_pin = RoventTrainingFilePin {
             path: self.root.join(Path::new(&pin.path)),
             sha256: pin.sha256.clone(),
             bytes: pin.bytes,
         };
         self.budget.verify_held(&held.file, &absolute_pin, true)
+    }
+    /// Recheck only the already retained descriptors with the caller's current
+    /// finite read budget. The original owner/budget stays alive and no pathname
+    /// is reopened; failed/partial read credit is never refunded.
+    pub fn revalidate_original(&self, budget: &RoventRecoveryReadBudget) -> Result<(), ArenaError> {
+        check(
+            self.directory.is_some()
+                && self.evidence.is_some()
+                && self.publication.is_some()
+                && self.ack.is_some(),
+            "/2 successful original FD owner required",
+        )?;
+        for held in &self.held {
+            let original = held
+                .identity
+                .ok_or_else(|| invalid("/2 original FD identity unavailable"))?;
+            let pin = RoventTrainingFilePin {
+                path: self.root.join(Path::new(&held.pin.path)),
+                sha256: held.pin.sha256.clone(),
+                bytes: held.pin.bytes,
+            };
+            let raw = budget.verify_held(&held.file, &pin, true)?;
+            let metadata = held
+                .file
+                .metadata()
+                .map_err(|e| ArenaError::Io(e.to_string()))?;
+            check(
+                metadata.is_file()
+                    && (metadata.dev(), metadata.ino()) == original
+                    && metadata.len() == held.pin.bytes,
+                "/2 original retained FD identity/size changed",
+            )?;
+            let expected = match held.pin.path.as_str() {
+                ROVENT_UTILITY_INTERVENTION_PUBLICATION_FILE => self.publication_raw.as_ref(),
+                ROVENT_UTILITY_INTERVENTION_ACK_FILE => self.ack_raw.as_ref(),
+                path => self.payloads.get(path),
+            }
+            .ok_or_else(|| invalid("/2 original FD lost retained payload"))?;
+            check(raw == *expected, "/2 original retained raw bytes changed")?;
+        }
+        Ok(())
     }
     pub fn evidence(&self) -> Option<&RoventHistoricalUtilityInterventionEvidence> {
         self.evidence.as_ref()

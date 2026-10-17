@@ -81,7 +81,7 @@ def intervention_case(*, change_arm=None):
         preimage = {"sequence": 101 + index, "stage_code": (2, 5)[index],
             "view_digest": prepared["provenance"]["full_view_sha256"], "view_seal_digest": view["view_digest"],
             "focus_prefix_sha256": h("synthetic private focus"), "goal_local_sha256": None, "legacy_full_records_sha256": None}
-        query = {"endpoint_rules": copy.deepcopy(neutral["root_rules"]), "prefix": [], "proposal": [64],
+        query = {"endpoint_rules": copy.deepcopy(neutral["root_rules"]), "prefix": [] if index else [64], "proposal": [64],
             "counterexample": None, "legal": [] if index else [64], "divergences": [0] if index else [],
             "question_preimage": preimage}
         arm = {"neutral_target_sha256": neutral_sha, "arm_query_sha256": independent_question(preimage),
@@ -209,6 +209,15 @@ def reseal_files(blobs):
 
 
 class InterventionPayloadTests(unittest.TestCase):
+    def test_p_reproposal_keeps_full_target_and_uses_only_original_first_prefix(self):
+        full = [64, 3896, 72]
+        for recipient, prefix in (("route_p", [64]), ("route_c", []), ("route_r", full)):
+            reader._query_prefix({"proposal": full, "prefix": prefix}, recipient, 64, full)
+        with self.assertRaises(ValueError):
+            reader._query_prefix({"proposal": full, "prefix": full}, "route_p", 64, full)
+        with self.assertRaises(ValueError):
+            reader._query_prefix({"proposal": [64], "prefix": [64]}, "route_p", 64, full)
+
     def test_neutral_hash_keeps_reference_bytes_and_original_serde_identity_order(self):
         _, _, blobs, _, _, case = full_cohort_case()
         neutral = neutral_from_input(case["input"])

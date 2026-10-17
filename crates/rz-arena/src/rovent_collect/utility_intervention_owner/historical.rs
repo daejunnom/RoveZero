@@ -513,7 +513,6 @@ mod pairs;
 mod trial;
 use super::super::utility_cohort_owner::historical as shared;
 use rz_contracts::pals::Move16;
-use rz_search::cpu_value::nnuec::rules;
 fn number(value: &Value, key: &str) -> Result<u64, ArenaError> {
     value
         .get(key)
@@ -715,6 +714,10 @@ pub(super) fn verify_historical_utility_intervention(
         input_sha256: canonical.input.input_sha256.clone(),
         target_sha256: canonical.input.target_sha256.clone(),
         neutral_target_sha256: canonical.digest.clone(),
+        role_queries: trials
+            .iter()
+            .filter_map(|trial| trial.role_query.clone())
+            .collect(),
         submission_target_sha256: canonical.input.submission_target_sha256.clone(),
         utility_context_sha256: canonical.input.context_sha256.clone(),
         known_pairs,

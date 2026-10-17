@@ -223,6 +223,11 @@ def _neutral(value, *, config, source):
     selected = value["target_record"]
     if selected >= len(metadata) or metadata[selected]["original_first_move"] != value["original_first_move"]:
         raise ValueError("intervention original selected target/first move differs")
+    if lines[selected].kind != 0 or metadata[selected]["anchor"] != 0 or not lines[selected].line.moves:
+        raise ValueError("intervention target requires its original current-root Proposal record")
+    first = lines[selected].line.moves[0]
+    if first.from_square | first.to_square << 6 | first.promotion << 12 != value["original_first_move"]:
+        raise ValueError("intervention original Proposal must start with its declared first move")
     expected = [index for index, row in enumerate(metadata) if row["source_state"] == metadata[selected]["source_state"]
         and row["original_first_move"] == value["original_first_move"]]
     if value["target_record_ids"] != expected:
@@ -417,6 +422,12 @@ def _arm(arm, *, trial, original, neutral, source, config):
     proof._rules_projection(query["endpoint_rules"])
     for name in ("prefix", "proposal", "legal"):
         _moves(query[name], 256)
+    neutral_capture = original.get("neutral_input")
+    if neutral_capture is None:
+        neutral_capture, _ = _neutral(neutral, config=config, source=source)
+    target_line = neutral_capture.reference_input.base_input.context_lines[neutral["target_record"]].line.moves
+    full_proposal = [move.from_square | move.to_square << 6 | move.promotion << 12 for move in target_line]
+    _query_prefix(query, trial["recipient"], neutral["original_first_move"], full_proposal)
     if query["counterexample"] is not None:
         _moves(query["counterexample"], 256)
     divergences = proof._array(query["divergences"], 256)
@@ -449,6 +460,17 @@ def _arm(arm, *, trial, original, neutral, source, config):
             or arm["public_context_sha256"] != neutral["record_scope_sha256"]):
         raise ValueError("intervention actual arm preparation crossed neutral records or its own original query view")
     return captured
+
+
+def _query_prefix(query, recipient, first, full_proposal):
+    # /2 P re-proposes from the exact first endpoint; it does not extend an
+    # already completed full target at its limit. Neutral/full target stays
+    # intact. C starts at root and R verifies the full target endpoint.
+    if not full_proposal or full_proposal[0] != first or query["proposal"] != full_proposal:
+        raise ValueError("intervention actual query lost its original full Proposal target")
+    expected = [first] if recipient == "route_p" else [] if recipient == "route_c" else full_proposal
+    if query["prefix"] != expected:
+        raise ValueError("intervention actual bounded P/C/R prefix differs from its registered role policy")
 
 
 def question_sha256(value):
@@ -633,6 +655,7 @@ def validate_intervention_payloads(files, *, registration):
         neutral = trial["neutral_target"]
         if neutral is not None:
             own_input, own_target = _neutral(neutral, config=config, source=source)
+            original["neutral_input"] = own_input
             if (own_target != common_target or sha(trial["neutral_target_sha256"]) != own_target
                     or own_input.input_bytes != captured.input_bytes
                     or neutral["model_identity"] != final_neutral["model_identity"]):

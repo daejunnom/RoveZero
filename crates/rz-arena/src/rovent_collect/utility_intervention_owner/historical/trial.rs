@@ -15,6 +15,9 @@ pub(super) struct CheckedTrial {
     pub authority: Value,
     pub source_budget: Value,
     pub baseline: Option<BTreeSet<String>>,
+    pub role_query: Option<
+        rz_experiments::rovent_utility_intervention_preparation::RoventInterventionRoleQuery,
+    >,
 }
 
 // These are independently pinned operands, not a replacement authority DTO.
@@ -373,6 +376,25 @@ pub(super) fn verify_trial(
             )?;
         }
     }
+    let role_query = if arm.is_null() {
+        None
+    } else {
+        use rz_experiments::rovent_utility_intervention_preparation::{
+            RoventInterventionRecipient, RoventInterventionRoleQuery,
+        };
+        Some(RoventInterventionRoleQuery {
+            trial_sequence: ordinal as u64 + 1,
+            recipient: match recipient {
+                4 => RoventInterventionRecipient::Proposer,
+                5 => RoventInterventionRecipient::Critic,
+                6 => RoventInterventionRecipient::Researcher,
+                _ => return Err(error("/2 original issued query recipient")),
+            },
+            question_sha256: hash_field(arm, "arm_query_sha256")?.into(),
+            view_sha256: hash_field(&arm["view"], "view_digest")?.into(),
+            full_view_sha256: hash_field(arm, "full_view_sha256")?.into(),
+        })
+    };
     Ok(CheckedTrial {
         cost,
         digest: digest_bytes(TRIAL_DOMAIN, raw),
@@ -384,6 +406,7 @@ pub(super) fn verify_trial(
         authority: physical.authority,
         source_budget: source_offer["budget"].clone(),
         baseline,
+        role_query,
     })
 }
 
