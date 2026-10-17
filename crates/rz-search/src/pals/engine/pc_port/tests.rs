@@ -76,7 +76,11 @@ fn port_with_observation_limit(
     .unwrap()
 }
 
-fn accepted(port: &mut Port, input: &Input, request: u64) -> (AcceptedRoleStep, RoleOutput) {
+fn accepted<M: RoleModel>(
+    port: &mut PcSemanticPort<M>,
+    input: &Input,
+    request: u64,
+) -> (AcceptedRoleStep, RoleOutput) {
     let mut registry = RoleTicketRegistry::<ReviewView, RoleOutput>::new(
         port.authority,
         512,
@@ -171,7 +175,11 @@ fn accepted(port: &mut Port, input: &Input, request: u64) -> (AcceptedRoleStep, 
     (accepted, output)
 }
 
-fn evidence(port: &Port, input: &Input, sequence: u64) -> AdaptivePortRoleEvidence {
+fn evidence<M: RoleModel>(
+    port: &PcSemanticPort<M>,
+    input: &Input,
+    sequence: u64,
+) -> AdaptivePortRoleEvidence {
     AdaptivePortRoleEvidence {
         execution: Some(rz_contracts::ExecutionId {
             epoch: port.authority.epoch,
@@ -318,3 +326,6 @@ fn discarded_live_lane_cannot_be_reported_as_selective_completion() {
     );
     assert!(port.is_complete());
 }
+
+#[path = "goal_tests.rs"]
+mod goals;

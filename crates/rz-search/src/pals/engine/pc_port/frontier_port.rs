@@ -156,10 +156,182 @@ impl<M: RoleModel> PcSemanticPort<M> {
         }
     }
 
+    fn close_frontier_boundary(&mut self, error: FrontierError) -> bool {
+        use crate::pals::rovent_frontier::{FrontierGoalStatus, FrontierStop};
+        let expected = self.rovent_frontier().is_some_and(|frontier| {
+            matches!(
+                (error, frontier.snapshot().goal),
+                (
+                    FrontierError::NodeBudget,
+                    FrontierGoalStatus::Stopped(FrontierStop::WorkBudget)
+                ) | (
+                    FrontierError::Deadline,
+                    FrontierGoalStatus::Stopped(FrontierStop::Deadline)
+                )
+            )
+        });
+        if !expected {
+            return false;
+        }
+        if let Some(state) = &mut self.frontier_state {
+            state.last_error = Some(error);
+        }
+        self.completion = if error == FrontierError::NodeBudget {
+            PcPortCompletion::WorkBudget
+        } else {
+            PcPortCompletion::Deadline
+        };
+        self.ready.clear();
+        true
+    }
+
+    pub(super) fn frontier_boundary_or_failure(
+        &mut self,
+        error: FrontierError,
+    ) -> Result<(), PalsError> {
+        if self.close_frontier_boundary(error) {
+            Ok(())
+        } else {
+            Err(self.frontier_failure(error))
+        }
+    }
+
+    pub(super) fn close_original_deadline(&mut self) -> Result<(), PalsError> {
+        if let Some(frontier) = self.owner.semantic.rovent_frontier.as_deref_mut() {
+            let result =
+                frontier.observe_original_hard_deadline_expiry(self.authority, self.deadline);
+            match result {
+                Err(error) => self.frontier_boundary_or_failure(error)?,
+                Ok(()) => {
+                    return Err(self.frontier_failure(FrontierError::Invalid(
+                        "original deadline expiry did not retire controller",
+                    )));
+                }
+            }
+        } else {
+            self.completion = PcPortCompletion::Deadline;
+            self.ready.clear();
+        }
+        Ok(())
+    }
+
+    /// The live original controller, rather than a copied result, must have
+    /// satisfied the goal. Pending tickets retain their physical custody and
+    /// are discarded only after the native owner fences them.
+    pub fn quiesce_satisfied_goal(&mut self) -> Result<(), FrontierError> {
+        use crate::pals::rovent_frontier::FrontierGoalStatus;
+        if !matches!(
+            self.completion,
+            PcPortCompletion::Active | PcPortCompletion::SelectiveFrontier
+        ) || Instant::now() >= self.hard_deadline
+            || !self.rovent_frontier().is_some_and(|frontier| {
+                matches!(
+                    frontier.snapshot().goal,
+                    FrontierGoalStatus::DepthSatisfied | FrontierGoalStatus::MateSatisfied
+                )
+            })
+        {
+            return Err(FrontierError::Invalid(
+                "R-free live satisfied goal required",
+            ));
+        }
+        self.ready.clear();
+        self.completion = PcPortCompletion::SelectiveFrontier;
+        Ok(())
+    }
+
+    /// The actual controller gates every new role, including root ranking.
+    /// This query grants neither a node nor a synthetic first-move source.
+    pub(super) fn admit_frontier_role(&mut self) -> Result<bool, PalsError> {
+        let Some((clock, now)) = self
+            .frontier_time()
+            .map_err(|error| self.frontier_failure(error))?
+        else {
+            return Ok(true);
+        };
+        let result = self
+            .owner
+            .semantic
+            .rovent_frontier
+            .as_deref_mut()
+            .ok_or(PalsError::InvalidConfig)?
+            .admit_role_input(clock, now);
+        match result {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                self.frontier_boundary_or_failure(error)?;
+                Ok(false)
+            }
+        }
+    }
+
+    pub(super) fn adopt_frontier_line(
+        &mut self,
+        line: &crate::pals::rovent_frontier::CheckedFrontierLine,
+    ) -> Result<usize, PalsError> {
+        let config = PalsSemanticConfig {
+            line_plies: usize::from(self.owner.profile.maximum_root_prefix_plies),
+            ..self.owner.config
+        };
+        let (node, new_edges) = self
+            .owner
+            .semantic
+            .adopt_checked_frontier_line(&config, self.root, line)?;
+        self.counters.checked_transitions = self
+            .counters
+            .checked_transitions
+            .checked_add(new_edges)
+            .ok_or(PalsError::Capacity)?;
+        Ok(node)
+    }
+
+    pub(super) fn admit_selected_child(
+        &mut self,
+        input: &FrameInput<ReviewView, PcPortQuestion>,
+        accepted: &AcceptedRoleStep,
+        output: &RoleOutput,
+        movement: BoardMove,
+    ) -> Result<Option<usize>, PalsError> {
+        let Some((clock, now)) = self
+            .frontier_time()
+            .map_err(|error| self.frontier_failure(error))?
+        else {
+            let (child, fresh) = self.owner.connect_hot(input.question.node, movement)?;
+            self.counters.checked_transitions = self
+                .counters
+                .checked_transitions
+                .checked_add(u64::from(fresh))
+                .ok_or(PalsError::Capacity)?;
+            return Ok(Some(child));
+        };
+        let semantic = &mut self.owner.semantic;
+        let checked = semantic
+            .rovent_frontier
+            .as_deref_mut()
+            .ok_or(PalsError::InvalidConfig)?
+            .observe_accepted_pc_child(
+                input,
+                accepted,
+                output,
+                movement,
+                &semantic.stores,
+                clock,
+                now,
+            );
+        match checked {
+            Ok(line) => self.adopt_frontier_line(&line).map(Some),
+            Err(error) => {
+                self.frontier_boundary_or_failure(error)?;
+                Ok(None)
+            }
+        }
+    }
+
     pub(super) fn prepare_frontier_root_if_attached(&mut self) -> Result<(), PalsError> {
         if self.frontier_state.is_some() {
-            self.prepare_rovent_root_rules()
-                .map_err(|error| self.frontier_failure(error))?;
+            if let Err(error) = self.prepare_rovent_root_rules() {
+                self.frontier_boundary_or_failure(error)?;
+            }
         }
         Ok(())
     }
@@ -195,6 +367,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
             .try_reserve(1)
             .map_err(|_| FrontierError::Capacity("P/C missing-goal queue"))?;
         self.ready.push_back(PcPlan {
+            node: origin.node(),
             frame,
             responsibilities: Vec::new(),
             continuation_end: origin.continuation_end(),
@@ -208,14 +381,19 @@ impl<M: RoleModel> PcSemanticPort<M> {
     }
 
     pub(super) fn complete_role_queue(&mut self) -> Result<(), PalsError> {
+        if self.completion != PcPortCompletion::Active {
+            return Ok(());
+        }
         if !self.ready.is_empty() || !self.pending.is_empty() {
             return Ok(());
         }
-        if self
-            .enqueue_missing_goal_question()
-            .map_err(|error| self.frontier_failure(error))?
-        {
-            return Ok(());
+        match self.enqueue_missing_goal_question() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => {
+                self.frontier_boundary_or_failure(error)?;
+                return Ok(());
+            }
         }
         if let Some((clock, now)) = self
             .frontier_time()
@@ -228,9 +406,10 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 .as_deref_mut()
                 .ok_or(PalsError::InvalidConfig)?;
             if !frontier.snapshot().selection_sealed {
-                frontier
-                    .seal_selected_policy(clock, now)
-                    .map_err(|error| self.frontier_failure(error))?;
+                if let Err(error) = frontier.seal_selected_policy(clock, now) {
+                    self.frontier_boundary_or_failure(error)?;
+                    return Ok(());
+                }
             }
         }
         self.completion = PcPortCompletion::SelectiveFrontier;
@@ -272,8 +451,13 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 )
             };
             if terminal {
-                self.owner
-                    .connect_hot(self.root, movement)
+                let semantic = &self.owner.semantic;
+                let checked = semantic
+                    .rovent_frontier
+                    .as_deref()
+                    .ok_or(FrontierError::ForeignRoot)?
+                    .checked_line(path, &semantic.stores)?;
+                self.adopt_frontier_line(&checked)
                     .map_err(|_| FrontierError::StoreUnavailable)?;
             }
         }

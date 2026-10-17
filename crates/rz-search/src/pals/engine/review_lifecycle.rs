@@ -324,15 +324,13 @@ impl<M: RoleModel> PalsEngine<M> {
         record: &RoleRecord,
         evidence: Option<ObservationId>,
     ) -> Result<(), PalsError> {
-        self.semantic.publish_review_record(
-            &PalsSemanticConfig::from(&self.config),
-            record,
-            evidence,
-        )
+        let config = self.semantic_sequence_config();
+        self.semantic
+            .publish_review_record(&config, record, evidence)
     }
     pub(super) fn restore_review_context_after_load(&mut self) {
-        self.semantic
-            .restore_review_context_after_load(&PalsSemanticConfig::from(&self.config));
+        let config = self.semantic_sequence_config();
+        self.semantic.restore_review_context_after_load(&config);
     }
     fn review_root_for_question(
         &self,
@@ -341,7 +339,7 @@ impl<M: RoleModel> PalsEngine<M> {
         legal: &[BoardMove],
     ) -> Result<StateId, PalsError> {
         self.semantic.review_root_for_question(
-            &PalsSemanticConfig::from(&self.config),
+            &self.semantic_sequence_config(),
             node,
             question,
             legal,
@@ -360,12 +358,9 @@ impl<M: RoleModel> PalsEngine<M> {
         question: RoleQuestion<'_>,
         legal: &[BoardMove],
     ) -> Result<Option<Arc<ReviewView>>, PalsError> {
-        self.semantic.prepare_review_view(
-            &PalsSemanticConfig::from(&self.config),
-            node,
-            question,
-            legal,
-        )
+        let config = self.semantic_sequence_config();
+        self.semantic
+            .prepare_review_view(&config, node, question, legal)
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_frozen_review_views(
@@ -377,8 +372,9 @@ impl<M: RoleModel> PalsEngine<M> {
         second_question: RoleQuestion<'_>,
         second_legal: &[BoardMove],
     ) -> Result<Option<FrozenReviewViews>, PalsError> {
+        let config = self.semantic_sequence_config();
         self.semantic.prepare_frozen_review_views(
-            &PalsSemanticConfig::from(&self.config),
+            &config,
             first_node,
             first_question,
             first_legal,

@@ -13,7 +13,29 @@ use rz_contracts::pals::Move16;
 use rz_contracts::pals_adaptive::ReviewViewSeal;
 use rz_contracts::{Deadline, Digest};
 use rz_position::Position;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+
+pub(super) enum QuestionOwner<'a> {
+    Adaptive(&'a Arc<AdaptivePortQuestion>),
+    Pc(&'a Arc<PcPortQuestion>),
+}
+pub(super) enum WeakQuestionOwner {
+    Adaptive(Weak<AdaptivePortQuestion>),
+    Pc(Weak<PcPortQuestion>),
+}
+impl WeakQuestionOwner {
+    pub(super) fn matches(&self, source: &VerifiedFrontierQuestion<'_>) -> bool {
+        match (self, &source.owner) {
+            (Self::Adaptive(original), QuestionOwner::Adaptive(actual)) => {
+                original.ptr_eq(&Arc::downgrade(actual))
+            }
+            (Self::Pc(original), QuestionOwner::Pc(actual)) => {
+                original.ptr_eq(&Arc::downgrade(actual))
+            }
+            _ => false,
+        }
+    }
+}
 
 pub(crate) struct VerifiedFrontierQuestion<'a> {
     pub(super) frame: FrameId,
@@ -27,6 +49,7 @@ pub(crate) struct VerifiedFrontierQuestion<'a> {
     pub(super) position: &'a Position,
     pub(super) context: &'a RoleLogicalContext,
     pub(super) pc_question: Option<&'a PcPortQuestion>,
+    owner: QuestionOwner<'a>,
 }
 
 impl<'a> VerifiedFrontierQuestion<'a> {
@@ -48,6 +71,7 @@ impl<'a> VerifiedFrontierQuestion<'a> {
             position: &work.input.question.position,
             context: &work.input.question.context,
             pc_question: None,
+            owner: QuestionOwner::Adaptive(&work.input.question),
         })
     }
 
@@ -69,6 +93,7 @@ impl<'a> VerifiedFrontierQuestion<'a> {
             position: work.input.question.position(),
             context: work.input.question.context(),
             pc_question: Some(&work.input.question),
+            owner: QuestionOwner::Pc(&work.input.question),
         })
     }
 
@@ -98,6 +123,14 @@ impl<'a> VerifiedFrontierQuestion<'a> {
             position: question.position(),
             context: question.context(),
             pc_question: Some(question),
+            owner: QuestionOwner::Pc(&input.question),
         })
+    }
+
+    pub(super) fn weak_owner(&self) -> WeakQuestionOwner {
+        match &self.owner {
+            QuestionOwner::Adaptive(owner) => WeakQuestionOwner::Adaptive(Arc::downgrade(owner)),
+            QuestionOwner::Pc(owner) => WeakQuestionOwner::Pc(Arc::downgrade(owner)),
+        }
     }
 }

@@ -12,6 +12,7 @@ pub(super) struct PcGoalLocalRules {
     authority: SearchAuthority,
     root_budget: ContractDigest,
     prefix: Vec<BoardMove>,
+    node: usize,
     snapshot: PositionSnapshot,
     root_side: Color,
     continuation_end: usize,
@@ -22,7 +23,7 @@ impl PcGoalLocalRules {
     /// A copied key or a guessed prefix cannot call this constructor. The
     /// actual controller-issued descriptor is validated before any Rules work.
     pub(super) fn prepare<M: RoleModel>(
-        port: &PcSemanticPort<M>,
+        port: &mut PcSemanticPort<M>,
         question: MissingMateQuestion,
     ) -> Result<Self, FrontierError> {
         let frontier = port
@@ -38,11 +39,6 @@ impl PcGoalLocalRules {
         {
             return Err(FrontierError::DepthHorizon);
         }
-        let mut replay =
-            Position::from_snapshot(port.rules.rules().snapshot(), Default::default())?;
-        for movement in &prefix {
-            replay.make_move(*movement)?;
-        }
         let continuation_end = prefix
             .len()
             .checked_add(usize::from(
@@ -54,6 +50,21 @@ impl PcGoalLocalRules {
             ))
             .ok_or(FrontierError::DepthHorizon)?;
         let root_budget = frontier.registration().root_budget;
+        let (clock, now) = port.frontier_time()?.ok_or(FrontierError::ForeignRoot)?;
+        let checked = port
+            .owner
+            .semantic
+            .rovent_frontier
+            .as_deref_mut()
+            .ok_or(FrontierError::ForeignRoot)?
+            .observe_missing_child(&question, clock, now)?;
+        if checked.prefix() != prefix.as_slice() {
+            return Err(FrontierError::ForeignHandle);
+        }
+        let snapshot = checked.endpoint_snapshot().clone();
+        let node = port
+            .adopt_frontier_line(&checked)
+            .map_err(|_| FrontierError::StoreUnavailable)?;
         let mut hash = Sha256::new();
         hash.update(b"rz-rovent-pc-goal-local-rules-origin/1\0");
         hash.update(root_budget.0);
@@ -74,7 +85,8 @@ impl PcGoalLocalRules {
             authority: port.authority,
             root_budget,
             prefix,
-            snapshot: replay.snapshot(),
+            node,
+            snapshot,
             root_side: port.owner.semantic.nodes[port.root].position.side_to_move(),
             continuation_end,
             digest: ContractDigest(hash.finalize().into()),
@@ -83,6 +95,9 @@ impl PcGoalLocalRules {
 
     pub(super) fn root_budget(&self) -> ContractDigest {
         self.root_budget
+    }
+    pub(super) fn node(&self) -> usize {
+        self.node
     }
     pub(super) fn prefix(&self) -> &[BoardMove] {
         &self.prefix

@@ -22,6 +22,7 @@ mod external_commit;
 #[cfg(test)]
 mod fixed_trace_tests;
 mod frontier_port;
+mod goal_hooks;
 mod legacy_full_context;
 mod model_namespace;
 mod nnuec_port;
@@ -51,7 +52,8 @@ pub use frontier_port::{
 pub use legacy_full_context::LegacyFullRoleRecords;
 pub use model_namespace::AdaptiveModelNamespace;
 pub use nnuec_port::{
-    AdaptiveNnuecPreparationError, AdaptiveNnuecReviewRequest, AdaptiveNnuecReviewSeal,
+    AdaptiveNnuecCaptureError, AdaptiveNnuecPreparationError, AdaptiveNnuecReviewRequest,
+    AdaptiveNnuecReviewSeal,
 };
 pub mod archive_worker;
 /// The process registry remains owned by UCI. Search cannot invent an owner
@@ -929,7 +931,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         self.round_candidates.clear();
         self.sequential_ranking_source = None;
         self.last_main_closed = None;
-        if self.root_round >= self.limits.max_rounds
+        if self.rovent_frontier().is_some_and(|frontier| {
+            let goal = frontier.registration().goal;
+            goal.depth_plies.is_some() || goal.mate_moves.is_some()
+        }) || self.root_round >= self.limits.max_rounds
             || self.engine.cpu_budget_used(&self.counters) >= self.limits.max_cpu_nodes
             || self.counters.role_calls >= self.engine.config.max_role_calls
         {

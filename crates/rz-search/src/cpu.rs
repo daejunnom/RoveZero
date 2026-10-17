@@ -237,6 +237,7 @@ pub struct CpuSliceControl {
     pub mailbox: Arc<CpuControlMailbox>,
     observed_yield_sequence: AtomicU64,
     observed_yield_cause: AtomicU64,
+    nnuec_capture: Option<crate::cpu_value::nnuec::v2::capture::NnuecActiveCapture>,
 }
 
 impl CpuSliceControl {
@@ -254,7 +255,21 @@ impl CpuSliceControl {
             mailbox,
             observed_yield_sequence: AtomicU64::new(0),
             observed_yield_cause: AtomicU64::new(0),
+            nnuec_capture: None,
         })
+    }
+    pub(crate) fn with_nnuec_capture(
+        mut self,
+        capture: crate::cpu_value::nnuec::v2::capture::NnuecActiveCapture,
+    ) -> Result<Self, CpuError> {
+        let scope = self.mailbox.scope();
+        if !capture.matches_slice(scope.job, scope.owner) {
+            return Err(CpuError::InvalidLimits(
+                "NNUEC capture belongs to another Job/owner",
+            ));
+        }
+        self.nnuec_capture = Some(capture);
+        Ok(self)
     }
     fn observe_yield(&self, cause: CpuYieldCause, sequence: u64) {
         self.observed_yield_sequence
@@ -2000,7 +2015,16 @@ impl CpuEngine {
         control: &Control<'_>,
         position: &Position,
     ) -> Result<i32, CpuValueError> {
-        let score = self.evaluator.score(&control.value, position)?;
+        let score = match control
+            .cooperative
+            .and_then(|slice| slice.nnuec_capture.as_ref())
+        {
+            Some(capture) => {
+                self.evaluator
+                    .score_with_capture(&control.value, position, capture)?
+            }
+            None => self.evaluator.score(&control.value, position)?,
+        };
         if !(-CPU_FRONTIER_SCORE_LIMIT..=CPU_FRONTIER_SCORE_LIMIT).contains(&score) {
             return Err(CpuValueError::ScoreOutsideFrontierNamespace);
         }

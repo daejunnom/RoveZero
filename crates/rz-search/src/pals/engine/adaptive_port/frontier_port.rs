@@ -82,11 +82,26 @@ impl AdaptivePortQuestion {
         let input = &work.input;
         let query = &input.question;
         let source = &query.frontier_source;
-        let view = &input.view;
         let first = query.first.ok_or(RoleError::InvalidOutput)?;
         let first = rz_contracts::pals::Move16::encode(
             rz_contracts::Move::try_from(first).map_err(|_| RoleError::InvalidOutput)?,
         );
+        if work.frame.authority != source.authority
+            || work.original_deadline != source.original_deadline
+            || work.original_first_move != first
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        Self::validate_frontier_input(input, stores)
+    }
+
+    fn validate_frontier_input(
+        input: &FrameInput<ReviewView, AdaptivePortQuestion>,
+        stores: &PalsStores,
+    ) -> Result<(), PalsError> {
+        let query = &input.question;
+        let source = &query.frontier_source;
+        let view = &input.view;
         let actual_seal = ReviewViewSeal {
             authority: source.authority,
             view_sequence: view.sequence(),
@@ -98,12 +113,9 @@ impl AdaptivePortQuestion {
             anchors: view.anchors().len() as u8,
             length_bucket: view.length_bucket(),
         };
-        if work.frame.authority != source.authority
-            || work.original_deadline != source.original_deadline
-            || query.deadline != source.deadline
+        if query.deadline != source.deadline
             || input.stage != query.stage
             || input.question_digest != query.question_digest
-            || work.original_first_move != first
             || actual_seal != source.view
             || input.view_seal != source.view
             || input.public_context.0 != view.record_scope_digest()
@@ -341,8 +353,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         clock: ClockDomain,
         now: MonotonicTick,
     ) -> Result<(), FrontierError> {
-        self.check_live().map_err(|_| FrontierError::ForeignRoot)?;
-        self.deadline.accepts(clock, now)?;
+        let scan_started = Instant::now();
         let frontier = self
             .rovent_frontier()
             .ok_or(FrontierError::Invalid("Rovent frontier absent"))?;
@@ -368,15 +379,38 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             },
             &self.engine.semantic.stores,
         )?;
+        if clock != self.deadline.clock {
+            return Err(FrontierError::ForeignRoot);
+        }
+        self.check_rovent_scan_live()?;
+        let observed_now = self
+            .rovent_frontier()
+            .unwrap()
+            .original_tick_after_elapsed(clock, now, scan_started.elapsed())?;
+        self.engine
+            .semantic
+            .rovent_frontier
+            .as_mut()
+            .unwrap()
+            .admit_role_input(clock, observed_now)?;
         if self.root_rules_scanned {
             return Ok(());
         }
-        let moves = frontier.root_moves().allowed().to_vec();
+        let moves = self
+            .rovent_frontier()
+            .unwrap()
+            .root_moves()
+            .allowed()
+            .to_vec();
         for movement in moves {
-            self.check_live().map_err(|_| FrontierError::ForeignRoot)?;
+            self.check_rovent_scan_live()?;
+            let observed_now = self
+                .rovent_frontier()
+                .unwrap()
+                .original_tick_after_elapsed(clock, now, scan_started.elapsed())?;
             let child = {
                 let frontier = self.engine.semantic.rovent_frontier.as_mut().unwrap();
-                let path = frontier.observe_root_child(movement, clock, now)?;
+                let path = frontier.observe_root_child(movement, clock, observed_now)?;
                 let child =
                     Position::from_snapshot(frontier.path_snapshot(path)?, Default::default())?;
                 matches!(
@@ -410,8 +444,23 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 }
             }
         }
+        self.check_rovent_scan_live()?;
         self.root_rules_scanned = true;
         Ok(())
+    }
+
+    pub(super) fn check_rovent_scan_live(&mut self) -> Result<(), FrontierError> {
+        match self.check_live() {
+            Ok(()) => Ok(()),
+            Err(PalsError::Role(RoleError::Deadline)) => self
+                .engine
+                .semantic
+                .rovent_frontier
+                .as_mut()
+                .ok_or(FrontierError::ForeignRoot)?
+                .observe_original_hard_deadline_expiry(self.authority, self.deadline),
+            Err(_) => Err(FrontierError::ForeignRoot),
+        }
     }
 
     /// Disjoint borrowing of the real controller and its Store. Controller
@@ -935,5 +984,190 @@ mod tests {
             ))
         );
         assert!(port.rovent_frontier().is_none());
+    }
+
+    #[test]
+    fn actual_hard_deadline_records_the_original_frontier_stop() {
+        let mut port = super::super::port_tests::setup(Position::startpos(), 4);
+        port.engine.semantic.rovent_frontier = Some(Box::new(controller(&port)));
+        let original = port.deadline;
+        let before = port.rovent_frontier().unwrap().snapshot().work;
+        port.limits.deadline = Instant::now();
+        assert_eq!(port.check_rovent_scan_live(), Err(FrontierError::Deadline));
+        let snapshot = port.rovent_frontier().unwrap().snapshot();
+        assert_eq!(snapshot.original_deadline, original);
+        assert_eq!(
+            snapshot.goal,
+            FrontierGoalStatus::Stopped(crate::pals::rovent_frontier::FrontierStop::Deadline,)
+        );
+        assert_eq!(snapshot.work.root_entries, before.root_entries);
+        assert_eq!(
+            snapshot.work.checked_transitions,
+            before.checked_transitions
+        );
+        assert_eq!(snapshot.work.native_nodes, before.native_nodes);
+        assert_eq!(
+            snapshot.work.reserved_native_nodes,
+            before.reserved_native_nodes
+        );
+        assert!(!port.root_rules_scanned);
+    }
+
+    #[test]
+    fn scan_tick_preserves_the_supplied_origin_and_adds_observed_elapsed_time() {
+        let port = super::super::port_tests::setup(Position::startpos(), 4);
+        let frontier = controller(&port);
+        let earlier = Instant::now()
+            .checked_sub(Duration::from_millis(2))
+            .unwrap();
+        let tick = frontier
+            .original_tick_after_elapsed(port.deadline.clock, MonotonicTick(100), earlier.elapsed())
+            .unwrap();
+        assert!(tick.0 >= 2_000_100);
+        assert!(
+            frontier
+                .original_tick_after_elapsed(
+                    port.deadline.clock,
+                    MonotonicTick(u64::MAX),
+                    earlier.elapsed()
+                )
+                .is_err()
+        );
+        assert_eq!(
+            frontier.original_tick_after_elapsed(
+                ClockDomain(rz_contracts::ProcessEpoch(99)),
+                MonotonicTick(100),
+                earlier.elapsed()
+            ),
+            Err(FrontierError::ForeignRoot)
+        );
+    }
+
+    #[test]
+    fn manager_hooks_keep_original_lane_and_exact_fresh_completion_on_retry() {
+        let mut port = super::super::port_tests::setup(Position::startpos(), 4);
+        let work = super::super::port_tests::work(
+            &mut port,
+            "e2e4",
+            RefinementStage::ProposalContinuation,
+            1,
+        );
+        let endpoint = fresh_descendant(&mut port, &work);
+        let frontier = controller(&port);
+        port.engine.semantic.rovent_frontier = Some(Box::new(frontier));
+        let clock = port.deadline.clock;
+        for _ in 0..2 {
+            assert!(
+                port.rovent_frame_admitted(
+                    &work,
+                    FrontierFrameKind::Candidate,
+                    clock,
+                    MonotonicTick(0),
+                )
+                .unwrap()
+            );
+        }
+        assert_eq!(
+            port.rovent_frontier().unwrap().snapshot().registered_frames,
+            1
+        );
+        let mut changed = work.clone();
+        Arc::make_mut(&mut changed.input.question)
+            .context
+            .public_revision += 1;
+        assert!(
+            port.rovent_frame_admitted(
+                &changed,
+                FrontierFrameKind::Candidate,
+                clock,
+                MonotonicTick(0),
+            )
+            .is_err()
+        );
+        let (accepted, output) = accepted(&endpoint);
+        let physical = AdaptivePortRoleEvidence {
+            execution: Some(ExecutionId::new(port.authority.epoch, 1)),
+            completed_nn_inputs: Some(1),
+            measurement_complete: true,
+            physical_fresh: Some(true),
+        };
+        for _ in 0..2 {
+            assert!(
+                port.rovent_fresh_accepted(
+                    &endpoint,
+                    &accepted,
+                    &output,
+                    physical,
+                    clock,
+                    MonotonicTick(0),
+                )
+                .unwrap()
+            );
+        }
+        let mut changed_output = output.clone();
+        let RolePayload::Proposal {
+            candidate_logits, ..
+        } = &mut changed_output.payload
+        else {
+            unreachable!()
+        };
+        candidate_logits[0] += 1.0;
+        assert!(
+            port.rovent_fresh_accepted(
+                &endpoint,
+                &accepted,
+                &changed_output,
+                physical,
+                clock,
+                MonotonicTick(0),
+            )
+            .is_err()
+        );
+        let budget = port.rovent_frontier().unwrap().registration().root_budget;
+        assert_eq!(
+            port.rovent_root_round_sealed(ContractDigest([99; 32]), clock, MonotonicTick(0)),
+            Err(FrontierError::ForeignRoot),
+        );
+        for _ in 0..2 {
+            assert!(
+                port.rovent_root_round_sealed(budget, clock, MonotonicTick(0))
+                    .unwrap()
+            );
+        }
+        let snapshot = port.rovent_frontier().unwrap().snapshot();
+        assert_eq!(snapshot.registered_frames, 1);
+        assert_eq!(snapshot.completed_frames, 1);
+        assert_eq!(snapshot.goal, FrontierGoalStatus::DepthSatisfied);
+    }
+
+    #[test]
+    fn manager_rules_endpoint_hook_closes_exact_terminal_without_native_result() {
+        let mut port = super::super::port_tests::setup(
+            Position::from_fen("7k/8/5KQ1/8/8/8/8/8 w - - 0 1").unwrap(),
+            4,
+        );
+        let work =
+            super::super::port_tests::work(&mut port, "g6g7", RefinementStage::CpuValidation, 1);
+        let frontier = controller(&port);
+        port.engine.semantic.rovent_frontier = Some(Box::new(frontier));
+        let clock = port.deadline.clock;
+        port.rovent_frame_admitted(&work, FrontierFrameKind::Candidate, clock, MonotonicTick(0))
+            .unwrap();
+        for _ in 0..2 {
+            assert!(
+                port.rovent_rules_endpoint(&work, clock, MonotonicTick(0))
+                    .unwrap()
+            );
+        }
+        let snapshot = port.rovent_frontier().unwrap().snapshot();
+        assert_eq!(snapshot.completed_frames, 1);
+        assert!(!snapshot.selection_sealed);
+        assert_eq!(snapshot.horizon.completed_depth, None);
+        let budget = port.rovent_frontier().unwrap().registration().root_budget;
+        port.rovent_root_round_sealed(budget, clock, MonotonicTick(0))
+            .unwrap();
+        let snapshot = port.rovent_frontier().unwrap().snapshot();
+        assert_eq!(snapshot.horizon.completed_depth.unwrap().0, 1);
+        assert_eq!(port.counters.role_calls, 0);
     }
 }

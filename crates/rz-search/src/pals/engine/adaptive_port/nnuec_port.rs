@@ -7,6 +7,9 @@ use super::*;
 use crate::cpu_value::CpuValueIdentity;
 use crate::cpu_value::nnuec::NnuecError;
 use crate::cpu_value::nnuec::v2::Model;
+use crate::cpu_value::nnuec::v2::capture::{
+    CaptureError, NnuecCaptureLimits, NnuecCaptureReservation,
+};
 use crate::cpu_value::nnuec::v2::cpu::V2CpuValue;
 use crate::cpu_value::nnuec::v2::review::{BoundNnuecReviewContext, PreparationError, Request};
 use crate::cpu_worker::PreparedValueInstallation;
@@ -41,6 +44,18 @@ impl From<NnuecError> for AdaptiveNnuecPreparationError {
     }
 }
 
+#[derive(Debug)]
+pub enum AdaptiveNnuecCaptureError {
+    Preparation(AdaptiveNnuecPreparationError),
+    Capture(CaptureError),
+}
+impl std::fmt::Display for AdaptiveNnuecCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "adaptive NNUEC capture: {self:?}")
+    }
+}
+impl std::error::Error for AdaptiveNnuecCaptureError {}
+
 /// Minted only after the actual port validates the original R question. A
 /// copied digest or a subsequently selected view cannot manufacture this
 /// custody. Keeping the work also keeps its exact Q/view/store pin alive.
@@ -54,6 +69,18 @@ impl AdaptiveNnuecReviewSeal {
     }
     pub fn frame(&self) -> FrameId {
         self.work.frame
+    }
+    pub fn question_digest(&self) -> ContractDigest {
+        self.work.input.question_digest
+    }
+    pub fn full_view_digest(&self) -> ContractDigest {
+        ContractDigest(self.work.input.view.digest())
+    }
+    pub fn original_deadline(&self) -> Deadline {
+        self.work.original_deadline
+    }
+    pub fn authority(&self) -> SearchAuthority {
+        self.work.frame.authority
     }
     pub fn model(&self) -> &CpuValueIdentity {
         &self.model
@@ -140,6 +167,29 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             &self.engine.semantic.stores,
             original.work.input.view.seal_digest(),
         )?)
+    }
+
+    /// Opt-in custody of this original R question only. This does not bind a
+    /// Job, run a score, publish a target or construct another RequestId.
+    pub fn reserve_cpu_nnuec_capture(
+        &self,
+        original: &AdaptiveNnuecReviewSeal,
+        model: Arc<Model>,
+        bound: Arc<BoundNnuecReviewContext>,
+        capture_sequence: u64,
+        limits: NnuecCaptureLimits,
+    ) -> Result<NnuecCaptureReservation, AdaptiveNnuecCaptureError> {
+        self.validate_nnuec_review_completion(original, &model, &bound)
+            .map_err(AdaptiveNnuecCaptureError::Preparation)?;
+        NnuecCaptureReservation::reserve(
+            model,
+            bound,
+            &original.work,
+            &self.engine.semantic.stores,
+            capture_sequence,
+            limits,
+        )
+        .map_err(AdaptiveNnuecCaptureError::Capture)
     }
 
     fn validate_nnuec_review_completion(

@@ -10,6 +10,9 @@ use crate::cpu::{
     CpuIterationProgress, CpuLimits, CpuMailboxScope, CpuReciprocalReply, CpuReciprocalRequest,
     CpuReciprocalScope, CpuResumePolicy, CpuResumeToken, CpuSliceControl, CpuWork,
 };
+use crate::cpu_value::nnuec::v2::capture::{
+    CaptureError, NnuecActiveCapture, NnuecCaptureEnding, NnuecCaptureReservation,
+};
 use rz_contracts::pals::SearchAuthority;
 use rz_contracts::pals_adaptive::{CpuJobEnvelope, CpuJobId, CpuWorkerId, SliceGrant};
 use rz_contracts::{Digest, ExecutionId};
@@ -43,6 +46,9 @@ pub use deferred_value::{
     DeferredNnuecCpuPlan, DeferredNnuecRSource, MaterializationCompletion, MaterializationHandoff,
     MaterializationRequest, MaterializedNnuecEngine, NnuecReadyRegistration, StartingNnuecWorker,
 };
+#[path = "cpu_worker/ledger_registration.rs"]
+mod ledger_registration;
+pub use ledger_registration::CpuLedgerRegistrationObservation;
 
 pub const CPU_WORKER_COMMAND_CAPACITY: usize = 8;
 pub const CPU_JOB_CAPACITY: usize = 64;
@@ -170,6 +176,7 @@ pub fn compiled_cooperative_cpu_owner_sha256() -> [u8; 32] {
         include_bytes!("cpu_worker.rs").as_slice(),
         include_bytes!("cpu_worker/prepared_value.rs").as_slice(),
         include_bytes!("cpu_worker/deferred_value.rs").as_slice(),
+        include_bytes!("cpu_worker/ledger_registration.rs").as_slice(),
     ] {
         hash.update((bytes.len() as u64).to_be_bytes());
         hash.update(bytes);
@@ -186,6 +193,7 @@ pub struct CpuJob {
     clock: InstantClock,
     pub mailbox: Arc<CpuControlMailbox>,
     reciprocal_scope: Option<CpuReciprocalScope>,
+    nnuec_capture: Option<NnuecCaptureReservation>,
 }
 
 impl CpuJob {
@@ -293,10 +301,56 @@ impl CpuJob {
             clock: *clock,
             mailbox,
             reciprocal_scope: None,
+            nnuec_capture: None,
         })
     }
     pub fn envelope(&self) -> CpuJobEnvelope {
         self.envelope
+    }
+    /// Optional collection custody is attached before Begin. This does not
+    /// activate a worker, evaluate a value or reserve additional node credit.
+    #[allow(clippy::result_large_err)]
+    pub fn enable_nnuec_capture(
+        &mut self,
+        capture: NnuecCaptureReservation,
+    ) -> Result<(), (CpuWorkerError, NnuecCaptureReservation)> {
+        if self.nnuec_capture.is_some() {
+            return Err((CpuWorkerError::Duplicate, capture));
+        }
+        if capture
+            .prepare_job(
+                self.envelope,
+                self.mailbox.scope().owner,
+                &self.position,
+                self.clock,
+            )
+            .is_err()
+        {
+            return Err((
+                CpuWorkerError::Invalid("NNUEC capture does not match prepared Job"),
+                capture,
+            ));
+        }
+        self.nnuec_capture = Some(capture);
+        Ok(())
+    }
+    pub fn nnuec_capture(&self) -> Option<&NnuecCaptureReservation> {
+        self.nnuec_capture.as_ref()
+    }
+    fn retire_nnuec_capture(
+        &self,
+        owner: CpuWorkerId,
+        ending: NnuecCaptureEnding,
+    ) -> Result<(), CaptureError> {
+        match &self.nnuec_capture {
+            Some(capture) => capture
+                .retire(self.envelope, owner, ending)
+                .map_err(|error| {
+                    capture.record_error(error.clone());
+                    error
+                }),
+            None => Ok(()),
+        }
     }
 
     /// Configure before Begin. The original Job, owner and hard deadline stay
@@ -973,6 +1027,7 @@ struct ActiveJob {
     terminal_permit: Option<
         ReliablePermit<TimedCpuCommand, CpuWorkerEventObservation, CpuWorkerProgressObservation>,
     >,
+    nnuec_capture: Option<NnuecActiveCapture>,
 }
 #[derive(Clone, Debug)]
 pub struct CpuWorkerProgress {
@@ -1357,6 +1412,16 @@ impl CpuWorker {
                                 .acknowledge_cancel(snapshot.cancel_sequence);
                         }
                         let controls = task.job.mailbox.seal_terminal();
+                        if task
+                            .job
+                            .retire_nnuec_capture(
+                                owner,
+                                NnuecCaptureEnding::CpuTerminal(completion),
+                            )
+                            .is_err()
+                        {
+                            engine_reusable = false;
+                        }
                         if let Some(mut permit) = task.terminal_permit.take() {
                             let termination = CpuJobTermination {
                                 job: task.job.envelope.id,
@@ -1448,7 +1513,38 @@ impl CpuWorker {
                                     .validate(&job.envelope, job.clock.domain(), now)
                                     .is_ok()
                             });
-                        if active.is_none() && fresh_eligible {
+                        let capture = if active.is_none() && fresh_eligible {
+                            match &job.nnuec_capture {
+                                Some(capture) => engine
+                                    .job_binding_digest()
+                                    .map_err(|_| CaptureError::Stale)
+                                    .and_then(|binding| {
+                                        binding.ok_or(CaptureError::Invalid(
+                                            "capture requires contextual value binding",
+                                        ))
+                                    })
+                                    .and_then(|binding| {
+                                        capture.bind_job(
+                                            job.envelope,
+                                            owner,
+                                            &job.position,
+                                            job.clock,
+                                            binding,
+                                        )
+                                    })
+                                    .map(Some),
+                                None => Ok(None),
+                            }
+                        } else {
+                            Ok(None)
+                        };
+                        let capture_ok = capture.is_ok();
+                        if let Err(error) = &capture {
+                            if let Some(scope) = &job.nnuec_capture {
+                                scope.record_error(error.clone());
+                            }
+                        }
+                        if active.is_none() && fresh_eligible && capture_ok {
                             active = Some(ActiveJob {
                                 job: *job,
                                 token: None,
@@ -1457,6 +1553,7 @@ impl CpuWorker {
                                 last_sequence: 0,
                                 last_control_sequence: 0,
                                 terminal_permit: None,
+                                nnuec_capture: capture.expect("checked capture admission"),
                             });
                             (grant, true, None)
                         } else {
@@ -1470,6 +1567,8 @@ impl CpuWorker {
                                 .is_some_and(|task| Arc::ptr_eq(&task.job.mailbox, &job.mailbox));
                             if !aliases_primary {
                                 rejected_controls = Some(job.mailbox.seal_terminal());
+                                let _ =
+                                    job.retire_nnuec_capture(owner, NnuecCaptureEnding::NotStarted);
                             }
                             (grant, false, None)
                         }
@@ -1556,6 +1655,10 @@ impl CpuWorker {
                     let mut invoked = false;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         CpuSliceControl::new(grant.node_credit, lease, task.job.mailbox.clone())
+                            .and_then(|control| match &task.nnuec_capture {
+                                Some(capture) => control.with_nnuec_capture(capture.clone()),
+                                None => Ok(control),
+                            })
                             .and_then(|control| {
                                 invoked = true;
                                 let limits = CpuLimits {
@@ -1718,6 +1821,22 @@ impl CpuWorker {
                         }
                         task.job.mailbox.seal_terminal();
                         report.controls = Some(task.job.mailbox.snapshot());
+                        let ending = if report.actual_work.is_none() {
+                            NnuecCaptureEnding::Unknown
+                        } else {
+                            match &report.result {
+                                Ok(value) => {
+                                    NnuecCaptureEnding::CpuTerminal(value.report.completion)
+                                }
+                                Err(_) => NnuecCaptureEnding::Failed,
+                            }
+                        };
+                        if task.job.retire_nnuec_capture(owner, ending).is_err() {
+                            engine_reusable = false;
+                            report.result = Err(CpuError::InvalidLimits(
+                                "NNUEC capture retirement is not attested",
+                            ));
+                        }
                         active = None;
                     } else {
                         report.controls = Some(task.job.mailbox.snapshot());
@@ -1737,6 +1856,9 @@ impl CpuWorker {
                         // work exists, so return the admission rejection
                         // with its actual closed question scope.
                         report.controls = Some(task.job.mailbox.seal_terminal());
+                        let _ = task
+                            .job
+                            .retire_nnuec_capture(owner, NnuecCaptureEnding::NotStarted);
                         active = None;
                     }
                 }
@@ -1763,6 +1885,9 @@ impl CpuWorker {
             }
             if let Some(task) = active {
                 task.job.mailbox.seal_terminal();
+                let _ = task
+                    .job
+                    .retire_nnuec_capture(owner, NnuecCaptureEnding::Unknown);
                 engine_reusable = false;
             }
             engine.discard_paused_stack();

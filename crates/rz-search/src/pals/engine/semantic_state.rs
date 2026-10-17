@@ -74,11 +74,11 @@ impl PalsSemanticConfig {
 /// maximum, while an exact original-root query prefix may span 256 plies.
 /// This profile never changes legacy PalsSemanticConfig validation or bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PcSemanticProfile {
+pub struct RoventSemanticProfile {
     pub semantic: PalsSemanticConfig,
     pub maximum_root_prefix_plies: u16,
 }
-impl PcSemanticProfile {
+impl RoventSemanticProfile {
     pub fn validate(&self) -> Result<(), PalsError> {
         self.semantic.validate()?;
         if self.maximum_root_prefix_plies == 0
@@ -89,13 +89,16 @@ impl PcSemanticProfile {
         }
         Ok(())
     }
-    fn sequence_config(self) -> PalsSemanticConfig {
+    pub(super) fn sequence_config(self) -> PalsSemanticConfig {
         PalsSemanticConfig {
             line_plies: usize::from(self.maximum_root_prefix_plies),
             ..self.semantic
         }
     }
 }
+
+/// Source compatibility name for the original R-free constructor.
+pub type PcSemanticProfile = RoventSemanticProfile;
 
 /// Exact graph/public-memory ownership shared by future typed assemblies.
 /// A state is not itself a search driver, researcher registration or receipt.
@@ -143,8 +146,17 @@ impl<M: RoleModel> PalsSemanticState<M> {
         Self::allocate_admitted(config, model, model_registered_value)
     }
 
-    fn new_pc_admitted(
-        profile: PcSemanticProfile,
+    pub(super) fn new_rovent_admitted(
+        profile: RoventSemanticProfile,
+        model: M,
+        model_registered_value: Option<ModelValueIdentity>,
+    ) -> Result<Self, PalsError> {
+        profile.validate()?;
+        Self::allocate_admitted(&profile.sequence_config(), model, model_registered_value)
+    }
+
+    pub(super) fn new_researcher_admitted(
+        profile: &ResearcherSemanticProfile,
         model: M,
         model_registered_value: Option<ModelValueIdentity>,
     ) -> Result<Self, PalsError> {
@@ -294,6 +306,72 @@ impl<M: RoleModel> PalsSemanticState<M> {
         let child = self.intern_hot(config, position)?;
         self.nodes[parent].edges.push(Edge { movement, child });
         Ok((child, true))
+    }
+
+    /// Adopt only Rules snapshots already checked and charged by this exact
+    /// controller. No second make_move or reconstructed quota is performed.
+    pub(super) fn adopt_checked_frontier_line(
+        &mut self,
+        config: &PalsSemanticConfig,
+        root: usize,
+        line: &crate::pals::rovent_frontier::CheckedFrontierLine,
+    ) -> Result<(usize, u64), PalsError> {
+        let frontier = self
+            .rovent_frontier
+            .as_deref()
+            .ok_or(StoreError::InvalidConditions(
+                "checked Rules line lost its original frontier",
+            ))?;
+        if !line.matches(frontier, &self.stores)
+            || line.prefix().len() != line.steps().len()
+            || line.prefix().len() > config.line_plies
+            || !self
+                .nodes
+                .get(root)
+                .is_some_and(|node| node.position.snapshot().same_state(line.root_snapshot()))
+        {
+            return Err(StoreError::InvalidEvidence("foreign checked frontier line").into());
+        }
+        let mut parent = root;
+        let mut new_edges = 0u64;
+        for (movement, step) in line.prefix().iter().zip(line.steps()) {
+            if *movement != step.movement() {
+                return Err(StoreError::InvalidEvidence("checked Rules step order").into());
+            }
+            if let Some(edge) = self.nodes[parent]
+                .edges
+                .iter()
+                .find(|edge| edge.movement == *movement)
+            {
+                if !self.nodes[edge.child]
+                    .position
+                    .snapshot()
+                    .same_state(step.snapshot())
+                {
+                    return Err(StoreError::InvalidEvidence(
+                        "semantic edge differs from checked Rules snapshot",
+                    )
+                    .into());
+                }
+                parent = edge.child;
+                continue;
+            }
+            self.nodes[parent]
+                .edges
+                .try_reserve(1)
+                .map_err(|_| PalsError::Capacity)?;
+            let child = self.intern_hot(
+                config,
+                Position::from_snapshot(step.snapshot(), Default::default())?,
+            )?;
+            self.nodes[parent].edges.push(Edge {
+                movement: *movement,
+                child,
+            });
+            parent = child;
+            new_edges = new_edges.checked_add(1).ok_or(PalsError::Capacity)?;
+        }
+        Ok((parent, new_edges))
     }
 
     pub(super) fn ensure_frontier_retired(&self) -> Result<(), PalsError> {
@@ -543,7 +621,7 @@ impl<M: RoleModel> PcSemanticOwner<M> {
         if let Some(namespace) = model.registered_representation_namespace() {
             namespace.verify_identity(model.identity(), Some(&identity))?;
         }
-        let mut semantic = PalsSemanticState::new_pc_admitted(profile, model, Some(identity))?;
+        let mut semantic = PalsSemanticState::new_rovent_admitted(profile, model, Some(identity))?;
         semantic.select_review_context(policy, limits)?;
         Ok(Self {
             config,

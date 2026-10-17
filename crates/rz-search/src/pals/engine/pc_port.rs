@@ -192,6 +192,34 @@ impl PcPortQuestion {
         }
         Ok(())
     }
+    /// Original accepted policy head for a single selected legal child. Root
+    /// ranking has no first move yet, so it cannot borrow a fictitious frame
+    /// responsibility merely to obtain Rules admission.
+    pub(crate) fn validate_accepted_frontier_child(
+        input: &FrameInput<ReviewView, Self>,
+        accepted: &AcceptedRoleStep,
+        output: &RoleOutput,
+        movement: BoardMove,
+        stores: &PalsStores,
+    ) -> Result<(), PalsError> {
+        Self::validate_input_source(input, stores)?;
+        let query = &input.question;
+        let ticket = accepted.ticket();
+        if query.frame == 0
+            || query.context.purpose == RoleQueryPurpose::ValueFresh
+            || ticket.authority != query.source.authority
+            || ticket.question != input.question_digest
+            || ticket.view != input.view_seal
+            || ticket.original_deadline != query.original_deadline()
+            || ticket.role != role_for_purpose(query.context.purpose)?
+            || ticket.representation.record_revision != query.context.public_revision
+            || !accepted.validates_output(output)
+            || !input.view.query().legal.contains(&movement)
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        Ok(())
+    }
     pub(crate) fn frontier_responsibilities(&self) -> &[PcResponsibilitySource] {
         &self.responsibilities
     }
@@ -321,6 +349,7 @@ impl PcPortQuestion {
 
 #[derive(Clone)]
 struct PcPlan {
+    node: usize,
     frame: u64,
     responsibilities: Vec<PcResponsibilitySource>,
     goal_local: Option<Arc<goal_local::PcGoalLocalRules>>,
@@ -350,6 +379,7 @@ pub enum PcPortCompletion {
     Canceled,
     Deadline,
     RoleBudget,
+    WorkBudget,
     Failed,
 }
 
@@ -446,6 +476,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
         let mut ready = VecDeque::new();
         if !terminal {
             ready.push_back(PcPlan {
+                node: root,
                 frame: 1,
                 responsibilities: Vec::new(),
                 goal_local: None,
@@ -509,6 +540,16 @@ impl<M: RoleModel> PcSemanticPort<M> {
     pub fn root_move_domain(&self) -> &Arc<RootMoveDomain> {
         &self.root_moves
     }
+    pub fn root_state_id(&self) -> StateId {
+        self.owner.semantic.nodes[self.root].state
+    }
+    pub fn model_namespace(&self) -> Result<&adaptive_port::AdaptiveModelNamespace, PalsError> {
+        self.owner
+            .semantic
+            .model
+            .registered_representation_namespace()
+            .ok_or(PalsError::InvalidConfig)
+    }
     pub fn is_complete(&self) -> bool {
         self.completion != PcPortCompletion::Active
             || (self.ready.is_empty() && self.pending.is_empty())
@@ -549,10 +590,13 @@ impl<M: RoleModel> PcSemanticPort<M> {
             return Ok(None);
         }
         if Instant::now() >= self.hard_deadline {
-            self.completion = PcPortCompletion::Deadline;
+            self.close_original_deadline()?;
             return Ok(None);
         }
         self.prepare_frontier_root_if_attached()?;
+        if self.completion != PcPortCompletion::Active {
+            return Ok(None);
+        }
         if self.ready.is_empty() {
             return Ok(None);
         }
@@ -574,11 +618,12 @@ impl<M: RoleModel> PcSemanticPort<M> {
             .front()
             .cloned()
             .ok_or(RoleError::InvalidOutput)?;
-        let mut node = self.root;
-        for movement in &plan.prefix {
-            let (next, _) = self.owner.connect_hot(node, *movement)?;
-            node = next;
-        }
+        let node = plan.node;
+        self.owner
+            .semantic
+            .nodes
+            .get(node)
+            .ok_or(StoreError::InvalidHandle("original P/C plan node"))?;
         if self.owner.semantic.nodes[node].terminal.is_none()
             && self.counters.submitted_role_calls.saturating_add(
                 self.pending
@@ -590,6 +635,9 @@ impl<M: RoleModel> PcSemanticPort<M> {
             if self.pending.is_empty() {
                 self.completion = PcPortCompletion::RoleBudget;
             }
+            return Ok(None);
+        }
+        if self.owner.semantic.nodes[node].terminal.is_none() && !self.admit_frontier_role()? {
             return Ok(None);
         }
         let legal = self.owner.semantic.nodes[node].position.legal_moves();
@@ -675,11 +723,15 @@ impl<M: RoleModel> PcSemanticPort<M> {
             public_context: ContractDigest(view.record_scope_digest()),
             view,
         };
-        self.observe_frontier_input(&input)
-            .map_err(|error| self.frontier_failure(error))?;
+        if let Err(error) = self.observe_frontier_input(&input) {
+            self.frontier_boundary_or_failure(error)?;
+            return Ok(None);
+        }
         if self.owner.semantic.nodes[node].terminal.is_some() {
-            self.accept_frontier_endpoint(&input, None)
-                .map_err(|error| self.frontier_failure(error))?;
+            if let Err(error) = self.accept_frontier_endpoint(&input, None) {
+                self.frontier_boundary_or_failure(error)?;
+                return Ok(None);
+            }
             self.next_question = next;
             self.ready.pop_front();
             self.complete_role_queue()?;
@@ -781,7 +833,10 @@ impl<M: RoleModel> PcSemanticPort<M> {
         }
         if matches!(
             self.completion,
-            PcPortCompletion::Canceled | PcPortCompletion::Deadline | PcPortCompletion::Failed
+            PcPortCompletion::Canceled
+                | PcPortCompletion::Deadline
+                | PcPortCompletion::WorkBudget
+                | PcPortCompletion::Failed
         ) {
             return Err(RoleError::Canceled.into());
         }
@@ -1053,20 +1108,19 @@ impl<M: RoleModel> PcSemanticPort<M> {
         if fresh {
             self.commit_value(input, output)?;
             if self.frontier_state.is_some() {
-                self.accept_frontier_endpoint(
+                if let Err(error) = self.accept_frontier_endpoint(
                     input,
                     Some((accepted, output, physical.ok_or(RoleError::InvalidOutput)?)),
-                )
-                .map_err(|error| self.frontier_failure(error))?;
+                ) {
+                    self.frontier_boundary_or_failure(error)?;
+                    return Ok(());
+                }
             }
         }
         for (movement, prefix) in continuations {
-            let (child, new_edge) = self.owner.connect_hot(query.node, movement)?;
-            self.counters.checked_transitions = self
-                .counters
-                .checked_transitions
-                .checked_add(u64::from(new_edge))
-                .ok_or(PalsError::Capacity)?;
+            let Some(child) = self.admit_selected_child(input, accepted, output, movement)? else {
+                return Ok(());
+            };
             let kind = match query.context.purpose {
                 RoleQueryPurpose::ReplyPolicy => RecordKind::Counterexample,
                 RoleQueryPurpose::RepairPolicy => RecordKind::Repair,
@@ -1106,6 +1160,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
             }
             self.ready.push_back(if end || terminal {
                 PcPlan {
+                    node: child,
                     frame,
                     responsibilities: responsibilities.clone(),
                     goal_local: None,
@@ -1117,6 +1172,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 }
             } else if query.context.purpose == RoleQueryPurpose::ReplyPolicy {
                 PcPlan {
+                    node: child,
                     frame,
                     responsibilities: responsibilities.clone(),
                     goal_local: None,
@@ -1128,6 +1184,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 }
             } else {
                 PcPlan {
+                    node: child,
                     frame,
                     responsibilities: responsibilities.clone(),
                     goal_local: None,

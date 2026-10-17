@@ -348,6 +348,18 @@ pub trait CpuValueEvaluator: Send + Sync {
         accumulator: &CpuAccumulator,
         position: &Position,
     ) -> Result<i32, CpuValueError>;
+    /// Explicit collection only. Legacy evaluators retain their same score
+    /// call and report unsupported capture rather than fabricating an input.
+    fn score_with_capture(
+        &self,
+        accumulator: &CpuAccumulator,
+        position: &Position,
+        capture: &nnuec::v2::capture::NnuecActiveCapture,
+    ) -> Result<i32, CpuValueError> {
+        let score = self.score(accumulator, position)?;
+        capture.unsupported();
+        Ok(score)
+    }
     /// Transactional update: failure leaves accumulator unchanged.
     fn apply_delta(
         &self,

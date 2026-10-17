@@ -17,6 +17,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::sync::Arc;
 
+#[path = "nnuec_v2_capture.rs"]
+pub mod capture;
 #[path = "nnuec_v2_cpu.rs"]
 pub mod cpu;
 #[path = "nnuec_v2_review.rs"]

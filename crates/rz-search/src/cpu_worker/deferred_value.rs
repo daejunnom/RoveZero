@@ -490,6 +490,10 @@ pub struct NnuecReadyRegistration {
     stack_owner_id: u64,
 }
 impl NnuecReadyRegistration {
+    /// Equal weights/configuration cannot substitute another declared source.
+    pub fn matches_source(&self, source: &DeferredNnuecRSource) -> bool {
+        Arc::ptr_eq(&self.declaration, &source.declaration)
+    }
     pub fn profile(&self) -> CpuWorkerProfile {
         self.profile
     }

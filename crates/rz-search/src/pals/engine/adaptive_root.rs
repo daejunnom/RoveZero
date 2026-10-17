@@ -9,6 +9,9 @@ use crate::pals::store::StoreReadOwner;
 use rz_contracts::pals::SearchAuthority;
 use std::sync::{Arc, Weak};
 
+#[path = "no_researcher_lifecycle.rs"]
+mod no_researcher_lifecycle;
+
 #[derive(Default)]
 pub struct AdaptiveRootRegistry {
     identity: Arc<()>,

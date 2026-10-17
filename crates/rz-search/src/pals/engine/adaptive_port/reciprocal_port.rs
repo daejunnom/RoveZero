@@ -4,8 +4,8 @@ use super::*;
 use crate::cpu::{CpuCompletion, CpuReciprocalReply, CpuReciprocalRequest};
 use crate::cpu_worker::CpuSliceReport;
 use crate::pals::coordinator::{
-    AcceptedRoleOrigin, AcceptedRoleOriginKind, AcceptedRoleStep, MAX_COORDINATOR_FRAMES,
-    MAX_RECIPROCAL_QUESTION_HISTORY,
+    AcceptedPeerSourceSeal, AcceptedRoleOrigin, AcceptedRoleStep, MAX_COORDINATOR_FRAMES,
+    MAX_RECIPROCAL_QUESTION_HISTORY, accepted_peer_semantic_digest,
 };
 use rz_contracts::pals_adaptive::CpuJobEnvelope;
 use rz_contracts::rovent::{
@@ -836,6 +836,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let origin = accepted
             .origin(work.frame, source_peer)
             .map_err(|_| RoleError::InvalidOutput)?;
+        let source = AcceptedPeerSourceSeal::freeze(origin, &work.input.view, output)
+            .map_err(|_| RoleError::InvalidOutput)?;
         let parent = source_peer.map(|peer| peer.id);
         if parent.is_some_and(|parent| parent.sequence >= id.sequence) {
             return Err(RoleError::InvalidOutput.into());
@@ -906,17 +908,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             None,
             purpose,
         )?;
-        let mut hash = Sha256::new();
-        hash.update(b"rz-rovent-accepted-peer-query/1\0");
-        hash.update(self.reciprocal_semantic_digest(&input, root_budget)?.0);
-        // Model-visible original input/head/kind, not physical issuance IDs.
-        hash.update(work.input.view.digest());
-        hash.update(accepted.output_digest().0);
-        hash.update([match origin.kind() {
-            AcceptedRoleOriginKind::LocalAccepted => 0,
-            AcceptedRoleOriginKind::PeerQuestion(_) => 1,
-        }]);
-        let semantic = ContractDigest(hash.finalize().into());
+        let semantic = accepted_peer_semantic_digest(
+            self.reciprocal_semantic_digest(&input, root_budget)?,
+            &source,
+        );
         let canonical = self
             .reciprocal
             .pending

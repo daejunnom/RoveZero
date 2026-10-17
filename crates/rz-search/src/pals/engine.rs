@@ -43,7 +43,10 @@ mod cpu_lifecycle;
 mod followup_execution;
 mod frozen_recheck;
 pub mod pc_port;
+mod researcher_admission;
+mod researcher_profile;
 mod review_lifecycle;
+pub use researcher_profile::ResearcherSemanticProfile;
 mod semantic_state;
 pub use followup_execution::{
     PALS_FOLLOWUP_EXECUTION_TRACE_MAX, PALS_FOLLOWUP_EXECUTION_VERSION,
@@ -54,7 +57,7 @@ pub use followup_execution::{
 };
 pub use semantic_state::{
     NoResearcher, PalsSemanticConfig, PalsSemanticState, PcSemanticOwner, PcSemanticProfile,
-    RegisteredResearcher,
+    RegisteredResearcher, RoventSemanticProfile,
 };
 
 pub const PALS_SEARCH_VERSION: &str = "pals-restricted-refinement/0.1";
@@ -133,6 +136,18 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 "pals/engine/semantic_state.rs",
                 include_str!("engine/semantic_state.rs"),
             ),
+            (
+                "pals/engine/researcher_admission.rs",
+                include_str!("engine/researcher_admission.rs"),
+            ),
+            (
+                "pals/engine/researcher_profile.rs",
+                include_str!("engine/researcher_profile.rs"),
+            ),
+            (
+                "pals/engine/no_researcher_lifecycle.rs",
+                include_str!("engine/no_researcher_lifecycle.rs"),
+            ),
             ("pals/engine/pc_port.rs", include_str!("engine/pc_port.rs")),
             (
                 "pals/engine/pc_port/frontier_port.rs",
@@ -153,6 +168,10 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
             (
                 "pals/engine/review_lifecycle.rs",
                 include_str!("engine/review_lifecycle.rs"),
+            ),
+            (
+                "pals/engine/adaptive_port/goal_hooks.rs",
+                include_str!("engine/adaptive_port/goal_hooks.rs"),
             ),
             (
                 "pals/engine/adaptive_port.rs",
@@ -1176,6 +1195,12 @@ pub enum PalsError {
     Capacity,
     RoleCallLimit,
     Review(ReviewError),
+    Rovent(crate::pals::rovent_frontier::FrontierError),
+}
+impl From<crate::pals::rovent_frontier::FrontierError> for PalsError {
+    fn from(error: crate::pals::rovent_frontier::FrontierError) -> Self {
+        Self::Rovent(error)
+    }
 }
 impl From<ReviewError> for PalsError {
     fn from(error: ReviewError) -> Self {
@@ -1328,6 +1353,7 @@ pub struct PalsEngine<M: RoleModel> {
     post_repair_recheck: PostRepairRecheckPolicy,
     cpu_interleave: CpuInterleavePolicy,
     held_cpu_task: Option<HeldCpuTask>,
+    rovent_root_prefix_plies: Option<u16>,
     // Explicit shutdown still supplies completion evidence. On ordinary Rust
     // destruction, release the actual researcher before its Store/context owner.
     researcher: RegisteredResearcher,
@@ -1455,120 +1481,16 @@ impl<M: RoleModel> PalsEngine<M> {
         resolver: ResolverPolicy,
         policy: PostRepairRecheckPolicy,
     ) -> Result<Self, PalsError> {
-        config.validate()?;
-        cpu.identity().validate()?;
-        if resolver == ResolverPolicy::OwnRawRestricted
-            && matches!(cpu.identity(), CheckerIdentity::ExternalUci(_))
-        {
-            return Err(CpuError::Unsupported("foreign checker with own raw resolver").into());
-        }
-        if policy != PostRepairRecheckPolicy::Disabled
-            && !policy.uses_frozen_model_wdl()
-            && matches!(cpu.identity(), CheckerIdentity::ExternalUci(_))
-        {
-            return Err(CpuError::Unsupported(
-                "post-Repair recheck v1 requires completed own CPU evidence",
-            )
-            .into());
-        }
-        let capabilities = cpu.capabilities();
-        if !capabilities.divergence || !capabilities.root_moves {
-            return Err(CpuError::Unsupported(
-                "PALS independent CPU divergence/root-move discovery",
-            )
-            .into());
-        }
-        if capabilities.max_depth == 0
-            || capabilities.max_depth > 64
-            || capabilities.max_prefix_plies < config.line_plies.saturating_sub(1)
-            || capabilities.max_root_moves < 256
-            || cpu.conditions().is_empty()
-            || cpu.conditions().len()
-                > if matches!(cpu.identity(), CheckerIdentity::ExternalUci(_)) {
-                    8192
-                } else {
-                    2048
-                }
-            || cpu.conditions().chars().any(char::is_control)
-        {
-            return Err(CpuError::Unsupported("PALS CPU bounded search capabilities").into());
-        }
-        let (cpu_registered_value, model_registered_value) = match cpu.identity() {
-            CheckerIdentity::Owned(identity) => {
-                let descriptor = cpu
-                    .owned_descriptor()
-                    .ok_or(CheckerError::Invalid("owned configuration missing"))?;
-                if descriptor.config.max_depth == 0
-                    || descriptor.config.max_depth > 64
-                    || descriptor.config.quiescence_ply > 32
-                    || capabilities.max_depth < descriptor.config.max_depth
-                    || descriptor.search_identity.is_empty()
-                {
-                    return Err(CpuError::Unsupported("PALS own CPU configuration").into());
-                }
-                (Some(identity.clone()), None)
-            }
-            CheckerIdentity::ExternalUci(_) => {
-                if cpu.owned_descriptor().is_some() || capabilities.resume {
-                    return Err(CheckerError::Invalid(
-                        "foreign helper cannot disclose own/resume semantics",
-                    )
-                    .into());
-                }
-                let identity = model
-                    .value_identity()
-                    .ok_or(RoleError::Unavailable)?
-                    .clone();
-                identity.validate()?;
-                if identity.model != model.identity()
-                    || identity.semantics != MODEL_WDL_VALUE_SEMANTICS
-                {
-                    return Err(RoleError::InvalidOutput.into());
-                }
-                (None, Some(identity))
-            }
-        };
-        let model_registered_value = if resolver == ResolverPolicy::ModelWdlRestricted
-            || policy.uses_frozen_model_wdl()
-        {
-            let identity = model
-                .value_identity()
-                .ok_or(RoleError::Unavailable)?
-                .clone();
-            identity.validate()?;
-            if identity.model != model.identity() || identity.semantics != MODEL_WDL_VALUE_SEMANTICS
-            {
-                return Err(RoleError::InvalidOutput.into());
-            }
-            Some(identity)
-        } else {
-            model_registered_value
-        };
-        let checker_registered_identity = cpu.identity().clone();
-        let cpu_registered_condition = Self::cpu_condition_for(cpu.as_ref());
+        let mut admission =
+            Self::admit_researcher(&config, &model, cpu.as_ref(), resolver, policy)?;
         let semantic = PalsSemanticState::new_admitted(
             &PalsSemanticConfig::from(&config),
             model,
-            model_registered_value,
+            admission.model_registered_value.take(),
         )?;
-        let researcher = RegisteredResearcher::from_admitted(
-            cpu,
-            checker_registered_identity,
-            cpu_registered_value,
-            cpu_registered_condition,
-        );
-        Ok(Self {
-            config,
-            resolver,
-            followup_lane: true,
-            post_repair_recheck: policy,
-            cpu_interleave: CpuInterleavePolicy::ReplaceOnFresh,
-            held_cpu_task: None,
-            semantic,
-            researcher,
-            last_cpu_checkpoint_cleanup_error: None,
-            followup_execution: followup_execution::FollowupExecutionRecorder::default(),
-        })
+        Ok(Self::from_admitted_researcher(
+            config, cpu, resolver, policy, None, admission, semantic,
+        ))
     }
 
     /// Immutable opt-in requiring an owner which can actually preserve one
@@ -1633,7 +1555,7 @@ impl<M: RoleModel> PalsEngine<M> {
             .model
             .new_game_with_generation(self.semantic.game_generation);
         self.semantic.revision = 0;
-        self.semantic.stores = PalsStores::new(Self::store_limits(&self.config));
+        self.semantic.stores = PalsStores::new(self.semantic_sequence_config().store_limits());
         self.reset_archive_new_game();
         self.semantic.consumer_id = 0;
         self.semantic.last_search_counters = None;
@@ -2542,7 +2464,7 @@ impl<M: RoleModel> PalsEngine<M> {
         question: RoleQuestion<'_>,
     ) -> Result<RoleLogicalContext, PalsError> {
         self.semantic
-            .role_context(&PalsSemanticConfig::from(&self.config), node, question)
+            .role_context(&self.semantic_sequence_config(), node, question)
     }
 
     fn accept_role_output(
@@ -4541,12 +4463,9 @@ impl<M: RoleModel> PalsEngine<M> {
         obsolete: Option<usize>,
         evidence: Option<ObservationId>,
     ) -> Result<(), PalsError> {
-        self.semantic.publish_record(
-            &PalsSemanticConfig::from(&self.config),
-            record,
-            obsolete,
-            evidence,
-        )
+        let config = self.semantic_sequence_config();
+        self.semantic
+            .publish_record(&config, record, obsolete, evidence)
     }
     fn check_logical_controls(controls: Option<(Instant, &AtomicBool)>) -> Result<(), PalsError> {
         if let Some((deadline, cancel)) = controls {
@@ -5751,7 +5670,7 @@ impl<M: RoleModel> PalsEngine<M> {
     }
     fn root_model_value(&self, child: usize) -> (PalsResolvedValue, PalsValueScope) {
         self.semantic
-            .root_model_value(&PalsSemanticConfig::from(&self.config), child)
+            .root_model_value(&self.semantic_sequence_config(), child)
     }
     fn model_result(
         &self,

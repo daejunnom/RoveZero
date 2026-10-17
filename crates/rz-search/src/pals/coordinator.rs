@@ -5,6 +5,7 @@
 //! sealed responses and commits validated Rules/store evidence. The historical
 //! synchronous `RoleModel` remains available alongside this facade.
 
+mod accepted_peer;
 mod external_binding;
 mod machine;
 mod native_acceptance;
@@ -15,6 +16,7 @@ mod ticket_observation;
 mod tickets;
 mod validator;
 
+pub(crate) use accepted_peer::{AcceptedPeerSourceSeal, accepted_peer_semantic_digest};
 pub use external_binding::*;
 pub use machine::*;
 pub use native_acceptance::*;
@@ -91,6 +93,10 @@ pub fn coordinator_source_digest() -> rz_contracts::Digest {
         (
             "coordinator/native_acceptance.rs",
             include_bytes!("coordinator/native_acceptance.rs").as_slice(),
+        ),
+        (
+            "coordinator/accepted_peer.rs",
+            include_bytes!("coordinator/accepted_peer.rs").as_slice(),
         ),
         (
             "coordinator/external_binding.rs",

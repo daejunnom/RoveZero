@@ -30,6 +30,10 @@ pub(super) struct EngineArchiveLifecycle {
 }
 
 impl<M: RoleModel> PalsSemanticState<M> {
+    pub(super) fn archive_is_configured(&self) -> bool {
+        self.archive_state.config.is_some()
+    }
+
     pub(super) fn ensure_archive_admission_open(&self) -> Result<(), PalsError> {
         if self.archive_state.closed_current_owner.is_some() {
             return Err(PalsError::Store(StoreError::InvalidConditions(
@@ -281,7 +285,7 @@ impl<M: RoleModel> PalsEngine<M> {
             .ok_or(StoreError::ArchiveDisabled)?
             .clone();
         let runtime_limits = self.archive_runtime_limits().copied();
-        let mut next = PalsStores::new(Self::store_limits(&self.config));
+        let mut next = PalsStores::new(self.semantic_sequence_config().store_limits());
         match &self.semantic.archive_state.root_capability {
             Some(capability) => next.enable_archive_with_capability(config, capability.clone()),
             None => next.enable_archive(config),

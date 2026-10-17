@@ -70,6 +70,35 @@ impl V2CpuValue {
         Ok(())
     }
 
+    fn score_native(
+        &self,
+        accumulator: &CpuAccumulator,
+        position: &Position,
+        capture: Option<&super::capture::NnuecActiveCapture>,
+    ) -> Result<i32, CpuValueError> {
+        self.cache_context(accumulator, position)?;
+        let state = accumulator
+            .nnuec
+            .as_ref()
+            .ok_or(CpuValueError::StateMismatch)?;
+        // The ordinary and observed paths compute precisely one same forward.
+        let numeric = self
+            .model
+            .base
+            .forward_with_context_values(
+                &state.board,
+                self.bound.context().values(),
+                &state.local,
+                position,
+            )
+            .map_err(cpu_error)?;
+        self.check_live()?;
+        if let Some(capture) = capture {
+            capture.observe(&self.model, &self.bound, &state.local, position, &numeric);
+        }
+        Ok(numeric.frontier_score())
+    }
+
     /// Observe the existing value/WDL/utility head without granting its utility
     /// rows any authority to retain, drop, revisit, or route work.
     pub fn observe(
@@ -95,7 +124,7 @@ impl V2CpuValue {
 
 /// Immutable job namespace belongs to the actual evaluator, so recovering its
 /// engine cannot silently replace view custody with a weights-only identity.
-fn binding_digest(
+pub(super) fn binding_digest(
     identity: &CpuValueIdentity,
     provenance: &Provenance,
 ) -> Result<Digest, NnuecError> {
@@ -182,26 +211,19 @@ impl CpuValueEvaluator for V2CpuValue {
         accumulator: &CpuAccumulator,
         position: &Position,
     ) -> Result<i32, CpuValueError> {
-        self.cache_context(accumulator, position)?;
-        let state = accumulator
-            .nnuec
-            .as_ref()
-            .ok_or(CpuValueError::StateMismatch)?;
         // Same admitted V2 C and same head arithmetic. A per-node score does
         // not need to serialize/hash all frozen review lines for an Output
         // receipt; only the explicit observation path emits that metadata.
-        let numeric = self
-            .model
-            .base
-            .forward_with_context_values(
-                &state.board,
-                self.bound.context().values(),
-                &state.local,
-                position,
-            )
-            .map_err(cpu_error)?;
-        self.check_live()?;
-        Ok(numeric.frontier_score())
+        self.score_native(accumulator, position, None)
+    }
+
+    fn score_with_capture(
+        &self,
+        accumulator: &CpuAccumulator,
+        position: &Position,
+        capture: &super::capture::NnuecActiveCapture,
+    ) -> Result<i32, CpuValueError> {
+        self.score_native(accumulator, position, Some(capture))
     }
 
     fn apply_delta(

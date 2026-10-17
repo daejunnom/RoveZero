@@ -48,6 +48,7 @@ impl PausedTask {
         legal: Vec<BoardMove>,
         limits: CpuLimits,
         resume: Option<&CpuResumeToken>,
+        capture: Option<&crate::cpu_value::nnuec::v2::capture::NnuecActiveCapture>,
     ) -> Result<Self, CpuError> {
         let value = engine
             .evaluator
@@ -56,10 +57,13 @@ impl PausedTask {
         let score = if let Some(token) = resume {
             token.score
         } else {
-            let score = engine
-                .evaluator
-                .score(&value, position)
-                .map_err(CpuError::Value)?;
+            let score = match capture {
+                Some(capture) => engine
+                    .evaluator
+                    .score_with_capture(&value, position, capture),
+                None => engine.evaluator.score(&value, position),
+            }
+            .map_err(CpuError::Value)?;
             if !(-CPU_FRONTIER_SCORE_LIMIT..=CPU_FRONTIER_SCORE_LIMIT).contains(&score) {
                 return Err(CpuError::Value(
                     CpuValueError::ScoreOutsideFrontierNamespace,
@@ -611,7 +615,15 @@ fn run_inner(
                 resume: None,
             });
         }
-        PausedTask::new(engine, position, root_moves, legal, limits, resume)?
+        PausedTask::new(
+            engine,
+            position,
+            root_moves,
+            legal,
+            limits,
+            resume,
+            cooperative.and_then(|slice| slice.nnuec_capture.as_ref()),
+        )?
     };
     if let Some((scope, reply)) = reciprocal {
         if task.reciprocal.is_none() {
@@ -2159,6 +2171,7 @@ mod tests {
             position.ordered_legal_moves().moves().to_vec(),
             limits(1),
             None,
+            None,
         )
         .unwrap();
         let retained = task.retained_bytes();
@@ -3125,6 +3138,7 @@ mod tests {
                 Some(&moves),
                 legal,
                 limits(100_000),
+                None,
                 None,
             )
             .unwrap();

@@ -168,6 +168,118 @@ fn zero_one_nodes_and_cached_edges_preserve_the_registered_unit() {
 }
 
 #[test]
+fn checked_line_keeps_paid_snapshot_after_budget_closes_and_cannot_change_owner() {
+    let mut fixture = Fixture::new(Position::startpos(), SearchGoal::default(), Some(2), false);
+    let path = fixture
+        .frontier
+        .observe_root_child(
+            mv("e2e4"),
+            fixture.clock.domain(),
+            fixture.clock.now().unwrap(),
+        )
+        .unwrap();
+    let line = fixture
+        .frontier
+        .checked_line(path, &fixture.stores)
+        .unwrap();
+    assert!(line.matches(&fixture.frontier, &fixture.stores));
+    assert_eq!(line.path(), path);
+    assert_eq!(line.prefix(), [mv("e2e4")]);
+    assert_eq!(line.steps().len(), 1);
+    assert_eq!(line.steps()[0].movement(), mv("e2e4"));
+    assert!(
+        line.root_snapshot()
+            .same_state(fixture.frontier.registration.root_rules.rules().snapshot())
+    );
+    assert!(
+        line.steps()[0]
+            .snapshot()
+            .same_state(line.endpoint_snapshot())
+    );
+    assert_eq!(
+        fixture
+            .frontier
+            .admit_role_input(fixture.clock.domain(), fixture.clock.now().unwrap()),
+        Err(FrontierError::NodeBudget)
+    );
+    assert!(line.matches(&fixture.frontier, &fixture.stores));
+    assert_eq!(
+        fixture.frontier.snapshot().work.total_node_visits(),
+        Some(2)
+    );
+    let other = Fixture::new(Position::startpos(), SearchGoal::default(), Some(2), false);
+    assert!(!line.matches(&other.frontier, &other.stores));
+    assert!(matches!(
+        other.frontier.checked_line(path, &other.stores),
+        Err(FrontierError::ForeignHandle)
+    ));
+}
+
+#[test]
+fn original_clock_bridge_keeps_constructor_entry_across_owner_move() {
+    let fixture = Fixture::new(Position::startpos(), SearchGoal::default(), None, false);
+    let entry = fixture.frontier.original_entry_instant;
+    let original_tick = fixture.frontier.original_entry_tick;
+    let before = fixture.frontier.observed_original_tick().unwrap();
+    assert_eq!(before.0, fixture.clock.domain());
+    assert!(before.1.0 >= original_tick.0);
+    let moved = Box::new(fixture.frontier);
+    assert_eq!(moved.original_entry_instant, entry);
+    let after = moved.observed_original_tick().unwrap();
+    assert_eq!(before.0, after.0);
+    assert!(after.1.0 >= before.1.0);
+    assert_eq!(moved.snapshot().work.total_node_visits(), Some(1));
+}
+
+#[test]
+fn missing_child_admission_charges_before_returning_its_unforgeable_snapshot_once() {
+    let mut fixture = Fixture::new(
+        Position::startpos(),
+        SearchGoal {
+            depth_plies: NonZeroU16::new(3),
+            mate_moves: NonZeroU16::new(2),
+        },
+        Some(20),
+        false,
+    );
+    let question = fixture
+        .frontier
+        .missing_mate_questions(1, fixture.clock.domain(), fixture.clock.now().unwrap())
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        fixture.frontier.snapshot().work.total_node_visits(),
+        Some(1)
+    );
+    let line = fixture
+        .frontier
+        .observe_missing_child(
+            &question,
+            fixture.clock.domain(),
+            fixture.clock.now().unwrap(),
+        )
+        .unwrap();
+    assert!(line.matches(&fixture.frontier, &fixture.stores));
+    assert_eq!(line.prefix(), [question.movement()]);
+    // One actual horizon transition and the two independently checked mate
+    // reducer transitions; no model call or raw value proves either lane.
+    assert_eq!(fixture.frontier.snapshot().work.checked_transitions, 3);
+    assert!(matches!(
+        fixture.frontier.observe_missing_child(
+            &question,
+            fixture.clock.domain(),
+            fixture.clock.now().unwrap()
+        ),
+        Err(FrontierError::ForeignHandle)
+    ));
+    assert_eq!(
+        fixture.frontier.snapshot().work.total_node_visits(),
+        Some(4)
+    );
+}
+
+#[test]
 fn unexamined_mate_defenses_are_returned_as_questions_and_depth_does_not_shrink_mate() {
     let mut root = Position::from_fen("6k1/p7/5K2/8/8/8/P7/5Q2 w - - 0 1").unwrap();
     for movement in ["a2a3", "a7a6", "f1g1"] {
