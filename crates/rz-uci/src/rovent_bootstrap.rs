@@ -251,6 +251,20 @@ mod native_startup_diagnostic_tests {
         }
         assert!(on.reserve().is_none());
         assert!(same.reserve().is_none());
+        // An exhausted diagnostic budget must neither skip work nor replace
+        // the original error owner. Disabled diagnostics preserve it too.
+        let calls = std::cell::Cell::new(0);
+        let original = Arc::new(());
+        for diagnostic in [&on, &off] {
+            let rejected = diagnostic
+                .trace(NativeStartupDiagnosticStage::NativeFactory, || {
+                    calls.set(calls.get() + 1);
+                    Err::<(), _>(Arc::clone(&original))
+                })
+                .unwrap_err();
+            assert!(Arc::ptr_eq(&rejected, &original));
+        }
+        assert_eq!(calls.get(), 2);
         assert_eq!(
             NATIVE_STARTUP_DIAGNOSTIC_STAGE_NAMES.len(),
             NATIVE_STARTUP_DIAGNOSTIC_STAGE_COUNT

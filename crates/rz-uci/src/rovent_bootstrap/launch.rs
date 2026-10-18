@@ -568,10 +568,8 @@ fn run_inner<'a>(
                 let directory = root
                     .open_dir_nofollow(&name)
                     .map_err(|failure| error("ProfileDirectory", failure))?;
-                Ok(
-                    VirtualReviewProfileDirectory::from_owned_directory(directory.into_std_file())
-                        .map_err(|failure| error("ProfileDirectory", failure))?,
-                )
+                VirtualReviewProfileDirectory::from_owned_directory(directory.into_std_file())
+                    .map_err(|failure| error("ProfileDirectory", failure))
             },
         )?)
     } else {
@@ -666,29 +664,40 @@ fn run_inner<'a>(
             None => RoventCollectionPreparedNative::Pc(Box::new(prepared)),
         }
     };
-    let driver = diagnostic
-        .trace(NativeStartupDiagnosticStage::ProductAssembly, || {
-            match (collection_preload, collection_assemble) {
-                (Some(preload), Some(assemble)) => assemble(RoventCollectionPreparedLaunch {
-                    native: prepared_product,
-                    preload,
-                    control: control.clone(),
-                    clock: clock.clone(),
-                    owners: Arc::clone(&owners),
-                    identity,
-                    root_policy: arguments.root_policy,
-                }),
-                (None, None) => assemble_native_product(
-                    prepared_product,
-                    clock.clone(),
-                    Arc::clone(&owners),
-                    identity,
-                    arguments.root_policy,
-                ),
-                _ => unreachable!("paired private Collection source and assembly request"),
-            }
-        })
-        .map_err(|failure| reject_product(failure, cleanup_until, &diagnostic))?;
+    diagnostic.emit(
+        NativeStartupDiagnosticStage::ProductAssembly,
+        NativeStartupDiagnosticPhase::Entry,
+    );
+    let driver = match (collection_preload, collection_assemble) {
+        (Some(preload), Some(assemble)) => assemble(RoventCollectionPreparedLaunch {
+            native: prepared_product,
+            preload,
+            control: control.clone(),
+            clock: clock.clone(),
+            owners: Arc::clone(&owners),
+            identity,
+            root_policy: arguments.root_policy,
+        }),
+        (None, None) => assemble_native_product(
+            prepared_product,
+            clock.clone(),
+            Arc::clone(&owners),
+            identity,
+            arguments.root_policy,
+        ),
+        _ => unreachable!("paired private Collection source and assembly request"),
+    }
+    .map_err(|failure| {
+        diagnostic.emit(
+            NativeStartupDiagnosticStage::ProductAssembly,
+            NativeStartupDiagnosticPhase::Error,
+        );
+        reject_product(failure, cleanup_until, &diagnostic)
+    })?;
+    diagnostic.emit(
+        NativeStartupDiagnosticStage::ProductAssembly,
+        NativeStartupDiagnosticPhase::Exit,
+    );
     let mut settings = EngineSettings {
         shutdown_limit: Duration::from_millis(lock.manifest.cleanup_max_ms),
         ..EngineSettings::default()
