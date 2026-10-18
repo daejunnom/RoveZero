@@ -114,6 +114,11 @@ impl NnuecValueRetirementOwner {
     ) -> Option<crate::cpu_worker::NnuecAuthorityRevocation> {
         self.bound.authority_revocation()
     }
+    /// The admitted original clock boundary, read for cleanup classification
+    /// only. This never extends, replaces or revives the Bound's deadline.
+    pub(crate) fn original_hard_deadline(&self) -> std::time::Instant {
+        self.bound.original_hard_deadline()
+    }
     pub fn provenance(&self) -> &Provenance {
         self.bound.provenance()
     }

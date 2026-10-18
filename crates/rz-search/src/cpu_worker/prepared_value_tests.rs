@@ -590,17 +590,37 @@ fn soft_terminal_recovery_requires_the_same_actual_bound_and_installed_binding()
     let cancelled = crate::cpu::CpuError::Value(CpuValueError::AuthorityRevoked(
         CpuValueAuthorityRevocation::Cancelled,
     ));
+    let known_work = Some(CpuWork::default());
     assert_eq!(
-        super::super::owned_soft_value_terminal(&cpu, binding, &cancelled),
+        super::super::owned_soft_value_terminal(&cpu, binding, &cancelled, known_work),
         None
     );
     fixture.cancel.store(true, Ordering::Release);
     assert_eq!(
-        super::super::owned_soft_value_terminal(&cpu, binding, &cancelled),
+        super::super::owned_soft_value_terminal(&cpu, binding, &cancelled, known_work),
         Some(crate::cpu::CpuCompletion::Canceled),
     );
     assert_eq!(
-        super::super::owned_soft_value_terminal(&cpu, None, &cancelled),
+        super::super::owned_soft_value_terminal(&cpu, None, &cancelled, known_work),
+        None
+    );
+    assert_eq!(
+        super::super::owned_soft_value_terminal(&cpu, binding, &cancelled, None),
+        None
+    );
+    let mut foreign_binding = binding.unwrap();
+    foreign_binding.0[0] ^= 1;
+    assert_eq!(
+        super::super::owned_soft_value_terminal(
+            &cpu,
+            Some(foreign_binding),
+            &cancelled,
+            known_work
+        ),
+        None
+    );
+    assert_eq!(
+        super::super::owned_soft_value_terminal(&engine(false), binding, &cancelled, known_work),
         None
     );
     for error in [
@@ -615,14 +635,86 @@ fn soft_terminal_recovery_requires_the_same_actual_bound_and_installed_binding()
                 &cpu,
                 binding,
                 &crate::cpu::CpuError::Value(error),
+                known_work,
             ),
             None
         );
     }
     fixture._actor.invalidate_cache().unwrap();
     assert_eq!(
-        super::super::owned_soft_value_terminal(&cpu, binding, &cancelled),
+        super::super::owned_soft_value_terminal(&cpu, binding, &cancelled, known_work),
         None
+    );
+}
+
+#[test]
+fn original_expiry_then_cancellation_preserves_deadline_without_accepting_hard_revocation() {
+    use crate::cpu_value::{CpuValueAuthorityRevocation, CpuValueError};
+    use crate::cpu_worker::NnuecAuthorityRevocation;
+    let original_deadline = Instant::now();
+    let before = original_deadline
+        .checked_sub(Duration::from_nanos(1))
+        .unwrap();
+    let after = original_deadline
+        .checked_add(Duration::from_nanos(1))
+        .unwrap();
+    let error = crate::cpu::CpuError::Value(CpuValueError::AuthorityRevoked(
+        CpuValueAuthorityRevocation::Expired,
+    ));
+    let original_error = error.clone();
+    assert!(super::super::original_soft_revocation_matches(
+        CpuValueAuthorityRevocation::Expired,
+        Some(NnuecAuthorityRevocation::Expired),
+        original_deadline,
+        original_deadline,
+    ));
+    assert!(super::super::original_soft_revocation_matches(
+        CpuValueAuthorityRevocation::Expired,
+        Some(NnuecAuthorityRevocation::Cancelled),
+        original_deadline,
+        after,
+    ));
+    assert!(!super::super::original_soft_revocation_matches(
+        CpuValueAuthorityRevocation::Expired,
+        Some(NnuecAuthorityRevocation::Cancelled),
+        original_deadline,
+        before,
+    ));
+    for current in [
+        None,
+        Some(NnuecAuthorityRevocation::ActorStopped),
+        Some(NnuecAuthorityRevocation::Invalidated),
+    ] {
+        assert!(!super::super::original_soft_revocation_matches(
+            CpuValueAuthorityRevocation::Expired,
+            current,
+            original_deadline,
+            after,
+        ));
+    }
+    for hard in [
+        CpuValueAuthorityRevocation::ActorStopped,
+        CpuValueAuthorityRevocation::Invalidated,
+    ] {
+        assert!(!super::super::original_soft_revocation_matches(
+            hard,
+            Some(NnuecAuthorityRevocation::Cancelled),
+            original_deadline,
+            after,
+        ));
+    }
+    assert!(!super::super::original_soft_revocation_matches(
+        CpuValueAuthorityRevocation::Cancelled,
+        Some(NnuecAuthorityRevocation::Expired),
+        original_deadline,
+        after,
+    ));
+    // Only the comparison helper consumed deterministic clock observations;
+    // no real Bound, registered deadline or original error was changed.
+    assert_eq!(error, original_error);
+    assert_eq!(
+        error.value_authority_stop(),
+        Some(crate::cpu::CpuCompletion::Deadline)
     );
 }
 

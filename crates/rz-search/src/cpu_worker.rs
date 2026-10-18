@@ -85,27 +85,52 @@ impl From<NnuecAuthorityRevocation> for crate::cpu_value::CpuValueAuthorityRevoc
 
 /// A typed soft error alone is not enough to recover a worker. Require the
 /// actual immutable V2 owner, the original installed binding, and the same
-/// original Bound's present reason. Hard revocations remain errors even if
-/// cancellation/expiry was also observed. This does not accept a value.
+/// original Bound's present control. Expiry may monotonically be followed
+/// by its cancellation, but the original Expired observation is not rewritten.
+/// Hard revocations and unknown work remain errors. This accepts no value.
 fn owned_soft_value_terminal(
     engine: &CpuEngine,
     binding: Option<Digest>,
     error: &CpuError,
+    actual_work: Option<CpuWork>,
 ) -> Option<CpuCompletion> {
+    actual_work?;
     let completion = error.value_authority_stop()?;
     let CpuError::Value(crate::cpu_value::CpuValueError::AuthorityRevoked(reason)) = error else {
         return None;
     };
     let owner = engine.nnuec_retirement_owner().ok().flatten()?;
     if binding != Some(owner.binding_digest())
-        || owner
-            .authority_revocation()
-            .map(crate::cpu_value::CpuValueAuthorityRevocation::from)
-            != Some(*reason)
+        || !original_soft_revocation_matches(
+            *reason,
+            owner.authority_revocation(),
+            owner.original_hard_deadline(),
+            Instant::now(),
+        )
     {
         return None;
     }
     Some(completion)
+}
+
+/// Pure control observation only. It cannot produce an owner or a terminal
+/// receipt. In particular a cancelled-but-not-expired Bound cannot attest a
+/// fabricated earlier Expired result merely because both are soft reasons.
+fn original_soft_revocation_matches(
+    observed: crate::cpu_value::CpuValueAuthorityRevocation,
+    current: Option<NnuecAuthorityRevocation>,
+    original_deadline: Instant,
+    observed_at: Instant,
+) -> bool {
+    use crate::cpu_value::CpuValueAuthorityRevocation;
+    match (observed, current) {
+        (CpuValueAuthorityRevocation::Cancelled, Some(NnuecAuthorityRevocation::Cancelled)) => true,
+        (
+            CpuValueAuthorityRevocation::Expired,
+            Some(NnuecAuthorityRevocation::Expired | NnuecAuthorityRevocation::Cancelled),
+        ) => observed_at >= original_deadline,
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1867,10 +1892,9 @@ impl CpuWorker {
                     report.admission_rejected = false;
                     report.result = result;
                     report.progress_sequence = progress_sequence;
-                    let mut nnuec_soft_terminal = report
-                        .actual_work
-                        .and_then(|_| report.result.as_ref().err())
-                        .and_then(|error| owned_soft_value_terminal(&engine, value_binding, error));
+                    let mut nnuec_soft_terminal = report.result.as_ref().err().and_then(|error| {
+                        owned_soft_value_terminal(&engine, value_binding, error, report.actual_work)
+                    });
                     if report.actual_work.is_none()
                         || (report.result.is_err() && nnuec_soft_terminal.is_none())
                     {
