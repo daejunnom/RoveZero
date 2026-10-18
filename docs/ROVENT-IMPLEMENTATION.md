@@ -819,3 +819,104 @@ provider나 현재 실행의 물리 완료 증거를 발급하지 않는다.
 독립 intervention cohort 게시·재소비, 실제 trainer child의 zero-update 종료다.
 로컬 RTX 4050 자료는 기능·수치 검증에만 사용한다. 실제 학습·대규모 수집·
 원격 비교·병합은 계속 제외한다.
+
+## 열여섯 번째 통합 체크포인트
+
+N05의 별도 개입 정책은 원 Ready offer를 만들거나 바꾸는 경로와 분리한다.
+같은 중립 Proposal을 대상으로 독립 root의 P 재제안·C 반례·R 검토를 실제
+발주하고, 각 arm의 권한·시계·cost epoch·물리 종료를 원 기록으로 보존한다.
+원 publication과 별도 durable ACK, strict 역사 소비 및 현재 부모·자식의
+zero-update 종료를 인수하기 전에는 이 기능 전체를 완료로 표시하지 않는다.
+
+`23017c4`의 실제 Linux 형식 검사·자원 identity 검사 5개·workspace 전체
+feature/target 엄격 Clippy와 실행 파일 8개 빌드가 통과했다. 이후 실제
+CPU P-C 시작에서 자원 영수증의 source/domain 혼용을 발견했다. `3fb36db`는
+로컬 readback schema를 보존하고 ArtifactRef의 공개 producer URL을 분리했다.
+실제 자원 evidence writer 검사 3개, Rules metadata 검사 2개, 전체 엄격
+Clippy와 실행 파일 9개 빌드가 통과했다. 파일 캐시·RSS·VRAM peak 미관측은
+unknown으로 남기며 이 빌드를 실제 네 모드 실행 성공으로 승격하지 않는다.
+
+별도 실행에서 공식 Stockfish 19와 Reckless 0.9.0 각각 정상 완료·진행 후
+취소·진행 후 Yield를 검사했다. `23017c4`의 원 외부 probe 6개가 모두
+통과했고 실제 worker join·terminal drain을 확인했다. 이는 외부 프로세스
+단독 수명 검사이며 P/C의 교사 응답 소비·실제 대국·기력·학습 인수와 다르다.
+
+첫 native 시작의 self-PID와 trainer direct-child 혼용은 `23017c4`에서
+구분했다. 이후 자원 영수증 오류, 준비 명세의 question/frame 한도 불일치,
+서비스 실행 환경의 cache root 누락도 원 실패와 구분해 보존했다. 한도나
+출처 guard를 완화하지 않았고 준비 선언만 정식 소비 조건에 맞게 고쳤다.
+CPU P-C는 그 뒤 실제 모델 로딩·uciok·readyok까지 도달했다.
+
+첫 depth root는 반복 재검토 정책을 원 Frontier 연결 전에 적용해 실패했다.
+`95cd9d2`는 Frontier 연결 후 정책을 적용하고 실제 readback을 대조하도록
+고쳤다. 첫 역할 발주 이전이라는 조건과 실패 port custody를 유지한다.
+closed 세션의 다음 Start는 admission에서 거부하고 원 물리 Unknown·실제
+actor/native join 조건은 바꾸지 않는다. 실패 실행에서 나온 fallback을
+정상 depth 완료로 보지 않으며 이후 native/GPU 실행은 새 source로 재검증한다.
+
+`23017c4`의 원격 CI에서는 외부 worker fixture 4개와 Python 실행 차단
+검사가 실패했다. fixture는 비용 청구 없는 hot 삽입 대신 실제 Rules
+frontier 경로를 사용하도록 고쳤고, tensor 경계는 owner·경로·family를
+읽기 전에 literal execute 승인을 검사하도록 복구했다. `95cd9d2`의 실제
+순수 Python 검사 23개가 통과했다. 이어 새 Rust 회귀의 비공개 ID import로
+컴파일이 실패했으며 `7e01bdd`에서 공개 계약 타입으로 수정했다. 이 단계의
+소스 수정·집중 검사와 아직 완료되지 않은 최신 전체 CI를 구분한다.
+
+`7e01bdd`에서는 Python 23개, P-C 정책 순서 회귀 1개, 외부 프로필 5개가
+실제로 통과했다. 외부 worker 4개 재검사는 1개 통과 뒤 raw PV의 Store
+projection 불일치로 실패했다. producer가 Discovery에서만 projection을
+만들고 Store는 다른 질문에서도 이를 요구하는 더 깊은 제품 접점을 확인했다.
+`beaf652`는 원 질문·Rules·quota로 필요한 projection을 만들고, 한도를 넘으면
+명시적인 오류와 원 report를 보존하도록 고쳤다. validation을 Discovery로
+재태깅하거나 Store의 PV 검증을 완화하지 않는다. 새 fixture의 실행 인수와
+ticket 상태 기대 오류도 원 실패와 나누어 수정했다. `b1d465f`에서 외부 worker
+집중 검사 5개가 실제로 통과했다. 정상 validation·peer R의 PV 게시, horizon·
+node 한도 부족의 원 packet 보존, 종료 이후 재시도·퇴역 수명을 포함한다.
+
+CPU P-C 실행 016은 실제 준비 이후 첫 go에서 물리 Unknown으로 중단됐다.
+공유 NNUEC의 원 root budget을 검증하기 전에 Frontier를 retire하는 순서
+오류를 확인했다. `b1d465f`는 manager와 driver의 원 영수증 검증을 먼저 하고
+Repair report·Frontier 회수·semantic owner 복귀를 뒤에 수행한다. handoff가
+실패해도 원 typed closure를 native owner와 함께 보존한다. Unknown의 코드·
+분류·실제 join 조건은 유지하고 실패 단계의 진단만 구체화했다. 원 실행 016의
+Unknown과 OS 종료·EOF는 재분류하지 않으며 새 실행에서 실제 복귀를 검증한다.
+
+`b1d465f`의 형식 검사, 순수 Python 23개, P-C 정책 순서 1개, 외부 프로필
+5개, 위 외부 worker 5개, workspace 전체 feature/target 엄격 Clippy와 실행
+파일 10개 빌드가 통과했다. 별도 정확한 모듈 필터의 R-free 목표·종료 검사
+2개도 통과했다. 0개가 실행된 보조 명령은 인수 수에 넣지 않는다. 이 결과는
+CPU/source 검사이며 네 모드의 실제 NN·물리 종료 인수와 구분한다.
+
+신규 cohort의 준비 접점으로 기존 Rules capture/checked restore를 재사용하는
+replay metadata와, 실제 pin된 teacher profile에서 신규 recipe actor 선언을
+내보내는 metadata를 추가했다. 후자는 source/options/assets/rights 선언을
+별도로 봉인하며 embedded 모델의 unknown 권리를 확인됐다고 표시하지 않는다.
+모든 준비 metadata는 실행·Ready·현재 root 권한·학습 완료를 발급하지 않는다.
+실제 Rust 예제로 시작 위치 replay와 두 teacher actor 선언을 추출했다.
+후속 membership 준비는 원 G0 inventory·원 model metadata·NNUEC raw/semantic
+pin과 현재 source를 각각 대조한다. 이 metadata 조립은 tensor 로딩·역사 실행
+재인증이나 실제 cohort 자료 게시가 아니다.
+
+실행 019의 CPU P-C는 UCI·메이트·stop·ponderhit·newgame·quit과 OS 종료를
+관측했지만 첫 depth 1의 `completed_depth=None`이므로 전체 기능 인수가 아니다.
+`e6cd269`는 실제 shutdown closure를 확인한 뒤 원 manager 실패를 보고하도록
+고쳤다. 실행 023은 `original P/C frontier rejected goal work`와 Pending 목표를
+보존했다. 선택적 Repair가 원 깊이를 넘어 발주되는 원인을 추적하며, 정상
+fallback이나 단순 bestmove를 완료 깊이로 재표시하지 않는다.
+
+실행 019의 CPU P-C-R은 첫 go에서 실제 stack overflow와 OS 종료 -6을 남겼다.
+원 ELF의 `run_admitted` prologue는 약 1.79MB의 정적 frame을 예약했다. 이는
+런타임 stack peak 관측값이 아니다. `f6d8bc5`는 같은 heap custody의 네 단계로
+큰 전이를 나누고 실패·원 receipt·물리 owner를 계속 보존한다. stack 크기나
+root 권한·물리 완료 조건은 바꾸지 않았으며 새 실제 실행을 별도로 인수한다.
+
+cohort source-only 준비 020과 membership 021은 실제 원 metadata로 통과했다.
+원 G0 inventory는 공유 64·P 19·C 21·V 20의 124개이며 V가 없었다고 표시하지
+않는다. 신규 선택 membership은 V-free P/C export에 해당하는 104개와 NNUEC
+24개를 선택하고, 원 V 20개 descriptor를 제외 근거와 함께 보존한다. 이는
+실제 tensor 로딩·publication ACK·학습 또는 현재 child IPC 인수를 뜻하지 않는다.
+
+잔여 실제 인수는 현재 source의 네 모드 UCI·NNUEC 소비·물리 종료,
+외부 응답 downstream·독립 cohort 원 자료 게시/재소비, 현재 trainer의
+zero-update 부모·자식 종료 및 최종 CI·증거 대조다. 로컬 GPU 결과는 계속
+기능·정확성 검증에 한정하고 실제 학습·원격 비교·병합은 실행하지 않는다.
