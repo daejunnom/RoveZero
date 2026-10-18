@@ -2281,7 +2281,7 @@ where
                 .driver()
                 .copy_role_consumption_diagnostic(diagnostic, true);
         }
-        let public_record_capacity = match manager.driver().rovent_public_record_capacity_closed() {
+        let publication_capacity = match manager.driver().rovent_publication_capacity_closed() {
             Ok(closed) => closed,
             Err(error) => {
                 *state = SessionState::Manager(manager);
@@ -2299,7 +2299,7 @@ where
             PalsCompletion::Deadline
         } else if manager.driver().root_is_terminal().unwrap_or(false) {
             PalsCompletion::Terminal
-        } else if public_record_capacity {
+        } else if publication_capacity {
             PalsCompletion::Capacity
         } else if matches!(self.researcher_limit_observation(&manager), Some(true)) {
             PalsCompletion::CpuNodeLimit

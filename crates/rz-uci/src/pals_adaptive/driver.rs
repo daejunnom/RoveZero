@@ -1522,6 +1522,21 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         }
         Ok(frontier.public_record_capacity_refused())
     }
+    fn rovent_public_review_index_capacity_closed(&self) -> Result<bool, AdaptiveManagerError> {
+        let port = self
+            .port
+            .as_ref()
+            .ok_or(AdaptiveManagerError::AuxiliaryPending)?;
+        let Some(frontier) = port.rovent_frontier() else {
+            return Ok(false);
+        };
+        if frontier.registration().authority != self.authority {
+            return Err(AdaptiveManagerError::Invalid(
+                "review capacity controller differs from the actual driver root",
+            ));
+        }
+        Ok(frontier.public_review_index_capacity_refused())
+    }
     fn rovent_lane_selected(
         &mut self,
         original: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,

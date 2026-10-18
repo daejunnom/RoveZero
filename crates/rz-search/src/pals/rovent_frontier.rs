@@ -101,6 +101,9 @@ pub enum FrontierError {
     /// The original semantic Store refused another retained public record.
     /// This does not cover pin, archive, allocation or physical-owner failures.
     PublicRecordCapacity,
+    /// The original selected-review producer refused its per-bundle record cap.
+    /// Generic index, view, sequence, owner and Store errors remain distinct.
+    PublicReviewIndexCapacity,
     ForeignRoot,
     ForeignHandle,
     Duplicate,
@@ -552,6 +555,8 @@ pub struct RoventFrontier {
     stop: Option<FrontierStop>,
     // Internal cause only; absent from FrontierSnapshot and historical schemas.
     public_record_capacity_refused: bool,
+    // Only the actual per-bundle review publication bound sets this cause.
+    public_review_index_capacity_refused: bool,
     // WorkBudget remains the first reported stop, but later revoke/unknown
     // still closes consumption of an already paid in-flight selection.
     consumption_stop: Option<FrontierStop>,
@@ -731,6 +736,7 @@ impl RoventFrontier {
             selection_sealed: false,
             stop,
             public_record_capacity_refused: false,
+            public_review_index_capacity_refused: false,
             consumption_stop: None,
             pins,
             pin,
@@ -2154,12 +2160,27 @@ impl RoventFrontier {
         self.public_record_capacity_refused && self.stop == Some(FrontierStop::Capacity)
     }
 
+    /// Read-only cause evidence from this same controller's original bundle cap.
+    /// A generic IndexCapacity, copied snapshot or error value cannot set it.
+    pub fn public_review_index_capacity_refused(&self) -> bool {
+        self.public_review_index_capacity_refused && self.stop == Some(FrontierStop::Capacity)
+    }
+
     /// Called only by the original public-record producer at its registered
     /// bound. Closing admission neither reclaims evidence nor completes depth.
     pub(super) fn refuse_public_record_capacity(&mut self) -> FrontierError {
         self.public_record_capacity_refused = true;
         self.interrupt(FrontierStop::Capacity);
         FrontierError::PublicRecordCapacity
+    }
+
+    /// Called only after the original selected-review publication returned
+    /// BundleRecordCapacity. Other review/index failures cannot call this path.
+    /// Closing admission neither removes evidence nor completes a goal/depth.
+    pub(super) fn refuse_public_review_index_capacity(&mut self) -> FrontierError {
+        self.public_review_index_capacity_refused = true;
+        self.interrupt(FrontierStop::Capacity);
+        FrontierError::PublicReviewIndexCapacity
     }
 
     /// A typed observation, not an output/fence authority. The real consumer

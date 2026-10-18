@@ -433,7 +433,7 @@ where
                 Err(AdaptiveManagerError::PhysicalUnknown)
             }
             FrontierGoalStatus::Stopped(FrontierStop::Capacity) => {
-                if manager.driver().rovent_public_record_capacity_closed()? {
+                if manager.driver().rovent_publication_capacity_closed()? {
                     Ok(true)
                 } else {
                     Err(AdaptiveManagerError::Frontier(FrontierError::Capacity(

@@ -1553,6 +1553,7 @@ fn review_error(
             ReviewError::AnchorMismatch => "AnchorMismatch",
             ReviewError::ViewCapacity => "ViewCapacity",
             ReviewError::IndexCapacity => "IndexCapacity",
+            ReviewError::BundleRecordCapacity => "BundleRecordCapacity",
             ReviewError::AlreadyConsumed => "AlreadyConsumed",
             ReviewError::Store(error) => {
                 o.nested("cause", |e| store_error(e, error))?;
@@ -1580,6 +1581,7 @@ fn frontier_error(
                 "Capacity"
             }
             FrontierError::PublicRecordCapacity => "PublicRecordCapacity",
+            FrontierError::PublicReviewIndexCapacity => "PublicReviewIndexCapacity",
             FrontierError::ForeignRoot => "ForeignRoot",
             FrontierError::ForeignHandle => "ForeignHandle",
             FrontierError::Duplicate => "Duplicate",
@@ -1687,6 +1689,26 @@ mod tests {
         assert_eq!(legacy["detail"], "original limit");
         // Historical JSON records the cause; it cannot recreate the private
         // live controller marker that authorizes graceful quiescence.
+    }
+
+    #[test]
+    fn public_review_bundle_capacity_projection_preserves_its_distinct_cause() {
+        use crate::pals::review_context::ReviewError;
+        use crate::pals::rovent_frontier::FrontierError;
+        let review =
+            projection(|encoder| review_error(encoder, &ReviewError::BundleRecordCapacity));
+        assert_eq!(review["domain"], "ReviewError");
+        assert_eq!(review["variant"], "BundleRecordCapacity");
+        assert!(review.get("detail").is_none());
+        let frontier = projection(|encoder| {
+            frontier_error(encoder, &FrontierError::PublicReviewIndexCapacity)
+        });
+        assert_eq!(frontier["domain"], "FrontierError");
+        assert_eq!(frontier["variant"], "PublicReviewIndexCapacity");
+        assert!(frontier.get("detail").is_none());
+        let generic = projection(|encoder| review_error(encoder, &ReviewError::IndexCapacity));
+        assert_eq!(generic["variant"], "IndexCapacity");
+        // Saved cause JSON cannot recreate either private live-controller marker.
     }
 
     #[test]

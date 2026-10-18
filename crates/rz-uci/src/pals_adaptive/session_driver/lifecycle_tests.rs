@@ -319,6 +319,31 @@ fn fixture_with_rovent_profile_and_peer_sources(
     ProcessClock,
     u64,
 ) {
+    fixture_with_rovent_profile_and_review_limits(
+        startup_gate,
+        role_limit,
+        rovent_mode,
+        line_plies,
+        full_roles,
+        peer_sources,
+        (max_records, ReviewIndexLimits::default()),
+    )
+}
+fn fixture_with_rovent_profile_and_review_limits(
+    startup_gate: Option<std::sync::mpsc::Receiver<()>>,
+    role_limit: Option<u64>,
+    rovent_mode: Option<rz_contracts::rovent::ExecutionMode>,
+    line_plies: usize,
+    full_roles: bool,
+    peer_sources: u16,
+    record_limits: (usize, ReviewIndexLimits),
+) -> (
+    AdaptiveSessionDriver<TerminalOwner>,
+    Arc<OwnerFacts>,
+    ProcessClock,
+    u64,
+) {
+    let (max_records, review_limits) = record_limits;
     let clock = ProcessClock::new(ProcessEpoch(31));
     let maximum_goal_plies = std::num::NonZeroU16::new(8).unwrap();
     let facts = Arc::new(OwnerFacts::default());
@@ -444,10 +469,7 @@ fn fixture_with_rovent_profile_and_peer_sources(
         )
     }
     .unwrap()
-    .with_selected_review_context(
-        ReviewSelectionPolicy::default(),
-        ReviewIndexLimits::default(),
-    )
+    .with_selected_review_context(ReviewSelectionPolicy::default(), review_limits)
     .unwrap();
     let next = Arc::new(AtomicU64::new(1));
     let issuer: AdaptiveRulesOwnerIssuer =
@@ -751,19 +773,34 @@ fn rovent_selected_counter_keeps_actual_parent_budget_after_peer_credit_spend() 
 
 #[test]
 fn rovent_game_record_capacity_keeps_evidence_and_closes_each_root_without_depth() {
+    assert_rovent_game_record_capacity(4, ReviewIndexLimits::default());
+}
+
+#[test]
+fn rovent_same_bundle_capacity_keeps_evidence_and_closes_each_root_without_depth() {
+    assert_rovent_game_record_capacity(
+        PalsConfig::default().max_records,
+        ReviewIndexLimits {
+            records_per_bundle: 4,
+            ..ReviewIndexLimits::default()
+        },
+    );
+}
+
+fn assert_rovent_game_record_capacity(max_records: usize, review_limits: ReviewIndexLimits) {
     use rz_contracts::rovent::ExecutionMode;
     use rz_search::pals::rovent_frontier::{FrontierGoalStatus, FrontierStop};
 
     // Use the existing real owner/manager/Rules/Fresh fixture. Each completed
     // depth-one root publishes one actual Proposal; do not prefill fake rows.
-    let (driver, facts, clock, _) = fixture_with_rovent_profile_and_peer_sources(
+    let (driver, facts, clock, _) = fixture_with_rovent_profile_and_review_limits(
         None,
         Some(64),
         Some(ExecutionMode::CpuPcr),
         1,
         true,
         1,
-        4,
+        (max_records, review_limits),
     );
     let retained_records = || {
         let state = driver.state.lock().unwrap();
@@ -806,7 +843,9 @@ fn rovent_game_record_capacity_keeps_evidence_and_closes_each_root_without_depth
         original.root_moves = Some(Arc::from([first]));
         let report = driver
             .run(&position, &original, &mut |_| {})
-            .unwrap_or_else(|error| panic!("actual record-bound root {root}: {error:?}"));
+            .unwrap_or_else(|error| {
+                panic!("actual record/bundle-bound root {root}: {error:?}; limits={max_records}/{review_limits:?}")
+            });
         final_until = Some(original.shutdown_deadline);
         assert_eq!(report.best_move, Some(first));
         let actual = driver.latest_rovent_root().unwrap().unwrap();

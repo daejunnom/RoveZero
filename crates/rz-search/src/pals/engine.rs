@@ -2214,6 +2214,7 @@ impl<M: RoleModel> PalsEngine<M> {
                     issue @ (ReviewError::ViewCapacity
                     | ReviewError::AnchorMismatch
                     | ReviewError::MissingRelation(_)
+                    | ReviewError::BundleRecordCapacity
                     | ReviewError::IndexCapacity
                     | ReviewError::Store(
                         StoreError::Capacity(_)

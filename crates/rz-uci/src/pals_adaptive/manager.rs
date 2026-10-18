@@ -903,6 +903,15 @@ pub trait AdaptiveSearchDriver<Q> {
     fn rovent_public_record_capacity_closed(&self) -> Result<bool, AdaptiveManagerError> {
         Ok(false)
     }
+    /// The exact public review-bundle producer stopped this same controller.
+    /// Other index/view/sequence/owner failures do not establish this boundary.
+    fn rovent_public_review_index_capacity_closed(&self) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
+    fn rovent_publication_capacity_closed(&self) -> Result<bool, AdaptiveManagerError> {
+        Ok(self.rovent_public_record_capacity_closed()?
+            || self.rovent_public_review_index_capacity_closed()?)
+    }
     fn rovent_frame_admitted(
         &mut self,
         _: &CoordinatorWork<ReviewView, Q>,
@@ -3627,13 +3636,17 @@ where
         &mut self,
         error: AdaptiveManagerError,
     ) -> Result<(), AdaptiveManagerError> {
-        if self.phase == ManagerPhase::Running
-            && matches!(
-                error,
-                AdaptiveManagerError::Frontier(FrontierError::PublicRecordCapacity)
-            )
-            && self.driver.rovent_public_record_capacity_closed()?
-        {
+        let controlled_capacity = self.phase == ManagerPhase::Running
+            && match &error {
+                AdaptiveManagerError::Frontier(FrontierError::PublicRecordCapacity) => {
+                    self.driver.rovent_public_record_capacity_closed()?
+                }
+                AdaptiveManagerError::Frontier(FrontierError::PublicReviewIndexCapacity) => {
+                    self.driver.rovent_public_review_index_capacity_closed()?
+                }
+                _ => false,
+            };
+        if controlled_capacity {
             // The rejected output/report remains in its original binding or
             // deferred queue. Quiescence drains it without semantic retry or
             // fabricated utility; the original frontier retains Capacity.

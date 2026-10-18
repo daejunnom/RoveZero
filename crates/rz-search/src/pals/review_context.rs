@@ -93,6 +93,9 @@ pub enum ReviewError {
     InvalidLine,
     AnchorMismatch,
     ViewCapacity,
+    /// This original (anchor, first move) bundle cannot retain another record.
+    /// Active-bundle admission and sequence exhaustion remain IndexCapacity.
+    BundleRecordCapacity,
     IndexCapacity,
     AlreadyConsumed,
     Store(StoreError),
@@ -552,7 +555,7 @@ impl ReviewContextIndex {
         }
         if let Some(id) = existing {
             if self.bundles[&id].revisions.len() >= self.limits.records_per_bundle {
-                return Err(ReviewError::IndexCapacity);
+                return Err(ReviewError::BundleRecordCapacity);
             }
         } else {
             self.compact_internal(None);
@@ -1743,6 +1746,92 @@ mod tests {
             .unwrap();
         assert_eq!(view.length_bucket(), 16);
         assert_eq!(view.token_count(), 9);
+    }
+
+    #[test]
+    fn full_bundle_keeps_original_records_and_live_view_without_widening_index_errors() {
+        let (stores, state) = stores(&Position::startpos());
+        let mut index = ReviewContextIndex::new(ReviewIndexLimits {
+            active_bundles: 2,
+            records_per_bundle: 4,
+        })
+        .unwrap();
+        let bundle = index
+            .publish(
+                &stores,
+                &record(state, 1, RecordKind::Proposal, "e2e4", None),
+                None,
+            )
+            .unwrap();
+        for revision in 2..=4 {
+            index
+                .publish(
+                    &stores,
+                    &record(
+                        state,
+                        revision,
+                        RecordKind::Counterexample,
+                        "e2e4 e7e5",
+                        Some(revision - 1),
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+        let view = index
+            .select(
+                &stores,
+                state,
+                empty_query(),
+                ReviewSelectionPolicy::default(),
+            )
+            .unwrap();
+        assert_eq!(view.records().len(), 4);
+        assert_eq!(stores.review_pin_count().unwrap(), 1);
+        assert_eq!(
+            index.publish(
+                &stores,
+                &record(state, 5, RecordKind::Repair, "e2e4 e7e5 g1f3", Some(4)),
+                None
+            ),
+            Err(ReviewError::BundleRecordCapacity),
+        );
+        assert_eq!(index.bundle(bundle).unwrap().revisions(), &[1, 2, 3, 4]);
+        assert_eq!(index.indexed_record_count(), 4);
+        assert!(!index.contains_revision(5));
+        assert!(view.validates(&stores));
+        assert_eq!(stores.review_pin_count().unwrap(), 1);
+        // A protected second bundle makes the separate active-bundle cap
+        // unreclaimable. It must retain the original general error class.
+        index
+            .publish(
+                &stores,
+                &record(state, 6, RecordKind::Counterexample, "d2d4 d7d5", None),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            index.publish(
+                &stores,
+                &record(state, 7, RecordKind::Proposal, "c2c4", None),
+                None
+            ),
+            Err(ReviewError::IndexCapacity),
+        );
+        assert_eq!(
+            index.publish(
+                &stores,
+                &record(state, 8, RecordKind::Repair, "e2e4 e7e5 g1f3", Some(99)),
+                None
+            ),
+            Err(ReviewError::MissingRelation(99)),
+        );
+        assert_eq!(index.bundle(bundle).unwrap().revisions(), &[1, 2, 3, 4]);
+        assert_eq!(index.indexed_record_count(), 5);
+        index.consume(&view, &stores).unwrap();
+        assert_eq!(index.bundle(bundle).unwrap().protected_consumptions(), 1);
+        drop(view);
+        assert_eq!(stores.review_pin_count().unwrap(), 0);
     }
 
     #[test]

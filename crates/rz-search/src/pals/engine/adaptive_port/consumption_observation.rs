@@ -60,7 +60,8 @@ impl AdaptiveRoleConsumptionRejection {
             PalsError::Capacity
             | PalsError::Store(StoreError::Capacity(_))
             | PalsError::Rovent(
-                crate::pals::rovent_frontier::FrontierError::PublicRecordCapacity,
+                crate::pals::rovent_frontier::FrontierError::PublicRecordCapacity
+                | crate::pals::rovent_frontier::FrontierError::PublicReviewIndexCapacity,
             ) => Self::Capacity,
             _ => Self::OtherOriginalFailure,
         }
@@ -187,5 +188,37 @@ impl AdaptiveRoleConsumptionObservation {
         }
         // Reservation was made once at opt-in; this push never grows beyond it.
         self.events.push(event);
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    use crate::pals::review_context::ReviewError;
+    use crate::pals::rovent_frontier::FrontierError;
+
+    #[test]
+    fn original_frontier_capacity_causes_do_not_reclassify_generic_review_errors() {
+        for cause in [
+            FrontierError::PublicRecordCapacity,
+            FrontierError::PublicReviewIndexCapacity,
+        ] {
+            assert_eq!(
+                AdaptiveRoleConsumptionRejection::from_error(&PalsError::Rovent(cause)),
+                AdaptiveRoleConsumptionRejection::Capacity,
+            );
+        }
+        // Only the original producer joins the bundle refusal to its frontier.
+        // A standalone ReviewError value is never that same-controller evidence.
+        for cause in [
+            ReviewError::BundleRecordCapacity,
+            ReviewError::IndexCapacity,
+            ReviewError::OwnerMismatch,
+        ] {
+            assert_eq!(
+                AdaptiveRoleConsumptionRejection::from_error(&PalsError::Review(cause)),
+                AdaptiveRoleConsumptionRejection::OtherOriginalFailure,
+            );
+        }
     }
 }

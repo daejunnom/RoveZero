@@ -1110,3 +1110,43 @@ root에서 raw 기록 보존·Capacity 종료, 다른 Capacity 원인 구분, ar
 유지하고, 고정 한도 도달·raw-only drain·원 fence 퇴역에서 관측·소비 계수와
 오류를 함께 확인한다. 이는 archive 회복이나 검색 재개가 아니며, 수정 후
 실제 검사·새 제품 바이너리·cohort 인수는 별도로 남는다.
+
+## 21차 체크포인트: PCR 종료 경합과 review bundle 포화
+
+소스 `315722c`의 전체 build 151은 실제 11단계 모두 통과했다. UCI 794개,
+Search 1,066개·ignored 2개, inventory 1개와 전체 feature/target 엄격 Clippy를
+확인했고 실행물 10개·검증 caller 2개를 원 depfile·hash와 함께 보존했다.
+등록 152는 원 NNUEC의 모델·가중치·구성·인코딩·namespace를 대조했으며 구현
+식별의 차이는 그대로 남겼다. 새 바이너리 수치 158의 실제 20 forward는
+독립 stdlib FP32 reference와 raw/WDL 최대 절대 차이가 각각 0이었다.
+
+이전 CPU PCR 142의 `UnknownPreparation`은 test-only 소스 `06f35b8`에서
+원 worker가 취소된 준비를 퇴역한 뒤 원 queued Prepared를 소비하는 경합으로
+재현했다. 실제 142에는 원 이벤트 ID가 없어 세부 분기가 같다고 소급 확정하지
+않는다. 후속 수정은 같은 binding의 성공한 취소를 다시 전송하지 않고 Draining의
+새 ACK 발주를 닫는다. 이미 큐에 들어간 Accept의 정확한 취소/실제 만료 ACK는
+원 ticket·issued seal·output digest와 미수락·미소비를 검사하고 output과 선형
+permit을 실제 fence까지 보존한다. 외래 permit·일반 거절·물리 Unknown은
+실패로 남는다. focused 159의 수정 후 네 검사는 실제로 통과했고 초기 fixture
+컴파일 실패도 별도 자료로 보존했다.
+
+CPU PCR 152는 depth 1/2·Rules mate와 movetime·중복 stop을 지나갔으나 다음
+ponder에서 `Review(IndexCapacity)`로 실패했다. 여섯 착수와 exit 0·EOF를
+전체 인수로 표시하지 않고 원 자료 다섯 개를 회수했다. 후속 GPU·cohort는
+시작하지 않았다. 로그에 bundle ID·개수가 없어 특정 한도 분기를 직접 관측한
+것으로 보고하지 않는다.
+
+선택 index에는 raw 128개와 별도로 bundle당 64개 한도가 있으며 기존 compact는
+활성 bundle 개수 압력만 처리한다. 같은 anchor·첫 수의 관계 사슬은 raw 한도
+이전에 bundle 한도에 도달할 수 있다. 후속 수정은 해당 원 producer만
+`BundleRecordCapacity`로 구별하고 현재 frontier의 별도 private 원인과
+`PublicReviewIndexCapacity`를 연결한다. 같은 controller와 정확한 typed 오류가
+일치할 때만 기존 drain으로 미완료 Capacity 종료를 수행한다. 기본 한도·관계·
+증거를 바꾸거나 archive 회복을 구현했다고 표시하지 않으며, 일반 index/view/
+sequence·owner·store 오류는 계속 실패한다. 같은 게임의 가득 찬 bundle은 이후에도
+Capacity일 수 있다. 이 추가 수정의 집중·전체·실제 제품 검사는 별도로 남는다.
+
+남은 인수는 현재 source의 네 모드, 실제 독립 cohort arm과 publication·별도
+ACK·strict 소비, update 0회 parent/child IPC, 일반 두 teacher의 실제 row/head
+소비, 외부 R의 counter→Repair→C/Fresh, 최종 CI·자료 회수다. 실제 학습과 원격
+성능/기력 비교·병합은 이번 비학습 목표에 포함하지 않는다.

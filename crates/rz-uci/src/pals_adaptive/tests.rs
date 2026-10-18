@@ -1303,6 +1303,27 @@ fn take_original_native_retirement(
 }
 
 #[test]
+fn copied_publication_capacity_error_without_original_controller_remains_failure() {
+    for cause in [
+        FrontierError::PublicRecordCapacity,
+        FrontierError::PublicReviewIndexCapacity,
+        FrontierError::Capacity("another original bounded resource"),
+    ] {
+        let (mut manager, _, _, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+        manager
+            .frontier_boundary_or_failure(AdaptiveManagerError::Frontier(cause))
+            .unwrap();
+        assert_eq!(manager.failures().count(), 1);
+        assert_eq!(manager.phase(), ManagerPhase::Running);
+        assert!(manager.shutdown_until.is_none());
+        let receipt = shutdown(&mut manager, until);
+        assert!(receipt.permits_root_reuse());
+        assert_eq!(receipt.counters.accepted_nn_inputs, 0);
+        assert_eq!(receipt.counters.consumed_role_outputs, 0);
+    }
+}
+
+#[test]
 fn pcr_keeps_actual_canceled_published_head_accept_until_original_fence() {
     for process_shutdown in [false, true] {
         let (mut manager, facts, root, until) =

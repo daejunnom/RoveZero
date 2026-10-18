@@ -1041,7 +1041,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             critical: true,
         };
         if cpu.is_some() || kind == RecordKind::CpuVerification {
-            self.engine.publish_record(record, None, None)?;
+            self.publish_hot_record(record, None)?;
             return Ok(None);
         }
         let focus = self
@@ -1099,14 +1099,32 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 committed_plies: record.line.len(),
                 first_move: record.line.first().copied(),
             });
-        self.engine
-            .publish_record(record, None, Some(observation))?;
+        self.publish_hot_record(record, Some(observation))?;
         // Only the successful original publication releases this observation.
         // A later commit error still returns unchanged, alongside Rejected.
         if let Some(destination) = repair_publication_sink {
             *destination = copied_repair_line;
         }
         Ok(Some((line, observation)))
+    }
+
+    /// Only the original bounded bundle producer can close this root's
+    /// review-index admission. Failed observations/lines remain with their
+    /// original Store and output owners until the existing physical drain.
+    fn publish_hot_record(
+        &mut self,
+        record: RoleRecord,
+        evidence: Option<ObservationId>,
+    ) -> Result<(), PalsError> {
+        match self.engine.publish_record(record, None, evidence) {
+            Err(PalsError::Review(ReviewError::BundleRecordCapacity)) => {
+                match self.engine.semantic.rovent_frontier.as_deref_mut() {
+                    Some(frontier) => Err(frontier.refuse_public_review_index_capacity().into()),
+                    None => Err(ReviewError::BundleRecordCapacity.into()),
+                }
+            }
+            result => result,
+        }
     }
 
     pub(super) fn checked_role_value(
