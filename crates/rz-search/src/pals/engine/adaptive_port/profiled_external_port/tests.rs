@@ -541,7 +541,34 @@ impl AuthoredWorkerFixture {
 
     fn work(&mut self, sequence: u64) -> Work {
         let first = BoardMove::from_uci("e2e4").unwrap();
-        let node = self.port.connect_hot(self.port.root, first).unwrap();
+        let before = self.port.rovent_frontier().unwrap().snapshot().work;
+        // An attached original frontier must still reject an uncharged hot
+        // insertion. This fixture uses the same charged Rules replay/adoption
+        // path as the product instead of manufacturing an edge behind it.
+        assert!(matches!(
+            self.port.connect_hot(self.port.root, first),
+            Err(PalsError::Rovent(
+                crate::pals::rovent_frontier::FrontierError::Invalid(
+                    "uncharged hot connection under original frontier"
+                )
+            ))
+        ));
+        let already_checked = self
+            .port
+            .existing_checked_frontier_line(&[first])
+            .unwrap()
+            .is_some();
+        let node = self.port.replay_node(&[first]).unwrap();
+        let charged = self.port.rovent_frontier().unwrap().snapshot().work;
+        assert_eq!(
+            charged.checked_transitions,
+            before.checked_transitions + u64::from(!already_checked)
+        );
+        assert_eq!(charged.native_nodes, before.native_nodes);
+        assert_eq!(self.port.replay_node(&[first]).unwrap(), node);
+        let reused = self.port.rovent_frontier().unwrap().snapshot().work;
+        assert_eq!(reused.checked_transitions, charged.checked_transitions);
+        assert_eq!(reused.native_nodes, charged.native_nodes);
         let input = self
             .port
             .input(

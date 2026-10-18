@@ -172,10 +172,21 @@ class UtilityTensorPureContractTests(unittest.TestCase):
 
         value = Untouchable()
         for call in (
+            lambda: tensors.create_utility_owner(value, value, value, value,
+                sampler=value, sampler_validator=None, execute=False),
+            lambda: tensors.create_cohort_utility_owner(value, value, value, value,
+                sampler=value, sampler_validator=None, execute=False),
             lambda: tensors.utility_tensor_payload(value, sampler_validator=None, execute=False),
             lambda: tensors.utility_tensor_projection(value, sampler_validator=None, execute=False),
             lambda: tensors.save_utility_checkpoint(value, value, sampler_validator=None,
                 max_file_bytes=1, execute=False),
+            lambda: tensors.stage_utility_resume(value, value, value, value, value, value,
+                sampler_validator=None, execute=False),
+            lambda: tensors.stage_cohort_utility_resume(value, value, value, value, value, value,
+                sampler_validator=None, authority=value, historical_checkpoint=value, execute=False),
+            lambda: tensors.stage_utility_fork(value, recipe=value, registration=value, membership=value,
+                sampler=value, source_sampler_validator=None, sampler_validator=None, reset_seed=value,
+                execute=False),
             lambda: tensors.export_utility_owner(value, value, authority=value,
                 kind="collection", execute=False),
         ):

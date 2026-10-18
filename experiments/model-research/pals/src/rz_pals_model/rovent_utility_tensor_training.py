@@ -34,9 +34,14 @@ _FORK_FROM_PINNED_SOURCE = object()
 _RESUME_COST_STATE_DOMAIN = "rz-rovent-utility-resume-cost-state/1"
 
 
-def _runtime(execute):
+def _require_tensor_execution(execute):
+    """Deny before consulting an owner, path, source family or neural import."""
     if execute is not True:
         raise ValueError("explicit utility tensor execution required; no implicit neural import")
+
+
+def _runtime(execute):
+    _require_tensor_execution(execute)
     from .rovent_tensor_training import _runtime as load_runtime
     return load_runtime(True)
 
@@ -278,6 +283,7 @@ def _optimizer_state(owner, torch, clone):
 def _create_utility_owner(model, preparation, *, sampler,
                           sampler_validator, cuda_devices=(), execute=False,
                           _fork_source=None, numerical_parts=None):
+    _require_tensor_execution(execute)
     if numerical_parts is None:
         preparation = validate_training_preparation(preparation)
     else:
@@ -320,6 +326,7 @@ def _create_utility_owner(model, preparation, *, sampler,
 def create_utility_owner(model, recipe, registration, membership, *, sampler,
                          sampler_validator, cuda_devices=(), execute=False):
     """Original V1 lifecycle-only path; cannot authorize cohort supervision."""
+    _require_tensor_execution(execute)
     preparation = prepare_training(recipe, registration, membership)
     return _create_utility_owner(model, preparation, sampler=sampler,
         sampler_validator=sampler_validator, cuda_devices=cuda_devices, execute=execute)
@@ -328,6 +335,7 @@ def create_utility_owner(model, recipe, registration, membership, *, sampler,
 def create_cohort_utility_owner(model, recipe, registration, membership, *, sampler,
                                 sampler_validator, cuda_devices=(), execute=False):
     """Explicit preparation/2 factory; still needs the current parent lease."""
+    _require_tensor_execution(execute)
     preparation = prepare_cohort_training(recipe, registration, membership)
     return _create_utility_owner(model, preparation, sampler=sampler,
         sampler_validator=sampler_validator, cuda_devices=cuda_devices, execute=execute)
@@ -377,6 +385,7 @@ def derived_training_state(owner):
 
 
 def _utility_tensor_payload(owner, *, sampler_validator, execute=False, _family=None):
+    _require_tensor_execution(execute)
     family = _checkpoint_family(_family)
     parts = family.parts(owner.preparation)
     runtime = _runtime(execute)
@@ -463,6 +472,7 @@ def _write_projection(path, value, *, maximum, read_accounting):
 
 def _save_utility_checkpoint(owner, path, *, sampler_validator,
                             max_file_bytes=MAX_CHECKPOINT_BYTES, read_accounting=None, execute=False, _family=None):
+    _require_tensor_execution(execute)
     family = _checkpoint_family(_family)
     maximum = uint(max_file_bytes, MAX_CHECKPOINT_BYTES)
     if not maximum:
@@ -585,6 +595,7 @@ def _stage_utility_resume(path, expected_sha256, template, preparation, *,
                           read_accounting=None, snapshot_directory=None, execute=False,
                           authority=None, historical_checkpoint=None,
                           require_historical=False, _family=None):
+    _require_tensor_execution(execute)
     family = _checkpoint_family(_family)
     preparation = family.parts(preparation).preparation
     if require_historical and authority is not None and historical_checkpoint is None:
@@ -661,6 +672,7 @@ def _stage_utility_resume(path, expected_sha256, template, preparation, *,
 def stage_utility_resume(path, expected_sha256, template, recipe, registration, membership, *,
                          sampler_validator, max_file_bytes=MAX_CHECKPOINT_BYTES,
                          read_accounting=None, snapshot_directory=None, execute=False, authority=None):
+    _require_tensor_execution(execute)
     return _stage_utility_resume(path, expected_sha256, template,
         prepare_training(recipe, registration, membership), sampler_validator=sampler_validator,
         max_file_bytes=max_file_bytes, read_accounting=read_accounting,
@@ -671,6 +683,7 @@ def stage_cohort_utility_resume(path, expected_sha256, template, recipe, registr
                                 sampler_validator, max_file_bytes=MAX_CHECKPOINT_BYTES,
                                 read_accounting=None, snapshot_directory=None, execute=False, authority=None,
                                 historical_checkpoint=None):
+    _require_tensor_execution(execute)
     return _stage_utility_resume(path, expected_sha256, template,
         prepare_cohort_training(recipe, registration, membership), sampler_validator=sampler_validator,
         max_file_bytes=max_file_bytes, read_accounting=read_accounting,
@@ -681,6 +694,7 @@ def stage_cohort_utility_resume(path, expected_sha256, template, recipe, registr
 def _stage_utility_fork(source, preparation, *, sampler,
                        source_sampler_validator, sampler_validator, reset_seed, execute=False, _family=None):
     """A fork resets moments/sampler/counts; a resume preserves every state."""
+    _require_tensor_execution(execute)
     family = _checkpoint_family(_family)
     parts = family.parts(preparation)
     preparation = parts.preparation
@@ -734,6 +748,7 @@ def _stage_utility_fork(source, preparation, *, sampler,
 
 def stage_utility_fork(source, *, recipe, registration, membership, sampler,
                        source_sampler_validator, sampler_validator, reset_seed, execute=False):
+    _require_tensor_execution(execute)
     preparation = (prepare_cohort_training(recipe, registration, membership)
         if source.preparation["schema"] == COHORT_PREPARATION_DOMAIN
         else prepare_training(recipe, registration, membership))
@@ -745,7 +760,9 @@ def stage_utility_fork(source, *, recipe, registration, membership, sampler,
 def _export_utility_owner(owner, path, *, authority, kind,
                          max_output_bytes=8 * 1024**2, execute=False, _family=None):
     """Call the numerical writer only after original learned-source admission."""
+    _require_tensor_execution(execute)
     family = _checkpoint_family(_family)
+    family.require_authority(authority, owner=owner)
     family.parts(owner.preparation)
     torch = _runtime(execute)[0]
     if kind not in ("collection", "deployment"):
@@ -755,7 +772,6 @@ def _export_utility_owner(owner, path, *, authority, kind,
         raise ValueError("utility export requires quiescent confirmed physical completion")
     if not family.intervention and owner.preparation["schema"] != COHORT_PREPARATION_DOMAIN:
         raise ValueError("learned utility export requires explicit cohort preparation/2")
-    family.require_authority(authority, owner=owner)
     training = authority.validate_learned_export(owner, kind)
     fields(training, ("kind", "steps", "run_id", "dataset_sha256"), "original utility learned training projection")
     if training["kind"] != "learned" or training["steps"] != owner.total_updates() or not owner.total_updates():

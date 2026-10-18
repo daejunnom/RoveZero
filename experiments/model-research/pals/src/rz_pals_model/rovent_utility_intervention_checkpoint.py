@@ -75,6 +75,7 @@ def read_intervention_utility_historical_checkpoint(reference, *, read_accountin
 
 def create_intervention_utility_owner(model, preparation, *, authority, sampler,
         sampler_validator, cuda_devices=(), execute=False):
+    tensors._require_tensor_execution(execute)
     INTERVENTION.require_authority(authority, allow_unleased=True)
     parts = INTERVENTION.parts(preparation)
     return tensors._create_utility_owner(model, parts.preparation, sampler=sampler,
@@ -101,8 +102,7 @@ def save_intervention_utility_checkpoint(owner, path, *, authority, lease, sampl
         post_snapshot_observer, max_file_bytes=tensors.MAX_CHECKPOINT_BYTES,
         read_accounting=None, execute=False):
     """Return only after the current peer ACK; uncertain files stay quarantined."""
-    if execute is not True:
-        raise ValueError("explicit intervention checkpoint tensor execution required")
+    tensors._require_tensor_execution(execute)
     INTERVENTION.require_authority(authority, lease=lease, owner=owner)
     INTERVENTION.parts(owner.preparation)
     tensors._counts(owner)
@@ -146,6 +146,7 @@ def save_intervention_utility_checkpoint(owner, path, *, authority, lease, sampl
 def stage_intervention_utility_resume(path, expected_sha256, template, preparation, *, authority,
         historical_checkpoint, sampler_validator, max_file_bytes=tensors.MAX_CHECKPOINT_BYTES,
         read_accounting=None, snapshot_directory=None, execute=False):
+    tensors._require_tensor_execution(execute)
     INTERVENTION.require_authority(authority, allow_unleased=True)
     parts = INTERVENTION.parts(preparation)
     if type(historical_checkpoint) is not HistoricalUtilityInterventionCheckpoint:
@@ -163,6 +164,7 @@ def stage_intervention_utility_resume(path, expected_sha256, template, preparati
 
 def stage_intervention_utility_fork(source, *, preparation, authority, sampler,
         source_sampler_validator, sampler_validator, reset_seed, execute=False):
+    tensors._require_tensor_execution(execute)
     INTERVENTION.require_authority(authority, allow_unleased=True)
     parts = INTERVENTION.parts(preparation)
     return tensors._stage_utility_fork(source, parts.preparation, sampler=sampler,
@@ -172,6 +174,7 @@ def stage_intervention_utility_fork(source, *, preparation, authority, sampler,
 
 def export_intervention_utility_owner(owner, path, *, authority, kind,
         max_output_bytes=8 * 1024**2, execute=False):
+    tensors._require_tensor_execution(execute)
     INTERVENTION.require_authority(authority, owner=owner)
     INTERVENTION.parts(owner.preparation)
     if not uint(owner.total_updates(), tensors.MAX_UPDATES):

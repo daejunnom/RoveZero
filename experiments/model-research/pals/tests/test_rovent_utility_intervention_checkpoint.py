@@ -56,6 +56,40 @@ def parsed(value, parser=checkpoint.parse_intervention_utility_tensor_projection
 
 
 class InterventionCheckpointCodecTests(unittest.TestCase):
+    def test_every_materializing_entry_denies_before_owner_path_authority_or_metadata(self):
+        class Untouchable:
+            def __getattribute__(self, name):
+                raise AssertionError("denied execution inspected an owner, authority or input")
+
+            def __fspath__(self):
+                raise AssertionError("denied execution inspected a path")
+
+        value = Untouchable()
+        for flag in (False, None, 0, 1, "true", [], {}, object()):
+            calls = {
+                "create": lambda: checkpoint.create_intervention_utility_owner(value, value,
+                    authority=value, sampler=value, sampler_validator=None, execute=flag),
+                "payload": lambda: checkpoint.intervention_utility_tensor_payload(value,
+                    sampler_validator=None, execute=flag),
+                "projection": lambda: checkpoint.intervention_utility_tensor_projection(value,
+                    sampler_validator=None, execute=flag),
+                "save": lambda: checkpoint.save_intervention_utility_checkpoint(value, value,
+                    authority=value, lease=value, sampler_validator=None, post_snapshot_observer=value,
+                    max_file_bytes=value, read_accounting=value, execute=flag),
+                "resume": lambda: checkpoint.stage_intervention_utility_resume(value, value, value, value,
+                    authority=value, historical_checkpoint=value, sampler_validator=None,
+                    max_file_bytes=value, read_accounting=value, snapshot_directory=value, execute=flag),
+                "fork": lambda: checkpoint.stage_intervention_utility_fork(value, preparation=value,
+                    authority=value, sampler=value, source_sampler_validator=None, sampler_validator=None,
+                    reset_seed=value, execute=flag),
+                "export": lambda: checkpoint.export_intervention_utility_owner(value, value,
+                    authority=value, kind=value, max_output_bytes=value, execute=flag),
+            }
+            for boundary, call in calls.items():
+                with self.subTest(boundary=boundary, flag=type(flag).__name__):
+                    with self.assertRaisesRegex(ValueError, "explicit utility tensor execution required"):
+                        call()
+
     def test_exact9_projection_keeps_original_preparation_and_emits_no_authority(self):
         value = projection()
         before = copy.deepcopy(value)
