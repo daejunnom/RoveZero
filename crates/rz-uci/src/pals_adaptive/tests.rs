@@ -1924,6 +1924,141 @@ fn next_view_failure_preserves_actual_original_role_consumption() {
 }
 
 #[test]
+fn original_prepared_echo_after_cancel_retirement_never_recancels_or_admits() {
+    let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    let preparation = manager.prepare_root_ranking(root).unwrap();
+    // Receive the actual owner event without letting the manager admit a
+    // RequestId. This is an original queued Prepared, not a fabricated seal.
+    let prepared = loop {
+        let version = manager.native.signal().version();
+        if let Some(event) = manager.native.poll() {
+            match event {
+                TicketNativeEvent::Prepared(prepared) => break prepared,
+                other => manager.native_event(other).unwrap(),
+            }
+        } else {
+            assert!(Instant::now() < until, "actual Prepared did not arrive");
+            manager
+                .native
+                .signal()
+                .wait_changed(version, Duration::from_millis(10));
+        }
+    };
+    assert_eq!(prepared.preparation, preparation);
+    assert_eq!(facts.prepared.load(Ordering::Acquire), 1);
+    assert_eq!(manager.native.occupancy(), 1);
+    assert_eq!(manager.roles.len(), 1);
+    assert!(manager.roles[0].ticket.is_none());
+    let original_view = Arc::downgrade(&manager.roles[0].input.view);
+    manager.begin_root_quiesce(until).unwrap();
+    // Do not pump manager events: let its real successful cancel and the
+    // original worker retire the unticketed preparation first. The queued
+    // PreparationFailed/RootQuiesced remain for their one original delivery.
+    while !facts.quiesce_called.load(Ordering::Acquire) || manager.native.occupancy() != 0 {
+        let version = manager.native.signal().version();
+        assert!(
+            Instant::now() < until,
+            "original cancel/quiesce did not finish"
+        );
+        manager
+            .native
+            .signal()
+            .wait_changed(version, Duration::from_millis(10));
+    }
+    assert!(original_view.upgrade().is_some());
+    assert_eq!(manager.counters().canceled_preparations, 0);
+    // A proved cancel for this original binding must not permit another ID
+    // or an altered immutable echo to take the same normal closing path.
+    let mut foreign = prepared;
+    foreign.preparation = PreparationId(preparation.0 + 1_000_000);
+    assert!(matches!(
+        manager.native_event(TicketNativeEvent::Prepared(foreign)),
+        Err(AdaptiveManagerError::Invalid(_))
+    ));
+    let mut altered = prepared;
+    altered.question = Digest([77; 32]);
+    assert!(matches!(
+        manager.native_event(TicketNativeEvent::Prepared(altered)),
+        Err(AdaptiveManagerError::Invalid(_))
+    ));
+    assert_eq!(manager.counters().canceled_preparations, 0);
+    manager
+        .native_event(TicketNativeEvent::Prepared(prepared))
+        .unwrap();
+    assert_eq!(manager.counters().canceled_preparations, 1);
+    // An exact duplicate is still a protocol error, not another normal cancel
+    // or permission to charge the same prepared input twice.
+    assert!(matches!(
+        manager.native_event(TicketNativeEvent::Prepared(prepared)),
+        Err(AdaptiveManagerError::Invalid(_))
+    ));
+    assert_eq!(manager.counters().canceled_preparations, 1);
+    let mut failed = false;
+    let mut fenced = false;
+    while !failed || !fenced {
+        let version = manager.native.signal().version();
+        if let Some(event) = manager.native.poll() {
+            match &event {
+                TicketNativeEvent::PreparationFailed {
+                    preparation: actual,
+                    failure,
+                } => {
+                    assert_eq!(*actual, preparation);
+                    assert_eq!(*failure, RoleFailure::Canceled);
+                    assert!(!failed, "original preparation retired more than once");
+                    failed = true;
+                }
+                TicketNativeEvent::RootQuiesced(fence) => {
+                    assert!(!fenced, "original root fenced more than once");
+                    assert_eq!(fence.authority(), manager.registration.authority);
+                    assert!(fence.permits_reuse());
+                    fenced = true;
+                }
+                _ => panic!("unsubmitted original preparation produced an unexpected event"),
+            }
+            manager.native_event(event).unwrap();
+        } else {
+            assert!(
+                Instant::now() < until,
+                "original terminal/fence did not arrive"
+            );
+            manager
+                .native
+                .signal()
+                .wait_changed(version, Duration::from_millis(10));
+        }
+    }
+    pump(&mut manager, until, |manager| {
+        manager.phase() == ManagerPhase::Finished
+    });
+    assert!(manager.failures().next().is_none());
+    assert!(manager.roles.is_empty());
+    assert_eq!(manager.role_call_budget_usage(), (0, 0));
+    assert_eq!(manager.counters().submitted_role_tickets, 0);
+    assert_eq!(manager.counters().physical_role_completions, 0);
+    assert_eq!(manager.counters().consumed_role_outputs, 0);
+    assert_eq!(manager.native_cpu_usage().unwrap(), (0, 0));
+    assert!(facts.started.lock().unwrap().is_empty());
+    assert!(facts.accepted.lock().unwrap().is_empty());
+    assert!(manager.shutdown_receipt().unwrap().permits_root_reuse());
+    let parts = match manager.into_persistent_parts() {
+        Ok(parts) => parts,
+        Err(rejected) => panic!("original canceled root owner recovery: {}", rejected.error),
+    };
+    let (mut native, _, _, _, _, _) = parts.into_components();
+    native.begin_shutdown(until);
+    while !native.try_join().unwrap() {
+        while native.poll().is_some() {}
+        assert!(
+            Instant::now() < until,
+            "original native process owner did not join"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(facts.finish_called.load(Ordering::Acquire));
+}
+
+#[test]
 fn changed_tick_observer_can_close_root_before_late_child_consumption() {
     let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
     assert!(manager.root_observation_snapshot().is_err());
