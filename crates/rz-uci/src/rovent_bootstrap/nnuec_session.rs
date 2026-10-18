@@ -599,6 +599,9 @@ impl RoventNnuecSessionDriver {
         })
     }
 
+    /// Original read-only Frontier/work observation. A later owner transfer
+    /// or same-actor retirement may still fail; this is not run-success or a
+    /// substitute for the actual returned report and physical completion.
     pub fn latest_root(&self) -> Result<Option<Arc<RoventNnuecRootReceipt>>, ContractError> {
         self.latest
             .lock()
@@ -610,6 +613,24 @@ impl RoventNnuecSessionDriver {
             .lock()
             .map(|r| r.clone())
             .map_err(|_| poisoned())
+    }
+
+    /// Preserve the original observation before any later work projection or
+    /// owner transfer can fail. This is neither a successful root return nor
+    /// the actor/engine retirement ACK. On poison the caller still owns this
+    /// same Arc and must retain it with the original physical owners.
+    fn observe_root_receipt(
+        &self,
+        receipt: &Arc<RoventNnuecRootReceipt>,
+    ) -> Result<(), SearchSessionFailure> {
+        let mut latest = self.latest.lock().map_err(|_| {
+            unknown(
+                "RoventNnuecRootObservation",
+                "original root receipt observation owner is poisoned",
+            )
+        })?;
+        *latest = Some(Arc::clone(receipt));
+        Ok(())
     }
 
     fn retain<T: Any + Send>(
@@ -771,6 +792,21 @@ impl RoventNnuecSessionDriver {
             stopped_before_research_execution: true,
             deadline_before_frontier: retired.deadline_before_frontier,
         });
+        if let Err(error) = self.observe_root_receipt(&receipt) {
+            return Err(self.retain(
+                (
+                    native,
+                    retired.owner,
+                    actor,
+                    retired.ledger,
+                    retired.root_rules,
+                    retired.root_moves,
+                    receipt,
+                ),
+                "RoventNnuecRootObservation",
+                &error.detail,
+            ));
+        }
         let work = match receipt.work() {
             Ok(work) => work,
             Err(error) => {
@@ -1096,15 +1132,10 @@ impl RoventNnuecSessionDriver {
             }
         };
         match self.run_admitted(idle, position, context, admission, progress) {
-            Ok((idle, report, receipt)) => {
+            Ok((idle, report, _receipt)) => {
                 *state = State::Idle(idle);
-                match self.latest.lock() {
-                    Ok(mut latest) => *latest = Some(receipt),
-                    Err(_) => {
-                        self.closed.store(true, Ordering::Release);
-                        return Err(SearchSessionFailure::physical_completion_unknown());
-                    }
-                }
+                // Each actual receipt was already observed at its original
+                // creation boundary, before fallible physical-owner transfers.
                 Ok(report)
             }
             Err((retained, error)) => {
@@ -1660,6 +1691,13 @@ impl RoventNnuecSessionDriver {
             deadline_before_frontier: false,
             initial_retirement: None,
         });
+        if let Err(error) = self.observe_root_receipt(&receipt) {
+            return Err(self.retain(
+                (manager, actor, pins, receipt),
+                "RoventNnuecRootObservation",
+                &error.detail,
+            ));
+        }
         let work = match receipt.work() {
             Ok(w) => w,
             Err(e) => {
@@ -2050,6 +2088,18 @@ impl Drop for RoventNnuecSessionDriver {
         let state = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
         if !matches!(state, State::Closed) {
             std::mem::forget(std::mem::replace(state, State::Moving));
+            // The Frontier was already retired when this read-only receipt
+            // was observed. Quarantining the physical owners must not drop
+            // their sole original frontier/admission observation on the way
+            // out. A normally joined Closed state releases it as before.
+            if let Some(receipt) = self
+                .latest
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                std::mem::forget(receipt);
+            }
             std::mem::forget(Arc::clone(&self.sources));
             std::mem::forget(Arc::clone(self.loaded.model()));
         }
