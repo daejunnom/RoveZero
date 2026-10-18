@@ -562,7 +562,14 @@ fn rovent_original_depth_one_and_two_close_actual_p_c_fresh_goal() {
         let mut original = context(&clock, 1, 0);
         original.goal.depth_plies = std::num::NonZeroU16::new(depth);
         original.root_moves = Some(Arc::from([allowed]));
-        let report = driver.run(&position, &original, &mut |_| {}).unwrap();
+        let report = driver
+            .run(&position, &original, &mut |_| {})
+            .unwrap_or_else(|error| {
+                panic!(
+                    "original go depth {depth} failed: {error:?}; actual root: {:?}",
+                    driver.latest_rovent_root(),
+                )
+            });
         let actual = driver.latest_rovent_root().unwrap().unwrap();
         let frontier = actual.frontier.as_ref().unwrap();
         assert_eq!(frontier.goal, FrontierGoalStatus::DepthSatisfied);
