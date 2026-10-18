@@ -580,7 +580,7 @@ fn soft_terminal_recovery_requires_the_same_actual_bound_and_installed_binding()
     )
     .unwrap();
     let cpu = CpuEngine::with_evaluator_ordering_and_resume_policy(
-        *engine(false).config(),
+        engine(false).config().clone(),
         Arc::new(value),
         CpuOrderingPolicy::LegacyMvvLvaV1,
         CpuResumePolicy::PausedStack,
