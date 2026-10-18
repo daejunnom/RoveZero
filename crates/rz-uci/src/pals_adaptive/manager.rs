@@ -1830,6 +1830,8 @@ impl AdaptiveShutdownReceipt {
 
 struct RoleBinding<Q, O> {
     preparation: PreparationId,
+    prepared_observed: bool,
+    cancellation_requested: bool,
     work: Option<CoordinatorWork<ReviewView, Q>>,
     input: FrameInput<ReviewView, Q>,
     ticket: Option<RoleTicketEnvelope>,
@@ -1850,6 +1852,8 @@ struct RoleBinding<Q, O> {
     class: Option<CostClass>,
     delivered: Option<Arc<O>>,
     ack_accepted: Option<bool>,
+    ack_dispatched: bool,
+    revoked_acceptance: Option<RoleFailure>,
     native_acceptance_recorded: bool,
     consumption_recorded: bool,
     purpose: RolePurpose,
@@ -3390,6 +3394,8 @@ where
             .map_err(|(error, _)| AdaptiveManagerError::Native(error))?;
         self.roles.push(RoleBinding {
             preparation,
+            prepared_observed: false,
+            cancellation_requested: false,
             work,
             input,
             ticket: None,
@@ -3407,6 +3413,8 @@ where
             class: None,
             delivered: None,
             ack_accepted: None,
+            ack_dispatched: false,
+            revoked_acceptance: None,
             native_acceptance_recorded: false,
             consumption_recorded: false,
             purpose,
@@ -3819,6 +3827,7 @@ where
                         .ok_or(AdaptiveManagerError::Invalid("unknown native preparation"))?;
                     let binding = &self.roles[index];
                     if binding.ticket.is_some()
+                        || binding.prepared_observed
                         || binding.admission_charged
                         || prepared.question != binding.input.question_digest
                         || prepared.view != binding.input.view_seal
@@ -3829,12 +3838,20 @@ where
                             "prepared immutable question echo mismatch",
                         ));
                     }
+                    self.roles[index].prepared_observed = true;
                     if self.phase != ManagerPhase::Running || self.check_running().is_err() {
-                        self.native.cancel(prepared.preparation)?;
+                        // Close may have canceled this same preparation before
+                        // its older Prepared event reached the manager. Retain
+                        // that real request; a retired control is not recanceled.
+                        if !self.roles[index].cancellation_requested {
+                            self.native.cancel(prepared.preparation)?;
+                            self.roles[index].cancellation_requested = true;
+                        }
                         self.counters.canceled_preparations += 1;
                         return Ok(());
                     }
                     let now = self.check_running()?;
+                    let binding = &self.roles[index];
                     let ticket = self.registry.admit(
                         RoleSubmission {
                             question: prepared.question,
@@ -4859,6 +4876,9 @@ where
                 };
                 if let Err(error) = result {
                     let cancel = self.native.cancel(self.roles[index].preparation);
+                    if cancel.is_ok() {
+                        self.roles[index].cancellation_requested = true;
+                    }
                     let abandoned = self
                         .collection_observer
                         .as_mut()
@@ -5011,6 +5031,11 @@ where
         Ok(changed)
     }
     fn flush_acks(&mut self) -> Result<(), AdaptiveManagerError> {
+        // The original native close now owns disposal. Preserve unsent ACKs
+        // and linear permits until its fence; do not enqueue into a retired root.
+        if self.phase != ManagerPhase::Running {
+            return Ok(());
+        }
         while let Some(mut ack) = self.acknowledgements.pop_front() {
             let result = if let Some(permit) = ack.permit.take() {
                 match self
@@ -5029,7 +5054,19 @@ where
                 self.native.discard(ack.preparation, ack.ticket)
             };
             match result {
-                Ok(()) => {}
+                Ok(()) => {
+                    let binding = self
+                        .roles
+                        .iter_mut()
+                        .find(|binding| {
+                            binding.preparation == ack.preparation
+                                && binding.ticket == Some(ack.ticket)
+                        })
+                        .ok_or(AdaptiveManagerError::Invalid(
+                            "original dispatched native ACK binding",
+                        ))?;
+                    binding.ack_dispatched = true;
+                }
                 Err(TicketServiceError::Capacity) => {
                     self.acknowledgements.push_front(ack);
                     break;
@@ -7899,8 +7936,10 @@ where
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         self.begin_profiled_close(until, mode)?;
         // Prepared/running logical cancellation never releases a GPU buffer.
-        for role in &self.roles {
-            self.native.cancel(role.preparation).ok();
+        for role in &mut self.roles {
+            if !role.cancellation_requested {
+                role.cancellation_requested = self.native.cancel(role.preparation).is_ok();
+            }
         }
         match mode {
             AdaptiveCloseMode::ProcessShutdown => self.native.begin_shutdown(until),
