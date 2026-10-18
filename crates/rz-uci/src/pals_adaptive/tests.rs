@@ -70,6 +70,10 @@ struct NativeFacts {
     /// let its run finish, then hold the second run on the native owner.
     block_after_first_run: AtomicBool,
     release_first_run: AtomicBool,
+    /// The queued-Accept race must observe real cancellation of run two,
+    /// rather than a fixture timeout that happened to free the native owner.
+    hold_second_until_cancel: AtomicBool,
+    second_run_observed_cancel: AtomicBool,
     reject_acceptance: AtomicBool,
     prepared: std::sync::atomic::AtomicU64,
     quiesce_called: AtomicBool,
@@ -130,7 +134,14 @@ impl<Q: Clone + Send + Sync + 'static> TicketNativeBackend<ReviewView, Q> for Na
             started.push(*ticket);
             started.len()
         };
-        let until = Instant::now() + Duration::from_secs(2);
+        let hold_second_until_cancel =
+            started_number > 1 && self.facts.hold_second_until_cancel.load(Ordering::Acquire);
+        let until = Instant::now()
+            + if hold_second_until_cancel {
+                WINDOW
+            } else {
+                Duration::from_secs(2)
+            };
         let block_after_first = self.facts.block_after_first_run.load(Ordering::Acquire);
         let blocked_run =
             !question.view.query().prefix.is_empty() && (!block_after_first || started_number > 1);
@@ -139,10 +150,20 @@ impl<Q: Clone + Send + Sync + 'static> TicketNativeBackend<ReviewView, Q> for Na
             && !self.facts.release_first_run.load(Ordering::Acquire))
             || (blocked_run && !self.facts.child_gate.load(Ordering::Acquire))
         {
-            if canceled.load(Ordering::Acquire) || Instant::now() >= until {
+            let actual_cancel = canceled.load(Ordering::Acquire);
+            if actual_cancel || Instant::now() >= until {
+                if hold_second_until_cancel && actual_cancel {
+                    self.facts
+                        .second_run_observed_cancel
+                        .store(true, Ordering::Release);
+                }
                 return TicketPhysicalResult {
                     physical: PhysicalRoleCompletion::Confirmed,
-                    output: Err(RoleFailure::Canceled),
+                    output: Err(if hold_second_until_cancel && !actual_cancel {
+                        RoleFailure::Expired
+                    } else {
+                        RoleFailure::Canceled
+                    }),
                 };
             }
             thread::sleep(Duration::from_millis(1));
@@ -1287,16 +1308,19 @@ fn pcr_keeps_actual_canceled_published_head_accept_until_original_fence() {
         let (mut manager, facts, root, until) =
             fixture(FixtureScope::TwoIndependentRoles, true, 4096);
         facts.block_after_first_run.store(true, Ordering::Release);
+        facts
+            .hold_second_until_cancel
+            .store(true, Ordering::Release);
         // Two actual native questions let the second run occupy the owner
         // while the manager queues the first original P-ranking Accept.
         // They are transport/custody fixtures, not invented search evidence.
+        let first = root.view.query().legal[0];
         manager
             .prepare_role(None, root, RolePurpose::RootRanking)
             .unwrap();
-        let first = manager.driver().rules.rules().legal_moves()[0];
         let child = manager
             .driver_mut()
-            .input(RefinementStage::ProposerContinuation, Some(first));
+            .input(RefinementStage::ProposalContinuation, Some(first));
         manager
             .prepare_role(None, child, RolePurpose::RoventRefinement)
             .unwrap();
@@ -1334,6 +1358,7 @@ fn pcr_keeps_actual_canceled_published_head_accept_until_original_fence() {
             manager.begin_root_quiesce(cleanup_until).unwrap();
         }
         let original = take_original_native_retirement(&mut manager, cleanup_until);
+        assert!(facts.second_run_observed_cancel.load(Ordering::Acquire));
         assert!(matches!(&original, TicketNativeEvent::Retired {
             ticket: actual, accepted: false, result: Err(RoleFailure::Canceled),
             rejected_permit: Some(_), native_receipt: None,
