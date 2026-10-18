@@ -1297,7 +1297,7 @@ fn should_quiesce(manager: &Manager) -> Result<bool, AdaptiveManagerError> {
             FrontierStop::Canceled | FrontierStop::Deadline | FrontierStop::WorkBudget,
         ) => Ok(true),
         FrontierGoalStatus::Stopped(FrontierStop::Capacity) => {
-            if manager.driver().rovent_public_record_capacity_closed()? {
+            if manager.driver().rovent_publication_capacity_closed()? {
                 Ok(true)
             } else {
                 Err(AdaptiveManagerError::PhysicalUnknown)

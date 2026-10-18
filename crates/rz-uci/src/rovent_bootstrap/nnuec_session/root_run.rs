@@ -730,7 +730,7 @@ impl RoventNnuecSessionDriver {
         if !semantic_failures.is_empty() {
             run.semantic_failures = Some(semantic_failures);
         }
-        let public_record_capacity = match manager.driver().rovent_public_record_capacity_closed() {
+        let publication_capacity = match manager.driver().rovent_publication_capacity_closed() {
             Ok(closed) => closed,
             Err(error) => {
                 return Err(run.retain_failure(
@@ -748,7 +748,7 @@ impl RoventNnuecSessionDriver {
             PalsCompletion::Deadline
         } else if manager.driver().root_is_terminal().unwrap_or(false) {
             PalsCompletion::Terminal
-        } else if public_record_capacity {
+        } else if publication_capacity {
             PalsCompletion::Capacity
         } else if manager.cpu_node_limit_reached() {
             PalsCompletion::CpuNodeLimit
