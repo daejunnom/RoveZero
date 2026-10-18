@@ -1062,7 +1062,8 @@ CPU P-C 실행 092는 여덟 요청과 정상 종료를 관측했다. P-C-R은 �
 후속 처리는 이 정확한 public-record producer만 원 controller의 private
 원인을 남기고 `Stopped(Capacity)`로 닫는다. 같은 root의 그 원인과 typed
 오류를 확인한 경우에만 기존 quiesce·ACK·credit·물리 drain을 수행한다.
-거절된 출력을 다시 소비하거나 완료 depth를 만들지 않는다. 다른 capacity,
+발행 거절 전에 실제 소비한 ranking은 한 번만 정산하며, 거절을 이유로 그 소비를
+지우거나 완료 depth를 만들지 않는다. 다른 capacity,
 pin·archive·물리 오류는 기존 실패 경로에 남는다. 이 수정은 자료 회수나
 archive 연결이 아니며, 실제 새 게임 reset 전에는 다음 root도 Capacity일 수 있다.
 
@@ -1083,3 +1084,29 @@ Collection, 잘못된 R endpoint 및 중복 선언을 각각 검사한다. 이 �
 남은 인수는 수정 후 네 모드·실제 독립 arm과 publication/별도 ACK/strict
 소비·업데이트 0회 IPC·일반 외부 교사 및 외부 R 연결·최종 CI와 자료 회수다.
 실제 학습·대규모 수집·원격 성능/기력 비교·PR 병합은 이번 목표에서 실행하지 않는다.
+
+## 20차 체크포인트: Collection의 선택 경계와 용량 오류 보존
+
+Collection에서 원 NNUEC R을 등록한 뒤 driver가 다시 teacher endpoint를 고르던
+두 번째 분기도 수정했다. manager가 실제 실행할 endpoint를 한 번 결정하고
+driver는 그 선택을 소비한다. 기존 Deployment와 legacy Collection의 선택
+의미를 자동으로 통합하지 않는다.
+
+소스 `adbe248`의 실제 집중 검사 131은 Collection R owner, 같은 게임의 연속
+root에서 raw 기록 보존·Capacity 종료, 다른 Capacity 원인 구분, archive의 새
+오류 직렬화 네 검사를 모두 통과했고 managed cleanup을 확인했다. 앞선 도구
+세션 중단은 전체 완료로 표시하지 않았다. 중단된 빌드 lease와 scratch는 원
+소유권·비활성 상태를 확인해 보존하고, 원 실행 결과는 unknown으로 남겼다.
+
+같은 소스의 전체 build 121은 UCI 791개를 통과했지만 Search는 1,061개 통과,
+3개 실패·2개 ignored였다. 최초 실패는 실행 중 record 상한을 낮추고 복구해
+같은 root를 계속 사용하는 기존 fixture였다. 새 terminal Capacity 의미와 맞지
+않아 정상 경로의 원 packet·중복 발행 검사와 고정 한도의 실제 소진 검사를
+분리한다. 나머지 두 실패는 같은 fixture 잠금의 poison이었으며 독립 성공으로
+대체하지 않는다. 이 실행은 Clippy·제품 빌드 단계까지 도달하지 않았다.
+
+발행 실패 뒤 raw 관측만 회수하는 호출이 성공해도 원 publication 오류는
+사라지지 않아야 한다. 후속 수정은 실제 feedback 발행 완료 전까지 그 원인을
+유지하고, 고정 한도 도달·raw-only drain·원 fence 퇴역에서 관측·소비 계수와
+오류를 함께 확인한다. 이는 archive 회복이나 검색 재개가 아니며, 수정 후
+실제 검사·새 제품 바이너리·cohort 인수는 별도로 남는다.

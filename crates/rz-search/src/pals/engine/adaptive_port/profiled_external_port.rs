@@ -1106,7 +1106,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     ) {
         if let Some(admission) = self.profiled_external.entries.get_mut(&question) {
             if admission.completion.is_some() {
-                admission.publication_error = result.as_ref().err().cloned();
+                if let Err(error) = result {
+                    admission.publication_error = Some(error.clone());
+                } else if admission.feedback_published {
+                    admission.publication_error = None;
+                }
+                // A raw-only drain or successful permit preparation does not
+                // publish the refused feedback. Retain its original failure
+                // for retirement instead of treating observation as recovery.
             }
         }
     }

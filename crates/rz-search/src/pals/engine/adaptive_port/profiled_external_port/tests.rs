@@ -384,6 +384,19 @@ impl AuthoredWorkerFixture {
         root_nodes: u64,
         long_pv: bool,
     ) -> Self {
+        Self::with_root_limits_and_record_limit(
+            lifetime, archive, goal_plies, root_nodes, long_pv, 16,
+        )
+    }
+
+    fn with_root_limits_and_record_limit(
+        lifetime: Duration,
+        archive: bool,
+        goal_plies: u16,
+        root_nodes: u64,
+        long_pv: bool,
+        max_records: usize,
+    ) -> Self {
         let goal_plies = NonZeroU16::new(goal_plies).expect("authored original goal is nonzero");
         let elf = AuthoredElf::new(long_pv);
         let config = elf.config();
@@ -452,7 +465,7 @@ impl AuthoredWorkerFixture {
             ResearcherSemanticProfile {
                 config: PalsConfig {
                     max_nodes: 257,
-                    max_records: 16,
+                    max_records,
                     beam_width: 1,
                     line_plies: 2,
                     cpu_nodes_per_task: 32,
@@ -769,7 +782,7 @@ fn retained_question_capacity_keeps_every_slot_until_root_retirement() {
 }
 
 #[test]
-fn authored_worker_nodes_only_retry_keeps_raw_constraint_and_publication_once() {
+fn authored_worker_nodes_only_keeps_raw_constraint_and_publication_once() {
     let _serial = EXTERNAL_FIXTURE_LOCK.lock().unwrap();
     let mut fixture = AuthoredWorkerFixture::new(Duration::from_secs(20), false);
     let work = fixture.work(1);
@@ -830,27 +843,9 @@ fn authored_worker_nodes_only_retry_keeps_raw_constraint_and_publication_once() 
         }
     ));
 
-    // Inject the existing logical record-cap failure after raw publication.
-    // This alters no source/receipt/protocol authority and runs no fake CPU.
-    let record_limit = fixture.port.engine.config.max_records;
-    fixture.port.engine.config.max_records = fixture.port.engine.semantic.records.len();
-    assert!(matches!(
-        fixture.port.commit_profiled_external(
-            &work,
-            &fixture.source,
-            admitted.reservation,
-            &packet,
-            true
-        ),
-        Err(PalsError::Store(StoreError::PinSaturated(_)))
-    ));
-    let pending = &fixture.port.profiled_external.entries[&work.input.question_digest];
-    assert_eq!(pending.consumed, Some(raw_only.observation));
-    assert!(!pending.feedback_published);
-    assert!(pending.publication_error.is_some());
-    assert_eq!(fixture.port.counters.consumed_external_checker_tasks, 1);
-
-    fixture.port.engine.config.max_records = record_limit;
+    // Consume the original retained packet and publish exactly once under the
+    // immutable configured bound. Record exhaustion closes its own root and
+    // is checked separately; it is not recoverable by changing this bound.
     let committed = fixture
         .port
         .commit_profiled_external(&work, &fixture.source, admitted.reservation, &packet, true)
@@ -979,6 +974,186 @@ fn authored_worker_nodes_only_retry_keeps_raw_constraint_and_publication_once() 
         retirement.original_cleanup_deadline(),
         Some(fixture.port.limits.deadline + Duration::from_secs(2))
     );
+}
+
+#[test]
+fn authored_worker_record_capacity_keeps_consumed_raw_and_error_through_drain() {
+    let _serial = EXTERNAL_FIXTURE_LOCK.lock().unwrap();
+    // Register the bound before any question. No transient config reduction,
+    // synthetic record, marker reset or post-failure bound increase is used.
+    let mut fixture = AuthoredWorkerFixture::with_root_limits_and_record_limit(
+        Duration::from_secs(20),
+        false,
+        2,
+        128,
+        false,
+        4,
+    );
+    for sequence in 1..=4 {
+        let work = fixture.work(sequence);
+        let (admitted, packet) = fixture.dispatch(&work, sequence);
+        let committed = fixture
+            .port
+            .commit_profiled_external(&work, &fixture.source, admitted.reservation, &packet, true)
+            .unwrap();
+        assert!(committed.consumed);
+        assert_eq!(
+            fixture.port.engine.semantic.records.len(),
+            sequence as usize
+        );
+    }
+    let records_before = fixture
+        .port
+        .engine
+        .semantic
+        .records
+        .iter()
+        .map(|record| (record.revision, record.line.clone(), record.cpu_observation))
+        .collect::<Vec<_>>();
+
+    let work = fixture.work(5);
+    let (admitted, packet) = fixture.dispatch(&work, 5);
+    let raw_only = fixture
+        .port
+        .commit_profiled_external(&work, &fixture.source, admitted.reservation, &packet, false)
+        .unwrap();
+    assert!(!raw_only.consumed);
+    let execution = fixture.port.profiled_external.entries[&work.input.question_digest].execution;
+    let reported_before = fixture.port.profiled_external_work().unwrap();
+    let checked_before = fixture.port.rovent_frontier().unwrap().snapshot().work;
+    assert!(matches!(
+        fixture.port.commit_profiled_external(
+            &work,
+            &fixture.source,
+            admitted.reservation,
+            &packet,
+            true,
+        ),
+        Err(PalsError::Rovent(
+            crate::pals::rovent_frontier::FrontierError::PublicRecordCapacity
+        ))
+    ));
+    let pending = &fixture.port.profiled_external.entries[&work.input.question_digest];
+    // The exact raw head was consumed before the later record publication
+    // refused admission. Its real use and original packet cannot be erased.
+    assert_eq!(pending.published, Some(raw_only.observation));
+    assert_eq!(pending.consumed, Some(raw_only.observation));
+    assert!(pending.terminal && pending.accounted && !pending.feedback_published);
+    assert!(Arc::ptr_eq(pending.completion.as_ref().unwrap(), &packet));
+    assert!(matches!(
+        pending.publication_error,
+        Some(PalsError::Rovent(
+            crate::pals::rovent_frontier::FrontierError::PublicRecordCapacity
+        ))
+    ));
+    assert!(
+        fixture
+            .port
+            .rovent_frontier()
+            .unwrap()
+            .public_record_capacity_refused()
+    );
+    assert_eq!(
+        fixture.port.rovent_frontier().unwrap().snapshot().goal,
+        crate::pals::rovent_frontier::FrontierGoalStatus::Stopped(
+            crate::pals::rovent_frontier::FrontierStop::Capacity
+        ),
+    );
+    assert!(
+        fixture
+            .port
+            .rovent_frontier()
+            .unwrap()
+            .snapshot()
+            .horizon
+            .completed_depth
+            .is_none()
+    );
+
+    // This is the actual Draining route: retain/re-observe the same raw packet
+    // with consume_current=false. It does not authorize a Fresh continuation,
+    // clear the earlier publication error, or consume the original head twice.
+    let drained = fixture
+        .port
+        .commit_profiled_external(&work, &fixture.source, admitted.reservation, &packet, false)
+        .unwrap();
+    assert_eq!(drained.observation, raw_only.observation);
+    assert!(!drained.consumed);
+    assert_eq!(fixture.port.counters.external_checker_tasks, 5);
+    assert_eq!(fixture.port.counters.external_checker_reports, 5);
+    assert_eq!(fixture.port.counters.consumed_external_checker_tasks, 5);
+    assert_eq!(fixture.port.counters.cpu_nodes, 0);
+    assert_eq!(fixture.port.counters.completed_cpu_tasks, 0);
+    assert_eq!(
+        fixture.port.profiled_external_work().unwrap(),
+        reported_before
+    );
+    let checked_after = fixture.port.rovent_frontier().unwrap().snapshot().work;
+    assert_eq!(
+        checked_after.checked_transitions,
+        checked_before.checked_transitions
+    );
+    assert_eq!(checked_after.native_nodes, 0);
+    assert!(
+        fixture
+            .port
+            .rovent_frontier()
+            .unwrap()
+            .public_record_capacity_refused()
+    );
+    assert_eq!(
+        fixture
+            .port
+            .engine
+            .semantic
+            .records
+            .iter()
+            .map(|record| { (record.revision, record.line.clone(), record.cpu_observation) })
+            .collect::<Vec<_>>(),
+        records_before,
+    );
+    let task = fixture
+        .port
+        .engine
+        .semantic
+        .stores
+        .tasks
+        .get(execution)
+        .unwrap();
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert_eq!(task.key.requested_depth, 0);
+    assert_eq!(task.key.node_budget, 16);
+    assert!(matches!(
+        task.key.question,
+        TaskQuestion::ProfiledExternal {
+            requested: ProfiledExternalConstraint::Nodes { reported_nodes: 16 }
+        }
+    ));
+    let fence = fixture.quiesce();
+    let retirement = fixture
+        .port
+        .release_profiled_external_root(&fixture.source, &fence)
+        .unwrap();
+    assert_eq!(retirement.retained_questions(), 5);
+    let original = retirement
+        .packets()
+        .find(|held| held.execution() == execution)
+        .unwrap();
+    assert!(Arc::ptr_eq(original.completion().unwrap(), &packet));
+    assert_eq!(original.observation(), Some(raw_only.observation));
+    assert_eq!(
+        original.actual_consumed_observation(),
+        Some(raw_only.observation)
+    );
+    assert!(original.search_consumed() && original.terminal() && original.accounted());
+    assert!(!original.feedback_published());
+    assert!(matches!(
+        original.publication_error(),
+        Some(PalsError::Rovent(
+            crate::pals::rovent_frontier::FrontierError::PublicRecordCapacity
+        ))
+    ));
+    assert_eq!(fixture.port.engine.config.max_records, 4);
 }
 
 #[test]
