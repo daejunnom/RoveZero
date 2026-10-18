@@ -201,6 +201,10 @@ struct NativeOwner {
     finished: Option<bool>,
     joined: bool,
     unexpected: Vec<TicketNativeEvent<VirtualReviewTicketOutput>>,
+    // A recovered native source retains the original typed root/cache closure
+    // even if subsequent semantic handoff or receipt publication is rejected.
+    // Unknown State drop quarantines this slot with its original process.
+    _root_closure: Option<RoleOnlyShutdownReceipt>,
 }
 impl NativeOwner {
     fn new(service: RoventNativeService<PcPortQuestion>) -> Self {
@@ -209,7 +213,12 @@ impl NativeOwner {
             finished: None,
             joined: false,
             unexpected: Vec::new(),
+            _root_closure: None,
         }
+    }
+    fn retain_root_closure(mut self, closure: RoleOnlyShutdownReceipt) -> Self {
+        self._root_closure = Some(closure);
+        self
     }
     fn finish(&mut self, until: Instant) -> Result<(), SearchSessionFailure> {
         self.service.begin_shutdown(until);
@@ -724,7 +733,10 @@ impl RoventPcSessionDriver {
         progress: &mut dyn FnMut(BoardMove),
     ) -> Result<SearchSessionReport, SearchSessionFailure> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(SearchSessionFailure::physical_completion_unknown());
+            return Err(physical_unknown_at(
+                "RoventPcRootAdmission",
+                "session is closed or quarantined",
+            ));
         }
         let cap = NonZeroU16::new(self.configuration.fields().frontier.maximum_goal_plies)
             .expect("admitted nonzero goal cap");
@@ -761,18 +773,27 @@ impl RoventPcSessionDriver {
             match self.state.try_lock() {
                 Ok(state) => break state,
                 Err(TryLockError::Poisoned(_)) => {
-                    return Err(SearchSessionFailure::physical_completion_unknown());
+                    return Err(physical_unknown_at(
+                        "RoventPcRootState",
+                        "session owner mutex is poisoned",
+                    ));
                 }
                 Err(TryLockError::WouldBlock) => {
                     if Instant::now() >= context.shutdown_deadline {
-                        return Err(SearchSessionFailure::physical_completion_unknown());
+                        return Err(physical_unknown_at(
+                            "RoventPcRootState",
+                            "original cleanup boundary expired while acquiring session custody",
+                        ));
                     }
                     std::thread::yield_now();
                 }
             }
         };
         if self.closed.load(Ordering::Acquire) {
-            return Err(SearchSessionFailure::physical_completion_unknown());
+            return Err(physical_unknown_at(
+                "RoventPcRootAdmission",
+                "session closed before source gate",
+            ));
         }
         // Hold the same actual idle owner through the final source gate. A
         // stopped Start consumes neither reset intent nor root registration.
@@ -784,7 +805,23 @@ impl RoventPcSessionDriver {
             {
                 idle
             }
-            _ => return Err(SearchSessionFailure::physical_completion_unknown()),
+            State::Idle(idle) => {
+                return Err(physical_unknown_at(
+                    "RoventPcNativeIdle",
+                    format!(
+                        "finished={:?}, joined={}, quarantined={}",
+                        idle.native.finished,
+                        idle.native.joined,
+                        idle.native.service.is_quarantined()
+                    ),
+                ));
+            }
+            _ => {
+                return Err(physical_unknown_at(
+                    "RoventPcRootState",
+                    "original idle custody is absent",
+                ));
+            }
         };
         let root_admission = match source
             .into_initial()
@@ -803,7 +840,10 @@ impl RoventPcSessionDriver {
                     Ok(mut latest) => *latest = Some(receipt),
                     Err(_) => {
                         self.closed.store(true, Ordering::Release);
-                        return Err(SearchSessionFailure::physical_completion_unknown());
+                        return Err(physical_unknown_at(
+                            "RoventPcStoppedInitial",
+                            "initial receipt owner is poisoned",
+                        ));
                     }
                 }
                 return Ok(report);
@@ -814,13 +854,19 @@ impl RoventPcSessionDriver {
             State::Idle(idle) => idle,
             other => {
                 *state = other;
-                return Err(SearchSessionFailure::physical_completion_unknown());
+                return Err(physical_unknown_at(
+                    "RoventPcRootTransfer",
+                    "original idle custody changed before transfer",
+                ));
             }
         };
         if idle.native.finished.is_some() || idle.native.joined {
             *state = State::Idle(idle);
             self.closed.store(true, Ordering::Release);
-            return Err(SearchSessionFailure::physical_completion_unknown());
+            return Err(physical_unknown_at(
+                "RoventPcNativeIdle",
+                "native owner already finished or joined before root transfer",
+            ));
         }
         let reset = self.reset_requested.swap(false, Ordering::AcqRel)
             || idle.game != Some(context.authority.game.0);
@@ -1169,15 +1215,35 @@ impl RoventPcSessionDriver {
                     failure.physical_completion = DriverPhysicalCompletion::Unknown;
                     failure
                 }
-                _ => SearchSessionFailure::physical_completion_unknown(),
+                _ => physical_unknown_at(
+                    "RoventPcRootExecution",
+                    "root closure panicked; original manager retained",
+                ),
             });
         }
         let physical = match manager.shutdown_receipt() {
             Ok(receipt) if receipt.permits_semantic_closure() => receipt,
-            _ => {
+            Ok(receipt) => {
                 *state = State::Manager(manager);
                 self.closed.store(true, Ordering::Release);
-                return Err(SearchSessionFailure::physical_completion_unknown());
+                return Err(physical_unknown_at(
+                    "RoventPcShutdownReceipt",
+                    format!(
+                        "closure rejected: joined={}, shutdown_confirmed={}, pending={}, retained={}, quarantined={}, root_fence={:?}, shared_closure={}",
+                        receipt.native_process_joined,
+                        receipt.native_physical_shutdown_confirmed,
+                        receipt.pending_tickets,
+                        receipt.retained_outputs,
+                        receipt.quarantined,
+                        receipt.root_fence(),
+                        receipt.shared_nnuec_closure().is_some()
+                    ),
+                ));
+            }
+            Err(error) => {
+                *state = State::Manager(manager);
+                self.closed.store(true, Ordering::Release);
+                return Err(physical_unknown_at("RoventPcShutdownReceipt", error));
             }
         };
         if let Some(observer) = &self.collection_hooks.root_closure {
@@ -1202,10 +1268,44 @@ impl RoventPcSessionDriver {
                 ));
             }
         };
-        let repair = match manager.driver_mut().port_mut().take_repair_report() {
+        // Verify the manager and the original driver/actor receipt while the
+        // same Frontier still owns its original budget and Rules identity.
+        // Retiring it first would destroy the basis for shared cache closure.
+        let sources = match manager.into_sources() {
+            Ok(sources) => sources,
+            Err((retained, error)) => {
+                *state = State::Manager(Box::new(retained));
+                self.closed.store(true, Ordering::Release);
+                return Err(physical_unknown_at("RoventPcIntoSources", error));
+            }
+        };
+        let native = NativeOwner::new(sources.native).retain_root_closure(physical.clone());
+        let mut port = match sources.driver.into_port(&physical) {
+            Ok(port) => port,
+            Err((port, error)) => {
+                let detail = format!(
+                    "error={error:?}, authority_matches={}, mode_matches={}, actual_root_budget={:?}, receipt_root_budget={:?}, shared_required={}, shared_closure_matches={}",
+                    port.port().authority() == physical.authority,
+                    port.port().mode() == physical.mode,
+                    port.port().original_root_budget(),
+                    physical.root_budget,
+                    port.port().requires_shared_nnuec_readout(),
+                    physical
+                        .shared_nnuec_closure()
+                        .is_some_and(|closure| port.port().shared_nnuec_closure_matches(closure)),
+                );
+                *state = State::RejectedPort { native, port };
+                self.closed.store(true, Ordering::Release);
+                return Err(physical_unknown_at("RoventPcIntoPort", detail));
+            }
+        };
+        let repair = match port.take_repair_report() {
             Ok(report) => report,
             Err(error) => {
-                *state = State::Manager(manager);
+                *state = State::RejectedPort {
+                    native,
+                    port: PcPortDriver::new(port),
+                };
                 self.closed.store(true, Ordering::Release);
                 return Err(SearchSessionFailure::debug("RoventPcRepairReport", &error));
             }
@@ -1214,12 +1314,26 @@ impl RoventPcSessionDriver {
             .retained_repair
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = repair;
-        let frontier = match manager.driver_mut().port_mut().retire_rovent_frontier() {
+        let frontier = match port.retire_rovent_frontier() {
             Ok(Some(receipt)) => receipt.snapshot,
-            _ => {
-                *state = State::Manager(manager);
+            Ok(None) => {
+                *state = State::RejectedPort {
+                    native,
+                    port: PcPortDriver::new(port),
+                };
                 self.closed.store(true, Ordering::Release);
-                return Err(SearchSessionFailure::physical_completion_unknown());
+                return Err(physical_unknown_at(
+                    "RoventPcRetireFrontier",
+                    "original Frontier is absent",
+                ));
+            }
+            Err(error) => {
+                *state = State::RejectedPort {
+                    native,
+                    port: PcPortDriver::new(port),
+                };
+                self.closed.store(true, Ordering::Release);
+                return Err(physical_unknown_at("RoventPcRetireFrontier", error));
             }
         };
         let repair = self
@@ -1237,22 +1351,32 @@ impl RoventPcSessionDriver {
             repair,
         });
         // This is an observation of the actual fence/frontier/report. It is
-        // retained before fallible owner transfers and is not a run-success flag.
+        // retained before fallible observation publication and semantic owner
+        // recovery; it is not a run-success flag.
         match self.latest.lock() {
             Ok(mut latest) => *latest = Some(Arc::clone(&receipt)),
             Err(_) => {
                 // The root cannot resume after this loss of its receipt slot.
                 // Preserve the original report even on this poisoned boundary.
                 std::mem::forget(receipt);
-                *state = State::Manager(manager);
+                *state = State::RejectedPort {
+                    native,
+                    port: PcPortDriver::new(port),
+                };
                 self.closed.store(true, Ordering::Release);
-                return Err(SearchSessionFailure::physical_completion_unknown());
+                return Err(physical_unknown_at(
+                    "RoventPcPublishReceipt",
+                    "root receipt owner is poisoned",
+                ));
             }
         }
         let work = match receipt.work() {
             Ok(work) => work,
             Err(error) => {
-                *state = State::Manager(manager);
+                *state = State::RejectedPort {
+                    native,
+                    port: PcPortDriver::new(port),
+                };
                 self.closed.store(true, Ordering::Release);
                 return Err(error);
             }
@@ -1264,27 +1388,9 @@ impl RoventPcSessionDriver {
             .mate_strategy
             .clone()
             .filter(|strategy| result.best_move == Some(strategy.best_move()));
-        let sources = match manager.into_sources() {
-            Ok(sources) => sources,
-            Err((retained, _)) => {
-                *state = State::Manager(Box::new(retained));
-                self.closed.store(true, Ordering::Release);
-                return Err(SearchSessionFailure::physical_completion_unknown());
-            }
-        };
-        let owner = match sources.driver.into_port(&physical) {
-            Ok(port) => port.into_owner(),
-            Err((port, _)) => {
-                *state = State::RejectedPort {
-                    native: NativeOwner::new(sources.native),
-                    port,
-                };
-                self.closed.store(true, Ordering::Release);
-                return Err(SearchSessionFailure::physical_completion_unknown());
-            }
-        };
+        let owner = port.into_owner();
         *state = State::Idle(Box::new(Idle {
-            native: NativeOwner::new(sources.native),
+            native,
             owner: Box::new(owner),
             next_request_sequence: next,
             game: Some(context.authority.game.0),
@@ -1395,7 +1501,8 @@ impl RoventPcSessionDriver {
                             return Err(SearchSessionFailure::physical_completion_unknown());
                         }
                     };
-                    let mut native = NativeOwner::new(sources.native);
+                    let mut native =
+                        NativeOwner::new(sources.native).retain_root_closure(receipt.clone());
                     native.finished = receipt.native_physical_shutdown_confirmed.then_some(true);
                     native.joined = receipt.native_process_joined;
                     // Process shutdown does not reuse the semantic owner. Keep its
@@ -1571,6 +1678,13 @@ fn configure_root_port(
         ));
     }
     Ok(())
+}
+/// Keep the original physical-unknown code and ownership classification while
+/// preserving the actual failed boundary for post-run diagnosis.
+fn physical_unknown_at(stage: &'static str, detail: impl std::fmt::Debug) -> SearchSessionFailure {
+    let mut failure = SearchSessionFailure::physical_completion_unknown();
+    failure.detail = format!("{stage}: {detail:?}");
+    failure
 }
 fn failure(code: &'static str, detail: &str) -> SearchSessionFailure {
     SearchSessionFailure {
