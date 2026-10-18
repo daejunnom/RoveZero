@@ -299,6 +299,10 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
                 include_str!("engine/adaptive_port/profiled_external_port.rs"),
             ),
             (
+                "pals/engine/adaptive_port/profiled_external_port/feedback_observation.rs",
+                include_str!("engine/adaptive_port/profiled_external_port/feedback_observation.rs"),
+            ),
+            (
                 "pals/engine/adaptive_port/profiled_retirement_archive.rs",
                 include_str!("engine/adaptive_port/profiled_retirement_archive.rs"),
             ),

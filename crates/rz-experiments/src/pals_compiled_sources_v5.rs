@@ -87,6 +87,9 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/pals/engine/adaptive_port/preparing_port.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/profiled_external_port.rs"),
             source!(
+                "crates/rz-search/src/pals/engine/adaptive_port/profiled_external_port/feedback_observation.rs"
+            ),
+            source!(
                 "crates/rz-search/src/pals/engine/adaptive_port/profiled_retirement_archive.rs"
             ),
             source!(
@@ -239,6 +242,9 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/pals/engine/adaptive_port/preparing_nnuec.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/preparing_port.rs"),
             source!("crates/rz-search/src/pals/engine/adaptive_port/profiled_external_port.rs"),
+            source!(
+                "crates/rz-search/src/pals/engine/adaptive_port/profiled_external_port/feedback_observation.rs"
+            ),
             source!(
                 "crates/rz-search/src/pals/engine/adaptive_port/profiled_retirement_archive.rs"
             ),

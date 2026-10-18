@@ -35,7 +35,40 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     published_line,
                 }));
         }
+        // Copy only a successful original semantic result. The separate
+        // first ConsumedView and coordinator acceptance are joined at readback.
+        let feedback_edge = self.role_consumption_observation.as_ref().and_then(|_| {
+            returned.as_ref().ok().map(|step| {
+                super::profiled_external_port::feedback_observation::ProfiledFeedbackRoleEdge {
+                    evidence: crate::pals::coordinator::StepEvidence {
+                        frame: work.frame,
+                        stage: work.input.stage,
+                        execution: crate::pals::coordinator::StepExecution::Role(ticket.id),
+                        submitted_question: work.input.question_digest,
+                        submitted_view: work.input.view_seal,
+                        completed_evidence: step.evidence,
+                    },
+                    request: ticket.id,
+                    role: ticket.role,
+                    ticket_question: ticket.question,
+                    ticket_view: ticket.view,
+                    namespace: self
+                        .model_namespace()
+                        .ok()
+                        .map(|v| v.utility_cohort_digest()),
+                    original_deadline: work.original_deadline,
+                    prefix_before_plies: work.input.question.context.prefix.len(),
+                    counter_source: work.input.question.counter_source,
+                    published_repair_line,
+                    repair_input: work.input.question.diagnostic_repair_line,
+                    fresh_pair: step.fresh_pair,
+                }
+            })
+        });
         if let Some(journal) = &mut self.role_consumption_observation {
+            if let Some(edge) = feedback_edge {
+                journal.record_feedback_role(edge);
+            }
             let (outcome, completed_evidence) = match &returned {
                 Ok(step) => (
                     AdaptiveRoleConsumptionOutcome::SemanticResult,

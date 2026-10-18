@@ -84,7 +84,8 @@ pub use profiled_external_port::{
     AdaptiveProfiledExternalPreparation, AdaptiveProfiledForeignPublication,
     CheckedProfiledExternalResponse, ProfiledExternalRetiredPacket,
     ProfiledExternalRetirementIdentity, ProfiledExternalRootRetirement,
-    ProfiledExternalUnsupported,
+    ProfiledExternalUnsupported, ProfiledFeedbackConsumedChain,
+    ProfiledFeedbackConsumptionObservation, ProfiledFeedbackObservationUnavailable,
 };
 pub mod archive_worker;
 pub mod profiled_retirement_archive;

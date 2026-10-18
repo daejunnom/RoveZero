@@ -705,8 +705,10 @@ impl RoventNativeProductDriver {
     /// Opt-in operational JSONL observations only. The handle cannot close or
     /// recreate any owner. Diagnostic I/O never replaces the physical cleanup.
     pub fn enable_lifecycle_stderr_diagnostics(&mut self) -> RoventLifecycleDiagnostics {
+        let first_enable = self.lifecycle_diagnostics.is_none();
         let implementation = self.actual().implementation();
-        self.lifecycle_diagnostics
+        let observation = self
+            .lifecycle_diagnostics
             .get_or_insert_with(|| {
                 RoventLifecycleDiagnostics::new_from_sources(
                     self.sources.lock_digest(),
@@ -715,7 +717,40 @@ impl RoventNativeProductDriver {
                     Arc::clone(&self.physically_closed),
                 )
             })
-            .clone()
+            .clone();
+        // Existing explicit opt-in only, and only the externally profiled R
+        // assembly. The diagnostic never constructs R/native work or a permit.
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        if first_enable
+            && matches!(
+                self.sources.lock().manifest.engine.researcher.as_ref(),
+                Some(rz_experiments::RoventResearcher::External { .. })
+            )
+        {
+            let installed = match self.inner.as_ref() {
+                ActualProductDriver::Pcr(driver) => {
+                    crate::pals_adaptive::ContinuationDiagnostic::new(
+                        crate::pals_adaptive::ContinuationDiagnosticOptions {
+                            pending_snapshots_max: 0,
+                            resolution_records_max:
+                                crate::pals_adaptive::CONTINUATION_RESOLUTION_RECORDS_MAX,
+                            role_consumption: true,
+                        },
+                    )
+                    .and_then(|diagnostic| {
+                        driver.install_continuation_diagnostic(diagnostic.clone())?;
+                        Ok(diagnostic)
+                    })
+                }
+                _ => {
+                    Err(crate::pals_adaptive::ContinuationDiagnosticError::AdmissionAlreadyStarted)
+                }
+            };
+            observation.install_profiled_feedback(installed);
+        }
+        #[cfg(not(feature = "pals-adaptive-diagnostics"))]
+        let _ = first_enable;
+        observation
     }
 
     fn actual(&self) -> &dyn SearchSessionDriver {
@@ -786,6 +821,8 @@ impl SearchSessionDriver for RoventNativeProductDriver {
         let result = self.actual().run(position, context, progress);
         if let Some(diagnostics) = &self.lifecycle_diagnostics {
             diagnostics.observe_root(self, context, result.as_ref().err());
+            #[cfg(feature = "pals-adaptive-diagnostics")]
+            diagnostics.observe_profiled_feedback(self, context);
         }
         result
     }

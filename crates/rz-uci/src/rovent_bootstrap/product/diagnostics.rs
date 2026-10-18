@@ -422,6 +422,12 @@ struct State {
     latest: Option<RoventProductLifecycleObservation>,
     retained_session: Option<RetainedSessionObservation>,
     retained_session_after_finish: Option<RetainedSessionObservation>,
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    profiled_feedback: Option<crate::pals_adaptive::ContinuationDiagnostic>,
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    profiled_feedback_issue: Option<&'static str>,
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    profiled_feedback_emitted: bool,
 }
 
 /// A read-only handle to this product's diagnostic state. Keeping the handle
@@ -436,6 +442,120 @@ pub struct RoventLifecycleDiagnostics {
     mode: ExecutionMode,
 }
 impl RoventLifecycleDiagnostics {
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    pub(super) fn install_profiled_feedback(
+        &self,
+        value: Result<
+            crate::pals_adaptive::ContinuationDiagnostic,
+            crate::pals_adaptive::ContinuationDiagnosticError,
+        >,
+    ) {
+        let Ok(mut state) = self.state.lock() else {
+            self.poisoned.store(true, Ordering::Release);
+            return;
+        };
+        match value {
+            Ok(value) if state.profiled_feedback.is_none() => state.profiled_feedback = Some(value),
+            _ => state.profiled_feedback_issue = Some("profiled_feedback_install_unavailable"),
+        }
+    }
+    /// One original root only. The existing diagnostic bind is once-only;
+    /// later roots cannot reset/relabel that opaque journal into a new proof.
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    pub(super) fn observe_profiled_feedback(
+        &self,
+        product: &RoventNativeProductDriver,
+        context: &SearchSessionContext,
+    ) {
+        let Ok(mut state) = self.state.lock() else {
+            self.poisoned.store(true, Ordering::Release);
+            return;
+        };
+        if state.profiled_feedback_emitted
+            || (state.profiled_feedback.is_none() && state.profiled_feedback_issue.is_none())
+        {
+            return;
+        }
+        state.profiled_feedback_emitted = true;
+        let snapshot = state
+            .profiled_feedback
+            .as_ref()
+            .and_then(|d| d.snapshot().ok());
+        let accepted = snapshot
+            .as_ref()
+            .ok_or("profiled_feedback_snapshot_unavailable")
+            .and_then(|s| {
+                if s.authority != Some(context.authority) {
+                    return Err("profiled_feedback_wrong_root");
+                }
+                s.accepted_profiled_feedback_chain()
+            });
+        let commits = match product.inner.as_ref() {
+            ActualProductDriver::Pcr(driver) => driver.profiled_retirement_commits(),
+            _ => return,
+        };
+        let mut row = serde_json::json!({
+            "domain":"rz-rovent-profiled-feedback-consumption-observation/1",
+            "event":"first_original_root_readback",
+            "input_lock_sha256":hex(self.lock),
+            "implementation_sha256":hex(self.implementation),
+            "authority":AuthorityObservation::from(context.authority),
+            "maximum_root_observations":1,
+            "semantic_chain_observed":accepted.is_ok(),
+            "chain_unavailable":accepted.as_ref().err().copied(),
+            "source_unavailable":snapshot.as_ref().and_then(|s| s.profiled_feedback.as_ref())
+                .and_then(|v| v.unavailable()).map(|v| format!("{v:?}")),
+            "role_readback_root_fence":snapshot.as_ref().and_then(|s| s.role_readback_root_fence),
+            "journal_unavailable_bits":snapshot.as_ref().map(|s| s.unavailable_bits),
+            "diagnostic_install_issue":state.profiled_feedback_issue,
+            "original_archive_commits":commits.as_ref().ok(),
+            "archive_observation_unavailable":commits.is_err(),
+            "physical_completion_attested":false,"capabilities_reissued":false,
+            "execution_authorized":false,"performance_evidence":false,
+            "full_acceptance_issued":false,
+        });
+        if let Ok(chain) = accepted {
+            let steps: Vec<_> = chain
+                .steps()
+                .iter()
+                .map(|value| {
+                    serde_json::json!({
+                        "authority":AuthorityObservation::from(value.frame.authority),
+                        "frame_sequence":value.frame.sequence,
+                        "stage":format!("{:?}", value.stage),
+                        "original_execution":format!("{:?}", value.execution),
+                        "question_sha256":hex(value.submitted_question),
+                        "view_sha256":hex(value.submitted_view.view_digest),
+                        "view_sequence":value.submitted_view.view_sequence,
+                        "public_context_policy_sha256":hex(value.submitted_view.context_policy),
+                        "completed_evidence_sha256":hex(value.completed_evidence),
+                    })
+                })
+                .collect();
+            let repair = chain.repair();
+            let pair = chain.fresh_pair();
+            row["chain"] = serde_json::json!({
+                "original_foreign_observation":chain.foreign_observation().0,
+                "steps_source_r_p_repair_c_fresh_repaired_fresh_counter":steps,
+                "prefix_before_plies":chain.prefix_before_plies(),
+                "committed_repair_plies":repair.published_line.committed_plies,
+                "repair_line":repair.published_line.line.0,
+                "repair_observation":repair.published_line.observation.0,
+                "record_revision":repair.published_line.record_revision,
+                "parent_revision":repair.published_line.parent_revision,
+                "supersedes_revision":repair.published_line.supersedes_revision,
+                "frozen_namespace_sha256":hex(chain.namespace()),
+                "fresh_public_context_sha256":hex(pair.public_context),
+                "fresh_model_sha256":hex(pair.model),"fresh_encoding_sha256":hex(pair.encoding),
+                "fresh_precision":format!("{:?}",pair.precision),"fresh_epoch":pair.frozen_epoch,
+                "fresh_perspective":format!("{:?}",pair.perspective),
+            });
+        }
+        if let Err(why) = write_profiled_feedback_row(&mut io::stderr().lock(), &row, &mut state) {
+            state.first_issue.get_or_insert(why);
+            state.scope_incomplete = true;
+        }
+    }
     pub(super) fn new_from_sources(
         lock: Digest,
         implementation: Digest,
@@ -1062,6 +1182,48 @@ fn write_row(
         .write_all(&buffer.0)
         .map_err(|_| "diagnostic_write_failed")?;
     output.flush().map_err(|_| "diagnostic_flush_failed")
+}
+#[cfg(feature = "pals-adaptive-diagnostics")]
+fn write_profiled_feedback_row(
+    output: &mut impl Write,
+    row: &serde_json::Value,
+    state: &mut State,
+) -> Result<(), &'static str> {
+    let mut buffer = RowBuffer(Vec::new());
+    buffer
+        .0
+        .try_reserve_exact(MAX_ROW_BYTES)
+        .map_err(|_| "profiled_feedback_allocation_failed")?;
+    if serde_json::to_writer(&mut buffer, row).is_err() || buffer.write_all(b"\n").is_err() {
+        // Never truncate a positive into a seemingly complete chain.
+        buffer.0.clear();
+        serde_json::to_writer(
+            &mut buffer,
+            &serde_json::json!({
+                "domain":"rz-rovent-profiled-feedback-consumption-observation/1",
+                "event":"first_original_root_readback","semantic_chain_observed":false,
+                "chain_unavailable":"bounded_row_incomplete","physical_completion_attested":false,
+                "capabilities_reissued":false,"full_acceptance_issued":false,
+            }),
+        )
+        .map_err(|_| "profiled_feedback_fallback_encoding_failed")?;
+        buffer
+            .write_all(b"\n")
+            .map_err(|_| "profiled_feedback_fallback_capacity")?;
+        state.scope_incomplete = true;
+        state
+            .first_issue
+            .get_or_insert("profiled_feedback_row_incomplete");
+    }
+    if buffer.0.len() > (MAX_STREAM_BYTES - MAX_ROW_BYTES).saturating_sub(state.bytes) {
+        return Err("profiled_feedback_stream_capacity");
+    }
+    // Same final-row reserve and one charged attempt as lifecycle output.
+    state.bytes += buffer.0.len();
+    output
+        .write_all(&buffer.0)
+        .map_err(|_| "profiled_feedback_write_failed")?;
+    output.flush().map_err(|_| "profiled_feedback_flush_failed")
 }
 fn physical(value: DriverPhysicalCompletion) -> &'static str {
     match value {

@@ -284,6 +284,11 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
                 .and_then(|port| port.role_consumption_observation()),
             original_root_fence,
         );
+        diagnostic.profiled_feedback_readback(
+            self.authority,
+            self.port()
+                .map(|port| port.profiled_feedback_consumption_observation()),
+        );
     }
     pub fn port(&self) -> Option<&AdaptiveEnginePort<M>> {
         self.port.as_deref()

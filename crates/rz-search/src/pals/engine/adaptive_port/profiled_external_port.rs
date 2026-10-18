@@ -19,6 +19,11 @@ use rz_contracts::rovent::{
 };
 use rz_contracts::{ClockDomain, MonotonicTick};
 use rz_runtime::{CompletionSignal, adaptive::ControlMailbox};
+pub(super) mod feedback_observation;
+pub use feedback_observation::{
+    ProfiledFeedbackConsumedChain, ProfiledFeedbackConsumptionObservation,
+    ProfiledFeedbackObservationUnavailable,
+};
 
 const PROFILED_QUESTION_CAPACITY: usize = 64;
 fn reserve_profiled_question_slot<T>(
@@ -389,6 +394,8 @@ struct ProfiledAdmission {
     published: Option<ObservationId>,
     consumed: Option<ObservationId>,
     feedback_published: bool,
+    /// Exact ordinary after_profiled_external result, never minted by a reader.
+    diagnostic_step_evidence: Option<ContractDigest>,
     publication_error: Option<PalsError>,
     terminal: bool,
     accounted: bool,
@@ -735,6 +742,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 published: None,
                 consumed: None,
                 feedback_published: false,
+                diagnostic_step_evidence: None,
                 publication_error: None,
                 terminal: false,
                 accounted: false,
@@ -1306,6 +1314,17 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         hash.update(work.input.question_digest.0);
         hash.update((committed.observation.0 as u64).to_le_bytes());
         step.evidence = ContractDigest(hash.finalize().into());
+        // Observation only. The existing successful source/Store/transition
+        // checks above remain the sole producer of this original evidence.
+        if self.role_consumption_observation.is_some() {
+            if let Some(admission) = self
+                .profiled_external
+                .entries
+                .get_mut(&work.input.question_digest)
+            {
+                admission.diagnostic_step_evidence = Some(step.evidence);
+            }
+        }
         Ok(step)
     }
 
