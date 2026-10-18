@@ -126,21 +126,61 @@ fn accepted_scripted(
 }
 
 fn repair_port() -> GoalPort {
+    repair_port_with_goal(SearchGoal {
+        depth_plies: None,
+        mate_moves: None,
+    })
+}
+
+fn repair_port_with_goal(goal: SearchGoal) -> GoalPort {
     let roots = moves("e2e4");
-    let mut port = goal_port(
-        Position::startpos(),
-        SearchGoal {
-            depth_plies: None,
-            mate_moves: None,
-        },
-        Some(&roots),
-    );
+    let mut port = goal_port(Position::startpos(), goal, Some(&roots));
     // This is the original registered generation chunk, not an inferred depth.
     port.owner.config.line_plies = 6;
     port.owner.profile.semantic.line_plies = 6;
     port.enable_post_repair_recheck(PostRepairRecheckPolicy::IterativeFrozenModelWdlV2)
         .unwrap();
     port
+}
+
+#[test]
+fn shallow_original_depth_completes_fresh_without_out_of_horizon_repair() {
+    for depth in [1, 2] {
+        let mut port = repair_port_with_goal(SearchGoal {
+            depth_plies: NonZeroU16::new(depth),
+            mate_moves: None,
+        });
+        let mut calls = 0;
+        while let Some(input) = port.next_role().unwrap() {
+            calls += 1;
+            assert!(calls <= 8, "the original shallow goal must make progress");
+            assert!(input.question.context.prefix.len() <= usize::from(depth));
+            assert!(input.question.repair.is_none());
+            let selected = if input.question.context.purpose == RoleQueryPurpose::ValueFresh {
+                None
+            } else if input.question.context.prefix.is_empty() {
+                Some(BoardMove::from_uci("e2e4").unwrap())
+            } else {
+                input.view.query().legal.first().copied()
+            };
+            let (accepted, output) =
+                accepted_scripted(&mut port, &input, calls, selected, [0.25, 0.50, 0.25]);
+            let physical = evidence(&port, &input, calls);
+            port.consume_accepted(&input, &accepted, &output, Some(physical))
+                .unwrap();
+        }
+        let receipt = port.rovent_frontier_receipt().unwrap();
+        assert_eq!(receipt.snapshot.goal, FrontierGoalStatus::DepthSatisfied);
+        assert_eq!(receipt.snapshot.horizon.completed_depth.unwrap().0, depth);
+        assert_eq!(receipt.snapshot.horizon.maximum_examined_ply.0, depth);
+        assert_eq!(receipt.snapshot.work.native_nodes, 0);
+        assert!(port.counters.accepted_fresh > 0);
+        assert!(port.last_frontier_error().is_none());
+        assert_eq!(
+            port.post_repair_recheck(),
+            PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
+        );
+    }
 }
 
 #[test]

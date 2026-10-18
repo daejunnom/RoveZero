@@ -163,7 +163,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
         match error {
             FrontierError::Deadline => RoleError::Deadline.into(),
             FrontierError::Capacity(_) => PalsError::Capacity,
-            _ => StoreError::InvalidEvidence("original P/C frontier rejected goal work").into(),
+            _ => error.into(),
         }
     }
 

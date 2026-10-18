@@ -333,6 +333,10 @@ impl<M: RoleModel> PcSemanticPort<M> {
         if self.repair_cycles.is_none() {
             return Ok(());
         }
+        // An optional Repair cycle shares the original go horizon. Its
+        // generation chunk cannot authorize a child beyond that horizon,
+        // and fewer than three plies cannot form this Repair recipe.
+        let end = self.owner.config.line_plies.min(self.continuation_limit());
         let root_budget = self
             .original_root_budget()
             .ok_or(PalsError::InvalidConfig)?;
@@ -342,7 +346,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
         if input.question.context.purpose != RoleQueryPurpose::ProposePolicy
             || !input.question.context.prefix.is_empty()
             || prefix.len() != 1
-            || self.owner.config.line_plies < 3
+            || end < 3
             || self.owner.semantic.nodes[node].terminal.is_some()
         {
             return Ok(());
@@ -372,7 +376,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
             root_budget,
             first,
             frame,
-            end: self.owner.config.line_plies,
+            end,
             model: self
                 .owner
                 .model_value_identity()
