@@ -43,9 +43,9 @@ const POLL: Duration = Duration::from_millis(5);
 // protocol replies are legal; no search or evaluator chooses them.
 const AUTHORED_UCI: &str = r#"
 use std::io::{self, BufRead, Write};
+const LONG_PV: bool = false;
 fn main() {
     let mut after_reply = false;
-    let long_pv = std::env::args().skip(1).any(|argument| argument == "--authored-long-pv");
     for line in io::stdin().lock().lines() {
         let line = line.unwrap();
         if line == "uci" {
@@ -65,7 +65,7 @@ fn main() {
         } else if line.starts_with("go ") {
             // The real adapter, not this fixture, owns requested/issued limits.
             let movement = if after_reply { "g1f3" } else { "e7e5" };
-            let pv = if long_pv {
+            let pv = if LONG_PV {
                 if after_reply { "g1f3 b8c6" } else { "e7e5 g1f3" }
             } else { movement };
             println!("info depth 2 seldepth 3 nodes 7 score cp 21 pv {pv}");
@@ -88,7 +88,7 @@ struct AuthoredElf {
 }
 
 impl AuthoredElf {
-    fn new() -> Self {
+    fn new(long_pv: bool) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let temporary_base = std::env::temp_dir().canonicalize().unwrap();
         let root = temporary_base.join(format!(
@@ -107,7 +107,17 @@ impl AuthoredElf {
         let stderr = fixture.root.join("rustc.stderr");
         let compiler_tmp = fixture.root.join("compiler-tmp");
         fs::create_dir(&compiler_tmp).unwrap();
-        fs::write(&source, AUTHORED_UCI).unwrap();
+        // The registered Reckless wire profile permits no launch arguments.
+        // Compile a separately hashed authored ELF for the negative PV case
+        // instead of changing that guarded launch contract.
+        let selector = "const LONG_PV: bool = false;";
+        assert_eq!(AUTHORED_UCI.matches(selector).count(), 1);
+        let authored_source = if long_pv {
+            AUTHORED_UCI.replacen(selector, "const LONG_PV: bool = true;", 1)
+        } else {
+            AUTHORED_UCI.to_owned()
+        };
+        fs::write(&source, authored_source).unwrap();
         let cpus = first_two_allowed_cpus();
         let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
         let mut command = Command::new("prlimit");
@@ -187,13 +197,9 @@ impl AuthoredElf {
         fixture
     }
 
-    fn config(&self, long_pv: bool) -> ExternalCpuConfig {
+    fn config(&self) -> ExternalCpuConfig {
         let profile = ExternalEngineProfile::Reckless090EmbeddedNnue;
-        let arguments = if long_pv {
-            vec!["--authored-long-pv".into()]
-        } else {
-            Vec::new()
-        };
+        let arguments = Vec::new();
         let arguments_sha256 = crate::external_cpu::arguments_sha256(&arguments);
         let mut hash = Sha256::new();
         let mut file = File::open(&self.program).unwrap();
@@ -379,8 +385,8 @@ impl AuthoredWorkerFixture {
         long_pv: bool,
     ) -> Self {
         let goal_plies = NonZeroU16::new(goal_plies).expect("authored original goal is nonzero");
-        let elf = AuthoredElf::new();
-        let config = elf.config(long_pv);
+        let elf = AuthoredElf::new(long_pv);
+        let config = elf.config();
         let authority = SearchAuthority {
             epoch: ProcessEpoch(73),
             game: GameGeneration(1),

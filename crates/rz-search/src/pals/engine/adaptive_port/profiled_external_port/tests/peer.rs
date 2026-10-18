@@ -58,9 +58,10 @@ fn authored_proposer_submission(
             now,
         )
         .unwrap();
-    assert_eq!(registry.phase(ticket.id), Some(TicketPhase::Submitted));
+    assert_eq!(registry.phase(ticket.id), Some(TicketPhase::Prepared));
     let dispatched = registry.take_dispatch().unwrap();
     assert_eq!(dispatched.ticket, ticket);
+    assert_eq!(registry.phase(ticket.id), Some(TicketPhase::Submitted));
     let selected = BoardMove::from_uci(selected).unwrap();
     assert!(input.view.query().legal.contains(&selected));
     let output = RoleOutput {
