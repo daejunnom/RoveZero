@@ -1345,3 +1345,42 @@ CPU P-C-R 241은 depth 1/2·mate·movetime 착수를 관측한 뒤 다음 infini
 새 보존 영역 관측은 약 18.01GB로 18GiB 안이며 추가 build223 회수는 실행하지 않았다.
 소스 구현·실제 CPU 수치·기능 실패·미실행 GPU를 구분한다. 성능·기력·실제 학습·병합은
 여전히 이번 인수에 포함하지 않는다.
+
+## 26차 체크포인트: frozen scope 회귀와 현재 CPU 실행
+
+최초 ranking fanout은 원 `ReviewView`에서 query만 fork하도록 `9048b6a`에
+수정했다. 기존 deferred 후보의 새 문맥 선택과 coordinator의 범위·owner·Rules·
+credit 검사는 유지한다. 최초 집중 실행은 컴파일과 순서 회귀를 통과했지만,
+4ply 자료를 3ply Store에 넣은 capacity fixture 오류로 실패했다. 검사 설정만
+4ply로 고친 `6afa16b`에서 집중 검사 3개가 모두 통과했다. 원 문맥이 가득 찬 경우
+추가 query는 `ViewCapacity`로 거부하며 기록을 재선택해 맞추지 않는다.
+
+`6afa16b`의 새 build250은 11단계를 모두 통과했다. formatting·현재 UCI/Search·
+inventory·엄격 workspace Clippy와 release 제품 10개·dev caller 2개를 확인하고
+원 바이트와 의존 파일을 보존했다. 관리 캐시는 약 4.2GB로 남았고 종료·임시 정리도
+확인했다. 이 SHA의 Linux·Windows CPU, bindings, PALS model, native validation
+bundle 다섯 CI job도 모두 성공을 관측했다. 새 문서 커밋이나 실제 제품 인수와
+원 실행 소스 `6afa16b`의 범위를 구분한다.
+
+새 WSL boot에서는 old241의 parent/inode를 재태깅하지 않았다. registration251
+직전 미존재를 확인한 parent를 실제 생성하고 boot·inode·UID·빈 프로세스 상태·
+controller와 CPU2·memory.high 3GiB/max 4GiB readback을 대조했다. numeric257은
+실제 Rust forward 20개를 독립 FP32와 대조했으며 accumulator·hidden·raw/value·
+WDL의 최대 절대차가 모두 0이었다. 이전 수치 실행을 새 실행으로 재사용하지 않았다.
+
+CPU P-C/P-C-R251은 각각 8개 go, stop·ponder·newgame·quit를 마쳤고 primary/secondary
+오류 없음, exit0·양 EOF·강제 신호 없음이었다. 각 원자료 5개를 회수했다. 이전
+ranking scope 불일치는 이 실행에서 재현되지 않았다. 다만 외부 UCI harness는
+제품 physical receipt와 formal R0 증거를 발급하지 않으므로 해당 항목은 여전히
+`unknown_without_product_receipt`이며 NN 계수 진단·OS 종료와 구분한다.
+
+source252·membership253·series254의 공식 passive 준비는 통과했다. 실제 별도
+intervention255는 첫 root admission에서 `intervention windows exceed original root`로
+실패했다. profile의 prelude5s+action10s와 go15000ms가 같은 경계에 있고 실제 root
+hard deadline은 시간 관리 reserve를 포함하므로 caller의 여유를 별도로 확인한다.
+원 physical completion unknown과 부분 자료를 보존하며 arm·publication·ACK·dataset
+성공으로 채우지 않는다. guard를 완화하지 않고 새 입력·실행 ID로 수정한다.
+
+실제 GPU·일반 teacher·외부 R·update0 IPC는 이 새 실행에서 아직 인수하지 않았다.
+관리 보존 영역은 약 18.64GB로 18GiB 안이었으며 추가 파일 삭제는 없었다. 위 자료는
+기능 검증이며 성능·기력 개선·학습·병합의 증거로 사용하지 않는다.
