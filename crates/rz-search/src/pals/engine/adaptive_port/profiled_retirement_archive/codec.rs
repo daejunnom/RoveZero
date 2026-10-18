@@ -1579,6 +1579,7 @@ fn frontier_error(
                 o.field("detail", detail)?;
                 "Capacity"
             }
+            FrontierError::PublicRecordCapacity => "PublicRecordCapacity",
             FrontierError::ForeignRoot => "ForeignRoot",
             FrontierError::ForeignHandle => "ForeignHandle",
             FrontierError::Duplicate => "Duplicate",
@@ -1669,6 +1670,23 @@ mod tests {
         body: impl FnOnce(&mut Encoder<'_>) -> Result<(), PalsError>,
     ) -> serde_json::Value {
         serde_json::from_slice(&projection_bytes(body)).unwrap()
+    }
+
+    #[test]
+    fn public_record_capacity_projection_preserves_its_distinct_cause() {
+        use crate::pals::rovent_frontier::FrontierError;
+        let value =
+            projection(|encoder| frontier_error(encoder, &FrontierError::PublicRecordCapacity));
+        assert_eq!(value["domain"], "FrontierError");
+        assert_eq!(value["variant"], "PublicRecordCapacity");
+        assert!(value.get("detail").is_none());
+        let legacy = projection(|encoder| {
+            frontier_error(encoder, &FrontierError::Capacity("original limit"))
+        });
+        assert_eq!(legacy["variant"], "Capacity");
+        assert_eq!(legacy["detail"], "original limit");
+        // Historical JSON records the cause; it cannot recreate the private
+        // live controller marker that authorizes graceful quiescence.
     }
 
     #[test]
