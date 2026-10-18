@@ -5,18 +5,94 @@
 use super::{
     BoundedJson, MAX_CHECKER_PROFILE_BYTES, UniqueJsonKeys, invalid, linux_path, sha, sorted_value,
 };
-use rz_search::cpu_checker::{CheckerError, ExternalCheckerIdentity};
+use rz_search::cpu_checker::{
+    CheckerError, ExternalAssetIdentity, ExternalCheckerIdentity, ExternalTrainingKnowledge,
+};
 use rz_search::external_cpu::ExternalCpuConfig;
 use rz_search::external_cpu::{
     ExternalEngineProfile, ExternalEnginePurpose, ExternalGoConstraint, ExternalUciCpuChecker,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 pub const ROVENT_EXTERNAL_PROFILE_SCHEMA: &str = "rz-rovent-external-engine-profile/1";
 pub const ROVENT_EXTERNAL_REGISTRATION_SCHEMA: &str = "rz-rovent-external-engine-registration/1";
 const CANONICAL_DOMAIN: &str = "rz-rovent-external-engine-profile-canonical/1";
 pub const ROVENT_EXTERNAL_CAPABILITY_DOMAIN: &str = "rz-rovent-external-capabilities/1";
+pub const ROVENT_PROSPECTIVE_TEACHER_ACTOR_DOMAIN: &str = "rz-rovent-prospective-teacher-actor/1";
+
+/// A new prospective recipe actor, never an old actor reissued from a fixture.
+/// No Deserialize implementation or execution capability is supplied here.
+#[derive(Debug, Serialize)]
+struct ProspectiveTeacherActor {
+    actor_id: String,
+    family: &'static str,
+    source_revision: &'static str,
+    source_sha256: String,
+    binary_sha256: String,
+    profile_sha256: String,
+    options_sha256: String,
+    assets_sha256: String,
+    rights_sha256: String,
+}
+#[derive(Debug, Serialize)]
+struct ProspectiveTeacherSource {
+    engine: ExternalEngineProfile,
+    declared_name: String,
+    declared_version: String,
+    declared_source: String,
+    source_commit: &'static str,
+}
+#[derive(Debug, Serialize)]
+struct ProspectiveTeacherRights {
+    declared_engine_license: String,
+    model_weights_sha256: Option<String>,
+    model_training: ExternalTrainingKnowledge,
+    model_declared_rights: Option<String>,
+    model_precision: Option<String>,
+}
+#[derive(Debug, Serialize)]
+struct ProspectiveTeacherProfile {
+    sha256: String,
+    bytes: u64,
+}
+
+/// Closed twelve-field metadata produced from the same validated profile.
+/// The declaration is suitable for a new execution-plan recipe; it is not a
+/// historical dataset, startup observation, rights verification or authority.
+#[derive(Debug, Serialize)]
+pub struct RoventProspectiveTeacherActorMetadata {
+    schema: &'static str,
+    actor: ProspectiveTeacherActor,
+    profile: ProspectiveTeacherProfile,
+    canonical_sha256: String,
+    capability_sha256: String,
+    source: ProspectiveTeacherSource,
+    options: BTreeMap<String, String>,
+    assets: Vec<ExternalAssetIdentity>,
+    rights: ProspectiveTeacherRights,
+    declaration_only: bool,
+    rights_verified: bool,
+    execution_authorized: bool,
+}
+
+fn prospective_teacher_digest(
+    kind: &'static str,
+    value: &impl Serialize,
+) -> Result<String, CheckerError> {
+    // Match compact sorted [domain, {kind,value}] framing without requiring
+    // the optional rz-experiments dependency in search-work-receipts builds.
+    let body = serde_json::json!({"kind":kind,"value":value});
+    let value = sorted_value(
+        serde_json::to_value((ROVENT_PROSPECTIVE_TEACHER_ACTOR_DOMAIN, body))
+            .map_err(|_| invalid("cannot encode prospective teacher declaration"))?,
+    );
+    let mut output = BoundedJson { bytes: Vec::new() };
+    serde_json::to_writer(&mut output, &value)
+        .map_err(|_| invalid("prospective teacher declaration exceeds finite byte bound"))?;
+    Ok(format!("{:x}", Sha256::digest(&output.bytes)))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -216,6 +292,85 @@ impl LoadedRoventExternalProfile {
         }
     }
 
+    /// Prepare a new teacher actor from this original validated declaration.
+    ///
+    /// Each source/options/assets/rights seal uses the explicit prospective
+    /// `rz-rovent-prospective-teacher-actor/1` domain with compact sorted JSON
+    /// `[domain,{kind,value}]`. Source is exactly engine/name/version/source
+    /// URL/commit; options and assets are the original validated collections.
+    /// Rights retain the declared engine license and the original unknown
+    /// embedded-model weights/training/rights/precision. Hashing those unknown
+    /// declarations does not verify rights, loading or option application.
+    /// No process, native FD source, Ready, clock, root or optimizer is created.
+    pub fn prospective_teacher_actor(
+        &self,
+        actor_id: &str,
+    ) -> Result<RoventProspectiveTeacherActorMetadata, CheckerError> {
+        self.profile.validate()?;
+        if self.profile.purpose != ExternalEnginePurpose::Teacher {
+            return Err(CheckerError::Unsupported(
+                "prospective teacher actor requires the original teacher purpose",
+            ));
+        }
+        if actor_id.is_empty()
+            || actor_id.len() > 256
+            || !actor_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(invalid(
+                "prospective teacher actor requires a bounded plain ID",
+            ));
+        }
+        let engine = self.profile.engine;
+        let identity = &self.profile.identity;
+        let source = ProspectiveTeacherSource {
+            engine,
+            declared_name: identity.declared_name.clone(),
+            declared_version: identity.declared_version.clone(),
+            declared_source: identity.declared_source.clone(),
+            source_commit: engine.source_commit(),
+        };
+        let rights = ProspectiveTeacherRights {
+            declared_engine_license: identity.declared_license.clone(),
+            model_weights_sha256: identity.model_metadata.weights_sha256.clone(),
+            model_training: identity.model_metadata.training,
+            model_declared_rights: identity.model_metadata.declared_rights.clone(),
+            model_precision: identity.model_metadata.precision.clone(),
+        };
+        let actor = ProspectiveTeacherActor {
+            actor_id: actor_id.into(),
+            family: match engine {
+                ExternalEngineProfile::Stockfish19EmbeddedNnue => "stockfish",
+                ExternalEngineProfile::Reckless090EmbeddedNnue => "reckless",
+            },
+            source_revision: engine.source_commit(),
+            source_sha256: prospective_teacher_digest("source", &source)?,
+            binary_sha256: identity.binary_sha256.clone(),
+            profile_sha256: self.file_sha256.clone(),
+            options_sha256: prospective_teacher_digest("options", &identity.options)?,
+            assets_sha256: prospective_teacher_digest("assets", &identity.assets)?,
+            rights_sha256: prospective_teacher_digest("rights", &rights)?,
+        };
+        Ok(RoventProspectiveTeacherActorMetadata {
+            schema: ROVENT_PROSPECTIVE_TEACHER_ACTOR_DOMAIN,
+            actor,
+            profile: ProspectiveTeacherProfile {
+                sha256: self.file_sha256.clone(),
+                bytes: self.file_bytes,
+            },
+            canonical_sha256: self.canonical_sha256.clone(),
+            capability_sha256: self.profile.capability_sha256()?,
+            source,
+            options: identity.options.clone(),
+            assets: identity.assets.clone(),
+            rights,
+            declaration_only: true,
+            rights_verified: false,
+            execution_authorized: false,
+        })
+    }
+
     /// Configuration only. No executable is read or process started here.
     pub fn configuration(&self) -> Result<ExternalCpuConfig, CheckerError> {
         self.profile.validate()?;
@@ -353,6 +508,144 @@ mod tests {
             .options
             .insert("Ponder".into(), "false".into());
         assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn prospective_actor_preserves_original_pin_unknown_rights_and_closed_shape() {
+        let mut declaration = profile();
+        declaration.purpose = ExternalEnginePurpose::Teacher;
+        let raw = serde_json::to_vec_pretty(&declaration).unwrap();
+        let raw_sha = format!("{:x}", Sha256::digest(&raw));
+        let loaded = RoventExternalProfile::from_verified_bytes(&raw, &raw_sha).unwrap();
+        let metadata = serde_json::to_value(
+            loaded
+                .prospective_teacher_actor("reckless-teacher")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata.as_object().unwrap().len(), 12);
+        assert_eq!(metadata["actor"].as_object().unwrap().len(), 9);
+        assert_eq!(metadata["source"].as_object().unwrap().len(), 5);
+        assert_eq!(metadata["rights"].as_object().unwrap().len(), 5);
+        assert_eq!(
+            metadata["profile"],
+            serde_json::json!({"sha256":raw_sha,"bytes":raw.len()})
+        );
+        assert_eq!(metadata["actor"]["profile_sha256"], raw_sha);
+        assert_eq!(
+            metadata["actor"]["binary_sha256"],
+            declaration.identity.binary_sha256
+        );
+        assert_eq!(metadata["actor"]["family"], "reckless");
+        assert_eq!(
+            metadata["source"]["source_commit"],
+            declaration.engine.source_commit()
+        );
+        assert_eq!(
+            metadata["options"],
+            serde_json::to_value(&declaration.identity.options).unwrap()
+        );
+        assert_eq!(metadata["assets"], serde_json::json!([]));
+        assert_eq!(
+            metadata["rights"],
+            serde_json::json!({
+                "declared_engine_license":"AGPL-3.0-only",
+                "model_weights_sha256":null,
+                "model_training":"unknown",
+                "model_declared_rights":null,
+                "model_precision":null
+            })
+        );
+        assert_eq!(metadata["declaration_only"], true);
+        assert_eq!(metadata["rights_verified"], false);
+        assert_eq!(metadata["execution_authorized"], false);
+
+        // Reformatting the same declaration changes its original raw pin, not
+        // its semantic declarations; no old actor/recipe bytes are reissued.
+        let compact_raw = serde_json::to_vec(&declaration).unwrap();
+        let compact_sha = format!("{:x}", Sha256::digest(&compact_raw));
+        assert_ne!(compact_sha, raw_sha);
+        let compact =
+            RoventExternalProfile::from_verified_bytes(&compact_raw, &compact_sha).unwrap();
+        let reformatted = serde_json::to_value(
+            compact
+                .prospective_teacher_actor("reckless-teacher")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reformatted["canonical_sha256"],
+            metadata["canonical_sha256"]
+        );
+        assert_eq!(
+            reformatted["capability_sha256"],
+            metadata["capability_sha256"]
+        );
+        assert_eq!(reformatted["actor"]["profile_sha256"], compact_sha);
+        for seal in [
+            "source_sha256",
+            "options_sha256",
+            "assets_sha256",
+            "rights_sha256",
+        ] {
+            assert_eq!(reformatted["actor"][seal], metadata["actor"][seal]);
+        }
+    }
+
+    #[test]
+    fn prospective_actor_rejects_non_teacher_and_seals_original_requested_options() {
+        for purpose in [
+            ExternalEnginePurpose::ResearchChecker,
+            ExternalEnginePurpose::ArenaOpponent,
+        ] {
+            let mut declaration = profile();
+            declaration.purpose = purpose;
+            let raw = serde_json::to_vec(&declaration).unwrap();
+            let raw_sha = format!("{:x}", Sha256::digest(&raw));
+            let loaded = RoventExternalProfile::from_verified_bytes(&raw, &raw_sha).unwrap();
+            assert!(matches!(
+                loaded.prospective_teacher_actor("teacher"),
+                Err(CheckerError::Unsupported(_))
+            ));
+        }
+        let mut declaration = profile();
+        declaration.purpose = ExternalEnginePurpose::Teacher;
+        let raw = serde_json::to_vec(&declaration).unwrap();
+        let raw_sha = format!("{:x}", Sha256::digest(&raw));
+        let loaded = RoventExternalProfile::from_verified_bytes(&raw, &raw_sha).unwrap();
+        assert!(loaded.prospective_teacher_actor("teacher/invalid").is_err());
+        let before =
+            serde_json::to_value(loaded.prospective_teacher_actor("teacher").unwrap()).unwrap();
+        // Hash is an admitted caller resource option, not evidence it was
+        // actually applied to an engine process (none is started here).
+        declaration
+            .identity
+            .options
+            .insert("Hash".into(), "128".into());
+        let changed_raw = serde_json::to_vec(&declaration).unwrap();
+        let changed_sha = format!("{:x}", Sha256::digest(&changed_raw));
+        let changed =
+            RoventExternalProfile::from_verified_bytes(&changed_raw, &changed_sha).unwrap();
+        let after =
+            serde_json::to_value(changed.prospective_teacher_actor("teacher").unwrap()).unwrap();
+        assert_eq!(after["options"]["Hash"], "128");
+        assert_ne!(
+            before["actor"]["options_sha256"],
+            after["actor"]["options_sha256"]
+        );
+        assert_ne!(
+            before["actor"]["profile_sha256"],
+            after["actor"]["profile_sha256"]
+        );
+        for seal in [
+            "source_sha256",
+            "binary_sha256",
+            "assets_sha256",
+            "rights_sha256",
+        ] {
+            assert_eq!(before["actor"][seal], after["actor"][seal]);
+        }
+        assert_eq!(after["execution_authorized"], false);
     }
 
     #[test]
