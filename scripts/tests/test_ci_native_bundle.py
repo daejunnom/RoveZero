@@ -15,6 +15,50 @@ import ci_native_bundle as bundle
 
 
 class NativeBundleTests(unittest.TestCase):
+    def test_compile_only_cleanup_preserves_published_bundle_and_unique_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / 'artifact'
+            artifact.mkdir()
+            archive = artifact / 'native-validation-binaries.tar.gz'
+            archive.write_bytes(b'synthetic already-verified archive')
+            (artifact / 'only-game.pgn').write_bytes(b'unique-result')
+            (root / 'unclassified-other-data').mkdir()
+            for name in ('target-native', 'private-elf', 'cargo-home', 'logs', 'tmp'):
+                (root / name).mkdir()
+                (root / name / 'owned-copy').write_bytes(b'regenerable')
+            receipt = {'status': 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED',
+                       'commands': [{'original_tree_cleanup_verified': True}],
+                       'binary_bundle': bundle.file_pin(archive)}
+            journal = bundle.cleanup_compiler_outputs(root, artifact, receipt)
+            self.assertTrue(journal['complete'])
+            self.assertTrue((root / 'logs' / 'owned-copy').exists())
+            self.assertFalse((root / 'private-elf').exists())
+            self.assertFalse((root / 'target-native').exists())
+            self.assertEqual(archive.read_bytes(), b'synthetic already-verified archive')
+            self.assertEqual((artifact / 'only-game.pgn').read_bytes(), b'unique-result')
+            self.assertTrue((root / 'unclassified-other-data').exists())
+
+    def test_uncertain_tree_or_changed_bundle_prevents_all_compiler_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / 'artifact'
+            artifact.mkdir()
+            archive = artifact / 'native-validation-binaries.tar.gz'
+            archive.write_bytes(b'retained')
+            (root / 'target-native').mkdir()
+            receipt = {'status': 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED',
+                       'commands': [{'original_tree_cleanup_verified': False}],
+                       'binary_bundle': bundle.file_pin(archive)}
+            with self.assertRaisesRegex(RuntimeError, 'VerifiedBundleAndTreeClosure'):
+                bundle.cleanup_compiler_outputs(root, artifact, receipt)
+            receipt['commands'][0]['original_tree_cleanup_verified'] = True
+            archive.write_bytes(b'changed')
+            with self.assertRaisesRegex(RuntimeError, 'VerifiedBundleAndTreeClosure'):
+                bundle.cleanup_compiler_outputs(root, artifact, receipt)
+            self.assertTrue((root / 'target-native').exists())
+            self.assertNotIn('regenerable_cleanup', receipt)
+
     @unittest.skipUnless(sys.platform == 'linux', 'Linux-only bundle FD/ctime custody; no Windows emulation')
     def test_cargo_hardlink_is_copied_into_single_link_custody(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -308,6 +308,31 @@ def stream_child(argv):
         selector.close()
 
 
+def cleanup_compiler_outputs(root, artifact, receipt):
+    """Retire only this fresh build's regenerable folders after custody closes."""
+    from managed_storage import remove_tree, write_record
+    require(receipt['status'] == 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED'
+            and all(row.get('original_tree_cleanup_verified') is True for row in receipt['commands'])
+            and file_pin(artifact / 'native-validation-binaries.tar.gz', ARTIFACT_CAP) == receipt['binary_bundle'],
+            'VerifiedBundleAndTreeClosureBeforeCleanup')
+    names = ('target-native', 'target-warm', 'target-diagnostic', 'cargo-home', 'tmp', 'private-elf')
+    # No model, source, original external asset or failure evidence is listed.
+    for name in names:
+        tree_size(root / name)
+    journal = {'schema': 'rovezero.ci-compile-cleanup.v1',
+               'scope': 'fresh_ci_compile_only', 'bundle_pin': receipt['binary_bundle'],
+               'planned_direct_children': list(names), 'removed': [], 'complete': False}
+    write_record(artifact / 'compile-cleanup.json', journal)
+    for name in names:
+        if (root / name).exists():
+            remove_tree(root / name, root)
+        journal['removed'].append(name)
+        write_record(artifact / 'compile-cleanup.json', journal)
+    journal['complete'] = True
+    write_record(artifact / 'compile-cleanup.json', journal)
+    return journal
+
+
 class Build:
     def __init__(self, root, source, seconds):
         self.root, self.source = root, source
@@ -579,8 +604,19 @@ def run(source, root, expected_head, seconds):
                     receipt['status'] = 'FAILED_NOT_ADMITTED'
                     receipt['log_preservation_error'] = {'type': type(error).__name__, 'message': str(error)[:512]}
                     break
+        if receipt['status'] == 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED':
+            receipt['regenerable_cleanup'] = {'journal': 'compile-cleanup.json',
+                'acceptance': 'terminal journal is required separately from build success'}
         write_json(artifact / 'build-receipt.json', receipt)
         require(tree_size(artifact) <= ARTIFACT_CAP, 'Artifact512MiBCap')
+        if receipt['status'] == 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED':
+            try:
+                cleanup_compiler_outputs(root, artifact, receipt)
+            except (OSError, RuntimeError) as error:
+                receipt['status'] = 'FAILED_NOT_ADMITTED'
+                receipt['cleanup_error'] = {'type': type(error).__name__, 'message': str(error)[:512]}
+                write_json(artifact / 'cleanup-failure.json', {
+                    'status': receipt['status'], 'cleanup_error': receipt['cleanup_error']})
         if os.environ.get('GITHUB_OUTPUT'):
             with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
                 output.write('artifact_ready=true\n')

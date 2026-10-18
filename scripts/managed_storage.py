@@ -10,6 +10,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from storage_guard import CatalogGuard, lifetime, reboot_proves_dead, owner_proven_dead
 
 GiB = 1024 ** 3
 SCHEMA = "rovezero.managed-build.v1"
@@ -176,21 +177,50 @@ def write_record(path: Path, value: dict) -> None:
         os.fsync(stream.fileno())
     try:
         os.replace(temporary, path)
+        if os.name == "posix":
+            directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                                | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def read_record(path: Path) -> dict:
-    checked(path)
-    if not path.is_file() or path.stat().st_size > 8192:
-        raise StorageError("ownership record absent or too large")
+def read_record_snapshot(path: Path, *, schema=SCHEMA):
+    path = checked(path)
+    def stamp(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+                info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate ownership field")
+            result[key] = value
+        return result
     try:
-        value = json.loads(path.read_bytes())
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= 8192:
+                raise StorageError("bounded single-link ownership record required")
+            raw = stream.read(8193)
+            if (len(raw) != before.st_size or stamp(before) != stamp(os.fstat(stream.fileno()))
+                    or stamp(before) != stamp(checked(path).lstat())):
+                raise StorageError("ownership file identity changed while reading")
+        value = json.loads(raw, object_pairs_hook=unique,
+                           parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite record")))
     except (ValueError, OSError) as exc:
         raise StorageError("ownership record is invalid; preserve it") from exc
-    if not isinstance(value, dict) or value.get("schema") != SCHEMA:
+    if not isinstance(value, dict) or value.get("schema") != schema:
         raise StorageError("unrecognized ownership record; preserve it")
-    return value
+    return value, hashlib.sha256(raw).hexdigest(), stamp(before)
+
+
+def read_record(path: Path) -> dict:
+    return read_record_snapshot(path)[0]
 
 
 def canonical_root() -> Path:
@@ -212,7 +242,7 @@ class ManagedBuild:
     after checking the original process tree, paths and source ownership.
     """
     def __init__(self, root: Path, source: Path, *, slot_limit=8 * GiB,
-                 total_limit=12 * GiB, slots_limit=4):
+                 total_limit=12 * GiB, slots_limit=4, purpose=None):
         self.root = checked(root)
         self.source = Path(os.path.realpath(source))
         if self.root.is_relative_to(self.source) or self.source.is_relative_to(self.root):
@@ -222,7 +252,11 @@ class ManagedBuild:
         self.slot_limit = slot_limit
         self.total_limit = total_limit
         self.slots_limit = slots_limit
-        identity = os.path.normcase(str(self.source))
+        if purpose is not None and (not isinstance(purpose, str) or not 1 <= len(purpose) <= 64
+                or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for c in purpose)):
+            raise StorageError("purpose requires 1..64 lowercase safe characters")
+        self.purpose = purpose
+        identity = os.path.normcase(str(self.source)) + ("\0" + purpose if purpose else "")
         self.source_id = hashlib.sha256(identity.encode()).hexdigest()[:24]
         self.slot = self.root / "slots" / self.source_id
         self.target = self.slot / "cargo-target"
@@ -233,12 +267,20 @@ class ManagedBuild:
         self.finished = False
         self.record = {}
         self.before = 0
+        self.lifetime = lifetime()
+        self.guard = CatalogGuard(self.root / "catalog.lock")
 
     def _identity(self) -> dict:
-        return {"schema": SCHEMA, "token": self.token, "pid": os.getpid(),
-                "source_id": self.source_id, "source": str(self.source)}
+        info = self.root.stat()
+        value = {"schema": SCHEMA, "token": self.token, "pid": os.getpid(),
+                 "source_id": self.source_id, "source": str(self.source),
+                 "lifetime": self.lifetime, "root_identity": [info.st_dev, info.st_ino]}
+        if self.purpose is not None:
+            value["purpose"] = self.purpose
+        return value
 
     def _assert_owner(self) -> None:
+        self.guard.assert_held()
         if read_record(self.lock) != self._identity():
             raise StorageError("catalog owner changed; preserve all artifacts")
         if self.slot.exists():
@@ -254,12 +296,18 @@ class ManagedBuild:
             if not item.is_dir():
                 raise StorageError("unknown catalog entry; preserve it")
             record = read_record(item / "record.json")
-            if record.get("source_id") != item.name or set(record) != {
+            if record.get("source_id") != item.name or set(record) - {
+                "lifetime", "root_identity", "purpose",
+            } != {
                 "schema", "source_id", "source", "token", "pid", "state", "finished_ns",
             }:
                 raise StorageError("unrecognized slot identity; preserve it")
             if (not isinstance(record["source"], str) or not Path(record["source"]).is_absolute()
-                    or hashlib.sha256(os.path.normcase(record["source"]).encode()).hexdigest()[:24] != item.name
+                    or ("purpose" in record and (not isinstance(record["purpose"], str)
+                        or not 1 <= len(record["purpose"]) <= 64
+                        or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for c in record["purpose"])))
+                    or hashlib.sha256((os.path.normcase(record["source"]) + (
+                        "\0" + record["purpose"] if "purpose" in record else "")).encode()).hexdigest()[:24] != item.name
                     or record["state"] not in {"active", "complete"}
                     or not isinstance(record["finished_ns"], int) or record["finished_ns"] < 0
                     or not isinstance(record["pid"], int) or record["pid"] <= 0
@@ -298,7 +346,9 @@ class ManagedBuild:
     def acquire(self) -> "ManagedBuild":
         checked(self.root)
         self.root.mkdir(parents=True, exist_ok=True)
-        if any(p.name not in {"owner.json", "slots"} for p in self.root.iterdir()):
+        self.guard.acquire()
+        if any(p.name not in {"owner.json", "slots", "catalog.lock", "maintenance.json", "closure.json"} for p in self.root.iterdir()):
+            self.guard.release()
             raise StorageError("unknown build root content; preserve it")
         try:
             with self.lock.open("xb") as stream:
@@ -306,7 +356,11 @@ class ManagedBuild:
                 stream.flush()
                 os.fsync(stream.fileno())
         except FileExistsError as exc:
+            self.guard.release()
             raise StorageError("managed build owner exists; do not steal a live/interrupted lease") from exc
+        except BaseException:
+            self.guard.release()
+            raise
         self.acquired = True
         try:
             (self.root / "slots").mkdir(exist_ok=True)
@@ -334,6 +388,7 @@ class ManagedBuild:
             if read_record(self.lock) == self._identity():
                 self.lock.unlink()
             self.acquired = False
+            self.guard.release()
             raise
 
     def environment(self) -> dict:
@@ -344,7 +399,8 @@ class ManagedBuild:
             raise StorageError("CARGO_TARGET_DIR conflicts with the managed target")
         env.update(CARGO_TARGET_DIR=expected, CARGO_INCREMENTAL="0",
                    TMPDIR=str(self.scratch), TMP=str(self.scratch),
-                   TEMP=str(self.scratch), PYTHONDONTWRITEBYTECODE="1")
+                   TEMP=str(self.scratch), PYTHONDONTWRITEBYTECODE="1",
+                   RZ_MANAGED_BUILD_ROOT=str(self.root), RZ_MANAGED_BUILD_TOKEN=self.token)
         return env
 
     def finish(self, *, exit_code: int, tree_gone: bool, supervisor_error=None) -> dict:
@@ -352,6 +408,12 @@ class ManagedBuild:
         if not tree_gone:
             # Keep lease and inputs: uncertain cleanup is not ordinary success.
             raise StorageError("process cleanup unverified; slot and lease retained")
+        # Durable original-supervisor witness precedes destructive cleanup.
+        # It is bound to this exact token, owner birth, boot and root inode.
+        write_record(self.root / "closure.json", {"schema": SCHEMA,
+                     "owner": self._identity(), "tree_gone": True})
+        from managed_outputs import finalize_supervised_outputs
+        finalize_supervised_outputs(self.root, self._identity())
         observed = tree_size(self.slot)
         remove_tree(self.scratch, self.slot)
         reset = tree_size(self.slot) > self.slot_limit
@@ -372,4 +434,65 @@ class ManagedBuild:
         self._assert_owner()
         self.lock.unlink()
         self.finished = True
+        self.guard.release()
         return result
+
+
+def recover_build(root: Path, owner_sha256: str) -> dict:
+    """Explicit exact-owner recovery after reboot or original terminal closure.
+
+    PID absence/reuse cannot establish that no orphan detached from its group.
+    Legacy owners without durable lifetime evidence remain preserved.
+    """
+    root = checked(root)
+    if not root.is_dir():
+        raise StorageError("existing managed build root required")
+    with CatalogGuard(root / "catalog.lock") as guard:
+        if any(p.name not in {"owner.json", "slots", "catalog.lock", "maintenance.json", "closure.json"}
+               for p in root.iterdir()):
+            raise StorageError("unknown build root content; preserve it")
+        owner, digest, owner_stamp = read_record_snapshot(root / "owner.json")
+        if digest != owner_sha256:
+            raise StorageError("original owner digest changed")
+        info = root.stat()
+        current = lifetime()
+        reboot = reboot_proves_dead(owner.get("lifetime"), current)
+        closure = read_record(root / "closure.json") if (root / "closure.json").exists() else None
+        terminal = (closure == {"schema": SCHEMA, "owner": owner, "tree_gone": True}
+                    and owner_proven_dead(owner.get("pid"), owner.get("lifetime"), current))
+        if owner.get("root_identity") != [info.st_dev, info.st_ino] or not (reboot or terminal):
+            raise StorageError("original tree termination not proven; preserve lease and all inputs")
+        manager = ManagedBuild(root, Path(owner["source"]), purpose=owner.get("purpose"))
+        rows = manager._records()
+        matches = [(slot, record) for slot, record in rows if slot == manager.slot]
+        if len(matches) != 1 or {k: v for k, v in matches[0][1].items()
+                                if k not in {"state", "finished_ns"}} != owner:
+            raise StorageError("slot and original owner do not match")
+        tree_size(manager.slot)
+        slot_stamp = (manager.slot.stat().st_dev, manager.slot.stat().st_ino)
+        def verify_recovery():
+            guard.assert_held()
+            if (owner["root_identity"] != [root.stat().st_dev, root.stat().st_ino]
+                    or slot_stamp != (manager.slot.stat().st_dev, manager.slot.stat().st_ino)
+                    or read_record_snapshot(root / "owner.json") != (owner, digest, owner_stamp)):
+                raise StorageError("original recovery custody changed")
+        audit = {"schema": SCHEMA, "operation": "same_host_reboot_recovery",
+                 "owner_sha256": digest, "source_id": manager.source_id,
+                 "recovered": False, "reason": "prior_boot_processes_cannot_survive" if reboot
+                 else "original_terminal_closure_and_owner_dead"}
+        write_record(root / "maintenance.json", audit)
+        from managed_outputs import finalize_supervised_outputs
+        finalize_supervised_outputs(root, owner)
+        verify_recovery()
+        remove_tree(manager.scratch, manager.slot)
+        verify_recovery()
+        remove_tree(manager.target, manager.slot)
+        record = {**matches[0][1], "state": "complete", "finished_ns": time.time_ns()}
+        write_record(manager.slot / "record.json", record)
+        audit.update(recovered=True, regenerable_cache_removed=True, temporary_removed=True)
+        write_record(root / "maintenance.json", audit)
+        verify_recovery()
+        if read_record(root / "owner.json") != owner:
+            raise StorageError("recovery owner changed; preserve lock")
+        (root / "owner.json").unlink()
+        return audit

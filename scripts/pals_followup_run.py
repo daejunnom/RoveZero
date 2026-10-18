@@ -19,6 +19,7 @@ import time
 sys.dont_write_bytecode = True
 from managed_process import run_group
 from managed_storage import checked, tree_size
+from managed_outputs import OutputLease
 
 GIB = 1024 ** 3
 SCHEMA = "rz-pals-followup-local-wrapper/1"
@@ -503,13 +504,22 @@ def main():
     if args.resource_profile == "strict-local":
         started = time.monotonic()
     if args.run:
+        target = args.output_root / args.label if args.mode == "arena" else args.model_report
+        # Preserve the Rust consumer's fresh-path contract: it creates its own
+        # attempt directory/file after this reservation, never a borrowed asset.
+        output_lease = OutputLease(target, Path(__file__).resolve().parent.parent,
+                                   reserve=args.output_bytes_max, deferred=True).acquire()
         observer = check_resources if args.resource_profile == "strict-local" else observe_resources
         receipt["actual_resources"] = observer(args.cpu_affinity)
         environment = os.environ.copy()
         environment.update({"OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "PYTHONDONTWRITEBYTECODE": "1"})
         if args.resource_profile == "strict-local":
+            def strict_budget():
+                check_resources(args.cpu_affinity)
+                check_colab_output_budget(args)
+                output_lease.check_budget()
             code, gone, failure = run_group(command, binary.parent, environment, args.seconds,
-                                           lambda: check_resources(args.cpu_affinity))
+                                           strict_budget)
             receipt.update(exit_code=code, tree_gone=gone, supervisor_error=failure,
                            status="completed" if code == 0 and gone else "failed_ownership_preserved")
         else:
@@ -531,6 +541,7 @@ def main():
                 check_colab_output_budget(args)
                 def observed_budget():
                     check_colab_output_budget(args)
+                    output_lease.check_budget()
                 code, gone, failure = run_group(command, binary.parent, environment, remaining, observed_budget)
                 if gone:
                     try:
@@ -543,6 +554,12 @@ def main():
     else:
         receipt["status"] = "prepared_no_child_spawned"
     receipt["elapsed_seconds"] = time.monotonic() - started
+    if args.run:
+        try:
+            output_lease.finish(status=receipt["status"], tree_gone=receipt["tree_gone"])
+        except (OSError, RuntimeError) as error:
+            receipt.update(status="failed_output_lifecycle", producer_exit_code=receipt["exit_code"],
+                exit_code=125, storage_lifecycle_error={"type": type(error).__name__, "message": str(error)})
     with receipt_path.open("x", encoding="utf-8") as stream:
         json.dump(receipt, stream, sort_keys=True, ensure_ascii=False, allow_nan=False)
         stream.write("\n")

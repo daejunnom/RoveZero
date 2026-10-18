@@ -9,12 +9,14 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 from managed_storage import ManagedBuild, StorageError, canonical_root, tree_size
 from managed_process import run_group
+from managed_outputs import sample_output_budget
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--timeout", type=int, default=1200)
+    parser.add_argument("--purpose", help="Stable diagnostic purpose slot; never a timestamp or PID")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -25,8 +27,8 @@ def main() -> int:
     if program is None or Path(program).suffix.lower() in {".bat", ".cmd"}:
         parser.error("command must resolve to an executable, not a shell batch file")
     command[0] = program
-    manager = ManagedBuild(canonical_root(), args.source_root)
     try:
+        manager = ManagedBuild(canonical_root(), args.source_root, purpose=args.purpose)
         manager.acquire()
         try:
             environment = manager.environment()
@@ -35,6 +37,7 @@ def main() -> int:
             raise
 
         def check_budget():
+            sample_output_budget()
             if tree_size(manager.root / "slots", allow_disappearing=True) > manager.total_limit:
                 raise StorageError("live managed build catalog exceeds 12 GiB")
 
