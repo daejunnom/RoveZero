@@ -37,13 +37,13 @@ class LifecycleTests(unittest.TestCase):
         return owner
 
     def test_retained_evidence_counts_after_expiry_no_automatic_deletion(self):
-        first = self.lease(reserve=8192, total_limit=12000)
+        first = self.lease(reserve=12000, total_limit=18000)
         evidence = first.output / "unique.pgn"
         evidence.write_bytes(b"x" * 7000)
         first.finish(status="failed_evidence_preserved", tree_gone=True)
         with patch("managed_outputs.time.time_ns", return_value=10**30):
             with self.assertRaisesRegex(StorageError, "budget"):
-                self.lease("next", reserve=8192, total_limit=12000)
+                self.lease("next", reserve=12000, total_limit=18000)
         self.assertEqual(evidence.stat().st_size, 7000)
         self.assertFalse((self.base / "next").exists())
         self.assertGreater(sample_output_budget(self.catalog), 7000)
@@ -102,6 +102,14 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(record["state"], "retained")
         self.assertIn("budget", record["budget_error"])
         self.assertEqual(evidence.stat().st_size, 5000)
+
+    def test_terminal_metadata_growth_is_not_a_successful_finish(self):
+        owner = self.lease(reserve=4096, total_limit=8192)
+        with self.assertRaises(OutputBudgetError):
+            owner.finish(status='diagnostic:' + 'x' * 2000, tree_gone=True)
+        row = json.loads((self.catalog / (owner.key + '.json')).read_text())
+        self.assertEqual(row['status'], 'failed_output_budget')
+        self.assertIn('budget', row['budget_error'])
 
     def test_changed_owner_is_never_overwritten_by_finish(self):
         owner = self.lease()

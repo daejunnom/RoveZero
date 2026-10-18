@@ -158,6 +158,12 @@ class OutputLease:
             self.record["identity"] = identity(self.output)
         try:
             self._write()
+            try:
+                self.check_budget()  # Terminal metadata itself consumes bytes.
+            except OutputBudgetError as late_error:
+                error = late_error
+                self.record.update(status="failed_output_budget", budget_error=str(late_error))
+                self._write()
         finally:
             self.guard.release()
         if error:
