@@ -1298,3 +1298,50 @@ Python 독립 reader도 `/2` producer·Rust reader와 같이 counterexample을 N
 회수했다. 약 1.50GiB를 반환했으며 모델·데이터·기보·실패 보고서는 삭제하지
 않았다. 원 명령을 재현하기 전에는 보존된 custody mapping으로 원 경로를 복원한다.
 이 기록과 새 자원 프로필은 기능 검증용이며 성능 개선의 근거로 사용하지 않는다.
+
+## 25차 체크포인트: 새 소스 검사 완료와 실제 후보 문맥 불일치
+
+`f82194b`에서 own CPU 재검토 집중 회귀 1개가 실제 통과했다. 최초 `c5475be`의
+검사는 양성 질문 준비를 통과한 뒤 닫힌 frame의 정확한 오류 예상을 잘못 지정해
+실패했다. 공통 admission의 `RoleError::InvalidOutput`을 기대하도록 검사만 고쳤고
+제품의 closed/owner/Rules/credit 조건은 유지했다.
+
+같은 `f82194b`의 새 빌드 240은 11단계를 모두 통과했다. UCI 797개, Search 1070개와
+기존 ignored 2개, inventory 1개, 엄격 workspace Clippy를 확인했다. 제품 단계 5~8은
+release, 독립 reader와 metadata caller 단계 9~10은 dev로 명시하고 실제 산출 경로의
+원 바이트·의존 파일을 보존했다. 제품 10개와 caller 2개를 회수한 뒤 자식 종료·임시
+정리를 확인했으며 관리 슬롯은 약 4.2GB로 8GiB 안에 남았다. 원격 Linux·Windows CPU,
+CPU bindings, PALS model, native validation bundle의 다섯 job도 이 SHA에서 모두
+성공을 관측했다. 이 결과를 실제 네 모드·GPU·cohort 인수로 바꾸지 않는다.
+
+새 등록 241은 현재 실행물·lock·원 boot/parent와 CPU 2개·memory.high 3GiB/max 4GiB
+readback을 연결한 passive metadata다. 수치 검사 247에서 실제 Rust NNUEC forward
+20개와 독립 scalar FP32를 대조했고 accumulator·hidden·raw/value/WDL 최대 절대차는
+모두 0이었다. 옛 수치 결과를 재사용하지 않았으며 GPU나 학습 검사는 아니다.
+
+CPU P-C-R 241은 depth 1/2·mate·movetime 착수를 관측한 뒤 다음 infinite 착수 부근에서
+`published root ranking/candidate question scope` 불일치를 기록했다. stderr에는
+오류의 원 frame과 시각이 없어 movetime 말기와 다음 root 중 어느 곳인지 원 로그만으로
+단정하지 않는다. exit 0·양 pipe EOF·강제 신호 없음에도 의미 실패로 판정하고 원자료
+5개를 회수했으며 다른 CPU·GPU·cohort 후속 실행은 보류했다. 목표는 수정 작업을
+계속하는 active 상태이며 원 실패를 정상 대국이나 성공으로 바꾸지 않는다.
+
+독립 소스 검토 두 건은 initial candidate가 원 ranking view를 이어받지 않고 문맥을
+다시 선택하는 생산 경계를 지적했다. 실제 소비 이후 보호 횟수와 query 토큰 예산에
+따라 record 범위·순서가 바뀔 수 있지만 coordinator는 원 public context를 요구한다.
+최초 fanout은 봉인된 ranking 문맥에서 query를 파생하도록 수정 초안을 반영했다.
+이미 제출된 view·ticket을 갱신하거나 범위 검사를 느슨하게 하지 않으며, 이전 frame
+종료 후 새 view를 만드는 sequential deferred 경로와 구분한다. 보호 소비로 재선택
+순서가 바뀌는 사례와 원 token budget이 가득 차 추가 query를 거부하는 사례를
+회귀로 추가했으며 이 체크포인트의 컴파일·실행은 아직 전이다. 새 실제 실행의
+인수도 남는다.
+
+240~247 실행 준비 스크립트는 새 provenance `/2`로 분리했다. 원 숫자 토큰·64hex와
+역사 source를 보존하고 현재 source 8곳만 명시 갱신한 뒤 총괄이 파생 15개의 AST와
+숫자 상수·문자열 이외 구조를 대조했다. 일반 teacher용 248/249도 source-only 제안과
+독립 검토를 보존했으나 실제 242/244·cohort·teacher·IPC 결과는 아직 없다. 기존
+087/088 소비자와 원 receipt는 수정하지 않는다.
+
+새 보존 영역 관측은 약 18.01GB로 18GiB 안이며 추가 build223 회수는 실행하지 않았다.
+소스 구현·실제 CPU 수치·기능 실패·미실행 GPU를 구분한다. 성능·기력·실제 학습·병합은
+여전히 이번 인수에 포함하지 않는다.

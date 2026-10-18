@@ -1261,8 +1261,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         };
         let mut out = Vec::with_capacity(issue_count);
         for _ in 0..issue_count {
-            let mut candidate =
-                self.make_root_candidate(remaining.pop_front().ok_or(PalsError::InvalidConfig)?)?;
+            let mut candidate = self.make_root_candidate_with_frozen_scope(
+                remaining.pop_front().ok_or(PalsError::InvalidConfig)?,
+                Some(ranking.view().as_ref()),
+            )?;
             if self.continuation_limit() == 1
                 && self.engine.semantic.nodes[candidate.input.question.node]
                     .terminal
@@ -1317,6 +1319,16 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         &mut self,
         movement: BoardMove,
     ) -> Result<AdaptivePortCandidate, PalsError> {
+        // A deferred candidate is selected only after the previous actual
+        // candidate closes. Its separate port proof permits that new scope.
+        self.make_root_candidate_with_frozen_scope(movement, None)
+    }
+
+    fn make_root_candidate_with_frozen_scope(
+        &mut self,
+        movement: BoardMove,
+        frozen_scope: Option<&ReviewView>,
+    ) -> Result<AdaptivePortCandidate, PalsError> {
         if !self.root_move_allowed(movement) {
             return Err(RoleError::InvalidOutput.into());
         }
@@ -1338,6 +1350,37 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         } else {
             Vec::new()
         };
+        let frozen = match frozen_scope {
+            Some(source) => {
+                // The initial ranking has already been consumed, which may
+                // change bundle protection and selection order. Keep its exact
+                // records/relations/anchors and fork only this checked query.
+                // The additional query tokens must fit that original scope;
+                // fork_query returns ViewCapacity rather than replacing rows.
+                self.ensure_new_review_leases(true)?;
+                let legal = self.engine.semantic.nodes[child].position.legal_moves();
+                let view = self
+                    .engine
+                    .semantic
+                    .review_index
+                    .as_mut()
+                    .ok_or(PalsError::InvalidConfig)?
+                    .fork_query(
+                        &self.engine.semantic.stores,
+                        source,
+                        crate::pals::review_context::ReviewQuerySequences {
+                            purpose: purpose_for_stage(stage),
+                            prefix: &prefix,
+                            proposal: &proposal,
+                            counterexample: None,
+                            legal: &legal,
+                            divergences: &[],
+                        },
+                    )?;
+                Some(Arc::new(view))
+            }
+            None => None,
+        };
         let input = self.input(
             child,
             stage,
@@ -1348,7 +1391,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             None,
             None,
             false,
-            None,
+            frozen,
             None,
         )?;
         Ok(AdaptivePortCandidate {

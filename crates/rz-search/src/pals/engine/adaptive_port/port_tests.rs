@@ -185,6 +185,17 @@ pub(in crate::pals::engine::adaptive_port) fn accepted_root_ranking<M: RoleModel
     ProposerRankingPublished,
     RoleTicketRegistry<ReviewView, RoleOutput>,
 ) {
+    let (ranking, registry, _) = accepted_root_ranking_with_input(port);
+    (ranking, registry)
+}
+
+fn accepted_root_ranking_with_input<M: RoleModel>(
+    port: &mut AdaptiveEnginePort<M>,
+) -> (
+    ProposerRankingPublished,
+    RoleTicketRegistry<ReviewView, RoleOutput>,
+    FrameInput<ReviewView, AdaptivePortQuestion>,
+) {
     let input = port.root_input().unwrap();
     assert_eq!(input.stage, RefinementStage::ProposerRanking);
     let mut ordered_candidates = Sha256::new();
@@ -274,7 +285,269 @@ pub(in crate::pals::engine::adaptive_port) fn accepted_root_ranking<M: RoleModel
         .unwrap();
     assert_eq!(ranking.source().ticket.representation, key);
     assert_eq!(ranking.source().ordered_candidate_digest, key.candidates);
-    (ranking, registry)
+    (ranking, registry, input)
+}
+
+#[test]
+fn root_ranking_initial_fanout_keeps_consumed_scope_when_protection_reorders_selection() {
+    for legacy_full in [false, true] {
+        let mut port = setup(Position::startpos(), 3);
+        port.engine.semantic.legacy_full_native_context = legacy_full;
+        let proposal = vec![
+            BoardMove::from_uci("e2e4").unwrap(),
+            BoardMove::from_uci("e7e5").unwrap(),
+        ];
+        let counter = vec![proposal[0], BoardMove::from_uci("c7c5").unwrap()];
+        port.record_hot(RecordKind::Proposal, &proposal, None)
+            .unwrap();
+        port.record_hot(RecordKind::Counterexample, &counter, None)
+            .unwrap();
+        let bundle = port
+            .engine
+            .semantic
+            .review_index
+            .as_ref()
+            .unwrap()
+            .bundle_for_revision(port.engine.semantic.revision)
+            .unwrap();
+        let input = port
+            .input(
+                port.root,
+                RefinementStage::CriticDivergence,
+                Some(proposal[0]),
+                Vec::new(),
+                proposal,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let prior = Work {
+            frame: FrameId {
+                authority: port.authority,
+                sequence: 100,
+            },
+            original_first_move: rz_contracts::pals::Move16::encode(
+                rz_contracts::Move::try_from(counter[0]).unwrap(),
+            ),
+            original_deadline: port.deadline,
+            budget: FrameBudget {
+                original_cpu_credit: port.limits.max_cpu_nodes,
+                role_submissions_remaining: port.engine.config.max_role_calls,
+                original_store_byte_limit: 8 * 1024 * 1024,
+            },
+            input,
+        };
+        let (ticket, value) = output(&prior, 100);
+        port.commit_role(&prior, &ticket, &value, None).unwrap();
+        port.role_consumed(&ticket, &prior.input.view).unwrap();
+        let protected = |port: &Port| {
+            port.engine
+                .semantic
+                .review_index
+                .as_ref()
+                .unwrap()
+                .bundle(bundle)
+                .unwrap()
+                .protected_consumptions()
+        };
+        assert_eq!(protected(&port), 1);
+        // This newer unprotected bundle follows the protected old bundle in
+        // the root input. The actual ranking consume expires that protection.
+        port.record_hot(
+            RecordKind::Proposal,
+            &[BoardMove::from_uci("d2d4").unwrap()],
+            None,
+        )
+        .unwrap();
+        let consumed_before = port.counters.consumed_role_outputs;
+        let calls_before = port.counters.role_calls;
+        let (ranking, mut registry, ranking_input) = accepted_root_ranking_with_input(&mut port);
+        let source_scope = ContractDigest(ranking.view().record_scope_digest());
+        let source_metadata = ranking.view().records_metadata().to_vec();
+        let source_lines: Vec<_> = ranking
+            .view()
+            .records()
+            .iter()
+            .map(|record| (record.revision, record.line.clone()))
+            .collect();
+        let candidates = port.ranking_published(&ranking).unwrap();
+        assert!(!candidates.is_empty());
+        assert_eq!(protected(&port), 0);
+        let first_input = &candidates[0].input;
+        let query = first_input.view.query();
+        let selected_again = port
+            .engine
+            .prepare_review_view(
+                first_input.question.node,
+                RoleQuestion {
+                    purpose: query.purpose,
+                    prefix: &query.prefix,
+                    proposal: &query.proposal,
+                    refutation: query.counterexample.as_deref(),
+                    divergences: &query.divergences,
+                },
+                &query.legal,
+            )
+            .unwrap()
+            .unwrap();
+        let changed_scope = ContractDigest(selected_again.record_scope_digest());
+        assert_ne!(
+            changed_scope, source_scope,
+            "fixture must cross actual selector ordering"
+        );
+        let mut machine = RefinementMachine::new(port.authority, port.deadline, 512).unwrap();
+        let candidate_count = candidates.len();
+        for candidate in candidates {
+            assert_eq!(candidate.input.public_context, source_scope);
+            assert_eq!(candidate.input.view.record_scope_digest(), source_scope.0);
+            assert_eq!(candidate.input.view.records_metadata(), source_metadata);
+            assert_eq!(
+                candidate
+                    .input
+                    .view
+                    .records()
+                    .iter()
+                    .map(|record| (record.revision, record.line.clone()))
+                    .collect::<Vec<_>>(),
+                source_lines,
+            );
+            assert!(candidate.input.view.validates(&port.engine.semantic.stores));
+            assert_eq!(
+                candidate.input.view.generation(),
+                ranking.view().generation()
+            );
+            assert_eq!(
+                candidate.input.view.root_state(),
+                ranking.view().root_state()
+            );
+            assert_ne!(
+                candidate.input.question_digest,
+                ranking_input.question_digest
+            );
+            assert_ne!(candidate.input.view.digest(), ranking.view().digest());
+            assert_eq!(candidate.input.view.query().prefix.len(), 1);
+            assert_eq!(
+                candidate.budget.role_submissions_remaining,
+                port.engine.config.max_role_calls - port.counters.role_calls
+            );
+            match (
+                &ranking_input.question.legacy_full_records,
+                &candidate.input.question.legacy_full_records,
+            ) {
+                (Some(original), Some(current)) => {
+                    assert!(Arc::ptr_eq(original, current));
+                    assert!(current.validates(&port.engine.semantic.stores));
+                }
+                (None, None) => assert!(!legacy_full),
+                _ => panic!("initial query changed the independent legacy raw namespace"),
+            }
+            let mut wrong_scope = candidate.input.clone();
+            wrong_scope.public_context = changed_scope;
+            let before = machine.history_usage();
+            assert_eq!(
+                machine.admit_candidate(
+                    &ranking,
+                    candidate.first_move,
+                    wrong_scope,
+                    candidate.budget,
+                    port.deadline.clock,
+                    MonotonicTick(4),
+                ),
+                Err(CoordinatorError::IdentityMismatch(
+                    "published root ranking/candidate question scope",
+                )),
+            );
+            assert_eq!(machine.history_usage(), before);
+            let frame = machine
+                .admit_candidate(
+                    &ranking,
+                    candidate.first_move,
+                    candidate.input.clone(),
+                    candidate.budget,
+                    port.deadline.clock,
+                    MonotonicTick(4),
+                )
+                .unwrap();
+            port.root_candidate_admitted(frame, candidate.first_move, &candidate.input)
+                .unwrap();
+            assert_eq!(
+                machine.frame(frame).unwrap().ranking_source(),
+                Some(ranking.source())
+            );
+        }
+        assert_eq!(machine.history_usage().ranking_fanouts, candidate_count);
+        assert_eq!(machine.history_usage().role_requests, 1);
+        assert_eq!(port.counters.role_calls, calls_before + 1);
+        assert_eq!(port.counters.consumed_role_outputs, consumed_before + 1);
+        assert_eq!(registry.next_request_sequence(), 2);
+        assert!(
+            registry.take_dispatch().is_none(),
+            "forking invented a forward"
+        );
+    }
+}
+
+#[test]
+fn root_ranking_full_frozen_scope_rejects_extra_query_tokens_without_reselection() {
+    let mut port = setup(Position::startpos(), 3);
+    port.engine
+        .semantic
+        .review_policy
+        .as_mut()
+        .unwrap()
+        .token_budget = 128;
+    let proposal = [
+        BoardMove::from_uci("e2e4").unwrap(),
+        BoardMove::from_uci("e7e5").unwrap(),
+        BoardMove::from_uci("g1f3").unwrap(),
+        BoardMove::from_uci("b8c6").unwrap(),
+    ];
+    // Fill one original coherent bundle with actual Rules-checked revisions.
+    // No raw evidence is truncated to make the candidate's extra token fit.
+    for _ in 0..32 {
+        port.record_hot(RecordKind::Proposal, &proposal, None)
+            .unwrap();
+    }
+    let revisions: Vec<_> = port
+        .engine
+        .semantic
+        .records
+        .iter()
+        .map(|record| record.revision)
+        .collect();
+    let (ranking, mut registry, _input) = accepted_root_ranking_with_input(&mut port);
+    assert_eq!(ranking.view().records().len(), 32);
+    assert_eq!(ranking.view().token_count(), 128);
+    let source_scope = ranking.view().record_scope_digest();
+    assert!(matches!(
+        port.ranking_published(&ranking),
+        Err(PalsError::Review(ReviewError::ViewCapacity))
+    ));
+    assert_eq!(port.counters.role_calls, 1);
+    assert_eq!(port.counters.consumed_role_outputs, 1);
+    assert!(
+        port.role_consumption_recorded(&ranking.source().ticket, ranking.view())
+            .unwrap()
+    );
+    assert!(port.round_candidates.is_empty());
+    assert!(port.lazy_frontier.is_empty());
+    assert_eq!(
+        port.engine
+            .semantic
+            .records
+            .iter()
+            .map(|record| record.revision)
+            .collect::<Vec<_>>(),
+        revisions
+    );
+    assert_eq!(ranking.view().record_scope_digest(), source_scope);
+    assert!(ranking.view().validates(&port.engine.semantic.stores));
+    assert_eq!(registry.next_request_sequence(), 2);
+    assert!(registry.take_dispatch().is_none());
 }
 
 #[test]
