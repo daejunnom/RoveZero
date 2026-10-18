@@ -726,10 +726,20 @@ pub(in crate::pals::engine::adaptive_port) mod tests {
     }
 
     fn accepted(work: &Work) -> (AcceptedRoleStep, RoleOutput) {
-        let (expected, output) = super::super::port_tests::output(work, 1);
-        let mut registry =
-            RoleTicketRegistry::new(work.frame.authority, 512, CoordinatorPolicy::Fixed, 1)
-                .unwrap();
+        let (_, output) = super::super::port_tests::output(work, 1);
+        let accepted = accepted_output(work, &output);
+        (accepted, output)
+    }
+
+    fn accepted_output(work: &Work, output: &RoleOutput) -> AcceptedRoleStep {
+        let (expected, _) = super::super::port_tests::output(work, output.id.sequence);
+        let mut registry = RoleTicketRegistry::new(
+            work.frame.authority,
+            512,
+            CoordinatorPolicy::Fixed,
+            output.id.sequence,
+        )
+        .unwrap();
         let ticket = registry
             .admit(
                 RoleSubmission {
@@ -767,14 +777,13 @@ pub(in crate::pals::engine::adaptive_port) mod tests {
                 MonotonicTick(0),
             )
             .unwrap();
-        let accepted = registry
+        registry
             .accept_reciprocal_native(
                 issuer.issue_success(permit),
                 work.original_deadline.clock,
                 MonotonicTick(0),
             )
-            .unwrap();
-        (accepted, output)
+            .unwrap()
     }
 
     fn fresh_descendant(port: &mut Port, source: &Work) -> Work {
@@ -1273,6 +1282,250 @@ pub(in crate::pals::engine::adaptive_port) mod tests {
         assert_eq!(snapshot.registered_frames, 1);
         assert_eq!(snapshot.completed_frames, 1);
         assert_eq!(snapshot.goal, FrontierGoalStatus::DepthSatisfied);
+    }
+
+    #[test]
+    fn zero_step_repair_observes_new_source_without_reusing_prior_unmet_repair_duty() {
+        let mut port = super::super::port_tests::setup_with_resolver(
+            Position::startpos(),
+            4,
+            ResolverPolicy::ModelWdlRestricted,
+        );
+        let original = super::super::port_tests::work(
+            &mut port,
+            "e2e4",
+            RefinementStage::ProposalContinuation,
+            1,
+        );
+        let base = controller(&port);
+        let mut registration = copied_registration(base.registration());
+        registration.goal.depth_plies = NonZeroU16::new(4);
+        drop(base);
+        let clock = port.deadline.clock;
+        port.engine.semantic.rovent_frontier = Some(Box::new(
+            RoventFrontier::new(
+                registration,
+                limits(),
+                &port.engine.semantic.stores,
+                clock,
+                MonotonicTick(0),
+            )
+            .unwrap(),
+        ));
+        let proposal = ["e2e4", "c7c5", "g1f3", "d7d6"]
+            .map(|movement| BoardMove::from_uci(movement).unwrap())
+            .to_vec();
+        let counter = ["e2e4", "e7e5", "g1f3", "b8c6"]
+            .map(|movement| BoardMove::from_uci(movement).unwrap())
+            .to_vec();
+        port.record_hot(RecordKind::Proposal, &proposal, None)
+            .unwrap();
+        port.record_hot(RecordKind::Counterexample, &counter, None)
+            .unwrap();
+        let prefix = counter[..2].to_vec();
+        let node = port.replay_node(&prefix).unwrap();
+        // An authored, Rules-checked starting question supplies no CPU proof.
+        // The duty itself must be issued by two real registry-accepted P moves,
+        // their original submitted-view consumption and the normal producer.
+        let input = port
+            .input(
+                node,
+                RefinementStage::Repair,
+                Some(proposal[0]),
+                prefix,
+                proposal,
+                Some(counter),
+                None,
+                Some(1),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut current = Work { input, ..original };
+        for (sequence, chosen) in [(1, "b1c3"), (2, "b8c6")] {
+            current.budget.role_submissions_remaining -= 1;
+            let (ticket, mut output) = super::super::port_tests::output(&current, sequence);
+            let RolePayload::Proposal {
+                candidate_logits, ..
+            } = &mut output.payload
+            else {
+                panic!("Repair must consume the actual P policy output")
+            };
+            let chosen = BoardMove::from_uci(chosen).unwrap();
+            let index = current
+                .input
+                .view
+                .query()
+                .legal
+                .iter()
+                .position(|movement| *movement == chosen)
+                .unwrap();
+            candidate_logits[index] = 1.0;
+            let accepted = accepted_output(&current, &output);
+            assert_eq!(accepted.ticket(), &ticket);
+            let step = port.commit_role(&current, &ticket, &output, None).unwrap();
+            port.role_consumed(&ticket, &current.input.view).unwrap();
+            let FrameTransition::Continue(input) = port.materialize_step(step).unwrap().transition
+            else {
+                panic!("actual P Repair lost its selected continuation")
+            };
+            let selected = Work {
+                input,
+                ..current.clone()
+            };
+            assert_eq!(
+                port.rovent_lane_selected(&current, &selected, clock, MonotonicTick(0))
+                    .unwrap(),
+                sequence == 2,
+            );
+            current = selected;
+        }
+        assert_eq!(current.input.stage, RefinementStage::RepairValidation);
+        let prior = port.rovent_frontier().unwrap().snapshot();
+        assert_eq!(prior.registered_frames, 1);
+        assert_eq!(prior.completed_frames, 0);
+        assert_eq!(prior.horizon.declared_obligations, 1);
+        assert_eq!(prior.horizon.completed_obligations, 0);
+        assert_eq!(port.counters.repair_calls, 2);
+
+        // A later real Counter Fresh selects a different final opponent move.
+        // Its unchanged full prefix creates a Repair record, but no P move.
+        let proposal = current.input.question.repaired.as_ref().unwrap().clone();
+        let counter = ["e2e4", "e7e5", "b1c3", "d7d6"]
+            .map(|movement| BoardMove::from_uci(movement).unwrap())
+            .to_vec();
+        port.record_hot(RecordKind::Counterexample, &counter, None)
+            .unwrap();
+        let node = port.replay_node(&counter).unwrap();
+        let input = port
+            .input(
+                node,
+                RefinementStage::CounterValueFresh,
+                Some(counter[0]),
+                counter.clone(),
+                proposal,
+                Some(counter),
+                None,
+                Some(3),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut counter_work = Work { input, ..current };
+        counter_work.budget.role_submissions_remaining -= 1;
+        let (ticket, output) = super::super::port_tests::output(&counter_work, 3);
+        let accepted = accepted_output(&counter_work, &output);
+        assert_eq!(accepted.ticket(), &ticket);
+        let physical = AdaptivePortRoleEvidence {
+            execution: Some(ExecutionId::new(port.authority.epoch, 3)),
+            completed_nn_inputs: Some(1),
+            measurement_complete: true,
+            physical_fresh: Some(true),
+        };
+        let step = port
+            .commit_role(&counter_work, &ticket, &output, Some(physical))
+            .unwrap();
+        port.role_consumed(&ticket, &counter_work.input.view)
+            .unwrap();
+        let FrameTransition::Continue(input) = port.materialize_step(step).unwrap().transition
+        else {
+            panic!("zero-step record lost its original observation question")
+        };
+        let observation = Work {
+            input,
+            ..counter_work.clone()
+        };
+        assert_eq!(observation.input.stage, RefinementStage::RepairValidation);
+        assert!(
+            port.rovent_lane_selected(&counter_work, &observation, clock, MonotonicTick(0))
+                .unwrap()
+        );
+        assert!(
+            !port
+                .rovent_frame_admitted(
+                    &observation,
+                    FrontierFrameKind::Repair,
+                    clock,
+                    MonotonicTick(0),
+                )
+                .unwrap()
+        );
+        let mut changed = observation.clone();
+        changed.budget.role_submissions_remaining -= 1;
+        assert!(
+            port.rovent_frame_admitted(
+                &changed,
+                FrontierFrameKind::Repair,
+                clock,
+                MonotonicTick(0),
+            )
+            .is_err()
+        );
+        let boundary = port
+            .prepare_rovent_goal_boundary(&observation)
+            .unwrap()
+            .unwrap();
+        boundary.validate(&observation).unwrap();
+        let (_, input) = boundary.into_parts();
+        let mut fresh = Work {
+            input,
+            ..observation
+        };
+        fresh.budget.role_submissions_remaining -= 1;
+        let (ticket, output) = super::super::port_tests::output(&fresh, 4);
+        let accepted = accepted_output(&fresh, &output);
+        let physical = AdaptivePortRoleEvidence {
+            execution: Some(ExecutionId::new(port.authority.epoch, 4)),
+            ..physical
+        };
+        let mut changed = fresh.clone();
+        changed.budget.role_submissions_remaining -= 1;
+        assert!(
+            port.rovent_fresh_accepted(
+                &changed,
+                &accepted,
+                &output,
+                physical,
+                clock,
+                MonotonicTick(0),
+            )
+            .is_err()
+        );
+        assert!(
+            !port
+                .rovent_fresh_accepted(
+                    &fresh,
+                    &accepted,
+                    &output,
+                    physical,
+                    clock,
+                    MonotonicTick(0),
+                )
+                .unwrap()
+        );
+        let step = port
+            .commit_role(&fresh, &ticket, &output, Some(physical))
+            .unwrap();
+        port.role_consumed(&ticket, &fresh.input.view).unwrap();
+        assert!(matches!(
+            port.materialize_step(step).unwrap().transition,
+            FrameTransition::Complete { .. },
+        ));
+        assert_eq!(port.counters.repair_calls, 2);
+        assert_eq!(port.counters.repairs, 2);
+        let observed = port.rovent_frontier().unwrap().snapshot();
+        assert_eq!(observed.registered_frames, prior.registered_frames);
+        assert_eq!(observed.completed_frames, prior.completed_frames);
+        assert_eq!(
+            observed.horizon.declared_obligations,
+            prior.horizon.declared_obligations
+        );
+        assert_eq!(
+            observed.horizon.completed_obligations,
+            prior.horizon.completed_obligations
+        );
     }
 
     #[test]

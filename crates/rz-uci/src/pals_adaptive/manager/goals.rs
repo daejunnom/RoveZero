@@ -72,21 +72,24 @@ where
             }
             _ => None,
         };
-        let selected_counter = matches!(
+        let selected_lane = matches!(
             selected_stage,
-            RefinementStage::CounterContinuation | RefinementStage::CounterValidation
+            RefinementStage::CounterContinuation
+                | RefinementStage::CounterValidation
+                | RefinementStage::RepairValidation
+                | RefinementStage::RepairValueFresh
         );
-        if kind.is_none() && !selected_counter {
+        if kind.is_none() && !selected_lane {
             return Ok(());
         }
         let now = self.check_running()?;
         let selected = self
             .machine
             .ready_work(original.frame, self.clock.domain(), now)?;
-        if selected_counter
+        if selected_lane
             && self
                 .driver
-                .rovent_counter_selected(original, &selected, self.clock.domain(), now)?
+                .rovent_lane_selected(original, &selected, self.clock.domain(), now)?
         {
             return Ok(());
         }

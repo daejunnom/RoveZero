@@ -1274,15 +1274,15 @@ impl RoventFrontier {
         self.register_verified_frame(&question, stores, kind, clock, now)
     }
 
-    /// The live Search producer selected another original counter under the
+    /// The live Search producer selected another original local lane under the
     /// same coordinator frame. Its opaque materialized-selection source is
     /// mandatory; the old duty stays unchanged, including unmet goal progress.
     /// Ordinary registration and its strict retry checks are not widened.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn register_local_counter_successor(
+    pub(crate) fn register_local_lane_successor(
         &mut self,
         previous: FrontierObligation,
-        source: &super::engine::adaptive_port::AdaptiveCounterSelection,
+        source: &super::engine::adaptive_port::AdaptiveLaneSelection,
         original: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
         stores: &PalsStores,
@@ -1293,17 +1293,20 @@ impl RoventFrontier {
         if !source.validates_transition(original, work) {
             return Err(FrontierError::MissingAcceptance);
         }
+        let kind = source
+            .obligation_kind()
+            .ok_or(FrontierError::MissingAcceptance)?;
+        if kind == FrontierFrameKind::Candidate {
+            return Err(FrontierError::MissingAcceptance);
+        }
         let question = VerifiedFrontierQuestion::from_adaptive(work, stores)?;
         let at = self.obligation_slot(previous, work.frame)?;
         let held = &self.frames[at];
         let first = BoardMove::try_from(work.original_first_move.decode()?)?;
         if held.pc_source
-            || held.kind != FrontierFrameKind::Counter
+            || held.kind != kind
             || held.original_first != first
-            || !matches!(
-                question.stage,
-                RefinementStage::CounterContinuation | RefinementStage::CounterValidation
-            )
+            || !admission_stage_matches(kind, question.stage)
         {
             return Err(FrontierError::MissingAcceptance);
         }
@@ -1316,7 +1319,7 @@ impl RoventFrontier {
         let anchor = self.observe_verified_question(&question, stores, clock, now)?;
         if self.frames.iter().any(|held| {
             held.frame == work.frame
-                && held.kind == FrontierFrameKind::Counter
+                && held.kind == kind
                 && (held.source_path == anchor || held.question == question.question_digest)
         }) {
             return Err(FrontierError::Duplicate);
@@ -1326,7 +1329,7 @@ impl RoventFrontier {
             first,
             question.question_digest,
             anchor,
-            FrontierFrameKind::Counter,
+            kind,
             false,
         )
     }

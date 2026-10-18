@@ -77,6 +77,7 @@ struct OwnerFacts {
     root_ranking: AtomicBool,
     full_roles: AtomicBool,
     role_runs: AtomicU64,
+    repair_role_runs: AtomicU64,
 }
 struct TerminalOwner {
     clock: ContractSystemClock,
@@ -134,6 +135,10 @@ impl TicketNativeBackend<ReviewView, AdaptivePortQuestion> for TerminalOwner {
         _: &AtomicBool,
     ) -> TicketPhysicalResult<RoleOutput> {
         self.facts.role_runs.fetch_add(1, Ordering::AcqRel);
+        if question.query.context.purpose == rz_search::pals::engine::RoleQueryPurpose::RepairPolicy
+        {
+            self.facts.repair_role_runs.fetch_add(1, Ordering::AcqRel);
+        }
         TicketPhysicalResult {
             physical: PhysicalRoleCompletion::Confirmed,
             output: Ok(RoleOutput {
@@ -279,6 +284,7 @@ fn fixture_with_rovent_profile(
     u64,
 ) {
     let clock = ProcessClock::new(ProcessEpoch(31));
+    let maximum_goal_plies = std::num::NonZeroU16::new(8).unwrap();
     let facts = Arc::new(OwnerFacts::default());
     facts.finish_ok.store(true, Ordering::Release);
     facts.full_roles.store(full_roles, Ordering::Release);
@@ -367,23 +373,39 @@ fn fixture_with_rovent_profile(
             rz_search::pals::engine::PALS_VALUE_RESOLVER_SEMANTICS
         },
     };
-    let engine = PalsEngine::new_with_boxed_checker_and_policies(
-        PalsConfig {
-            beam_width: 1,
-            line_plies,
-            cpu_nodes_per_task: 8,
-            max_role_calls: role_limit.unwrap_or_else(|| PalsConfig::default().max_role_calls),
-            ..Default::default()
-        },
-        model,
-        Box::new(metadata.clone().into_mirror()),
-        if full_roles {
-            ResolverPolicy::ModelWdlRestricted
-        } else {
-            ResolverPolicy::OwnRawRestricted
-        },
-        PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
-    )
+    let config = PalsConfig {
+        beam_width: 1,
+        line_plies,
+        cpu_nodes_per_task: 8,
+        max_role_calls: role_limit.unwrap_or_else(|| PalsConfig::default().max_role_calls),
+        ..Default::default()
+    };
+    let resolver = if full_roles {
+        ResolverPolicy::ModelWdlRestricted
+    } else {
+        ResolverPolicy::OwnRawRestricted
+    };
+    let recheck = PostRepairRecheckPolicy::IterativeFrozenModelWdlV2;
+    let engine = if rovent_mode.is_some() {
+        PalsEngine::new_with_boxed_checker_and_rovent_profile(
+            rz_search::pals::engine::ResearcherSemanticProfile {
+                config,
+                maximum_root_prefix_plies: maximum_goal_plies.get(),
+            },
+            model,
+            Box::new(metadata.clone().into_mirror()),
+            resolver,
+            recheck,
+        )
+    } else {
+        PalsEngine::new_with_boxed_checker_and_policies(
+            config,
+            model,
+            Box::new(metadata.clone().into_mirror()),
+            resolver,
+            recheck,
+        )
+    }
     .unwrap()
     .with_selected_review_context(
         ReviewSelectionPolicy::default(),
@@ -430,13 +452,13 @@ fn fixture_with_rovent_profile(
             registration,
             RoventPcrSessionProfile {
                 mode,
-                maximum_goal_plies: std::num::NonZeroU16::new(8).unwrap(),
+                maximum_goal_plies,
                 input_lock: Digest([9; 32]),
                 root_budget: Digest([10; 32]),
                 selective_policy: Digest([11; 32]),
                 model_namespace: rovent_namespace,
                 frontier_limits: rz_search::pals::rovent_frontier::FrontierLimits {
-                    maximum_goal_plies: std::num::NonZeroU16::new(8).unwrap(),
+                    maximum_goal_plies,
                     maximum_frames: 16,
                     maximum_paths: 64,
                     maximum_mate_nodes: 128,
@@ -554,7 +576,7 @@ fn rovent_original_depth_one_and_two_close_actual_p_c_fresh_goal() {
     use rz_contracts::rovent::ExecutionMode;
     use rz_search::pals::rovent_frontier::FrontierGoalStatus;
 
-    for (line_plies, depth) in [(4, 1), (4, 2), (2, 3)] {
+    for (line_plies, depth) in [(4, 1), (4, 2), (2, 3), (4, 3)] {
         let (driver, facts, clock, _) = fixture_with_rovent_profile(
             None,
             Some(64),
@@ -588,6 +610,18 @@ fn rovent_original_depth_one_and_two_close_actual_p_c_fresh_goal() {
             assert_eq!(frontier.horizon.completed_obligations, 3);
             assert_eq!(frontier.registered_frames, 3);
             assert_eq!(frontier.completed_frames, 3);
+        }
+        if line_plies == 4 && depth == 3 {
+            // Each actual selected counter has a nonzero accepted P Repair.
+            // The second Repair must own another duty under the same frame,
+            // rather than closing the first Repair's completed source again.
+            assert_eq!(facts.repair_role_runs.load(Ordering::Acquire), 2);
+            assert_eq!(frontier.horizon.declared_obligations, 5);
+            assert_eq!(frontier.horizon.completed_obligations, 5);
+            assert_eq!(frontier.registered_frames, 5);
+            assert_eq!(frontier.completed_frames, 5);
+        } else {
+            assert_eq!(facts.repair_role_runs.load(Ordering::Acquire), 0);
         }
         assert!(actual.counters.consumed_role_outputs >= 2);
         assert!(facts.role_runs.load(Ordering::Acquire) >= 2);

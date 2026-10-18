@@ -238,6 +238,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 } else {
                     query.repaired.clone()
                 };
+                let repair_selection = if query.stage == RefinementStage::Repair && done {
+                    self.prepare_completed_repair_goal_selection(work, &prefix)?
+                } else {
+                    None
+                };
                 let mut next = self.blueprint(
                     node,
                     next,
@@ -251,7 +256,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     None,
                     None,
                 )?;
-                next = next.with_counter_source(query.counter_source);
+                next = next
+                    .with_counter_source(query.counter_source)
+                    .with_goal_lane_selection(repair_selection)?;
                 AdaptivePortTransition::Continue(next)
             }
             RefinementStage::CriticDivergence => {
@@ -589,7 +596,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 RefinementStage::RepairValidation => RefinementStage::RepairValueFresh,
                 _ => return Err(RoleError::InvalidOutput.into()),
             };
-            AdaptivePortTransition::Continue(self.blueprint(
+            let selection = self.prepare_zero_step_repair_feedback_selection(work)?;
+            let mut blueprint = self.blueprint(
                 query.node,
                 stage,
                 query.first,
@@ -601,7 +609,13 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 false,
                 None,
                 None,
-            )?)
+            )?;
+            if selection.is_some() {
+                blueprint = blueprint
+                    .with_counter_source(query.counter_source)
+                    .with_goal_lane_selection(selection)?;
+            }
+            AdaptivePortTransition::Continue(blueprint)
         } else {
             self.after_validation(query, Some(work))?
         };
@@ -672,7 +686,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     .ok_or(RoleError::InvalidOutput)?
                     .to_vec();
                 let node = self.replay_node(&prefix)?;
-                self.begin_repair_continuation(
+                let mut transition = self.begin_repair_continuation(
                     node,
                     query.first,
                     prefix,
@@ -680,7 +694,11 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     counter.clone(),
                     ply,
                     query.counter_source,
-                )
+                )?;
+                if let Some(original) = parent {
+                    self.bind_zero_step_repair_goal_transition(original, &mut transition)?;
+                }
+                Ok(transition)
             }
             RefinementStage::RepairValidation | RefinementStage::RepairValueFresh => {
                 self.publish_supported_repair(query)?;

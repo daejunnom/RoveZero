@@ -907,7 +907,7 @@ pub trait AdaptiveSearchDriver<Q> {
     ) -> Result<bool, AdaptiveManagerError> {
         Ok(false)
     }
-    fn rovent_counter_selected(
+    fn rovent_lane_selected(
         &mut self,
         _: &CoordinatorWork<ReviewView, Q>,
         _: &CoordinatorWork<ReviewView, Q>,

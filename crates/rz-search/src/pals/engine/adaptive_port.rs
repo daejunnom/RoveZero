@@ -64,8 +64,8 @@ pub use external_commit::{AdaptiveForeignPublication, AdaptivePortExternalQuesti
 pub use frontier_port::{
     AdaptiveFrontierReceipt, AdaptiveFrontierStartup, AdaptiveReviewLeaseAdmission,
 };
-pub(crate) use goal_hooks::AdaptiveCounterSelection;
 pub use goal_hooks::AdaptiveGoalBoundary;
+pub(crate) use goal_hooks::AdaptiveLaneSelection;
 pub use goal_local::{
     AdaptiveGoalLocalAdmission, GoalLocalBlockReason, GoalLocalInput, GoalLocalLeaf,
     GoalLocalLeafKind, GoalLocalQuestionKey, GoalLocalStep,

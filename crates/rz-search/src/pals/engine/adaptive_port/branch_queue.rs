@@ -546,7 +546,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .ok_or(RoleError::InvalidOutput)?
                 .to_vec();
             let anchor = self.replay_node(&prefix)?;
-            return self.begin_repair_continuation(
+            let mut transition = self.begin_repair_continuation(
                 anchor,
                 Some(pending.first),
                 prefix,
@@ -554,7 +554,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 pending.counter,
                 pending.attack,
                 pending.source,
-            );
+            )?;
+            self.bind_zero_step_repair_goal_transition(original, &mut transition)?;
+            return Ok(transition);
         }
         let goal_selection = self.prepare_counter_goal_selection(
             original,
@@ -587,7 +589,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         )?;
         Ok(AdaptivePortTransition::Continue(
             next.with_counter_source(pending.source)
-                .with_counter_goal_selection(goal_selection)?,
+                .with_goal_lane_selection(goal_selection)?,
         ))
     }
     /// Preserve each branch outcome even when a sibling continues under the

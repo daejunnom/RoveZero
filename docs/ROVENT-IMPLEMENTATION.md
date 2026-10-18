@@ -1023,3 +1023,17 @@ arm/query 발급 실패는 별도 실패이며, 자료 보존을 dataset 인수�
 않는다. 학습 0회 창은 실제 모델·AdamW owner 초기화와 begin/end·fence·drain을
 검증하지만 sample·forward·backward·optimizer step·checkpoint·export를
 발행하지 않는다. 이를 학습 완료나 유효 학습 target 확보로 보고하지 않는다.
+
+후속 실제 build 051은 깊이 1·2와 서로 다른 Counter 책임 세 개의 등록·완료를
+통과했지만, 추가 chunk 2·depth 3 사례가 Capacity로 실패했다. 조사한 fixture는
+legacy 생성자로 root prefix도 2에 묶은 채 Frontier 목표 8을 등록했다. 실제
+제품과 같은 ResearcherSemanticProfile로 이미 선언한 목표 8을 연결하고 chunk·
+노드·역할·시간 예산과 제품 입력 제한은 유지한다. 원 실패는 보존한다.
+
+같은 frame에서 두 실제 nonzero Repair도 각각 원 책임을 갖도록 선택 source를
+확장한다. 실제 P 착수와 Rules 전이가 완료된 생산 지점에서만 새 Repair 책임을
+발급한다. zero-step은 원 Counter·Repair record에 묶인 관찰 전용 상태이며 새
+P 출력이나 책임을 만들지 않는다. CPU 재검증의 실제 feedback 뒤 현재 예산을
+다시 봉인하고, Ready 단계와 실제 Fresh 제출 한 번의 차감을 구분한다. 이전
+책임의 history·미완료 horizon과 일반 중복 거부는 유지한다. 새 혼합 관찰 회귀와
+두 nonzero Repair 회귀는 실제 후속 검사에서 인수하며 소스 검토로 대신하지 않는다.

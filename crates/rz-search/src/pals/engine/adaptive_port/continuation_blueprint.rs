@@ -53,7 +53,7 @@ struct InputRecipe {
     paired_repaired: Option<ObservationId>,
     discovery_restricted: bool,
     counter_source: Option<ObservationId>,
-    counter_selection: Option<Box<super::goal_hooks::AdaptiveCounterSelection>>,
+    lane_selection: Option<Box<super::goal_hooks::AdaptiveLaneSelection>>,
 }
 enum BlueprintContent {
     Input(InputRecipe),
@@ -80,17 +80,17 @@ pub struct AdaptiveContinuationBlueprint {
     diagnostic_repair_line: Option<AdaptiveRepairLineProvenance>,
 }
 impl AdaptiveContinuationBlueprint {
-    pub(super) fn with_counter_goal_selection(
+    pub(super) fn with_goal_lane_selection(
         mut self,
-        source: Option<Box<super::goal_hooks::AdaptiveCounterSelection>>,
+        source: Option<Box<super::goal_hooks::AdaptiveLaneSelection>>,
     ) -> Result<Self, PalsError> {
         let BlueprintContent::Input(recipe) = &mut self.content else {
             return Err(RoleError::InvalidOutput.into());
         };
-        if recipe.counter_selection.is_some() {
+        if recipe.lane_selection.is_some() {
             return Err(RoleError::InvalidOutput.into());
         }
-        recipe.counter_selection = source;
+        recipe.lane_selection = source;
         Ok(self)
     }
     pub(super) fn carry_diagnostic_repair_line(
@@ -181,6 +181,45 @@ impl AdaptivePortTransition {
 }
 
 impl<M: RoleModel> AdaptiveEnginePort<M> {
+    /// An unchanged full Repair prefix publishes an observation, never an
+    /// accepted P continuation. Attach its actual record only after the normal
+    /// producer returned that zero-step validation/value recipe.
+    pub(super) fn bind_zero_step_repair_goal_transition(
+        &self,
+        original: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        transition: &mut AdaptivePortTransition,
+    ) -> Result<(), PalsError> {
+        let AdaptivePortTransition::Continue(blueprint) = transition else {
+            return Ok(());
+        };
+        let BlueprintContent::Input(recipe) = &mut blueprint.content else {
+            return Ok(());
+        };
+        if !matches!(
+            recipe.stage,
+            RefinementStage::RepairValidation | RefinementStage::RepairValueFresh
+        ) || recipe.prefix.len() != self.continuation_limit()
+            || recipe.repaired.as_ref() != Some(&recipe.prefix)
+        {
+            return Ok(());
+        }
+        if recipe.lane_selection.is_some() {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        recipe.lane_selection = self.prepare_zero_step_repair_goal_observation(
+            original,
+            RoleQuestion {
+                purpose: RoleQueryPurpose::RepairPolicy,
+                prefix: &recipe.prefix,
+                proposal: &recipe.proposal,
+                refutation: recipe.counter.as_deref(),
+                divergences: &[],
+            },
+            recipe.attack_ply.ok_or(RoleError::InvalidOutput)?,
+            recipe.counter_source,
+        )?;
+        Ok(())
+    }
     fn blueprint_seal(&self, node: usize) -> Result<BlueprintSeal, PalsError> {
         self.check_live()?;
         let endpoint = self
@@ -274,7 +313,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 paired_repaired,
                 discovery_restricted: false,
                 counter_source: None,
-                counter_selection: None,
+                lane_selection: None,
             }),
         })
     }
@@ -440,7 +479,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 let diagnostic_repair_line = blueprint.diagnostic_repair_line;
                 let input = match blueprint.content {
                     BlueprintContent::Input(recipe) => {
-                        let counter_selection = recipe.counter_selection;
+                        let lane_selection = recipe.lane_selection;
                         let mut input = self.input(
                             recipe.node,
                             recipe.stage,
@@ -458,8 +497,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                         query.counter_source = recipe.counter_source;
                         query.discovery_restricted = recipe.discovery_restricted;
                         query.diagnostic_repair_line = diagnostic_repair_line;
-                        if let Some(selection) = counter_selection {
-                            self.bind_counter_goal_selection(selection, &input)?;
+                        if let Some(selection) = lane_selection {
+                            self.bind_goal_lane_selection(selection, &input)?;
                         }
                         input
                     }
