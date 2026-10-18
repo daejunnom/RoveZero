@@ -988,7 +988,14 @@ fn membership_for_path(mountinfo: &str, path: &Path) -> Result<PathBuf, ArenaErr
     validate_absolute(&membership)?;
     Ok(membership)
 }
-fn process_start(text: &str, pid: u32) -> Result<u64, ArenaError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessIdentity {
+    parent_pid: u32,
+    start_ticks: u64,
+}
+/// Parse original proc identity only. A self/root PID need not be a child of
+/// this caller; each consumer verifies its own actual relationship separately.
+fn parse_process_identity(text: &str, pid: u32) -> Result<ProcessIdentity, ArenaError> {
     let begin = text
         .find('(')
         .ok_or_else(|| invalid("proc stat command absent"))?;
@@ -1000,19 +1007,33 @@ fn process_start(text: &str, pid: u32) -> Result<u64, ArenaError> {
         "proc stat PID differs",
     )?;
     let fields: Vec<_> = text[end + 2..].split_whitespace().collect();
-    check(
-        canonical_u64(
-            fields
-                .get(1)
-                .ok_or_else(|| invalid("proc stat parent absent"))?,
-        )? == u64::from(std::process::id()),
-        "PID is not a direct child of the original parent",
+    let parent = canonical_u64(
+        fields
+            .get(1)
+            .ok_or_else(|| invalid("proc stat parent absent"))?,
     )?;
-    canonical_u64(
+    check(parent <= i32::MAX as u64, "proc stat parent PID overflow")?;
+    let start_ticks = canonical_u64(
         fields
             .get(19)
             .ok_or_else(|| invalid("proc stat start time absent"))?,
+    )?;
+    Ok(ProcessIdentity {
+        parent_pid: parent as u32,
+        start_ticks,
+    })
+}
+fn require_process_parent(identity: &ProcessIdentity, parent_pid: u32) -> Result<(), ArenaError> {
+    check(
+        identity.parent_pid == parent_pid,
+        "PID is not a direct child of the original parent",
     )
+}
+/// The trainer path still requires a direct child of this original caller.
+fn process_start(text: &str, pid: u32) -> Result<u64, ArenaError> {
+    let identity = parse_process_identity(text, pid)?;
+    require_process_parent(&identity, std::process::id())?;
+    Ok(identity.start_ticks)
 }
 fn task_ids(tasks: &Dir, maximum: u32) -> Result<Vec<u32>, ArenaError> {
     let mut ids = BTreeSet::new();
@@ -1061,6 +1082,33 @@ mod tests {
             affinity: vec![0, 2],
             device: "cuda:0".into(),
         }
+    }
+    fn proc_stat(pid: u32, parent: u32, start: u64) -> String {
+        let mut fields = vec!["0".to_owned(); 20];
+        fields[0] = "R".into();
+        fields[1] = parent.to_string();
+        fields[19] = start.to_string();
+        format!("{pid} (native ) worker) {}", fields.join(" "))
+    }
+    #[test]
+    fn proc_identity_accepts_original_self_and_descendants_without_inventing_parentage() {
+        let original = parse_process_identity(&proc_stat(42, 7, 123), 42).unwrap();
+        assert_eq!(original.parent_pid, 7);
+        assert_eq!(original.start_ticks, 123);
+        assert!(parse_process_identity(&proc_stat(42, 7, 123), 43).is_err());
+        let descendant = parse_process_identity(&proc_stat(84, 42, 456), 84).unwrap();
+        assert!(require_process_parent(&descendant, 42).is_ok());
+        assert!(require_process_parent(&descendant, 7).is_err());
+        assert!(parse_process_identity("42 (native) R 7", 42).is_err());
+    }
+    #[test]
+    fn trainer_start_still_requires_the_original_callers_direct_child() {
+        let caller = std::process::id();
+        let other_parent = if caller == 1 { 2 } else { 1 };
+        assert_eq!(process_start(&proc_stat(84, caller, 456), 84).unwrap(), 456);
+        assert!(process_start(&proc_stat(84, other_parent, 456), 84).is_err());
+        assert!(parse_process_identity(&proc_stat(caller, other_parent, 123), caller).is_ok());
+        assert!(process_start(&proc_stat(caller, other_parent, 123), caller).is_err());
     }
     #[test]
     fn policy_is_explicit_bounded_and_duplicate_fields_are_rejected() {

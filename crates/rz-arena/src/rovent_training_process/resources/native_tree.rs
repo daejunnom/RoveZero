@@ -3,6 +3,7 @@
 //! caller retains the original owner on every failure after partial migration.
 use super::*;
 use nix::sched::sched_setaffinity;
+use std::collections::BTreeMap;
 
 /// Current-process entry is issued only after the actual self migration and
 /// readback. Numeric PID/path declarations cannot reconstruct this custody.
@@ -67,7 +68,9 @@ impl RoventTrainingResources {
         let current = proc
             .open_dir_nofollow(pid.to_string())
             .map_err(|_| io("native_self_proc"))?;
-        let start = process_start(&read_kernel(&current, "stat", MAX_PROC_TEXT, true)?, pid)?;
+        let start =
+            parse_process_identity(&read_kernel(&current, "stat", MAX_PROC_TEXT, true)?, pid)?
+                .start_ticks;
         let original_membership =
             parse_membership(&read_kernel(&current, "cgroup", MAX_PROC_TEXT, true)?)?;
         let tasks = current
@@ -95,7 +98,11 @@ impl RoventTrainingResources {
         // first mutation. Future threads/processes inherit both boundaries.
         check(
             task_ids(&tasks, self.policy.pids_max)? == [pid]
-                && process_start(&read_kernel(&current, "stat", MAX_PROC_TEXT, true)?, pid)?
+                && parse_process_identity(
+                    &read_kernel(&current, "stat", MAX_PROC_TEXT, true)?,
+                    pid,
+                )?
+                .start_ticks
                     == start
                 && parse_membership(&read_kernel(&current, "cgroup", MAX_PROC_TEXT, true)?)?
                     == original_membership,
@@ -203,11 +210,13 @@ fn native_tree(
             .set(cpu as usize)
             .map_err(|_| invalid("native expected affinity"))?;
     }
-    let mut pending = BTreeSet::from([entry.root_pid]);
+    // Preserve the actual task/children edge rather than requiring every
+    // descendant (or the root itself) to be a child of this caller.
+    let mut pending = BTreeMap::from([(entry.root_pid, None)]);
     let mut visited = BTreeSet::new();
     let mut result = Vec::new();
     let mut thread_count = 0usize;
-    while let Some(pid) = pending.pop_first() {
+    while let Some((pid, parent)) = pending.pop_first() {
         check(
             members.contains(&pid) && visited.insert(pid),
             "native descendant escaped the leaf or formed a cycle",
@@ -215,7 +224,12 @@ fn native_tree(
         let process = proc
             .open_dir_nofollow(pid.to_string())
             .map_err(|_| io("native_tree_process"))?;
-        let start_ticks = process_start(&read_kernel(&process, "stat", MAX_PROC_TEXT, true)?, pid)?;
+        let identity =
+            parse_process_identity(&read_kernel(&process, "stat", MAX_PROC_TEXT, true)?, pid)?;
+        if let Some(parent) = parent {
+            require_process_parent(&identity, parent)?;
+        }
+        let start_ticks = identity.start_ticks;
         check(
             pid != entry.root_pid || start_ticks == entry.root_start_ticks,
             "native original process PID was reused",
@@ -263,10 +277,14 @@ fn native_tree(
                 children.insert(child as u32);
             }
         }
+        let after =
+            parse_process_identity(&read_kernel(&process, "stat", MAX_PROC_TEXT, true)?, pid)?;
+        if let Some(parent) = parent {
+            require_process_parent(&after, parent)?;
+        }
         check(
             task_ids(&tasks, resources.policy.pids_max)? == thread_ids
-                && process_start(&read_kernel(&process, "stat", MAX_PROC_TEXT, true)?, pid)?
-                    == start_ticks,
+                && after.start_ticks == start_ticks,
             "native process/thread identity changed during observation",
         )?;
         for &child in &children {
@@ -274,7 +292,10 @@ fn native_tree(
                 !visited.contains(&child),
                 "native descendant PID cycle/reuse",
             )?;
-            pending.insert(child);
+            check(
+                pending.insert(child, Some(pid)).is_none(),
+                "native descendant was listed under multiple parents",
+            )?;
         }
         check(
             pending.len().saturating_add(visited.len()) <= resources.policy.pids_max as usize,
