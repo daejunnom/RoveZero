@@ -867,6 +867,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-search/src/external_cpu.rs"),
             source!("crates/rz-search/src/external_cpu/adaptive.rs"),
             source!("crates/rz-search/src/external_cpu/collection_teacher.rs"),
+            source!("crates/rz-search/src/external_cpu/process_scope.rs"),
             source!("crates/rz-search/src/external_cpu/profiled_researcher.rs"),
             source!("crates/rz-search/src/external_cpu/profiled_worker.rs"),
             source!("crates/rz-search/src/external_cpu/profiled_worker/current_root.rs"),

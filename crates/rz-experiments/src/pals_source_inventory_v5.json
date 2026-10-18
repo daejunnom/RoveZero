@@ -715,6 +715,7 @@
       "crates/rz-search/src/external_cpu.rs",
       "crates/rz-search/src/external_cpu/adaptive.rs",
       "crates/rz-search/src/external_cpu/collection_teacher.rs",
+      "crates/rz-search/src/external_cpu/process_scope.rs",
       "crates/rz-search/src/external_cpu/profiled_researcher.rs",
       "crates/rz-search/src/external_cpu/profiled_worker.rs",
       "crates/rz-search/src/external_cpu/profiled_worker/current_root.rs",
