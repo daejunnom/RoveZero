@@ -114,6 +114,45 @@ fn original_forward_deadline(
 fn encode(value: &impl Serialize) -> Result<Vec<u8>, ArenaError> {
     serde_json::to_vec(value).map_err(|error| invalid(error.to_string()))
 }
+fn encode_startup(family: UtilityRuntimeFamily, mut startup: Value) -> Result<Vec<u8>, ArenaError> {
+    let fields = [
+        "schema",
+        "execution_id",
+        "window_id",
+        "registration_sha256",
+        "registration",
+        "control",
+        "original_started_ns",
+        "execution_until_ns",
+        "whole_until_ns",
+        "source_root",
+        "package_root",
+        "source_files",
+        "dependency_directories",
+        "runtime_module_pins",
+        "python_runtime",
+        "resources",
+        "artifact_watch_profile",
+        "child_read_credit",
+    ];
+    let object = startup
+        .as_object_mut()
+        .ok_or_else(|| invalid("utility startup object"))?;
+    require(
+        object.len() == fields.len() && fields.iter().all(|field| object.contains_key(*field)),
+        "utility startup original fields",
+    )?;
+    require(
+        object.get("schema").and_then(Value::as_str) == Some(family.domain(STARTUP)),
+        "utility startup original family domain",
+    )?;
+    // The family comes from the validated original registration, never an
+    // optional JSON flag. Legacy bytes keep their exact eighteen-field shape.
+    if family == UtilityRuntimeFamily::InterventionV2 {
+        object.insert("data_family".into(), json!("intervention_v2"));
+    }
+    encode(&startup)
+}
 fn decode<T: DeserializeOwned>(raw: &[u8]) -> Result<T, ArenaError> {
     crate::decode_json(std::str::from_utf8(raw).map_err(|_| invalid("strict UTF8 JSON"))?)
 }
@@ -1687,7 +1726,7 @@ pub fn run_rovent_utility_from_cli(
         )?;
         budget.reserve(registration.max_child_read_bytes)?;
         let startup = json!({"schema":registration.family().domain(STARTUP),"execution_id":registration.execution_id,"window_id":window.window_id,"registration_sha256":command.registration.sha256,"registration":registration,"control":{"socket_path":socket,"parent_pid":std::process::id(),"parent_start_ticks":parent_start,"control_device":control_device,"control_inode":control_inode},"original_started_ns":start_ns,"execution_until_ns":execution_ns,"whole_until_ns":whole_ns,"source_root":registration.output_root.join("source"),"package_root":registration.output_root.join("source").join(linux::PACKAGE),"source_files":sources,"dependency_directories":dependencies,"runtime_module_pins":registration.runtime_endpoints.iter().map(|p|p.artifact.clone()).collect::<Vec<_>>(),"python_runtime":{"version":registration.trainer_python_version,"executable":registration.trainer_python_executable},"resources":resources.startup_json()?,"artifact_watch_profile":{"schema":"rz-rovent-training-artifact-watch/1","maximum_total_bytes":registration.max_output_bytes-control_limit,"maximum_file_bytes":MAX_TENSOR,"maximum_files":registration.max_artifact_files,"scope":"new_trainer_owned_output_tree_only"},"child_read_credit":{"reserved_bytes":registration.max_child_read_bytes,"scope":"charged_in_parent_shared_budget_no_refund"}});
-        let startup_raw = encode(&startup)?;
+        let startup_raw = encode_startup(registration.family(), startup)?;
         require(
             startup_raw.len() <= crate::MAX_ORIGINAL_INPUT_BYTES,
             "utility startup stdin bound",
@@ -2268,6 +2307,86 @@ pub fn run_rovent_utility_from_cli(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn startup_draft(family: UtilityRuntimeFamily) -> Value {
+        // Declaration-only transport fixture. No FD, peer, lease or process
+        // authority is created by building these original startup fields.
+        json!({
+            "schema": family.domain(STARTUP),
+            "execution_id": "startup-test",
+            "window_id": "startup-window",
+            "registration_sha256": "12".repeat(32),
+            "registration": {"fixture": "original-registration"},
+            "control": {"fixture": "original-control"},
+            "original_started_ns": 100,
+            "execution_until_ns": 200,
+            "whole_until_ns": 300,
+            "source_root": "/owned/source",
+            "package_root": "/owned/source/package",
+            "source_files": [{"fixture": "original-source-pin"}],
+            "dependency_directories": [],
+            "runtime_module_pins": [],
+            "python_runtime": {"fixture": "original-runtime"},
+            "resources": {"fixture": "original-resource-observation"},
+            "artifact_watch_profile": {"fixture": "original-output-bound"},
+            "child_read_credit": {"fixture": "original-reserved-credit"}
+        })
+    }
+
+    #[test]
+    fn utility_legacy_startup_keeps_exact_eighteen_fields_and_bytes() {
+        let original = startup_draft(UtilityRuntimeFamily::CohortV1);
+        let original_raw = encode(&original).unwrap();
+        let raw = encode_startup(UtilityRuntimeFamily::CohortV1, original.clone()).unwrap();
+        assert_eq!(raw, original_raw);
+        let decoded: Value = decode(&raw).unwrap();
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.as_object().unwrap().len(), 18);
+        assert!(decoded.get("data_family").is_none());
+        assert_eq!(decoded["schema"], STARTUP);
+    }
+
+    #[test]
+    fn utility_intervention_startup_adds_original_family_before_encoding() {
+        let original = startup_draft(UtilityRuntimeFamily::InterventionV2);
+        let raw = encode_startup(UtilityRuntimeFamily::InterventionV2, original.clone()).unwrap();
+        let decoded: Value = decode(&raw).unwrap();
+        assert_eq!(decoded.as_object().unwrap().len(), 19);
+        assert_eq!(decoded["schema"], "rz-rovent-utility-trainer-startup/2");
+        assert_eq!(decoded["data_family"], "intervention_v2");
+        for (key, value) in original.as_object().unwrap() {
+            assert_eq!(decoded.get(key), Some(value));
+        }
+        let mut expected = original;
+        expected["data_family"] = json!("intervention_v2");
+        assert_eq!(raw, encode(&expected).unwrap());
+    }
+
+    #[test]
+    fn utility_startup_rejects_foreign_or_pretagged_family_drafts() {
+        let original = startup_draft(UtilityRuntimeFamily::CohortV1);
+        assert!(encode_startup(UtilityRuntimeFamily::InterventionV2, original).is_err());
+        let original = startup_draft(UtilityRuntimeFamily::InterventionV2);
+        assert!(encode_startup(UtilityRuntimeFamily::CohortV1, original).is_err());
+        for family in [
+            UtilityRuntimeFamily::CohortV1,
+            UtilityRuntimeFamily::InterventionV2,
+        ] {
+            let mut pretagged = startup_draft(family);
+            pretagged["data_family"] = json!("intervention_v2");
+            assert!(encode_startup(family, pretagged).is_err());
+            let mut missing = startup_draft(family);
+            missing
+                .as_object_mut()
+                .unwrap()
+                .remove("original_started_ns");
+            assert!(encode_startup(family, missing).is_err());
+            let mut foreign = startup_draft(family);
+            foreign["execution_authorized"] = json!(true);
+            assert!(encode_startup(family, foreign).is_err());
+        }
+    }
+
     #[test]
     fn utility_checkpoint_reserve_closes_only_new_work_and_keeps_original_hard_limit() {
         let original_started = Instant::now();
