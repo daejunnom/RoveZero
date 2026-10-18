@@ -1907,14 +1907,9 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
         profiles: &[CpuWorkerProfile],
         external: Option<&ExternalCpuConfig>,
-        selection: CpuEndpointSelection,
+        endpoint: CpuEndpoint,
         physical_budget_exhausted: bool,
     ) -> Result<CpuQuestion, AdaptiveManagerError> {
-        let endpoint = if selection.execution_use == CpuExecutionUse::Collection {
-            selection.cpu_t
-        } else {
-            selection.cpu_r
-        };
         match endpoint {
             CpuEndpoint::Own => {
                 let port = self.hot()?;

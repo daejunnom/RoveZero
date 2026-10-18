@@ -688,7 +688,7 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
         work: &CoordinatorWork<ReviewView, u64>,
         _: &[CpuWorkerProfile],
         _: Option<&ExternalCpuConfig>,
-        _: CpuEndpointSelection,
+        _: CpuEndpoint,
         physical_budget_exhausted: bool,
     ) -> Result<CpuQuestion, AdaptiveManagerError> {
         if physical_budget_exhausted {
@@ -2073,14 +2073,14 @@ mod adaptive_partial_feedback {
             work: &CoordinatorWork<ReviewView, u64>,
             profiles: &[CpuWorkerProfile],
             external: Option<&ExternalCpuConfig>,
-            selection: CpuEndpointSelection,
+            endpoint: CpuEndpoint,
             physical_budget_exhausted: bool,
         ) -> Result<CpuQuestion, AdaptiveManagerError> {
             self.inner.cpu_question(
                 work,
                 profiles,
                 external,
-                selection,
+                endpoint,
                 physical_budget_exhausted,
             )
         }

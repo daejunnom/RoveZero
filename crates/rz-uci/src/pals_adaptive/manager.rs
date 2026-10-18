@@ -1258,12 +1258,14 @@ pub trait AdaptiveSearchDriver<Q> {
         output: &RoleOutput,
         physical: Option<TicketExecutionEvidence>,
     ) -> Result<CheckedStep<Q>, AdaptiveManagerError>;
+    /// Use the manager's already resolved endpoint. The driver must not choose
+    /// the Collection teacher again after native R admission/preparation.
     fn cpu_question(
         &mut self,
         work: &CoordinatorWork<ReviewView, Q>,
         profiles: &[CpuWorkerProfile],
         external: Option<&ExternalCpuConfig>,
-        selection: CpuEndpointSelection,
+        endpoint: CpuEndpoint,
         physical_budget_exhausted: bool,
     ) -> Result<CpuQuestion, AdaptiveManagerError>;
     fn commit_cpu(
@@ -6824,7 +6826,7 @@ where
                     &work,
                     &profiles,
                     self.external.as_ref().map(|external| &external.config),
-                    self.registration.endpoints,
+                    endpoint,
                     physical_budget_exhausted,
                 ) {
                     Ok(question) => question,
