@@ -1150,3 +1150,47 @@ Capacity일 수 있다. 이 추가 수정의 집중·전체·실제 제품 검�
 ACK·strict 소비, update 0회 parent/child IPC, 일반 두 teacher의 실제 row/head
 소비, 외부 R의 counter→Repair→C/Fresh, 최종 CI·자료 회수다. 실제 학습과 원격
 성능/기력 비교·병합은 이번 비학습 목표에 포함하지 않는다.
+
+## 22차 체크포인트: 현재 CPU 실행과 Hybrid 초기화 실패 보존
+
+소스 `b010188`의 집중 검사 179는 실제 취소 ACK·원 terminal·capture 퇴역과
+review 용량 종료의 아홉 검사를 통과했다. 전체 build 171도 11단계 모두
+통과했다. 실제 UCI 796개, Search 1,069개·ignored 2개, inventory 1개와
+전체 feature/target 엄격 Clippy를 확인했고 실행물 10개·검증 caller 2개를
+보존했다. 별도 최소 feature caller 빌드의 기존 dead-code 경고를 workspace
+엄격 Clippy의 결과와 섞지 않는다. 관리 빌드의 임시 영역 정리도 확인했다.
+
+등록 172에서는 원 모델·가중치·인코딩·namespace를 유지하고 NNUEC 구현
+식별 차이를 보존했다. 새 바이너리 수치 178의 실제 20 forward는 독립
+scalar FP32 reference와 raw 출력·WDL 최대 절대 차이가 각각 0이었다.
+CPU P-C와 P-C-R은 각각 등록한 여덟 요청과 stop·ponder·quit 구간을 마쳤고,
+원 stdout/stderr·report·admission·finished readback 다섯 개씩을 회수했다.
+이는 UCI·OS 종료 범위의 자료이며 별도 제품 receipt 없는 물리 완료나
+통제된 성능 비교를 인수한 것으로 표시하지 않는다.
+
+Hybrid P-C 172는 초기 `uci` 응답 전에 60초 제한에 도달했다. 원 quit의
+15초 종료 조건도 충족하지 못해 신원을 확인한 원 프로세스에 SIGTERM을
+보냈고 OS 종료와 pipe EOF를 관측했다. 원자료 네 개를 회수했으며
+finished-live readback은 생성되지 않았다. 원 물리 완료는 unknown이다.
+admission은 모델·worker 생성 전의 관측이고 CUDA profile 디렉터리는
+생겼지만 placement 파일은 없었다. 이 자료로 CUDA 오류, 특정 loader
+병목, NN 실행 여부 또는 시간 부족을 확정하지 않는다. 후속 Hybrid P-C-R과
+cohort GPU 실행은 시작하지 않았으며 초기화 경계 진단이 먼저 필요하다.
+
+같은 `b010188`의 원격 Linux·Windows CPU 및 CPU bindings job은 성공했다.
+native bundle job은 제품 빌드 전 Python 설치 다운로드의 해시 불일치로
+실패했고 원 로그를 보존했다. PALS model CI는 감사 fixture의 engine source
+핀 변경으로 실패했다. 원 고정 Git blob 14개를 대조한 결과 engine의
+`BundleRecordCapacity` 처리 한 줄만 달라졌고 다른 13개는 같았다. 기존 세
+역사 bank와 제품 registry는 보존하고, 검토한 고정 LF source의 새 synthetic
+bank에 현재 fixture 소비자를 연결했다. 수정 후 관련 세 모듈의 CPU 검사
+180은 141개 모두 통과했다. 이 결과는 전체 PALS CI 재통과나 제품 실행 권한,
+Rules 증명·학습 target·실제 GPU 인수를 대신하지 않는다.
+
+선택한 별도 cohort `/2 FrozenProposalReviewV1`은 기본 탐색과 Ready `/1`을
+보존한다. 원 neutral proposal을 봉인하고 각 독립 root에서 P/C/R 요청과
+예산·clock·종료를 따로 보존하며, 미발급 arm을 unknown 또는 utility 0으로
+합성하지 않는다. 소스 감사에서 해당 경계의 추가 누락은 찾지 못했으나,
+현재 소스의 실제 세 arm·publication·별도 ACK·strict 소비 인수는 아직 남는다.
+그 후 update 0회 IPC, 일반 두 teacher와 외부 R 연결, 최종 CI·자료 회수를
+진행한다. 실제 학습·원격 성능/기력 비교·병합은 계속 제외한다.

@@ -30,12 +30,12 @@ from test_repair_context import RepairFixture
 from test_semantic_verifier import SemanticFixture, tokens
 import test_training as fixtures
 from native_source_review_fixture import (
-    PC_SHARED_REVIEWED_SOURCE_COMMIT as REVIEWED_SOURCE_COMMIT,
-    PC_SHARED_REVIEWED_TRANSITION_PINS as REVIEWED_TRANSITION_PINS,
-    PC_SHARED_SYNTHETIC_COMPILED_FACT as SYNTHETIC_COMPILED_FACT,
-    pc_shared_fixture_manifest as fixture_manifest,
-    pc_shared_fixture_review_scope as fixture_review_scope,
-    read_pc_shared_fixture_sources as read_reviewed_fixture_sources,
+    BUNDLE_CAPACITY_REVIEWED_SOURCE_COMMIT as REVIEWED_SOURCE_COMMIT,
+    BUNDLE_CAPACITY_REVIEWED_TRANSITION_PINS as REVIEWED_TRANSITION_PINS,
+    BUNDLE_CAPACITY_SYNTHETIC_COMPILED_FACT as SYNTHETIC_COMPILED_FACT,
+    bundle_capacity_fixture_manifest as fixture_manifest,
+    bundle_capacity_fixture_review_scope as fixture_review_scope,
+    read_bundle_capacity_fixture_sources as read_reviewed_fixture_sources,
 )
 
 
@@ -542,6 +542,39 @@ class NativeSlotClosureConsumerTests(unittest.TestCase):
 
 
 class ReviewedFixtureSuccessorTests(unittest.TestCase):
+    def test_bundle_capacity_bank_preserves_three_prior_banks_and_has_one_reviewed_change(self):
+        import native_source_review_fixture as banks
+        from rz_pals_model import native_source_review as reviewed
+        old_factories = (banks.fixture_profile, banks.successor_fixture_profile, banks.pc_shared_fixture_profile)
+        prior = [factory("default_disabled") for factory in old_factories]
+        current = banks.bundle_capacity_fixture_profile("default_disabled")
+        engine = slot_witness._SOURCE_PATHS[0]
+        self.assertEqual(banks.bundle_capacity_fixture_manifest()["source_commit"],
+                         "f1b82eae0f08241b53e885ed2e6e6d573221d54a")
+        self.assertEqual(current["component_pins"][engine], {"bytes": 423275,
+            "sha256": "7f1322ba591aef3c5f1f566c30f4f8184b9a736c935136fa4fed2c96273635e4"})
+        self.assertEqual(len(current["component_pins"]), 14)
+        self.assertEqual([path for path in prior[-1]["component_pins"]
+            if prior[-1]["component_pins"][path] != current["component_pins"][path]], [engine])
+        self.assertEqual(len({profile["review_id"] for profile in [*prior, current]}), 4)
+        before = copy.deepcopy(reviewed.REVIEWED_CLOSURE_PROFILES)
+        for lane in ("default_disabled", "legacy_single_reply"):
+            with banks.bundle_capacity_fixture_review_scope(lane) as profile:
+                manifest = banks.bundle_capacity_fixture_manifest()
+                proof = reviewed.review_transition_sources(pair=profile["transition_sources"], manifest=manifest,
+                    source={"native": {"search_implementation_sha256": banks.BUNDLE_CAPACITY_SYNTHETIC_COMPILED_FACT}}, lane=lane)
+                self.assertEqual(proof["closure_sha256"], banks.BUNDLE_CAPACITY_REVIEWED_CLOSURE_SHA256)
+                self.assertIs(proof["historical_metadata_only"], True)
+                for name in ("execution_authorized", "original_native_authority_reissued",
+                             "rules_proof_authorized", "training_target_authorized"):
+                    self.assertIs(proof[name], False)
+                for old in prior:
+                    with self.assertRaisesRegex(ValueError, "compiled search closure differs"):
+                        reviewed.review_transition_sources(pair=profile["transition_sources"], manifest=manifest,
+                            source={"native": {"search_implementation_sha256": old["compiled_search_implementation_sha256"]}}, lane=lane)
+            self.assertEqual(reviewed.REVIEWED_CLOSURE_PROFILES, before)
+        self.assertEqual([factory("default_disabled") for factory in old_factories], prior)
+
     def test_pc_shared_bank_preserves_both_earlier_banks_and_requires_its_own_fact(self):
         import native_source_review_fixture as banks
         from rz_pals_model import native_source_review as reviewed
