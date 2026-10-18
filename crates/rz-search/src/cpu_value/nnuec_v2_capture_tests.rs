@@ -647,18 +647,51 @@ fn yield_is_not_retirement_and_owner_cancel_retires_once_without_refill() {
     let first = report(&worker);
     assert!(!first.terminal && first.continuation_retained);
     assert!(capture.retirement().is_none());
-    mailbox.request_cancel(2).unwrap();
+    assert_eq!(mailbox.scope().job, envelope.id);
+    assert_eq!(mailbox.scope().owner, CpuWorkerId(0));
+    let cancel = mailbox.request_cancel(2);
+    // The original owner may acknowledge this exact request and seal the
+    // mailbox after request.store/notify but before request's final read.
+    // Closed alone proves nothing: require that owner's real terminal below.
+    assert!(matches!(
+        cancel,
+        Ok(()) | Err(rz_runtime::adaptive::ControlError::Closed)
+    ));
     let until = Instant::now() + WINDOW;
-    loop {
+    let termination = loop {
         let observed = worker.signal.version();
-        if capture.retirement().is_some() {
-            break;
+        if let Some(event) = worker.try_event().unwrap() {
+            match event {
+                CpuWorkerEvent::JobTerminated(termination) => break termination,
+                CpuWorkerEvent::Slice(_) => {
+                    panic!("cancel must not execute or refill another slice")
+                }
+            }
         }
-        assert!(Instant::now() < until);
+        assert!(
+            Instant::now() < until,
+            "original cancel terminal missing; request={cancel:?}"
+        );
         worker
             .signal
             .wait_changed(observed, Duration::from_millis(10));
-    }
+    };
+    assert_eq!(termination.job, envelope.id);
+    assert_eq!(termination.owner, CpuWorkerId(0));
+    assert_eq!(termination.last_execution, first.grant.execution);
+    assert_eq!(termination.completion, crate::cpu::CpuCompletion::Canceled);
+    assert_eq!(termination.controls.cancel_sequence, 2);
+    assert_eq!(termination.controls.cancel_ack, 2);
+    assert!(termination.controls.terminal);
+    assert_eq!(termination.retained_bytes, 0);
+    assert!(
+        !termination.shutdown,
+        "the owner canceled before process shutdown"
+    );
+    let controls = mailbox.snapshot();
+    assert_eq!(controls.cancel_sequence, 2);
+    assert_eq!(controls.cancel_ack, 2);
+    assert!(controls.terminal);
     let retirement = capture.retirement().unwrap();
     assert_eq!(
         retirement.ending(),
@@ -671,7 +704,12 @@ fn yield_is_not_retirement_and_owner_cancel_retires_once_without_refill() {
             .is_err()
     );
     assert_eq!(capture.retirement().unwrap().attempted(), attempted);
-    worker.shutdown().unwrap();
+    let stopped = worker.shutdown().unwrap();
+    assert!(stopped.thread_joined && !stopped.thread_panicked && stopped.engine_recoverable);
+    assert!(
+        stopped.events.is_empty(),
+        "original terminal was already collected once"
+    );
 }
 
 #[test]
