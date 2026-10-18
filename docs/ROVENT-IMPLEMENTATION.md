@@ -1462,3 +1462,43 @@ N05의 source272~actual275, 일반 teacher282/283, update0 IPC의 owner287 준�
 rawpin2/독립 경로 pin의 차이를 좁은 접점에서 검증한다. 실제 publication·별도 ACK·
 strict reader·IPC 종료가 없으면 준비나 구문 검사만으로 완료하지 않는다. 실제 학습,
 원격 성능·기력 비교와 병합은 계속 범위 밖이며 목표는 구현·기능 인수를 진행 중이다.
+
+## 29차 체크포인트: 새 실행물·metadata 준비와 GPU 미인수 유지
+
+`e3e7075`의 수명 진단과 공식 bundle 선언 도구를 공유했다. 진단 집중 검사 3개와
+launch 검사 5개, bundle metadata example 14개 및 영향받는 library/example의 엄격
+Clippy가 통과했다. build298의 다섯 단계와 세 dev 실행물을 별도로 보존했다.
+Windows worktree를 WSL에서 검증할 때 Git directory/worktree 경로와 실제
+`core.autocrlf=true`를 맞추고 양쪽 HEAD·clean을 확인한 뒤 공개 compiled source를
+명시했다. 이 경계를 갖추지 못한 294/297 준비 실패를 실제 source 등록으로 사용하지
+않는다. 새 출력은 550MiB 예약에 등록하고 원 ELF·의존 파일·strip 결과를 보존했으며
+allocated ELF section 동일성을 확인했다. 이 빌드는 기능 검증용이며 속도 자료가 아니다.
+
+새 CI는 JSON source catalog의 두 새 diagnostics 경로가 실제 embedded source
+목록에는 빠졌음을 기존 inventory 검사에서 검출했다. 두 component에 같은 leaf를
+추가하며 assertion이나 catalog에서 경로를 제거하지 않는다. 이 수정의 실제 CI는
+후속 정확 SHA에서 확인해야 한다. 옛 네 CPU job의 성공과 취소된 native bundle을
+새 source의 전체 성공으로 재사용하지 않는다.
+
+공식 Rust bundle digest로 corrected registration295의 네 mode metadata와 lock이
+준비됐다. 실제 공개 모델 boundary 다섯 source는 원바이트가 같고 CPU search,
+encoding/reference/export/runtime component와 원 NNUEC 조건도 대조했다. 해당
+준비기는 모델·ONNX·라이브러리 본문을 열거나 session/NN을 실행하지 않는다.
+
+새 Hybrid P-C 실행302는 wrapper가 XDG cache 환경을 전달하지 않아 runtime 단계에서
+종료했다. 원본은 보존하고 명시 환경과 별도 유한 window/lock304를 등록했다.
+304는 CUDA inventory·ORT runtime·모델 session·product assembly와 UCI/ready까지
+통과했다. 첫 depth 요청에서는 외부 harness의 등록360초와 달리 실제 타이머가
+180초로 남아 timeout됐고, quit 한도 뒤 TERM으로 종료했다. 원 exit/양 EOF와
+빈 cgroup은 확인했지만 NN 완료·원 root/session physical fence를 얻지 못했으므로
+GPU 물리 완료는 unknown이다. 후속 GPU 실행은 중단하고 하네스의 실제 clock과
+release 실행물을 준비한다. 준비 성공·device 종류만으로 GPU 수치 인수를 발급하지 않는다.
+
+병렬 metadata 준비272→273→274 factory/series→275 입력 조립은 모두 실제 exit0과
+원 child cleanup/EOF로 끝났다. 새 go20000ms와 prelude5s/action10s 조건을 보존하고
+actual275 실행은 별도다. safe-v3는 원 prefix와 old002 역사 pin을 보존하면서 현재
+preentry291을 원 held FD로 검증·실행한다. 일반 teacher282 source, 공식 새 recipe와
+validate,283 caller 및 두 helper003 plan 준비도 완료했다. 이 결과는 실제 P/C teacher
+target이나 일반 corpus publication·strict 소비를 대신하지 않는다. owner287은 현재
+등록291/STRIP251을 분리한 source·구문 준비이며 실제 dataset 이후 zero276을 진행한다.
+actual Collector·teacher/root·optimizer·학습 완료는 아직 이 체크포인트의 결과가 아니다.
