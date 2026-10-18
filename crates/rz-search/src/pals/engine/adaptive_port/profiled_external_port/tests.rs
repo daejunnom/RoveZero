@@ -45,6 +45,7 @@ const AUTHORED_UCI: &str = r#"
 use std::io::{self, BufRead, Write};
 fn main() {
     let mut after_reply = false;
+    let long_pv = std::env::args().skip(1).any(|argument| argument == "--authored-long-pv");
     for line in io::stdin().lock().lines() {
         let line = line.unwrap();
         if line == "uci" {
@@ -64,7 +65,10 @@ fn main() {
         } else if line.starts_with("go ") {
             // The real adapter, not this fixture, owns requested/issued limits.
             let movement = if after_reply { "g1f3" } else { "e7e5" };
-            println!("info depth 2 seldepth 3 nodes 7 score cp 21 pv {movement}");
+            let pv = if long_pv {
+                if after_reply { "g1f3 b8c6" } else { "e7e5 g1f3" }
+            } else { movement };
+            println!("info depth 2 seldepth 3 nodes 7 score cp 21 pv {pv}");
             println!("bestmove {movement}");
         } else if line == "quit" {
             break;
@@ -183,8 +187,14 @@ impl AuthoredElf {
         fixture
     }
 
-    fn config(&self) -> ExternalCpuConfig {
+    fn config(&self, long_pv: bool) -> ExternalCpuConfig {
         let profile = ExternalEngineProfile::Reckless090EmbeddedNnue;
+        let arguments = if long_pv {
+            vec!["--authored-long-pv".into()]
+        } else {
+            Vec::new()
+        };
+        let arguments_sha256 = crate::external_cpu::arguments_sha256(&arguments);
         let mut hash = Sha256::new();
         let mut file = File::open(&self.program).unwrap();
         let mut buffer = [0_u8; 65_536];
@@ -197,12 +207,12 @@ impl AuthoredElf {
         }
         ExternalCpuConfig {
             program: self.program.clone(),
-            arguments: Vec::new(),
+            arguments,
             working_directory: self.root.clone(),
             identity: ExternalCheckerIdentity {
                 adapter_semantics: crate::external_cpu::EXTERNAL_UCI_SCORE_SEMANTICS.into(),
                 binary_sha256: format!("{:x}", hash.finalize()),
-                launch_arguments_sha256: crate::external_cpu::arguments_sha256(&[]),
+                launch_arguments_sha256: arguments_sha256,
                 // Authored declarations select the guarded wire protocol; the
                 // binary hash above is this fixture's, never the official pin.
                 declared_name: profile.expected_uci_name().into(),
@@ -354,8 +364,23 @@ struct AuthoredWorkerFixture {
 
 impl AuthoredWorkerFixture {
     fn new(lifetime: Duration, archive: bool) -> Self {
+        Self::with_goal_and_pv(lifetime, archive, 2, false)
+    }
+
+    fn with_goal_and_pv(lifetime: Duration, archive: bool, goal_plies: u16, long_pv: bool) -> Self {
+        Self::with_root_limits(lifetime, archive, goal_plies, 128, long_pv)
+    }
+
+    fn with_root_limits(
+        lifetime: Duration,
+        archive: bool,
+        goal_plies: u16,
+        root_nodes: u64,
+        long_pv: bool,
+    ) -> Self {
+        let goal_plies = NonZeroU16::new(goal_plies).expect("authored original goal is nonzero");
         let elf = AuthoredElf::new();
-        let config = elf.config();
+        let config = elf.config(long_pv);
         let authority = SearchAuthority {
             epoch: ProcessEpoch(73),
             game: GameGeneration(1),
@@ -454,7 +479,7 @@ impl AuthoredWorkerFixture {
             PalsLimits {
                 deadline: origin + lifetime,
                 max_rounds: 1,
-                max_cpu_nodes: 128,
+                max_cpu_nodes: root_nodes,
                 cpu_depth: 2,
             },
             issuer,
@@ -480,10 +505,10 @@ impl AuthoredWorkerFixture {
                 original_deadline: deadline,
                 root_budget: budget,
                 goal: SearchGoal {
-                    depth_plies: NonZeroU16::new(2),
+                    depth_plies: Some(goal_plies),
                     mate_moves: None,
                 },
-                nodes: Some(128),
+                nodes: Some(root_nodes),
                 selective_policy: ContractDigest([11; 32]),
                 root_rules: Arc::clone(&port.rules),
                 root_moves: Arc::clone(&domain),
@@ -743,11 +768,43 @@ fn authored_worker_nodes_only_retry_keeps_raw_constraint_and_publication_once() 
     let mut fixture = AuthoredWorkerFixture::new(Duration::from_secs(20), false);
     let work = fixture.work(1);
     let (admitted, packet) = fixture.dispatch(&work, 1);
+    let before_projection = fixture.port.rovent_frontier().unwrap().snapshot().work;
     let raw_only = fixture
         .port
         .commit_profiled_external(&work, &fixture.source, admitted.reservation, &packet, false)
         .unwrap();
     assert!(!raw_only.consumed);
+    assert_eq!(work.input.stage, RefinementStage::CpuValidation);
+    let retained_raw = fixture
+        .port
+        .engine
+        .semantic
+        .stores
+        .observations
+        .get(raw_only.observation)
+        .unwrap();
+    let report = retained_raw.external_report.as_ref().unwrap();
+    assert_eq!(report.pv, [BoardMove::from_uci("e7e5").unwrap()]);
+    assert_eq!(
+        fixture
+            .port
+            .engine
+            .semantic
+            .stores
+            .lines
+            .moves(retained_raw.cpu_pv.expect("live validation has a paid PV"))
+            .unwrap(),
+        report.pv
+    );
+    let after_projection = fixture.port.rovent_frontier().unwrap().snapshot().work;
+    assert_eq!(
+        after_projection.checked_transitions,
+        before_projection.checked_transitions + 1
+    );
+    assert_eq!(
+        after_projection.native_nodes,
+        before_projection.native_nodes
+    );
     let execution = fixture.port.profiled_external.entries[&work.input.question_digest].execution;
     let task = fixture
         .port
@@ -916,6 +973,77 @@ fn authored_worker_nodes_only_retry_keeps_raw_constraint_and_publication_once() 
         retirement.original_cleanup_deadline(),
         Some(fixture.port.limits.deadline + Duration::from_secs(2))
     );
+}
+
+#[test]
+fn authored_worker_complete_pv_beyond_original_allowance_retains_packet_without_publication() {
+    let _serial = EXTERNAL_FIXTURE_LOCK.lock().unwrap();
+    for (goal, root_nodes, paid_before_failure) in [(2, 128, 0), (3, 3, 1)] {
+        let mut fixture = AuthoredWorkerFixture::with_root_limits(
+            Duration::from_secs(20),
+            false,
+            goal,
+            root_nodes,
+            true,
+        );
+        let work = fixture.work(1);
+        let (admitted, packet) = fixture.dispatch(&work, 1);
+        assert_eq!(work.input.stage, RefinementStage::CpuValidation);
+        assert_eq!(
+            packet.result().as_ref().unwrap().report.raw.pv,
+            [
+                BoardMove::from_uci("e7e5").unwrap(),
+                BoardMove::from_uci("g1f3").unwrap()
+            ]
+        );
+        let before = fixture.port.rovent_frontier().unwrap().snapshot().work;
+        let failure = fixture.port.commit_profiled_external(
+            &work,
+            &fixture.source,
+            admitted.reservation,
+            &packet,
+            false,
+        );
+        if goal == 2 {
+            assert!(matches!(
+                failure,
+                Err(PalsError::Rovent(
+                    crate::pals::rovent_frontier::FrontierError::DepthHorizon
+                ))
+            ));
+        } else {
+            assert!(matches!(
+                failure,
+                Err(PalsError::Rovent(
+                    crate::pals::rovent_frontier::FrontierError::NodeBudget
+                ))
+            ));
+        }
+        let after = fixture.port.rovent_frontier().unwrap().snapshot().work;
+        // Horizon rejection happens before replay. Quota failure keeps the
+        // paid first transition; neither case publishes a partial observation.
+        assert_eq!(
+            after.checked_transitions,
+            before.checked_transitions + paid_before_failure
+        );
+        assert_eq!(after.native_nodes, before.native_nodes);
+        let original = &fixture.port.profiled_external.entries[&work.input.question_digest];
+        assert!(Arc::ptr_eq(original.completion.as_ref().unwrap(), &packet));
+        assert!(original.prepared_observation.is_none());
+        assert!(original.published.is_none() && original.consumed.is_none());
+        assert!(original.publication_error.is_some());
+        assert_eq!(fixture.port.counters.consumed_external_checker_tasks, 0);
+        let fence = fixture.quiesce();
+        let retirement = fixture
+            .port
+            .release_profiled_external_root(&fixture.source, &fence)
+            .unwrap();
+        assert_eq!(retirement.retained_questions(), 1);
+        let retained = retirement.packets().next().unwrap();
+        assert!(Arc::ptr_eq(retained.completion().unwrap(), &packet));
+        assert!(retained.publication_error().is_some());
+        assert!(!retained.search_consumed() && retained.observation().is_none());
+    }
 }
 
 #[test]

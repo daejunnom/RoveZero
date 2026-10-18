@@ -75,6 +75,12 @@ impl PalsStores {
         self.append_cpu_pv_once(position, moves)
     }
 
+    /// The exact retained prefix required by validate_external_pv. Reading the
+    /// original Store cap grants no Rules path, allocation or work allowance.
+    pub(crate) fn hot_external_pv_projection_plies(&self, reported_plies: usize) -> usize {
+        reported_plies.min(self.limits.line_plies)
+    }
+
     /// Register only a suffix of the original controller's already-paid Rules
     /// path. Immutable snapshots are compared; no second make/replay is done.
     /// This authenticates historical path validity, never CPU work or a score.

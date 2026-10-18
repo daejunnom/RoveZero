@@ -954,50 +954,36 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 CheckerError::Invalid("profiled raw report changed source/constraint").into(),
             );
         }
-        // The real private parser validated the complete raw PV before this
-        // packet was minted. Retain that complete report without extra Rules
-        // work. Only discovery's actual line consumer needs a paid projection.
-        let projection_limit = if work.input.stage == RefinementStage::CpuDiscovery
-            && self.check_work(work).is_ok()
-            && admission.source.validate_current().is_ok()
-        {
-            let remaining = self
-                .engine
-                .config
-                .line_plies
-                .saturating_sub(work.input.question.context.prefix.len());
-            let original = self
-                .existing_checked_frontier_line(&work.input.question.context.prefix)?
-                .ok_or(crate::pals::rovent_frontier::FrontierError::ForeignHandle)?;
-            usize::from(
-                self.rovent_frontier()
-                    .ok_or(crate::pals::rovent_frontier::FrontierError::ForeignRoot)?
-                    .chunk_limit(
-                        original.path(),
-                        u16::try_from(remaining).map_err(|_| PalsError::Capacity)?,
-                    )?,
-            )
-        } else {
-            0
-        };
-        let projected: Vec<_> = raw.pv.iter().copied().take(projection_limit).collect();
-        let pv = if projected.is_empty()
-            || self.check_work(work).is_err()
-            || admission.source.validate_current().is_err()
-        {
-            // The unprojected, unverified late PV remains in external_report.
-            // Closed admission cannot start Rules work merely to archive it.
+        // The complete raw report is retained independently. Every publication
+        // stage must additionally meet the Store's exact bounded-PV contract;
+        // validation/peer R must not be relabelled as discovery to obtain it.
+        let projection_plies = self
+            .engine
+            .semantic
+            .stores
+            .hot_external_pv_projection_plies(raw.pv.len());
+        let projected = &raw.pv[..projection_plies];
+        let pv = if projected.is_empty() {
             None
         } else {
+            self.check_work(work)?;
+            admission.source.validate_current()?;
             let mut prefix = work.input.question.context.prefix.clone();
-            prefix.extend_from_slice(&projected);
+            prefix
+                .try_reserve_exact(projected.len())
+                .map_err(|_| PalsError::Capacity)?;
+            prefix.extend_from_slice(projected);
+            // This existing path handles every checked ply under the original
+            // horizon, quota and deadline, including paths longer than one CPU
+            // chunk. Failure retains any paid partial path and the completed
+            // packet, but no partial Store observation is manufactured.
             let checked = match self.existing_checked_frontier_line(&prefix)? {
                 Some(checked) => checked,
                 None => self.checked_frontier_line(&prefix)?,
             };
             Some(self.engine.semantic.stores.hot_append_checked_cpu_pv(
                 &admission.job.position,
-                &projected,
+                projected,
                 &checked,
             )?)
         };

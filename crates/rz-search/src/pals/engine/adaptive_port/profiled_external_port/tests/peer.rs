@@ -144,7 +144,10 @@ fn authored_published_ranking(
 #[test]
 fn authored_worker_optional_peer_r_returns_to_original_accepted_parent() {
     let _serial = EXTERNAL_FIXTURE_LOCK.lock().unwrap();
-    let mut fixture = AuthoredWorkerFixture::new(Duration::from_secs(20), false);
+    // P publishes the two-ply prefix; R's actual one-ply raw PV needs one
+    // further paid Rules transition inside this original startup horizon.
+    let mut fixture =
+        AuthoredWorkerFixture::with_goal_and_pv(Duration::from_secs(20), false, 3, false);
     let clock = fixture.clock.domain();
     let root_budget = fixture
         .port
@@ -460,6 +463,17 @@ fn authored_worker_optional_peer_r_returns_to_original_accepted_parent() {
         EvidenceScope::ProfiledExternalUci { .. }
     ));
     assert!(matches!(raw.score, RawScore::ExternalUci { .. }));
+    assert_eq!(
+        fixture
+            .port
+            .engine
+            .semantic
+            .stores
+            .lines
+            .moves(raw.cpu_pv.expect("peer R has its original paid PV"))
+            .unwrap(),
+        [BoardMove::from_uci("g1f3").unwrap()]
+    );
     let fence = fixture.quiesce();
     let retirement = fixture
         .port
