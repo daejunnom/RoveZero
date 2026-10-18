@@ -2826,6 +2826,17 @@ where
         self.collection_admission = Some(admission);
         Ok(())
     }
+    /// A same-root cooperative Collection failure closes new work but cannot
+    /// discard already admitted native/CPU owners. The original typed failure
+    /// remains separate from the actual root fence produced by the drain.
+    pub(crate) fn record_collection_caller_failure(
+        &mut self,
+        error: AdaptiveCollectionError,
+        until: Instant,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.record_failure(AdaptiveManagerError::Collection(error));
+        self.begin_root_quiesce(until)
+    }
     /// 다음 root에서 재사용할 observer 반환은 실제 owner fence 뒤만 허용한다.
     pub fn take_collection_observer(
         &mut self,

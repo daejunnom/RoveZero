@@ -2325,6 +2325,62 @@ fn changed_tick_observer_can_close_root_before_late_child_consumption() {
 }
 
 #[test]
+fn cooperative_collection_failure_drains_active_native_before_retained_semantic_error() {
+    let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    // Hold the actual first authored physical run until its same-owner cancel.
+    // Merely having a submitted ticket is not evidence of an active run.
+    facts.block_after_first_run.store(true, Ordering::Release);
+    manager.prepare_root_ranking(root).unwrap();
+    pump(&mut manager, until, |_| {
+        facts.started.lock().unwrap().len() == 1
+    });
+    assert!(facts.accepted.lock().unwrap().is_empty());
+    let original = AdaptiveCollectionError::new(
+        AdaptiveCollectionStage::Settled,
+        "FixtureCollectionCaller",
+        "original cooperative failure while physical role is active",
+    );
+    manager
+        .record_collection_caller_failure(original.clone(), until)
+        .unwrap();
+    assert_eq!(manager.phase(), ManagerPhase::Draining);
+    assert!(!manager.shutdown_receipt().unwrap().permits_root_reuse());
+    // Uses the existing original deadline and real cancel/Retired/root fence,
+    // rather than clearing the active run or inventing a completed output.
+    let receipt = manager.run_until(until, &AtomicBool::new(false)).unwrap();
+    assert!(receipt.permits_root_reuse());
+    assert_eq!(manager.phase(), ManagerPhase::Finished);
+    assert_eq!(receipt.native_cpu_reserved, 0);
+    assert_eq!(receipt.pending_tickets, 0);
+    assert_eq!(manager.counters().consumed_role_outputs, 0);
+    assert!(facts.accepted.lock().unwrap().is_empty());
+    assert!(facts.quiesce_called.load(Ordering::Acquire));
+    assert!(!facts.finish_called.load(Ordering::Acquire));
+    assert!(matches!(
+        manager.failures().next(),
+        Some(AdaptiveManagerError::Collection(error)) if error == &original
+    ));
+    // A physical reuse receipt never erases the retained semantic failure.
+    // Finish the original process owner explicitly; no native thread is left
+    // active merely because this fixture's root fence was successful.
+    let parts = match manager.into_persistent_parts() {
+        Ok(parts) => parts,
+        Err(rejected) => panic!("failed Collection root owner recovery: {}", rejected.error),
+    };
+    let (mut native, _, _, _, _, _) = parts.into_components();
+    native.begin_shutdown(until);
+    while !native.try_join().unwrap() {
+        while native.poll().is_some() {}
+        assert!(
+            Instant::now() < until,
+            "original physical process finish timed out"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(facts.finish_called.load(Ordering::Acquire));
+}
+
+#[test]
 fn cancel_during_actual_cpu_slice_preserves_final_receipts_before_archive_close() {
     let (mut manager, facts, root, until) = fixture(FixtureScope::OwnCpuResume, true, 13);
     facts.child_gate.store(true, Ordering::Release);

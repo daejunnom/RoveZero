@@ -83,6 +83,9 @@ struct RootRunCustody {
     /// Semantic failure is distinct from the physical retirement below. Keep
     /// actual typed observations until that retirement can return known Idle.
     semantic_failures: Option<Box<[AdaptiveManagerError]>>,
+    /// First exact cooperative Collection error. Later drain/closure failures
+    /// cannot replace its primary diagnostic or create a physical fence.
+    collection_failure: Option<crate::pals_adaptive::AdaptiveCollectionError>,
     finished: Option<Box<RootReturn>>,
 }
 
@@ -130,15 +133,21 @@ impl RootRunCustody {
             retirement_deadline: None,
             failure_payload: None,
             semantic_failures: None,
+            collection_failure: None,
             finished: None,
         })
     }
 
     fn fail(&self, code: &'static str, detail: impl Into<String>) -> RootRunFailure {
-        RootRunFailure {
-            code,
-            detail: detail.into(),
-        }
+        let detail = detail.into();
+        let detail = match &self.collection_failure {
+            Some(original) => format!(
+                "{}; subsequent {code}: {detail}",
+                AdaptiveManagerError::Collection(original.clone())
+            ),
+            None => detail,
+        };
+        RootRunFailure { code, detail }
     }
 
     fn retain_failure<T: Any + Send>(
@@ -596,6 +605,7 @@ impl RoventNnuecSessionDriver {
     ) -> Result<(), RootRunFailure> {
         let root_budget = run.root_budget.expect("same original root budget");
         let mut collection_admitted = false;
+        let mut collection_failure = None;
         let execution = {
             let manager = run.manager.as_mut().expect("actual admitted manager");
             let actor = run.actor.as_ref().expect("same preparation actor");
@@ -671,9 +681,22 @@ impl RoventNnuecSessionDriver {
                         {
                             manager.begin_root_quiesce(context.shutdown_deadline)?;
                         }
-                        if collection_admitted {
+                        if collection_admitted && collection_failure.is_none() {
                             if let Some(pump) = &self.collection_hooks.cooperative {
-                                pump()?;
+                                match pump() {
+                                    Ok(()) => {}
+                                    Err(AdaptiveManagerError::Collection(error)) => {
+                                        // Disable only the failed caller pump.
+                                        // The same actor/native cleanup below
+                                        // must keep progressing while closing.
+                                        collection_failure = Some(error.clone());
+                                        manager.record_collection_caller_failure(
+                                            error,
+                                            context.shutdown_deadline,
+                                        )?;
+                                    }
+                                    Err(error) => return Err(error),
+                                }
                             }
                         }
                         manager.pump_nnuec_preparation(actor)?;
@@ -700,6 +723,7 @@ impl RoventNnuecSessionDriver {
             }))
         };
         run.collection_admitted = collection_admitted;
+        run.collection_failure = collection_failure;
         match execution {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -726,7 +750,17 @@ impl RoventNnuecSessionDriver {
             }
         };
         let manager = run.manager.as_ref().expect("same fenced manager");
-        let semantic_failures: Box<[_]> = manager.failures().cloned().collect();
+        let mut semantic_failures: Vec<_> = manager.failures().cloned().collect();
+        if let Some(original) = &run.collection_failure {
+            // The manager's existing bounded history may have rolled over
+            // while draining. Keep this exact first caller cause primary
+            // without changing that history's capacity or error semantics.
+            semantic_failures.retain(|error| {
+                !matches!(error, AdaptiveManagerError::Collection(error) if error == original)
+            });
+            semantic_failures.insert(0, AdaptiveManagerError::Collection(original.clone()));
+        }
+        let semantic_failures = semantic_failures.into_boxed_slice();
         if !semantic_failures.is_empty() {
             run.semantic_failures = Some(semantic_failures);
         }
