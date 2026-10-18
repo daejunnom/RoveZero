@@ -409,9 +409,37 @@ where
             .as_ref()
             .expect("retained accepted role output")
             .proposer_ranking_output();
+        // The submitted snapshot remains the original input/output lineage.
+        // Actual dependent children may have spent transferred role credit
+        // since submission, so only the machine can supply the current budget.
+        let current = self
+            .machine
+            .bound_work(work.frame, StepExecution::Role(source.id))?;
+        if source.authority != work.frame.authority
+            || source.question != work.input.question_digest
+            || source.view != work.input.view_seal
+            || source.original_deadline != work.original_deadline
+            || current.frame != work.frame
+            || current.original_first_move != work.original_first_move
+            || current.original_deadline != work.original_deadline
+            || current.input.stage != work.input.stage
+            || current.input.stage.role() != Some(source.role)
+            || current.input.question_digest != work.input.question_digest
+            || current.input.view_seal != work.input.view_seal
+            || current.input.public_context != work.input.public_context
+            || !Arc::ptr_eq(&current.input.question, &work.input.question)
+            || !Arc::ptr_eq(&current.input.view, &work.input.view)
+            || current.budget.original_cpu_credit != work.budget.original_cpu_credit
+            || current.budget.original_store_byte_limit != work.budget.original_store_byte_limit
+            || current.budget.role_submissions_remaining > work.budget.role_submissions_remaining
+        {
+            return Err(AdaptiveManagerError::Invalid(
+                "accepted peer parent readback differs from original bound source",
+            ));
+        }
         let checked = self
             .driver
-            .commit_role(&work, &source, output, held.binding.physical)?;
+            .commit_role(&current, &source, output, held.binding.physical)?;
         self.driver.role_consumed(&source, &work.input.view)?;
         if !held.binding.consumption_recorded {
             self.record_role_consumption(source, held.binding.physical)?;
@@ -428,7 +456,7 @@ where
                 .expect("actual accepted source"),
             output,
         )?;
-        self.resolve(work, StepExecution::Role(source.id), checked)?;
+        self.resolve(current, StepExecution::Role(source.id), checked)?;
         Ok(true)
     }
 
