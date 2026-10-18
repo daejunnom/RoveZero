@@ -37,6 +37,43 @@ pub(super) struct UtilityInterventionState<Q> {
     cache_ack: Option<NnuecCacheReleaseAck>,
     cache_attached: bool,
 }
+impl<Q> UtilityInterventionState<Q> {
+    /// Observe the original prelude without declaring a trial or a route.
+    pub(super) fn awaiting_source(
+        profile: Digest,
+        prelude_cutoff: Instant,
+        maximum_cleanup: Instant,
+        observer: Box<dyn UtilityInterventionSourceObserver<Q>>,
+    ) -> Self {
+        Self {
+            profile,
+            prelude_cutoff,
+            maximum_cleanup,
+            observer: Some(observer),
+            trial: None,
+            rejection: None,
+            window: None,
+            rejected_target: None,
+            rejected_source: None,
+            rejected_candidate: None,
+            rejected_admission: None,
+            cache_invalidation: None,
+            cache_ack: None,
+            cache_attached: false,
+        }
+    }
+}
+#[cfg(test)]
+struct ContinueOriginalPrelude;
+#[cfg(test)]
+impl<Q> UtilityInterventionSourceObserver<Q> for ContinueOriginalPrelude {
+    fn source(
+        &mut self,
+        _: UtilityInterventionSourceSnapshot<Q>,
+    ) -> UtilityInterventionSourceDisposition<Q> {
+        UtilityInterventionSourceDisposition::ContinuePrelude
+    }
+}
 impl<Q, B, D> AdaptiveExecutionManager<Q, B, D>
 where
     Q: Clone + Send + Sync + 'static,
@@ -44,6 +81,56 @@ where
     B::Output: ProposerRankingOutput,
     D: AdaptiveSearchDriver<Q>,
 {
+    /// Keep the component probe inside the manager's private ownership boundary.
+    /// It neither calls public Collection admission nor mints an actual trial.
+    #[cfg(test)]
+    pub(in crate::pals_adaptive) fn pump_nnuec_with_unselected_intervention_for_test(
+        &mut self,
+        actor: &PreparationActor,
+        installed_bound_checked: &mut bool,
+    ) -> Result<bool, AdaptiveManagerError> {
+        assert!(self.utility_intervention.is_none());
+        assert!(self.utility_route.is_none());
+        self.utility_intervention = Some(UtilityInterventionState::awaiting_source(
+            Digest([126; 32]),
+            self.registration.hard_deadline,
+            self.registered_cleanup_deadline()
+                .expect("original registered cleanup"),
+            Box::new(ContinueOriginalPrelude),
+        ));
+        // The same actor's real prepared_bound passes through utility_bind_bound
+        // during this pump before its original R installation can continue.
+        let pumped = self.pump_nnuec_preparation(actor);
+        if !*installed_bound_checked
+            && let Some(bound) = self
+                .nnuec_jobs
+                .first()
+                .map(|custody| Arc::clone(&custody.bound))
+        {
+            assert!(bound.utility_input_capture().is_none());
+            assert!(!self.utility_bind_bound(Arc::clone(&bound)).unwrap());
+            // A declared route is no longer pure prelude. This ordinary R
+            // Bound has no neutral capture and must still fail closed.
+            self.declare_cohort_utility_route(0, UtilityRouteRecipient::Researcher, 1)
+                .unwrap();
+            let rejected = self.utility_bind_bound(bound);
+            let route = self.utility_route.take().unwrap();
+            assert!(route.action.is_none() && route.preparation.is_none());
+            assert!(matches!(
+                rejected,
+                Err(AdaptiveManagerError::Invalid(
+                    "intervention neutral Request has no capture"
+                ))
+            ));
+            *installed_bound_checked = true;
+        }
+        let original = self.utility_intervention.take().unwrap();
+        assert!(original.trial.is_none() && original.rejection.is_none());
+        assert!(original.observer.is_some());
+        assert!(self.utility_route.is_none());
+        pumped
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn set_utility_intervention_source_observer(
         &mut self,
@@ -129,22 +216,12 @@ where
         })();
         match checked {
             Ok((profile, prelude_cutoff, maximum_cleanup)) => {
-                self.utility_intervention = Some(UtilityInterventionState {
+                self.utility_intervention = Some(UtilityInterventionState::awaiting_source(
                     profile,
                     prelude_cutoff,
                     maximum_cleanup,
-                    observer: Some(observer),
-                    trial: None,
-                    rejection: None,
-                    window: None,
-                    rejected_target: None,
-                    rejected_source: None,
-                    rejected_candidate: None,
-                    rejected_admission: None,
-                    cache_invalidation: None,
-                    cache_ack: None,
-                    cache_attached: false,
-                });
+                    observer,
+                ));
                 Ok(())
             }
             Err(e) => Err((e, observer)),
@@ -272,13 +349,23 @@ where
         s.window = Some(trial.arm_window(started)?);
         Ok(())
     }
-    /// Runs only for the actual neutral preparation completion, before any arm
-    /// Request/role/native work can be admitted.
+    /// Intercept an actual neutral/arm completion only after its source was
+    /// selected. An unselected observer leaves the ordinary R installation live.
     pub(super) fn bind_intervention_neutral_bound(
         &mut self,
         bound: Arc<BoundNnuecReviewContext>,
     ) -> Result<bool, AdaptiveManagerError> {
-        if self.utility_intervention.is_none() {
+        let Some(intervention) = &self.utility_intervention else {
+            return Ok(false);
+        };
+        // The actor also completes ordinary R preparations while the original
+        // observer waits for an eligible source. An observer alone cannot turn
+        // those Bounds into neutral intervention inputs. Once a trial, route,
+        // or rejection exists, retain the strict route/capture checks below.
+        if intervention.trial.is_none()
+            && self.utility_route.is_none()
+            && intervention.rejection.is_none()
+        {
             return Ok(false);
         }
         let state = self

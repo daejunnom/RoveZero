@@ -1502,3 +1502,39 @@ validate,283 caller 및 두 helper003 plan 준비도 완료했다. 이 결과는
 target이나 일반 corpus publication·strict 소비를 대신하지 않는다. owner287은 현재
 등록291/STRIP251을 분리한 source·구문 준비이며 실제 dataset 이후 zero276을 진행한다.
 actual Collector·teacher/root·optimizer·학습 완료는 아직 이 체크포인트의 결과가 아니다.
+
+## 30차 체크포인트: 실제 개입 실패와 준비 단계 routing 수정
+
+`b16d681`의 embedded source 목록 수정은 새 관리 실행의 inventory 집중 검사에서
+통과했다. 해당 SHA의 CI는 CPU bindings 성공과 Windows workspace 검사 단계의
+성공까지 관측했으며, 나머지 job의 최종 상태는 이 기록에 포함하지 않는다.
+관측 중인 CI나 같은 이름의 과거 성공을 실제 제품 인수로 사용하지 않는다.
+
+원 `6afa16b`/STRIP251의 actual275-v3는 약 1.14초 만에
+`intervention route missing`으로 실패했다. 원 프로세스 종료·양 EOF와 빈 delegated
+parent는 확인했지만 제품이 보고한 `PhysicalCompletionUnknown`을 보존한다.
+원 source·입력·실패 receipt와 준비272~275를 새 실행 성공으로 바꾸지 않는다.
+
+원인은 UCI manager가 observer 등록만 된 prelude에서 일반 R의 실제 준비 완료를
+개입 neutral 완료로 처리한 분기였다. source snapshot의 Trial 선택 전에 route를
+요구했다. trial·route·rejection이 모두 없는 경우만 원 R 설치를 계속하도록 수정한다.
+실제 발급 뒤의 route·원 capture·권한 검사는 유지한다. 기존 NNUEC owner 통합검사에
+실제 actor의 installed Bound 관측과 route 발급 뒤 capture 누락 거부를 연결했다.
+private 상태 접근은 manager 내부의 test 전용 경계로 제한하며 Search/Arena는
+변경하지 않았다. 이 source 수정의 컴파일·실제 재시도는 후속 정확 SHA에서 확인한다.
+
+새 GPU 하네스305의 실제 clock은 최초 시작점 기준 실행360초·정리390초이며
+보고서의 360000/30000ms와 일치한다. 독립 AST 집중 검사는 이 두 계산을 확인했다.
+원304 타이머 실패는 보존하며 새 lock·leaf·epoch 없이 같은 실행을 반복하지 않는다.
+
+외부 프로필 도구070은 compiled source `6afa16b`와 관리 tooling `b16d681`의 원문
+핀을 명시적으로 분리한 새310 경로에서 빌드·보존했다. 원 구형 실행기가 최신
+closure metadata를 거부한306 실패는 유지한다. 새 출력은128MiB 예약과14일 검토
+기한을 가지며, streaming ELF 해시·보존 FD readback·원 supervisor tree 종료·
+retained catalog/sidecar 일치를 확인했다. 이 결과는 외부 R 실행이나 신경망 완료가 아니다.
+
+남은 실제 인수는 N05의 새 source arm/publication·별도 ACK·strict 소비,
+일반 teacher의 P/C target·publication·strict 소비, 외부 R의 실제 counter→Repair→
+C/Fresh 연결, 실제 dataset 이후 update0 IPC, 현재 네 mode와 독립 Fresh GPU 수치·
+물리 종료다. 준비 문서·metadata·빌드와 각 실제 결과를 계속 구분한다.
+실제 학습·원격 성능/기력 비교·병합은 이번 범위 밖이다.

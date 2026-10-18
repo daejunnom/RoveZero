@@ -490,12 +490,29 @@ fn run_same_preparing_owner(endpoints: CpuEndpointSelection) {
         .unwrap();
     let root = manager.driver_mut().root_input().unwrap();
     manager.prepare_root_ranking(root).unwrap();
+    let collection_prelude =
+        endpoints.execution_use == rz_search::external_cpu::CpuExecutionUse::Collection;
+    let mut prelude_bound_checked = false;
     let receipt = manager
         .run_root_until_observed(cleanup_until, &AtomicBool::new(false), &mut |manager| {
-            manager.pump_nnuec_preparation(&actor)?;
+            if collection_prelude {
+                // Exercise the actual actor -> prepared_bound -> manager bind
+                // path. Private state and the strict route-negative probe stay
+                // inside the manager's cfg(test)-only helper.
+                manager.pump_nnuec_with_unselected_intervention_for_test(
+                    &actor,
+                    &mut prelude_bound_checked,
+                )?;
+            } else {
+                manager.pump_nnuec_preparation(&actor)?;
+            }
             Ok(())
         })
         .unwrap();
+    assert!(
+        !collection_prelude || prelude_bound_checked,
+        "Collection regression must observe an actual installed R Bound"
+    );
     eprintln!("NNUEC_OWNER_STAGE actual-root-completed");
     assert_eq!(manager.phase(), ManagerPhase::Finished);
     assert!(receipt.permits_root_reuse(), "{receipt:?}");
