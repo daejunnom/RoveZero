@@ -98,6 +98,9 @@ pub struct FrontierAttachment<'a> {
 pub enum FrontierError {
     Invalid(&'static str),
     Capacity(&'static str),
+    /// The original semantic Store refused another retained public record.
+    /// This does not cover pin, archive, allocation or physical-owner failures.
+    PublicRecordCapacity,
     ForeignRoot,
     ForeignHandle,
     Duplicate,
@@ -547,6 +550,8 @@ pub struct RoventFrontier {
     work: FrontierNodeWork,
     selection_sealed: bool,
     stop: Option<FrontierStop>,
+    // Internal cause only; absent from FrontierSnapshot and historical schemas.
+    public_record_capacity_refused: bool,
     // WorkBudget remains the first reported stop, but later revoke/unknown
     // still closes consumption of an already paid in-flight selection.
     consumption_stop: Option<FrontierStop>,
@@ -725,6 +730,7 @@ impl RoventFrontier {
             },
             selection_sealed: false,
             stop,
+            public_record_capacity_refused: false,
             consumption_stop: None,
             pins,
             pin,
@@ -2140,6 +2146,20 @@ impl RoventFrontier {
 
     pub fn cancel(&mut self) {
         self.interrupt(FrontierStop::Canceled);
+    }
+
+    /// Read-only cause evidence from this same controller. A generic capacity
+    /// stop, copied snapshot or error value cannot set the private marker.
+    pub fn public_record_capacity_refused(&self) -> bool {
+        self.public_record_capacity_refused && self.stop == Some(FrontierStop::Capacity)
+    }
+
+    /// Called only by the original public-record producer at its registered
+    /// bound. Closing admission neither reclaims evidence nor completes depth.
+    pub(super) fn refuse_public_record_capacity(&mut self) -> FrontierError {
+        self.public_record_capacity_refused = true;
+        self.interrupt(FrontierStop::Capacity);
+        FrontierError::PublicRecordCapacity
     }
 
     /// A typed observation, not an output/fence authority. The real consumer

@@ -23,6 +23,7 @@ use super::{
 };
 use crate::EngineIdentity;
 use crate::engine::{OwnerRegistry, ProcessClock};
+use crate::pals_adaptive::AdaptiveSearchDriver as _;
 use crate::pals_adaptive::{
     AdaptiveExecutionLimits, AdaptiveExecutionManager, AdaptiveManagerCounters,
     AdaptiveManagerError, AdaptiveManagerRegistration, AdaptiveManagerSources,
@@ -1295,6 +1296,13 @@ fn should_quiesce(manager: &Manager) -> Result<bool, AdaptiveManagerError> {
         | FrontierGoalStatus::Stopped(
             FrontierStop::Canceled | FrontierStop::Deadline | FrontierStop::WorkBudget,
         ) => Ok(true),
+        FrontierGoalStatus::Stopped(FrontierStop::Capacity) => {
+            if manager.driver().rovent_public_record_capacity_closed()? {
+                Ok(true)
+            } else {
+                Err(AdaptiveManagerError::PhysicalUnknown)
+            }
+        }
         _ => Err(AdaptiveManagerError::PhysicalUnknown),
     }
 }

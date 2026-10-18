@@ -17,6 +17,20 @@ fn mv(text: &str) -> BoardMove {
 }
 
 #[test]
+fn unrelated_capacity_stop_does_not_certify_public_record_exhaustion() {
+    let mut fixture = Fixture::new(Position::startpos(), SearchGoal::default(), None, false);
+    assert!(!fixture.frontier.public_record_capacity_refused());
+    // An actual controller can stop for another bounded resource. Its equal
+    // public Capacity snapshot must not authorize the record-specific path.
+    fixture.frontier.interrupt(FrontierStop::Capacity);
+    assert_eq!(
+        fixture.frontier.snapshot().goal,
+        FrontierGoalStatus::Stopped(FrontierStop::Capacity),
+    );
+    assert!(!fixture.frontier.public_record_capacity_refused());
+}
+
+#[test]
 fn paid_cpu_pv_adopts_root_and_nonroot_suffix_without_another_frontier_visit() {
     let mut fixture = Fixture::new(Position::startpos(), SearchGoal::default(), None, false);
     let moves = [mv("e2e4"), mv("e7e5")];

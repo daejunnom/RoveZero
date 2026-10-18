@@ -898,6 +898,11 @@ pub trait AdaptiveSearchDriver<Q> {
     fn rovent_root_budget(&self) -> Result<Option<Digest>, AdaptiveManagerError> {
         Ok(None)
     }
+    /// Read the same current controller; no caller-supplied stop/receipt can
+    /// establish a capacity boundary for another root or a legacy driver.
+    fn rovent_public_record_capacity_closed(&self) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
     fn rovent_frame_admitted(
         &mut self,
         _: &CoordinatorWork<ReviewView, Q>,
@@ -3496,7 +3501,7 @@ where
         {
             changed = true;
             if let Err(error) = self.foreign_event(completion) {
-                self.record_failure(error);
+                self.physical_event_error(error)?;
             }
         }
         if let Some((sequence, progress)) = self
@@ -3541,7 +3546,7 @@ where
                                 changed = true;
                                 break;
                             }
-                            self.record_failure(error);
+                            self.frontier_boundary_or_failure(error)?;
                             break;
                         }
                     }
@@ -3606,7 +3611,27 @@ where
             self.begin_root_quiesce(self.cleanup_until()?)?;
             return Ok(());
         }
-        self.record_failure(error);
+        self.frontier_boundary_or_failure(error)
+    }
+    fn frontier_boundary_or_failure(
+        &mut self,
+        error: AdaptiveManagerError,
+    ) -> Result<(), AdaptiveManagerError> {
+        if self.phase == ManagerPhase::Running
+            && matches!(
+                error,
+                AdaptiveManagerError::Frontier(FrontierError::PublicRecordCapacity)
+            )
+            && self.driver.rovent_public_record_capacity_closed()?
+        {
+            // The rejected output/report remains in its original binding or
+            // deferred queue. Quiescence drains it without semantic retry or
+            // fabricated utility; the original frontier retains Capacity.
+            self.fail_utility_route();
+            self.begin_root_quiesce(self.cleanup_until()?)?;
+        } else {
+            self.record_failure(error);
+        }
         Ok(())
     }
     fn schedule_root_round(&mut self) -> Result<bool, AdaptiveManagerError> {

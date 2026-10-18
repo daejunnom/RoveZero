@@ -57,7 +57,11 @@ impl AdaptiveRoleConsumptionRejection {
                 Self::PhysicalCompletionUnknown
             }
             PalsError::RoleCallLimit => Self::RoleCallLimit,
-            PalsError::Capacity | PalsError::Store(StoreError::Capacity(_)) => Self::Capacity,
+            PalsError::Capacity
+            | PalsError::Store(StoreError::Capacity(_))
+            | PalsError::Rovent(
+                crate::pals::rovent_frontier::FrontierError::PublicRecordCapacity,
+            ) => Self::Capacity,
             _ => Self::OtherOriginalFailure,
         }
     }

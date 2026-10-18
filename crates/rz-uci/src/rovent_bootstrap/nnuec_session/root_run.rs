@@ -7,6 +7,7 @@
 
 use super::retirement::NnuecRootRetired;
 use super::*;
+use crate::pals_adaptive::AdaptiveSearchDriver as _;
 use crate::pals_adaptive::{
     AdaptiveCheckerMetadata, AdaptiveNnuecRootParts, AdaptiveSequenceContinuation,
     NnuecPreparationRecord, UtilityRoutePendingClosure,
@@ -729,6 +730,16 @@ impl RoventNnuecSessionDriver {
         if !semantic_failures.is_empty() {
             run.semantic_failures = Some(semantic_failures);
         }
+        let public_record_capacity = match manager.driver().rovent_public_record_capacity_closed() {
+            Ok(closed) => closed,
+            Err(error) => {
+                return Err(run.retain_failure(
+                    "RoventNnuecCapacityObservation",
+                    error.to_string(),
+                    error,
+                ));
+            }
+        };
         let completion = if context.cancellation.is_canceled()
             || context.control.cancellation.load(Ordering::Acquire)
         {
@@ -737,6 +748,8 @@ impl RoventNnuecSessionDriver {
             PalsCompletion::Deadline
         } else if manager.driver().root_is_terminal().unwrap_or(false) {
             PalsCompletion::Terminal
+        } else if public_record_capacity {
+            PalsCompletion::Capacity
         } else if manager.cpu_node_limit_reached() {
             PalsCompletion::CpuNodeLimit
         } else if manager.role_call_limit_reached() {

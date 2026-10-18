@@ -968,6 +968,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         }
         if self.engine.semantic.records.len() >= self.engine.config.max_records {
             // Raw/failed evidence is not deleted on the manager to keep running.
+            if let Some(frontier) = self.engine.semantic.rovent_frontier.as_deref_mut() {
+                return Err(frontier.refuse_public_record_capacity().into());
+            }
             return Err(
                 StoreError::PinSaturated("adaptive public records need archive worker").into(),
             );

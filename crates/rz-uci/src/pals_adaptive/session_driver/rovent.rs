@@ -2,6 +2,7 @@
 //! Legacy V5 construction does not install this policy or emit these records.
 
 use super::*;
+use crate::pals_adaptive::AdaptiveSearchDriver as _;
 use crate::pals_adaptive::{
     AdaptiveManagerCounters, AdaptiveNativeAccountingSnapshot, RoventPeerFollowupPolicy,
     RoventReciprocalPolicy,
@@ -408,7 +409,8 @@ where
         Ok(Some(receipt))
     }
     /// A normal control boundary closes admission without claiming a completed
-    /// horizon. Storage/physical failures remain failures rather than fallback.
+    /// horizon. Only the original typed public-record bound joins control
+    /// stops; other storage/physical failures remain failures.
     pub(super) fn rovent_should_quiesce(
         &self,
         manager: &SessionManager<B>,
@@ -430,9 +432,15 @@ where
             FrontierGoalStatus::Stopped(FrontierStop::NativeUnknown) => {
                 Err(AdaptiveManagerError::PhysicalUnknown)
             }
-            FrontierGoalStatus::Stopped(FrontierStop::Capacity) => Err(
-                AdaptiveManagerError::Frontier(FrontierError::Capacity("Rovent frontier stopped")),
-            ),
+            FrontierGoalStatus::Stopped(FrontierStop::Capacity) => {
+                if manager.driver().rovent_public_record_capacity_closed()? {
+                    Ok(true)
+                } else {
+                    Err(AdaptiveManagerError::Frontier(FrontierError::Capacity(
+                        "Rovent frontier stopped",
+                    )))
+                }
+            }
             FrontierGoalStatus::Stopped(FrontierStop::EvidenceReclaimed) => Err(
                 AdaptiveManagerError::Frontier(FrontierError::StoreUnavailable),
             ),

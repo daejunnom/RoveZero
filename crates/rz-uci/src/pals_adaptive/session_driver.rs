@@ -36,6 +36,7 @@ pub use rovent_external::{
     RoventExternalSessionSources, RoventExternalSourcePreparationRejection,
 };
 
+use super::AdaptiveSearchDriver as _;
 use super::{
     AdaptiveCollectionDispatchObserver, AdaptiveExecutionLimits, AdaptiveExecutionManager,
     AdaptiveExternalTeacherObserver, AdaptiveManagerAdmissionRejection, AdaptiveManagerError,
@@ -2280,6 +2281,16 @@ where
                 .driver()
                 .copy_role_consumption_diagnostic(diagnostic, true);
         }
+        let public_record_capacity = match manager.driver().rovent_public_record_capacity_closed() {
+            Ok(closed) => closed,
+            Err(error) => {
+                *state = SessionState::Manager(manager);
+                return Err(SearchSessionFailure::debug(
+                    "RoventCapacityObservation",
+                    &error,
+                ));
+            }
+        };
         let completion = if context.cancellation.is_canceled()
             || context.control.cancellation.load(Ordering::Acquire)
         {
@@ -2288,6 +2299,8 @@ where
             PalsCompletion::Deadline
         } else if manager.driver().root_is_terminal().unwrap_or(false) {
             PalsCompletion::Terminal
+        } else if public_record_capacity {
+            PalsCompletion::Capacity
         } else if matches!(self.researcher_limit_observation(&manager), Some(true)) {
             PalsCompletion::CpuNodeLimit
         } else if manager.role_call_limit_reached() {

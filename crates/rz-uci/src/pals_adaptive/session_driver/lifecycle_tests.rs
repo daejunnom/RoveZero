@@ -302,6 +302,7 @@ fn fixture_with_rovent_profile(
         line_plies,
         full_roles,
         1,
+        PalsConfig::default().max_records,
     )
 }
 fn fixture_with_rovent_profile_and_peer_sources(
@@ -311,6 +312,7 @@ fn fixture_with_rovent_profile_and_peer_sources(
     line_plies: usize,
     full_roles: bool,
     peer_sources: u16,
+    max_records: usize,
 ) -> (
     AdaptiveSessionDriver<TerminalOwner>,
     Arc<OwnerFacts>,
@@ -410,6 +412,7 @@ fn fixture_with_rovent_profile_and_peer_sources(
     let config = PalsConfig {
         beam_width: 1,
         line_plies,
+        max_records,
         cpu_nodes_per_task: 8,
         max_role_calls: role_limit.unwrap_or_else(|| PalsConfig::default().max_role_calls),
         ..Default::default()
@@ -683,6 +686,7 @@ fn rovent_selected_counter_keeps_actual_parent_budget_after_peer_credit_spend() 
         4,
         true,
         4,
+        PalsConfig::default().max_records,
     );
     facts.capture_role_sources.store(true, Ordering::Release);
     let selected_source_peers = Arc::new(AtomicU64::new(0));
@@ -743,6 +747,110 @@ fn rovent_selected_counter_keeps_actual_parent_budget_after_peer_credit_spend() 
         driver.finish_session(original.shutdown_deadline).unwrap(),
         Some(crate::search_driver::DriverPhysicalCompletion::Confirmed),
     );
+}
+
+#[test]
+fn rovent_game_record_capacity_keeps_evidence_and_closes_each_root_without_depth() {
+    use rz_contracts::rovent::ExecutionMode;
+    use rz_search::pals::rovent_frontier::{FrontierGoalStatus, FrontierStop};
+
+    // Use the existing real owner/manager/Rules/Fresh fixture. Each completed
+    // depth-one root publishes one actual Proposal; do not prefill fake rows.
+    let (driver, facts, clock, _) = fixture_with_rovent_profile_and_peer_sources(
+        None,
+        Some(64),
+        Some(ExecutionMode::CpuPcr),
+        1,
+        true,
+        1,
+        4,
+    );
+    let retained_records = || {
+        let state = driver.state.lock().unwrap();
+        let SessionState::Idle(owners) = &*state else {
+            panic!("the original root did not return its actual idle owners");
+        };
+        owners
+            .engine
+            .as_ref()
+            .expect("original semantic owner after confirmed root fence")
+            .records()
+            .iter()
+            .map(|record| {
+                // critical is a root-relative ReviewView projection. Keep the
+                // complete original raw identity, relationships and evidence.
+                (
+                    record.revision,
+                    record.parent_revision,
+                    record.supersedes_revision,
+                    record.origin_state,
+                    record.kind,
+                    record.line.clone(),
+                    record.value,
+                    record.completed_depth,
+                    record.score_scope,
+                    record.cpu_observation,
+                    record.perspective,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let position = Position::startpos();
+    let first: BoardMove = "e2e4".parse().unwrap();
+    let mut full_records = None;
+    let mut final_until = None;
+    for root in 1..=6 {
+        // No ucinewgame: raw evidence is game-wide and must survive each root.
+        let mut original = context(&clock, root, 0);
+        original.goal.depth_plies = std::num::NonZeroU16::new(1);
+        original.root_moves = Some(Arc::from([first]));
+        let report = driver
+            .run(&position, &original, &mut |_| {})
+            .unwrap_or_else(|error| panic!("actual record-bound root {root}: {error:?}"));
+        final_until = Some(original.shutdown_deadline);
+        assert_eq!(report.best_move, Some(first));
+        let actual = driver.latest_rovent_root().unwrap().unwrap();
+        let frontier = actual.frontier.as_ref().unwrap();
+        assert!(actual.physical.as_ref().unwrap().permits_root_reuse());
+        assert!(!driver.closed.load(Ordering::Acquire));
+        if root <= 4 {
+            assert_eq!(frontier.goal, FrontierGoalStatus::DepthSatisfied);
+            assert_eq!(frontier.horizon.completed_depth.unwrap().0, 1);
+            assert_eq!(retained_records().len(), root as usize);
+            if root == 4 {
+                full_records = Some(retained_records());
+            }
+        } else {
+            assert_eq!(
+                frontier.goal,
+                FrontierGoalStatus::Stopped(FrontierStop::Capacity),
+            );
+            assert_eq!(frontier.horizon.completed_depth, None);
+            assert!(!frontier.horizon.target_satisfied);
+            assert!(matches!(
+                report.work,
+                DriverWork::RoventNative {
+                    completed_depth: None,
+                    ..
+                }
+            ));
+            assert_eq!(&retained_records(), full_records.as_ref().unwrap());
+            // The real rejected ranking/output drains unused, never consumed
+            // again to make the new root or its depth appear successful.
+            assert!(actual.counters.unused_role_results > 0);
+            assert!(actual.counters.submitted_role_tickets > actual.counters.consumed_role_outputs);
+            let last = driver.completion_diagnostic().unwrap().last.unwrap();
+            assert_eq!(last.semantic_completion, Some(PalsCompletion::Capacity));
+            assert_eq!(last.driver_return, AdaptiveCompletionReturn::Ok);
+            assert!(last.failure.is_none());
+        }
+    }
+    assert!(facts.role_runs.load(Ordering::Acquire) > 0);
+    assert_eq!(
+        driver.finish_session(final_until.unwrap()).unwrap(),
+        Some(crate::search_driver::DriverPhysicalCompletion::Confirmed),
+    );
+    assert_eq!(facts.finishes.load(Ordering::Acquire), 1);
 }
 
 #[test]
