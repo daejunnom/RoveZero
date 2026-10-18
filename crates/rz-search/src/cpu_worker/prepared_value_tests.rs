@@ -501,7 +501,9 @@ fn expired_idle_value_can_be_replaced_and_recovered_binding_survives_respawn() {
             assert_eq!(
                 reason,
                 CpuWorkerError::Cpu(crate::cpu::CpuError::Value(
-                    crate::cpu_value::CpuValueError::StateMismatch
+                    crate::cpu_value::CpuValueError::AuthorityRevoked(
+                        crate::cpu_value::CpuValueAuthorityRevocation::Cancelled,
+                    )
                 ))
             );
             assert_eq!(returned.value_identity(), new.model.identity());
@@ -564,6 +566,64 @@ fn one_terminal_seat_remains_reserved_until_the_private_ack_is_checked() {
     let mut forged = second.clone();
     forged.authority = Arc::new(());
     assert!(!endpoint.validates_receipt(&forged));
+}
+
+#[test]
+fn soft_terminal_recovery_requires_the_same_actual_bound_and_installed_binding() {
+    use crate::cpu_value::{CpuValueAuthorityRevocation, CpuValueError};
+    let fixture = fixture("e2e4");
+    let value = crate::cpu_value::nnuec::v2::cpu::V2CpuValue::from_bound(
+        Arc::clone(&fixture.model),
+        Arc::clone(&fixture.bound),
+        &fixture.stores,
+        fixture.view.seal_digest(),
+    )
+    .unwrap();
+    let cpu = CpuEngine::with_evaluator_ordering_and_resume_policy(
+        *engine(false).config(),
+        Arc::new(value),
+        CpuOrderingPolicy::LegacyMvvLvaV1,
+        CpuResumePolicy::PausedStack,
+    )
+    .unwrap();
+    let binding = cpu.job_binding_digest().unwrap();
+    let cancelled = crate::cpu::CpuError::Value(CpuValueError::AuthorityRevoked(
+        CpuValueAuthorityRevocation::Cancelled,
+    ));
+    assert_eq!(
+        super::super::owned_soft_value_terminal(&cpu, binding, &cancelled),
+        None
+    );
+    fixture.cancel.store(true, Ordering::Release);
+    assert_eq!(
+        super::super::owned_soft_value_terminal(&cpu, binding, &cancelled),
+        Some(crate::cpu::CpuCompletion::Canceled),
+    );
+    assert_eq!(
+        super::super::owned_soft_value_terminal(&cpu, None, &cancelled),
+        None
+    );
+    for error in [
+        CpuValueError::AuthorityRevoked(CpuValueAuthorityRevocation::Expired),
+        CpuValueError::AuthorityRevoked(CpuValueAuthorityRevocation::ActorStopped),
+        CpuValueError::AuthorityRevoked(CpuValueAuthorityRevocation::Invalidated),
+        CpuValueError::StateMismatch,
+        CpuValueError::NonFiniteForward,
+    ] {
+        assert_eq!(
+            super::super::owned_soft_value_terminal(
+                &cpu,
+                binding,
+                &crate::cpu::CpuError::Value(error),
+            ),
+            None
+        );
+    }
+    fixture._actor.invalidate_cache().unwrap();
+    assert_eq!(
+        super::super::owned_soft_value_terminal(&cpu, binding, &cancelled),
+        None
+    );
 }
 
 #[test]

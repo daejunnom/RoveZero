@@ -703,6 +703,23 @@ impl std::fmt::Display for CpuError {
 
 impl std::error::Error for CpuError {}
 
+impl CpuError {
+    /// No value is implied. Only an exact evaluator control error can name
+    /// this no-score terminal; other CPU/Rules/numerical failures stay errors.
+    pub fn value_authority_stop(&self) -> Option<CpuCompletion> {
+        use crate::cpu_value::CpuValueAuthorityRevocation;
+        match self {
+            Self::Value(CpuValueError::AuthorityRevoked(
+                CpuValueAuthorityRevocation::Cancelled,
+            )) => Some(CpuCompletion::Canceled),
+            Self::Value(CpuValueError::AuthorityRevoked(CpuValueAuthorityRevocation::Expired)) => {
+                Some(CpuCompletion::Deadline)
+            }
+            _ => None,
+        }
+    }
+}
+
 impl From<PositionError> for CpuError {
     fn from(value: PositionError) -> Self {
         Self::Rules(value)
@@ -1054,6 +1071,9 @@ struct Control<'a> {
 #[derive(Debug)]
 enum Abort {
     Stop(CpuCompletion),
+    /// A value callback may revoke after the safe control boundary. Its
+    /// unfinished frame is disposed, never offered as a resumable checkpoint.
+    ValueAuthorityStop(CpuCompletion),
     Error(CpuError),
 }
 
@@ -1065,7 +1085,11 @@ impl From<PositionError> for Abort {
 
 impl From<CpuValueError> for Abort {
     fn from(error: CpuValueError) -> Self {
-        Self::Error(CpuError::Value(error))
+        let error = CpuError::Value(error);
+        match error.value_authority_stop() {
+            Some(completion) => Self::ValueAuthorityStop(completion),
+            None => Self::Error(error),
+        }
     }
 }
 
@@ -1899,6 +1923,7 @@ impl CpuEngine {
         };
         let mut completed_depth = resume.map_or(0, |token| token.completed_depth);
         let mut completion = CpuCompletion::DepthLimit;
+        let mut value_authority_stopped = false;
         observer(CpuIterationProgress {
             best_move: best.first().copied(),
             score,
@@ -1956,6 +1981,11 @@ impl CpuEngine {
                     completion = reason;
                     break;
                 }
+                Err(Abort::ValueAuthorityStop(reason)) => {
+                    completion = reason;
+                    value_authority_stopped = true;
+                    break;
+                }
                 Err(Abort::Error(error)) => {
                     self.last_attempt_work = Some(control.actual_work());
                     return Err(error);
@@ -1964,11 +1994,11 @@ impl CpuEngine {
         }
         // Observers are outside node search and may cancel or consume time.
         // Preserve the completed result while recording the final stop reason.
-        if let Err(Abort::Stop(reason)) = control.check_stop() {
+        if !value_authority_stopped && let Err(Abort::Stop(reason)) = control.check_stop() {
             completion = reason;
         }
         self.last_attempt_work = Some(control.actual_work());
-        let token = (completed_depth > 0).then(|| CpuResumeToken {
+        let token = (completed_depth > 0 && !value_authority_stopped).then(|| CpuResumeToken {
             root: position.position_identity(),
             root_moves: root_moves.map(<[BoardMove]>::to_vec),
             profile: self.config.profile,
@@ -2609,6 +2639,38 @@ pub fn evaluate_bootstrap(position: &Position) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_original_soft_value_revocation_can_be_a_controlled_stop() {
+        use crate::cpu_value::CpuValueAuthorityRevocation;
+        for (reason, completion) in [
+            (
+                CpuValueAuthorityRevocation::Cancelled,
+                CpuCompletion::Canceled,
+            ),
+            (
+                CpuValueAuthorityRevocation::Expired,
+                CpuCompletion::Deadline,
+            ),
+        ] {
+            assert!(matches!(
+                Abort::from(CpuValueError::AuthorityRevoked(reason)),
+                Abort::ValueAuthorityStop(actual) if actual == completion,
+            ));
+        }
+        for error in [
+            CpuValueError::AuthorityRevoked(CpuValueAuthorityRevocation::ActorStopped),
+            CpuValueError::AuthorityRevoked(CpuValueAuthorityRevocation::Invalidated),
+            CpuValueError::StateMismatch,
+            CpuValueError::NonFiniteForward,
+            CpuValueError::ScoreOutsideFrontierNamespace,
+            CpuValueError::AccumulatorOverflow,
+        ] {
+            assert!(matches!(
+                Abort::from(error.clone()),
+                Abort::Error(CpuError::Value(actual)) if actual == error,
+            ));
+        }
+    }
 
     fn held_cpu() -> CpuEngine {
         CpuEngine::with_paused_side_scope(

@@ -1128,6 +1128,64 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 })
     }
 
+    /// Settle a real no-value terminal without publishing an ObservationId,
+    /// score, PV, feedback, coverage or a successful task. The returned seal is
+    /// the original receipt equality seal already retained by this admission.
+    pub fn observe_cpu_no_value_termination(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        receipt: &CpuSliceReport,
+    ) -> Result<ContractDigest, PalsError> {
+        let soft_stop = receipt
+            .result
+            .as_ref()
+            .err()
+            .and_then(crate::cpu::CpuError::value_authority_stop);
+        if soft_stop.is_none()
+            || receipt.actual_work.is_none()
+            || !receipt.terminal
+            || receipt.continuation_retained
+            || receipt.admission_rejected
+            || receipt.reciprocal_request.is_some()
+            || receipt.controls.is_none_or(|controls| {
+                !controls.terminal
+                    || controls.cancel_ack > controls.cancel_sequence
+                    || controls.yield_ack > controls.yield_sequence
+                    || controls.publish_ack > controls.publish_sequence
+            })
+        {
+            return Err(StoreError::InvalidEvidence(
+                "CPU no-value termination requires an original known soft revocation",
+            )
+            .into());
+        }
+        // This exact observer performs original question/Store/grant validation
+        // and charges the known delta once, including when admission is revoked.
+        // Its Err result is retained in the receipt, never replaced by a value.
+        self.observe_cpu_report(work, receipt)?;
+        let admission = self.cpu_admissions.get(&work.input.question_digest).ok_or(
+            StoreError::InvalidConditions("CPU no-value admission missing"),
+        )?;
+        let (_, execution, seal) = admission
+            .settled_receipt
+            .ok_or(StoreError::InvalidEvidence(
+                "CPU no-value original receipt was not settled",
+            ))?;
+        if !admission.terminal
+            || admission.quarantined
+            || admission.continuation_retained
+            || admission.grant.is_some()
+            || !self.cpu_receipt_settled(work, receipt)
+            || self.engine.semantic.stores.tasks.get(execution)?.status != TaskStatus::Failed
+        {
+            return Err(StoreError::InvalidEvidence(
+                "CPU no-value termination did not retain its original failed task",
+            )
+            .into());
+        }
+        Ok(seal)
+    }
+
     fn commit_cpu_report_inner(
         &mut self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
@@ -2247,6 +2305,151 @@ mod tests {
         assert_eq!(port.counters.cpu_tasks_requested, 2);
         assert_eq!(port.counters.consumed_partial_cpu_values, 1);
         assert_eq!(port.counters.consumed_cpu_tasks, 1);
+    }
+
+    #[test]
+    fn soft_no_value_terminal_retains_original_receipt_without_score_or_observation() {
+        use crate::cpu_value::{CpuValueAuthorityRevocation, CpuValueError};
+        for reason in [
+            CpuValueAuthorityRevocation::Cancelled,
+            CpuValueAuthorityRevocation::Expired,
+        ] {
+            let (mut port, work, profile) = port_and_work(RefinementStage::CpuValidation, 2);
+            let (_, grant) = first_grant(&mut port, &work, profile);
+            let report = CpuSliceReport {
+                grant,
+                reciprocal_request: None,
+                actual_work: Some(CpuWork {
+                    nodes: 7,
+                    quiescence_nodes: 2,
+                    tt_hits: 1,
+                }),
+                result: Err(crate::cpu::CpuError::Value(
+                    CpuValueError::AuthorityRevoked(reason),
+                )),
+                cumulative_nodes: 7,
+                progress_sequence: 1,
+                continuation_retained: false,
+                terminal: true,
+                admission_rejected: false,
+                controls: Some(rz_runtime::adaptive::ControlSnapshot {
+                    terminal: true,
+                    ..Default::default()
+                }),
+            };
+            let observations = port.engine.semantic.stores.observations.len();
+            let seal = port
+                .observe_cpu_no_value_termination(&work, &report)
+                .unwrap();
+            assert_eq!(seal, cpu_receipt_digest(&report));
+            assert_eq!(
+                port.observe_cpu_no_value_termination(&work, &report)
+                    .unwrap(),
+                seal
+            );
+            assert_eq!(port.counters.cpu_nodes, 7);
+            assert_eq!(port.counters.cpu_quiescence_nodes, 2);
+            assert_eq!(port.counters.consumed_cpu_tasks, 0);
+            assert_eq!(port.counters.consumed_partial_cpu_values, 0);
+            assert_eq!(port.counters.consumed_frontier_cpu_values, 0);
+            assert_eq!(port.engine.semantic.stores.observations.len(), observations);
+            assert!(
+                port.engine.semantic.nodes[work.input.question.node]
+                    .evidence
+                    .is_none()
+            );
+            let held = &port.cpu_admissions[&work.input.question_digest];
+            assert!(held.consumed_observation.is_none());
+            assert!(held.committed_execution.is_none());
+            assert!(held.terminal && held.grant.is_none());
+            assert_eq!(
+                port.engine
+                    .semantic
+                    .stores
+                    .tasks
+                    .get(held.execution.unwrap())
+                    .unwrap()
+                    .status,
+                TaskStatus::Failed
+            );
+            let mut changed = report.clone();
+            changed.progress_sequence += 1;
+            assert!(
+                port.observe_cpu_no_value_termination(&work, &changed)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn no_value_terminal_rejects_hard_errors_unknown_work_and_retained_tokens() {
+        use crate::cpu_value::{CpuValueAuthorityRevocation, CpuValueError};
+        for error in [
+            CpuValueError::StateMismatch,
+            CpuValueError::NonFiniteForward,
+            CpuValueError::AuthorityRevoked(CpuValueAuthorityRevocation::ActorStopped),
+            CpuValueError::AuthorityRevoked(CpuValueAuthorityRevocation::Invalidated),
+        ] {
+            let (mut port, work, profile) = port_and_work(RefinementStage::CpuValidation, 2);
+            let (_, grant) = first_grant(&mut port, &work, profile);
+            let mut report = receipt(&port, &work, grant, 1, 0, 0, CpuCompletion::Canceled);
+            report.result = Err(crate::cpu::CpuError::Value(error));
+            report.controls = Some(rz_runtime::adaptive::ControlSnapshot {
+                terminal: true,
+                ..Default::default()
+            });
+            assert!(
+                port.observe_cpu_no_value_termination(&work, &report)
+                    .is_err()
+            );
+            assert!(
+                port.cpu_admissions[&work.input.question_digest]
+                    .grant
+                    .is_some()
+            );
+        }
+        let (mut port, work, profile) = port_and_work(RefinementStage::CpuValidation, 2);
+        let (_, grant) = first_grant(&mut port, &work, profile);
+        // No CpuReport or numeric score exists in this original terminal.
+        let report = CpuSliceReport {
+            grant,
+            reciprocal_request: None,
+            actual_work: Some(CpuWork::default()),
+            result: Err(crate::cpu::CpuError::Value(
+                CpuValueError::AuthorityRevoked(CpuValueAuthorityRevocation::Cancelled),
+            )),
+            cumulative_nodes: 0,
+            progress_sequence: 0,
+            continuation_retained: false,
+            terminal: true,
+            admission_rejected: false,
+            controls: Some(rz_runtime::adaptive::ControlSnapshot {
+                terminal: true,
+                ..Default::default()
+            }),
+        };
+        let mut unknown = report.clone();
+        unknown.actual_work = None;
+        assert!(
+            port.observe_cpu_no_value_termination(&work, &unknown)
+                .is_err()
+        );
+        let mut retained = report.clone();
+        retained.continuation_retained = true;
+        assert!(
+            port.observe_cpu_no_value_termination(&work, &retained)
+                .is_err()
+        );
+        assert!(
+            port.cpu_admissions[&work.input.question_digest]
+                .grant
+                .is_some()
+        );
+        let before = port.engine.semantic.stores.observations.len();
+        port.observe_cpu_no_value_termination(&work, &report)
+            .unwrap();
+        assert_eq!(port.counters.cpu_nodes, 0);
+        assert_eq!(port.engine.semantic.stores.observations.len(), before);
     }
 
     #[test]

@@ -471,14 +471,22 @@ fn run_inner(
         task.search_conditions != engine.search_conditions()
             || task.maximum_bytes != engine.paused_stack_max_bytes
             || task.value_identity != *engine.value_identity
-            || task
-                .value
-                .as_ref()
-                .is_none_or(|value| engine.evaluator.cache_context(value, &task.work).is_err())
+            || task.value.is_none()
     }) {
         engine.invalidate_paused_stack();
         engine.observe_paused_stack_rejection(resume);
         return Err(CpuError::ResumeMismatch("retained CPU namespace changed"));
+    }
+    if let Some(error) = engine.paused.as_ref().and_then(|task| {
+        task.value
+            .as_ref()
+            .and_then(|value| engine.evaluator.cache_context(value, &task.work).err())
+    }) {
+        // Keep the evaluator's exact typed cause. This preflight has not
+        // accepted a new score or work, so it cannot manufacture CpuReport.
+        engine.invalidate_paused_stack();
+        engine.observe_paused_stack_rejection(resume);
+        return Err(CpuError::Value(error));
     }
     let started = Instant::now();
     if let Some(token) = resume {
@@ -727,25 +735,27 @@ fn run_inner(
             return Err(error);
         }
     };
-    let completion = match result {
-        Ok(()) => CpuCompletion::DepthLimit,
-        Err(Abort::Stop(reason)) => reason,
+    let (completion, value_authority_stopped) = match result {
+        Ok(()) => (CpuCompletion::DepthLimit, false),
+        Err(Abort::Stop(reason)) => (reason, false),
+        Err(Abort::ValueAuthorityStop(reason)) => (reason, true),
         Err(Abort::Error(error)) => {
             engine.invalidate_paused_stack();
             return Err(error);
         }
     };
-    let can_pause = if cooperative.is_some() {
-        matches!(
-            completion,
-            CpuCompletion::Yielded | CpuCompletion::AwaitReciprocal
-        )
-    } else {
-        matches!(
-            completion,
-            CpuCompletion::NodeLimit | CpuCompletion::Deadline
-        )
-    };
+    let can_pause = !value_authority_stopped
+        && if cooperative.is_some() {
+            matches!(
+                completion,
+                CpuCompletion::Yielded | CpuCompletion::AwaitReciprocal
+            )
+        } else {
+            matches!(
+                completion,
+                CpuCompletion::NodeLimit | CpuCompletion::Deadline
+            )
+        };
     let mut token = None;
     if can_pause {
         if let Err(error) = task.check_memory() {

@@ -303,10 +303,10 @@ impl MaterializationRequest {
     }
 }
 
-/// A live binding readback remains mandatory. If its *specific* StateMismatch
-/// races original cancellation/expiry, the actual immutable V2 owner must also
-/// match before reporting that control revocation. A foreign/malformed owner
-/// or a different error is never converted to a normal-stop observation.
+/// A live binding readback remains mandatory. An explicit original authority
+/// revocation requires the same typed reason and actual immutable V2 owner.
+/// A StateMismatch or a foreign/malformed owner is never reclassified from
+/// the current cancel flag or clock into a control observation.
 fn validate_materialized_readback(
     engine: &CpuEngine,
     model: &Arc<Model>,
@@ -320,14 +320,16 @@ fn validate_materialized_readback(
     }
     match observed {
         Ok(Some(actual)) if actual == binding => {}
-        Err(CpuError::Value(CpuValueError::StateMismatch)) => {
+        Err(CpuError::Value(CpuValueError::AuthorityRevoked(typed))) => {
             if let Some(reason) = bound.authority_revocation() {
                 let actual = engine.nnuec_retirement_owner().ok().flatten();
-                if actual.as_ref().is_some_and(|owner| {
-                    owner.matches_model(model)
-                        && owner.matches_bound(bound)
-                        && owner.binding_digest() == binding
-                }) {
+                if crate::cpu_value::CpuValueAuthorityRevocation::from(reason) == typed
+                    && actual.as_ref().is_some_and(|owner| {
+                        owner.matches_model(model)
+                            && owner.matches_bound(bound)
+                            && owner.binding_digest() == binding
+                    })
+                {
                     return Err(CpuWorkerError::NnuecAuthorityRevoked(reason));
                 }
             }

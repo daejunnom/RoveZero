@@ -700,6 +700,81 @@ impl<V, Q> RefinementMachine<V, Q> {
                 "dependent CPU failure original execution/question/view",
             ));
         }
+        self.retire_cpu_failure_frame(evidence, reason)
+    }
+
+    /// Cleanup of the original known no-value Slice. This is neither an
+    /// unsubmitted Ready decline nor a successful reciprocal/goal response.
+    /// The caller must first settle the native ledger and obtain the original
+    /// receipt seal from the Search no-value observer; no synthetic terminal
+    /// packet or score is accepted here.
+    pub fn retire_cpu_no_value(
+        &mut self,
+        original: &CoordinatorWork<V, Q>,
+        report: &crate::cpu_worker::CpuSliceReport,
+        receipt_seal: Digest,
+    ) -> Result<ClosedFrame, CoordinatorError> {
+        let evidence = StepEvidence {
+            frame: original.frame,
+            stage: original.input.stage,
+            execution: StepExecution::Cpu {
+                job: report.grant.job,
+                execution: report.grant.execution,
+            },
+            submitted_question: original.input.question_digest,
+            submitted_view: original.input.view_seal,
+            completed_evidence: receipt_seal,
+        };
+        self.check_reciprocal_cpu_terminal(evidence, report)?;
+        let stop = report
+            .result
+            .as_ref()
+            .err()
+            .and_then(crate::cpu::CpuError::value_authority_stop);
+        let frame = self
+            .frame(original.frame)
+            .ok_or(CoordinatorError::UnknownRequest)?;
+        if stop.is_none()
+            || report.reciprocal_request.is_some()
+            || report.controls.is_none_or(|controls| {
+                !controls.terminal
+                    || controls.cancel_ack > controls.cancel_sequence
+                    || controls.yield_ack > controls.yield_sequence
+                    || controls.publish_ack > controls.publish_sequence
+            })
+            || frame.phase != FramePhase::Waiting(evidence.execution)
+            || frame.last_execution != Some(evidence.execution)
+            || frame.id.authority != report.grant.job.authority
+            || report.grant.execution.epoch != frame.id.authority.epoch
+            || frame.original_first_move != original.original_first_move
+            || frame.original_deadline != original.original_deadline
+            || frame.input.stage != original.input.stage
+            || frame.input.question_digest != original.input.question_digest
+            || frame.input.view_seal != original.input.view_seal
+            || frame.input.public_context != original.input.public_context
+            || !Arc::ptr_eq(&frame.input.question, &original.input.question)
+            || !Arc::ptr_eq(&frame.input.view, &original.input.view)
+            || frame.budget.original_cpu_credit != original.budget.original_cpu_credit
+            || frame.budget.original_store_byte_limit != original.budget.original_store_byte_limit
+        {
+            return Err(CoordinatorError::IdentityMismatch(
+                "no-value CPU terminal original execution/question/view/limits",
+            ));
+        }
+        // Cleanup is legal after revoke/expiry. Original controls and immutable
+        // binding stay unchanged; there is no renewed check_control window.
+        self.check_dependent_credit_return(evidence.frame)?;
+        self.retire_cpu_failure_frame(evidence, "CPU value authority ended without a value")
+    }
+
+    fn retire_cpu_failure_frame(
+        &mut self,
+        evidence: StepEvidence,
+        reason: &'static str,
+    ) -> Result<ClosedFrame, CoordinatorError> {
+        let frame = self
+            .frame(evidence.frame)
+            .ok_or(CoordinatorError::UnknownRequest)?;
         let remaining_roles = frame.budget.role_submissions_remaining;
         let closed = ClosedFrame {
             id: frame.id,

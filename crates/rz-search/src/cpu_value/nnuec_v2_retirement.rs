@@ -107,6 +107,13 @@ impl NnuecValueRetirementOwner {
     pub fn binding_digest(&self) -> Digest {
         self.binding
     }
+    /// Cleanup-only readback from this same retained original Bound. It
+    /// issues no new score, binding, deadline, worker or resume authority.
+    pub(crate) fn authority_revocation(
+        &self,
+    ) -> Option<crate::cpu_worker::NnuecAuthorityRevocation> {
+        self.bound.authority_revocation()
+    }
     pub fn provenance(&self) -> &Provenance {
         self.bound.provenance()
     }

@@ -2102,6 +2102,20 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
                 .map_err(semantic)
         }
     }
+    fn cpu_no_value_terminated(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        report: &CpuSliceReport,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        // Unlike cpu_slice_observed, this remains observation-only while
+        // Running, and cannot enter commit_cpu_report/after_cpu.
+        let original = self
+            .hot()?
+            .observe_cpu_no_value_termination(work, report)
+            .map_err(semantic)?;
+        self.cpu_feedback.remove(&work.input.question_digest);
+        Ok(original)
+    }
     fn cpu_rejected(
         &mut self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,

@@ -72,6 +72,41 @@ pub enum NnuecAuthorityRevocation {
     ActorStopped,
     Invalidated,
 }
+impl From<NnuecAuthorityRevocation> for crate::cpu_value::CpuValueAuthorityRevocation {
+    fn from(reason: NnuecAuthorityRevocation) -> Self {
+        match reason {
+            NnuecAuthorityRevocation::Cancelled => Self::Cancelled,
+            NnuecAuthorityRevocation::Expired => Self::Expired,
+            NnuecAuthorityRevocation::ActorStopped => Self::ActorStopped,
+            NnuecAuthorityRevocation::Invalidated => Self::Invalidated,
+        }
+    }
+}
+
+/// A typed soft error alone is not enough to recover a worker. Require the
+/// actual immutable V2 owner, the original installed binding, and the same
+/// original Bound's present reason. Hard revocations remain errors even if
+/// cancellation/expiry was also observed. This does not accept a value.
+fn owned_soft_value_terminal(
+    engine: &CpuEngine,
+    binding: Option<Digest>,
+    error: &CpuError,
+) -> Option<CpuCompletion> {
+    let completion = error.value_authority_stop()?;
+    let CpuError::Value(crate::cpu_value::CpuValueError::AuthorityRevoked(reason)) = error else {
+        return None;
+    };
+    let owner = engine.nnuec_retirement_owner().ok().flatten()?;
+    if binding != Some(owner.binding_digest())
+        || owner
+            .authority_revocation()
+            .map(crate::cpu_value::CpuValueAuthorityRevocation::from)
+            != Some(*reason)
+    {
+        return None;
+    }
+    Some(completion)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CpuWorkerError {
@@ -1832,11 +1867,31 @@ impl CpuWorker {
                     report.admission_rejected = false;
                     report.result = result;
                     report.progress_sequence = progress_sequence;
-                    if report.actual_work.is_none() || report.result.is_err() {
+                    let mut nnuec_soft_terminal = report
+                        .actual_work
+                        .and_then(|_| report.result.as_ref().err())
+                        .and_then(|error| owned_soft_value_terminal(&engine, value_binding, error));
+                    if report.actual_work.is_none()
+                        || (report.result.is_err() && nnuec_soft_terminal.is_none())
+                    {
                         engine_reusable = false;
                     }
                     if report.terminal {
                         engine.discard_paused_stack();
+                        if nnuec_soft_terminal.is_some()
+                            && (!engine.paused_stack_snapshot().is_some_and(|snapshot| {
+                                snapshot.complete
+                                    && snapshot.owner_id != 0
+                                    && snapshot.tokens_retained == 0
+                                    && snapshot.bytes_current == 0
+                            }) || engine.paused_stack_bytes().is_some()
+                                || engine.pending_reciprocal_request().is_some())
+                        {
+                            // No repair of counters, owner IDs, states or
+                            // unknown cleanup. Preserve the original Err.
+                            engine_reusable = false;
+                            nnuec_soft_terminal = None;
+                        }
                         let snapshot = task.job.mailbox.snapshot();
                         if snapshot.cancel_sequence > snapshot.cancel_ack {
                             let _ = task
@@ -1853,7 +1908,10 @@ impl CpuWorker {
                                 Ok(value) => {
                                     NnuecCaptureEnding::CpuTerminal(value.report.completion)
                                 }
-                                Err(_) => NnuecCaptureEnding::Failed,
+                                Err(_) => nnuec_soft_terminal.map_or(
+                                    NnuecCaptureEnding::Failed,
+                                    NnuecCaptureEnding::CpuTerminal,
+                                ),
                             }
                         };
                         if task.job.retire_nnuec_capture(owner, ending).is_err() {

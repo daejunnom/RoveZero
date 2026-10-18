@@ -124,6 +124,154 @@ fn cpu_fixture(stage: RefinementStage) -> (CpuJobEnvelope, SliceGrant) {
     (job, grant)
 }
 
+fn no_value_report(
+    grant: SliceGrant,
+    reason: crate::cpu_value::CpuValueAuthorityRevocation,
+) -> crate::cpu_worker::CpuSliceReport {
+    // Authored contract packet only; no CpuReport, score or physical claim.
+    crate::cpu_worker::CpuSliceReport {
+        grant,
+        reciprocal_request: None,
+        actual_work: Some(crate::cpu::CpuWork {
+            nodes: 2,
+            quiescence_nodes: 1,
+            tt_hits: 0,
+        }),
+        result: Err(crate::cpu::CpuError::Value(
+            crate::cpu_value::CpuValueError::AuthorityRevoked(reason),
+        )),
+        cumulative_nodes: 2,
+        progress_sequence: 0,
+        continuation_retained: false,
+        terminal: true,
+        admission_rejected: false,
+        controls: Some(rz_runtime::adaptive::ControlSnapshot {
+            terminal: true,
+            ..Default::default()
+        }),
+    }
+}
+
+#[test]
+fn original_no_value_cpu_retires_unknown_after_revoke_without_goal_completion() {
+    use crate::cpu_value::CpuValueAuthorityRevocation;
+    for reason in [
+        CpuValueAuthorityRevocation::Cancelled,
+        CpuValueAuthorityRevocation::Expired,
+    ] {
+        let mut machine = machine(ExecutionMode::CpuPcr);
+        let id = parent(&mut machine, RefinementStage::CpuValidation);
+        let original = machine
+            .ready_work(id, deadline().clock, MonotonicTick(0))
+            .unwrap();
+        let (job, grant) = cpu_fixture(RefinementStage::CpuValidation);
+        machine
+            .bind_cpu(id, &job, &grant, deadline().clock, MonotonicTick(0))
+            .unwrap();
+        let report = no_value_report(grant, reason);
+        machine.revoke();
+        let mut wrong_deadline = original.clone();
+        wrong_deadline.original_deadline.at = MonotonicTick(deadline().at.0 + 1);
+        assert!(
+            machine
+                .retire_cpu_no_value(&wrong_deadline, &report, Digest([71; 32]))
+                .is_err()
+        );
+        let mut wrong_question = original.clone();
+        wrong_question.input.question_digest = Digest([72; 32]);
+        assert!(
+            machine
+                .retire_cpu_no_value(&wrong_question, &report, Digest([71; 32]))
+                .is_err()
+        );
+        let mut foreign_view = original.clone();
+        foreign_view.input.view = Arc::new(*original.input.view);
+        assert!(
+            machine
+                .retire_cpu_no_value(&foreign_view, &report, Digest([71; 32]))
+                .is_err()
+        );
+        assert_eq!(machine.frames().count(), 1);
+        let closed = machine
+            .retire_cpu_no_value(&original, &report, Digest([71; 32]))
+            .unwrap();
+        assert_eq!(closed.original_first_move, original.original_first_move);
+        assert_eq!(
+            closed.unknown,
+            Some("CPU value authority ended without a value")
+        );
+        assert_eq!(closed.completion_scope, None);
+        assert_eq!(closed.evidence, vec![Digest([71; 32])]);
+        assert!(machine.frame(id).is_none());
+        assert!(
+            machine
+                .retire_cpu_no_value(&original, &report, Digest([71; 32]))
+                .is_err()
+        );
+        assert!(matches!(
+            machine.ready_work(id, deadline().clock, MonotonicTick(0)),
+            Err(CoordinatorError::AdmissionClosed)
+        ));
+    }
+}
+
+#[test]
+fn no_value_cpu_child_releases_waiter_without_successful_reciprocal_answer() {
+    let mut machine = machine(ExecutionMode::CpuPcr);
+    let parent = parent(&mut machine, RefinementStage::ProposerRanking);
+    let original_parent_budget = machine.frame(parent).unwrap().budget;
+    let child = admit(&mut machine, parent, RefinementStage::CpuValidation, 1);
+    let original = machine
+        .ready_work(child, deadline().clock, MonotonicTick(0))
+        .unwrap();
+    let (job, grant) = cpu_fixture(RefinementStage::CpuValidation);
+    machine
+        .bind_cpu(child, &job, &grant, deadline().clock, MonotonicTick(0))
+        .unwrap();
+    let report = no_value_report(
+        grant,
+        crate::cpu_value::CpuValueAuthorityRevocation::Cancelled,
+    );
+    let mut hard = report.clone();
+    hard.result = Err(crate::cpu::CpuError::Value(
+        crate::cpu_value::CpuValueError::StateMismatch,
+    ));
+    assert!(
+        machine
+            .retire_cpu_no_value(&original, &hard, Digest([73; 32]))
+            .is_err()
+    );
+    let mut unknown = report.clone();
+    unknown.actual_work = None;
+    assert!(
+        machine
+            .retire_cpu_no_value(&original, &unknown, Digest([73; 32]))
+            .is_err()
+    );
+    let mut retained = report.clone();
+    retained.continuation_retained = true;
+    assert!(
+        machine
+            .retire_cpu_no_value(&original, &retained, Digest([73; 32]))
+            .is_err()
+    );
+    assert_eq!(machine.waiting_on(parent), Some(child));
+    machine.revoke();
+    let closed = machine
+        .retire_cpu_no_value(&original, &report, Digest([73; 32]))
+        .unwrap();
+    assert!(closed.unknown.is_some());
+    assert_eq!(closed.completion_scope, None);
+    assert_eq!(machine.waiting_on(parent), None);
+    // Existing unconsumed role allowance returns only to its original owner;
+    // no new native-node credit, consumed-role refund or new work is issued.
+    assert_eq!(
+        machine.frame(parent).unwrap().budget,
+        original_parent_budget
+    );
+    assert_eq!(machine.frame(parent).unwrap().phase, FramePhase::Ready);
+}
+
 fn accepted_policy(
     stage: RefinementStage,
 ) -> (RoleTicketEnvelope, super::super::super::AcceptedRoleStep) {

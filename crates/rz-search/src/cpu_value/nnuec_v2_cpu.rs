@@ -64,8 +64,8 @@ impl V2CpuValue {
     }
 
     fn check_live(&self) -> Result<(), CpuValueError> {
-        if !self.bound.authority_is_live() {
-            return Err(CpuValueError::StateMismatch);
+        if let Some(reason) = self.bound.authority_revocation() {
+            return Err(CpuValueError::AuthorityRevoked(reason.into()));
         }
         Ok(())
     }
@@ -190,7 +190,6 @@ impl CpuValueEvaluator for V2CpuValue {
         accumulator: &CpuAccumulator,
         position: &Position,
     ) -> Result<CpuValueCacheContext, CpuValueError> {
-        self.check_live()?;
         let state = accumulator
             .nnuec
             .as_ref()
@@ -205,6 +204,10 @@ impl CpuValueEvaluator for V2CpuValue {
         {
             return Err(CpuValueError::StateMismatch);
         }
+        // A known foreign accumulator remains a hard failure even when the
+        // original Bound has also been cancelled. No new arithmetic follows
+        // a revoked authority; only the read-only identity guards precede it.
+        self.check_live()?;
         let context = self
             .model
             .cache_context(self.bound.context(), &state.local, position)
@@ -238,7 +241,6 @@ impl CpuValueEvaluator for V2CpuValue {
         accumulator: &mut CpuAccumulator,
         delta: &RuleMoveDelta,
     ) -> Result<CpuAccumulatorUndo, CpuValueError> {
-        self.check_live()?;
         if accumulator.namespace != self.model.identity
             || accumulator.identity != delta.before.position_identity()
         {
@@ -256,6 +258,7 @@ impl CpuValueEvaluator for V2CpuValue {
         {
             return Err(CpuValueError::StateMismatch);
         }
+        self.check_live()?;
         // This small ownership bridge follows the existing V1 native delta
         // sequence. Every numerical operation remains in the same B/L helper;
         // do not replay legality or introduce a different FP32 update order.
@@ -769,27 +772,34 @@ mod tests {
         let identity = accumulator.identity.clone();
         let second = position.make_move("e7e5".parse().unwrap()).unwrap();
         fixture.cancel.store(true, Ordering::Release);
+        let cancelled = CpuValueError::AuthorityRevoked(
+            crate::cpu_value::CpuValueAuthorityRevocation::Cancelled,
+        );
         assert!(matches!(
             evaluator.initialize(&child),
-            Err(CpuValueError::StateMismatch)
+            Err(CpuValueError::AuthorityRevoked(
+                crate::cpu_value::CpuValueAuthorityRevocation::Cancelled
+            ))
         ));
         assert_eq!(
             evaluator.cache_context(&accumulator, &child),
-            Err(CpuValueError::StateMismatch)
+            Err(cancelled.clone())
         );
         assert_eq!(
             evaluator.score(&accumulator, &child),
-            Err(CpuValueError::StateMismatch)
+            Err(cancelled.clone())
         );
         assert!(matches!(
             evaluator.observe(&accumulator, &child),
-            Err(CpuValueError::StateMismatch)
+            Err(CpuValueError::AuthorityRevoked(
+                crate::cpu_value::CpuValueAuthorityRevocation::Cancelled
+            ))
         ));
         assert_eq!(
             evaluator
                 .apply_delta(&mut accumulator, second.delta())
                 .err(),
-            Some(CpuValueError::StateMismatch),
+            Some(cancelled.clone()),
         );
         assert_eq!(accumulator.values, values);
         assert_eq!(accumulator.identity, identity);
@@ -801,11 +811,11 @@ mod tests {
         assert!(accumulator.nnuec.as_ref().unwrap().local.moves().is_empty());
         assert_eq!(
             evaluator.score(&accumulator, &position),
-            Err(CpuValueError::StateMismatch),
+            Err(cancelled.clone()),
         );
         assert_eq!(
             evaluator.cache_context(&accumulator, &position),
-            Err(CpuValueError::StateMismatch),
+            Err(cancelled),
         );
         assert_eq!(
             V2CpuValue::from_bound(
@@ -831,23 +841,209 @@ mod tests {
             .apply_delta(&mut accumulator, rules.delta())
             .unwrap();
         fixture.actor.invalidate_cache().unwrap();
+        fixture.cancel.store(true, Ordering::Release);
+        let invalidated = CpuValueError::AuthorityRevoked(
+            crate::cpu_value::CpuValueAuthorityRevocation::Invalidated,
+        );
         assert_eq!(
             evaluator.score(&accumulator, &position),
-            Err(CpuValueError::StateMismatch)
+            Err(invalidated.clone())
         );
         position.unmake(rules).unwrap();
         evaluator
             .restore(&mut accumulator, undo, &position)
             .unwrap();
         assert_eq!(accumulator.values, original_values);
-        assert_eq!(
-            evaluator.score(&accumulator, &position),
-            Err(CpuValueError::StateMismatch),
-        );
+        assert_eq!(evaluator.score(&accumulator, &position), Err(invalidated),);
         fixture.actor.shutdown().unwrap();
         assert_eq!(
             evaluator.cache_context(&accumulator, &position),
+            Err(CpuValueError::AuthorityRevoked(
+                crate::cpu_value::CpuValueAuthorityRevocation::ActorStopped
+            ))
+        );
+    }
+
+    #[test]
+    fn revoked_authority_does_not_hide_a_foreign_accumulator() {
+        let first = prepare_fixture(checkpoint());
+        let second = prepare_fixture(checkpoint());
+        let a = first.evaluator();
+        let b = second.evaluator();
+        let position = Position::startpos();
+        let mut foreign = a.initialize(&position).unwrap();
+        second.cancel.store(true, Ordering::Release);
+        assert_eq!(
+            b.cache_context(&foreign, &position),
+            Err(CpuValueError::StateMismatch),
+        );
+        assert_eq!(
+            b.score(&foreign, &position),
             Err(CpuValueError::StateMismatch)
         );
+        let mut work = Position::startpos();
+        let rules = work.make_move("e2e4".parse().unwrap()).unwrap();
+        assert_eq!(
+            b.apply_delta(&mut foreign, rules.delta()).err(),
+            Some(CpuValueError::StateMismatch),
+        );
+        assert_eq!(foreign.identity, position.position_identity());
+    }
+
+    #[test]
+    fn original_cancel_inside_value_readout_is_a_known_nonresumable_stop() {
+        use crate::cpu::{CpuCompletion, CpuConfig, CpuEngine, CpuOrderingPolicy, CpuResumePolicy};
+        use std::sync::atomic::AtomicU64;
+
+        struct CancelOnSecondScore {
+            inner: V2CpuValue,
+            cancel: Arc<AtomicBool>,
+            scores: AtomicU64,
+        }
+        impl CpuValueEvaluator for CancelOnSecondScore {
+            fn identity(&self) -> &CpuValueIdentity {
+                self.inner.identity()
+            }
+            fn provenance(&self) -> &'static str {
+                self.inner.provenance()
+            }
+            fn job_binding_digest(&self) -> Result<Option<Digest>, CpuValueError> {
+                self.inner.job_binding_digest()
+            }
+            fn initialize(&self, p: &Position) -> Result<CpuAccumulator, CpuValueError> {
+                self.inner.initialize(p)
+            }
+            fn cache_context(
+                &self,
+                a: &CpuAccumulator,
+                p: &Position,
+            ) -> Result<CpuValueCacheContext, CpuValueError> {
+                self.inner.cache_context(a, p)
+            }
+            fn score(&self, a: &CpuAccumulator, p: &Position) -> Result<i32, CpuValueError> {
+                if self.scores.fetch_add(1, Ordering::AcqRel) == 1 {
+                    // The actual CPU control check has already admitted this
+                    // readout. Revoke the exact original Bound, without a
+                    // sleep, new deadline, fake score or synthetic response.
+                    self.cancel.store(true, Ordering::Release);
+                }
+                self.inner.score(a, p)
+            }
+            fn apply_delta(
+                &self,
+                a: &mut CpuAccumulator,
+                d: &RuleMoveDelta,
+            ) -> Result<CpuAccumulatorUndo, CpuValueError> {
+                self.inner.apply_delta(a, d)
+            }
+            fn restore(
+                &self,
+                a: &mut CpuAccumulator,
+                u: CpuAccumulatorUndo,
+                p: &Position,
+            ) -> Result<(), CpuValueError> {
+                self.inner.restore(a, u, p)
+            }
+        }
+        let fixture = prepare_fixture(checkpoint());
+        let position = Position::startpos();
+        let before = position.snapshot();
+        let original = fixture.evaluator();
+        let original_score = original
+            .score(&original.initialize(&position).unwrap(), &position)
+            .unwrap();
+        let mut engine = CpuEngine::with_evaluator_ordering_and_resume_policy(
+            CpuConfig {
+                tt_entries: 0,
+                max_depth: 2,
+                ..CpuConfig::default()
+            },
+            Arc::new(CancelOnSecondScore {
+                inner: original,
+                cancel: Arc::clone(&fixture.cancel),
+                scores: AtomicU64::new(0),
+            }),
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+            CpuResumePolicy::PausedStack,
+        )
+        .unwrap();
+        let report = engine
+            .analyze(
+                &position,
+                crate::cpu::CpuLimits {
+                    max_depth: 2,
+                    max_nodes: 100_000,
+                    deadline: None,
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(report.completion, CpuCompletion::Canceled);
+        assert_eq!(report.completed_depth, 0);
+        assert_eq!(report.score, original_score);
+        assert!(report.nodes > 0);
+        assert_eq!(engine.last_attempt_work().unwrap().nodes, report.nodes);
+        assert!(report.resume.is_none() && engine.paused_stack_bytes().is_none());
+        let owner = engine.paused_stack_snapshot().unwrap();
+        assert!(owner.complete && owner.owner_id != 0);
+        assert_eq!(owner.tokens_retained, 0);
+        assert_eq!(owner.bytes_current, 0);
+        assert!(before.same_state(&position.snapshot()));
+    }
+
+    #[test]
+    fn fresh_and_retained_value_preflight_keep_the_original_no_score_revocation() {
+        use crate::cpu::{
+            CpuConfig, CpuEngine, CpuError, CpuLimits, CpuOrderingPolicy, CpuResumePolicy, CpuWork,
+        };
+        use crate::cpu_value::CpuValueAuthorityRevocation;
+
+        for retained in [false, true] {
+            let fixture = prepare_fixture(checkpoint());
+            let position = Position::startpos();
+            let before = position.snapshot();
+            let mut engine = CpuEngine::with_evaluator_ordering_and_resume_policy(
+                CpuConfig {
+                    tt_entries: 0,
+                    max_depth: 2,
+                    ..CpuConfig::default()
+                },
+                Arc::new(fixture.evaluator()),
+                CpuOrderingPolicy::LegacyMvvLvaV1,
+                CpuResumePolicy::PausedStack,
+            )
+            .unwrap();
+            let limits = CpuLimits {
+                max_depth: 2,
+                max_nodes: 1,
+                deadline: None,
+            };
+            let token = retained.then(|| {
+                engine
+                    .analyze(&position, limits, &AtomicBool::new(false))
+                    .unwrap()
+                    .resume
+                    .unwrap()
+            });
+            fixture.cancel.store(true, Ordering::Release);
+            let result = if let Some(token) = &token {
+                engine.resume(&position, token, limits, &AtomicBool::new(false))
+            } else {
+                engine.analyze(&position, limits, &AtomicBool::new(false))
+            };
+            assert!(matches!(
+                result,
+                Err(CpuError::Value(CpuValueError::AuthorityRevoked(
+                    CpuValueAuthorityRevocation::Cancelled,
+                )))
+            ));
+            assert_eq!(engine.last_attempt_work(), Some(CpuWork::default()));
+            assert!(engine.paused_stack_bytes().is_none());
+            let owner = engine.paused_stack_snapshot().unwrap();
+            assert!(owner.complete && owner.owner_id != 0);
+            assert_eq!(owner.tokens_retained, 0);
+            assert_eq!(owner.bytes_current, 0);
+            assert!(before.same_state(&position.snapshot()));
+        }
     }
 }

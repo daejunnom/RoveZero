@@ -1275,6 +1275,17 @@ pub trait AdaptiveSearchDriver<Q> {
     ) -> Result<(), AdaptiveManagerError> {
         Ok(())
     }
+    /// Original known terminal with no CPU score. This is a cleanup consumer,
+    /// never an ordinary commit/after_cpu or a successful reciprocal response.
+    fn cpu_no_value_terminated(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CpuSliceReport,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        Err(AdaptiveManagerError::Invalid(
+            "CPU no-value consumer is unavailable",
+        ))
+    }
     fn cpu_partial_continuation_eligible(
         &self,
         _: &CoordinatorWork<ReviewView, Q>,
@@ -1955,6 +1966,13 @@ enum DeferredCommit<Q> {
     Own {
         binding: OwnBinding<Q>,
         report: CpuSliceReport,
+    },
+    OwnNoValue {
+        binding: OwnBinding<Q>,
+        report: CpuSliceReport,
+        // A publication retry retains the actual committed Unknown closure;
+        // it must not attempt to retire the already-removed frame twice.
+        closed: Option<ClosedFrame>,
     },
     External {
         binding: ForeignBinding<Q>,
@@ -4713,13 +4731,13 @@ where
             if self.phase == ManagerPhase::Running && !self.driver.prepare_semantic_commit()? {
                 break;
             }
-            let Some(event) = self.deferred.pop_front() else {
+            let Some(mut event) = self.deferred.pop_front() else {
                 break;
             };
             let changed_before_event = changed;
             let consumed_before_event = self.counters.consumed_role_outputs;
             changed = true;
-            let result = match &event {
+            let result = match &mut event {
                 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
                 DeferredCommit::ProfiledExternal { binding, packet } => {
                     self.commit_profiled_packet(binding, packet)
@@ -4734,6 +4752,11 @@ where
                             .and_then(|_| self.release_nnuec_report(&binding.work, report))
                     }
                 }
+                DeferredCommit::OwnNoValue {
+                    binding,
+                    report,
+                    closed,
+                } => self.commit_own_no_value(binding, report, closed),
                 DeferredCommit::External { binding, report } => {
                     if self.phase == ManagerPhase::Running {
                         self.commit_foreign(binding, report)
@@ -5203,6 +5226,35 @@ where
                         "CPU slice grant echo mismatch",
                     ));
                 }
+                // Validate the original submitted question before preserving a
+                // worker cause or taking the exact soft no-value path.
+                if report.grant.job != binding.envelope.id
+                    || binding.work.frame.authority != binding.envelope.id.authority
+                    || binding.work.input.question_digest != binding.envelope.question
+                    || binding.work.original_deadline != binding.envelope.hard_deadline
+                {
+                    self.own[slot].binding = Some(binding);
+                    self.quarantined_cpu_receipts
+                        .push(CpuWorkerEvent::Slice(report));
+                    self.phase = ManagerPhase::Quarantined;
+                    return Err(AdaptiveManagerError::Invalid(
+                        "CPU receipt original question binding",
+                    ));
+                }
+                if let Err(error) = &report.result {
+                    if error.value_authority_stop().is_none()
+                        && !self.failures.iter().any(|failure| {
+                            matches!(failure, AdaptiveManagerError::Cpu(CpuWorkerError::Cpu(_)))
+                        })
+                    {
+                        // Preserve the first hard cause before any later
+                        // generic recovery failure. The raw typed error stays
+                        // in the original binding/deferred receipt as well.
+                        self.record_failure(AdaptiveManagerError::Cpu(CpuWorkerError::Cpu(
+                            error.clone(),
+                        )));
+                    }
+                }
                 // The same accepted native-ledger receipt remains available
                 // for collection after actual Store consumption. It is never
                 // recreated from reported counters or a global snapshot.
@@ -5351,6 +5403,8 @@ where
                     return Err(error);
                 }
                 if report.admission_rejected {
+                    // A rejected command remains the original admission error;
+                    // it is not relabelled as an entered no-value termination.
                     // Credit has been settled by a definite no-work report. Do
                     // not manufacture a CPU result or move an existing stack.
                     if report.continuation_retained {
@@ -5366,6 +5420,24 @@ where
                     return Err(AdaptiveManagerError::Invalid(
                         "private CPU admission was rejected",
                     ));
+                }
+                if report
+                    .result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.value_authority_stop())
+                    .is_some()
+                {
+                    // Keep the original worker terminal and its typed cause.
+                    // The Search consumer validates every terminal/known-work
+                    // condition; no JobTerminated packet or score is minted.
+                    self.defer(DeferredCommit::OwnNoValue {
+                        binding,
+                        report,
+                        closed: None,
+                    })?;
+                    self.flush_deferred()?;
+                    return Ok(());
                 }
                 if report
                     .result
@@ -5824,16 +5896,10 @@ where
         self.flush_deferred()?;
         Ok(())
     }
-    fn commit_own(
-        &mut self,
+    fn validate_own_nnuec_custody(
+        &self,
         binding: &OwnBinding<Q>,
-        report: &CpuSliceReport,
     ) -> Result<(), AdaptiveManagerError> {
-        let utility_execution = StepExecution::Cpu {
-            job: binding.envelope.id,
-            execution: report.grant.execution,
-        };
-        self.utility_begin_commit(&binding.work, utility_execution)?;
         if let Some(original) = &binding.nnuec {
             if original.seal.frame() != binding.work.frame
                 || original.seal.question_digest() != binding.envelope.question
@@ -5850,6 +5916,48 @@ where
                 ));
             }
         }
+        Ok(())
+    }
+    fn commit_own_no_value(
+        &mut self,
+        binding: &OwnBinding<Q>,
+        report: &CpuSliceReport,
+        closed: &mut Option<ClosedFrame>,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.validate_own_nnuec_custody(binding)?;
+        let receipt_seal = self.driver.cpu_no_value_terminated(&binding.work, report)?;
+        self.release_nnuec_report(&binding.work, report)?;
+        if binding.feedback_forwarded {
+            // Only old CPU custody ended. Its already-advanced logical frame
+            // and any new P/C/Fresh responsibility remain untouched.
+            return Ok(());
+        }
+        if closed.is_none() {
+            *closed = Some(self.machine.retire_cpu_no_value(
+                &binding.work,
+                report,
+                receipt_seal,
+            )?);
+        }
+        let closed = closed
+            .as_ref()
+            .expect("actual no-value retirement retained");
+        self.release_accepted_role_waiters(closed.id)?;
+        // The existing publisher records an Unknown closure only. In particular
+        // there is no utility_cpu_committed/after_cpu/goal completion here.
+        self.publish_closed_frame(closed)
+    }
+    fn commit_own(
+        &mut self,
+        binding: &OwnBinding<Q>,
+        report: &CpuSliceReport,
+    ) -> Result<(), AdaptiveManagerError> {
+        let utility_execution = StepExecution::Cpu {
+            job: binding.envelope.id,
+            execution: report.grant.execution,
+        };
+        self.utility_begin_commit(&binding.work, utility_execution)?;
+        self.validate_own_nnuec_custody(binding)?;
         if self
             .accepted_roles
             .iter()
@@ -7829,6 +7937,17 @@ where
             self.own[index].ready_readback = receipt.ready_readback;
             if let Some(error) = nnuec_readback_error {
                 self.record_failure(AdaptiveManagerError::NnuecPreparation(error));
+            }
+            if let Some(error) = receipt.value_installation_error {
+                // The independently retained terminal is not contingent on
+                // there still being a matching pending installation slot.
+                self.record_failure(AdaptiveManagerError::Cpu(error));
+            }
+            if !receipt.engine_recoverable {
+                // A joined, non-panicked thread is not an engine ownership
+                // fence. Keep actual usage settlement above, but never issue
+                // a clean archive/root reuse receipt for this owner.
+                self.record_failure(AdaptiveManagerError::Cpu(CpuWorkerError::Quarantined));
             }
             if receipt.thread_panicked {
                 self.quarantine_frontier_slot(index);

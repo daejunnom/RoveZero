@@ -363,14 +363,20 @@ impl BoundNnuecReviewContext {
     /// Original control only; never infer a stop from a readback, foreign
     /// actor, allocation failure or caller-provided error string.
     pub(crate) fn authority_revocation(&self) -> Option<NnuecAuthorityRevocation> {
-        if self.cancel.load(Ordering::Acquire) {
-            Some(NnuecAuthorityRevocation::Cancelled)
-        } else if Instant::now() >= self.deadline {
-            Some(NnuecAuthorityRevocation::Expired)
-        } else if self.stopping.load(Ordering::Acquire) {
+        // Observe the original soft control, then give any observed hard
+        // revocation priority. Cancellation/expiry cannot hide a stopped
+        // actor or an invalidated immutable context. These are observations,
+        // not a new deadline, Bound, actor or permission to resume.
+        let cancelled = self.cancel.load(Ordering::Acquire);
+        let expired = Instant::now() >= self.deadline;
+        if self.stopping.load(Ordering::Acquire) {
             Some(NnuecAuthorityRevocation::ActorStopped)
         } else if self.invalidations.load(Ordering::Acquire) != self.preparation_epoch {
             Some(NnuecAuthorityRevocation::Invalidated)
+        } else if cancelled {
+            Some(NnuecAuthorityRevocation::Cancelled)
+        } else if expired {
+            Some(NnuecAuthorityRevocation::Expired)
         } else {
             None
         }
@@ -1570,6 +1576,8 @@ mod tests {
         assert!(!bound.validates(&stores, state, stores.generation(), view.seal_digest()));
         bound.deadline = Instant::now() + Duration::from_secs(1);
         factory.invalidations.fetch_add(1, Ordering::AcqRel);
+        cancel.store(true, Ordering::Release);
+        bound.deadline = Instant::now() - Duration::from_secs(1);
         assert_eq!(
             bound.authority_revocation(),
             Some(NnuecAuthorityRevocation::Invalidated)

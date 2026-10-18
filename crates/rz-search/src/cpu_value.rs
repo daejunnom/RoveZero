@@ -288,6 +288,9 @@ pub enum CpuValueError {
     Io(String),
     Json(String),
     StateMismatch,
+    /// The original immutable NNUEC Bound revoked this invocation. This is
+    /// distinct from an accumulator, namespace, numerical or owner failure.
+    AuthorityRevoked(CpuValueAuthorityRevocation),
     NonFiniteForward,
     ScoreOutsideFrontierNamespace,
     AccumulatorOverflow,
@@ -303,6 +306,9 @@ impl std::fmt::Display for CpuValueError {
             Self::StateMismatch => {
                 f.write_str("CPU accumulator does not match exact Rules state or value namespace")
             }
+            Self::AuthorityRevoked(reason) => {
+                write!(f, "original CPU NNUEC authority revoked: {reason:?}")
+            }
             Self::NonFiniteForward => f.write_str("CPU FP32 forward produced a non-finite value"),
             Self::ScoreOutsideFrontierNamespace => {
                 f.write_str("CPU nonterminal evaluator score entered the Rules mate namespace")
@@ -313,6 +319,16 @@ impl std::fmt::Display for CpuValueError {
 }
 
 impl std::error::Error for CpuValueError {}
+
+/// Original evaluator control observation, not a cleanup or resume capability.
+/// Hard owner/context revocations cannot be relabeled as cancellation/expiry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CpuValueAuthorityRevocation {
+    Cancelled,
+    Expired,
+    ActorStopped,
+    Invalidated,
+}
 
 /// Immutable weights for an entire admitted CPU task. Changing weights or
 /// semantics requires a new evaluator/engine; implementations must not update
