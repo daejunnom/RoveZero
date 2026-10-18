@@ -51,6 +51,14 @@ fn apply(position: &mut Position, line: &[u16], cap: usize) -> Result<(), ArenaE
     Ok(())
 }
 impl RoventRulesPositionReplay {
+    /// Export detached preparation metadata through the original capture and
+    /// checked replay codecs. This creates Rules observers only, never a live
+    /// collection/native root, worker, action target or execution authority.
+    pub fn metadata_from_position(position: &Position) -> Result<Self, ArenaError> {
+        let metadata = Self::capture(position)?;
+        metadata.restore()?;
+        Ok(metadata)
+    }
     /// 원 owner의 실제 snapshot에서만 live producer가 호출한다.
     /// 공개 DTO를 읽는 소비자는 이 함수 대신 restore로 무결성만 재검증한다.
     pub(super) fn capture(position: &Position) -> Result<Self, ArenaError> {

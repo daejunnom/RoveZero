@@ -25,6 +25,9 @@ use std::{
 };
 
 pub const ROVENT_NATIVE_RESOURCE_EVIDENCE: &str = "rz-rovent-native-resource-readback/1";
+// The schema names these local readback bytes; ArtifactRef.source identifies
+// their public producer source, not a schema/domain or a remote evidence copy.
+const ROVENT_NATIVE_RESOURCE_SOURCE: &str = "https://github.com/daejunnom/RoveZero";
 const MAX_EVIDENCE_BYTES: usize = 4 << 20;
 
 pub mod launch;
@@ -328,7 +331,7 @@ impl RoventNativeResourceSnapshot {
             path,
             sha256: format!("{:x}", Sha256::digest(&bytes)),
             bytes: bytes.len() as u64,
-            source: ROVENT_NATIVE_RESOURCE_EVIDENCE.into(),
+            source: ROVENT_NATIVE_RESOURCE_SOURCE.into(),
             license: "MIT".into(),
         };
         artifact.validate()?;
@@ -386,7 +389,7 @@ mod tests {
     /// any source/native authority. No public success constructor is added.
     fn fixture_snapshot() -> RoventNativeResourceSnapshot {
         RoventNativeResourceSnapshot {
-            raw: json!({"fixture":"projection_only_no_kernel_or_native_authority"}),
+            raw: json!({"schema":ROVENT_NATIVE_RESOURCE_EVIDENCE,"fixture":"projection_only_no_kernel_or_native_authority"}),
             applied: None,
             threads: None,
             limits: None,
@@ -394,13 +397,76 @@ mod tests {
         }
     }
     fn fixture_artifact() -> ArtifactRef {
-        ArtifactRef {
+        let artifact = ArtifactRef {
             path: "fixture/resource-readback.json".into(),
             sha256: "a".repeat(64),
             bytes: 1,
-            source: ROVENT_NATIVE_RESOURCE_EVIDENCE.into(),
+            source: ROVENT_NATIVE_RESOURCE_SOURCE.into(),
             license: "MIT".into(),
+        };
+        artifact.validate().unwrap();
+        artifact
+    }
+
+    #[test]
+    fn written_evidence_validates_public_source_without_changing_readback_schema() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "rovezero-native-resource-evidence-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let directory = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        // Only the exact create-new test file and its own empty directory may
+        // be removed, including when an assertion unwinds. No recursive cleanup.
+        struct Output {
+            root: std::path::PathBuf,
+            directory: Dir,
         }
+        impl Drop for Output {
+            fn drop(&mut self) {
+                let _ = self.directory.remove_file("resource-readback.json");
+                let _ = std::fs::remove_dir(&self.root);
+            }
+        }
+        let output = Output { root, directory };
+        let snapshot = fixture_snapshot();
+        let observed = snapshot
+            .write_evidence(&output.directory, Path::new("resource-readback.json"))
+            .unwrap();
+        observed.evidence.validate().unwrap();
+        assert_eq!(observed.evidence.source, ROVENT_NATIVE_RESOURCE_SOURCE);
+        let bytes = output.directory.read("resource-readback.json").unwrap();
+        assert_eq!(observed.evidence.bytes, bytes.len() as u64);
+        assert_eq!(
+            observed.evidence.sha256,
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+        let raw: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(raw, snapshot.raw);
+        assert_eq!(raw["schema"], ROVENT_NATIVE_RESOURCE_EVIDENCE);
+        // Reproduce the original source/domain mixup through the real metadata
+        // validator; accepting a local schema as a public source stays forbidden.
+        let mut domain_as_source = observed.evidence.clone();
+        domain_as_source.source = ROVENT_NATIVE_RESOURCE_EVIDENCE.into();
+        assert!(domain_as_source.validate().is_err());
+        assert_eq!(observed.limits_applied, RoventObserved::Unknown);
+        assert_eq!(observed.inventory_complete, RoventObserved::Unknown);
+        assert!(
+            snapshot
+                .require_admission(RoventNativeResourceProfile::FunctionalValidation)
+                .is_err()
+        );
+        // Successful writing neither grants resource admission nor overwrites
+        // existing evidence, even when the new bytes would be identical.
+        assert!(
+            snapshot
+                .write_evidence(&output.directory, Path::new("resource-readback.json"))
+                .is_err()
+        );
     }
 
     #[test]
