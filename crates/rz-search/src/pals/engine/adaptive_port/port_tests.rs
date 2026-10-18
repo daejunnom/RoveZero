@@ -493,7 +493,7 @@ fn root_ranking_initial_fanout_keeps_consumed_scope_when_protection_reorders_sel
 
 #[test]
 fn root_ranking_full_frozen_scope_rejects_extra_query_tokens_without_reselection() {
-    let mut port = setup(Position::startpos(), 3);
+    let mut port = setup(Position::startpos(), 4);
     port.engine
         .semantic
         .review_policy
