@@ -1471,7 +1471,7 @@ fn cpu_value_error(
     e: &mut Encoder<'_>,
     value: &crate::cpu_value::CpuValueError,
 ) -> Result<(), PalsError> {
-    use crate::cpu_value::CpuValueError;
+    use crate::cpu_value::{CpuValueAuthorityRevocation, CpuValueError};
     e.object(|o| {
         o.field("domain", "CpuValueError")?;
         o.field("message", DisplayText(value))?;
@@ -1490,6 +1490,18 @@ fn cpu_value_error(
                 "Json"
             }
             CpuValueError::StateMismatch => "StateMismatch",
+            CpuValueError::AuthorityRevoked(reason) => {
+                o.field(
+                    "reason",
+                    match reason {
+                        CpuValueAuthorityRevocation::Cancelled => "Cancelled",
+                        CpuValueAuthorityRevocation::Expired => "Expired",
+                        CpuValueAuthorityRevocation::ActorStopped => "ActorStopped",
+                        CpuValueAuthorityRevocation::Invalidated => "Invalidated",
+                    },
+                )?;
+                "AuthorityRevoked"
+            }
             CpuValueError::NonFiniteForward => "NonFiniteForward",
             CpuValueError::ScoreOutsideFrontierNamespace => "ScoreOutsideFrontierNamespace",
             CpuValueError::AccumulatorOverflow => "AccumulatorOverflow",
@@ -1633,9 +1645,7 @@ mod tests {
             Ok(())
         }
     }
-    fn projection(
-        body: impl FnOnce(&mut Encoder<'_>) -> Result<(), PalsError>,
-    ) -> serde_json::Value {
+    fn projection_bytes(body: impl FnOnce(&mut Encoder<'_>) -> Result<(), PalsError>) -> Vec<u8> {
         let stores = PalsStores::new(StoreLimits::default());
         let cancel = AtomicBool::new(false);
         let origin = Instant::now();
@@ -1653,7 +1663,82 @@ mod tests {
             };
             body(&mut encoder).unwrap();
         }
-        serde_json::from_slice(&output.bytes[..output.used]).unwrap()
+        output.bytes[..output.used].to_vec()
+    }
+    fn projection(
+        body: impl FnOnce(&mut Encoder<'_>) -> Result<(), PalsError>,
+    ) -> serde_json::Value {
+        serde_json::from_slice(&projection_bytes(body)).unwrap()
+    }
+
+    #[test]
+    fn cpu_value_revocation_roundtrip_preserves_each_original_typed_reason() {
+        use crate::cpu::{CpuCompletion, CpuError};
+        use crate::cpu_value::{CpuValueAuthorityRevocation, CpuValueError};
+        for (reason, expected, stop) in [
+            (
+                CpuValueAuthorityRevocation::Cancelled,
+                "Cancelled",
+                Some(CpuCompletion::Canceled),
+            ),
+            (
+                CpuValueAuthorityRevocation::Expired,
+                "Expired",
+                Some(CpuCompletion::Deadline),
+            ),
+            (
+                CpuValueAuthorityRevocation::ActorStopped,
+                "ActorStopped",
+                None,
+            ),
+            (
+                CpuValueAuthorityRevocation::Invalidated,
+                "Invalidated",
+                None,
+            ),
+        ] {
+            let error = CpuError::Value(CpuValueError::AuthorityRevoked(reason));
+            let value = projection(|encoder| cpu_error(encoder, &error));
+            assert_eq!(value["domain"], "CpuError");
+            assert_eq!(value["variant"], "Value");
+            assert_eq!(value["cause"]["domain"], "CpuValueError");
+            assert_eq!(value["cause"]["variant"], "AuthorityRevoked");
+            assert_eq!(value["cause"]["reason"], expected);
+            assert_eq!(value["cause"].as_object().unwrap().len(), 4);
+            assert_eq!(
+                value["cause"]["message"],
+                format!("original CPU NNUEC authority revoked: {expected}"),
+            );
+            assert_eq!(value["message"], error.to_string());
+            // JSON readback is historical data only. It creates no value,
+            // live error/owner, cancellation or cleanup acknowledgement.
+            assert_eq!(error.value_authority_stop(), stop);
+        }
+    }
+
+    #[test]
+    fn legacy_cpu_value_error_projection_bytes_remain_unchanged() {
+        use crate::cpu_value::CpuValueError;
+        for (error, expected) in [
+            (CpuValueError::CheckpointSize,
+                br#"{"domain":"CpuValueError","message":"CPU checkpoint exceeds 8 MiB","variant":"CheckpointSize"}"#.as_slice()),
+            (CpuValueError::InvalidCheckpoint("frozen source"),
+                br#"{"domain":"CpuValueError","message":"CPU checkpoint: frozen source","detail":"frozen source","variant":"InvalidCheckpoint"}"#.as_slice()),
+            (CpuValueError::Io("disk original".into()),
+                br#"{"domain":"CpuValueError","message":"CPU checkpoint read: disk original","detail":"disk original","variant":"Io"}"#.as_slice()),
+            (CpuValueError::Json("syntax original".into()),
+                br#"{"domain":"CpuValueError","message":"CPU checkpoint JSON: syntax original","detail":"syntax original","variant":"Json"}"#.as_slice()),
+            (CpuValueError::StateMismatch,
+                br#"{"domain":"CpuValueError","message":"CPU accumulator does not match exact Rules state or value namespace","variant":"StateMismatch"}"#.as_slice()),
+            (CpuValueError::NonFiniteForward,
+                br#"{"domain":"CpuValueError","message":"CPU FP32 forward produced a non-finite value","variant":"NonFiniteForward"}"#.as_slice()),
+            (CpuValueError::ScoreOutsideFrontierNamespace,
+                br#"{"domain":"CpuValueError","message":"CPU nonterminal evaluator score entered the Rules mate namespace","variant":"ScoreOutsideFrontierNamespace"}"#.as_slice()),
+            (CpuValueError::AccumulatorOverflow,
+                br#"{"domain":"CpuValueError","message":"CPU signed192 accumulator overflow","variant":"AccumulatorOverflow"}"#.as_slice()),
+        ] {
+            assert_eq!(projection_bytes(|encoder| cpu_value_error(encoder, &error)), expected);
+        }
     }
 
     #[test]
