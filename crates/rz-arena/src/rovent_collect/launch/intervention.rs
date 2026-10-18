@@ -180,6 +180,11 @@ struct CohortCaller {
     pairs: Vec<rz_uci::pals_adaptive::UtilityInterventionPair>,
     pair_rejected: Option<rz_uci::pals_adaptive::UtilityInterventionPairRejection>,
     held_payload: Option<std::fs::File>,
+    // Same create_new output owner; diagnostics are outside the proof corpus.
+    diagnostic_directory: Dir,
+    diagnostic_held: Option<std::fs::File>,
+    diagnostic_attempted: bool,
+    diagnostic_error: Option<ArenaError>,
     failure: Option<String>,
 }
 struct TrialCaller {
@@ -303,6 +308,54 @@ impl CohortCaller {
                 "watchdog_joined":original.watchdog_joined,"engine_error_retained":original.engine_error.is_some(),
                 "engine_panic_retained":original.engine_panic.is_some()}))
         }).collect()
+    }
+    fn publish_finite_diagnostic_sidecar(&mut self) -> Result<(), ArenaError> {
+        check(
+            !self.diagnostic_attempted && self.diagnostic_error.is_none(),
+            "original finite diagnostic publication already attempted",
+        )?;
+        self.diagnostic_attempted = true;
+        let trials = self.trials.iter().enumerate().map(|(ordinal, trial)| {
+            let trial = trial.try_lock().map_err(|_|invalid("original trial diagnostics are busy or poisoned"))?;
+            let finite = trial.finite.try_lock().map_err(|_|invalid("original finite diagnostics are busy or poisoned"))?;
+            let original = trial.original_final.as_ref().map(|value|json!({
+                "cohort_id":hex(value.cohort_id()),"trial_sequence":value.trial_sequence(),
+                "recipient":value.recipient().as_str(),"authority":{"process_epoch":value.authority().epoch.0,"game_generation":value.authority().game.0,"root_generation":value.authority().root.0,"implementation_sha256":hex(value.authority().implementation)},
+                "trial_semantic_sha256":hex(value.sha256()),
+                "unknown_reason":value.unknown_reason(),"comparable":value.comparable()
+            }));
+            Ok(json!({"trial_sequence":ordinal as u64+1,
+                "requested_recipient":self.profile.input.requested_recipients.get(ordinal),
+                "original_trial":original,"finite":finite.diagnostic_value()}))
+        }).collect::<Result<Vec<_>,ArenaError>>()?;
+        let original_launch_error = self.failure.as_ref().map(|error| {
+            let prefix = super::cohort_driver::bounded_error(error);
+            json!({"utf8_prefix":prefix,"utf8_bytes":error.len(),"truncated":prefix.len()!=error.len()})
+        });
+        let raw = serde_json::to_vec(&json!({
+            "schema":"rz-rovent-utility-intervention-diagnostics/1",
+            "scope":"bounded_original_finite_observations_not_training_or_physical_proof",
+            "cohort_profile_raw_sha256":hex(Digest(Sha256::digest(&self.profile_bytes).into())),
+            "original_launch_error":original_launch_error,"trials":trials,
+            "training_executed":false,"physical_completion_attested":false,"performance_evidence":false
+        })).map_err(|error|invalid(error.to_string()))?;
+        check(
+            raw.len() <= 4 << 20,
+            "bounded finite diagnostic sidecar exceeded",
+        )?;
+        // I/O only: no native/window/Ready/ACK authority is extended. The outer
+        // supervisor still owns its original finite cleanup and output lease.
+        let until = Instant::now()
+            .checked_add(Duration::from_millis(self.plan.publication_timeout_ms))
+            .ok_or_else(|| invalid("finite diagnostic publication deadline overflow"))?;
+        put_final_raw(
+            &self.diagnostic_directory,
+            "utility-intervention-diagnostics.json",
+            &raw,
+            &mut self.diagnostic_held,
+            until,
+        )?;
+        Ok(())
     }
     fn resources(&self) -> Result<Vec<Value>, ArenaError> {
         self.trials
@@ -709,6 +762,10 @@ pub fn run_rovent_utility_intervention(
             pairs: Vec::new(),
             pair_rejected: None,
             held_payload: None,
+            diagnostic_directory: output,
+            diagnostic_held: None,
+            diagnostic_attempted: false,
+            diagnostic_error: None,
             failure: None,
         })
     })()
@@ -804,15 +861,44 @@ pub fn run_rovent_utility_intervention(
             original: Arc::clone(&shared),
         })
     })();
-    result.map_err(|error| {
-        if let Ok(mut owner) = shared.lock() {
-            owner.failure.get_or_insert_with(|| error.to_string());
+    // Preserve the original typed trial observations before the process exits.
+    // The sidecar is a sibling of utility-intervention-cohort and is never a
+    // publication payload, materialization, durable ACK, or known utility.
+    let diagnostic_error = match shared.try_lock() {
+        Ok(mut owner) => {
+            if let Err(error) = &result {
+                owner.failure.get_or_insert_with(|| error.to_string());
+            }
+            match owner.publish_finite_diagnostic_sidecar() {
+                Ok(()) => None,
+                Err(error) => {
+                    let detail = error.to_string();
+                    owner.diagnostic_error = Some(error);
+                    Some(detail)
+                }
+            }
         }
-        RoventUtilityInterventionLaunchFailure {
-            detail: error.to_string(),
-            original: Some(shared),
+        Err(_) => Some("cohort owner busy or poisoned before diagnostic publication".into()),
+    };
+    match (result, diagnostic_error) {
+        (Ok(receipt), None) => Ok(receipt),
+        (original, diagnostic_error) => {
+            let detail = match (original.err(), diagnostic_error) {
+                (Some(primary), Some(secondary)) => format!(
+                    "{primary}; original finite diagnostics publication failed: {secondary}"
+                ),
+                (Some(primary), None) => primary.to_string(),
+                (None, Some(secondary)) => {
+                    format!("original finite diagnostics publication failed: {secondary}")
+                }
+                (None, None) => unreachable!("successful result handled above"),
+            };
+            Err(RoventUtilityInterventionLaunchFailure {
+                detail,
+                original: Some(shared),
+            })
         }
-    })
+    }
 }
 
 // The assembly closure must return this trial's original prepared Product,
@@ -1490,5 +1576,39 @@ mod tests {
         let mut unsafe_path = arguments();
         unsafe_path[0] = "--utility-intervention-plan=inputs/../outside.json".into();
         assert!(parse_rovent_collection_cli(unsafe_path).is_err());
+    }
+    #[test]
+    fn diagnostic_sidecar_no_clobber_preserves_the_original_and_failed_fd() {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let path = std::env::temp_dir().join(format!(
+            "rz-n05-diagnostic-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let dir = Dir::open_ambient_dir(&path, cap_std::ambient_authority()).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let name = "utility-intervention-diagnostics.json";
+        let mut held = None;
+        let raw = br#"{"schema":"test-original-finite-observation","known":false}"#;
+        let first = put_final_raw(&dir, name, raw, &mut held, until).unwrap();
+        assert!(held.is_none());
+        assert_eq!(first.bytes, raw.len() as u64);
+        assert_eq!(dir.read(name).unwrap(), raw);
+        let replacement = br#"{"known":true}"#;
+        assert!(put_final_raw(&dir, name, replacement, &mut held, until).is_err());
+        assert_eq!(dir.read(name).unwrap(), raw);
+        assert!(held.is_some());
+        use std::io::{Seek, SeekFrom};
+        let failed = held.as_mut().unwrap();
+        failed.seek(SeekFrom::Start(0)).unwrap();
+        let mut retained = Vec::new();
+        failed.read_to_end(&mut retained).unwrap();
+        assert_eq!(retained, replacement);
+        drop(held);
+        drop(dir);
+        std::fs::remove_file(path.join(name)).unwrap();
+        std::fs::remove_file(path.join(format!("{name}.pending"))).unwrap();
+        std::fs::remove_dir(path).unwrap();
     }
 }

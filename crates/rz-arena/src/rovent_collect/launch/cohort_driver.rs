@@ -84,6 +84,29 @@ impl FiniteTrialObservation {
     pub(super) fn diagnostics_truncated(&self) -> bool {
         self.diagnostics.truncated
     }
+    /// Bounded original observations only; no text is promoted to an outcome.
+    pub(super) fn diagnostic_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "protocol_utf8_prefix":self.protocol_utf8_prefix(),
+            "diagnostics_utf8_prefix":self.diagnostics_utf8_prefix(),
+            "protocol_bytes":self.protocol_bytes(),
+            "diagnostics_bytes":self.diagnostics_bytes(),
+            "protocol_truncated":self.protocol_truncated(),
+            "diagnostics_truncated":self.diagnostics_truncated(),
+            "bestmove":self.bestmove,"bestmove_count":self.bestmove_count,
+            "uciok":self.uciok,"readyok":self.readyok,
+            "maximum_wall_reached":self.maximum_wall_reached,
+            "stop_sent":self.stop_sent,"quit_sent":self.quit_sent,
+            "transport_aborted":self.transport_aborted,
+            "watchdog_joined":self.watchdog_joined,
+            "watchdog_failed":self.watchdog_failed,
+            "watchdog_spawn_error":self.watchdog_spawn_error.as_ref().map(bounded_error),
+            "input_rejected":self.input_rejected,
+            "engine_error":self.engine_error.as_ref().map(bounded_error),
+            "engine_error_retained":self.engine_error.is_some(),
+            "engine_panic_retained":self.engine_panic.is_some()
+        })
+    }
 }
 
 #[derive(Default)]
@@ -286,7 +309,7 @@ impl fmt::Write for BoundedDisplay {
         }
     }
 }
-fn bounded_error(error: &EngineError) -> String {
+pub(super) fn bounded_error(error: &impl fmt::Display) -> String {
     let mut text = BoundedDisplay(String::new());
     let _ = write!(&mut text, "{error}");
     text.0
@@ -438,5 +461,51 @@ pub(super) fn run_finite_collection_trial(
             detail,
         }),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn original_diagnostic_projection_retains_failure_and_truncation() {
+        let mut original = FiniteTrialObservation {
+            engine_error: Some(EngineError::DrainTimeout),
+            input_rejected: Some("original position/go rejected"),
+            ..FiniteTrialObservation::default()
+        };
+        original
+            .diagnostics
+            .append(b"RoventNnuecManagerFailure: original typed error\n")
+            .unwrap();
+        original.diagnostics.append(&[b'x'; CAPTURE_BYTES]).unwrap();
+        let value = original.diagnostic_value();
+        assert!(
+            value["diagnostics_utf8_prefix"]
+                .as_str()
+                .unwrap()
+                .starts_with("RoventNnuecManagerFailure: original typed error\n")
+        );
+        assert_eq!(value["diagnostics_truncated"], true);
+        assert!(value["diagnostics_bytes"].as_u64().unwrap() > CAPTURE_BYTES as u64);
+        assert_eq!(value["engine_error"], "DrainTimeout");
+        assert_eq!(value["engine_error_retained"], true);
+        assert!(matches!(
+            original.engine_error.as_ref(),
+            Some(EngineError::DrainTimeout)
+        ));
+        assert_eq!(value["bestmove_count"], 0);
+        assert!(
+            value.get("preferred").is_none() && value.get("physical_completion_attested").is_none()
+        );
+    }
+    #[test]
+    fn original_empty_diagnostics_stays_empty_without_an_invented_failure() {
+        let value = FiniteTrialObservation::default().diagnostic_value();
+        assert_eq!(value["diagnostics_utf8_prefix"], "");
+        assert_eq!(value["diagnostics_bytes"], 0);
+        assert!(value["engine_error"].is_null() && value["input_rejected"].is_null());
+        assert_eq!(value["engine_error_retained"], false);
+        assert_eq!(value["engine_panic_retained"], false);
     }
 }
