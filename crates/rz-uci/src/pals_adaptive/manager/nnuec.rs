@@ -457,11 +457,10 @@ where
         model: Arc<Model>,
     ) -> Result<(), AdaptiveManagerError> {
         self.check_running()?;
-        let endpoint = if self.registration.endpoints.execution_use == CpuExecutionUse::Collection {
-            self.registration.endpoints.cpu_t
-        } else {
-            self.registration.endpoints.cpu_r
-        };
+        // This preparation installs the engine's native R evaluator. Collection
+        // may independently use a foreign teacher, or leave CPU_T disabled when
+        // that teacher is owned by the outer collector.
+        let endpoint = self.registration.endpoints.cpu_r;
         if self.root_started
             || self.nnuec.is_some()
             || self.nnuec_pending.is_some()

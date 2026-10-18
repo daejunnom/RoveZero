@@ -182,6 +182,19 @@ fn authored_untrained_model() -> Arc<Model> {
 
 #[test]
 fn same_preparing_owner_installs_each_question_and_releases_all_view_pins() {
+    run_same_preparing_owner(CpuEndpointSelection::deployment());
+}
+
+#[test]
+fn collection_native_r_uses_original_idle_owner_independently_of_teacher() {
+    let mut endpoints = CpuEndpointSelection::deployment();
+    endpoints.execution_use = rz_search::external_cpu::CpuExecutionUse::Collection;
+    // This is the actual NNUEC Product selection. Arena owns its teacher;
+    // there is no synthetic product CPU_T or external-worker Ready here.
+    run_same_preparing_owner(endpoints);
+}
+
+fn run_same_preparing_owner(endpoints: CpuEndpointSelection) {
     eprintln!("NNUEC_OWNER_STAGE fixture-entered");
     let clock = ContractSystemClock::new(ProcessEpoch(321));
     let until = clock.origin() + OWNER_WINDOW;
@@ -384,7 +397,7 @@ fn same_preparing_owner_installs_each_question_and_releases_all_view_pins() {
             policy: CoordinatorPolicy::Fixed,
             first_request_sequence: 1,
             native_cpu_node_limit: OWNER_NODES,
-            endpoints: CpuEndpointSelection::deployment(),
+            endpoints,
             controller: ControllerConfig::default(),
             device_digest: Digest([124; 32]),
             cpu_device_digest: Digest([125; 32]),
@@ -404,6 +417,74 @@ fn same_preparing_owner_installs_each_question_and_releases_all_view_pins() {
         },
     )
     .unwrap_or_else(|rejected| panic!("actual original-ledger admission: {:?}", rejected.error));
+    if endpoints.execution_use == rz_search::external_cpu::CpuExecutionUse::Collection {
+        use rz_search::external_cpu::CpuEndpoint;
+        let original_budget = manager
+            .driver()
+            .port()
+            .and_then(|port| port.rovent_frontier())
+            .map(|frontier| frontier.registration().root_budget);
+        assert_eq!(original_budget, Some(root_budget));
+        assert_eq!(manager.registration.authority, authority);
+        assert_eq!(manager.registration.hard_deadline, until);
+        assert_eq!(manager.clock.domain().0, authority.epoch);
+        assert!(!manager.root_started);
+        assert!(manager.nnuec.is_none() && manager.nnuec_pending.is_none());
+
+        // Exercise only this startup method's endpoint guard on the actual
+        // original manager. An Own teacher cannot stand in for a missing or
+        // external R. No root input, actor request, installation or work runs.
+        for wrong_r in [CpuEndpoint::Disabled, CpuEndpoint::ExternalUci] {
+            manager.registration.endpoints.cpu_t = CpuEndpoint::Own;
+            manager.registration.endpoints.cpu_r = wrong_r;
+            assert!(matches!(
+                manager.enable_nnuec_preparation(Arc::clone(&model)),
+                Err(AdaptiveManagerError::Invalid(
+                    "NNUEC preparation idle root registration"
+                ))
+            ));
+            assert!(manager.nnuec.is_none() && manager.nnuec_pending.is_none());
+            assert!(!manager.root_started);
+        }
+
+        // This is a method-local declaration test, not an admission of an
+        // external worker. The manager constructor still independently
+        // requires the real owner whenever product CPU_T is ExternalUci.
+        // Recover each unsubmitted model declaration before restoring the
+        // validated Product policy and entering the existing execution below.
+        for teacher in [CpuEndpoint::Disabled, CpuEndpoint::ExternalUci] {
+            manager.registration.endpoints = endpoints;
+            manager.registration.endpoints.cpu_t = teacher;
+            manager
+                .enable_nnuec_preparation(Arc::clone(&model))
+                .unwrap();
+            assert!(matches!(
+                manager.enable_nnuec_preparation(Arc::clone(&model)),
+                Err(AdaptiveManagerError::Invalid(
+                    "NNUEC preparation idle root registration"
+                ))
+            ));
+            assert!(!manager.root_started && manager.nnuec_pending.is_none());
+            let unsubmitted = manager
+                .nnuec
+                .take()
+                .expect("original idle model declaration");
+            assert!(Arc::ptr_eq(&unsubmitted.model, &model));
+            assert!(!unsubmitted.canceled.load(Ordering::Acquire));
+            drop(unsubmitted);
+        }
+        manager.registration.endpoints = endpoints;
+        assert_eq!(manager.registration.authority, authority);
+        assert_eq!(manager.registration.hard_deadline, until);
+        assert_eq!(
+            manager
+                .driver()
+                .port()
+                .and_then(|port| port.rovent_frontier())
+                .map(|frontier| frontier.registration().root_budget),
+            original_budget,
+        );
+    }
     manager
         .enable_nnuec_preparation(Arc::clone(&model))
         .unwrap();
