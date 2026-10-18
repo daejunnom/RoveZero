@@ -761,6 +761,7 @@ pub fn compiled_bootstrap_source_digest() -> [u8; 32] {
         include_str!("rovent_bootstrap/nnuec_source.rs"),
         include_str!("rovent_bootstrap/nnuec_preparing.rs"),
         include_str!("rovent_bootstrap/nnuec_session.rs"),
+        include_str!("rovent_bootstrap/nnuec_session/root_run.rs"),
         include_str!("rovent_bootstrap/nnuec_session/retirement.rs"),
         include_str!("rovent_bootstrap/nnuec_session/initial_cleanup.rs"),
         include_str!("rovent_bootstrap/pinned/nnuec.rs"),

@@ -1,0 +1,1146 @@
+//! Stack-bounded transport of one original NNUEC root.
+//!
+//! Every phase borrows the same heap custody. Large successful owners and
+//! failed by-value transfers stay in explicit slots; an error unsizes this
+//! same allocation into the session's existing retained state. This changes
+//! neither the original admission nor any physical completion requirement.
+
+use super::retirement::NnuecRootRetired;
+use super::*;
+use crate::pals_adaptive::{
+    AdaptiveCheckerMetadata, AdaptiveNnuecRootParts, AdaptiveSequenceContinuation,
+    NnuecPreparationRecord, UtilityRoutePendingClosure,
+};
+use rz_runtime::CompletionSignal;
+use rz_search::pals::engine::PalsResult;
+use rz_search::pals::engine::adaptive_port::AdaptivePreparingRootCustody;
+use rz_search::pals::engine::preparing_root::ResearcherPreparingRoot;
+use rz_search::pals::rovent_engine::RootMoveDomain;
+
+type RootParts =
+    AdaptiveNnuecRootParts<AdaptivePortQuestion, Backend, AdaptivePortDriver<AdaptivePortModel>>;
+
+/// Original transfer metadata stays alive if a later port/retirement fails.
+struct TransferReadback {
+    continuation: AdaptiveSequenceContinuation,
+    receipt: AdaptiveShutdownReceipt,
+    _preparation_observations: Vec<NnuecPreparationRecord>,
+    _preparation_observations_omitted: u64,
+}
+
+struct RootRunFailure {
+    code: &'static str,
+    detail: String,
+}
+
+/// Empty slots indicate a transfer to another slot or the same physical
+/// actor/worker, never a release acknowledgement. Large phase layouts are
+/// boxed independently so even constructing this custody has a small frame.
+struct RootRunCustody {
+    idle: Option<Box<Idle>>,
+    native: Option<NativeOwner>,
+    owner: Option<Box<SemanticOwner>>,
+    actor: Option<PreparationActor>,
+    root: Option<Box<ResearcherPreparingRoot<AdaptivePortModel>>>,
+    initial: Option<InitialNnuecPreparing>,
+    ready: Option<Box<InitialNnuecReady>>,
+    port: Option<Box<AdaptiveEnginePort<AdaptivePortModel>>>,
+    preparing_custody: Option<Box<AdaptivePreparingRootCustody>>,
+    worker: Option<CpuWorker>,
+    metadata: Option<AdaptiveCheckerMetadata>,
+    pins: Option<NnuecRootRetirementPins>,
+    ledger: Option<CpuCreditLedger>,
+    root_budget: Option<Digest>,
+    cleanup_deadline: Option<Instant>,
+    root_moves: Option<Arc<RootMoveDomain>>,
+    driver: Option<Box<AdaptivePortDriver<AdaptivePortModel>>>,
+    manager: Option<Box<Manager>>,
+    parts: Option<Box<RootParts>>,
+    transfer: Option<Box<TransferReadback>>,
+    retired_worker: Option<AdaptiveNnuecRetiredOwner>,
+    utility_pending: Option<Box<UtilityRoutePendingClosure<AdaptivePortQuestion>>>,
+    retirement: Option<Box<NnuecRootRetirement>>,
+    retired: Option<Box<NnuecRootRetired>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    intervention_trial:
+        Option<Arc<crate::pals_adaptive::UtilityInterventionTrialPhysicalRetirement>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    cohort_trial: Option<Arc<crate::pals_adaptive::UtilityTrialPhysicalRetirement>>,
+    completed_utility: Option<Arc<crate::pals_adaptive::CompletedUtilityRouteAction>>,
+    admission: Arc<RoventRootAdmission>,
+    signal: Option<CompletionSignal>,
+    next_request_sequence: u64,
+    game: Option<u64>,
+    collection_admitted: bool,
+    receipt: Option<Arc<RoventNnuecRootReceipt>>,
+    result: Option<Box<PalsResult>>,
+    work: Option<DriverWork>,
+    retirement_deadline: Option<Instant>,
+    /// Original typed error/rejection or panic payload, including any owners
+    /// returned by a failed consuming API. It is never a replacement owner.
+    failure_payload: Option<Box<dyn Any + Send>>,
+    finished: Option<Box<RootReturn>>,
+}
+
+impl RootRunCustody {
+    #[inline(never)]
+    fn new(idle: Box<Idle>, admission: Arc<RoventRootAdmission>) -> Box<Self> {
+        Box::new(Self {
+            idle: Some(idle),
+            native: None,
+            owner: None,
+            actor: None,
+            root: None,
+            initial: None,
+            ready: None,
+            port: None,
+            preparing_custody: None,
+            worker: None,
+            metadata: None,
+            pins: None,
+            ledger: None,
+            root_budget: None,
+            cleanup_deadline: None,
+            root_moves: None,
+            driver: None,
+            manager: None,
+            parts: None,
+            transfer: None,
+            retired_worker: None,
+            utility_pending: None,
+            retirement: None,
+            retired: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            intervention_trial: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            cohort_trial: None,
+            completed_utility: None,
+            admission,
+            signal: None,
+            next_request_sequence: 0,
+            game: None,
+            collection_admitted: false,
+            receipt: None,
+            result: None,
+            work: None,
+            retirement_deadline: None,
+            failure_payload: None,
+            finished: None,
+        })
+    }
+
+    fn fail(&self, code: &'static str, detail: impl Into<String>) -> RootRunFailure {
+        RootRunFailure {
+            code,
+            detail: detail.into(),
+        }
+    }
+
+    fn retain_failure<T: Any + Send>(
+        &mut self,
+        code: &'static str,
+        detail: impl Into<String>,
+        original: T,
+    ) -> RootRunFailure {
+        self.failure_payload = Some(Box::new(original));
+        self.fail(code, detail)
+    }
+
+    fn retain_panic(
+        &mut self,
+        code: &'static str,
+        detail: &'static str,
+        payload: Box<dyn Any + Send>,
+    ) -> RootRunFailure {
+        self.failure_payload = Some(payload);
+        self.fail(code, detail)
+    }
+}
+
+impl RoventNnuecSessionDriver {
+    /// Only pointer-sized phase custody crosses this orchestration frame.
+    #[inline(never)]
+    pub(super) fn run_admitted(
+        &self,
+        idle: Box<Idle>,
+        position: &Position,
+        context: &SearchSessionContext,
+        admission: Arc<RoventRootAdmission>,
+        progress: &mut dyn FnMut(BoardMove),
+    ) -> RootReturn {
+        let mut run = RootRunCustody::new(idle, admission);
+        let outcome = (|| {
+            if !self.prepare_admitted_root(&mut run, position, context)? {
+                return Ok(());
+            }
+            if !self.adopt_ready_manager(&mut run, context)? {
+                return Ok(());
+            }
+            self.execute_admitted_manager(&mut run, context, progress)?;
+            self.retire_executed_root(&mut run, context)
+        })();
+        match outcome {
+            Ok(()) => *run
+                .finished
+                .take()
+                .expect("completed phase has its original return"),
+            Err(failed) => {
+                self.closed.store(true, Ordering::Release);
+                Err((
+                    State::Retained { _owners: run },
+                    unknown(failed.code, &failed.detail),
+                ))
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn prepare_admitted_root(
+        &self,
+        run: &mut RootRunCustody,
+        position: &Position,
+        context: &SearchSessionContext,
+    ) -> Result<bool, RootRunFailure> {
+        let idle = run.idle.as_mut().expect("original idle custody");
+        let reset = self.reset_requested.swap(false, Ordering::AcqRel)
+            || idle.game != Some(context.authority.game.0);
+        if reset {
+            if let Err(error) = idle.owner.try_adaptive_new_game(
+                context.authority,
+                context.control.deadline,
+                &context.control.cancellation,
+            ) {
+                return Err(run.retain_failure("RoventNnuecNewGame", error.to_string(), error));
+            }
+            idle.game = Some(context.authority.game.0);
+        }
+        let deadline = match self.clock.deadline(context.control.deadline) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                return Err(run.retain_failure("RoventNnuecClock", error.to_string(), error));
+            }
+        };
+        let Idle {
+            native,
+            owner,
+            actor,
+            next_request_sequence,
+            game,
+            previous_root: _,
+        } = *run.idle.take().expect("same original idle");
+        run.native = Some(native);
+        run.actor = actor;
+        run.next_request_sequence = next_request_sequence;
+        run.game = game;
+        let root = match (*owner).bind_root(
+            position.clone(),
+            context.authority,
+            deadline,
+            context.control.deadline,
+            Arc::clone(&context.control.cancellation),
+        ) {
+            Ok(root) => root,
+            Err((owner, error)) => {
+                run.owner = Some(Box::new(owner));
+                return Err(run.retain_failure("RoventNnuecBindRoot", error.to_string(), error));
+            }
+        };
+        run.root = Some(Box::new(root));
+        let root = run.root.as_mut().expect("bound original root");
+        if let Err(error) = root.attach_original_controls(
+            ResearcherRootStartup {
+                mode: self.snapshot.mode,
+                root_budget: run.admission.root_budget_digest(),
+                goal: context.goal,
+                nodes: context.requested_nodes,
+                selective_policy: self.selective_policy,
+                frontier_limits: self.frontier_limits.clone(),
+                clock: self.clock.b_clock(),
+                limits: PalsLimits {
+                    deadline: context.control.deadline,
+                    max_rounds: self.max_rounds,
+                    max_cpu_nodes: self.max_native_nodes,
+                    cpu_depth: self.cpu_depth,
+                },
+                cleanup_deadline: context.shutdown_deadline,
+            },
+            Arc::clone(&self.issuer),
+            context.root_moves.as_deref(),
+        ) {
+            return Err(run.retain_failure("RoventNnuecControls", error.to_string(), error));
+        }
+        if let Err(error) = root.prepare_original_root_rules() {
+            let controlled = matches!(
+                (
+                    &error,
+                    root.original_frontier_receipt()
+                        .map(|receipt| receipt.snapshot.goal)
+                ),
+                (
+                    ResearcherPreparingError::Frontier(FrontierError::NodeBudget),
+                    Some(FrontierGoalStatus::Stopped(FrontierStop::WorkBudget))
+                ) | (
+                    ResearcherPreparingError::Frontier(FrontierError::Deadline),
+                    Some(FrontierGoalStatus::Stopped(FrontierStop::Deadline))
+                ) | (
+                    ResearcherPreparingError::Frontier(FrontierError::Revoked),
+                    Some(FrontierGoalStatus::Stopped(FrontierStop::Canceled))
+                )
+            );
+            if !controlled {
+                return Err(run.retain_failure("RoventNnuecRootRules", error.to_string(), error));
+            }
+        }
+        let accepted = match context.accepts() {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                return Err(run.retain_failure(
+                    "RoventNnuecInitialControl",
+                    error.to_string(),
+                    error,
+                ));
+            }
+        };
+        if !accepted || context.soft_expired(Instant::now()) {
+            root.cancel();
+        }
+        let terminal = root.deadline_before_frontier()
+            || root.original_frontier_receipt().is_some_and(|receipt| {
+                !matches!(receipt.snapshot.goal, FrontierGoalStatus::Pending)
+            });
+        if terminal {
+            let root = run.root.take().expect("same stopped root");
+            let retired = match (*root).retire_before_materialization() {
+                Ok(retired) => retired,
+                Err((root, error)) => {
+                    run.root = Some(Box::new(root));
+                    return Err(run.retain_failure(
+                        "RoventNnuecInitialRetire",
+                        error.to_string(),
+                        error,
+                    ));
+                }
+            };
+            run.finished = Some(Box::new(self.finish_preparing_retirement(
+                run.native.take().expect("same native owner"),
+                retired,
+                run.actor.take(),
+                run.next_request_sequence,
+                run.game,
+                context,
+                Arc::clone(&run.admission),
+                None,
+            )));
+            return Ok(false);
+        }
+        let signal = run
+            .native
+            .as_ref()
+            .expect("same native owner")
+            .service
+            .signal();
+        run.signal = Some(signal.clone());
+        if run.actor.is_none() {
+            run.actor = match PreparationActor::spawn_notified(
+                Arc::clone(self.loaded.model()),
+                signal.clone(),
+            ) {
+                Ok(actor) => Some(actor),
+                Err(error) => {
+                    return Err(run.retain_failure(
+                        "RoventNnuecActor",
+                        format!("{error:?}"),
+                        error,
+                    ));
+                }
+            };
+        }
+        run.initial = Some(InitialNnuecPreparing::new(
+            *run.root.take().expect("same unmaterialized root"),
+            run.actor.take().expect("actual actor just admitted"),
+            CpuWorkerId(0),
+            signal.clone(),
+        ));
+        loop {
+            if run.initial.as_ref().expect("same preparation").phase()
+                != InitialNnuecPhase::AdoptPort
+            {
+                let accepted = match context.accepts() {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        return Err(run.retain_failure(
+                            "RoventNnuecInitialControl",
+                            error.to_string(),
+                            error,
+                        ));
+                    }
+                };
+                if !accepted || context.soft_expired(Instant::now()) {
+                    let cleanup = run
+                        .initial
+                        .take()
+                        .expect("same stopped preparation")
+                        .into_cleanup();
+                    run.finished = Some(Box::new(self.cleanup_initial(
+                        run.native.take().expect("same native owner"),
+                        cleanup,
+                        context,
+                        Arc::clone(&run.admission),
+                        run.next_request_sequence,
+                        run.game,
+                        "RoventNnuecInitialStopped",
+                    )));
+                    return Ok(false);
+                }
+            }
+            let observed = signal.version();
+            match run.initial.take().expect("same preparation").step() {
+                InitialNnuecStep::Pending(pending) => run.initial = Some(pending),
+                InitialNnuecStep::Ready(ready) => {
+                    run.ready = Some(ready);
+                    return Ok(true);
+                }
+                InitialNnuecStep::RetainedFailure(failed) => {
+                    run.finished = Some(Box::new(self.cleanup_initial(
+                        run.native.take().expect("same native owner"),
+                        failed.into_cleanup(),
+                        context,
+                        Arc::clone(&run.admission),
+                        run.next_request_sequence,
+                        run.game,
+                        "RoventNnuecInitialPreparation",
+                    )));
+                    return Ok(false);
+                }
+            }
+            signal.wait_changed(
+                observed,
+                context
+                    .shutdown_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(1)),
+            );
+        }
+    }
+
+    #[inline(never)]
+    fn adopt_ready_manager(
+        &self,
+        run: &mut RootRunCustody,
+        context: &SearchSessionContext,
+    ) -> Result<bool, RootRunFailure> {
+        let InitialNnuecReady {
+            port,
+            custody,
+            worker,
+            actor,
+            metadata,
+        } = *run.ready.take().expect("actual initial Ready");
+        run.port = Some(Box::new(port));
+        run.preparing_custody = Some(Box::new(custody));
+        run.worker = Some(worker);
+        run.actor = Some(actor);
+        run.metadata = Some(metadata);
+        let metadata = run.metadata.as_ref().expect("actual metadata");
+        let port = run.port.as_ref().expect("same ready port");
+        let registration = PalsCheckerRegistration {
+            identity: metadata.identity().clone(),
+            conditions: metadata.conditions().to_owned(),
+            capabilities: metadata.capabilities(),
+            owned_descriptor: metadata.owned_descriptor(),
+            cpu_resume_policy: metadata.resume_policy(),
+            role_model: port.engine().model_identity().to_owned(),
+            model_value: port.engine().model_value_identity().cloned(),
+            resolver_version: rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION,
+            resolver_semantics: rz_search::pals::value::MODEL_WDL_RESOLVER_SEMANTICS,
+        };
+        match self.latest_checker.lock() {
+            Ok(mut latest) => *latest = Some(registration),
+            Err(_) => {
+                return Err(run.fail(
+                    "RoventNnuecMetadata",
+                    "actual metadata observation mutex poisoned",
+                ));
+            }
+        }
+        run.root_moves = Some(Arc::clone(
+            &run.preparing_custody
+                .as_ref()
+                .expect("original handoff")
+                .root_moves,
+        ));
+        let (ledger, root_budget, cleanup_deadline, pins) = NnuecRootRetirementPins::from_custody(
+            *run.preparing_custody.take().expect("same original handoff"),
+            run.metadata.take().expect("same actual metadata"),
+        );
+        run.ledger = Some(ledger);
+        run.root_budget = Some(root_budget);
+        run.cleanup_deadline = Some(cleanup_deadline);
+        run.pins = Some(pins);
+        let accepted = match context.accepts() {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                return Err(run.retain_failure(
+                    "RoventNnuecAdoptedControl",
+                    error.to_string(),
+                    error,
+                ));
+            }
+        };
+        if !accepted || context.soft_expired(Instant::now()) {
+            self.finish_adopted_initial(run, context);
+            return Ok(false);
+        }
+        let driver = AdaptivePortDriver::new_with_coordinator_policy_retaining(
+            *run.port.take().expect("same ready port"),
+            context.control.deadline,
+            Arc::new(run.signal.as_ref().expect("same native signal").clone()),
+            ExternalSlicePolicy::default(),
+            self.policy,
+        );
+        match driver {
+            Ok(driver) => run.driver = Some(Box::new(driver)),
+            Err((port, AdaptiveManagerError::Deadline)) => {
+                run.port = Some(Box::new(port));
+                self.finish_adopted_initial(run, context);
+                return Ok(false);
+            }
+            Err((port, error)) => {
+                run.port = Some(Box::new(port));
+                return Err(run.retain_failure("RoventNnuecPort", error.to_string(), error));
+            }
+        }
+        if let Some(observer) = &self.collection_hooks.external_teacher {
+            if let Err(error) = run
+                .driver
+                .as_mut()
+                .expect("actual driver")
+                .set_external_teacher_observer(Arc::clone(observer))
+            {
+                return Err(run.retain_failure(
+                    "RoventNnuecTeacherObserver",
+                    error.to_string(),
+                    error,
+                ));
+            }
+        }
+        let registration = AdaptiveManagerRegistration {
+            authority: context.authority,
+            hard_deadline: context.control.deadline,
+            token_budget: self.configuration.fields().review.token_budget,
+            policy: self.policy,
+            first_request_sequence: run.next_request_sequence,
+            native_cpu_node_limit: self.max_native_nodes,
+            endpoints: CpuEndpointSelection::deployment(),
+            controller: self.controller,
+            device_digest: self.snapshot.backend,
+            cpu_device_digest: Digest(Sha256::digest(b"native-own-nnuec-v2-host-cpu").into()),
+        };
+        let sources = AdaptiveRegisteredLedgerSources {
+            sources: AdaptiveManagerSources {
+                native: run.native.take().expect("same native owner").service,
+                own_workers: vec![run.worker.take().expect("one actual own worker")],
+                external: None,
+                driver: *run.driver.take().expect("same actual driver"),
+            },
+            ledger: run.ledger.take().expect("same original ledger"),
+            root_budget,
+            cleanup_deadline,
+        };
+        match Manager::new_retaining_with_registered_ledger(
+            registration,
+            self.clock.runtime_clock(),
+            self.execution_limits,
+            sources,
+        ) {
+            Ok(manager) => run.manager = Some(Box::new(manager)),
+            Err(rejection) => {
+                let detail = rejection.error.to_string();
+                return Err(run.retain_failure("RoventNnuecManager", detail, rejection));
+            }
+        }
+        Ok(true)
+    }
+
+    /// All physical slots move to the existing original cleanup helper once.
+    #[inline(never)]
+    fn finish_adopted_initial(&self, run: &mut RootRunCustody, context: &SearchSessionContext) {
+        run.finished = Some(Box::new(self.cleanup_adopted_initial(
+            run.native.take().expect("same native owner"),
+            *run.port.take().expect("same adopted port"),
+            run.worker.take().expect("same original worker"),
+            run.actor.take().expect("same preparation actor"),
+            run.pins.take().expect("same original pins"),
+            run.ledger.take().expect("same original ledger"),
+            run.root_budget.expect("same root budget"),
+            run.cleanup_deadline.expect("same cleanup boundary"),
+            run.root_moves.take().expect("same root move domain"),
+            run.next_request_sequence,
+            run.game,
+            context,
+            Arc::clone(&run.admission),
+        )));
+    }
+
+    #[inline(never)]
+    fn execute_admitted_manager(
+        &self,
+        run: &mut RootRunCustody,
+        context: &SearchSessionContext,
+        progress: &mut dyn FnMut(BoardMove),
+    ) -> Result<(), RootRunFailure> {
+        let root_budget = run.root_budget.expect("same original root budget");
+        let mut collection_admitted = false;
+        let execution = {
+            let manager = run.manager.as_mut().expect("actual admitted manager");
+            let actor = run.actor.as_ref().expect("same preparation actor");
+            let admission = &run.admission;
+            catch_unwind(AssertUnwindSafe(|| -> Result<(), AdaptiveManagerError> {
+                if manager.registered_cleanup_deadline() != Some(context.shutdown_deadline) {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "NNUEC original cleanup boundary differs",
+                    ));
+                }
+                if let Some(clock) = &context.effective_clock {
+                    manager.register_effective_clock(clock.clone())?;
+                }
+                manager.enable_nnuec_preparation(Arc::clone(self.loaded.model()))?;
+                let fields = self.configuration.fields();
+                if let ExecutionConfiguration::OwnResearcher {
+                    reciprocal, peers, ..
+                } = fields.execution
+                {
+                    manager.configure_rovent_reciprocal(
+                        reciprocal
+                            .actual(self.snapshot.mode, root_budget)
+                            .map_err(|error| AdaptiveManagerError::Semantic(error.to_string()))?,
+                    )?;
+                    manager.configure_rovent_peer_followups(
+                        peers
+                            .actual()
+                            .map_err(|error| AdaptiveManagerError::Semantic(error.to_string()))?,
+                    )?;
+                }
+                if context.accepts().unwrap_or(false) && !context.soft_expired(Instant::now()) {
+                    if let Some(origin) = &self.collection_origin {
+                        let frontier = manager
+                            .driver()
+                            .port()
+                            .and_then(|port| port.rovent_frontier())
+                            .ok_or(AdaptiveManagerError::Invalid(
+                                "actual NNUEC collection frontier absent",
+                            ))?;
+                        let cap = RoventCollectionRootAdmission::from_attached_frontier(
+                            origin,
+                            frontier,
+                            self.snapshot.input_lock,
+                            root_budget,
+                            self.selective_policy,
+                            Arc::clone(admission),
+                        )?;
+                        manager.admit_collection_root(cap)?;
+                        if let Some(observer) = &self.collection_hooks.root_admission {
+                            observer(manager)?;
+                        }
+                        collection_admitted = true;
+                    }
+                }
+                // The same original gate precedes root input and every C pump.
+                if context.accepts().unwrap_or(false)
+                    && !context.soft_expired(Instant::now())
+                    && !should_quiesce(manager)?
+                {
+                    let input = manager.driver_mut().root_input()?;
+                    manager.prepare_root_ranking(input)?;
+                }
+                let mut published = None;
+                manager.run_root_until_observed(
+                    context.shutdown_deadline,
+                    &context.control.cancellation,
+                    &mut |manager| {
+                        let accepts = context.accepts().unwrap_or(false);
+                        if manager.phase() == ManagerPhase::Running
+                            && (!accepts
+                                || context.soft_expired(Instant::now())
+                                || should_quiesce(manager)?)
+                        {
+                            manager.begin_root_quiesce(context.shutdown_deadline)?;
+                        }
+                        if collection_admitted {
+                            if let Some(pump) = &self.collection_hooks.cooperative {
+                                pump()?;
+                            }
+                        }
+                        manager.pump_nnuec_preparation(actor)?;
+                        if context.accepts().unwrap_or(false) {
+                            if let Ok(result) = manager.driver().result(PalsCompletion::RoundLimit)
+                            {
+                                if let Some(movement) = result.best_move {
+                                    if !admission.allowed_root_moves().contains(&movement) {
+                                        return Err(AdaptiveManagerError::Invalid(
+                                            "NNUEC progress escaped original root moves",
+                                        ));
+                                    }
+                                    if published != Some(movement) {
+                                        progress(movement);
+                                        published = Some(movement);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
+                Ok(())
+            }))
+        };
+        run.collection_admitted = collection_admitted;
+        match execution {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(run.retain_failure("RoventNnuecExecution", error.to_string(), error));
+            }
+            Err(payload) => {
+                return Err(run.retain_panic(
+                    "RoventNnuecExecutionPanic",
+                    "actual root execution panicked; original panic and physical owners retained",
+                    payload,
+                ));
+            }
+        }
+        let physical = {
+            let manager = run.manager.as_ref().expect("same manager after execution");
+            match manager.shutdown_receipt() {
+                Ok(receipt)
+                    if receipt.permits_root_reuse()
+                        && manager.phase() == ManagerPhase::Finished =>
+                {
+                    receipt
+                }
+                _ => return Err(run.fail("RoventNnuecFence", "actual root fence absent")),
+            }
+        };
+        let manager = run.manager.as_ref().expect("same fenced manager");
+        let completion = if context.cancellation.is_canceled()
+            || context.control.cancellation.load(Ordering::Acquire)
+        {
+            PalsCompletion::Canceled
+        } else if Instant::now() >= context.control.deadline {
+            PalsCompletion::Deadline
+        } else if manager.driver().root_is_terminal().unwrap_or(false) {
+            PalsCompletion::Terminal
+        } else if manager.cpu_node_limit_reached() {
+            PalsCompletion::CpuNodeLimit
+        } else if manager.role_call_limit_reached() {
+            PalsCompletion::RoleCallLimit
+        } else {
+            PalsCompletion::RoundLimit
+        };
+        run.result = match manager.driver().result(completion) {
+            Ok(result) => Some(Box::new(result)),
+            Err(error) => {
+                return Err(run.retain_failure("RoventNnuecResult", error.to_string(), error));
+            }
+        };
+        if run.collection_admitted {
+            if let Some(observer) = &self.collection_hooks.root_closure {
+                let completion = run
+                    .result
+                    .as_ref()
+                    .expect("same original result")
+                    .completion;
+                let closure = catch_unwind(AssertUnwindSafe(|| {
+                    observer(
+                        run.manager.as_mut().expect("same original manager"),
+                        completion,
+                    )
+                }));
+                match closure {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(run.retain_failure("RoventNnuecCollectionClosure", error.to_string(), error)),
+                    Err(payload) => return Err(run.retain_panic("RoventNnuecCollectionClosurePanic",
+                        "root closure panicked; original pending utility and physical owners retained", payload)),
+                }
+            }
+        }
+        let frontier = match run
+            .manager
+            .as_mut()
+            .expect("same manager")
+            .driver_mut()
+            .retire_rovent_frontier()
+        {
+            Ok(Some(receipt)) => receipt.snapshot,
+            original => {
+                return Err(run.retain_failure(
+                    "RoventNnuecFrontierRetire",
+                    "actual frontier retirement absent",
+                    original,
+                ));
+            }
+        };
+        // Store the same Arc before the fallible latest/observer boundary.
+        // A failed observer retains both this original receipt and its owners.
+        run.receipt = Some(Arc::new(RoventNnuecRootReceipt {
+            domain: ROVENT_NNUEC_ROOT_DOMAIN,
+            authority: context.authority,
+            input_lock: self.snapshot.input_lock,
+            root_admission: Arc::clone(&run.admission),
+            frontier: Some(frontier),
+            physical: Some(physical),
+            counters: run.manager.as_ref().expect("same manager").counters(),
+            stopped_before_research_execution: false,
+            deadline_before_frontier: false,
+            initial_retirement: None,
+        }));
+        let receipt = run.receipt.as_ref().expect("same original root receipt");
+        if let Err(error) = self.observe_root_receipt(receipt) {
+            return Err(run.retain_failure(
+                "RoventNnuecRootObservation",
+                error.detail.clone(),
+                error,
+            ));
+        }
+        run.work = match receipt.work() {
+            Ok(work) => Some(work),
+            Err(error) => {
+                return Err(run.retain_failure("RoventNnuecWork", error.detail.clone(), error));
+            }
+        };
+        if run
+            .result
+            .as_ref()
+            .expect("same result")
+            .best_move
+            .is_some_and(|movement| {
+                !receipt
+                    .root_admission
+                    .allowed_root_moves()
+                    .contains(&movement)
+            })
+        {
+            return Err(run.fail(
+                "RoventNnuecRootRestriction",
+                "actual result escaped original move domain",
+            ));
+        }
+        run.utility_pending = match run
+            .manager
+            .as_mut()
+            .expect("same manager")
+            .take_utility_route_retirement()
+        {
+            Ok(pending) => pending.map(Box::new),
+            Err(error) => {
+                return Err(run.retain_failure(
+                    "RoventNnuecUtilityRetirement",
+                    error.to_string(),
+                    error,
+                ));
+            }
+        };
+        let retirement_deadline = context.shutdown_deadline;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let retirement_deadline = run
+            .utility_pending
+            .as_ref()
+            .and_then(|pending| pending.cohort_cleanup_deadline())
+            .map_or(retirement_deadline, |cutoff| {
+                retirement_deadline.min(cutoff)
+            });
+        run.retirement_deadline = Some(retirement_deadline);
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn retire_executed_root(
+        &self,
+        run: &mut RootRunCustody,
+        context: &SearchSessionContext,
+    ) -> Result<(), RootRunFailure> {
+        let manager = run.manager.take().expect("same fenced manager");
+        run.parts = match (*manager).into_nnuec_root_parts() {
+            Ok(parts) => Some(Box::new(parts)),
+            Err(rejection) => {
+                let detail = rejection.error.to_string();
+                return Err(run.retain_failure("RoventNnuecRootTransfer", detail, rejection));
+            }
+        };
+        let parts = run.parts.as_ref().expect("same original root parts");
+        if parts.cpu.len() != 1 || parts.external.is_some() {
+            return Err(run.fail(
+                "RoventNnuecCpuTransfer",
+                "actual researcher owner set differs",
+            ));
+        }
+        let RootParts {
+            native,
+            mut cpu,
+            external: _,
+            driver,
+            continuation,
+            receipt,
+            preparation_observations,
+            preparation_observations_omitted,
+        } = *run.parts.take().expect("validated original owner set");
+        run.native = Some(NativeOwner::new(native));
+        run.retired_worker = cpu.pop();
+        run.driver = Some(Box::new(driver));
+        run.next_request_sequence = continuation.first_request_sequence();
+        run.transfer = Some(Box::new(TransferReadback {
+            continuation,
+            receipt,
+            _preparation_observations: preparation_observations,
+            _preparation_observations_omitted: preparation_observations_omitted,
+        }));
+        let driver = run.driver.take().expect("same fenced driver");
+        let port =
+            match (*driver).into_port(&run.transfer.as_ref().expect("same root fence").receipt) {
+                Ok(port) => port,
+                Err((driver, error)) => {
+                    run.driver = Some(Box::new(driver));
+                    return Err(run.retain_failure(
+                        "RoventNnuecSemanticFence",
+                        error.to_string(),
+                        error,
+                    ));
+                }
+            };
+        run.port = Some(Box::new(port));
+        run.retirement = Some(Box::new(NnuecRootRetirement::new(
+            run.actor.take().expect("same preparation actor"),
+            run.retired_worker
+                .take()
+                .expect("one actual joined researcher"),
+            run.pins.take().expect("same original pins"),
+            run.port.take().expect("same fenced port").into_engine(),
+        )));
+        if let Some(pending) = run.utility_pending.take() {
+            if let Err((error, pending)) = run
+                .retirement
+                .as_mut()
+                .expect("same retirement")
+                .attach_utility_route_pending(*pending)
+            {
+                run.utility_pending = Some(Box::new(pending));
+                return Err(run.retain_failure(
+                    "RoventNnuecUtilityRetirement",
+                    "original utility pending owner was rejected before same-actor retirement",
+                    error,
+                ));
+            }
+        }
+        let retirement_deadline = run
+            .retirement_deadline
+            .expect("original retirement boundary");
+        let signal = run.signal.as_ref().expect("same native signal").clone();
+        loop {
+            if Instant::now() >= retirement_deadline {
+                return Err(run.fail(
+                    "RoventNnuecRetirementDeadline",
+                    "original cleanup deadline expired before same-actor release",
+                ));
+            }
+            let observed = signal.version();
+            let retirement = run.retirement.take().expect("same ongoing retirement");
+            match (*retirement).step() {
+                NnuecRootRetirementStep::Pending(pending) => {
+                    run.retirement = Some(Box::new(pending))
+                }
+                NnuecRootRetirementStep::Ready(retired) => {
+                    run.retired = Some(Box::new(retired));
+                    break;
+                }
+                NnuecRootRetirementStep::RetainedFailure(failed) => {
+                    let detail = format!(
+                        "same-actor release failed in {:?}: {}; original owners retained",
+                        failed.phase(),
+                        failed.error()
+                    );
+                    return Err(run.retain_failure("RoventNnuecRetirement", detail, failed));
+                }
+            }
+            signal.wait_changed(
+                observed,
+                retirement_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(1)),
+            );
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        {
+            let retired = run.retired.as_ref().expect("same acknowledged retirement");
+            if usize::from(retired.utility_route.is_some())
+                + usize::from(retired.utility_cohort.is_some())
+                + usize::from(retired.utility_intervention.is_some())
+                > 1
+            {
+                return Err(run.fail(
+                    "RoventNnuecUtilityRetirementKind",
+                    "one original retirement returned both root-local and cohort outputs",
+                ));
+            }
+            run.intervention_trial = run
+                .retired
+                .as_mut()
+                .expect("same retired owner")
+                .utility_intervention
+                .take();
+            if let Some(trial) = &run.intervention_trial {
+                if !run.collection_admitted
+                    || trial.authority() != context.authority
+                    || !trial.matches_root_admission(
+                        &run.receipt
+                            .as_ref()
+                            .expect("original receipt")
+                            .root_admission,
+                    )
+                {
+                    return Err(run.fail(
+                        "RoventNnuecInterventionTrialScope",
+                        "/2 retirement differs from original Collection root",
+                    ));
+                }
+                let Some(observer) = &self.collection_hooks.utility_intervention_trial_retired
+                else {
+                    return Err(run.fail(
+                        "RoventNnuecInterventionTrialObserverMissing",
+                        "actual /2 retirement has no original final consumer",
+                    ));
+                };
+                match catch_unwind(AssertUnwindSafe(|| observer(trial))) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        return Err(run.retain_failure(
+                            "RoventNnuecInterventionTrialPublication",
+                            error.to_string(),
+                            error,
+                        ));
+                    }
+                    Err(payload) => {
+                        return Err(run.retain_panic(
+                            "RoventNnuecInterventionTrialPublicationPanic",
+                            "/2 consumer panicked; original cap and actual owners retained",
+                            payload,
+                        ));
+                    }
+                }
+                run.intervention_trial = None;
+            }
+            run.cohort_trial = run
+                .retired
+                .as_mut()
+                .expect("same retired owner")
+                .utility_cohort
+                .take();
+            if let Some(trial) = &run.cohort_trial {
+                if !run.collection_admitted
+                    || trial.authority() != context.authority
+                    || !trial.matches_root_admission(
+                        &run.receipt
+                            .as_ref()
+                            .expect("original receipt")
+                            .root_admission,
+                    )
+                {
+                    return Err(run.fail(
+                        "RoventNnuecUtilityTrialScope",
+                        "cohort retirement differs from the original collection root admission",
+                    ));
+                }
+                let Some(observer) = &self.collection_hooks.utility_trial_retired else {
+                    return Err(run.fail(
+                        "RoventNnuecUtilityTrialObserverMissing",
+                        "actual cohort retirement has no final trial consumer",
+                    ));
+                };
+                match catch_unwind(AssertUnwindSafe(|| observer(trial))) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(run.retain_failure("RoventNnuecUtilityTrialPublication", error.to_string(), error)),
+                    Err(payload) => return Err(run.retain_panic("RoventNnuecUtilityTrialPublicationPanic",
+                        "cohort trial consumer panicked; original physical cap and actual owners retained", payload)),
+                }
+                run.cohort_trial = None;
+            }
+        }
+        run.completed_utility = run
+            .retired
+            .as_mut()
+            .expect("same retired owner")
+            .utility_route
+            .take()
+            .map(Arc::new);
+        if let Some(completed) = &run.completed_utility {
+            if !run.collection_admitted
+                || completed.id().authority() != context.authority
+                || completed.semantic().root_budget()
+                    != run
+                        .receipt
+                        .as_ref()
+                        .expect("original receipt")
+                        .root_admission
+                        .root_budget_digest()
+            {
+                return Err(run.fail(
+                    "RoventNnuecUtilityScope",
+                    "completed utility action differs from the original admitted collection root",
+                ));
+            }
+            let Some(observer) = &self.collection_hooks.utility_route_completed else {
+                return Err(run.fail(
+                    "RoventNnuecUtilityObserverMissing",
+                    "actual utility completion has no final collection consumer",
+                ));
+            };
+            match catch_unwind(AssertUnwindSafe(|| observer(completed))) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(run.retain_failure(
+                        "RoventNnuecUtilityPublication",
+                        error.to_string(),
+                        error,
+                    ));
+                }
+                Err(payload) => return Err(run.retain_panic(
+                    "RoventNnuecUtilityPublicationPanic",
+                    "final utility consumer panicked; original action and actual owners retained",
+                    payload,
+                )),
+            }
+            run.completed_utility = None;
+        }
+        let receipt = run.receipt.take().expect("same original observed receipt");
+        let result = run.result.take().expect("same original result");
+        let mate_strategy = receipt
+            .frontier
+            .as_ref()
+            .and_then(|frontier| frontier.mate_strategy.clone())
+            .filter(|strategy| result.best_move == Some(strategy.best_move()));
+        let retired = run.retired.take().expect("same fully acknowledged owner");
+        // Continuation and physical metadata are retained until all callbacks
+        // succeeded. The next sequence remains this original continuation's.
+        let next_request_sequence = run
+            .transfer
+            .as_ref()
+            .expect("same transfer readback")
+            .continuation
+            .first_request_sequence();
+        run.finished = Some(Box::new(Ok((
+            Box::new(Idle {
+                native: run.native.take().expect("same original native service"),
+                owner: Box::new(retired.owner),
+                actor: Some(retired.actor),
+                next_request_sequence,
+                game: run.game,
+                previous_root: Some(Arc::clone(&receipt)),
+            }),
+            SearchSessionReport {
+                best_move: result.best_move,
+                work: run.work.take().expect("same original work receipt"),
+                mate_strategy,
+            },
+            receipt,
+        ))));
+        Ok(())
+    }
+}
