@@ -1507,6 +1507,17 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
             .rovent_frontier()
             .map(|frontier| frontier.registration().root_budget))
     }
+    fn rovent_counter_selected(
+        &mut self,
+        original: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        selected: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        self.hot()?
+            .rovent_counter_selected(original, selected, clock, now)
+            .map_err(semantic)
+    }
     fn rovent_frame_admitted(
         &mut self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,

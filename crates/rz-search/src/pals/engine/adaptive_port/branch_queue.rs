@@ -530,6 +530,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     }
     pub(super) fn begin_counter(
         &mut self,
+        original: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
         pending: PendingCounter,
     ) -> Result<AdaptivePortTransition, PalsError> {
         let node = self.replay_node(&pending.counter)?;
@@ -555,6 +556,13 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 pending.source,
             );
         }
+        let goal_selection = self.prepare_counter_goal_selection(
+            original,
+            &pending.counter,
+            &pending.proposal,
+            pending.attack,
+            pending.source,
+        )?;
         let done = pending.counter.len() >= self.continuation_limit()
             || self.engine.semantic.nodes[node].terminal.is_some();
         let stage = if done {
@@ -578,7 +586,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             None,
         )?;
         Ok(AdaptivePortTransition::Continue(
-            next.with_counter_source(pending.source),
+            next.with_counter_source(pending.source)
+                .with_counter_goal_selection(goal_selection)?,
         ))
     }
     /// Preserve each branch outcome even when a sibling continues under the
@@ -655,7 +664,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .get_mut(&first)
             .and_then(VecDeque::pop_front);
         if let Some(next) = next {
-            return self.begin_counter(next);
+            return self.begin_counter(work, next);
         }
         // Queuing the exact accepted Repair is an administrative frontier
         // closure. Earlier Unknown receipts still describe unresolved sibling

@@ -907,6 +907,15 @@ pub trait AdaptiveSearchDriver<Q> {
     ) -> Result<bool, AdaptiveManagerError> {
         Ok(false)
     }
+    fn rovent_counter_selected(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: &CoordinatorWork<ReviewView, Q>,
+        _: ClockDomain,
+        _: MonotonicTick,
+    ) -> Result<bool, AdaptiveManagerError> {
+        Ok(false)
+    }
     fn rovent_fresh_accepted(
         &mut self,
         _: &CoordinatorWork<ReviewView, Q>,

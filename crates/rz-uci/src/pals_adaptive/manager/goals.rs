@@ -54,8 +54,9 @@ where
         let Some(frame) = self.machine.frame(original.frame) else {
             return Ok(());
         };
+        let selected_stage = frame.input.stage;
         let queued_recheck = frame.parent.is_some() && frame.parent == frame.supersedes;
-        let kind = match (original.input.stage, frame.input.stage) {
+        let kind = match (original.input.stage, selected_stage) {
             (
                 RefinementStage::CriticReply,
                 RefinementStage::CounterContinuation | RefinementStage::CounterValidation,
@@ -71,13 +72,28 @@ where
             }
             _ => None,
         };
-        let Some(kind) = kind else { return Ok(()) };
+        let selected_counter = matches!(
+            selected_stage,
+            RefinementStage::CounterContinuation | RefinementStage::CounterValidation
+        );
+        if kind.is_none() && !selected_counter {
+            return Ok(());
+        }
         let now = self.check_running()?;
         let selected = self
             .machine
             .ready_work(original.frame, self.clock.domain(), now)?;
-        self.driver
-            .rovent_frame_admitted(&selected, kind, self.clock.domain(), now)?;
+        if selected_counter
+            && self
+                .driver
+                .rovent_counter_selected(original, &selected, self.clock.domain(), now)?
+        {
+            return Ok(());
+        }
+        if let Some(kind) = kind {
+            self.driver
+                .rovent_frame_admitted(&selected, kind, self.clock.domain(), now)?;
+        }
         Ok(())
     }
 

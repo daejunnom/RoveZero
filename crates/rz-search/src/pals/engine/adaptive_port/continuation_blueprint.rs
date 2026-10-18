@@ -53,6 +53,7 @@ struct InputRecipe {
     paired_repaired: Option<ObservationId>,
     discovery_restricted: bool,
     counter_source: Option<ObservationId>,
+    counter_selection: Option<Box<super::goal_hooks::AdaptiveCounterSelection>>,
 }
 enum BlueprintContent {
     Input(InputRecipe),
@@ -79,6 +80,19 @@ pub struct AdaptiveContinuationBlueprint {
     diagnostic_repair_line: Option<AdaptiveRepairLineProvenance>,
 }
 impl AdaptiveContinuationBlueprint {
+    pub(super) fn with_counter_goal_selection(
+        mut self,
+        source: Option<Box<super::goal_hooks::AdaptiveCounterSelection>>,
+    ) -> Result<Self, PalsError> {
+        let BlueprintContent::Input(recipe) = &mut self.content else {
+            return Err(RoleError::InvalidOutput.into());
+        };
+        if recipe.counter_selection.is_some() {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        recipe.counter_selection = source;
+        Ok(self)
+    }
     pub(super) fn carry_diagnostic_repair_line(
         &mut self,
         source: Option<AdaptiveRepairLineProvenance>,
@@ -260,6 +274,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 paired_repaired,
                 discovery_restricted: false,
                 counter_source: None,
+                counter_selection: None,
             }),
         })
     }
@@ -425,6 +440,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 let diagnostic_repair_line = blueprint.diagnostic_repair_line;
                 let input = match blueprint.content {
                     BlueprintContent::Input(recipe) => {
+                        let counter_selection = recipe.counter_selection;
                         let mut input = self.input(
                             recipe.node,
                             recipe.stage,
@@ -442,6 +458,9 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                         query.counter_source = recipe.counter_source;
                         query.discovery_restricted = recipe.discovery_restricted;
                         query.diagnostic_repair_line = diagnostic_repair_line;
+                        if let Some(selection) = counter_selection {
+                            self.bind_counter_goal_selection(selection, &input)?;
+                        }
                         input
                     }
                     BlueprintContent::FrozenSecond(input) => {

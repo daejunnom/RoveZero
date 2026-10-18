@@ -64,6 +64,7 @@ pub use external_commit::{AdaptiveForeignPublication, AdaptivePortExternalQuesti
 pub use frontier_port::{
     AdaptiveFrontierReceipt, AdaptiveFrontierStartup, AdaptiveReviewLeaseAdmission,
 };
+pub(crate) use goal_hooks::AdaptiveCounterSelection;
 pub use goal_hooks::AdaptiveGoalBoundary;
 pub use goal_local::{
     AdaptiveGoalLocalAdmission, GoalLocalBlockReason, GoalLocalInput, GoalLocalLeaf,
@@ -552,6 +553,7 @@ pub struct AdaptiveEnginePort<M: RoleModel> {
     reciprocal: reciprocal_port::ReciprocalPortState,
     nnuec_installations: nnuec_installation::NnuecQuestionInstallations,
     goal_local: goal_local::GoalLocalPortState,
+    goal_lanes: goal_hooks::AdaptiveGoalLanes,
     utility_continuations: utility_dependencies::UtilityContinuationRegistry,
 }
 #[derive(Clone)]
@@ -822,6 +824,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             reciprocal: reciprocal_port::ReciprocalPortState::default(),
             nnuec_installations: nnuec_installation::NnuecQuestionInstallations::default(),
             goal_local: goal_local::GoalLocalPortState::default(),
+            goal_lanes: goal_hooks::AdaptiveGoalLanes::default(),
             utility_continuations: utility_dependencies::UtilityContinuationRegistry::default(),
         }
     }

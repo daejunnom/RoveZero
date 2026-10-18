@@ -2,9 +2,85 @@
 //! An endpoint transition only issues the next real Fresh question; it never
 //! invents a physical completion, a value, or a selected move.
 use super::*;
-use crate::pals::coordinator::AcceptedRoleStep;
-use crate::pals::rovent_frontier::{FrontierError, FrontierFrameKind};
+use crate::pals::coordinator::{AcceptedRoleStep, MAX_COORDINATOR_FRAMES};
+use crate::pals::rovent_frontier::{FrontierError, FrontierFrameKind, FrontierObligation};
 use rz_contracts::{ClockDomain, MonotonicTick};
+
+#[derive(Default)]
+pub(super) struct AdaptiveGoalLanes {
+    active: HashMap<(FrameId, FrontierFrameKind), FrontierObligation>,
+    selected: HashMap<ContractDigest, SelectedCounterLane>,
+}
+
+/// Only begin_counter can put this source into a continuation recipe. The
+/// materializer binds it to the actual new question/view after native source
+/// consumption; an arbitrary public work descriptor cannot issue this source.
+pub(crate) struct AdaptiveCounterSelection {
+    frame: FrameId,
+    first: rz_contracts::pals::Move16,
+    deadline: Deadline,
+    budget: FrameBudget,
+    parent_question: std::sync::Weak<AdaptivePortQuestion>,
+    parent_view: std::sync::Weak<ReviewView>,
+    parent_digest: ContractDigest,
+    selected_question: Option<std::sync::Weak<AdaptivePortQuestion>>,
+    selected_view: Option<std::sync::Weak<ReviewView>>,
+    counter: Vec<BoardMove>,
+    proposal: Vec<BoardMove>,
+    attack: usize,
+    source: Option<ObservationId>,
+}
+struct SelectedCounterLane {
+    source: Arc<AdaptiveCounterSelection>,
+}
+
+impl AdaptiveCounterSelection {
+    pub(crate) fn validates_transition(
+        &self,
+        original: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        selected: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> bool {
+        self.matches_parent(original)
+            && self.matches_selected(&selected.input)
+            && self
+                .selected_question
+                .as_ref()
+                .is_some_and(|question| question.ptr_eq(&Arc::downgrade(&selected.input.question)))
+            && self
+                .selected_view
+                .as_ref()
+                .is_some_and(|view| view.ptr_eq(&Arc::downgrade(&selected.input.view)))
+            && selected.frame == original.frame
+            && selected.budget == original.budget
+            && selected.original_deadline == original.original_deadline
+    }
+    fn matches_parent(&self, work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>) -> bool {
+        self.frame == work.frame
+            && self.first == work.original_first_move
+            && self.deadline == work.original_deadline
+            && self.budget == work.budget
+            && self.parent_digest == work.input.question_digest
+            && self
+                .parent_question
+                .ptr_eq(&Arc::downgrade(&work.input.question))
+            && self.parent_view.ptr_eq(&Arc::downgrade(&work.input.view))
+    }
+    fn matches_selected(&self, input: &FrameInput<ReviewView, AdaptivePortQuestion>) -> bool {
+        matches!(
+            input.stage,
+            RefinementStage::CounterContinuation | RefinementStage::CounterValidation
+        ) && input.question.context.prefix == self.counter
+            && input.question.counter.as_ref() == Some(&self.counter)
+            && input.question.proposal == self.proposal
+            && input.question.attack_ply == Some(self.attack)
+            && input.question.counter_source == self.source
+            && input.question.first.is_some_and(|first| {
+                rz_contracts::Move::try_from(first).is_ok_and(|movement| {
+                    rz_contracts::pals::Move16::encode(movement) == self.first
+                })
+            })
+    }
+}
 
 /// An unsubmitted same-owner validation at its original go horizon. Only the
 /// live Search port can issue this move-only transition. It is neither a CPU
@@ -79,6 +155,116 @@ impl<Q> AdaptiveGoalBoundary<Q> {
 }
 
 impl<M: RoleModel> AdaptiveEnginePort<M> {
+    pub(super) fn prepare_counter_goal_selection(
+        &self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        counter: &[BoardMove],
+        proposal: &[BoardMove],
+        attack: usize,
+        source: Option<ObservationId>,
+    ) -> Result<Option<Box<AdaptiveCounterSelection>>, PalsError> {
+        if self.rovent_frontier().is_none() {
+            return Ok(None);
+        }
+        self.check_work(work)?;
+        Ok(Some(Box::new(AdaptiveCounterSelection {
+            frame: work.frame,
+            first: work.original_first_move,
+            deadline: work.original_deadline,
+            budget: work.budget,
+            parent_question: Arc::downgrade(&work.input.question),
+            parent_view: Arc::downgrade(&work.input.view),
+            parent_digest: work.input.question_digest,
+            selected_question: None,
+            selected_view: None,
+            counter: counter.to_vec(),
+            proposal: proposal.to_vec(),
+            attack,
+            source,
+        })))
+    }
+
+    pub(super) fn bind_counter_goal_selection(
+        &mut self,
+        mut selection: Box<AdaptiveCounterSelection>,
+        input: &FrameInput<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<(), PalsError> {
+        if !selection.matches_selected(input)
+            || self
+                .goal_lanes
+                .selected
+                .contains_key(&input.question_digest)
+        {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        if self.goal_lanes.selected.len() >= MAX_COORDINATOR_FRAMES {
+            return Err(PalsError::Capacity);
+        }
+        self.goal_lanes
+            .selected
+            .try_reserve(1)
+            .map_err(|_| PalsError::Capacity)?;
+        selection.selected_question = Some(Arc::downgrade(&input.question));
+        selection.selected_view = Some(Arc::downgrade(&input.view));
+        self.goal_lanes.selected.insert(
+            input.question_digest,
+            SelectedCounterLane {
+                source: Arc::from(selection),
+            },
+        );
+        Ok(())
+    }
+
+    /// Called only after the manager committed this real selected continuation.
+    /// The original immutable source in the private materialized recipe is
+    /// required even when a sibling shares the same coordinator frame/kind.
+    pub fn rovent_counter_selected(
+        &mut self,
+        original: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        selected: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<bool, PalsError> {
+        let Some(held) = self
+            .goal_lanes
+            .selected
+            .get(&selected.input.question_digest)
+        else {
+            return Ok(false);
+        };
+        if !held.source.validates_transition(original, selected) {
+            return Err(RoleError::InvalidOutput.into());
+        }
+        let source = Arc::clone(&held.source);
+        self.check_work(original)?;
+        self.check_work(selected)?;
+        let key = (selected.frame, FrontierFrameKind::Counter);
+        let previous = self.goal_lanes.active.get(&key).copied();
+        self.goal_lanes
+            .active
+            .try_reserve(1)
+            .map_err(|_| PalsError::Capacity)?;
+        let handle = self
+            .with_rovent_frontier(|frontier, stores| match previous {
+                Some(previous) => frontier.register_local_counter_successor(
+                    previous, &source, original, selected, stores, clock, now,
+                ),
+                None => frontier.register_local_frame(
+                    selected,
+                    stores,
+                    FrontierFrameKind::Counter,
+                    clock,
+                    now,
+                ),
+            })?
+            .ok_or(FrontierError::ForeignRoot)?;
+        self.goal_lanes.active.insert(key, handle);
+        self.goal_lanes
+            .selected
+            .remove(&selected.input.question_digest);
+        Ok(true)
+    }
+
     /// The configured generation chunk remains unchanged. A go's own depth
     /// or mate horizon can only shorten it; goal-local work keeps its separate
     /// controller-issued continuation beyond a shorter configured chunk.
@@ -222,21 +408,35 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         if !self.rovent_goal_work_live(work)? {
             return Ok(false);
         }
-        self.with_rovent_frontier(|frontier, stores| {
-            frontier.admit_role_input(clock, now)?;
-            if let Some(original) = frontier.adaptive_obligation(work.frame, kind)? {
-                return if frontier.adaptive_obligation_source_matches(original, work, stores)? {
-                    Ok(true)
-                } else {
-                    Err(FrontierError::Invalid(
-                        "responsibility retry differs from original question",
-                    ))
+        let key = (work.frame, kind);
+        let active = self.goal_lanes.active.get(&key).copied();
+        // Every active key is a subset of the Frontier's bounded original
+        // responsibility journal. Reserve before that journal can mutate.
+        self.goal_lanes
+            .active
+            .try_reserve(1)
+            .map_err(|_| FrontierError::Capacity("active adaptive responsibility allocation"))?;
+        let handle = self
+            .with_rovent_frontier(|frontier, stores| {
+                frontier.admit_role_input(clock, now)?;
+                let original = match active {
+                    Some(handle) => Some(handle),
+                    None => frontier.adaptive_obligation(work.frame, kind)?,
                 };
-            }
-            frontier.register_local_frame(work, stores, kind, clock, now)?;
-            Ok(true)
-        })?
-        .ok_or(FrontierError::ForeignRoot)
+                if let Some(original) = original {
+                    return if frontier.adaptive_obligation_source_matches(original, work, stores)? {
+                        Ok(original)
+                    } else {
+                        Err(FrontierError::Invalid(
+                            "responsibility retry differs from original question",
+                        ))
+                    };
+                }
+                frontier.register_local_frame(work, stores, kind, clock, now)
+            })?
+            .ok_or(FrontierError::ForeignRoot)?;
+        self.goal_lanes.active.insert(key, handle);
+        Ok(true)
     }
 
     /// Only an actual retired native Fresh response can close its lane. A
@@ -258,10 +458,13 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         let kind = fresh_kind(work.input.stage).ok_or(FrontierError::MissingAcceptance)?;
         // Capacity and original physical/source validation precede head use.
         // The controller is the only place that may close its responsibility.
-        let obligation = self
-            .rovent_frontier()
-            .ok_or(FrontierError::ForeignRoot)?
-            .adaptive_obligation(work.frame, kind)?;
+        let obligation = match self.goal_lanes.active.get(&(work.frame, kind)).copied() {
+            Some(handle) => Some(handle),
+            None => self
+                .rovent_frontier()
+                .ok_or(FrontierError::ForeignRoot)?
+                .adaptive_obligation(work.frame, kind)?,
+        };
         let Some(obligation) = obligation else {
             self.with_rovent_frontier(|frontier, stores| {
                 frontier.observe_local_question(work, stores, clock, now)?;
@@ -308,9 +511,14 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             return Ok(false);
         }
         let kind = endpoint_kind(work.input.stage).ok_or(FrontierError::MissingAcceptance)?;
+        let active = self.goal_lanes.active.get(&(work.frame, kind)).copied();
         self.with_rovent_frontier(|frontier, stores| {
             let endpoint = frontier.observe_local_question(work, stores, clock, now)?;
-            let Some(obligation) = frontier.adaptive_obligation(work.frame, kind)? else {
+            let obligation = match active {
+                Some(handle) => Some(handle),
+                None => frontier.adaptive_obligation(work.frame, kind)?,
+            };
+            let Some(obligation) = obligation else {
                 return Ok(false);
             };
             frontier

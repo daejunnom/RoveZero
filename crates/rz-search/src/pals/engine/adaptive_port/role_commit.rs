@@ -301,13 +301,12 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     if let Some(critic) = critic {
                         self.enqueue_counter(critic)?;
                     }
-                    self.begin_counter(Self::pending_counter(
-                        query,
-                        cpu.clone(),
-                        query.counter_source,
-                    )?)?
+                    self.begin_counter(
+                        work,
+                        Self::pending_counter(query, cpu.clone(), query.counter_source)?,
+                    )?
                 } else if let Some(critic) = critic {
-                    self.begin_counter(critic)?
+                    self.begin_counter(work, critic)?
                 } else {
                     AdaptivePortTransition::Complete {
                         scope: FrameCompletionScope::NoAlternative,

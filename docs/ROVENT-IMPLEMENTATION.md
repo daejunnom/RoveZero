@@ -989,3 +989,37 @@ NNUEC base에 대해 공식 scalar decoder로 검증한 미학습 네 배열이�
 실제 독립 arm·publication/ACK·원 파일 strict 소비 → 실제 dataset의
 zero-update 부모·자식 종료 → 최신 CI와 필수 31항목 대조다. 조건부 O01~O04,
 실제 학습·대규모 수집·원격 비용/기력 비교·병합은 별도로 남긴다.
+
+## 18차 체크포인트: 독립 cohort 개입과 반례별 목표 책임
+
+사용자 선택에 따라 N05의 선택형 비교는 기존 Ready offer만 기다리는 경로와
+별도로 `FrozenProposalReviewV1` 개입 정책을 사용한다. 같은 입력·모델·예산과
+중립 target을 봉인한 뒤 독립 root에서 P/C/R 중 하나를 실제 발주한다. P는
+원 first move prefix와 전체 중립 proposal을, C는 빈 prefix와 같은 proposal을,
+R은 원 target 전체를 사용한다. 각 arm의 실제 authority·clock·cost·종료 근거는
+각각 보존한다. 등록 epoch는 첫 trial의 anchor이며 다른 trial 시계를 합치지
+않는다. 기본 탐색과 기존 Ready 기반 형식은 변경하지 않는다.
+
+실제 build 045의 UCI 검사는 787개 통과·1개 실패였다. 진단을 추가한
+`69db350`의 집중 실행 050은 깊이 1을 통과했지만 깊이 2에서 원
+`Frontier(Duplicate)`를 재현했다. 원 snapshot은 책임 두 개의 완료와 최대
+조사 ply 2를 기록했으나 선택 범위는 아직 seal되지 않았고 완료 깊이는
+`None`이었다. 원 물리 완료가 Confirmed라는 사실을 의미 목표의 성공으로
+대체하지 않는다. 실패 자료와 원 044의 PhysicalUnknown은 그대로 보존한다.
+
+소스 추적에서는 같은 coordinator frame의 다음 queued counter가 첫 counter의
+완료된 책임을 다시 조회하는 경로를 확인했다. 후속 수정은 실제 선택된
+counter마다 원 질문·Rules prefix·first move·deadline·budget에 묶인 책임을
+별도로 보존한다. 기존 일반 등록과 exact retry의 중복 거부는 유지한다.
+이전 counter의 미완료 horizon도 삭제하거나 완료로 바꾸지 않으며, 원
+controller가 계속 소유한다. 깊이 완료는 실제 책임과 정책 seal의 결과로만
+반환한다. 이 문서 갱신 자체는 수정 후 검사나 제품 실행 성공이 아니다.
+
+실제 cohort의 세 arm이 발급·퇴역되고 publication·별도 ACK·strict 소비가
+통과했더라도 새 유효 witness가 없으면 선호 action은 `unknown/masked`다.
+비용 차이만으로 utility 정답을 만들지 않는다. known pair 0인 실제 자료도
+원 무결성 조건을 만족하면 학습 0회 IPC 검증에 사용할 수 있다. 반면 실제
+arm/query 발급 실패는 별도 실패이며, 자료 보존을 dataset 인수로 표시하지
+않는다. 학습 0회 창은 실제 모델·AdamW owner 초기화와 begin/end·fence·drain을
+검증하지만 sample·forward·backward·optimizer step·checkpoint·export를
+발행하지 않는다. 이를 학습 완료나 유효 학습 target 확보로 보고하지 않는다.

@@ -554,9 +554,14 @@ fn rovent_original_depth_one_and_two_close_actual_p_c_fresh_goal() {
     use rz_contracts::rovent::ExecutionMode;
     use rz_search::pals::rovent_frontier::FrontierGoalStatus;
 
-    for depth in [1, 2] {
-        let (driver, facts, clock, _) =
-            fixture_with_rovent_profile(None, Some(64), Some(ExecutionMode::CpuPcr), 4, true);
+    for (line_plies, depth) in [(4, 1), (4, 2), (2, 3)] {
+        let (driver, facts, clock, _) = fixture_with_rovent_profile(
+            None,
+            Some(64),
+            Some(ExecutionMode::CpuPcr),
+            line_plies,
+            true,
+        );
         let position = Position::startpos();
         let allowed: BoardMove = "e2e4".parse().unwrap();
         let mut original = context(&clock, 1, 0);
@@ -566,7 +571,7 @@ fn rovent_original_depth_one_and_two_close_actual_p_c_fresh_goal() {
             .run(&position, &original, &mut |_| {})
             .unwrap_or_else(|error| {
                 panic!(
-                    "original go depth {depth} failed: {error:?}; actual root: {:?}",
+                    "original go depth {depth}, chunk {line_plies} failed: {error:?}; actual root: {:?}",
                     driver.latest_rovent_root(),
                 )
             });
@@ -575,6 +580,15 @@ fn rovent_original_depth_one_and_two_close_actual_p_c_fresh_goal() {
         assert_eq!(frontier.goal, FrontierGoalStatus::DepthSatisfied);
         assert_eq!(frontier.horizon.completed_depth.unwrap().0, depth);
         assert_eq!(frontier.horizon.maximum_examined_ply.0, depth);
+        if depth == 2 {
+            // The CPU-discovered counter and the accepted C counter select
+            // different actual sibling lines under the same original frame.
+            // Both must be declared and completed in addition to Candidate.
+            assert_eq!(frontier.horizon.declared_obligations, 3);
+            assert_eq!(frontier.horizon.completed_obligations, 3);
+            assert_eq!(frontier.registered_frames, 3);
+            assert_eq!(frontier.completed_frames, 3);
+        }
         assert!(actual.counters.consumed_role_outputs >= 2);
         assert!(facts.role_runs.load(Ordering::Acquire) >= 2);
         assert!(actual.physical.as_ref().unwrap().permits_root_reuse());

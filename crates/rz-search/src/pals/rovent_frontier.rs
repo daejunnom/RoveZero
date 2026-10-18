@@ -1274,6 +1274,63 @@ impl RoventFrontier {
         self.register_verified_frame(&question, stores, kind, clock, now)
     }
 
+    /// The live Search producer selected another original counter under the
+    /// same coordinator frame. Its opaque materialized-selection source is
+    /// mandatory; the old duty stays unchanged, including unmet goal progress.
+    /// Ordinary registration and its strict retry checks are not widened.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn register_local_counter_successor(
+        &mut self,
+        previous: FrontierObligation,
+        source: &super::engine::adaptive_port::AdaptiveCounterSelection,
+        original: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+        stores: &PalsStores,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<FrontierObligation, FrontierError> {
+        self.check_control(clock, now)?;
+        if !source.validates_transition(original, work) {
+            return Err(FrontierError::MissingAcceptance);
+        }
+        let question = VerifiedFrontierQuestion::from_adaptive(work, stores)?;
+        let at = self.obligation_slot(previous, work.frame)?;
+        let held = &self.frames[at];
+        let first = BoardMove::try_from(work.original_first_move.decode()?)?;
+        if held.pc_source
+            || held.kind != FrontierFrameKind::Counter
+            || held.original_first != first
+            || !matches!(
+                question.stage,
+                RefinementStage::CounterContinuation | RefinementStage::CounterValidation
+            )
+        {
+            return Err(FrontierError::MissingAcceptance);
+        }
+        if self.selection_sealed {
+            return Err(FrontierError::PolicySealed);
+        }
+        if self.frames.len() >= self.limits.maximum_frames {
+            return Err(FrontierError::Capacity("frame obligations"));
+        }
+        let anchor = self.observe_verified_question(&question, stores, clock, now)?;
+        if self.frames.iter().any(|held| {
+            held.frame == work.frame
+                && held.kind == FrontierFrameKind::Counter
+                && (held.source_path == anchor || held.question == question.question_digest)
+        }) {
+            return Err(FrontierError::Duplicate);
+        }
+        self.append_checked_frame(
+            work.frame,
+            first,
+            question.question_digest,
+            anchor,
+            FrontierFrameKind::Counter,
+            false,
+        )
+    }
+
     pub(crate) fn register_verified_frame(
         &mut self,
         question: &VerifiedFrontierQuestion<'_>,
@@ -1397,6 +1454,18 @@ impl RoventFrontier {
                 ));
             }
         }
+        self.append_checked_frame(frame, original_first, question, anchor, kind, pc_source)
+    }
+
+    fn append_checked_frame(
+        &mut self,
+        frame: FrameId,
+        original_first: BoardMove,
+        question: Digest,
+        anchor: FrontierPath,
+        kind: FrontierFrameKind,
+        pc_source: bool,
+    ) -> Result<FrontierObligation, FrontierError> {
         self.frames
             .try_reserve(1)
             .map_err(|_| FrontierError::Capacity("frame obligation allocation"))?;
