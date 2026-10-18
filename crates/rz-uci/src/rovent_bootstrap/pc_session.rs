@@ -1573,8 +1573,12 @@ fn failure(code: &'static str, detail: &str) -> SearchSessionFailure {
 /// quota, topology and observed OS affinity; this grants none of those facts.
 fn declares_shared_nnuec_helper(pools: &[rz_experiments::RoventThreadPool]) -> bool {
     pools.iter().any(|pool| {
-        pool.actors
-            .contains(&rz_experiments::RoventActor::RuntimeHelper)
+        // This actor owns a distinct physical thread; it cannot claim to
+        // share the manager/caller's single physical pool.
+        pool.actors.len() == 1
+            && pool
+                .actors
+                .contains(&rz_experiments::RoventActor::RuntimeHelper)
             && pool.max_threads >= 1
     })
 }
@@ -1608,9 +1612,18 @@ mod shared_nnuec_resource_tests {
     }
 
     #[test]
+    fn shared_readout_rejects_a_helper_disguised_as_the_manager_pool() {
+        assert!(!declares_shared_nnuec_helper(&[RoventThreadPool {
+            actors: BTreeSet::from([RoventActor::Manager, RoventActor::RuntimeHelper]),
+            max_threads: 1,
+            cpu_charge_millicpus: 1_000,
+        }]));
+    }
+
+    #[test]
     fn shared_readout_accepts_one_declared_helper_in_original_pool() {
         assert!(declares_shared_nnuec_helper(&[RoventThreadPool {
-            actors: BTreeSet::from([RoventActor::Manager, RoventActor::RuntimeHelper]),
+            actors: BTreeSet::from([RoventActor::RuntimeHelper]),
             max_threads: 1,
             cpu_charge_millicpus: 1_000,
         }]));

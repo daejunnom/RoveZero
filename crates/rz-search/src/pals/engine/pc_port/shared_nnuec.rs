@@ -205,6 +205,9 @@ pub struct PcSharedReadoutRootClosure {
     root_budget: Option<ContractDigest>,
     deadline: Deadline,
     terminals: Vec<PcNnuecReadoutTerminal>,
+    // Snapshot of the original issued roster's actual semantic acceptance,
+    // not inferred from submission or a physically completed preparation.
+    semantic_consumed_requests: usize,
     _release: NnuecCacheReleaseAck,
 }
 impl std::fmt::Debug for PcSharedReadoutRootClosure {
@@ -224,6 +227,25 @@ impl PcSharedReadoutRootClosure {
             .iter()
             .filter(|terminal| terminal.submitted())
             .count()
+    }
+    /// Counts only original actor terminal observations in this bounded root
+    /// roster. Completed, Cancelled, Failed and Expired remain distinct. A
+    /// never-submitted Request has no observation and contributes to none.
+    /// These counts are neither native NN inputs nor search/node authority.
+    pub fn terminal_status_count(&self, status: PreparationStatus) -> usize {
+        self.terminals
+            .iter()
+            .filter(|terminal| {
+                terminal
+                    .observation()
+                    .is_some_and(|observation| observation.status() == status)
+            })
+            .count()
+    }
+    /// Actual successful same-question semantic consumptions at closure.
+    /// A completed readout cancelled before consumption is not included.
+    pub fn semantic_consumed_requests(&self) -> usize {
+        self.semantic_consumed_requests
     }
 }
 
@@ -477,11 +499,14 @@ impl<M: RoleModel> PcSemanticPort<M> {
                     "original shared Request/cache release roster differs",
                 ));
             }
-            Ok(Arc::downgrade(&state.model))
+            Ok((
+                Arc::downgrade(&state.model),
+                requests.iter().filter(|request| request.consumed).count(),
+            ))
         })();
         match checked {
             Err(error) => Err((error, release, terminals)),
-            Ok(model) => Ok(PcSharedReadoutRootClosure {
+            Ok((model, semantic_consumed_requests)) => Ok(PcSharedReadoutRootClosure {
                 owner: Arc::downgrade(&self.identity),
                 model,
                 authority: self.authority,
@@ -489,6 +514,7 @@ impl<M: RoleModel> PcSemanticPort<M> {
                 root_budget: self.original_root_budget(),
                 deadline: self.deadline,
                 terminals,
+                semantic_consumed_requests,
                 _release: release,
             }),
         }
@@ -674,6 +700,17 @@ mod tests {
             .unwrap_or_else(|_| panic!("original root/cache closure"));
         assert_eq!(closure.issued_requests(), 1);
         assert_eq!(closure.submitted_requests(), 1);
+        assert_eq!(
+            closure.terminal_status_count(PreparationStatus::Completed),
+            1
+        );
+        assert_eq!(
+            closure.terminal_status_count(PreparationStatus::Cancelled),
+            0
+        );
+        assert_eq!(closure.terminal_status_count(PreparationStatus::Failed), 0);
+        assert_eq!(closure.terminal_status_count(PreparationStatus::Expired), 0);
+        assert_eq!(closure.semantic_consumed_requests(), 1);
         assert!(port.shared_nnuec_closure_matches(&closure));
         assert!(!foreign_port.shared_nnuec_closure_matches(&closure));
         actor.shutdown().unwrap();
@@ -704,8 +741,62 @@ mod tests {
             .close_shared_nnuec_readouts(&actor, release(&actor), vec![terminal])
             .unwrap_or_else(|_| panic!("cancelled root physical closure"));
         assert!(port.shared_nnuec_closure_matches(&closure));
+        // Physical completion before a late cancellation remains Completed;
+        // the failed semantic consumption must not become a consumed readout.
+        assert_eq!(closure.submitted_requests(), 1);
+        assert_eq!(
+            closure.terminal_status_count(PreparationStatus::Completed),
+            1
+        );
+        assert_eq!(
+            closure.terminal_status_count(PreparationStatus::Cancelled),
+            0
+        );
+        assert_eq!(closure.semantic_consumed_requests(), 0);
         assert_eq!(port.counters.consumed_role_outputs, 0);
         assert_eq!(port.counters.completed_nn_inputs, Some(0));
+
+        // A different original Request cancelled before actor execution has
+        // an actual Cancelled terminal, rather than the late-cancelled status
+        // above. The same actor is reused after its previous cache ACK.
+        let mut cancelled_port = self::port();
+        cancelled_port
+            .register_shared_nnuec_readout(Arc::clone(&model))
+            .unwrap();
+        let cancelled_input = cancelled_port.next_role().unwrap().unwrap();
+        let cancelled_control = Arc::new(AtomicBool::new(false));
+        let (cancelled_request, cancelled_seal) = prepare(
+            &cancelled_port,
+            &cancelled_input,
+            &model,
+            Arc::clone(&cancelled_control),
+        );
+        cancelled_control.store(true, Ordering::Release);
+        let cancelled_completion = self::completion(&actor, cancelled_request);
+        let cancelled_terminal = cancelled_seal
+            .retire(cancelled_completion)
+            .unwrap_or_else(|_| panic!("original cancelled actor terminal"));
+        let cancelled_closure = cancelled_port
+            .close_shared_nnuec_readouts(&actor, release(&actor), vec![cancelled_terminal])
+            .unwrap_or_else(|_| panic!("original cancelled actor closure"));
+        assert_eq!(cancelled_closure.submitted_requests(), 1);
+        assert_eq!(
+            cancelled_closure.terminal_status_count(PreparationStatus::Completed),
+            0
+        );
+        assert_eq!(
+            cancelled_closure.terminal_status_count(PreparationStatus::Cancelled),
+            1
+        );
+        assert_eq!(
+            cancelled_closure.terminal_status_count(PreparationStatus::Failed),
+            0
+        );
+        assert_eq!(
+            cancelled_closure.terminal_status_count(PreparationStatus::Expired),
+            0
+        );
+        assert_eq!(cancelled_closure.semantic_consumed_requests(), 0);
         actor.shutdown().unwrap();
     }
 
@@ -752,6 +843,15 @@ mod tests {
             .unwrap_or_else(|_| panic!("original actor close without fabricated terminal"));
         assert_eq!(closure.submitted_requests(), 0);
         assert_eq!(closure.issued_requests(), 1);
+        for status in [
+            PreparationStatus::Completed,
+            PreparationStatus::Cancelled,
+            PreparationStatus::Failed,
+            PreparationStatus::Expired,
+        ] {
+            assert_eq!(closure.terminal_status_count(status), 0);
+        }
+        assert_eq!(closure.semantic_consumed_requests(), 0);
         assert!(port.shared_nnuec_closure_matches(&closure));
         actor.shutdown().unwrap();
         foreign_actor.shutdown().unwrap();
