@@ -4199,8 +4199,27 @@ where
                         }
                         return Err(AdaptiveManagerError::Invalid("unknown native retirement"));
                     };
+                    let revoked_ack = rejected_permit.as_ref().is_some_and(|permit| {
+                        self.is_revoked_acceptance_ack(
+                            index,
+                            &ticket,
+                            accepted,
+                            &result,
+                            permit,
+                            native_receipt.is_some(),
+                        )
+                    });
                     if let Some(permit) = rejected_permit {
                         self.retained_native_permits.push(permit);
+                    }
+                    if revoked_ack {
+                        // The owner rejected this exact queued Accept before
+                        // successful backend acceptance. Preserve its original
+                        // output/permit and typed reason until the real fence;
+                        // do not create an accepted step or semantic retirement.
+                        self.roles[index].revoked_acceptance =
+                            Some(result.expect_err("validated original revoked Accept"));
+                        return Ok(());
                     }
                     if let Err(failure) = result {
                         if let Some(receipt) = native_receipt {
@@ -4385,6 +4404,69 @@ where
             .iter_mut()
             .find(|binding| binding.ticket.is_some_and(|ticket| ticket.id == request))
             .ok_or(AdaptiveManagerError::Invalid("unknown role request"))
+    }
+    fn is_revoked_acceptance_ack(
+        &mut self,
+        index: usize,
+        ticket: &RoleTicketEnvelope,
+        accepted: bool,
+        result: &Result<(), RoleFailure>,
+        permit: &NativeAcceptancePermit,
+        has_native_receipt: bool,
+    ) -> bool {
+        let binding = &self.roles[index];
+        let actual_expiry = self.clock.try_now().ok().is_some_and(|now| {
+            self.clock.domain() == ticket.original_deadline.clock
+                && now.0 >= ticket.original_deadline.at.0
+        });
+        let cancellation_failure = match result {
+            Err(RoleFailure::Canceled) => true,
+            Err(RoleFailure::Expired) => actual_expiry,
+            _ => false,
+        };
+        if self.phase != ManagerPhase::Draining
+            || self.shutdown_until.is_none()
+            || ticket.authority != self.registration.authority
+            || ticket.original_deadline != self.deadline
+            || binding.ticket != Some(*ticket)
+            || accepted
+            || has_native_receipt
+            || !binding.cancellation_requested
+            || !binding.ack_dispatched
+            || binding.ack_accepted != Some(true)
+            || binding.revoked_acceptance.is_some()
+            || binding.native_acceptance_recorded
+            || binding.consumption_recorded
+            || binding.reciprocal_acceptance.is_some()
+            || !binding.service_completed
+            || !cancellation_failure
+            || binding.delivered.as_ref().and_then(|output| {
+                rz_search::pals::coordinator::native_acceptance_output_digest(
+                    output.proposer_ranking_output(),
+                )
+                .ok()
+            }) != Some(permit.output_digest())
+        {
+            return false;
+        }
+        let purpose = binding.purpose;
+        // Delivered + successful payload + original issued seal in the
+        // registry also proves Confirmed physical completion: Unknown enters
+        // Quarantined and cannot issue or satisfy either permit validator.
+        match purpose {
+            RolePurpose::RootRanking | RolePurpose::Validator => self
+                .registry
+                .validate_revoked_published_head_native_permit(ticket, permit)
+                .is_ok(),
+            RolePurpose::Reciprocal
+            | RolePurpose::RoventRefinement
+            | RolePurpose::RoventFresh
+            | RolePurpose::RoventGoalLocal => self
+                .registry
+                .validate_revoked_reciprocal_native_permit(ticket, permit)
+                .is_ok(),
+            RolePurpose::Refinement => false,
+        }
     }
     fn retire_role(
         &mut self,

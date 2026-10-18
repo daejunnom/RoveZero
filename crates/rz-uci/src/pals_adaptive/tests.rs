@@ -1259,6 +1259,181 @@ fn shutdown(manager: &mut Manager, until: Instant) -> AdaptiveShutdownReceipt {
     manager.shutdown_receipt().unwrap()
 }
 
+/// Wait for an actual owner event without manufacturing a Retired packet or
+/// copying its linear permit. All earlier actual events are processed once.
+fn take_original_native_retirement(
+    manager: &mut Manager,
+    until: Instant,
+) -> TicketNativeEvent<RoleOutput> {
+    loop {
+        assert!(
+            Instant::now() < until,
+            "original native retirement fixture timeout"
+        );
+        if let Some(event) = manager.native.poll() {
+            if matches!(&event, TicketNativeEvent::Retired { .. }) {
+                return event;
+            }
+            manager.native_event(event).unwrap();
+        } else {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+#[test]
+fn pcr_keeps_actual_canceled_published_head_accept_until_original_fence() {
+    for process_shutdown in [false, true] {
+        let (mut manager, facts, root, until) =
+            fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+        facts.block_after_first_run.store(true, Ordering::Release);
+        // Two actual native questions let the second run occupy the owner
+        // while the manager queues the first original P-ranking Accept.
+        // They are transport/custody fixtures, not invented search evidence.
+        manager
+            .prepare_role(None, root, RolePurpose::RootRanking)
+            .unwrap();
+        let first = manager.driver().rules.rules().legal_moves()[0];
+        let child = manager
+            .driver_mut()
+            .input(RefinementStage::ProposerContinuation, Some(first));
+        manager
+            .prepare_role(None, child, RolePurpose::RoventRefinement)
+            .unwrap();
+        pump(&mut manager, until, |manager| {
+            manager.shutdown_receipt().unwrap().pending_tickets == 2
+        });
+        facts.release_first_run.store(true, Ordering::Release);
+        while facts.started.lock().unwrap().len() < 2 {
+            assert!(
+                Instant::now() < until,
+                "second actual native run did not start"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        manager.tick().unwrap();
+        let ticket = manager
+            .roles
+            .iter()
+            .find(|binding| binding.purpose == RolePurpose::RootRanking)
+            .and_then(|binding| binding.ticket)
+            .expect("original P-ranking ticket");
+        let binding = manager
+            .roles
+            .iter()
+            .find(|binding| binding.ticket == Some(ticket))
+            .unwrap();
+        assert!(binding.ack_dispatched && binding.ack_accepted == Some(true));
+        assert!(binding.service_completed && !binding.native_acceptance_recorded);
+        assert!(manager.driver().consumed.is_empty());
+        assert!(facts.accepted.lock().unwrap().is_empty());
+        let cleanup_until = Instant::now() + WINDOW;
+        if process_shutdown {
+            manager.begin_shutdown(cleanup_until).unwrap();
+        } else {
+            manager.begin_root_quiesce(cleanup_until).unwrap();
+        }
+        let original = take_original_native_retirement(&mut manager, cleanup_until);
+        assert!(matches!(&original, TicketNativeEvent::Retired {
+            ticket: actual, accepted: false, result: Err(RoleFailure::Canceled),
+            rejected_permit: Some(_), native_receipt: None,
+        } if *actual == ticket));
+        manager.native_event(original).unwrap();
+        let binding = manager
+            .roles
+            .iter()
+            .find(|binding| binding.ticket == Some(ticket))
+            .unwrap();
+        assert_eq!(binding.revoked_acceptance, Some(RoleFailure::Canceled));
+        assert!(binding.delivered.is_some());
+        assert!(!binding.native_acceptance_recorded && !binding.consumption_recorded);
+        assert_eq!(manager.retained_native_permits.len(), 1);
+        assert_eq!(manager.registry.occupancy(), 2);
+        assert!(manager.native_root_fence.is_none());
+        pump(&mut manager, cleanup_until, |manager| {
+            manager.phase() == ManagerPhase::Finished
+        });
+        let receipt = manager.shutdown_receipt().unwrap();
+        assert!(receipt.permits_semantic_closure(), "{receipt:?}");
+        assert!(
+            manager.failures().next().is_none(),
+            "{:?}",
+            manager.failures().collect::<Vec<_>>()
+        );
+        assert_eq!(receipt.counters.accepted_nn_inputs, 0);
+        assert_eq!(receipt.counters.consumed_role_outputs, 0);
+        assert_eq!(receipt.pending_tickets, 0);
+        assert!(manager.driver().consumed.is_empty());
+        assert!(facts.accepted.lock().unwrap().is_empty());
+        assert!(manager.roles.is_empty() && manager.retained_native_permits.is_empty());
+        assert_eq!(manager.driver().stores.review_pin_count().unwrap(), 0);
+        if !receipt.native_owner_joined {
+            manager.native.begin_shutdown(cleanup_until);
+            while !manager.native.try_join().unwrap() {
+                assert!(Instant::now() < cleanup_until);
+                manager.native.poll();
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+#[test]
+fn pcr_drain_does_not_hide_actual_non_cancel_published_head_rejection() {
+    let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    facts.reject_acceptance.store(true, Ordering::Release);
+    manager.prepare_root_ranking(root).unwrap();
+    pump(&mut manager, until, |manager| {
+        manager.roles.iter().any(|binding| binding.ack_dispatched)
+    });
+    // Capture the actual failed owner ACK before close, then consume that
+    // same event once during Draining. All other cancellation/permit guards
+    // hold; InvalidOutput must still remain a failure rather than cleanup.
+    let original = take_original_native_retirement(&mut manager, until);
+    assert!(matches!(
+        &original,
+        TicketNativeEvent::Retired {
+            accepted: false,
+            result: Err(RoleFailure::InvalidOutput),
+            rejected_permit: Some(_),
+            native_receipt: None,
+            ..
+        }
+    ));
+    let cleanup_until = Instant::now() + WINDOW;
+    manager.begin_root_quiesce(cleanup_until).unwrap();
+    let error = manager.native_event(original).unwrap_err();
+    assert!(matches!(&error, AdaptiveManagerError::Semantic(message)
+        if message == "native retirement: InvalidOutput"));
+    assert!(
+        manager
+            .roles
+            .iter()
+            .all(|binding| binding.revoked_acceptance.is_none())
+    );
+    assert_eq!(manager.retained_native_permits.len(), 1);
+    manager.record_failure(error);
+    pump(&mut manager, cleanup_until, |manager| {
+        manager.phase() == ManagerPhase::Finished
+    });
+    let receipt = manager.shutdown_receipt().unwrap();
+    assert!(receipt.permits_root_reuse(), "{receipt:?}");
+    assert!(manager.failures().any(|error| matches!(error,
+        AdaptiveManagerError::Semantic(message) if message == "native retirement: InvalidOutput")));
+    assert_eq!(receipt.counters.accepted_nn_inputs, 0);
+    assert_eq!(receipt.counters.consumed_role_outputs, 0);
+    assert!(manager.driver().consumed.is_empty());
+    assert!(facts.accepted.lock().unwrap().is_empty());
+    assert!(manager.roles.is_empty() && manager.retained_native_permits.is_empty());
+    assert_eq!(manager.driver().stores.review_pin_count().unwrap(), 0);
+    manager.native.begin_shutdown(cleanup_until);
+    while !manager.native.try_join().unwrap() {
+        assert!(Instant::now() < cleanup_until);
+        manager.native.poll();
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 type ActualPortManager = AdaptiveExecutionManager<
     rz_search::pals::engine::adaptive_port::AdaptivePortQuestion,
     NativeFixture,

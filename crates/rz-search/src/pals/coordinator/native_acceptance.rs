@@ -391,6 +391,43 @@ impl<V, O> RoleTicketRegistry<V, O> {
         Ok(())
     }
 
+    /// Match only an original issued P-ranking/V-task head permit after
+    /// revocation. This neither confirms acceptance nor releases any owner:
+    /// the caller must retain the returned permit/output until its actual
+    /// native fence and independently validate the original cancellation ACK.
+    pub fn validate_revoked_published_head_native_permit(
+        &mut self,
+        ticket: &RoleTicketEnvelope,
+        permit: &NativeAcceptancePermit,
+    ) -> Result<(), CoordinatorError> {
+        let held = self.match_ticket_mut(ticket)?;
+        let original_head = match ticket.role {
+            Role::Proposer => held
+                .proposer_ranking
+                .as_ref()
+                .map(|head| head.output_digest),
+            Role::Validator => held
+                .validator_ranking
+                .as_ref()
+                .map(|head| head.output_digest),
+            Role::Critic => None,
+        };
+        if permit.ticket() != ticket
+            || held.phase != TicketPhase::Delivered
+            || !held.revoked
+            || !held.successful_payload
+            || held.native_acceptance_issued != Some(permit.seal)
+            || held.native_acceptance_confirmed
+            || permit.seal.reciprocal
+            || original_head != Some(permit.output_digest())
+        {
+            return Err(CoordinatorError::IdentityMismatch(
+                "revoked published original ticket/head/permit",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn issue_reciprocal_native_acceptance(
         &mut self,
         ticket: &RoleTicketEnvelope,
