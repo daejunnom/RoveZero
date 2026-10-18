@@ -9,7 +9,8 @@ use crate::pals_native::ticketed::{
 use rz_contracts::pals::{Move16, RepresentationKey, RoleOutput, RolePayload};
 use rz_contracts::pals_adaptive::{CpuWorkerId, RoleTicketEnvelope};
 use rz_contracts::{
-    CancelToken, ExecutionId, GameGeneration, OwnerId, PrecisionProfile, RootGeneration, Wdl,
+    CancelToken, ExecutionId, GameGeneration, OwnerId, PrecisionProfile, RequestId, RootGeneration,
+    Wdl,
 };
 use rz_runtime::contracts::ContractSystemClock;
 use rz_search::cpu::{CpuConfig, CpuEngine, CpuOrderingPolicy, CpuResumePolicy};
@@ -20,7 +21,9 @@ use rz_search::cpu_worker::{
 use rz_search::driver::SearchControl;
 use rz_search::pals::coordinator::{PhysicalRoleCompletion, RoleFailure};
 use rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace;
-use rz_search::pals::engine::{PalsConfig, PostRepairRecheckPolicy, ResolverPolicy};
+use rz_search::pals::engine::{
+    PalsConfig, PostRepairRecheckPolicy, ResolverPolicy, RoleQueryPurpose,
+};
 use rz_search::pals::review_context::{ReviewIndexLimits, ReviewSelectionPolicy};
 use rz_search::pals::value::{MODEL_WDL_VALUE_SEMANTICS, ModelValueIdentity};
 use sha2::Sha256;
@@ -78,6 +81,8 @@ struct OwnerFacts {
     full_roles: AtomicBool,
     role_runs: AtomicU64,
     repair_role_runs: AtomicU64,
+    capture_role_sources: AtomicBool,
+    role_sources: Mutex<Vec<(RequestId, RoleQueryPurpose)>>,
 }
 struct TerminalOwner {
     clock: ContractSystemClock,
@@ -135,6 +140,13 @@ impl TicketNativeBackend<ReviewView, AdaptivePortQuestion> for TerminalOwner {
         _: &AtomicBool,
     ) -> TicketPhysicalResult<RoleOutput> {
         self.facts.role_runs.fetch_add(1, Ordering::AcqRel);
+        if self.facts.capture_role_sources.load(Ordering::Acquire) {
+            self.facts
+                .role_sources
+                .lock()
+                .unwrap()
+                .push((ticket.id, question.query.context.purpose));
+        }
         if question.query.context.purpose == rz_search::pals::engine::RoleQueryPurpose::RepairPolicy
         {
             self.facts.repair_role_runs.fetch_add(1, Ordering::AcqRel);
@@ -277,6 +289,28 @@ fn fixture_with_rovent_profile(
     rovent_mode: Option<rz_contracts::rovent::ExecutionMode>,
     line_plies: usize,
     full_roles: bool,
+) -> (
+    AdaptiveSessionDriver<TerminalOwner>,
+    Arc<OwnerFacts>,
+    ProcessClock,
+    u64,
+) {
+    fixture_with_rovent_profile_and_peer_sources(
+        startup_gate,
+        role_limit,
+        rovent_mode,
+        line_plies,
+        full_roles,
+        1,
+    )
+}
+fn fixture_with_rovent_profile_and_peer_sources(
+    startup_gate: Option<std::sync::mpsc::Receiver<()>>,
+    role_limit: Option<u64>,
+    rovent_mode: Option<rz_contracts::rovent::ExecutionMode>,
+    line_plies: usize,
+    full_roles: bool,
+    peer_sources: u16,
 ) -> (
     AdaptiveSessionDriver<TerminalOwner>,
     Arc<OwnerFacts>,
@@ -475,7 +509,7 @@ fn fixture_with_rovent_profile(
                 peers: crate::pals_adaptive::RoventPeerFollowupPolicy {
                     pc_peer: true,
                     researcher: true,
-                    max_sources_per_root: 1,
+                    max_sources_per_root: peer_sources,
                 },
             },
         ),
@@ -634,6 +668,81 @@ fn rovent_original_depth_one_and_two_close_actual_p_c_fresh_goal() {
             Some(crate::search_driver::DriverPhysicalCompletion::Confirmed),
         );
     }
+}
+
+#[test]
+fn rovent_selected_counter_keeps_actual_parent_budget_after_peer_credit_spend() {
+    use crate::pals_adaptive::PeerFollowupDisposition;
+    use rz_contracts::rovent::ExecutionMode;
+    use rz_search::pals::rovent_frontier::FrontierGoalStatus;
+
+    let (mut driver, facts, clock, _) = fixture_with_rovent_profile_and_peer_sources(
+        None,
+        Some(64),
+        Some(ExecutionMode::CpuPcr),
+        4,
+        true,
+        4,
+    );
+    facts.capture_role_sources.store(true, Ordering::Release);
+    let selected_source_peers = Arc::new(AtomicU64::new(0));
+    let observed_peers = Arc::clone(&selected_source_peers);
+    let observed_facts = Arc::clone(&facts);
+    driver.collection_hooks.root_closure = Some(Arc::new(move |manager, _| {
+        let sources = observed_facts.role_sources.lock().unwrap();
+        let actual = manager
+            .peer_followup_observations()
+            .filter(|observation| {
+                observation.disposition == PeerFollowupDisposition::Admitted
+                    && sources.iter().any(|(request, purpose)| {
+                        *request == observation.source
+                            && matches!(
+                                purpose,
+                                RoleQueryPurpose::ReplyPolicy | RoleQueryPurpose::RepairPolicy
+                            )
+                    })
+            })
+            .count();
+        observed_peers.store(actual as u64, Ordering::Release);
+        Ok(())
+    }));
+    let position = Position::startpos();
+    let first = BoardMove::from_uci("e2e4").unwrap();
+    let mut original = context(&clock, 1, 0);
+    original.goal.depth_plies = std::num::NonZeroU16::new(3);
+    original.root_moves = Some(Arc::from([first]));
+    let report = driver
+        .run(&position, &original, &mut |_| {})
+        .unwrap_or_else(|error| {
+            panic!(
+                "actual Counter/Repair peer credit root failed: {error:?}; actual root: {:?}",
+                driver.latest_rovent_root(),
+            )
+        });
+    assert!(
+        selected_source_peers.load(Ordering::Acquire) > 0,
+        "the actual selected Counter/Repair source must dispatch a real peer child",
+    );
+    let actual = driver.latest_rovent_root().unwrap().unwrap();
+    let frontier = actual.frontier.as_ref().unwrap();
+    assert_eq!(frontier.goal, FrontierGoalStatus::DepthSatisfied);
+    assert_eq!(frontier.horizon.completed_depth.unwrap().0, 3);
+    assert_eq!(frontier.horizon.maximum_examined_ply.0, 3);
+    assert!(frontier.registered_frames >= 3);
+    assert_eq!(frontier.registered_frames, frontier.completed_frames);
+    assert!(actual.physical.as_ref().unwrap().permits_root_reuse());
+    assert!(matches!(
+        report.work,
+        DriverWork::RoventNative {
+            completed_depth: Some(3),
+            maximum_examined_ply: 3,
+            ..
+        }
+    ));
+    assert_eq!(
+        driver.finish_session(original.shutdown_deadline).unwrap(),
+        Some(crate::search_driver::DriverPhysicalCompletion::Confirmed),
+    );
 }
 
 #[test]
