@@ -619,7 +619,17 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             return Err(PalsError::Capacity);
         }
         let descriptor = self.engine.owned_descriptor()?;
-        let target_depth = self.limits.cpu_depth;
+        let target_depth = if let Some(horizon) = self.original_goal_horizon() {
+            let remaining = horizon
+                .checked_sub(question.context.prefix.len())
+                .filter(|remaining| *remaining != 0)
+                .ok_or(crate::pals::rovent_frontier::FrontierError::DepthHorizon)?;
+            self.limits
+                .cpu_depth
+                .min(u16::try_from(remaining).map_err(|_| PalsError::InvalidLimits)?)
+        } else {
+            self.limits.cpu_depth
+        };
         if target_depth > descriptor.config.max_depth {
             return Err(PalsError::InvalidLimits);
         }
@@ -1356,9 +1366,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             .iter()
             .copied()
             .take(
-                self.engine
-                    .config
-                    .line_plies
+                self.continuation_limit()
                     .saturating_sub(work.input.question.context.prefix.len()),
             )
             .collect();

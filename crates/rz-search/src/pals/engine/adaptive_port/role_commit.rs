@@ -189,7 +189,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 let mut prefix = query.context.prefix.clone();
                 prefix.push(movement);
                 let node = self.replay_node(&prefix)?;
-                let done = prefix.len() >= self.engine.config.line_plies
+                let done = prefix.len() >= self.continuation_limit()
                     || self.engine.semantic.nodes[node].terminal.is_some();
                 let next = if done {
                     let (kind, stage) = match query.stage {
@@ -543,7 +543,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             } else {
                 let cpu_line = if alternative {
                     let mut line = query.context.prefix.clone();
-                    let available = self.engine.config.line_plies.saturating_sub(line.len());
+                    let available = self.continuation_limit().saturating_sub(line.len());
                     line.extend(pv.iter().take(available));
                     self.replay_node(&line)?;
                     self.record_hot(RecordKind::Counterexample, &line, Some(observation))?;
@@ -743,9 +743,10 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     ) -> Result<AdaptivePortTransition, PalsError> {
         self.check_live()?;
         let first = first.ok_or(RoleError::InvalidOutput)?;
-        if prefix.len() > self.engine.config.line_plies
-            || proposal.len() > self.engine.config.line_plies
-            || counter.len() > self.engine.config.line_plies
+        let continuation_limit = self.continuation_limit();
+        if prefix.len() > continuation_limit
+            || proposal.len() > continuation_limit
+            || counter.len() > continuation_limit
             || prefix.first() != Some(&first)
             || proposal.first() != Some(&first)
             || counter.first() != Some(&first)
@@ -756,7 +757,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         {
             return Err(ReviewError::AnchorMismatch.into());
         }
-        let zero_step = prefix.len() == self.engine.config.line_plies
+        let zero_step = prefix.len() == continuation_limit
             || self.engine.semantic.nodes[node].terminal.is_some();
         if !zero_step {
             return Ok(AdaptivePortTransition::Continue(

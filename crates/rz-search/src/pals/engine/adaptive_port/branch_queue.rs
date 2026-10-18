@@ -466,8 +466,8 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
     pub(super) fn enqueue_counter(&mut self, pending: PendingCounter) -> Result<bool, PalsError> {
         if pending.proposal.first() != Some(&pending.first)
             || pending.counter.first() != Some(&pending.first)
-            || pending.counter.len() > self.engine.config.line_plies
-            || pending.proposal.len() > self.engine.config.line_plies
+            || pending.counter.len() > self.continuation_limit()
+            || pending.proposal.len() > self.continuation_limit()
             || pending.attack >= pending.counter.len()
             || pending.attack >= pending.proposal.len()
             || pending.counter.get(..pending.attack) != pending.proposal.get(..pending.attack)
@@ -555,7 +555,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 pending.source,
             );
         }
-        let done = pending.counter.len() >= self.engine.config.line_plies
+        let done = pending.counter.len() >= self.continuation_limit()
             || self.engine.semantic.nodes[node].terminal.is_some();
         let stage = if done {
             self.record_hot(RecordKind::Counterexample, &pending.counter, pending.source)?;

@@ -79,6 +79,9 @@ struct RootRunCustody {
     /// Original typed error/rejection or panic payload, including any owners
     /// returned by a failed consuming API. It is never a replacement owner.
     failure_payload: Option<Box<dyn Any + Send>>,
+    /// Semantic failure is distinct from the physical retirement below. Keep
+    /// actual typed observations until that retirement can return known Idle.
+    semantic_failures: Option<Box<[AdaptiveManagerError]>>,
     finished: Option<Box<RootReturn>>,
 }
 
@@ -125,6 +128,7 @@ impl RootRunCustody {
             work: None,
             retirement_deadline: None,
             failure_payload: None,
+            semantic_failures: None,
             finished: None,
         })
     }
@@ -531,7 +535,7 @@ impl RoventNnuecSessionDriver {
             policy: self.policy,
             first_request_sequence: run.next_request_sequence,
             native_cpu_node_limit: self.max_native_nodes,
-            endpoints: CpuEndpointSelection::deployment(),
+            endpoints: nnuec_endpoints(self.collection_origin.is_some()),
             controller: self.controller,
             device_digest: self.snapshot.backend,
             cpu_device_digest: Digest(Sha256::digest(b"native-own-nnuec-v2-host-cpu").into()),
@@ -721,6 +725,10 @@ impl RoventNnuecSessionDriver {
             }
         };
         let manager = run.manager.as_ref().expect("same fenced manager");
+        let semantic_failures: Box<[_]> = manager.failures().cloned().collect();
+        if !semantic_failures.is_empty() {
+            run.semantic_failures = Some(semantic_failures);
+        }
         let completion = if context.cancellation.is_canceled()
             || context.control.cancellation.load(Ordering::Acquire)
         {
@@ -1123,15 +1131,29 @@ impl RoventNnuecSessionDriver {
             .expect("same transfer readback")
             .continuation
             .first_request_sequence();
+        let idle = Box::new(Idle {
+            native: run.native.take().expect("same original native service"),
+            owner: Box::new(retired.owner),
+            actor: Some(retired.actor),
+            next_request_sequence,
+            game: run.game,
+            previous_root: Some(Arc::clone(&receipt)),
+        });
+        if let Some(original) = run.semantic_failures.take() {
+            let mut failure = SearchSessionFailure::debug("RoventNnuecManagerFailure", &original);
+            failure.detail.push_str(&format!(
+                "; actual_frontier_goal={:?}",
+                receipt.frontier.as_ref().map(|frontier| frontier.goal),
+            ));
+            // Every original physical retirement above succeeded. Preserve
+            // the same known Idle sources for session finish, rather than
+            // relabeling a semantic rejection as unknown physical work.
+            self.closed.store(true, Ordering::Release);
+            run.finished = Some(Box::new(Err((State::Idle(idle), failure))));
+            return Ok(());
+        }
         run.finished = Some(Box::new(Ok((
-            Box::new(Idle {
-                native: run.native.take().expect("same original native service"),
-                owner: Box::new(retired.owner),
-                actor: Some(retired.actor),
-                next_request_sequence,
-                game: run.game,
-                previous_root: Some(Arc::clone(&receipt)),
-            }),
+            idle,
             SearchSessionReport {
                 best_move: result.best_move,
                 work: run.work.take().expect("same original work receipt"),
@@ -1140,5 +1162,32 @@ impl RoventNnuecSessionDriver {
             receipt,
         ))));
         Ok(())
+    }
+}
+
+fn nnuec_endpoints(has_collection_origin: bool) -> CpuEndpointSelection {
+    let mut endpoints = CpuEndpointSelection::deployment();
+    if has_collection_origin {
+        // The product's original Collection origin grants this use. Its
+        // external teacher is an independent Arena owner, not product CPU_T.
+        endpoints.execution_use = rz_search::external_cpu::CpuExecutionUse::Collection;
+    }
+    endpoints
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    use rz_search::external_cpu::{CpuEndpoint, CpuExecutionUse};
+
+    #[test]
+    fn collection_origin_changes_use_without_loading_v_or_product_teacher() {
+        let deployment = nnuec_endpoints(false);
+        assert_eq!(deployment, CpuEndpointSelection::deployment());
+        let collection = nnuec_endpoints(true);
+        assert_eq!(collection.execution_use, CpuExecutionUse::Collection);
+        assert_eq!(collection.cpu_t, CpuEndpoint::Disabled);
+        assert_eq!(collection.cpu_r, CpuEndpoint::Own);
+        assert!(!collection.load_v);
     }
 }

@@ -926,6 +926,15 @@ pub trait AdaptiveSearchDriver<Q> {
     ) -> Result<bool, AdaptiveManagerError> {
         Ok(false)
     }
+    fn prepare_rovent_goal_boundary(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, Q>,
+    ) -> Result<
+        Option<rz_search::pals::engine::adaptive_port::AdaptiveGoalBoundary<Q>>,
+        AdaptiveManagerError,
+    > {
+        Ok(None)
+    }
     fn rovent_root_round_sealed(
         &mut self,
         _: Digest,
@@ -6456,6 +6465,18 @@ where
                 changed = true;
                 continue;
             }
+            if !reciprocal_child {
+                if let Some(boundary) = self.driver.prepare_rovent_goal_boundary(&work)? {
+                    self.machine.advance_original_goal_boundary(
+                        work.frame,
+                        boundary,
+                        self.clock.domain(),
+                        self.check_running()?,
+                    )?;
+                    changed = true;
+                    continue;
+                }
+            }
             if self.registration.endpoints.load_v && !reciprocal_child {
                 if self.exclusive_requested && self.exclusive_scope.is_none() {
                     if !self.roles.is_empty()
@@ -6572,12 +6593,11 @@ where
                         "native CPU root credit overrun",
                     ));
                 }
-                let endpoint =
-                    if self.registration.endpoints.execution_use == CpuExecutionUse::Collection {
-                        self.registration.endpoints.cpu_t
-                    } else {
-                        self.registration.endpoints.cpu_r
-                    };
+                let endpoint = dispatch_cpu_endpoint(
+                    self.registration.endpoints,
+                    self.researcher_source_kind(),
+                    self.nnuec.is_some(),
+                );
                 // Outstanding reservations are not completed work. Leave the
                 // still-ready frame for the next tick after its real receipt.
                 if endpoint == CpuEndpoint::Own
@@ -8274,6 +8294,51 @@ fn observed_public_cache_class(
         _ => CacheClass::Unknown,
     }
 }
+/// Native NNUEC is the actual R owner in both product uses. Collection's
+/// independent teacher does not replace that worker. Legacy PALS still uses
+/// its existing Collection teacher/deployment researcher selection.
+fn dispatch_cpu_endpoint(
+    endpoints: CpuEndpointSelection,
+    source: AdaptiveResearcherSourceKind,
+    has_nnuec: bool,
+) -> CpuEndpoint {
+    if (has_nnuec && source == AdaptiveResearcherSourceKind::Native)
+        || endpoints.execution_use == CpuExecutionUse::Deployment
+    {
+        endpoints.cpu_r
+    } else {
+        endpoints.cpu_t
+    }
+}
+
+#[cfg(test)]
+mod endpoint_selection_tests {
+    use super::*;
+
+    #[test]
+    fn native_nnuec_keeps_r_while_legacy_collection_keeps_teacher_selection() {
+        let mut collection = CpuEndpointSelection::deployment();
+        collection.execution_use = CpuExecutionUse::Collection;
+        assert_eq!(
+            dispatch_cpu_endpoint(collection, AdaptiveResearcherSourceKind::Native, true),
+            CpuEndpoint::Own,
+        );
+        collection.cpu_t = CpuEndpoint::ExternalUci;
+        assert_eq!(
+            dispatch_cpu_endpoint(collection, AdaptiveResearcherSourceKind::Native, false),
+            CpuEndpoint::ExternalUci,
+        );
+        assert_eq!(
+            dispatch_cpu_endpoint(
+                CpuEndpointSelection::deployment(),
+                AdaptiveResearcherSourceKind::Native,
+                false,
+            ),
+            CpuEndpoint::Own,
+        );
+    }
+}
+
 #[cfg(test)]
 mod observed_cache_tests {
     use super::*;

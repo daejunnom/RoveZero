@@ -987,8 +987,9 @@ impl<V, Q> RefinementMachine<V, Q> {
         )
     }
 
-    /// Only an attested worker completion or checked Rules endpoint may enter
-    /// this commit boundary. The latter never invents a StepExecution.
+    /// Only an attested worker completion, checked Rules endpoint, or opaque
+    /// same-owner goal endpoint may enter this commit boundary. The endpoint
+    /// paths never invent a StepExecution; Fresh still needs a real ticket.
     fn commit_transition(
         &mut self,
         frame_id: FrameId,
@@ -2327,6 +2328,44 @@ impl<Q> RefinementMachine<crate::pals::review_context::ReviewView, Q> {
         frame.last_execution = Some(execution);
         self.used_cpu_executions.insert(grant.execution);
         self.observe_history_peak();
+        Ok(())
+    }
+
+    /// The actual Search owner replaced an unsubmitted validation exactly at
+    /// its original go horizon with a Fresh question. This creates no R job,
+    /// completed role value or physical execution evidence. A public input
+    /// cannot authorize this path without the move-only original owner cap.
+    pub fn advance_original_goal_boundary(
+        &mut self,
+        id: FrameId,
+        boundary: crate::pals::engine::adaptive_port::AdaptiveGoalBoundary<Q>,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<(), CoordinatorError> {
+        self.check_control(clock, now)?;
+        let frame = self.frame(id).ok_or(CoordinatorError::UnknownRequest)?;
+        if frame.phase != FramePhase::Ready
+            || frame.cpu_owner.is_some()
+            || frame.last_execution.is_some()
+        {
+            return Err(CoordinatorError::InvalidTransition(
+                "original goal boundary cannot replace active or paused work",
+            ));
+        }
+        let work = self.ready_work(id, clock, now)?;
+        boundary.validate(&work).map_err(|_| {
+            CoordinatorError::IdentityMismatch("actual original goal boundary owner")
+        })?;
+        let (evidence, next) = boundary.into_parts();
+        super::ranking::validate_actual_view(&next.view, next.view_seal)?;
+        if self
+            .commit_transition(id, evidence, FrameTransition::Continue(next), None)?
+            .is_some()
+        {
+            return Err(CoordinatorError::InvalidTransition(
+                "original goal boundary cannot close an unevaluated frame",
+            ));
+        }
         Ok(())
     }
 

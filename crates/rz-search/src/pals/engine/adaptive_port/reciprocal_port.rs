@@ -975,7 +975,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             let Some(movement) = ranked.first().copied() else {
                 return Ok(None);
             };
-            if work.input.question.context.prefix.len() >= self.engine.config.line_plies.min(256) {
+            if work.input.question.context.prefix.len() >= self.continuation_limit().min(256) {
                 return Ok(None);
             }
             let mut prefix = work.input.question.context.prefix.clone();
@@ -984,6 +984,16 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         };
         let node = self.replay_node(&prefix)?;
         if self.engine.semantic.nodes[node].terminal.is_some() {
+            return Ok(None);
+        }
+        if self
+            .original_goal_horizon()
+            .is_some_and(|horizon| prefix.len() >= horizon)
+        {
+            // The original accepted source was consumed above. At a go's
+            // endpoint there is no remaining ply for a new optional policy
+            // or R peer. Its ordinary continuation still supplies the real
+            // endpoint Fresh ticket; no dependent completion is fabricated.
             return Ok(None);
         }
         if self.reciprocal.pending.len() >= MAX_COORDINATOR_FRAMES {

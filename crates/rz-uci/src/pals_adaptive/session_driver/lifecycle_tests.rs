@@ -1,5 +1,6 @@
 //! Actual CPU owner/native command-loop lifecycle on terminal Rules inputs.
-//! Terminal lifecycle and one opt-in authored root ranking; no NN/GPU inference.
+//! Terminal lifecycle, opt-in authored root ranking and full-role goal profile;
+//! all role outputs are deterministic mock work with no NN/GPU inference.
 use super::*;
 use crate::contracts::SessionScope;
 use crate::pals_native::ticketed::{
@@ -74,6 +75,7 @@ struct OwnerFacts {
     finishes: AtomicU64,
     finish_ok: AtomicBool,
     root_ranking: AtomicBool,
+    full_roles: AtomicBool,
     role_runs: AtomicU64,
 }
 struct TerminalOwner {
@@ -91,8 +93,9 @@ impl TicketNativeBackend<ReviewView, AdaptivePortQuestion> for TerminalOwner {
         question: &TicketPreparation<ReviewView, AdaptivePortQuestion>,
         _: &AtomicBool,
     ) -> Result<(Self::Prepared, RepresentationKey), RoleFailure> {
-        if !self.facts.root_ranking.load(Ordering::Acquire)
-            || !question.view.query().prefix.is_empty()
+        if !self.facts.full_roles.load(Ordering::Acquire)
+            && (!self.facts.root_ranking.load(Ordering::Acquire)
+                || !question.view.query().prefix.is_empty())
         {
             return Err(RoleFailure::Backend(
                 "terminal lifecycle fixture forbids non-root model preparation".into(),
@@ -115,7 +118,7 @@ impl TicketNativeBackend<ReviewView, AdaptivePortQuestion> for TerminalOwner {
             encoding: Digest([6; 32]),
             precision: PrecisionProfile::Fp32,
             frozen_epoch: 1,
-            record_revision: 0,
+            record_revision: question.query.context.public_revision,
             role: question.role,
         };
         Ok((key, key))
@@ -137,11 +140,25 @@ impl TicketNativeBackend<ReviewView, AdaptivePortQuestion> for TerminalOwner {
                 id: ticket.id,
                 authority: ticket.authority,
                 key: ticket.representation,
-                payload: RolePayload::Proposal {
-                    candidate_logits: (0..question.view.query().legal.len())
+                payload: {
+                    let candidate_logits = (0..question.view.query().legal.len())
                         .map(|i| i as f32)
-                        .collect(),
-                    wdl: Wdl::try_new(0.25, 0.5, 0.25, 1e-4).unwrap(),
+                        .collect();
+                    let wdl = Wdl::try_new(0.25, 0.5, 0.25, 1e-4).unwrap();
+                    match question.role {
+                        rz_contracts::pals::Role::Proposer => RolePayload::Proposal {
+                            candidate_logits,
+                            wdl,
+                        },
+                        rz_contracts::pals::Role::Critic => RolePayload::Counterexample {
+                            candidate_logits,
+                            divergence_logits: vec![0.; question.view.query().divergences.len()],
+                            wdl,
+                        },
+                        rz_contracts::pals::Role::Validator => {
+                            panic!("V is not enabled in this P/C lifecycle fixture")
+                        }
+                    }
                 },
                 private_latent: vec![0.; 16 * 384],
             }),
@@ -247,9 +264,24 @@ fn fixture_with_rovent_mode(
     ProcessClock,
     u64,
 ) {
+    fixture_with_rovent_profile(startup_gate, role_limit, rovent_mode, 1, false)
+}
+fn fixture_with_rovent_profile(
+    startup_gate: Option<std::sync::mpsc::Receiver<()>>,
+    role_limit: Option<u64>,
+    rovent_mode: Option<rz_contracts::rovent::ExecutionMode>,
+    line_plies: usize,
+    full_roles: bool,
+) -> (
+    AdaptiveSessionDriver<TerminalOwner>,
+    Arc<OwnerFacts>,
+    ProcessClock,
+    u64,
+) {
     let clock = ProcessClock::new(ProcessEpoch(31));
     let facts = Arc::new(OwnerFacts::default());
     facts.finish_ok.store(true, Ordering::Release);
+    facts.full_roles.store(full_roles, Ordering::Release);
     facts
         .root_ranking
         .store(role_limit.is_some(), Ordering::Release);
@@ -322,22 +354,34 @@ fn fixture_with_rovent_mode(
         capabilities: metadata.capabilities(),
         owned_descriptor: metadata.owned_descriptor(),
         cpu_resume_policy: metadata.resume_policy(),
-        role_model: value.model,
-        model_value: None,
-        resolver_version: rz_search::pals::engine::PALS_VALUE_RESOLVER_VERSION,
-        resolver_semantics: rz_search::pals::engine::PALS_VALUE_RESOLVER_SEMANTICS,
+        role_model: value.model.clone(),
+        model_value: full_roles.then_some(value),
+        resolver_version: if full_roles {
+            rz_search::pals::value::MODEL_WDL_RESOLVER_VERSION
+        } else {
+            rz_search::pals::engine::PALS_VALUE_RESOLVER_VERSION
+        },
+        resolver_semantics: if full_roles {
+            rz_search::pals::value::MODEL_WDL_RESOLVER_SEMANTICS
+        } else {
+            rz_search::pals::engine::PALS_VALUE_RESOLVER_SEMANTICS
+        },
     };
     let engine = PalsEngine::new_with_boxed_checker_and_policies(
         PalsConfig {
             beam_width: 1,
-            line_plies: 1,
+            line_plies,
             cpu_nodes_per_task: 8,
             max_role_calls: role_limit.unwrap_or_else(|| PalsConfig::default().max_role_calls),
             ..Default::default()
         },
         model,
         Box::new(metadata.clone().into_mirror()),
-        ResolverPolicy::OwnRawRestricted,
+        if full_roles {
+            ResolverPolicy::ModelWdlRestricted
+        } else {
+            ResolverPolicy::OwnRawRestricted
+        },
         PostRepairRecheckPolicy::IterativeFrozenModelWdlV2,
     )
     .unwrap()
@@ -502,6 +546,38 @@ fn rovent_initial_nodes_boundary_quiesces_without_a_role_ticket_or_physical_fail
             Some(crate::search_driver::DriverPhysicalCompletion::Confirmed)
         );
         assert_eq!(facts.finishes.load(Ordering::Acquire), 1);
+    }
+}
+
+#[test]
+fn rovent_original_depth_one_and_two_close_actual_p_c_fresh_goal() {
+    use rz_contracts::rovent::ExecutionMode;
+    use rz_search::pals::rovent_frontier::FrontierGoalStatus;
+
+    for depth in [1, 2] {
+        let (driver, facts, clock, _) =
+            fixture_with_rovent_profile(None, Some(64), Some(ExecutionMode::CpuPcr), 4, true);
+        let position = Position::startpos();
+        let allowed: BoardMove = "e2e4".parse().unwrap();
+        let mut original = context(&clock, 1, 0);
+        original.goal.depth_plies = std::num::NonZeroU16::new(depth);
+        original.root_moves = Some(Arc::from([allowed]));
+        let report = driver.run(&position, &original, &mut |_| {}).unwrap();
+        let actual = driver.latest_rovent_root().unwrap().unwrap();
+        let frontier = actual.frontier.as_ref().unwrap();
+        assert_eq!(frontier.goal, FrontierGoalStatus::DepthSatisfied);
+        assert_eq!(frontier.horizon.completed_depth.unwrap().0, depth);
+        assert_eq!(frontier.horizon.maximum_examined_ply.0, depth);
+        assert!(actual.counters.consumed_role_outputs >= 2);
+        assert!(facts.role_runs.load(Ordering::Acquire) >= 2);
+        assert!(actual.physical.as_ref().unwrap().permits_root_reuse());
+        assert!(matches!(report.work, DriverWork::RoventNative {
+            completed_depth: Some(completed), maximum_examined_ply, ..
+        } if completed == depth && maximum_examined_ply == depth));
+        assert_eq!(
+            driver.finish_session(original.shutdown_deadline).unwrap(),
+            Some(crate::search_driver::DriverPhysicalCompletion::Confirmed),
+        );
     }
 }
 

@@ -64,6 +64,7 @@ pub use external_commit::{AdaptiveForeignPublication, AdaptivePortExternalQuesti
 pub use frontier_port::{
     AdaptiveFrontierReceipt, AdaptiveFrontierStartup, AdaptiveReviewLeaseAdmission,
 };
+pub use goal_hooks::AdaptiveGoalBoundary;
 pub use goal_local::{
     AdaptiveGoalLocalAdmission, GoalLocalBlockReason, GoalLocalInput, GoalLocalLeaf,
     GoalLocalLeafKind, GoalLocalQuestionKey, GoalLocalStep,
@@ -254,7 +255,8 @@ pub struct AdaptivePortCandidate {
     pub deferred: Option<DeferredRootCandidate<AdaptivePortQuestion>>,
     pub initialized: Option<CheckedRootCandidate<AdaptivePortQuestion>>,
 }
-/// The actual port alone attests the registered one-ply policy shortcut.
+/// The actual port alone attests a one-ply policy shortcut within its
+/// registered chunk and the admitted original go horizon.
 /// General public FrameInput cannot claim that a second forward was omitted.
 pub struct CheckedRootCandidate<Q> {
     source: ProposerRankingSource,
@@ -1258,7 +1260,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         for _ in 0..issue_count {
             let mut candidate =
                 self.make_root_candidate(remaining.pop_front().ok_or(PalsError::InvalidConfig)?)?;
-            if self.engine.config.line_plies == 1
+            if self.continuation_limit() == 1
                 && self.engine.semantic.nodes[candidate.input.question.node]
                     .terminal
                     .is_none()
@@ -1268,7 +1270,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                     first: candidate.first_move,
                     input: candidate.input.clone(),
                     budget: candidate.budget,
-                    line_plies: self.engine.config.line_plies,
+                    line_plies: self.continuation_limit(),
                 });
             }
             out.push(candidate);
@@ -1317,7 +1319,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         }
         let prefix = vec![movement];
         let child = self.replay_node(&prefix)?;
-        let stage = if self.engine.config.line_plies <= 1
+        let stage = if self.continuation_limit() <= 1
             || self.engine.semantic.nodes[child].terminal.is_some()
         {
             RefinementStage::CpuValidation

@@ -1162,7 +1162,7 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
                 .pv
                 .iter()
                 .copied()
-                .take(self.engine.config.line_plies)
+                .take(self.continuation_limit())
                 .collect();
             let line = if projected.is_empty() {
                 None

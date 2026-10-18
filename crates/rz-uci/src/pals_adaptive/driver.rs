@@ -1447,6 +1447,17 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
     fn close_rovent_goal_admission(&mut self) -> Result<(), AdaptiveManagerError> {
         self.hot()?.close_rovent_goal_admission().map_err(semantic)
     }
+    fn prepare_rovent_goal_boundary(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,
+    ) -> Result<
+        Option<rz_search::pals::engine::adaptive_port::AdaptiveGoalBoundary<AdaptivePortQuestion>>,
+        AdaptiveManagerError,
+    > {
+        self.hot()?
+            .prepare_rovent_goal_boundary(work)
+            .map_err(semantic)
+    }
     fn release_rovent_goal_state(&mut self) -> Result<(), AdaptiveManagerError> {
         self.hot()?.release_rovent_goal_state().map_err(semantic)
     }
