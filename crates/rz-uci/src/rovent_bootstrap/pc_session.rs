@@ -28,9 +28,9 @@ use rz_contracts::{ContractError, Digest};
 use rz_position::{BoardMove, Position};
 use rz_runtime::contracts::ContractClock;
 use rz_search::cpu_value::nnuec::v2::review::PreparationActor;
-use rz_search::pals::engine::PcSemanticOwner;
 use rz_search::pals::engine::adaptive_port::{AdaptivePortModel, AdaptiveRulesOwnerIssuer};
 use rz_search::pals::engine::pc_port::{PcFrontierStartup, PcPortQuestion, PcSemanticPort};
+use rz_search::pals::engine::{PcSemanticOwner, PostRepairRecheckPolicy};
 use rz_search::pals::rovent_frontier::{
     FrontierError, FrontierGoalStatus, FrontierLimits, FrontierRegistration, FrontierSnapshot,
     FrontierStop,
@@ -927,28 +927,6 @@ impl RoventPcSessionDriver {
                 return Err(SearchSessionFailure::debug("RoventPcPort", &error));
             }
         };
-        let recheck = self
-            .configuration
-            .post_repair_policy_for(self.snapshot.mode);
-        if let Err(error) = port.enable_post_repair_recheck(recheck) {
-            *state = State::RejectedPort {
-                native,
-                port: PcPortDriver::new(port),
-            };
-            self.closed.store(true, Ordering::Release);
-            return Err(SearchSessionFailure::debug("RoventPcRecheckPolicy", &error));
-        }
-        if port.post_repair_recheck() != recheck {
-            *state = State::RejectedPort {
-                native,
-                port: PcPortDriver::new(port),
-            };
-            self.closed.store(true, Ordering::Release);
-            return Err(failure(
-                "RoventPcRecheckPolicy",
-                "actual port policy differs from its registered configuration",
-            ));
-        }
         let model_namespace = match port.model_namespace() {
             Ok(namespace) => Arc::new(namespace.clone()),
             Err(error) => {
@@ -975,21 +953,24 @@ impl RoventPcSessionDriver {
             native_ledger: None,
         };
         let root_budget = frontier.root_budget;
-        let attached = port.attach_rovent_frontier(
+        let configured = configure_root_port(
+            &mut port,
             frontier,
             self.frontier_limits.clone(),
             PcFrontierStartup {
                 root_budget,
                 clock: self.clock.b_clock(),
             },
+            self.configuration
+                .post_repair_policy_for(self.snapshot.mode),
         );
-        if let Err(error) = attached {
+        if let Err(error) = configured {
             *state = State::RejectedPort {
                 native,
                 port: PcPortDriver::new(port),
             };
             self.closed.store(true, Ordering::Release);
-            return Err(SearchSessionFailure::debug("RoventPcFrontier", &error));
+            return Err(error);
         }
         let collection_admission = match &self.collection_origin {
             Some(origin) => {
@@ -1485,6 +1466,13 @@ impl SearchSessionDriver for RoventPcSessionDriver {
         position: &Position,
         go: &crate::parser::GoLimits,
     ) -> Result<(), ContractError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ContractError::new(
+                rz_contracts::ErrorCode::BackendFailure,
+                rz_contracts::Stage::Admission,
+                "Rovent P/C physical owner is closed or quarantined",
+            ));
+        }
         let max = self.search_goal_capability().ok_or_else(poisoned)?;
         crate::rovent_root_admission::preadmission::validate_go(
             position,
@@ -1562,6 +1550,28 @@ impl Drop for RoventPcSessionDriver {
         }
     }
 }
+/// The same production ordering is used by every P/C session configuration.
+/// No role input/manager exists yet. Recheck binds the already attached
+/// original per-go budget, never an invented startup budget or silent default.
+fn configure_root_port(
+    port: &mut PcSemanticPort<Model>,
+    frontier: FrontierRegistration,
+    limits: FrontierLimits,
+    actual: PcFrontierStartup,
+    recheck: PostRepairRecheckPolicy,
+) -> Result<(), SearchSessionFailure> {
+    port.attach_rovent_frontier(frontier, limits, actual)
+        .map_err(|error| SearchSessionFailure::debug("RoventPcFrontier", &error))?;
+    port.enable_post_repair_recheck(recheck)
+        .map_err(|error| SearchSessionFailure::debug("RoventPcRecheckPolicy", &error))?;
+    if port.post_repair_recheck() != recheck {
+        return Err(failure(
+            "RoventPcRecheckPolicy",
+            "actual port policy differs from its registered configuration",
+        ));
+    }
+    Ok(())
+}
 fn failure(code: &'static str, detail: &str) -> SearchSessionFailure {
     SearchSessionFailure {
         physical_completion: DriverPhysicalCompletion::Confirmed,
@@ -1627,5 +1637,131 @@ mod shared_nnuec_resource_tests {
             max_threads: 1,
             cpu_charge_millicpus: 1_000,
         }]));
+    }
+}
+
+#[cfg(test)]
+mod root_policy_tests {
+    use super::*;
+    use rz_contracts::pals::{GameGeneration, RootGeneration};
+    use rz_contracts::rovent::{ExecutionMode, SearchGoal};
+    use rz_contracts::{
+        ClockDomain, Deadline, MonotonicTick, OwnerId, PrecisionProfile, ProcessEpoch,
+    };
+    use rz_search::contract_time::{ContractClock, InstantClock};
+    use rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace;
+    use rz_search::pals::engine::{
+        LegalOrderRoleMock, PalsSemanticConfig, PcSemanticProfile, RoleModel,
+    };
+    use rz_search::pals::review_context::{ReviewIndexLimits, ReviewSelectionPolicy};
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn iterative_pc_policy_binds_original_frontier_before_first_role_input() {
+        let value = LegalOrderRoleMock.value_identity().unwrap().clone();
+        let namespace = AdaptiveModelNamespace::new(
+            value.clone(),
+            Digest([5; 32]),
+            Digest([6; 32]),
+            PrecisionProfile::Fp32,
+            1,
+        )
+        .unwrap();
+        let model = AdaptivePortModel::new_with_namespace(
+            value.model.clone(),
+            Some(value),
+            namespace.clone(),
+        )
+        .unwrap();
+        let mut owner = PcSemanticOwner::new_selected_rovent(
+            PcSemanticProfile {
+                semantic: PalsSemanticConfig {
+                    beam_width: 1,
+                    line_plies: 6,
+                    max_nodes: 257,
+                    max_records: 128,
+                    max_role_calls: 64,
+                },
+                maximum_root_prefix_plies: 16,
+            },
+            model,
+            ReviewSelectionPolicy::default(),
+            ReviewIndexLimits::default(),
+        )
+        .unwrap();
+        let position = Position::startpos();
+        let authority = SearchAuthority {
+            epoch: ProcessEpoch(23),
+            game: GameGeneration(0),
+            root: RootGeneration(7),
+            implementation: Digest([7; 32]),
+        };
+        let clock = InstantClock::new(ClockDomain(authority.epoch), Instant::now());
+        let deadline = Deadline {
+            clock: clock.domain(),
+            at: MonotonicTick(20_000_000_000),
+        };
+        let registration = owner.register_adaptive_root(&position, authority).unwrap();
+        let next = Arc::new(AtomicU64::new(1));
+        let issuer: AdaptiveRulesOwnerIssuer =
+            Arc::new(move || Ok(OwnerId(next.fetch_add(1, Ordering::Relaxed))));
+        let mut port = PcSemanticPort::new_registered_retaining(
+            owner,
+            position,
+            authority,
+            deadline,
+            clock.instant_at(deadline.at).unwrap(),
+            ExecutionMode::CpuPc,
+            issuer,
+            registration,
+            None,
+        )
+        .map_err(|(_, error)| error)
+        .unwrap();
+        let policy = PostRepairRecheckPolicy::IterativeFrozenModelWdlV2;
+        assert_eq!(port.original_root_budget(), None);
+        assert!(port.enable_post_repair_recheck(policy).is_err());
+        assert_eq!(
+            port.post_repair_recheck(),
+            PostRepairRecheckPolicy::Disabled
+        );
+        let budget = Digest([11; 32]);
+        let frontier = FrontierRegistration {
+            authority,
+            mode: ExecutionMode::CpuPc,
+            original_deadline: deadline,
+            root_budget: budget,
+            goal: SearchGoal {
+                depth_plies: NonZeroU16::new(1),
+                mate_moves: None,
+            },
+            nodes: Some(2_000),
+            selective_policy: Digest([12; 32]),
+            root_rules: port.root_rules(),
+            root_moves: Arc::clone(port.root_move_domain()),
+            root_state: port.root_state_id(),
+            model_namespace: Arc::new(namespace),
+            native_ledger: None,
+        };
+        configure_root_port(
+            &mut port,
+            frontier,
+            FrontierLimits {
+                maximum_goal_plies: NonZeroU16::new(16).unwrap(),
+                maximum_frames: 64,
+                maximum_paths: 128,
+                maximum_mate_nodes: 256,
+                maximum_native_receipts: 1,
+            },
+            PcFrontierStartup {
+                root_budget: budget,
+                clock,
+            },
+            policy,
+        )
+        .unwrap();
+        assert_eq!(port.original_root_budget(), Some(budget));
+        assert_eq!(port.post_repair_recheck(), policy);
+        assert!(port.enable_post_repair_recheck(policy).is_err());
     }
 }
