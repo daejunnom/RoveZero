@@ -1317,7 +1317,11 @@ fn copied_publication_capacity_error_without_original_controller_remains_failure
         assert_eq!(manager.phase(), ManagerPhase::Running);
         assert!(manager.shutdown_until.is_none());
         let receipt = shutdown(&mut manager, until);
-        assert!(receipt.permits_root_reuse());
+        // This helper joins the process owner; it does not quiesce an owner
+        // for another root. Physical closure must not erase logical failure.
+        assert!(receipt.permits_archive_close());
+        assert!(!receipt.permits_root_reuse());
+        assert_eq!(manager.failures().count(), 1);
         assert_eq!(receipt.counters.accepted_nn_inputs, 0);
         assert_eq!(receipt.counters.consumed_role_outputs, 0);
     }
