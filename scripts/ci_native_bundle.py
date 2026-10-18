@@ -80,9 +80,19 @@ def strict_json(raw):
                       parse_constant=lambda _: (_ for _ in ()).throw(RuntimeError('NonfiniteJson')))
 
 
-def identity(meta):
+def identity(meta, *, creation_time=False):
+    # CPython 3.12+ Windows path stat reports creation time in st_ctime,
+    # while fstat reports ChangeTime. Only FD-versus-path comparisons use
+    # their common birthtime; FD-versus-FD checks retain ChangeTime.
+    timestamp = getattr(meta, 'st_birthtime_ns', meta.st_ctime_ns) if creation_time else meta.st_ctime_ns
     return (meta.st_dev, meta.st_ino, meta.st_mode, meta.st_nlink,
-            meta.st_size, meta.st_mtime_ns, meta.st_ctime_ns)
+            meta.st_size, meta.st_mtime_ns, timestamp)
+
+
+def same_file_identity(before, after, named):
+    return (identity(before) == identity(after)
+            and identity(before, creation_time=os.name == 'nt')
+            == identity(named, creation_time=os.name == 'nt'))
 
 
 def pinned_file(path, maximum=SOURCE_CAP, cargo=False, allow_empty=False):
@@ -99,7 +109,7 @@ def pinned_file(path, maximum=SOURCE_CAP, cargo=False, allow_empty=False):
         while raw := stream.read(65536):
             digest.update(raw)
             blob.update(raw)
-        require(identity(before) == identity(os.fstat(fd)) == identity(path.lstat()), 'ArtifactIdentityChanged')
+        require(same_file_identity(before, os.fstat(fd), path.lstat()), 'ArtifactIdentityChanged')
         stream.seek(0)
         return stream, {'bytes': before.st_size, 'sha256': digest.hexdigest()}, before, blob.hexdigest()
     except BaseException:
@@ -130,7 +140,7 @@ def copy_cargo_elf(source, destination, check_budget):
                 count += len(raw)
             target.flush()
             os.fsync(target.fileno())
-        require(identity(before) == identity(os.fstat(stream.fileno())) == identity(source.lstat()), 'CargoOriginalElfChanged')
+        require(same_file_identity(before, os.fstat(stream.fileno()), source.lstat()), 'CargoOriginalElfChanged')
     destination.chmod(0o700)
     actual = file_pin(destination, ELF_CAP)
     require(actual == expected == {'bytes': count, 'sha256': digest.hexdigest()}
@@ -390,7 +400,7 @@ class Build:
         stream, row['stdout_pin'], before, _ = pinned_file(out, LOG_CAP)
         with stream:
             raw = stream.read()
-            require(identity(before) == identity(os.fstat(stream.fileno())) == identity(out.lstat()), 'CommandStdoutFDChanged')
+            require(same_file_identity(before, os.fstat(stream.fileno()), out.lstat()), 'CommandStdoutFDChanged')
         # Empty stderr is ordinary; stdout-consuming commands are nonempty.
         row['stderr_bytes'] = err.stat().st_size
         stream, row['stderr_pin'], _, _ = pinned_file(err, LOG_CAP, allow_empty=True)
@@ -542,7 +552,7 @@ def run(source, root, expected_head, seconds):
         require(rules.get('rules_input_semantic_sha256') == semantic.hexdigest()
                 and rules.get('rules_encoder_source_sha256') == encoder.hexdigest(), 'StaticRulesDescriptorSourceFraming')
         require(source_inventory(source, tree) == (rows, controls)
-                and identity(lock_meta) == identity(os.fstat(lock.fileno())) == identity((source / 'Cargo.lock').lstat())
+                and same_file_identity(lock_meta, os.fstat(lock.fileno()), (source / 'Cargo.lock').lstat())
                 and file_pin(source / 'Cargo.lock') == lock_pin, 'SourceOrLockChangedDuringBuild')
         require(build.command('git-head-final', [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
                 'HeadChangedDuringBuild')
@@ -559,7 +569,7 @@ def run(source, root, expected_head, seconds):
             shutil.copyfileobj(lock, target, 65536)
             target.flush()
             os.fsync(target.fileno())
-        require(identity(lock_meta) == identity(os.fstat(lock.fileno())) == identity((source / 'Cargo.lock').lstat()),
+        require(same_file_identity(lock_meta, os.fstat(lock.fileno()), (source / 'Cargo.lock').lstat()),
                 'BundledLockOriginalFDChanged')
         require(file_pin(artifact / 'Cargo.lock') == lock_pin, 'BundledLockPin')
         members = sorted(receipt['binaries'])
@@ -575,7 +585,7 @@ def run(source, root, expected_head, seconds):
                     info = tarfile.TarInfo('bin/' + name)
                     info.size, info.mode = actual['bytes'], 0o700
                     archive.addfile(info, stream)
-                    require(identity(before) == identity(os.fstat(stream.fileno())) == identity((private / name).lstat()), 'BundleMemberFDChanged')
+                    require(same_file_identity(before, os.fstat(stream.fileno()), (private / name).lstat()), 'BundleMemberFDChanged')
         receipt.update(status='SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED',
                        source_files=len(rows), component_count=len(components), source_components=components,
                        Cargo_lock_before_after=lock_pin, Cargo_lock_same_fd_stable=True,
@@ -599,7 +609,7 @@ def run(source, root, expected_head, seconds):
                         shutil.copyfileobj(stream, target, 65536)
                         target.flush()
                         os.fsync(target.fileno())
-                        require(identity(before) == identity(os.fstat(stream.fileno())) == identity(path.lstat()), 'ClosedCommandLogFDChanged')
+                        require(same_file_identity(before, os.fstat(stream.fileno()), path.lstat()), 'ClosedCommandLogFDChanged')
                 except (OSError, RuntimeError) as error:
                     receipt['status'] = 'FAILED_NOT_ADMITTED'
                     receipt['log_preservation_error'] = {'type': type(error).__name__, 'message': str(error)[:512]}

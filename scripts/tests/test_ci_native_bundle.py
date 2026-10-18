@@ -6,15 +6,47 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import ci_native_bundle as bundle
 
 
 class NativeBundleTests(unittest.TestCase):
+    def test_cross_source_creation_time_preserves_all_named_file_identity_fields(self):
+        fields = dict(st_dev=7, st_ino=(1 << 100) + 11, st_mode=stat.S_IFREG | 0o666,
+                      st_nlink=1, st_size=40, st_mtime_ns=1000,
+                      st_ctime_ns=2000, st_birthtime_ns=900)
+        opened = SimpleNamespace(**fields)
+        named = SimpleNamespace(**{**fields, 'st_ctime_ns': fields['st_birthtime_ns']})
+        self.assertNotEqual(bundle.identity(opened), bundle.identity(named))
+        self.assertEqual(bundle.identity(opened, creation_time=True),
+                         bundle.identity(named, creation_time=True))
+        with patch.object(bundle.os, 'name', 'nt'):
+            self.assertTrue(bundle.same_file_identity(opened, opened, named))
+        with patch.object(bundle.os, 'name', 'posix'):
+            self.assertFalse(bundle.same_file_identity(opened, opened, named))
+        for field in ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_size',
+                      'st_mtime_ns', 'st_birthtime_ns'):
+            with self.subTest(field=field):
+                changed = SimpleNamespace(**{**vars(named), field: getattr(named, field) + 1})
+                self.assertNotEqual(bundle.identity(opened, creation_time=True),
+                                    bundle.identity(changed, creation_time=True))
+
+    def test_same_file_identity_keeps_original_fd_change_time_check(self):
+        fields = dict(st_dev=7, st_ino=11, st_mode=stat.S_IFREG | 0o600,
+                      st_nlink=1, st_size=40, st_mtime_ns=1000,
+                      st_ctime_ns=2000, st_birthtime_ns=900)
+        opened = SimpleNamespace(**fields)
+        changed = SimpleNamespace(**{**fields, 'st_ctime_ns': 2001})
+        self.assertTrue(bundle.same_file_identity(opened, opened, opened))
+        self.assertFalse(bundle.same_file_identity(opened, changed, opened))
+
     def test_compile_only_cleanup_preserves_published_bundle_and_unique_results(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
