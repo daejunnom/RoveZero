@@ -835,10 +835,13 @@ fn rovent_game_record_capacity_keeps_evidence_and_closes_each_root_without_depth
                 }
             ));
             assert_eq!(&retained_records(), full_records.as_ref().unwrap());
-            // The real rejected ranking/output drains unused, never consumed
-            // again to make the new root or its depth appear successful.
-            assert!(actual.counters.unused_role_results > 0);
-            assert!(actual.counters.submitted_role_tickets > actual.counters.consumed_role_outputs);
+            // The original ranking is consumed before candidate publication.
+            // Capacity rejects that publication, not the real consumption;
+            // draining must neither erase it nor consume the output again.
+            assert_eq!(actual.counters.submitted_role_tickets, 1);
+            assert_eq!(actual.counters.physical_role_completions, 1);
+            assert_eq!(actual.counters.consumed_role_outputs, 1);
+            assert_eq!(actual.counters.unused_role_results, 0);
             let last = driver.completion_diagnostic().unwrap().last.unwrap();
             assert_eq!(last.semantic_completion, Some(PalsCompletion::Capacity));
             assert_eq!(last.driver_return, AdaptiveCompletionReturn::Ok);
