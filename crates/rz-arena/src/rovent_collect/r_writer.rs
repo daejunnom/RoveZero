@@ -411,6 +411,8 @@ pub struct FinishedRoventRCorpus {
     payloads: Payloads,
     admissions: Vec<RoventRPublicationAdmission>,
     retirements: Vec<RoventRPublicationRetirement>,
+    // 비-Linux R 완료 owner도 원 allocation 근거를 보유한다. 게시만 Linux 전용이다.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     allocations: super::allocation::RoventAllocationSupplementCapture,
 }
 impl FinishedRoventRCorpus {

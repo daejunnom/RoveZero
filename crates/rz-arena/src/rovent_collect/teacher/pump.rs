@@ -142,6 +142,7 @@ impl RoventCollectionTeacherPump {
             _ => unreachable!("checked submitted-input"),
         })
     }
+    #[cfg(target_os = "linux")]
     pub(crate) fn next_ready_submitted_input_is_divergence(&self) -> Option<bool> {
         self.ready.front().and_then(|row| match row {
             PumpRow::SubmittedV1(row) => {

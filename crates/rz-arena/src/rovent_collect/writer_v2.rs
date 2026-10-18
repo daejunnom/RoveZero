@@ -11,6 +11,8 @@ pub struct RoventCorpusWriterV2 {
 }
 pub(super) struct RoventWriterFinishFailureV2 {
     pub failure: ArenaError,
+    // 실패 객체의 원 writer 소유권은 유지한다. 복구 소비자는 Linux launch에 있다.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub writer: RoventCorpusWriterV2,
 }
 impl RoventCorpusWriterV2 {
@@ -137,6 +139,8 @@ pub struct FinishedRoventCorpusV2 {
     manifest: RoventCorpusManifestV2,
     index: RoventCorpusIndexV2,
     admissions: BTreeMap<String, Arc<publication::RoventPublicationSourceSnapshot>>,
+    // 비-Linux 완료 owner도 원 allocation 근거를 유지하며 게시만 Linux에 한정한다.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     allocations: allocation::RoventAllocationSupplementCapture,
 }
 impl FinishedRoventCorpusV2 {

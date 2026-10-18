@@ -275,7 +275,11 @@ pub struct FinishedRoventCorpus {
     manifest: RoventCorpusManifest,
     index: RoventCorpusIndex,
     native_admission_sha256: Vec<String>,
+    // 원 출처 snapshot의 소유권은 유지한다. durable 게시 소비자만 Linux 전용이다.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     admissions: BTreeMap<String, Arc<RoventPublicationSourceSnapshot>>,
+    // 비-Linux 완료 owner도 원 allocation 근거를 버리지 않고 보유한다.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     allocations: super::allocation::RoventAllocationSupplementCapture,
 }
 

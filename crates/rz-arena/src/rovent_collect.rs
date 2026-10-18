@@ -1061,6 +1061,7 @@ pub use external_scope::{
     RoventHistoricalExternalSource, verify_historical_external_source_input_lock,
 };
 pub use historical_scope::{RoventHistoricalRecordEvidence, verify_historical_record_evidence};
+#[cfg(target_os = "linux")]
 pub(crate) use historical_scope::{RoventNativeOriginEvidence, RoventRootAdmissionEvidence};
 mod publication;
 pub use publication::{

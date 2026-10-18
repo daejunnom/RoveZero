@@ -71,6 +71,8 @@ impl RoventAllocationSupplement {
 }
 struct CapturedAllocation {
     descriptor: rz_experiments::RoventRootDescriptor,
+    // 검증한 원 clock은 capture와 함께 유지한다. supplement 게시 소비자는 Linux 전용이다.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     clock: rz_experiments::RoventRootAllocationClock,
     raw: Vec<u8>,
 }
