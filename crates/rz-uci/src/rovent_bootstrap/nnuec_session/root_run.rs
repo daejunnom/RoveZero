@@ -847,6 +847,7 @@ impl RoventNnuecSessionDriver {
             stopped_before_research_execution: false,
             deadline_before_frontier: false,
             initial_retirement: None,
+            pre_materialization_retirement: None,
         }));
         let receipt = run.receipt.as_ref().expect("same original root receipt");
         if let Err(error) = self.observe_root_receipt(receipt) {

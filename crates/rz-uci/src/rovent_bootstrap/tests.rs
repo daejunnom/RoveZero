@@ -9,7 +9,7 @@ fn artifact(name: &str) -> Value {
     json!({"path":format!("fixture/{name}"), "sha256":"a".repeat(64),
         "bytes":32, "source":"https://example.org/source-only-fixture", "license":"MIT"})
 }
-fn wire(mode: ExecutionMode) -> Value {
+pub(super) fn wire(mode: ExecutionMode) -> Value {
     let native_r = mode.has_native_r();
     let gpu = mode.pc_compute() == rz_contracts::rovent::PcCompute::Accelerator;
     let model = json!({"semantics":virtual_review::MODEL_SEMANTICS,

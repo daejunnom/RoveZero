@@ -126,6 +126,42 @@ struct RootPhysicalObservation {
     shared_nnuec_semantic_consumed_requests: Option<usize>,
 }
 impl RootPhysicalObservation {
+    // Called only after the original producer-only witness matched this
+    // root's admission/clock/ledger and actual pre-materialization retirement.
+    // Inapplicable manager/native shutdown fields remain false/None. This
+    // source never substitutes counter0 for a manager fence or process join.
+    fn pre_materialization() -> Self {
+        Self {
+            source: "original_pre_materialization_retirement",
+            external_root_fence_present: None,
+            external_root_fence_reusable: None,
+            external_process_joined: None,
+            external_process_close_proof_present: None,
+            auxiliary_shutdown_confirmed: None,
+            reported_external_outstanding_questions: None,
+            semantic_closure_confirmed: true,
+            native_root_fence_present: Some(false),
+            native_root_fence_reusable: false,
+            native_process_joined: false,
+            native_physical_shutdown_confirmed: false,
+            pending_tickets: 0,
+            retained_outputs: None,
+            quarantined: false,
+            own_cpu_joined: None,
+            expected_own_cpu_owners: None,
+            own_cpu_panicked: None,
+            native_cpu_reserved: None,
+            shared_nnuec_closure_present: None,
+            shared_nnuec_issued_requests: None,
+            shared_nnuec_submitted_requests: None,
+            shared_nnuec_completed_requests: None,
+            shared_nnuec_cancelled_requests: None,
+            shared_nnuec_expired_requests: None,
+            shared_nnuec_failed_requests: None,
+            shared_nnuec_semantic_consumed_requests: None,
+        }
+    }
+
     fn pc(value: &RoleOnlyShutdownReceipt) -> Self {
         let closure = value.shared_nnuec_closure();
         Self {
@@ -711,6 +747,51 @@ fn same_original_start(admission: &RoventRootAdmission, context: &SearchSessionC
         .is_some_and(|(original, current)| Arc::ptr_eq(original, current))
 }
 
+/// Same current-root projection for the concrete driver and private producer
+/// regression; neither the helper nor its serialized row can issue authority.
+fn project_nnuec_root_receipt(
+    receipt: &super::super::nnuec_session::RoventNnuecRootReceipt,
+    lock: Digest,
+    context: &SearchSessionContext,
+) -> (&'static str, Option<RootObservation>) {
+    let Some(frontier) = &receipt.frontier else {
+        return ("original_frontier_not_admitted", None);
+    };
+    if receipt.input_lock != lock
+        || !original_scope(
+            &receipt.root_admission,
+            receipt.authority,
+            lock,
+            context,
+            frontier,
+        )
+        || receipt
+            .physical
+            .as_ref()
+            .is_some_and(|value| value.authority != context.authority)
+    {
+        return ("original_root_scope_mismatch", None);
+    }
+    (
+        "original_current_root",
+        Some(RootObservation::new(
+            receipt.domain,
+            &receipt.root_admission,
+            frontier,
+            &receipt.counters,
+            receipt
+                .physical
+                .as_ref()
+                .map(RootPhysicalObservation::pcr)
+                .or_else(|| {
+                    receipt
+                        .pre_materialization_retirement_matches()
+                        .then(RootPhysicalObservation::pre_materialization)
+                }),
+        )),
+    )
+}
+
 fn project_root(
     product: &RoventNativeProductDriver,
     context: &SearchSessionContext,
@@ -765,34 +846,7 @@ fn project_root(
                 Ok(None) => return ("no_original_root_receipt", None),
                 Err(_) => return ("original_root_receipt_read_failed", None),
             };
-            let Some(frontier) = &receipt.frontier else {
-                return ("original_frontier_not_admitted", None);
-            };
-            if receipt.input_lock != lock
-                || !original_scope(
-                    &receipt.root_admission,
-                    receipt.authority,
-                    lock,
-                    context,
-                    frontier,
-                )
-                || receipt
-                    .physical
-                    .as_ref()
-                    .is_some_and(|value| value.authority != context.authority)
-            {
-                return ("original_root_scope_mismatch", None);
-            }
-            (
-                "original_current_root",
-                Some(RootObservation::new(
-                    receipt.domain,
-                    &receipt.root_admission,
-                    frontier,
-                    &receipt.counters,
-                    receipt.physical.as_ref().map(RootPhysicalObservation::pcr),
-                )),
-            )
+            project_nnuec_root_receipt(&receipt, lock, context)
         }
         ActualProductDriver::Pcr(driver) => {
             let receipt = match driver.latest_rovent_root() {
@@ -1070,6 +1124,16 @@ fn hex(value: Digest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nnuec_original_retirement_producer_matcher_and_projection_keep_scope() {
+        crate::rovent_bootstrap::nnuec_session::pre_materialization_tests::check_projection(
+            |receipt, lock, context| {
+                let (status, root) = project_nnuec_root_receipt(receipt, lock, context);
+                serde_json::json!({"observation_status": status, "root": root})
+            },
+        );
+    }
 
     fn diagnostic() -> RoventLifecycleDiagnostics {
         RoventLifecycleDiagnostics::new_from_sources(

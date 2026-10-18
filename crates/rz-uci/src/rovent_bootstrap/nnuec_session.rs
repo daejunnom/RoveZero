@@ -6,6 +6,8 @@
 //! Unknown transfers retain all original owners rather than replacing them.
 
 mod initial_cleanup;
+#[cfg(test)]
+pub(in crate::rovent_bootstrap) mod pre_materialization_tests;
 mod retirement;
 mod root_run;
 
@@ -97,6 +99,22 @@ type RootReturn = Result<
 pub const ROVENT_NNUEC_ROOT_DOMAIN: &str = "rz-rovent-nnuec-native-root/1";
 pub const ROVENT_NNUEC_INITIAL_DOMAIN: &str = "rz-rovent-nnuec-native-initial-stop/1";
 
+/// Original pre-materialization retirement observation. Only the private
+/// preparing_retirement_receipt producer creates it, after consuming Search's
+/// RetiredPreparingRoot and validating its original ledger/clock/controls.
+/// This is not a manager fence, native shutdown or a new execution authority.
+#[derive(Clone, Debug)]
+struct PreMaterializationRetirement {
+    admission: Arc<RoventRootAdmission>,
+    root_budget: Digest,
+    cleanup_deadline: Instant,
+    frontier_authority: SearchAuthority,
+    frontier_deadline: rz_contracts::Deadline,
+    frontier_goal: FrontierGoalStatus,
+    frontier_work: rz_search::pals::rovent_frontier::FrontierNodeWork,
+    ledger: rz_search::cpu_worker::CpuLedgerRegistrationObservation,
+}
+
 /// Producer-only original cleanup witnesses, distinct from a manager root
 /// fence. They grant no search result, native execution, or new Ready owner.
 pub struct RoventNnuecInitialRetirementReceipt {
@@ -148,8 +166,60 @@ pub struct RoventNnuecRootReceipt {
     pub counters: AdaptiveManagerCounters,
     pub stopped_before_research_execution: bool,
     pub deadline_before_frontier: bool,
+    // A caller cannot recreate this private original-retirement witness by
+    // constructing a public root descriptor or by reporting zero counters.
+    pre_materialization_retirement: Option<Arc<PreMaterializationRetirement>>,
 }
 impl RoventNnuecRootReceipt {
+    pub(crate) fn pre_materialization_retirement_matches(&self) -> bool {
+        let Some(original) = &self.pre_materialization_retirement else {
+            return false;
+        };
+        let Some(frontier) = &self.frontier else {
+            return false;
+        };
+        Arc::ptr_eq(&original.admission, &self.root_admission)
+            && self.domain == ROVENT_NNUEC_ROOT_DOMAIN
+            && self.input_lock == self.root_admission.startup_lock_digest()
+            && original.root_budget == self.root_admission.root_budget_digest()
+            && original.cleanup_deadline == self.root_admission.original_context().shutdown_deadline
+            && original.frontier_authority == self.authority
+            && original.frontier_authority == self.root_admission.authority()
+            && frontier.authority == original.frontier_authority
+            && original.frontier_deadline == self.root_admission.hard_deadline()
+            && frontier.original_deadline == original.frontier_deadline
+            && frontier.goal == original.frontier_goal
+            && matches!(
+                frontier.goal,
+                FrontierGoalStatus::DepthSatisfied
+                    | FrontierGoalStatus::MateSatisfied
+                    | FrontierGoalStatus::Stopped(
+                        FrontierStop::WorkBudget | FrontierStop::Deadline | FrontierStop::Canceled
+                    )
+            )
+            && frontier.work == original.frontier_work
+            && self.stopped_before_research_execution
+            && !self.deadline_before_frontier
+            && self.initial_retirement.is_none()
+            && self.physical.is_none()
+            && self.counters == AdaptiveManagerCounters::default()
+            && original.ledger.authority == self.authority
+            && original.ledger.clock_domain == self.root_admission.runtime_clock().domain()
+            && original.ledger.clock_origin == self.root_admission.runtime_clock().origin()
+            && original.ledger.spent_native_nodes == 0
+            && original.ledger.reserved_native_nodes == 0
+            && original.ledger.active_jobs == 0
+            && original.ledger.outstanding_executions == 0
+            && original.ledger.quarantined_jobs == 0
+            && original.ledger.highest_job_sequence == 0
+            && original.ledger.highest_execution_sequence == 0
+            && frontier.work.native_usage_known
+            && frontier.work.native_nodes == 0
+            && frontier.work.native_qsearch_nodes == 0
+            && frontier.work.reserved_native_nodes == 0
+            && frontier.work.outstanding_native_executions == 0
+    }
+
     pub fn work(&self) -> Result<DriverWork, SearchSessionFailure> {
         let Some(frontier) = &self.frontier else {
             if self.deadline_before_frontier
@@ -763,38 +833,24 @@ impl RoventNnuecSessionDriver {
         admission: Arc<RoventRootAdmission>,
         initial_retirement: Option<Arc<RoventNnuecInitialRetirementReceipt>>,
     ) -> RootReturn {
-        let original_ledger = retired.ledger.registration_observation();
-        if retired.root_budget != admission.root_budget_digest()
-            || retired.cleanup_deadline != context.shutdown_deadline
-            || !matches!(original_ledger, Ok(observed)
-                if observed.authority == context.authority
-                    && observed.clock_domain == self.clock.domain()
-                    && observed.clock_origin == self.clock.runtime_clock().origin()
-                    && observed.native_node_limit == self.max_native_nodes
-                    && observed.spent_native_nodes == 0
-                    && observed.reserved_native_nodes == 0
-                    && observed.active_jobs == 0
-                    && observed.outstanding_executions == 0
-                    && observed.quarantined_jobs == 0)
-        {
-            return Err(self.retain(
-                (native, retired, actor, initial_retirement, original_ledger),
-                "RoventNnuecInitialRetirement",
-                "actual initial retirement differs from the original root/ledger controls",
-            ));
-        }
-        let receipt = Arc::new(RoventNnuecRootReceipt {
-            domain: ROVENT_NNUEC_ROOT_DOMAIN,
-            authority: context.authority,
-            input_lock: self.snapshot.input_lock,
-            root_admission: admission.clone(),
-            frontier: retired.frontier.map(|r| r.snapshot),
-            physical: None,
+        let (retired, receipt) = match preparing_retirement_receipt(
+            retired,
+            context,
+            admission.clone(),
+            self.snapshot.input_lock,
+            &self.clock,
+            self.max_native_nodes,
             initial_retirement,
-            counters: AdaptiveManagerCounters::default(),
-            stopped_before_research_execution: true,
-            deadline_before_frontier: retired.deadline_before_frontier,
-        });
+        ) {
+            Ok(observed) => observed,
+            Err(rejection) => {
+                return Err(self.retain(
+                    (native, rejection, actor),
+                    "RoventNnuecInitialRetirement",
+                    "actual initial retirement differs from the original root/ledger controls",
+                ));
+            }
+        };
         if let Err(error) = self.observe_root_receipt(&receipt) {
             return Err(self.retain(
                 (
@@ -1306,6 +1362,81 @@ fn should_quiesce(manager: &Manager) -> Result<bool, AdaptiveManagerError> {
         _ => Err(AdaptiveManagerError::PhysicalUnknown),
     }
 }
+type PreparingRetirementReceiptRejection = (
+    RetiredPreparingRoot<AdaptivePortModel>,
+    Option<Arc<RoventNnuecInitialRetirementReceipt>>,
+    Result<rz_search::cpu_worker::CpuLedgerRegistrationObservation, CpuWorkerError>,
+);
+
+/// Consume Search's actual retired owner before issuing its observation. A
+/// rejection returns every original owner/readback to the session's retention.
+/// Kept private: tests use this same producer, never a witness constructor.
+#[allow(clippy::result_large_err)]
+fn preparing_retirement_receipt(
+    mut retired: RetiredPreparingRoot<AdaptivePortModel>,
+    context: &SearchSessionContext,
+    admission: Arc<RoventRootAdmission>,
+    input_lock: Digest,
+    clock: &ProcessClock,
+    native_node_limit: u64,
+    initial_retirement: Option<Arc<RoventNnuecInitialRetirementReceipt>>,
+) -> Result<
+    (
+        RetiredPreparingRoot<AdaptivePortModel>,
+        Arc<RoventNnuecRootReceipt>,
+    ),
+    PreparingRetirementReceiptRejection,
+> {
+    let original_ledger = retired.ledger.registration_observation();
+    if retired.root_budget != admission.root_budget_digest()
+        || retired.cleanup_deadline != context.shutdown_deadline
+        || !matches!(original_ledger, Ok(observed)
+            if observed.authority == context.authority
+                && observed.clock_domain == clock.domain()
+                && observed.clock_origin == clock.runtime_clock().origin()
+                && observed.native_node_limit == native_node_limit
+                && observed.spent_native_nodes == 0
+                && observed.reserved_native_nodes == 0
+                && observed.active_jobs == 0
+                && observed.outstanding_executions == 0
+                && observed.quarantined_jobs == 0)
+    {
+        return Err((retired, initial_retirement, original_ledger));
+    }
+    // An initial C/TT cleanup has its own release/cache ACK and must not
+    // be reclassified as a path that never materialized anything.
+    let pre_materialization_retirement = if initial_retirement.is_none() {
+        retired.frontier.as_ref().map(|frontier| {
+            Arc::new(PreMaterializationRetirement {
+                admission: Arc::clone(&admission),
+                root_budget: retired.root_budget,
+                cleanup_deadline: retired.cleanup_deadline,
+                frontier_authority: frontier.snapshot.authority,
+                frontier_deadline: frontier.snapshot.original_deadline,
+                frontier_goal: frontier.snapshot.goal,
+                frontier_work: frontier.snapshot.work,
+                ledger: original_ledger.expect("original retirement validated its ledger"),
+            })
+        })
+    } else {
+        None
+    };
+    let receipt = Arc::new(RoventNnuecRootReceipt {
+        domain: ROVENT_NNUEC_ROOT_DOMAIN,
+        authority: context.authority,
+        input_lock,
+        root_admission: admission.clone(),
+        frontier: retired.frontier.take().map(|r| r.snapshot),
+        physical: None,
+        initial_retirement,
+        counters: AdaptiveManagerCounters::default(),
+        stopped_before_research_execution: true,
+        deadline_before_frontier: retired.deadline_before_frontier,
+        pre_materialization_retirement,
+    });
+    Ok((retired, receipt))
+}
+
 fn zero_work() -> DriverWork {
     DriverWork::RoventNative {
         root_entries: 0,
