@@ -1256,6 +1256,31 @@ impl RoventPcSessionDriver {
                 ));
             }
         }
+        // Finished proves the original physical closure, not successful
+        // semantic consumption. Normal stop/expiry and validated canceled
+        // native ACKs already have separate manager control paths; never
+        // reinterpret a recorded failure by matching its backend text.
+        let semantic_failure = manager.failures().next().map(|error| {
+            let mut failure = SearchSessionFailure::debug("RoventPcManagerFailure", error);
+            failure.detail.push_str(&format!(
+                "; recorded_failures={}, actual_frontier_goal={:?}",
+                manager.failures().count(),
+                manager
+                    .driver()
+                    .port()
+                    .rovent_frontier_receipt()
+                    .map(|receipt| receipt.snapshot.goal),
+            ));
+            failure
+        });
+        if let Some(failure) = semantic_failure {
+            // The same manager still owns every original failure, port,
+            // receipt and native source through finish's actual join path.
+            // Its verified closure above permits Confirmed failure reporting.
+            *state = State::Manager(manager);
+            self.closed.store(true, Ordering::Release);
+            return Err(failure);
+        }
         let result = manager.driver().result();
         let next = match physical.request_sequence_high_water.checked_add(1) {
             Some(next) => next,
