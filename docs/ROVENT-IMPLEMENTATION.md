@@ -1384,3 +1384,42 @@ hard deadline은 시간 관리 reserve를 포함하므로 caller의 여유를 �
 실제 GPU·일반 teacher·외부 R·update0 IPC는 이 새 실행에서 아직 인수하지 않았다.
 관리 보존 영역은 약 18.64GB로 18GiB 안이었으며 추가 파일 삭제는 없었다. 위 자료는
 기능 검증이며 성능·기력 개선·학습·병합의 증거로 사용하지 않는다.
+
+## 27차 체크포인트: 수명주기 보강과 중단 인계
+
+사용자 요청으로 새 대형 NN/GPU·cohort 실행을 시작하지 않고 현재 준비 작업을
+정리했다. intervention255는 prelude5s+action10s가 root hard deadline14990ms를
+10ms 넘은 원 실패로 보존한다. 후속 caller는 profile을 바꾸지 않고 go20000ms를
+선언하는 새 ID의 source-only 제안으로 남겼다. 262 파생 준비기의 숫자 치환이
+`sha256`을 `sha266`으로 바꿔 metadata 준비에서 실패한 기록도 보존한다.
+새 272~276 제안은 protocol literal 보호와 좁은 예외를 포함하지만 실제 파생·NN
+재시도 인수는 아직 없다. 일반 teacher258 metadata와 259 caller JSON 준비도
+통과했으나 실제 teacher root·policy publication·strict 소비와는 구분한다.
+
+수명주기 코드는 `e8d3755`와 `cc2282f`에 반영했다. 고정 purpose 빌드 슬롯, 새 output의 공통
+예약·보존 카탈로그, CPU 원 runtime CAS의 유한 상한, 원 owner/종료 증거를 대조하는
+명시 복구를 추가했다. 일반 실행과 유지보수는 OS gate·catalog/root inode를 대조한다.
+hash와 decode는 한 held FD snapshot을 사용하고 PID 부재·age만으로 회수하지 않는다.
+CI 성공 bundle의 compile-only 복제와 검증 환경 scratch의 종료 경계도 연결했다.
+세부 사용법과 과거 자료의 처리 한계는 [저장소 유지보수](STORAGE-MAINTENANCE.md)에 둔다.
+
+이 소스의 관리 실행기를 통한 Linux Python3.12 `scripts/tests` 77건 중 74건이 통과하고
+Windows 전용 3건은 건너뛰었다. Windows Python3.10의 storage lifecycle·managed storage·followup
+65건 중 59건이 통과하고 플랫폼 조건 6건은 건너뛰었다. 두 실행 모두 exit0·자식 트리
+종료·scratch 정리를 확인했다. 첫 관리 실행의 Windows 검사는 종료 metadata 증가에
+따른 작은 fixture 용량 경계로 실패했고, 원 로그를 보존한 뒤 마지막 metadata 쓰기까지
+다시 검사하는 보완과 플랫폼 독립 fixture를 추가했다. CI bundle module은 Python3.10에
+tomllib이 없어 Windows 로컬에서는 로드되지 않았고 Linux3.12에서 검사했다. 실제
+owner 프로세스를 종료시킨 뒤 원 closure로 복구하는 작은 stdlib 검사와 잘못된 owner·
+gate/디렉터리 교체·최종 출력 증가·unknown 예약·손상 CAS 거부를 포함한다.
+
+기존 실험 결과·모델·PGN·구형 lease·미등록 sibling을 일괄 삭제하지 않았고 현재 전체
+디스크 사용량을 다시 측정했다는 주장도 하지 않는다. 빌드12GiB·출력18GiB·원 runtime
+CAS4GiB는 각각의 등록 영역 기준이며 C: 전체나 VHD 물리 사용량의 보장이 아니다.
+
+현재 실제 제품 실행 근거는 여전히 `6afa16b`/build250이다. 저장소 tooling 변경을
+옛 바이너리에 재태깅하지 않는다. 재개 시 원 source·wrapper·자산·자원·boot의 영향
+입력을 다시 대조한다. 남은 핵심 인수는 로컬4050의 GPU 두 모드·수치/물리 완료,
+N05 실제 action/cohort publication·strict 소비, update0 IPC 종료, 일반 teacher의
+실제 P/C target 소비와 외부 CPU_R 연결, 그리고 31개 필수 항목의 최종 근거 감사다.
+성능/기력 비교·실제 학습·조건부 후속·병합은 완료로 처리하지 않는다.
