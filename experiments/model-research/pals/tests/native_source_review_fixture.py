@@ -331,3 +331,154 @@ def read_bundle_capacity_fixture_sources(repo):
 def bundle_capacity_fixture_manifest():
     return {"source_commit": BUNDLE_CAPACITY_REVIEWED_SOURCE_COMMIT,
         "files": [{"path": path, **copy.deepcopy(pin)} for path, pin in BUNDLE_CAPACITY_REVIEWED_COMPONENT_PINS.items()]}
+
+# Separate reviewed feedback-observation successor, fixed to original Git/LF
+# bytes. Against f1b82ea, this fourteen-path scope changes only engine.rs:
+# four include_str inventory lines name feedback_observation.rs. Other thirteen
+# reviewed files are byte-identical. Earlier four banks and product registry
+# remain unchanged. This synthetic fixture certifies no compiled artifact,
+# observation semantics, lifecycle/physical completion, model or training run.
+FEEDBACK_OBSERVATION_REVIEWED_SOURCE_COMMIT = "102b339618c55b399a3b2bb29c97c7b3ef5dbc76"
+FEEDBACK_OBSERVATION_REVIEWED_COMPONENT_PINS = {
+    "crates/rz-search/src/pals/engine.rs": {
+        "bytes": 423497,
+        "sha256": "2d25a6609561d042aa7cb4927c337e29f9202575bb37c839512f29a8b95cdac4"
+    },
+    "crates/rz-arena/src/pals_collect/native.rs": {
+        "bytes": 234273,
+        "sha256": "83d54753084c62ecc14dc1f6c7b33e7f93f0d1cd4e2a5e5ce5b27a8a86746cbb"
+    },
+    "crates/rz-search/src/pals/engine/semantic_state.rs": {
+        "bytes": 34003,
+        "sha256": "aecd3584f37b4e4ea1105d6f60a977719e040cad0adfa832801af1089c22812c"
+    },
+    "crates/rz-search/src/pals/engine/researcher_admission.rs": {
+        "bytes": 5957,
+        "sha256": "5a1838c122e0e7eddd13b501f73cc94d9ea668333c70c1047111e9c137d3fdcd"
+    },
+    "crates/rz-search/src/pals/engine/researcher_profile.rs": {
+        "bytes": 5443,
+        "sha256": "118239c55485dcc88f4d82e29f60e68f47d3c4ba1e95b717368f41fab99ee810"
+    },
+    "crates/rz-search/src/pals/engine/review_lifecycle.rs": {
+        "bytes": 37179,
+        "sha256": "4a2059282d54f92ef05fda27d08f6383c9f6ef95d2f944b62c889217d3a8dc72"
+    },
+    "crates/rz-search/src/pals/engine/cpu_lifecycle.rs": {
+        "bytes": 41911,
+        "sha256": "2ad824a55e1f9d4b4215bf3f56663827955ac4f6efec37e5a695f0c54866fe0f"
+    },
+    "crates/rz-search/src/pals/engine/followup_execution.rs": {
+        "bytes": 42122,
+        "sha256": "72e85351261631f7bf57e95a53f95d8c8a6a079e3a320f27efcbefec2e1f938a"
+    },
+    "crates/rz-search/src/pals/engine/archive_lifecycle.rs": {
+        "bytes": 154741,
+        "sha256": "39120ddc5b9173d019e47f2f4757eda8a33676d2961b1120cd5395a1d9adb69c"
+    },
+    "crates/rz-arena/src/pals_collect.rs": {
+        "bytes": 182486,
+        "sha256": "608ed3c18d4a25e03e686c060a3c332a85443f8370406bfd9ed8f5e963b9e2e6"
+    },
+    "crates/rz-arena/src/pals_collect/full_line.rs": {
+        "bytes": 18672,
+        "sha256": "6f79dd8e05add10c258ebe873fd3db2642e39727e616ebf4e256d0c7f3b4ce30"
+    },
+    "crates/rz-arena/src/pals_collect/divergence.rs": {
+        "bytes": 4980,
+        "sha256": "f2916c4128767ffc0fe06407bc39024e2b6c2ec2e1eb952faeef998d7d7b1efd"
+    },
+    "crates/rz-arena/src/pals_collect/continuation.rs": {
+        "bytes": 29927,
+        "sha256": "22ce51044c1a4d3b61b3e62f9eae23198a004611e30ef14b20825ea5206f3963"
+    },
+    "crates/rz-arena/src/pals_collect/producer.rs": {
+        "bytes": 21824,
+        "sha256": "d72fad02feee033ce223f8d8608bd4847e6adc954232b82dd0c3abfd2065a304"
+    }
+}
+FEEDBACK_OBSERVATION_REVIEWED_TRANSITION_PINS = {
+    path: copy.deepcopy(FEEDBACK_OBSERVATION_REVIEWED_COMPONENT_PINS[path]) for path in (
+        "crates/rz-search/src/pals/engine.rs", "crates/rz-arena/src/pals_collect/native.rs")}
+FEEDBACK_OBSERVATION_REVIEWED_CLOSURE_SHA256 = "ff081ae138aa486e54f0966751d47909781f75055c869f5cc1fc4eaee5ce7acb"
+# SHA-256 of an independent synthetic label, never an actual compiler artifact:
+# "synthetic independently declared compiled closure fact for reviewed feedback observation source 102b339\n".
+FEEDBACK_OBSERVATION_SYNTHETIC_COMPILED_FACT = "6d3e272975feee584ead05845efffd6c9e5e5ed4dc2a2e69ac868514fea98664"
+
+
+def feedback_observation_fixture_profile(lane):
+    if lane not in ("default_disabled", "legacy_single_reply"):
+        raise ValueError("explicit synthetic feedback-observation review lane required")
+    return {"schema": "rz-pals-native-reviewed-transition-profile/1",
+        "review_id": "synthetic-reviewed-102b339-feedback-observation-fourteen-source-" + lane,
+        "lane": lane, "transition_sources": copy.deepcopy(FEEDBACK_OBSERVATION_REVIEWED_TRANSITION_PINS),
+        "component_pins": copy.deepcopy(FEEDBACK_OBSERVATION_REVIEWED_COMPONENT_PINS),
+        "compiled_search_implementation_sha256": FEEDBACK_OBSERVATION_SYNTHETIC_COMPILED_FACT,
+        "closure_sha256": FEEDBACK_OBSERVATION_REVIEWED_CLOSURE_SHA256}
+
+
+@contextmanager
+def feedback_observation_fixture_review_scope(lane):
+    """One fixed synthetic successor only; never change the product registry."""
+    profile = feedback_observation_fixture_profile(lane)
+    with patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", (profile,)):
+        yield profile
+
+
+def read_feedback_observation_fixture_sources(repo):
+    """Compare exact reviewed LF bytes without normalization or enrollment."""
+    sources = {}
+    for path, expected in FEEDBACK_OBSERVATION_REVIEWED_COMPONENT_PINS.items():
+        with (repo / path).open("rb") as stream:
+            actual = stream.read(expected["bytes"] + 1)
+        if {"bytes": len(actual), "sha256": hashlib.sha256(actual).hexdigest()} != expected:
+            raise AssertionError("reviewed feedback-observation Rust fixture source pin changed: " + path)
+        sources[path] = actual
+    return sources
+
+
+def feedback_observation_fixture_manifest():
+    return {"source_commit": FEEDBACK_OBSERVATION_REVIEWED_SOURCE_COMMIT,
+        "files": [{"path": path, **copy.deepcopy(value)}
+                  for path, value in FEEDBACK_OBSERVATION_REVIEWED_COMPONENT_PINS.items()]}
+
+
+import unittest as _fixture_unittest
+
+
+class FeedbackObservationFixtureTests(_fixture_unittest.TestCase):
+
+    def test_feedback_observation_bank_preserves_four_prior_banks_and_requires_its_own_fact(self):
+        import native_source_review_fixture as banks
+        from rz_pals_model import native_source_review as reviewed
+        factories = (banks.fixture_profile, banks.successor_fixture_profile,
+                     banks.pc_shared_fixture_profile, banks.bundle_capacity_fixture_profile)
+        prior = [factory("default_disabled") for factory in factories]
+        current = banks.feedback_observation_fixture_profile("default_disabled")
+        engine = 'crates/rz-search/src/pals/engine.rs'
+        self.assertEqual(banks.feedback_observation_fixture_manifest()["source_commit"],
+                         "102b339618c55b399a3b2bb29c97c7b3ef5dbc76")
+        self.assertEqual(current["component_pins"][engine], {'bytes': 423497, 'sha256': '2d25a6609561d042aa7cb4927c337e29f9202575bb37c839512f29a8b95cdac4'})
+        self.assertEqual(len(current["component_pins"]), 14)
+        self.assertEqual([path for path in prior[-1]["component_pins"]
+            if prior[-1]["component_pins"][path] != current["component_pins"][path]], [engine])
+        self.assertEqual(len({profile["review_id"] for profile in [*prior, current]}), 5)
+        before = copy.deepcopy(reviewed.REVIEWED_CLOSURE_PROFILES)
+        for lane in ("default_disabled", "legacy_single_reply"):
+            with banks.feedback_observation_fixture_review_scope(lane) as profile:
+                manifest = banks.feedback_observation_fixture_manifest()
+                proof = reviewed.review_transition_sources(pair=profile["transition_sources"], manifest=manifest,
+                    source={"native": {"search_implementation_sha256": banks.FEEDBACK_OBSERVATION_SYNTHETIC_COMPILED_FACT}},
+                    lane=lane)
+                self.assertEqual(proof["closure_sha256"], banks.FEEDBACK_OBSERVATION_REVIEWED_CLOSURE_SHA256)
+                self.assertIs(proof["historical_metadata_only"], True)
+                for name in ("execution_authorized", "original_native_authority_reissued",
+                             "rules_proof_authorized", "training_target_authorized"):
+                    self.assertIs(proof[name], False)
+                for old in prior:
+                    with self.assertRaisesRegex(ValueError, "compiled search closure differs"):
+                        reviewed.review_transition_sources(pair=profile["transition_sources"], manifest=manifest,
+                            source={"native": {"search_implementation_sha256": old["compiled_search_implementation_sha256"]}},
+                            lane=lane)
+            self.assertEqual(reviewed.REVIEWED_CLOSURE_PROFILES, before)
+        self.assertEqual([factory("default_disabled") for factory in factories], prior)

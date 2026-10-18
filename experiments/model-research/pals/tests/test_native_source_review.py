@@ -18,6 +18,7 @@ _guard = NeuralImportsForbidden()
 sys.meta_path.insert(0, _guard)
 try:
     from rz_pals_model import native_source_review as review
+    from native_source_review_fixture import FeedbackObservationFixtureTests
 finally:
     sys.meta_path.remove(_guard)
 
