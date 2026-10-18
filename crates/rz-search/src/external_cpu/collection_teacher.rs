@@ -1328,21 +1328,32 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn native_fixture(mode: &str) -> (CollectionTeacherWorker, TeacherJob, Instant) {
-        let (mut job, mut registration, _, clock) = fixture();
+        // Expected identity preparation reads this large test ELF once. Do
+        // that before issuing the fixture's original root/startup clocks;
+        // the real process owner still independently rehashes the pinned ELF
+        // inside the unchanged common fixture handshake window below.
         let mut config = super::super::tests::fixture_config(mode);
         config.identity.options.insert("MultiPV".into(), "1".into());
         config.stop_grace = EXTERNAL_STOP_DRAIN_RESERVE;
-        config.handshake_timeout = Duration::from_secs(2);
         config.shutdown_grace = Duration::from_secs(1);
-        let hard = registration_deadline(registration, clock).unwrap();
-        let cleanup = hard + config.shutdown_grace;
-        let startup = Instant::now() + Duration::from_secs(2);
-        registration.original_deadline = job.original_deadline;
         let pin = ExternalLaunchPin::from_owned_descriptors(
             File::open(&config.program).unwrap(),
             File::open(&config.working_directory).unwrap(),
         )
         .unwrap();
+        let (mut job, mut registration, _, clock) = fixture();
+        // This fixture runs startup followed by two finite go/stop/ready
+        // phases. Startup time must not consume either original task's wall
+        // allocation, and cleanup remains outside the original root limit.
+        let startup = clock.origin + config.handshake_timeout;
+        let root_wall = config
+            .handshake_timeout
+            .checked_add(config.max_task_wall_time.checked_mul(2).unwrap())
+            .unwrap();
+        job.original_deadline.at = MonotonicTick(u64::try_from(root_wall.as_nanos()).unwrap());
+        registration.original_deadline = job.original_deadline;
+        let hard = registration_deadline(registration, clock).unwrap();
+        let cleanup = hard + config.shutdown_grace;
         let profile = ExternalEngineProfile::Reckless090EmbeddedNnue;
         // This actual test executable requires --exact arguments and its own
         // MIT fixture identity. It cannot pass as an official engine artifact.

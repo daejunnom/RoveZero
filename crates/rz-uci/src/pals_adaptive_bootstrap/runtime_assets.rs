@@ -44,6 +44,9 @@ pub(crate) struct RuntimeAssetDeclaration<'a> {
 }
 
 /// The original descriptor, not a reopened pathname or a verification flag.
+// Non-Linux callers retain this same borrowed declaration/FD shape, but the
+// admission boundary rejects that unsupported profile before reading either.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone, Copy)]
 pub(crate) struct RuntimeAssetView<'a> {
     pub declaration: RuntimeAssetDeclaration<'a>,

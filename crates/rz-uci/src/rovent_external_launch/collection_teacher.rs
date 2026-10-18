@@ -3,9 +3,10 @@
 use super::*;
 use crate::rovent_root_admission::RoventRootAdmission;
 use rz_runtime::contracts::ContractClock;
+#[cfg(target_os = "linux")]
+use rz_search::external_cpu::collection_teacher::TeacherWorkerRegistration;
 use rz_search::external_cpu::collection_teacher::{
     CollectionTeacherWorker, TeacherCompletion, TeacherDiagnostics, TeacherDispatch, TeacherJob,
-    TeacherWorkerRegistration,
 };
 use std::sync::Arc;
 
