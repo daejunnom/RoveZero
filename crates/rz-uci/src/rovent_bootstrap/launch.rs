@@ -94,6 +94,7 @@ struct Arguments {
     startup_ms: u64,
     root_policy: RoventRootAdmissionPolicy,
     startup_diagnostics: bool,
+    lifecycle_diagnostics: bool,
 }
 impl Arguments {
     fn parse(arguments: &[String]) -> Result<Self, RoventLaunchError> {
@@ -106,6 +107,7 @@ impl Arguments {
         let mut startup_ms = None;
         let mut root_policy = None;
         let mut startup_diagnostics = None;
+        let mut lifecycle_diagnostics = None;
         for argument in arguments {
             let (name, value) = argument
                 .split_once('=')
@@ -141,6 +143,17 @@ impl Arguments {
                         }
                     });
                 }
+                "--lifecycle-diagnostics" if lifecycle_diagnostics.is_none() => {
+                    lifecycle_diagnostics = Some(match value {
+                        "stderr-v1" => true,
+                        _ => {
+                            return Err(error(
+                                "Arguments",
+                                "unknown explicit lifecycle diagnostic selection",
+                            ));
+                        }
+                    });
+                }
                 "--root-policy" if root_policy.is_none() => {
                     root_policy = Some(match value {
                         "exact-registered" => RoventRootAdmissionPolicy::ExactRegistered,
@@ -169,6 +182,7 @@ impl Arguments {
             root_policy: root_policy
                 .ok_or_else(|| error("Arguments", "--root-policy is required"))?,
             startup_diagnostics: startup_diagnostics.unwrap_or(false),
+            lifecycle_diagnostics: lifecycle_diagnostics.unwrap_or(false),
         })
     }
 }
@@ -668,7 +682,7 @@ fn run_inner<'a>(
         NativeStartupDiagnosticStage::ProductAssembly,
         NativeStartupDiagnosticPhase::Entry,
     );
-    let driver = match (collection_preload, collection_assemble) {
+    let mut driver = match (collection_preload, collection_assemble) {
         (Some(preload), Some(assemble)) => assemble(RoventCollectionPreparedLaunch {
             native: prepared_product,
             preload,
@@ -698,6 +712,9 @@ fn run_inner<'a>(
         NativeStartupDiagnosticStage::ProductAssembly,
         NativeStartupDiagnosticPhase::Exit,
     );
+    let lifecycle_diagnostics = arguments
+        .lifecycle_diagnostics
+        .then(|| driver.enable_lifecycle_stderr_diagnostics());
     let mut settings = EngineSettings {
         shutdown_limit: Duration::from_millis(lock.manifest.cleanup_max_ms),
         ..EngineSettings::default()
@@ -734,6 +751,29 @@ fn run_inner<'a>(
                     .map_err(|failure| error("UciSession", failure))
             })
         }
+    };
+    // The ordinary protocol/product runner has already attempted its original
+    // whole-session cleanup. Diagnostic write failure is handled only now, and
+    // cannot skip cleanup or reclassify an unknown fence as Confirmed.
+    let result = match lifecycle_diagnostics
+        .as_ref()
+        .map(|diagnostics| diagnostics.complete_session(result.is_ok()))
+        .transpose()
+    {
+        Ok(_) => result,
+        Err(cause) => match result {
+            Ok(()) => Err(error("LifecycleDiagnostics", cause)),
+            Err(original) => {
+                // Keep the original primary stage/cause. This bounded secondary
+                // notice is best-effort when the diagnostic FD itself failed.
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "rovent-lifecycle-diagnostic-failure/1 cause={cause}"
+                );
+                Err(original)
+            }
+        },
     };
     drop(boundary);
     drop((

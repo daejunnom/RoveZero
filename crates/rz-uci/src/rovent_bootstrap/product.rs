@@ -51,6 +51,11 @@ use std::{
 };
 
 type PcrDriver = AdaptiveSessionDriver<RoventNativeBackend<AdaptivePortQuestion>>;
+mod diagnostics;
+pub use diagnostics::{
+    ROVENT_LIFECYCLE_DIAGNOSTIC_DOMAIN, RoventLifecycleDiagnostics,
+    RoventProductLifecycleObservation,
+};
 // A product's single Arc owns exactly one selected driver for the whole
 // session, including physical shutdown and retained-source custody.
 #[allow(clippy::large_enum_variant)]
@@ -68,6 +73,7 @@ pub struct RoventNativeProductDriver {
     sources: Arc<RoventPinnedNativeSources>,
     physically_closed: Arc<AtomicBool>,
     retirement_sources: Option<Arc<LaunchRetirementRegistrationCustody>>,
+    lifecycle_diagnostics: Option<RoventLifecycleDiagnostics>,
 }
 
 /// Read-only observation of the same product's existing finish boundary.
@@ -163,6 +169,7 @@ impl RoventNativeProductDriver {
             sources,
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: Some(registration),
+            lifecycle_diagnostics: None,
         })
     }
 
@@ -188,6 +195,7 @@ impl RoventNativeProductDriver {
             sources,
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
+            lifecycle_diagnostics: None,
         })
     }
     #[allow(clippy::too_many_arguments, clippy::result_large_err)]
@@ -220,6 +228,7 @@ impl RoventNativeProductDriver {
             sources,
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
+            lifecycle_diagnostics: None,
         })
     }
 
@@ -243,6 +252,7 @@ impl RoventNativeProductDriver {
             sources,
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
+            lifecycle_diagnostics: None,
         })
     }
 
@@ -274,6 +284,7 @@ impl RoventNativeProductDriver {
             sources,
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
+            lifecycle_diagnostics: None,
         })
     }
 
@@ -310,6 +321,7 @@ impl RoventNativeProductDriver {
             sources,
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
+            lifecycle_diagnostics: None,
         })
     }
 
@@ -346,6 +358,7 @@ impl RoventNativeProductDriver {
             sources,
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
+            lifecycle_diagnostics: None,
         })
     }
 
@@ -680,12 +693,29 @@ impl RoventNativeProductDriver {
             sources: pins,
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
+            lifecycle_diagnostics: None,
         })
     }
     pub(crate) fn physical_close_observation(&self) -> RoventProductPhysicalClose {
         RoventProductPhysicalClose {
             closed: Arc::clone(&self.physically_closed),
         }
+    }
+
+    /// Opt-in operational JSONL observations only. The handle cannot close or
+    /// recreate any owner. Diagnostic I/O never replaces the physical cleanup.
+    pub fn enable_lifecycle_stderr_diagnostics(&mut self) -> RoventLifecycleDiagnostics {
+        let implementation = self.actual().implementation();
+        self.lifecycle_diagnostics
+            .get_or_insert_with(|| {
+                RoventLifecycleDiagnostics::new_from_sources(
+                    self.sources.lock_digest(),
+                    implementation,
+                    self.sources.lock().manifest.engine.mode,
+                    Arc::clone(&self.physically_closed),
+                )
+            })
+            .clone()
     }
 
     fn actual(&self) -> &dyn SearchSessionDriver {
@@ -729,11 +759,14 @@ impl SearchSessionDriver for RoventNativeProductDriver {
         &self,
         until: Instant,
     ) -> Result<Option<DriverPhysicalCompletion>, SearchSessionFailure> {
-        let result = self.actual().finish_session(until)?;
-        if result == Some(DriverPhysicalCompletion::Confirmed) {
+        let result = self.actual().finish_session(until);
+        if matches!(result, Ok(Some(DriverPhysicalCompletion::Confirmed))) {
             self.physically_closed.store(true, Ordering::Release);
         }
-        Ok(result)
+        if let Some(diagnostics) = &self.lifecycle_diagnostics {
+            diagnostics.observe_finish(self, &result);
+        }
+        result
     }
     fn accept_uci_output(
         &self,
@@ -750,7 +783,11 @@ impl SearchSessionDriver for RoventNativeProductDriver {
         context: &SearchSessionContext,
         progress: &mut dyn FnMut(BoardMove),
     ) -> Result<SearchSessionReport, SearchSessionFailure> {
-        self.actual().run(position, context, progress)
+        let result = self.actual().run(position, context, progress);
+        if let Some(diagnostics) = &self.lifecycle_diagnostics {
+            diagnostics.observe_root(self, context, result.as_ref().err());
+        }
+        result
     }
 }
 impl Drop for RoventNativeProductDriver {

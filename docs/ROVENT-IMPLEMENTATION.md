@@ -1423,3 +1423,42 @@ CAS4GiB는 각각의 등록 영역 기준이며 C: 전체나 VHD 물리 사용�
 N05 실제 action/cohort publication·strict 소비, update0 IPC 종료, 일반 teacher의
 실제 P/C target 소비와 외부 CPU_R 연결, 그리고 31개 필수 항목의 최종 근거 감사다.
 성능/기력 비교·실제 학습·조건부 후속·병합은 완료로 처리하지 않는다.
+
+## 28차 체크포인트: 재개 후 등록 경계와 제품 수명 관측
+
+Windows Python 3.12의 경로 stat과 FD fstat은 ctime의 의미가 달라 원 관리
+실행기가 Cargo 진입 전에 소유권 변경으로 거부했다. `90481c7`은 Windows의
+FD↔경로 교차 비교에 공통 birthtime을 사용한다. 같은 FD의 전후 ChangeTime,
+inode·link·size·mtime 검사는 유지한다. 새 CI의 Linux·Windows CPU, CPU bindings,
+PALS model 네 job은 성공을 관측했으며 native validation bundle은 이 기록 시점에
+진행 중이다. 로컬 Python 3.10/3.14 집중 검사와 정확 SHA의 CI를 구분한다.
+
+새 boot의 registration291은 build250/STRIP251 원 바이트를 다시 확인하고 별도
+parent·inode·controller·자원 readback과 연결했다. 등록은 passive metadata이며
+학습·NN·제품 준비 완료 권한을 발급하지 않는다. 등록 준비281의 ArtifactRef 생성에
+메타데이터용 1MiB 상한을 잘못 적용한 실패와 재개 preentry의 과거 parent 불일치는
+보존했다. 바이너리에만 명시적 상한을 적용하고 새 parent와 boot를 대조하는
+별도 실행 준비기로 수정했으며 원본은 덮어쓰지 않았다.
+
+Hybrid P-C292는 native preparation에서 configuration identity 불일치로 종료했다.
+실제 backend 선언이 CUDA bundle JSON의 raw SHA를 사용한 반면 제품은 공식
+`CudaRuntimeBundleSpec::digest()`의 semantic SHA를 요구한다. Hybrid P-C-R도 같은
+선언 오류가 있어 후속 GPU 실행을 멈췄다. 제품 guard는 유지하고 새 metadata·lock으로
+수정한다. 이 실패는 ORT session/forward 전에 발생했으며 GPU 수치·물리 완료 인수가
+아니다. 원 실패·종료·EOF 자료와 physical unknown을 보존한다.
+
+`--lifecycle-diagnostics=stderr-v1`은 원 제품의 root/initial/finish receipt를 읽는
+선택형 관측이다. 기본은 off이며 policy·credit·물리 완료 권한을 바꾸지 않는다.
+root authority·input lock·원 Start·deadline을 대조하고 PC의 실제 R0와 shared
+NNUEC closure/readback, 전체 세션 finish를 분리한다. 관측 JSON에서 live authority를
+복원할 수 없다. row/전체 byte 상한과 최종 행 공간을 두고 진단 오류도 원 정리 뒤에
+처리한다. 최종 행의 complete는 출력 전 관측 범위이며 전달 ACK가 아니므로 정상
+process exit와 양 EOF를 함께 확인해야 한다. 새 집중 검사 3개와 launch 검사 5개가
+실제 WSL 관리 실행기를 통해 통과했고 자식 트리 종료·scratch 정리를 확인했다.
+이 검사는 실제 네 모드의 원 receipt 인수를 대신하지 않는다.
+
+N05의 source272~actual275, 일반 teacher282/283, update0 IPC의 owner287 준비는
+서로 다른 단계로 관리한다. 현재 등록291과 원 STRIP251의 번호를 분리하고 원
+rawpin2/독립 경로 pin의 차이를 좁은 접점에서 검증한다. 실제 publication·별도 ACK·
+strict reader·IPC 종료가 없으면 준비나 구문 검사만으로 완료하지 않는다. 실제 학습,
+원격 성능·기력 비교와 병합은 계속 범위 밖이며 목표는 구현·기능 인수를 진행 중이다.

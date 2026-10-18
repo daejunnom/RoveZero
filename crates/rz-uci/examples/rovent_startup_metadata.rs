@@ -2,6 +2,8 @@
 //!
 //! Usage: `rovent_startup_metadata --config=PATH.json [--backend-metadata=PATH.json]`
 //! Optional: `--position-command=position startpos moves e2e4` (one argv value).
+//! Standalone: `--runtime-bundle-metadata=PATH.json` declares the original bundle
+//! JSON byte pin and its existing typed semantic digest, without opening libraries.
 //! The existing startup codec owns validation, canonicalization and domain hashes.
 //! This example never opens referenced assets or creates a native/runtime owner.
 
@@ -24,6 +26,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 mod metadata {
     use rz_eval::error::BackendError;
+    use rz_eval::runtime_pin::CudaRuntimeBundleSpec;
     use rz_experiments::RoventDevice;
     use rz_position::contracts::{profile_digest, rules_snapshot_semantic_digest};
     use rz_position::{BoardMove, Position, PositionError};
@@ -57,6 +60,7 @@ mod metadata {
         InputKind,
         InputBudget,
         BackendDeclaration(&'static str),
+        RuntimeBundleDeclaration(Box<BackendError>),
         PositionSyntax(ParseError),
         PositionCommand,
         PositionRules {
@@ -81,6 +85,7 @@ mod metadata {
                 Self::InputKind => "unsupported_input_file",
                 Self::InputBudget => "configuration_byte_budget",
                 Self::BackendDeclaration(_) => "backend_metadata_declaration_rejected",
+                Self::RuntimeBundleDeclaration(_) => "runtime_bundle_declaration_rejected",
                 Self::PositionSyntax(_) => "position_command_syntax_rejected",
                 Self::PositionCommand => "position_command_required",
                 Self::PositionRules { stage, .. } => stage,
@@ -96,10 +101,11 @@ mod metadata {
     impl fmt::Display for Error {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
-                Self::Arguments => f.write_str("expected --config=PATH.json and optional --backend-metadata=PATH.json / --position-command=POSITION, at most once each"),
+                Self::Arguments => f.write_str("expected --config=PATH.json and optional --backend-metadata=PATH.json / --position-command=POSITION, or standalone --runtime-bundle-metadata=PATH.json, at most once each"),
                 Self::InputKind => f.write_str("input must be a regular non-symlink JSON file"),
                 Self::InputBudget => f.write_str("each input must contain 1..=65536 bytes"),
                 Self::BackendDeclaration(detail) => f.write_str(detail),
+                Self::RuntimeBundleDeclaration(cause) => write!(f, "runtime bundle declaration: {cause}"),
                 Self::PositionSyntax(cause) => write!(f, "position command: {cause}"),
                 Self::PositionCommand => f.write_str("only one UCI position command is accepted"),
                 Self::PositionRules { stage, zero_based_ply, cause } => {
@@ -130,6 +136,11 @@ mod metadata {
         position_command: Option<PositionCommand>,
     }
     #[derive(Debug, PartialEq, Eq)]
+    enum Invocation {
+        Startup(Arguments),
+        RuntimeBundleMetadata(PathBuf),
+    }
+    #[derive(Debug, PartialEq, Eq)]
     struct PositionCommand {
         raw: String,
         position: PositionSpec,
@@ -155,10 +166,11 @@ mod metadata {
         }
         Ok(path)
     }
-    fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Arguments, Error> {
+    fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, Error> {
         let mut configuration = None;
         let mut backend_metadata = None;
         let mut position_command = None;
+        let mut runtime_bundle_metadata = None;
         for argument in arguments {
             let text = argument.to_str().ok_or(Error::Arguments)?;
             if let Some(path) = text.strip_prefix("--config=") {
@@ -176,15 +188,30 @@ mod metadata {
                     return Err(Error::Arguments);
                 }
                 position_command = Some(parse_position_command(command)?);
+            } else if let Some(path) = text.strip_prefix("--runtime-bundle-metadata=") {
+                if runtime_bundle_metadata.is_some() {
+                    return Err(Error::Arguments);
+                }
+                runtime_bundle_metadata = Some(json_path(path)?);
             } else {
                 return Err(Error::Arguments);
             }
         }
-        Ok(Arguments {
+        if let Some(bundle) = runtime_bundle_metadata {
+            return if configuration.is_none()
+                && backend_metadata.is_none()
+                && position_command.is_none()
+            {
+                Ok(Invocation::RuntimeBundleMetadata(bundle))
+            } else {
+                Err(Error::Arguments)
+            };
+        }
+        Ok(Invocation::Startup(Arguments {
             configuration: configuration.ok_or(Error::Arguments)?,
             backend_metadata,
             position_command,
-        })
+        }))
     }
 
     fn read_configuration(path: &std::path::Path) -> Result<Vec<u8>, Error> {
@@ -288,6 +315,51 @@ mod metadata {
             bytes: bytes.len(),
             sha256: hex(&Sha256::digest(bytes)),
         }
+    }
+
+    #[derive(Serialize)]
+    struct RuntimeBundleMetadata {
+        domain: &'static str,
+        raw_json_sha256: String,
+        bytes: usize,
+        semantic_bundle_sha256: String,
+        schema_version: u32,
+        declared_only: bool,
+        runtime_loading_executed: bool,
+        sessions_created: u64,
+        neural_forwards: u64,
+        native_authority: bool,
+        training: bool,
+    }
+    fn prepare_runtime_bundle_metadata(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+        check_input_budget(bytes)?;
+        serde_json::from_slice::<UniqueJson>(bytes).map_err(Error::Json)?;
+        // The typed parser and binary codec own the roster/aliases and digest.
+        // This operation opens no declared file and constructs no runtime pin,
+        // ORT session, loading profile or native/GPU owner.
+        let text = std::str::from_utf8(bytes).map_err(Error::CanonicalUtf8)?;
+        let bundle = CudaRuntimeBundleSpec::from_json(text)
+            .map_err(|cause| Error::RuntimeBundleDeclaration(Box::new(cause)))?;
+        let semantic = bundle
+            .digest()
+            .map_err(|cause| Error::RuntimeBundleDeclaration(Box::new(cause)))?;
+        let raw = byte_pin(bytes);
+        let output = RuntimeBundleMetadata {
+            domain: "rz-rovent-runtime-bundle-declaration/1",
+            raw_json_sha256: raw.sha256,
+            bytes: raw.bytes,
+            semantic_bundle_sha256: hex(&semantic),
+            schema_version: bundle.schema_version,
+            declared_only: true,
+            runtime_loading_executed: false,
+            sessions_created: 0,
+            neural_forwards: 0,
+            native_authority: false,
+            training: false,
+        };
+        let mut encoded = serde_json::to_vec(&output).map_err(Error::OutputEncoding)?;
+        encoded.push(b'\n');
+        enforce_stdout_budget(encoded)
     }
     // Required tagged declarations distinguish explicit absence from omission.
     // No default, path scan or runtime hash is substituted for a missing value.
@@ -614,18 +686,24 @@ mod metadata {
         }
     }
     fn run() -> Result<(), Error> {
-        let arguments = parse_arguments(std::env::args_os().skip(1))?;
-        let input = read_configuration(&arguments.configuration)?;
-        let backend = arguments
-            .backend_metadata
-            .as_deref()
-            .map(read_configuration)
-            .transpose()?;
-        let output = match arguments.position_command.as_ref() {
-            Some(position) => {
-                prepare_metadata_with_position(&input, backend.as_deref(), Some(position))?
+        let output = match parse_arguments(std::env::args_os().skip(1))? {
+            Invocation::Startup(arguments) => {
+                let input = read_configuration(&arguments.configuration)?;
+                let backend = arguments
+                    .backend_metadata
+                    .as_deref()
+                    .map(read_configuration)
+                    .transpose()?;
+                match arguments.position_command.as_ref() {
+                    Some(position) => {
+                        prepare_metadata_with_position(&input, backend.as_deref(), Some(position))?
+                    }
+                    None => prepare_metadata(&input, backend.as_deref())?,
+                }
             }
-            None => prepare_metadata(&input, backend.as_deref())?,
+            Invocation::RuntimeBundleMetadata(path) => {
+                prepare_runtime_bundle_metadata(&read_configuration(&path)?)?
+            }
         };
         let mut stdout = io::stdout().lock();
         stdout
@@ -669,6 +747,23 @@ mod metadata {
                 vec!["--config=a.json", "--other=1"],
                 vec!["--config=a.json", "--config=b.json"],
                 vec!["--backend-metadata=a.json"],
+                vec!["--runtime-bundle-metadata="],
+                vec!["--runtime-bundle-metadata=.env"],
+                vec!["--runtime-bundle-metadata=a.json", "--other=1"],
+                vec![
+                    "--runtime-bundle-metadata=a.json",
+                    "--runtime-bundle-metadata=b.json",
+                ],
+                vec!["--runtime-bundle-metadata=a.json", "--config=b.json"],
+                vec!["--config=b.json", "--runtime-bundle-metadata=a.json"],
+                vec![
+                    "--runtime-bundle-metadata=a.json",
+                    "--backend-metadata=b.json",
+                ],
+                vec![
+                    "--runtime-bundle-metadata=a.json",
+                    "--position-command=position startpos",
+                ],
                 vec![
                     "--config=a.json",
                     "--backend-metadata=a.json",
@@ -679,23 +774,165 @@ mod metadata {
             }
             assert_eq!(
                 parse_arguments([OsString::from("--config=선언.json")]).unwrap(),
-                Arguments {
+                Invocation::Startup(Arguments {
                     configuration: PathBuf::from("선언.json"),
                     backend_metadata: None,
                     position_command: None,
-                }
+                })
             );
             assert_eq!(
                 parse_arguments(
                     ["--backend-metadata=b.json", "--config=a.json"].map(OsString::from)
                 )
                 .unwrap(),
-                Arguments {
+                Invocation::Startup(Arguments {
                     configuration: PathBuf::from("a.json"),
                     backend_metadata: Some(PathBuf::from("b.json")),
                     position_command: None,
-                }
+                })
             );
+            assert_eq!(
+                parse_arguments([OsString::from("--runtime-bundle-metadata=선언.json")]).unwrap(),
+                Invocation::RuntimeBundleMetadata(PathBuf::from("선언.json"))
+            );
+        }
+
+        fn runtime_bundle_fixture(version: u32) -> serde_json::Value {
+            // Same closed synthetic roster as runtime_assets::tests::Fixture::cuda.
+            // Metadata only: no library file is created or opened by these tests.
+            let names = [
+                ("libonnxruntime.so.1.22.0", "core"),
+                ("libonnxruntime_providers_shared.so", "providers_shared"),
+                ("libonnxruntime_providers_cuda.so", "providers_cuda"),
+                ("libcudart.so.12", "nvidia_dependency"),
+                ("libcublas.so.12", "nvidia_dependency"),
+                ("libcublasLt.so.12", "nvidia_dependency"),
+                ("libcufft.so.11", "nvidia_dependency"),
+                ("libcurand.so.10", "nvidia_dependency"),
+                ("libnvrtc.so.12", "nvidia_dependency"),
+                ("libnvrtc-builtins.so.12.8", "nvidia_dependency"),
+                ("libnvJitLink.so.12", "nvidia_dependency"),
+                ("libcudnn.so.9", "nvidia_dependency"),
+                ("libcudnn_adv.so.9", "nvidia_dependency"),
+                ("libcudnn_cnn.so.9", "nvidia_dependency"),
+                ("libcudnn_ops.so.9", "nvidia_dependency"),
+                ("libcudnn_engines_precompiled.so.9", "nvidia_dependency"),
+                (
+                    "libcudnn_engines_runtime_compiled.so.9",
+                    "nvidia_dependency",
+                ),
+                ("libcudnn_graph.so.9", "nvidia_dependency"),
+                ("libcudnn_heuristic.so.9", "nvidia_dependency"),
+            ];
+            let files = names
+                .into_iter()
+                .map(|(filename, role)| {
+                    serde_json::json!({"filename": filename, "role": role, "bytes": 7, "sha256": "11".repeat(32)})
+                })
+                .collect::<Vec<_>>();
+            let mut value = serde_json::json!({"schema_version": version, "files": files});
+            if version == 2 {
+                value["loader_aliases"] = serde_json::json!([
+                    {"filename":"libcudnn.so.9.8.0", "target":"libcudnn.so.9"},
+                    {"filename":"libcudnn_cnn.so.9.8.0", "target":"libcudnn_cnn.so.9"}
+                ]);
+            }
+            value
+        }
+
+        #[test]
+        fn runtime_bundle_declaration_keeps_raw_and_typed_semantic_pins_separate() {
+            for version in [1, 2] {
+                let value = runtime_bundle_fixture(version);
+                let raw = serde_json::to_vec(&value).unwrap();
+                let output = prepare_runtime_bundle_metadata(&raw).unwrap();
+                let observed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                let typed =
+                    CudaRuntimeBundleSpec::from_json(std::str::from_utf8(&raw).unwrap()).unwrap();
+                let semantic = hex(&typed.digest().unwrap());
+                let original = byte_pin(&raw);
+                assert_eq!(observed["domain"], "rz-rovent-runtime-bundle-declaration/1");
+                assert_eq!(
+                    observed["raw_json_sha256"].as_str(),
+                    Some(original.sha256.as_str())
+                );
+                assert_eq!(observed["bytes"].as_u64(), Some(raw.len() as u64));
+                assert_eq!(
+                    observed["semantic_bundle_sha256"].as_str(),
+                    Some(semantic.as_str())
+                );
+                assert_ne!(original.sha256, semantic);
+                assert_eq!(
+                    observed["schema_version"].as_u64(),
+                    Some(u64::from(version))
+                );
+                assert_eq!(observed["declared_only"], true);
+                for field in ["runtime_loading_executed", "native_authority", "training"] {
+                    assert_eq!(observed[field], false);
+                }
+                assert_eq!(observed["sessions_created"], 0);
+                assert_eq!(observed["neural_forwards"], 0);
+                assert!(output.len() <= STDOUT_MAX_BYTES);
+
+                let mut reordered = value;
+                reordered["files"].as_array_mut().unwrap().reverse();
+                if let Some(aliases) = reordered.get_mut("loader_aliases") {
+                    aliases.as_array_mut().unwrap().reverse();
+                }
+                let reordered = serde_json::to_vec_pretty(&reordered).unwrap();
+                let other: serde_json::Value =
+                    serde_json::from_slice(&prepare_runtime_bundle_metadata(&reordered).unwrap())
+                        .unwrap();
+                assert_ne!(observed["raw_json_sha256"], other["raw_json_sha256"]);
+                assert_eq!(
+                    observed["semantic_bundle_sha256"],
+                    other["semantic_bundle_sha256"]
+                );
+            }
+        }
+
+        #[test]
+        fn runtime_bundle_metadata_rejects_duplicate_keys_bad_rosters_and_bounds() {
+            let value = runtime_bundle_fixture(2);
+            let raw = serde_json::to_string(&value).unwrap();
+            let duplicate = raw.replacen(
+                "\"schema_version\":2",
+                "\"schema_version\":2,\"schema_version\":2",
+                1,
+            );
+            assert_ne!(raw, duplicate);
+            assert!(matches!(
+                prepare_runtime_bundle_metadata(duplicate.as_bytes()),
+                Err(Error::Json(_))
+            ));
+            let duplicate = raw.replacen(
+                "\"filename\":",
+                "\"filename\":\"duplicate\",\"filename\":",
+                1,
+            );
+            assert!(matches!(
+                prepare_runtime_bundle_metadata(duplicate.as_bytes()),
+                Err(Error::Json(_))
+            ));
+            let mut invalid = value.clone();
+            invalid["files"][0]["filename"] = serde_json::json!("undeclared.so");
+            assert!(matches!(
+                prepare_runtime_bundle_metadata(&serde_json::to_vec(&invalid).unwrap()),
+                Err(Error::RuntimeBundleDeclaration(_))
+            ));
+            let mut invalid = value;
+            invalid["unknown"] = serde_json::json!(true);
+            assert!(matches!(
+                prepare_runtime_bundle_metadata(&serde_json::to_vec(&invalid).unwrap()),
+                Err(Error::RuntimeBundleDeclaration(_))
+            ));
+            assert!(prepare_runtime_bundle_metadata(format!("{raw} {{}}").as_bytes()).is_err());
+            for rejected in [Vec::new(), vec![b' '; INPUT_MAX_BYTES + 1]] {
+                assert!(matches!(
+                    prepare_runtime_bundle_metadata(&rejected),
+                    Err(Error::InputBudget)
+                ));
+            }
         }
         #[test]
         fn byte_bounds_and_aggregate_output_reservation_are_explicit() {
