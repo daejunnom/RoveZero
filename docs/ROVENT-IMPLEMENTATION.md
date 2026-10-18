@@ -764,3 +764,58 @@ R worker·TT·PVS·qsearch·SEE·native node ledger는 생성하지 않으며, �
 신경망 WDL이나 Rules mate 증명으로 바꾸지 않는다. baseline의 명시적인 `None` 경로도
 보존한다. 그 뒤 네 모드 UCI·실제 외부 엔진·독립 cohort·현재 trainer의 비학습 수명과
 최종 CI를 각각 인수한다. 실제 학습·대규모 수집·원격 비교·병합은 계속 제외한다.
+
+
+## 열다섯 번째 통합 체크포인트
+
+N05는 사용자가 선택한 별도 `FrozenProposalReviewV1` 개입 정책을 유지한다.
+기본 탐색의 Ready offer를 조작하지 않고 독립 root에서 선택한 P/C/R의 실제
+질문을 발주한다. 원 authority·clock·cost epoch·종료 근거를 각각 보존한다.
+원 publication·durable ACK와 strict `/2` 소비, 현재 trainer child 종료를
+실제로 확인하기 전에는 N05 전체 완료로 표시하지 않는다.
+
+`47b6020`에서 R 없는 P-C에 선택형 공통 NNUEC 문맥 판독을 연결했다. 원 model
+owner와 PreparationActor를 재사용하고 질문별 Rules/view/budget/deadline을
+봉인한다. 원 terminal·cache-release ACK를 회수한 root closure를 요구하며
+늦은 완료·취소·완료 불명에서 원 model/source/buffer 소유권을 유지한다.
+R worker·TT·PVS·qsearch·SEE나 R node ledger는 생성하지 않는다. 판독 값은
+P/C의 policy·WDL·Rules 메이트 증명·utility 정답으로 바꾸지 않는다.
+기존 명시적 `None` 기준 경로도 보존한다.
+
+첫 공유 검사에서는 fixture의 node 한도 64가 기존 semantic 최소값보다 작아
+시작 전에 거부됐다. 원 실패를 남기고 fixture만 257로 수정했다. 제품의 최소
+한도는 유지했다. `4e12e2f`의 실제 Linux 공유 검사 12개와 `47b6020`의 전체
+feature·전체 target 컴파일 및 엄격 Clippy가 통과했다. 겹치는 검사를 합산하지 않는다.
+
+`961c59b`의 선택형 position metadata는 기존 UCI parser와 자체 Rules를 사용해
+실제 상태·이력 digest와 Rules profile digest를 읽는다. FEN의 미확인 과거를
+유지하고 새 root 권한·시계·session을 만들지 않는다. 인수가 없으면 기존
+metadata/1의 필드를 보존한다. 실제 Linux 검사 12개, 자원 선언 검사 2개와
+전체 workspace 엄격 Clippy가 통과했다.
+
+`09e591b`는 별도로 생성되는 shared readout helper를 manager와 같은 물리
+pool로 선언하지 못하게 했다. 완료·취소·실패·만료 terminal 수와 실제 semantic
+소비 수를 별도 getter로 관측하며 제출 수로부터 추정하지 않는다. 실제 Linux에서
+공유 12개, 자원 선언 3개, configuration 14개, R 없는 manager 9개와 embedded
+source inventory 1개 검사가 통과했다. thread affinity와 물리 pool sharing은
+소스나 Rust ThreadId만으로 확인됐다고 표시하지 않는다.
+
+`dfad001`의 별도 비학습 CPU 검사에서 metadata 소비자 139개와 실제 tensor
+상태·checkpoint 복원 29개가 통과했다. optimizer step·backward·autograd 호출을
+차단했으며 차단 시도와 실제 update는 모두 0이었다. 이 결과는 실제 현재
+parent/child IPC와 원 end receipt의 인수가 아니다. 후속은 기존 window/3의
+명시적인 `max_optimizer_updates=0`으로 begin/end와 physical fence를 검사한다.
+optimizer를 만들 수 있지만 sample·forward·backward·step과 checkpoint 저장에는
+진입하지 않으며 `checkpoint=null`인 no-update 종료를 요구한다.
+
+공식 Stockfish 19·Reckless 0.9.0의 배포물·binary SHA를 검증한 뒤 실제 UCI
+식별·readiness·정상 quit을 확인했다. 아직 실제 go/stop/drain·피드백·교사 target·
+대국 근거로 사용하지 않는다. 모델·NNUEC·runtime 원 자산은 제품의 inputs
+namespace와 읽기 전용 단일 소유 파일 조건으로 준비한다. CUDA 라이브러리는
+네 모드마다 복제하지 않고 한 벌을 순차 재사용한다. 준비의 pin/hash 확인은
+provider나 현재 실행의 물리 완료 증거를 발급하지 않는다.
+
+남은 실제 인수는 네 모드 UCI·공유 NNUEC, 외부 두 엔진의 탐색·취소·피드백,
+독립 intervention cohort 게시·재소비, 실제 trainer child의 zero-update 종료다.
+로컬 RTX 4050 자료는 기능·수치 검증에만 사용한다. 실제 학습·대규모 수집·
+원격 비교·병합은 계속 제외한다.
