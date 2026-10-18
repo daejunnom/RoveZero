@@ -9,11 +9,11 @@ use super::product::{
     RoventNativeProductDriver, RoventProductStartupOwners, RoventProductStartupRejection,
 };
 use super::{
+    NativeStartupDiagnostic, NativeStartupDiagnosticPhase, NativeStartupDiagnosticStage,
     PreparedRoventNative, RoventCollectionPreloadSources, RoventExternalRAssetSelection,
     RoventExternalRSourceSelection, RoventNativeAssetSelection, RoventNativeGraphAsset,
     RoventNativeResources, RoventNativeService, RoventNativeStartupRejection,
-    RoventPinnedExternalRSource, RoventPinnedNativeSources, RoventStartupControl, prepare_native,
-    prepare_native_with_collection_observer,
+    RoventPinnedExternalRSource, RoventPinnedNativeSources, RoventStartupControl,
 };
 use crate::pals_adaptive::NativeQuestionProjection;
 use crate::pals_adaptive_bootstrap::protocol::serve_driver;
@@ -93,6 +93,7 @@ struct Arguments {
     process_epoch: u64,
     startup_ms: u64,
     root_policy: RoventRootAdmissionPolicy,
+    startup_diagnostics: bool,
 }
 impl Arguments {
     fn parse(arguments: &[String]) -> Result<Self, RoventLaunchError> {
@@ -104,6 +105,7 @@ impl Arguments {
         let mut process_epoch = None;
         let mut startup_ms = None;
         let mut root_policy = None;
+        let mut startup_diagnostics = None;
         for argument in arguments {
             let (name, value) = argument
                 .split_once('=')
@@ -127,6 +129,17 @@ impl Arguments {
                 }
                 "--startup-ms" if startup_ms.is_none() => {
                     startup_ms = Some(number(value, 3_600_000)?)
+                }
+                "--startup-diagnostics" if startup_diagnostics.is_none() => {
+                    startup_diagnostics = Some(match value {
+                        "stderr-v1" => true,
+                        _ => {
+                            return Err(error(
+                                "Arguments",
+                                "unknown explicit startup diagnostic selection",
+                            ));
+                        }
+                    });
                 }
                 "--root-policy" if root_policy.is_none() => {
                     root_policy = Some(match value {
@@ -155,6 +168,7 @@ impl Arguments {
             startup_ms: startup_ms.ok_or_else(|| error("Arguments", "--startup-ms is required"))?,
             root_policy: root_policy
                 .ok_or_else(|| error("Arguments", "--root-policy is required"))?,
+            startup_diagnostics: startup_diagnostics.unwrap_or(false),
         })
     }
 }
@@ -354,6 +368,7 @@ fn run_inner<'a>(
         ));
     }
     let begin = Instant::now();
+    let diagnostic = NativeStartupDiagnostic::new(arguments.startup_diagnostics, begin);
     let clock = ProcessClock::new(ProcessEpoch(arguments.process_epoch));
     let until = begin
         .checked_add(Duration::from_millis(arguments.startup_ms))
@@ -387,7 +402,9 @@ fn run_inner<'a>(
         control
             .check()
             .map_err(|failure| error("ResourceAdmission", failure))?;
-        admit_resource(&lock)?;
+        diagnostic.trace(NativeStartupDiagnosticStage::ResourceAdmission, || {
+            admit_resource(&lock)
+        })?;
         control
             .check()
             .map_err(|failure| error("ResourceAdmission", failure))?;
@@ -423,24 +440,28 @@ fn run_inner<'a>(
         .transpose()?;
     let source_root = root.try_clone().map_err(|failure| error("Cwd", failure))?;
     let sources = Arc::new(
-        match &collection_preload {
-            Some(preload) => RoventPinnedNativeSources::open_collection(
-                Arc::clone(&lock),
-                source_root,
-                cwd.clone(),
-                selection,
-                &control,
-                Arc::clone(preload),
-            ),
-            None => RoventPinnedNativeSources::open(
-                Arc::clone(&lock),
-                source_root,
-                cwd.clone(),
-                selection,
-                &control,
-            ),
-        }
-        .map_err(|failure| error("Assets", failure))?,
+        diagnostic
+            .trace(
+                NativeStartupDiagnosticStage::SourcePins,
+                || match &collection_preload {
+                    Some(preload) => RoventPinnedNativeSources::open_collection(
+                        Arc::clone(&lock),
+                        source_root,
+                        cwd.clone(),
+                        selection,
+                        &control,
+                        Arc::clone(preload),
+                    ),
+                    None => RoventPinnedNativeSources::open(
+                        Arc::clone(&lock),
+                        source_root,
+                        cwd.clone(),
+                        selection,
+                        &control,
+                    ),
+                },
+            )
+            .map_err(|failure| error("Assets", failure))?,
     );
     sources
         .configuration()
@@ -534,27 +555,34 @@ fn run_inner<'a>(
         }
     };
     let cuda_profile = if matches!(lock.manifest.engine.pc.device, RoventDevice::Cuda { .. }) {
-        let name = format!(
-            "rovent-cuda-profile-{}-{}",
-            std::process::id(),
-            arguments.process_epoch
-        );
-        root.create_dir(&name)
-            .map_err(|failure| error("ProfileDirectory", failure))?;
-        let directory = root
-            .open_dir_nofollow(&name)
-            .map_err(|failure| error("ProfileDirectory", failure))?;
-        Some(
-            VirtualReviewProfileDirectory::from_owned_directory(directory.into_std_file())
-                .map_err(|failure| error("ProfileDirectory", failure))?,
-        )
+        Some(diagnostic.trace(
+            NativeStartupDiagnosticStage::CudaProfileDirectory,
+            || -> Result<VirtualReviewProfileDirectory, RoventLaunchError> {
+                let name = format!(
+                    "rovent-cuda-profile-{}-{}",
+                    std::process::id(),
+                    arguments.process_epoch
+                );
+                root.create_dir(&name)
+                    .map_err(|failure| error("ProfileDirectory", failure))?;
+                let directory = root
+                    .open_dir_nofollow(&name)
+                    .map_err(|failure| error("ProfileDirectory", failure))?;
+                Ok(
+                    VirtualReviewProfileDirectory::from_owned_directory(directory.into_std_file())
+                        .map_err(|failure| error("ProfileDirectory", failure))?,
+                )
+            },
+        )?)
     } else {
         None
     };
     let configuration = sources.configuration();
     let resources = RoventNativeResources {
-        runtime: sources
-            .pin_runtime()
+        runtime: diagnostic
+            .trace(NativeStartupDiagnosticStage::RuntimePin, || {
+                sources.pin_runtime()
+            })
             .map_err(|failure| error("Runtime", failure))?,
         configuration: configuration
             .fields()
@@ -581,7 +609,10 @@ fn run_inner<'a>(
     let loaded_nnuec =
         if sources.configuration().fields().nnuec_selection() != NativeNnuecSelection::Absent {
             Some(
-                LoadedRoventNnuecSource::load(Arc::clone(&sources), &control)
+                diagnostic
+                    .trace(NativeStartupDiagnosticStage::NnuecSource, || {
+                        LoadedRoventNnuecSource::load(Arc::clone(&sources), &control)
+                    })
                     .map_err(|failure| error("NnuecSource", failure))?,
             )
         } else {
@@ -599,8 +630,9 @@ fn run_inner<'a>(
             &clock,
             control.clone(),
             collection_observer,
+            &diagnostic,
         )
-        .map_err(|failure| reject_factory(failure, cleanup_until))?;
+        .map_err(|failure| reject_factory(failure, cleanup_until, &diagnostic))?;
         match (external_source, loaded_nnuec, retirement_evidence) {
             (Some(external), None, Some(retirement_evidence)) => {
                 RoventCollectionPreparedNative::ExternalPcr {
@@ -623,8 +655,9 @@ fn run_inner<'a>(
             &clock,
             control.clone(),
             collection_observer,
+            &diagnostic,
         )
-        .map_err(|failure| reject_factory(failure, cleanup_until))?;
+        .map_err(|failure| reject_factory(failure, cleanup_until, &diagnostic))?;
         match loaded_nnuec {
             Some(loaded) => RoventCollectionPreparedNative::PcNnuec {
                 prepared: Box::new(prepared),
@@ -633,26 +666,29 @@ fn run_inner<'a>(
             None => RoventCollectionPreparedNative::Pc(Box::new(prepared)),
         }
     };
-    let driver = match (collection_preload, collection_assemble) {
-        (Some(preload), Some(assemble)) => assemble(RoventCollectionPreparedLaunch {
-            native: prepared_product,
-            preload,
-            control: control.clone(),
-            clock: clock.clone(),
-            owners: Arc::clone(&owners),
-            identity,
-            root_policy: arguments.root_policy,
-        }),
-        (None, None) => assemble_native_product(
-            prepared_product,
-            clock.clone(),
-            Arc::clone(&owners),
-            identity,
-            arguments.root_policy,
-        ),
-        _ => unreachable!("paired private Collection source and assembly request"),
-    }
-    .map_err(|failure| reject_product(failure, cleanup_until))?;
+    let driver = diagnostic
+        .trace(NativeStartupDiagnosticStage::ProductAssembly, || {
+            match (collection_preload, collection_assemble) {
+                (Some(preload), Some(assemble)) => assemble(RoventCollectionPreparedLaunch {
+                    native: prepared_product,
+                    preload,
+                    control: control.clone(),
+                    clock: clock.clone(),
+                    owners: Arc::clone(&owners),
+                    identity,
+                    root_policy: arguments.root_policy,
+                }),
+                (None, None) => assemble_native_product(
+                    prepared_product,
+                    clock.clone(),
+                    Arc::clone(&owners),
+                    identity,
+                    arguments.root_policy,
+                ),
+                _ => unreachable!("paired private Collection source and assembly request"),
+            }
+        })
+        .map_err(|failure| reject_product(failure, cleanup_until, &diagnostic))?;
     let mut settings = EngineSettings {
         shutdown_limit: Duration::from_millis(lock.manifest.cleanup_max_ms),
         ..EngineSettings::default()
@@ -684,8 +720,10 @@ fn run_inner<'a>(
         }
         None => {
             let driver: Arc<dyn SearchSessionDriver> = Arc::new(driver);
-            serve_driver(driver, clock, owners, settings)
-                .map_err(|failure| error("UciSession", failure))
+            diagnostic.trace(NativeStartupDiagnosticStage::UciServe, || {
+                serve_driver(driver, clock, owners, settings)
+                    .map_err(|failure| error("UciSession", failure))
+            })
         }
     };
     drop(boundary);
@@ -705,17 +743,18 @@ fn prepare_launch_native<Q: NativeQuestionProjection>(
     clock: &ProcessClock,
     control: RoventStartupControl,
     observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+    diagnostic: &NativeStartupDiagnostic,
 ) -> Result<PreparedRoventNative<Q>, RoventNativeStartupRejection<Q>> {
-    match observer {
-        Some(observer) => prepare_native_with_collection_observer(
+    diagnostic.trace(NativeStartupDiagnosticStage::NativePreparation, || {
+        super::prepare_native_with_optional_observer(
             sources,
             resources,
             clock.runtime_clock(),
             control,
             observer,
-        ),
-        None => prepare_native(sources, resources, clock.runtime_clock(), control),
-    }
+            diagnostic.clone(),
+        )
+    })
 }
 
 // Assembly rejection returns the original prepared/startup owners and pins;
@@ -797,20 +836,40 @@ fn read_bounded(file: &File, maximum: u64) -> Result<Vec<u8>, RoventLaunchError>
 fn reject_factory<Q: NativeQuestionProjection>(
     mut failure: RoventNativeStartupRejection<Q>,
     until: Instant,
+    diagnostic: &NativeStartupDiagnostic,
 ) -> RoventLaunchError {
     let detail = error("NativeStartup", &failure.error);
-    if failure
-        .native
-        .as_mut()
-        .is_some_and(|native| !drain_native(native, until))
-    {
+    if failure.native.as_mut().is_some_and(|native| {
+        diagnostic.emit(
+            NativeStartupDiagnosticStage::FactoryDrain,
+            NativeStartupDiagnosticPhase::Entry,
+        );
+        let confirmed = drain_native(native, until);
+        diagnostic.emit(
+            NativeStartupDiagnosticStage::FactoryDrain,
+            if confirmed {
+                NativeStartupDiagnosticPhase::Exit
+            } else {
+                NativeStartupDiagnosticPhase::Error
+            },
+        );
+        !confirmed
+    }) {
         let _quarantine = Box::leak(Box::new(failure));
         return error("PhysicalCompletionUnknown", detail);
     }
     detail
 }
-fn reject_product(mut failure: RoventProductStartupRejection, until: Instant) -> RoventLaunchError {
+fn reject_product(
+    mut failure: RoventProductStartupRejection,
+    until: Instant,
+    diagnostic: &NativeStartupDiagnostic,
+) -> RoventLaunchError {
     let detail = error("ProductAssembly", &failure.failure);
+    diagnostic.emit(
+        NativeStartupDiagnosticStage::ProductDrain,
+        NativeStartupDiagnosticPhase::Entry,
+    );
     let confirmed = match &mut failure.owners {
         RoventProductStartupOwners::Pc(prepared) => drain_native(&mut prepared.service, until),
         RoventProductStartupOwners::PcNnuec { prepared, .. } => {
@@ -854,6 +913,14 @@ fn reject_product(mut failure: RoventProductStartupRejection, until: Instant) ->
             drain_native(&mut prepared.service, until)
         }
     };
+    diagnostic.emit(
+        NativeStartupDiagnosticStage::ProductDrain,
+        if confirmed {
+            NativeStartupDiagnosticPhase::Exit
+        } else {
+            NativeStartupDiagnosticPhase::Error
+        },
+    );
     if !confirmed {
         let _quarantine = Box::leak(Box::new(failure));
         return error("PhysicalCompletionUnknown", detail);

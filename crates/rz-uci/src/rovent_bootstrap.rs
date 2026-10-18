@@ -95,6 +95,169 @@ impl RoventStartupControl {
     }
 }
 
+// Optional constructor diagnostics only. No request, root, Ready, provider or
+// physical-completion authority can be constructed from these observations.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub(crate) enum NativeStartupDiagnosticStage {
+    ResourceAdmission,
+    SourcePins,
+    CudaProfileDirectory,
+    RuntimePin,
+    NnuecSource,
+    NativePreparation,
+    NativeFactory,
+    CudaInventory,
+    OrtRuntime,
+    ModelSessions,
+    NativeReady,
+    ProductAssembly,
+    UciServe,
+    FactoryDrain,
+    ProductDrain,
+}
+const NATIVE_STARTUP_DIAGNOSTIC_STAGE_COUNT: usize = 15;
+const NATIVE_STARTUP_DIAGNOSTIC_STAGE_NAMES: [&str; NATIVE_STARTUP_DIAGNOSTIC_STAGE_COUNT] = [
+    "resource_admission",
+    "source_pins",
+    "cuda_profile_directory",
+    "runtime_pin",
+    "nnuec_source",
+    "native_preparation",
+    "native_factory",
+    "cuda_inventory",
+    "ort_runtime",
+    "model_sessions",
+    "native_ready",
+    "product_assembly",
+    "uci_serve",
+    "factory_drain",
+    "product_drain",
+];
+const MAX_NATIVE_STARTUP_DIAGNOSTIC_EMISSIONS: u8 = 40;
+#[derive(Clone, Copy)]
+pub(crate) enum NativeStartupDiagnosticPhase {
+    Entry,
+    Exit,
+    Error,
+}
+impl NativeStartupDiagnosticPhase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Entry => "entry",
+            Self::Exit => "exit",
+            Self::Error => "error",
+        }
+    }
+}
+struct NativeStartupDiagnosticState {
+    origin: Instant,
+    emitted: std::sync::atomic::AtomicU8,
+}
+#[derive(Clone, Default)]
+pub(crate) struct NativeStartupDiagnostic {
+    state: Option<Arc<NativeStartupDiagnosticState>>,
+}
+impl NativeStartupDiagnostic {
+    pub(crate) fn new(enabled: bool, origin: Instant) -> Self {
+        Self {
+            state: enabled.then(|| {
+                Arc::new(NativeStartupDiagnosticState {
+                    origin,
+                    emitted: std::sync::atomic::AtomicU8::new(0),
+                })
+            }),
+        }
+    }
+    // Reserved slots, not an acknowledgement that an OS write completed.
+    fn reserve(&self) -> Option<u8> {
+        self.state
+            .as_ref()?
+            .emitted
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if n < MAX_NATIVE_STARTUP_DIAGNOSTIC_EMISSIONS {
+                    Some(n + 1)
+                } else {
+                    None
+                }
+            })
+            .ok()
+            .map(|n| n + 1)
+    }
+    pub(crate) fn emit(
+        &self,
+        stage: NativeStartupDiagnosticStage,
+        phase: NativeStartupDiagnosticPhase,
+    ) {
+        let Some(sequence) = self.reserve() else {
+            return;
+        };
+        let state = self
+            .state
+            .as_ref()
+            .expect("diagnostic reservation retains its state");
+        let elapsed_ns = u64::try_from(state.origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        use std::io::Write;
+        // Static closed tokens plus sequence/time only. No original error text,
+        // paths, environment, model/tensor values or diagnostic objects.
+        // A bounded row count is not a hard OS-I/O deadline: retain the caller's
+        // original external supervisor and all existing startup/cleanup limits.
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "rovent-startup-diagnostic/1 seq={sequence} stage={} phase={} elapsed_ns={elapsed_ns}",
+            NATIVE_STARTUP_DIAGNOSTIC_STAGE_NAMES[stage as usize],
+            phase.name()
+        );
+    }
+    pub(crate) fn trace<T, E>(
+        &self,
+        stage: NativeStartupDiagnosticStage,
+        f: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        if self.state.is_none() {
+            return f();
+        }
+        self.emit(stage, NativeStartupDiagnosticPhase::Entry);
+        let result = f();
+        self.emit(
+            stage,
+            if result.is_ok() {
+                NativeStartupDiagnosticPhase::Exit
+            } else {
+                NativeStartupDiagnosticPhase::Error
+            },
+        );
+        result
+    }
+}
+#[cfg(test)]
+mod native_startup_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn diagnostic_default_is_off_and_cloned_budget_never_renews() {
+        let off = NativeStartupDiagnostic::default();
+        assert!(off.reserve().is_none());
+        let on = NativeStartupDiagnostic::new(true, Instant::now());
+        let same = on.clone();
+        for n in 1..=MAX_NATIVE_STARTUP_DIAGNOSTIC_EMISSIONS {
+            assert_eq!(
+                if n % 2 == 0 {
+                    same.reserve()
+                } else {
+                    on.reserve()
+                },
+                Some(n)
+            );
+        }
+        assert!(on.reserve().is_none());
+        assert!(same.reserve().is_none());
+        assert_eq!(
+            NATIVE_STARTUP_DIAGNOSTIC_STAGE_NAMES.len(),
+            NATIVE_STARTUP_DIAGNOSTIC_STAGE_COUNT
+        );
+    }
+}
+
 /// An actual verified runtime capability; it is consumed on the ticket owner.
 /// CUDA control inventory is read from the same retained asset selection.
 pub struct RoventNativeResources {
@@ -234,7 +397,14 @@ pub fn prepare_native<Q: NativeQuestionProjection>(
     clock: ContractSystemClock,
     control: RoventStartupControl,
 ) -> Result<PreparedRoventNative<Q>, RoventNativeStartupRejection<Q>> {
-    prepare_native_with_optional_observer(sources, resources, clock, control, None)
+    prepare_native_with_optional_observer(
+        sources,
+        resources,
+        clock,
+        control,
+        None,
+        NativeStartupDiagnostic::default(),
+    )
 }
 
 /// 원 native owner가 입력을 준비하는 시점에만 수집기를 호출한다. observer는
@@ -246,7 +416,14 @@ pub fn prepare_native_with_collection_observer<Q: NativeQuestionProjection>(
     control: RoventStartupControl,
     observer: Box<dyn VirtualReviewCollectionObserver>,
 ) -> Result<PreparedRoventNative<Q>, RoventNativeStartupRejection<Q>> {
-    prepare_native_with_optional_observer(sources, resources, clock, control, Some(observer))
+    prepare_native_with_optional_observer(
+        sources,
+        resources,
+        clock,
+        control,
+        Some(observer),
+        NativeStartupDiagnostic::default(),
+    )
 }
 
 fn prepare_native_with_optional_observer<Q: NativeQuestionProjection>(
@@ -255,6 +432,7 @@ fn prepare_native_with_optional_observer<Q: NativeQuestionProjection>(
     clock: ContractSystemClock,
     control: RoventStartupControl,
     observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+    diagnostic: NativeStartupDiagnostic,
 ) -> Result<PreparedRoventNative<Q>, RoventNativeStartupRejection<Q>> {
     let before = || -> Result<(), BackendError> {
         control.check()?;
@@ -292,16 +470,21 @@ fn prepare_native_with_optional_observer<Q: NativeQuestionProjection>(
     let factory_sources = Arc::clone(&sources);
     let factory_control = control.clone();
     let factory_clock = clock.clone();
+    let factory_diagnostic = diagnostic.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
     let native = TicketedNativeService::spawn_with_capacity(
         move || {
-            let loaded = load_native(
-                factory_sources,
-                resources,
-                factory_clock,
-                &factory_control,
-                observer,
-            );
+            let loaded =
+                factory_diagnostic.trace(NativeStartupDiagnosticStage::NativeFactory, || {
+                    load_native(
+                        factory_sources,
+                        resources,
+                        factory_clock,
+                        &factory_control,
+                        observer,
+                        &factory_diagnostic,
+                    )
+                });
             let observation = loaded
                 .as_ref()
                 .map(|(_, snapshot)| snapshot.clone())
@@ -320,6 +503,10 @@ fn prepare_native_with_optional_observer<Q: NativeQuestionProjection>(
         native: None,
     })?;
     let mut native = Some(Box::new(native));
+    diagnostic.emit(
+        NativeStartupDiagnosticStage::NativeReady,
+        NativeStartupDiagnosticPhase::Entry,
+    );
     let snapshot = loop {
         if let Err(error) = control.check() {
             return Err(rejected_native(error, native, control.cleanup_until));
@@ -394,6 +581,10 @@ fn prepare_native_with_optional_observer<Q: NativeQuestionProjection>(
             ));
         }
     };
+    diagnostic.emit(
+        NativeStartupDiagnosticStage::NativeReady,
+        NativeStartupDiagnosticPhase::Exit,
+    );
     Ok(PreparedRoventNative {
         service: *native
             .take()
@@ -421,6 +612,7 @@ fn load_native(
     clock: ContractSystemClock,
     control: &RoventStartupControl,
     observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+    diagnostic: &NativeStartupDiagnostic,
 ) -> Result<
     (
         NativeVirtualReviewTicketBackend,
@@ -431,33 +623,37 @@ fn load_native(
     control.check()?;
     validate_native_resources(&sources, &resources)?;
     let config_digest = configuration_digest(&resources, sources.cuda_inventory_digest())?;
-    let profile = match (sources.cuda_inventory_bytes()?, resources.cuda_profile) {
-        (Some((raw, expected)), Some(directory)) => Some((
-            PalsCudaControlPolicy::from_virtual_review_inventory_bytes(&raw, &hex(expected))?,
-            directory,
-        )),
-        (None, None) => None,
-        _ => {
-            return Err(fail(
+    let profile = diagnostic.trace(NativeStartupDiagnosticStage::CudaInventory, || {
+        match (sources.cuda_inventory_bytes()?, resources.cuda_profile) {
+            (Some((raw, expected)), Some(directory)) => Ok(Some((
+                PalsCudaControlPolicy::from_virtual_review_inventory_bytes(&raw, &hex(expected))?,
+                directory,
+            ))),
+            (None, None) => Ok(None),
+            _ => Err(fail(
                 K::IdentityMismatch,
                 "CUDA control and directory ownership differ",
-            ));
+            )),
         }
-    };
-    let runtime = match resources.loading_profile {
-        Some(profile) => OrtRuntime::load_with_cuda_loading_profile(&resources.runtime, profile)?,
-        None => OrtRuntime::load(&resources.runtime)?,
-    };
+    })?;
+    let runtime = diagnostic.trace(NativeStartupDiagnosticStage::OrtRuntime, || match resources
+        .loading_profile
+    {
+        Some(profile) => OrtRuntime::load_with_cuda_loading_profile(&resources.runtime, profile),
+        None => OrtRuntime::load(&resources.runtime),
+    })?;
     control.check()?;
-    let backend = PalsVirtualReviewOnnxBackend::load_owned_sources_with_profile(
-        sources.clone() as Arc<dyn VirtualReviewOwnedSources>,
-        &sources.export_digest_text(),
-        runtime,
-        resources.configuration,
-        VirtualReviewExecutionMode::Deployment,
-        VirtualReviewArtifactKind::Fresh,
-        profile,
-    )?;
+    let backend = diagnostic.trace(NativeStartupDiagnosticStage::ModelSessions, || {
+        PalsVirtualReviewOnnxBackend::load_owned_sources_with_profile(
+            sources.clone() as Arc<dyn VirtualReviewOwnedSources>,
+            &sources.export_digest_text(),
+            runtime,
+            resources.configuration,
+            VirtualReviewExecutionMode::Deployment,
+            VirtualReviewArtifactKind::Fresh,
+            profile,
+        )
+    })?;
     control.check()?;
     if backend.validator_present()
         || backend.approximate_warm_capable()

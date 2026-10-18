@@ -19,6 +19,12 @@ fn product_arguments_require_one_explicit_closed_selection_and_policy() {
     assert_eq!(args.root_policy, RoventRootAdmissionPolicy::DynamicGo);
     assert_eq!(args.process_epoch, 23);
     assert_eq!(args.external_r_sources, None);
+    assert!(!args.startup_diagnostics);
+    let mut diagnostics = arguments();
+    diagnostics.push("--startup-diagnostics=stderr-v1".into());
+    assert!(Arguments::parse(&diagnostics).unwrap().startup_diagnostics);
+    diagnostics.push("--startup-diagnostics=stderr-v1".into());
+    assert!(Arguments::parse(&diagnostics).is_err());
     let mut exact = arguments();
     exact[4] = "--root-policy=exact-registered".into();
     assert_eq!(
@@ -54,6 +60,8 @@ fn product_arguments_reject_unregistered_paths_and_unbounded_controls() {
         "--retirement-sink=/tmp/registration.json",
         "--evidence-root=relative/evidence",
         "--unknown=true",
+        "--startup-diagnostics=true",
+        "--startup-diagnostics=stdout-v1",
     ] {
         let mut args = arguments();
         let key = bad.split_once('=').unwrap().0;
