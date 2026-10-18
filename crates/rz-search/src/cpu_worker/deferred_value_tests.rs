@@ -574,13 +574,19 @@ fn cancelled_starting_owner_retains_original_bound_and_can_only_be_joined_for_cl
     let starting = start(&source, materialize(request));
     assert!(!terminal.allows_c_only_cleanup());
     cancel.store(true, Ordering::Release);
+    assert_eq!(
+        starting.try_ready(),
+        Err(CpuWorkerError::NnuecAuthorityRevoked(
+            NnuecAuthorityRevocation::Cancelled
+        ))
+    );
     actor.shutdown().unwrap();
     assert!(weak_bound.upgrade().is_some());
     assert!(weak_view.upgrade().is_some());
     assert_eq!(
         starting.try_ready(),
         Err(CpuWorkerError::NnuecAuthorityRevoked(
-            NnuecAuthorityRevocation::Cancelled
+            NnuecAuthorityRevocation::ActorStopped
         ))
     );
     let mut retained = match starting.accept_ready() {
@@ -588,7 +594,7 @@ fn cancelled_starting_owner_retains_original_bound_and_can_only_be_joined_for_cl
         Err((retained, reason)) => {
             assert_eq!(
                 reason,
-                CpuWorkerError::NnuecAuthorityRevoked(NnuecAuthorityRevocation::Cancelled)
+                CpuWorkerError::NnuecAuthorityRevoked(NnuecAuthorityRevocation::ActorStopped)
             );
             retained
         }
