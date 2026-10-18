@@ -6,6 +6,7 @@
 //! Rules 결과, native node credit 또는 exact resume 권한을 발급하지 않는다.
 //! 기존 profiled R worker의 mode/recipient guard는 이 경로에서 변경하지 않는다.
 
+use super::process_scope::CollectionProcessPermit;
 use super::profiled_worker::{ProfiledExternalOutcome, ProfiledExternalTiming};
 use super::worker::{
     ExternalWorkerClock, ExternalWorkerStartup, external_evaluation_namespace,
@@ -246,6 +247,39 @@ impl CollectionTeacherWorker {
             startup_deadline,
             cleanup_ceiling,
             launch_pin,
+            None,
+            create_profiled_teacher,
+        )
+    }
+
+    /// Registered collection sibling. The opaque permit belongs to the exact
+    /// original root/actor and survives until the lower process owner closes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_in_process_scope(
+        config: ExternalCpuConfig,
+        profile: ExternalEngineProfile,
+        registration: TeacherWorkerRegistration,
+        clock: ExternalWorkerClock,
+        startup_deadline: Instant,
+        cleanup_ceiling: Instant,
+        launch_pin: ExternalLaunchPin,
+        permit: CollectionProcessPermit,
+    ) -> Result<Self, CheckerError> {
+        config.validate()?;
+        profile.validate_identity(
+            ExternalEnginePurpose::Teacher,
+            &config.identity,
+            config.expected_uci_name.as_deref().unwrap_or_default(),
+        )?;
+        Self::spawn_checked(
+            config,
+            profile,
+            registration,
+            clock,
+            startup_deadline,
+            cleanup_ceiling,
+            launch_pin,
+            Some(permit),
             create_profiled_teacher,
         )
     }
@@ -262,6 +296,7 @@ impl CollectionTeacherWorker {
         startup_deadline: Instant,
         cleanup_ceiling: Instant,
         launch_pin: ExternalLaunchPin,
+        process_permit: Option<CollectionProcessPermit>,
         create_checker: fn(
             ExternalCpuConfig,
             ExternalEngineProfile,
@@ -299,6 +334,13 @@ impl CollectionTeacherWorker {
                 "teacher original registration/clock/deadline",
             ));
         }
+        let launch_pin = match process_permit {
+            Some(permit) => {
+                permit.validate(registration)?;
+                launch_pin.with_collection_permit(permit)
+            }
+            None => launch_pin,
+        };
         let mailbox = Mailbox::new(1, 2, CompletionSignal::default())
             .map_err(|_| error("teacher_worker", "mailbox_capacity"))?;
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1377,6 +1419,7 @@ mod tests {
             startup,
             cleanup,
             pin,
+            None,
             create_fixture_checker,
         )
         .unwrap();
@@ -1473,6 +1516,137 @@ mod tests {
                 .signal()
                 .wait_changed(observed, Duration::from_millis(20));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registered_scope_keeps_two_teacher_processes_ready_and_fully_retires_both() {
+        use super::super::process_scope::CollectionProcessScope;
+
+        let _guard = super::super::tests::FIXTURE_LOCK.lock().unwrap();
+        // Hash the fixture ELF before issuing the shared original clock. The
+        // actual lower owners independently revalidate it during startup.
+        let mut config = super::super::tests::fixture_config("fake_uci_normal");
+        config.identity.options.insert("MultiPV".into(), "1".into());
+        config.stop_grace = EXTERNAL_STOP_DRAIN_RESERVE;
+        config.shutdown_grace = Duration::from_secs(1);
+        let pin = ExternalLaunchPin::from_owned_descriptors(
+            File::open(&config.program).unwrap(),
+            File::open(&config.working_directory).unwrap(),
+        )
+        .unwrap();
+        let (_, mut first_registration, _, clock) = fixture();
+        let root_wall = config
+            .handshake_timeout
+            .checked_add(config.max_task_wall_time.checked_mul(2).unwrap())
+            .unwrap();
+        first_registration.original_deadline.at =
+            MonotonicTick(u64::try_from(root_wall.as_nanos()).unwrap());
+        let mut second_registration = first_registration;
+        second_registration.collection_owner += 1;
+        second_registration.frozen_actor = ContractDigest([55; 32]);
+        let startup = clock.origin + config.handshake_timeout;
+        let hard = registration_deadline(first_registration, clock).unwrap();
+        let cleanup = hard + config.shutdown_grace;
+        let manifest = ContractDigest([91; 32]);
+        let scope =
+            CollectionProcessScope::new(manifest, vec![first_registration, second_registration])
+                .unwrap();
+        let first_permit = scope.permit(manifest, first_registration).unwrap();
+        let second_permit = scope.permit(manifest, second_registration).unwrap();
+        let profile = ExternalEngineProfile::Reckless090EmbeddedNnue;
+        // A valid seat for another member must fail before a worker is started.
+        assert!(
+            CollectionTeacherWorker::spawn_checked(
+                config.clone(),
+                profile,
+                second_registration,
+                clock,
+                startup,
+                cleanup,
+                pin.clone(),
+                Some(first_permit.clone()),
+                create_fixture_checker,
+            )
+            .is_err()
+        );
+        let mut first = CollectionTeacherWorker::spawn_checked(
+            config.clone(),
+            profile,
+            first_registration,
+            clock,
+            startup,
+            cleanup,
+            pin.clone(),
+            Some(first_permit),
+            create_fixture_checker,
+        )
+        .unwrap();
+        let mut second = CollectionTeacherWorker::spawn_checked(
+            config.clone(),
+            profile,
+            second_registration,
+            clock,
+            startup,
+            cleanup,
+            pin,
+            Some(second_permit),
+            create_fixture_checker,
+        )
+        .unwrap();
+        wait_startup(&first, startup);
+        wait_startup(&second, startup);
+        let first_process = first
+            .startup_report()
+            .unwrap()
+            .attempt
+            .unwrap()
+            .external
+            .unwrap()
+            .process
+            .process_identity
+            .unwrap();
+        let second_process = second
+            .startup_report()
+            .unwrap()
+            .attempt
+            .unwrap()
+            .external
+            .unwrap()
+            .process
+            .process_identity
+            .unwrap();
+        assert_ne!(first_process, second_process);
+
+        let mut legacy = ExternalUciCpuChecker::create(config.clone()).unwrap();
+        assert!(matches!(
+            legacy.start(startup, &AtomicBool::new(false)),
+            Err(CheckerError::External {
+                stage: "spawn",
+                code: "process_slot_unavailable"
+            })
+        ));
+        scope.close_admission();
+        assert!(scope.permit(manifest, first_registration).is_err());
+        drop(scope);
+        first.request_shutdown(cleanup);
+        second.request_shutdown(cleanup);
+        let first_closed = close_fixture(&mut first, cleanup);
+        let second_closed = close_fixture(&mut second, cleanup);
+        assert_eq!(first_closed.process_identity, Some(first_process));
+        assert_eq!(second_closed.process_identity, Some(second_process));
+
+        // Both actual process leases have retired; a retained closed worker
+        // receipt alone must not keep the whole group exclusively claimed.
+        let until = Instant::now() + config.handshake_timeout;
+        let mut replacement = ExternalUciCpuChecker::create(config).unwrap();
+        replacement.start(until, &AtomicBool::new(false)).unwrap();
+        let closed = replacement
+            .shutdown(until + Duration::from_secs(1))
+            .unwrap();
+        assert!(closed.exit_observed && closed.cleanup_complete);
+        assert!(closed.stdout_drained && closed.stderr_drained);
+        assert!(!closed.quarantined && !closed.ownership_lost);
     }
 
     #[cfg(target_os = "linux")]

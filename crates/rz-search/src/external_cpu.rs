@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 pub mod adaptive;
 pub mod collection_teacher;
+pub mod process_scope;
 mod profiled_researcher;
 pub mod profiled_worker;
 pub mod profiles;
@@ -51,6 +52,8 @@ pub struct ExternalLaunchPin {
     directory: Arc<File>,
     #[cfg(not(target_os = "linux"))]
     _unsupported: (),
+    #[cfg(target_os = "linux")]
+    collection_process_permit: Option<process_scope::CollectionProcessPermit>,
 }
 
 impl ExternalLaunchPin {
@@ -74,7 +77,26 @@ impl ExternalLaunchPin {
         Ok(Self {
             executable: Arc::new(executable),
             directory: Arc::new(directory),
+            collection_process_permit: None,
         })
+    }
+    /// Only the Collection worker can attach its exact registered member.
+    /// Public legacy pinned checkers remain on the original singleton gate.
+    pub(crate) fn with_collection_permit(
+        self,
+        permit: process_scope::CollectionProcessPermit,
+    ) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let mut pin = self;
+            pin.collection_process_permit = Some(permit);
+            pin
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = permit;
+            self
+        }
     }
 }
 
@@ -1758,11 +1780,6 @@ mod process {
     use std::os::unix::process::CommandExt;
     use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
-    // A quarantined owner keeps this slot occupied. Repeated failed creation
-    // cannot accumulate arbitrarily many child groups or retained handles.
-    static PROCESS_SLOT: AtomicBool = AtomicBool::new(false);
-    static QUARANTINE_PRESENT: AtomicBool = AtomicBool::new(false);
-
     pub(super) struct OwnedProcess {
         child: Option<Child>,
         stdin: Option<ChildStdin>,
@@ -1784,6 +1801,7 @@ mod process {
         lines: VecDeque<String>,
         state: CheckerShutdown,
         shutdown_grace: Duration,
+        process_slot: process_scope::ProcessLease,
     }
 
     pub(super) struct SpawnFailure {
@@ -1872,23 +1890,28 @@ mod process {
             cancel: &AtomicBool,
             launch_pin: Option<&ExternalLaunchPin>,
         ) -> Result<Self, Box<SpawnFailure>> {
-            if PROCESS_SLOT
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return Err(Box::new(SpawnFailure {
-                    error: error("spawn", "process_slot_unavailable"),
-                    process: empty_shutdown(),
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                }));
-            }
+            let mut process_slot = Some(
+                process_scope::ProcessLease::acquire(
+                    launch_pin.and_then(|pin| pin.collection_process_permit.as_ref()),
+                )
+                .map_err(|error| {
+                    Box::new(SpawnFailure {
+                        error,
+                        process: empty_shutdown(),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    })
+                })?,
+            );
             let mut failure_evidence = None;
-            let result =
-                Self::spawn_owned(config, deadline, cancel, launch_pin, &mut failure_evidence);
-            if result.is_err() && !QUARANTINE_PRESENT.load(Ordering::Acquire) {
-                PROCESS_SLOT.store(false, Ordering::Release);
-            }
+            let result = Self::spawn_owned(
+                config,
+                deadline,
+                cancel,
+                launch_pin,
+                &mut failure_evidence,
+                &mut process_slot,
+            );
             result.map_err(|failure| {
                 Box::new(failure_evidence.unwrap_or_else(|| {
                     let mut process = empty_shutdown();
@@ -1908,6 +1931,7 @@ mod process {
             cancel: &AtomicBool,
             launch_pin: Option<&ExternalLaunchPin>,
             failure_evidence: &mut Option<SpawnFailure>,
+            process_slot: &mut Option<process_scope::ProcessLease>,
         ) -> Result<Self, CheckerError> {
             use std::os::unix::fs::FileExt;
             let program = match launch_pin {
@@ -2008,9 +2032,16 @@ mod process {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .process_group(0);
+            // Before spawn, dropping this reservation means NotStarted. After
+            // spawn it is immediately installed in the original OS owner.
+            let mut process_slot = process_slot
+                .take()
+                .expect("reserved process slot before spawn");
+            process_slot.ensure_spawn_allowed()?;
             let mut child = command
                 .spawn()
                 .map_err(|_| error("spawn", "native_spawn"))?;
+            process_slot.mark_started();
             // Linux kernel PIDs fit signed pid_t. Install the owned child before
             // any fallible setup and retain optional pipes even on setup error.
             let pid = Pid::from_raw(child.id() as i32);
@@ -2040,6 +2071,7 @@ mod process {
                 lines: VecDeque::new(),
                 state: empty_shutdown(),
                 shutdown_grace: config.shutdown_grace,
+                process_slot,
             };
             let setup = (|| {
                 let identity = proc_identity(pid.as_raw())?
@@ -2357,7 +2389,7 @@ mod process {
                         self.authority = false;
                         self.state.cleanup_complete = true;
                         self.state.quarantined = false;
-                        PROCESS_SLOT.store(false, Ordering::Release);
+                        self.process_slot.complete_physical();
                         return Ok(self.state);
                     }
                 }
@@ -2388,8 +2420,8 @@ mod process {
                 if let Some(child) = self.child.take() {
                     std::mem::forget(child);
                 }
-                QUARANTINE_PRESENT.store(true, Ordering::Release);
-                PROCESS_SLOT.store(true, Ordering::Release);
+                // The ProcessLease drops as unconfirmed and keeps its original
+                // singleton/group gate occupied. No reservation is refunded.
             }
         }
     }

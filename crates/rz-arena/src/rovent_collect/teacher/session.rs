@@ -4,8 +4,9 @@ use super::collection::RoventCollectionTeacherBinding;
 use super::*;
 use rz_contracts::Deadline;
 use rz_search::external_cpu::collection_teacher::{
-    TeacherCompletion, TeacherDispatch, TeacherJob, TeacherJobId,
+    TeacherCompletion, TeacherDispatch, TeacherJob, TeacherJobId, TeacherWorkerRegistration,
 };
+use rz_search::external_cpu::process_scope::CollectionProcessScope;
 use rz_search::external_cpu::worker::ExternalWorkerClock;
 use rz_uci::rovent_external_launch::RoventCollectionTeacherOwner;
 use std::{
@@ -36,6 +37,7 @@ pub struct RoventCollectionTeacherSession {
     pending: BTreeMap<(u32, u64), Pending>,
     shutdown_requested: bool,
     quarantined: Vec<(TeacherCompletion, String)>,
+    process_scope: Option<CollectionProcessScope>,
 }
 pub struct RoventCollectionTeacherCompleted {
     actor: String,
@@ -81,6 +83,55 @@ impl RoventCollectionTeacherSession {
         session.manifest_sha256 = manifest.sha256()?;
         Ok(session)
     }
+
+    /// Register the exact bounded teacher roster for this opaque admitted root.
+    /// This only permits the declared idle processes; go/order/resource limits
+    /// and all original teacher startup evidence remain unchanged.
+    pub fn new_submitted_input_v1_with_process_scope(
+        manifest: &rz_experiments::rovent_corpus_v2::RoventCorpusManifestV2,
+        admission: RoventCollectionRootAdmission,
+        roster: &[(String, u32)],
+    ) -> Result<Self, ArenaError> {
+        let mut session = Self::new_submitted_input_v1(manifest, admission)?;
+        check(
+            !roster.is_empty()
+                && roster.len() <= 16
+                && roster.len() == manifest.teachers.len()
+                && roster
+                    .iter()
+                    .map(|(actor, _)| actor)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    == roster.len()
+                && roster
+                    .iter()
+                    .all(|(actor, owner)| *owner != 0 && manifest.teachers.contains_key(actor)),
+            "Collection process roster differs from frozen manifest",
+        )?;
+        let root = session.admission.root_admission();
+        let registrations = roster
+            .iter()
+            .map(|(actor_id, collection_owner)| {
+                let registered = RoventRegisteredTeacher {
+                    actor_id: actor_id.clone(),
+                    pin: manifest.teachers[actor_id].clone(),
+                };
+                Ok(process_registration(
+                    root,
+                    *collection_owner,
+                    registered.frozen_actor_digest()?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ArenaError>>()?;
+        session.process_scope = Some(
+            CollectionProcessScope::new(
+                process_scope_manifest_digest(&session.manifest_sha256)?,
+                registrations,
+            )
+            .map_err(|error| invalid(error.to_string()))?,
+        );
+        Ok(session)
+    }
     pub fn new(
         manifest: &RoventCorpusManifest,
         admission: RoventCollectionRootAdmission,
@@ -100,6 +151,7 @@ impl RoventCollectionTeacherSession {
             pending: BTreeMap::new(),
             shutdown_requested: false,
             quarantined: vec![],
+            process_scope: None,
         })
     }
     /// Caller는 preload가 보존한 원 source FD를 이동한다. 실제 worker가 동일 FD
@@ -154,19 +206,45 @@ impl RoventCollectionTeacherSession {
             .checked_add(Duration::from_nanos(root.cleanup_deadline().at.0))
             .ok_or_else(|| invalid("Collection root original cleanup ceiling overflow"))?;
         let cleanup_ceiling = cleanup_ceiling.min(root_cleanup).min(profile_cleanup);
-        let owner = launch
-            .spawn_collection_teacher_pinned(
+        let frozen_actor = registered.frozen_actor_digest()?;
+        let permit = self
+            .process_scope
+            .as_ref()
+            .map(|scope| {
+                scope
+                    .permit(
+                        process_scope_manifest_digest(&self.manifest_sha256)?,
+                        process_registration(root.as_ref(), collection_owner, frozen_actor),
+                    )
+                    .map_err(|error| invalid(error.to_string()))
+            })
+            .transpose()?;
+        let owner = match permit {
+            Some(permit) => launch.spawn_collection_teacher_pinned_in_process_scope(
                 executable,
                 cwd,
                 collection_owner,
-                registered.frozen_actor_digest()?,
+                frozen_actor,
                 root,
                 clock,
                 startup_deadline,
                 cleanup_ceiling,
                 cancel,
-            )
-            .map_err(|e| invalid(e.to_string()))?;
+                permit,
+            ),
+            None => launch.spawn_collection_teacher_pinned(
+                executable,
+                cwd,
+                collection_owner,
+                frozen_actor,
+                root,
+                clock,
+                startup_deadline,
+                cleanup_ceiling,
+                cancel,
+            ),
+        }
+        .map_err(|e| invalid(e.to_string()))?;
         self.actors.insert(
             actor_id.into(),
             ActorOwner {
@@ -407,6 +485,11 @@ impl RoventCollectionTeacherSession {
     }
     pub fn request_shutdown(&mut self, until: Instant) {
         self.shutdown_requested = true;
+        // Drop the initial issuer reference even while closed root evidence is
+        // retained. Running/quarantined owners retain their own opaque leases.
+        if let Some(scope) = self.process_scope.take() {
+            scope.close_admission();
+        }
         for actor in self.actors.values() {
             actor.owner.worker().request_shutdown(until);
         }
@@ -495,4 +578,39 @@ impl RoventCollectionTeacherSession {
     pub fn quarantined_completions(&self) -> impl Iterator<Item = (&TeacherCompletion, &str)> {
         self.quarantined.iter().map(|(c, why)| (c, why.as_str()))
     }
+}
+
+fn process_registration(
+    root: &rz_uci::rovent_root_admission::RoventRootAdmission,
+    collection_owner: u32,
+    frozen_actor: Digest,
+) -> TeacherWorkerRegistration {
+    TeacherWorkerRegistration {
+        collection_owner,
+        authority: root.authority(),
+        original_deadline: root.hard_deadline(),
+        input_lock: root.startup_lock_digest(),
+        root_admission: root.digest(),
+        root_budget: root.root_budget_digest(),
+        frozen_actor,
+    }
+}
+
+fn process_scope_manifest_digest(value: &str) -> Result<Digest, ArenaError> {
+    check(
+        generation_sha(value),
+        "Collection process manifest SHA syntax",
+    )?;
+    let mut bytes = [0; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let digit = |byte: u8| {
+            if byte <= b'9' {
+                byte - b'0'
+            } else {
+                byte - b'a' + 10
+            }
+        };
+        bytes[index] = digit(pair[0]) * 16 + digit(pair[1]);
+    }
+    Ok(Digest(bytes))
 }

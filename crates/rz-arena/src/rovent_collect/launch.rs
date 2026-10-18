@@ -536,10 +536,18 @@ impl CollectionCaller {
         let Some(admission) = self.pending_admission.take() else {
             return Ok(());
         };
-        let session = teacher::RoventCollectionTeacherSession::new_submitted_input_v1(
-            &self.manifest,
-            admission.clone(),
-        )?;
+        let roster = self
+            .plan
+            .teacher_slots
+            .iter()
+            .map(|binding| (binding.actor_id.clone(), binding.collection_owner))
+            .collect::<Vec<_>>();
+        let session =
+            teacher::RoventCollectionTeacherSession::new_submitted_input_v1_with_process_scope(
+                &self.manifest,
+                admission.clone(),
+                &roster,
+            )?;
         self.active = Some(RootCaller {
             admission,
             pump: teacher::RoventCollectionTeacherPump::new_submitted_input_v1(

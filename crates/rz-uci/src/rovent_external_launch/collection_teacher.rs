@@ -8,6 +8,7 @@ use rz_search::external_cpu::collection_teacher::TeacherWorkerRegistration;
 use rz_search::external_cpu::collection_teacher::{
     CollectionTeacherWorker, TeacherCompletion, TeacherDiagnostics, TeacherDispatch, TeacherJob,
 };
+use rz_search::external_cpu::process_scope::CollectionProcessPermit;
 use std::sync::Arc;
 
 pub struct RoventCollectionTeacherOwner {
@@ -31,6 +32,64 @@ impl PreparedRoventExternalLaunch {
         startup_deadline: Instant,
         cleanup_ceiling: Instant,
         cancel: &AtomicBool,
+    ) -> Result<RoventCollectionTeacherOwner, CheckerError> {
+        self.spawn_collection_teacher_pinned_internal(
+            executable,
+            working_directory,
+            collection_owner,
+            frozen_actor,
+            root,
+            clock,
+            startup_deadline,
+            cleanup_ceiling,
+            cancel,
+            None,
+        )
+    }
+
+    /// The registered collector supplies a same-root process seat. Public
+    /// metadata alone cannot reconstruct this permit or another actor's seat.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_collection_teacher_pinned_in_process_scope(
+        self,
+        executable: File,
+        working_directory: File,
+        collection_owner: u32,
+        frozen_actor: Digest,
+        root: Arc<RoventRootAdmission>,
+        clock: ExternalWorkerClock,
+        startup_deadline: Instant,
+        cleanup_ceiling: Instant,
+        cancel: &AtomicBool,
+        permit: CollectionProcessPermit,
+    ) -> Result<RoventCollectionTeacherOwner, CheckerError> {
+        self.spawn_collection_teacher_pinned_internal(
+            executable,
+            working_directory,
+            collection_owner,
+            frozen_actor,
+            root,
+            clock,
+            startup_deadline,
+            cleanup_ceiling,
+            cancel,
+            Some(permit),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_collection_teacher_pinned_internal(
+        self,
+        executable: File,
+        working_directory: File,
+        collection_owner: u32,
+        frozen_actor: Digest,
+        root: Arc<RoventRootAdmission>,
+        clock: ExternalWorkerClock,
+        startup_deadline: Instant,
+        cleanup_ceiling: Instant,
+        cancel: &AtomicBool,
+        process_permit: Option<CollectionProcessPermit>,
     ) -> Result<RoventCollectionTeacherOwner, CheckerError> {
         if cancel.load(Ordering::Acquire) || Instant::now() >= startup_deadline {
             return Err(invalid("collection teacher startup canceled/expired"));
@@ -60,6 +119,7 @@ impl PreparedRoventExternalLaunch {
                 root,
                 clock,
                 cleanup_ceiling,
+                process_permit,
             );
             Err(CheckerError::Unsupported(
                 "collection teacher requires Linux pinned ELF",
@@ -87,15 +147,29 @@ impl PreparedRoventExternalLaunch {
                 root_budget: root.root_budget_digest(),
                 frozen_actor,
             };
-            let worker = CollectionTeacherWorker::spawn(
-                self.profile.configuration()?,
-                self.profile().engine,
-                registration,
-                clock,
-                startup_deadline,
-                cleanup_ceiling,
-                pin,
-            )?;
+            // The worker validates this original-root registration against the
+            // permit before moving it into its private process startup.
+            let worker = match process_permit {
+                Some(permit) => CollectionTeacherWorker::spawn_in_process_scope(
+                    self.profile.configuration()?,
+                    self.profile().engine,
+                    registration,
+                    clock,
+                    startup_deadline,
+                    cleanup_ceiling,
+                    pin,
+                    permit,
+                ),
+                None => CollectionTeacherWorker::spawn(
+                    self.profile.configuration()?,
+                    self.profile().engine,
+                    registration,
+                    clock,
+                    startup_deadline,
+                    cleanup_ceiling,
+                    pin,
+                ),
+            }?;
             Ok(RoventCollectionTeacherOwner {
                 launch: self,
                 worker,
