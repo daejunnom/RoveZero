@@ -920,3 +920,72 @@ cohort source-only 준비 020과 membership 021은 실제 원 metadata로 통과
 외부 응답 downstream·독립 cohort 원 자료 게시/재소비, 현재 trainer의
 zero-update 부모·자식 종료 및 최종 CI·증거 대조다. 로컬 GPU 결과는 계속
 기능·정확성 검증에 한정하고 실제 학습·원격 비교·병합은 실행하지 않는다.
+
+## 열일곱 번째 통합 체크포인트
+
+`bb7543b`는 P-C의 선택적 Repair 끝을 원 go의 실제 horizon으로 제한한다.
+정책 자체를 끄거나 Frontier의 거부를 완화하지 않는다. 같은 소스의 실제
+CPU P-C 실행 029는 깊이 1의 원 완료 범위와 메이트, movetime, stop·중복 stop,
+ponderhit·ponder miss의 원/새 root, newgame·quit을 관측했다. 일곱 착수와
+정상 OS 종료·EOF를 확인했고 두 depth root는 `completed_depth=Some(1)`,
+native R·qsearch 사용량 0을 기록했다. 이는 고정 제품 소스의 원 closure·join
+검사와 실제 transcript를 함께 대조한 기능 근거다. 일반 UCI가 전체 formal
+RootReceipt를 파일로 수출했다거나 별도 GPU peak를 관측했다는 뜻은 아니다.
+
+CPU P-C-R 실행 029는 첫 go에서 여전히 stack overflow로 종료됐다. 실제
+GDB 진단 036은 정상 퇴역 중 `PreparationActor::try_retire_engine`을 호출하는
+`NnuecRootRetirement::step`에서 실패했음을 확인했다. `2fee388`은 원 퇴역
+소유 객체를 동일한 heap allocation에 두고 아홉 단계를 개별 함수로 나눈다.
+Busy·오류는 같은 engine을 원 슬롯에 복귀시키며 engine ACK → cache ACK →
+원 pin 해제 → 실제 Store pin zero → utility 최종 소비 → preparing owner
+복귀 순서를 보존한다. stack 증설이나 물리 완료 조건 변경은 하지 않는다.
+
+실제 build 037에서 형식 검사, UCI 전체 feature 라이브러리 검사 785개,
+workspace 전체 feature/target 엄격 Clippy와 실행물 10개 빌드가 통과했다.
+재사용한 search/Python 검사는 원 build 025의 source와 범위를 따로 기록했다.
+파일·디렉터리 동기화와 원 ELF hash readback 뒤 새 실행물 038을 등록했다.
+정적 진단의 개별 함수 prologue는 보조 원인 자료이며 런타임 peak·처리량
+개선이나 기능 인수의 대체물이 아니다.
+
+새 CPU P-C/P-C-R 실행 038은 각각 일곱 착수와 다음 root·newgame·quit,
+정상 반환을 관측했고 각 원 stream과 자원 admission/finished 파일을 회수했다.
+P-C-R의 movetime root에서는 실제 native R와 P/C 출력 소비도 관측했다.
+그러나 P-C-R depth root의 완료 깊이는 여전히 `None`이다. 원 retired
+Frontier의 범위를 그대로 반환하므로 이를 단순 진단 누락이나 전체 depth
+성공으로 표시하지 않는다. 일반 candidate continuation도 원 go horizon을
+존중하도록 수정하고, 원 물리 closure 이후 manager의 의미 실패를 보고하는
+접점을 보완한다. owner가 발급한 실제 goal endpoint만 역할별 Fresh로
+넘기며 임의 frame·0-depth R·강제 완료 깊이를 발급하지 않는다.
+
+`bb7543b` CI의 Linux 최초 실패는 대형 fixture ELF의 재해시를 2초 시작
+창에 넣은 데서 발생했고 후속 20개는 공유 잠금 poison에 의한 연쇄였다.
+Windows는 Linux 전용 import와 필드 사용 경계의 경고 두 건이었다.
+`61c0b31`은 테스트의 사전 identity 준비와 실제 시작 시계를 구분하고 기존
+공통 handshake 창을 사용하며 OS 전용 경고를 좁게 처리한다. 제품의 hash·
+deadline·stop 검사는 바꾸지 않는다. 원 CI 실패와 새 CI의 실제 완료 상태를
+구분하며 이 수정 커밋 자체로 새 CI 성공을 선언하지 않는다.
+
+현재 소스의 source-only 준비 038, membership 039와 series/Collection 준비
+040은 실제로 통과했다. source aggregate·원 lock·NNUEC·P/C 의미와 실제
+membership을 조인했고 metadata 단계에서는 NN import를 차단했다. 이들은
+Ready·root·물리 완료·실제 collection 권한을 발급하지 않는다.
+
+별도 `FrozenProposalReviewV1`의 첫 실제 발주 044는 원 R 수집 observer를
+연결하는 검사에서 거부됐다. 원 오류는 `native R collection requires
+original idle NNUEC Collection root`이며 상위 원 결과의 물리 완료는
+Unknown이다. 최초 arm의 자원 admission과 원 stderr·실행 자료를 보존했고
+다음 arm·추가 NN/GPU 실행을 시작하지 않았다. 원 프로세스 부재는 확인했지만
+이를 누락된 제품 물리 종료 증거로 대신하지 않는다. Collection의 외부
+CPU_T와 native CPU_R가 독립적으로 연결되는 조건을 검토·수정한다.
+
+후속 strict historical reader는 기존 제품 API만 사용하는 외부 검증 caller로
+실제 빌드했다. 원 publication·별도 ACK가 아직 없으므로 역사 소비 성공이나
+semantic dataset SHA를 발급하지 않았다. 별도 utility 초기 자산 041도 원
+NNUEC base에 대해 공식 scalar decoder로 검증한 미학습 네 배열이다.
+모델 forward·optimizer·학습·기존 diagnostic eligibility 전환은 실행하지
+않았으며 이 자산 준비를 현재 부모·자식 IPC 인수로 표시하지 않는다.
+
+남은 순서는 P-C-R의 원 목표·Collection 연결 수정 → 네 모드 기능 인수 →
+실제 독립 arm·publication/ACK·원 파일 strict 소비 → 실제 dataset의
+zero-update 부모·자식 종료 → 최신 CI와 필수 31항목 대조다. 조건부 O01~O04,
+실제 학습·대규모 수집·원격 비용/기력 비교·병합은 별도로 남긴다.

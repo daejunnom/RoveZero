@@ -412,7 +412,9 @@ where
             || self.cpu_semantic.is_some()
             || self.researcher_source_kind() != AdaptiveResearcherSourceKind::Native
             || self.registration.endpoints.execution_use != CpuExecutionUse::Collection
-            || self.registration.endpoints.cpu_t != CpuEndpoint::Own
+            // This observer captures the actual native R worker; the teacher
+            // endpoint is selected independently and may be external.
+            || self.registration.endpoints.cpu_r != CpuEndpoint::Own
         {
             return Err(AdaptiveManagerError::Invalid(
                 "native R collection requires original idle NNUEC Collection root",
