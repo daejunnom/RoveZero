@@ -59,7 +59,7 @@ struct RootRunCustody {
     transfer: Option<Box<TransferReadback>>,
     retired_worker: Option<AdaptiveNnuecRetiredOwner>,
     utility_pending: Option<Box<UtilityRoutePendingClosure<AdaptivePortQuestion>>>,
-    retirement: Option<Box<NnuecRootRetirement>>,
+    retirement: Option<NnuecRootRetirement>,
     retired: Option<Box<NnuecRootRetired>>,
     #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
     intervention_trial:
@@ -907,14 +907,14 @@ impl RoventNnuecSessionDriver {
                 }
             };
         run.port = Some(Box::new(port));
-        run.retirement = Some(Box::new(NnuecRootRetirement::new(
+        run.retirement = Some(NnuecRootRetirement::new(
             run.actor.take().expect("same preparation actor"),
             run.retired_worker
                 .take()
                 .expect("one actual joined researcher"),
             run.pins.take().expect("same original pins"),
             run.port.take().expect("same fenced port").into_engine(),
-        )));
+        ));
         if let Some(pending) = run.utility_pending.take() {
             if let Err((error, pending)) = run
                 .retirement
@@ -943,12 +943,10 @@ impl RoventNnuecSessionDriver {
             }
             let observed = signal.version();
             let retirement = run.retirement.take().expect("same ongoing retirement");
-            match (*retirement).step() {
-                NnuecRootRetirementStep::Pending(pending) => {
-                    run.retirement = Some(Box::new(pending))
-                }
+            match retirement.step() {
+                NnuecRootRetirementStep::Pending(pending) => run.retirement = Some(pending),
                 NnuecRootRetirementStep::Ready(retired) => {
-                    run.retired = Some(Box::new(retired));
+                    run.retired = Some(retired);
                     break;
                 }
                 NnuecRootRetirementStep::RetainedFailure(failed) => {
