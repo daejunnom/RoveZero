@@ -1037,3 +1037,49 @@ P 출력이나 책임을 만들지 않는다. CPU 재검증의 실제 feedback �
 다시 봉인하고, Ready 단계와 실제 Fresh 제출 한 번의 차감을 구분한다. 이전
 책임의 history·미완료 horizon과 일반 중복 거부는 유지한다. 새 혼합 관찰 회귀와
 두 nonzero Repair 회귀는 실제 후속 검사에서 인수하며 소스 검토로 대신하지 않는다.
+
+## 19차 체크포인트: 현재 수치 대조와 Collection의 R 등록
+
+고정 소스 `b5860ad`의 실제 Search 검사는 1,062개 통과·2개 ignored였으며,
+workspace 전체 feature/target 엄격 Clippy도 통과했다. 실제 build 091의 UCI
+검사 789개와 inventory 검사 1개, 새 실행물 10개·검증 caller 2개도 통과했다.
+Search와 Clippy는 같은 소스의 원 실행 증거를 명시적으로 재사용했으며,
+build 091에서 다시 실행한 것으로 합산하지 않는다.
+
+등록 092에서는 NNUEC의 구현 식별이 변경됐으나 원 가중치·구성·인코딩·의미·
+namespace는 유지됨을 원문으로 대조했다. 구현 식별까지 같다고 표시하지
+않았다. 현재 원 바이너리의 수치 검사 101은 기존 20개 입력을 실제로 다시
+실행하고, Rust가 출력한 reference input을 독립 scalar FP32 reference에
+전달했다. raw 출력과 WDL의 최대 절대 차이는 각각 0이었다. 이는 CPU 수치
+근거이며 실제 Collection·물리 퇴역·GPU·성능·학습 인수를 대신하지 않는다.
+
+CPU P-C 실행 092는 여덟 요청과 정상 종료를 관측했다. P-C-R은 첫 깊이 1·2의
+완료와 여덟 착수를 관측했지만, 같은 게임의 raw public record 상한에서
+`PinSaturated`로 끝났으므로 전체 기능 통과가 아니다. 이 구성은 archive를
+사용하지 않으며 raw 상한은 128, selected review 상한은 64다. 새 root는
+원 증거를 삭제하지 않으므로 여러 `go`가 같은 raw 한도를 공유한다.
+
+후속 처리는 이 정확한 public-record producer만 원 controller의 private
+원인을 남기고 `Stopped(Capacity)`로 닫는다. 같은 root의 그 원인과 typed
+오류를 확인한 경우에만 기존 quiesce·ACK·credit·물리 drain을 수행한다.
+거절된 출력을 다시 소비하거나 완료 depth를 만들지 않는다. 다른 capacity,
+pin·archive·물리 오류는 기존 실패 경로에 남는다. 이 수정은 자료 회수나
+archive 연결이 아니며, 실제 새 게임 reset 전에는 다음 root도 Capacity일 수 있다.
+
+source 093·membership 094·series 095 재개는 NN·optimizer 실행 없이 실제
+metadata를 연결했다. 실제 cohort 096은 첫 arm의 NNUEC 등록에서 거부됐고,
+원 제품 결과의 물리 완료는 Unknown이다. 다음 arm은 실행하지 않았으며 원
+stderr·자원 admission/finished 자료를 회수했다. OS 종료·EOF를 누락된 원
+물리 완료 증거로 바꾸지 않는다. 유효 dataset·utility 0·publication ACK를
+만들었다고 표시하지 않는다.
+
+원인은 Collection에서 NNUEC R 등록이 `cpu_t`를 검사한 분기였다. 해당 제품은
+`cpu_r=Own`, `cpu_t=Disabled`이며 Arena가 외부 교사를 따로 소유한다. 후속
+수정은 NNUEC 등록도 실제 `cpu_r`를 검사하도록 맞추고 원 모델·root budget·
+idle·중복·pending 검증은 유지한다. 기존 실제 owner fixture에서 Deployment와
+Collection, 잘못된 R endpoint 및 중복 선언을 각각 검사한다. 이 소스 변경
+자체는 수정 후 실제 cohort의 성공 근거가 아니며 새 빌드와 실행으로 인수한다.
+
+남은 인수는 수정 후 네 모드·실제 독립 arm과 publication/별도 ACK/strict
+소비·업데이트 0회 IPC·일반 외부 교사 및 외부 R 연결·최종 CI와 자료 회수다.
+실제 학습·대규모 수집·원격 성능/기력 비교·PR 병합은 이번 목표에서 실행하지 않는다.
