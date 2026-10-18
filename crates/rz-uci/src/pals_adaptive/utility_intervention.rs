@@ -870,12 +870,34 @@ pub struct UtilityInterventionPublicationRejection {
 impl UtilityInterventionDurableAck {
     #[allow(clippy::result_large_err)]
     pub fn acknowledge_trial_publication(
+        file: std::fs::File,
+        original: &UtilityInterventionTrialPhysicalRetirement,
+    ) -> Result<Self, UtilityInterventionPublicationRejection> {
+        Self::acknowledge_trial_publication_inner(file, original, None)
+    }
+    /// Keep the caller's one publication window through the original FD's
+    /// readback and sync. A synchronous OS operation is not preempted here;
+    /// its late return is rejected with the same owned file retained.
+    #[allow(clippy::result_large_err)]
+    pub fn acknowledge_trial_publication_with_control(
+        file: std::fs::File,
+        original: &UtilityInterventionTrialPhysicalRetirement,
+        until: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Self, UtilityInterventionPublicationRejection> {
+        Self::acknowledge_trial_publication_inner(file, original, Some((until, cancel)))
+    }
+    #[allow(clippy::result_large_err)]
+    fn acknowledge_trial_publication_inner(
         mut file: std::fs::File,
         original: &UtilityInterventionTrialPhysicalRetirement,
+        control: Option<(Instant, &std::sync::atomic::AtomicBool)>,
     ) -> Result<Self, UtilityInterventionPublicationRejection> {
         use std::io::{Read, Seek, SeekFrom};
         let started = Instant::now();
+        let active = || check_intervention_publication_control(control);
         let checked = (|| {
+            active()?;
             let bytes = original.original_bytes();
             if bytes.is_empty()
                 || bytes.len() > 32 << 20
@@ -887,11 +909,13 @@ impl UtilityInterventionDurableAck {
             {
                 return Err(invalid("intervention FD length"));
             }
+            active()?;
             file.seek(SeekFrom::Start(0))
                 .map_err(|_| invalid("intervention FD seek"))?;
             let mut chunk = [0u8; 8192];
             let mut offset = 0;
             while offset < bytes.len() {
+                active()?;
                 let n = (bytes.len() - offset).min(chunk.len());
                 file.read_exact(&mut chunk[..n])
                     .map_err(|_| invalid("intervention FD readback"))?;
@@ -900,6 +924,7 @@ impl UtilityInterventionDurableAck {
                 }
                 offset += n;
             }
+            active()?;
             if file
                 .read(&mut [0u8; 1])
                 .map_err(|_| invalid("intervention FD EOF"))?
@@ -907,9 +932,13 @@ impl UtilityInterventionDurableAck {
             {
                 return Err(invalid("intervention FD grew"));
             }
+            active()?;
             file.sync_all()
                 .map_err(|_| invalid("intervention FD sync"))?;
-            Ok(Digest(Sha256::digest(bytes).into()))
+            active()?;
+            let digest = Digest(Sha256::digest(bytes).into());
+            active()?;
+            Ok(digest)
         })();
         match checked {
             Ok(file_sha256) => Ok(Self {
@@ -953,6 +982,18 @@ pub struct UtilityInterventionAckRejection {
     pub ack: Arc<UtilityInterventionDurableAck>,
     pub error: AdaptiveManagerError,
 }
+fn check_intervention_publication_control(
+    control: Option<(Instant, &std::sync::atomic::AtomicBool)>,
+) -> Result<(), AdaptiveManagerError> {
+    if control.is_some_and(|(until, cancel)| {
+        Instant::now() >= until || cancel.load(std::sync::atomic::Ordering::Acquire)
+    }) {
+        return Err(invalid(
+            "intervention original publication canceled/expired; source retained",
+        ));
+    }
+    Ok(())
+}
 impl UtilityInterventionCohortOwner {
     #[allow(clippy::result_large_err)]
     pub fn accept_durable_ack(
@@ -960,12 +1001,35 @@ impl UtilityInterventionCohortOwner {
         original: &UtilityInterventionTrialPhysicalRetirement,
         ack: Arc<UtilityInterventionDurableAck>,
     ) -> Result<(), UtilityInterventionAckRejection> {
+        self.accept_durable_ack_inner(original, ack, None)
+    }
+    /// The deadline is checked after acquiring the original state lock, at
+    /// the admission gate. A delayed lock cannot open another trial window.
+    #[allow(clippy::result_large_err)]
+    pub fn accept_durable_ack_with_control(
+        &mut self,
+        original: &UtilityInterventionTrialPhysicalRetirement,
+        ack: Arc<UtilityInterventionDurableAck>,
+        until: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), UtilityInterventionAckRejection> {
+        self.accept_durable_ack_inner(original, ack, Some((until, cancel)))
+    }
+    #[allow(clippy::result_large_err)]
+    fn accept_durable_ack_inner(
+        &mut self,
+        original: &UtilityInterventionTrialPhysicalRetirement,
+        ack: Arc<UtilityInterventionDurableAck>,
+        control: Option<(Instant, &std::sync::atomic::AtomicBool)>,
+    ) -> Result<(), UtilityInterventionAckRejection> {
         let checked = (|| {
+            check_intervention_publication_control(control)?;
             let mut s = self
                 .shared
                 .state
                 .lock()
                 .map_err(|_| invalid("intervention owner poisoned"))?;
+            check_intervention_publication_control(control)?;
             if !Arc::ptr_eq(&self.shared, &original.shared)
                 || ack.cohort != self.cohort_id()
                 || ack.sequence != original.sequence
@@ -977,6 +1041,7 @@ impl UtilityInterventionCohortOwner {
                     "intervention original ACK is foreign, duplicate or reordered",
                 ));
             }
+            check_intervention_publication_control(control)?;
             s.durable.push(Arc::clone(&ack));
             s.active = None;
             s.next += 1;

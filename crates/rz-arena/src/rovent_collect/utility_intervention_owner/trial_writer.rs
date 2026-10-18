@@ -102,6 +102,7 @@ impl RoventUtilityInterventionTrialWriter {
     ) -> Result<(), ArenaError> {
         let entry = self.originals.last_mut().expect("retained original trial");
         let original = &entry.original;
+        publication_active(until, cancel)?;
         check(
             original.matches_root_admission(admission.root_admission()),
             "utility cohort original root/clock differs",
@@ -155,9 +156,13 @@ impl RoventUtilityInterventionTrialWriter {
             until,
             cancel,
         )?);
+        // Keep the FD in its original slot if publication expired before ACK.
+        publication_active(until, cancel)?;
         let file = entry.fd.take().expect("retained original checkpoint FD");
         let actual_ack =
-            match UtilityInterventionDurableAck::acknowledge_trial_publication(file, original) {
+            match UtilityInterventionDurableAck::acknowledge_trial_publication_with_control(
+                file, original, until, cancel,
+            ) {
                 Ok(ack) => Arc::new(ack),
                 Err(rejected) => {
                     entry.fd = Some(rejected.file);
@@ -167,6 +172,7 @@ impl RoventUtilityInterventionTrialWriter {
         // Retain the real FD-bearing ACK before the owner checks it. The
         // original cap and ACK remain available even if that final join fails.
         entry.ack = Some(Arc::clone(&actual_ack));
+        publication_active(until, cancel)?;
         let finished_tick_ns = clock
             .try_now()
             .map_err(|error| invalid(format!("{error:?}")))?
@@ -190,9 +196,11 @@ impl RoventUtilityInterventionTrialWriter {
                 synced_directories: 3 * (1 + u64::from(materialized_bytes > 0)),
             },
         });
+        publication_active(until, cancel)?;
         owner
-            .accept_durable_ack(original, actual_ack)
+            .accept_durable_ack_with_control(original, actual_ack, until, cancel)
             .map_err(|rejected| invalid(format!("{:?}", rejected.error)))?;
+        publication_active(until, cancel)?;
         entry.accepted = true;
         Ok(())
     }
@@ -230,6 +238,13 @@ impl RoventUtilityInterventionTrialWriter {
 fn io(error: std::io::Error) -> ArenaError {
     ArenaError::Io(error.to_string())
 }
+fn publication_active(until: Instant, cancel: &AtomicBool) -> Result<(), ArenaError> {
+    check(
+        Instant::now() < until && !cancel.load(Ordering::Acquire),
+        "utility cohort publication canceled/expired; source retained",
+    )
+}
+
 fn put_original(
     root: &Dir,
     subdirectory: &str,
@@ -239,12 +254,7 @@ fn put_original(
     until: Instant,
     cancel: &AtomicBool,
 ) -> Result<RoventPublicationFile, ArenaError> {
-    let active = || {
-        check(
-            Instant::now() < until && !cancel.load(Ordering::Acquire),
-            "utility cohort publication canceled/expired; source retained",
-        )
-    };
+    let active = || publication_active(until, cancel);
     active()?;
     check(
         retained.is_none(),
@@ -293,6 +303,7 @@ fn put_original(
     active()?;
     let directory_fd = crate::pals_collect_v3::training_process::directory_file(&directory)?;
     directory_fd.sync_all().map_err(io)?;
+    active()?;
     directory
         .hard_link(&pending, &directory, &name)
         .map_err(io)?;
@@ -301,9 +312,81 @@ fn put_original(
     crate::pals_collect_v3::training_process::directory_file(root)?
         .sync_all()
         .map_err(io)?;
-    Ok(RoventPublicationFile {
+    active()?;
+    let pin = RoventPublicationFile {
         path: format!("{subdirectory}/{name}"),
         sha256: hex(Digest(Sha256::digest(bytes).into())),
         bytes: bytes.len() as u64,
-    })
+    };
+    active()?;
+    Ok(pin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::historical_files::tests::TestRoot;
+    use super::*;
+    use std::{os::unix::fs::MetadataExt, time::Duration};
+
+    #[test]
+    fn closed_publication_window_keeps_the_original_fd_without_opening_a_new_payload() {
+        // This is real FD custody over authored payload bytes. It does not
+        // fabricate a retired trial, a live owner, an ACK or execution proof.
+        for (expired, canceled) in [(true, false), (false, true), (true, true)] {
+            let root = TestRoot::new();
+            let original_path = root.directory().join("held-original.json");
+            let original_bytes = b"original already-opened trial checkpoint";
+            let mut original = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&original_path)
+                .unwrap();
+            original.write_all(original_bytes).unwrap();
+            original.sync_all().unwrap();
+            original.seek(SeekFrom::Start(2)).unwrap();
+            let identity = original.metadata().unwrap();
+            let directory =
+                Dir::open_ambient_dir(root.directory(), cap_std::ambient_authority()).unwrap();
+            let mut retained = Some(original);
+            let cancel = AtomicBool::new(canceled);
+            let started = Instant::now();
+            let until = if expired {
+                started.checked_sub(Duration::from_secs(1)).unwrap()
+            } else {
+                started + Duration::from_secs(5)
+            };
+            let error = put_original(
+                &directory,
+                "trials",
+                0,
+                b"a replacement must not be published",
+                &mut retained,
+                until,
+                &cancel,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("publication canceled/expired"));
+            assert!(!root.directory().join("trials").exists());
+            let file = retained.as_mut().expect("original rejected FD retained");
+            let observed = file.metadata().unwrap();
+            assert_eq!(
+                (observed.dev(), observed.ino()),
+                (identity.dev(), identity.ino())
+            );
+            assert_eq!(observed.len(), original_bytes.len() as u64);
+            assert_eq!(file.stream_position().unwrap(), 2);
+            // Replacing the pathname cannot substitute bytes for the retained
+            // descriptor, even after the caller's window has ended.
+            std::fs::remove_file(&original_path).unwrap();
+            std::fs::write(&original_path, b"unrelated replacement").unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut recovered = Vec::new();
+            file.read_to_end(&mut recovered).unwrap();
+            assert_eq!(recovered, original_bytes);
+            drop(retained);
+            drop(directory);
+            std::fs::remove_file(original_path).unwrap();
+        }
+    }
 }

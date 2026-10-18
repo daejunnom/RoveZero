@@ -271,19 +271,19 @@ impl RoventHistoricalUtilityInterventionFiles {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::rovent_collect::utility_intervention_owner) mod tests {
     use super::*;
     use std::{
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
         time::{Duration, Instant},
     };
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    struct TestRoot {
+    pub(in crate::rovent_collect::utility_intervention_owner) struct TestRoot {
         parent: PathBuf,
         root: PathBuf,
     }
     impl TestRoot {
-        fn new() -> Self {
+        pub(in crate::rovent_collect::utility_intervention_owner) fn new() -> Self {
             let parent = std::env::temp_dir().join(format!(
                 "rz-intervention-fd-{}-{}",
                 std::process::id(),
@@ -293,6 +293,9 @@ mod tests {
             let root = parent.join("utility-intervention-cohort");
             std::fs::create_dir(&root).unwrap();
             Self { parent, root }
+        }
+        pub(in crate::rovent_collect::utility_intervention_owner) fn directory(&self) -> &Path {
+            &self.root
         }
     }
     impl Drop for TestRoot {
