@@ -1592,11 +1592,11 @@ fn original_critic_recheck_opens_native_cpu_question_but_closed_frame_stays_reje
         completion_scope: None,
     })
     .unwrap();
+    // The common sealed-work check rejects the closed frame before the CPU
+    // stage-specific check. Preserve that original typed rejection.
     assert!(matches!(
         port.prepare_cpu_question(&validation, &[profile], false),
-        Err(PalsError::Store(StoreError::InvalidConditions(
-            "not an open CPU frame"
-        )))
+        Err(PalsError::Role(RoleError::InvalidOutput))
     ));
     assert_eq!(port.cpu_admissions.len(), 1);
     assert_eq!(port.counters(), before);
