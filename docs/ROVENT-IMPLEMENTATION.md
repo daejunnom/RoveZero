@@ -1194,3 +1194,60 @@ Rules 증명·학습 target·실제 GPU 인수를 대신하지 않는다.
 현재 소스의 실제 세 arm·publication·별도 ACK·strict 소비 인수는 아직 남는다.
 그 후 update 0회 IPC, 일반 두 teacher와 외부 R 연결, 최종 CI·자료 회수를
 진행한다. 실제 학습·원격 성능/기력 비교·병합은 계속 제외한다.
+
+## 23차 체크포인트: 현재 빌드·CPU 재검증과 중단된 Hybrid 원자료
+
+소스 `e3b02d2`의 전체 build 201은 11단계 모두 통과했다. UCI 797개,
+Search 1,069개·ignored 2개, compiled inventory 1개와 workspace 전체
+feature/target 엄격 Clippy를 확인했으며 실행물 10개와 별도 검증 caller
+2개를 보존했다. 제품 실행물은 dev profile이다. 최소 feature caller의
+기존 경고, 실제 workspace Clippy 성공, 실제 제품 실행의 인수는 구분한다.
+초기화 진단은 명시 옵션에서만 최대 40회 출력 시도를 하며 기본 off다.
+원 오류 owner·startup/cleanup·물리 fence·quarantine 조건은 유지한다.
+진단 출력 자체로 provider 준비나 물리 완료를 승인하지 않는다.
+
+새 수치 검사 208에서는 원 요청 20개의 Rust forward를 실제 완료하고,
+각 Rust reference input에 대한 독립 scalar FP32 결과와 대조했다.
+accumulator·hidden·raw 출력·WDL의 최대 절대 차이는 모두 0이었다.
+이전 수치 결과를 새 실행으로 재표시하지 않았다. 등록 209는 같은 build
+201의 바이너리와 네 모드 startup metadata·NNUEC registration 원시 핀이
+등록 202와 같음을 별도로 확인해 208의 결과를 재사용한다. 재사용 확인은
+새 forward 실행이나 GPU 인수가 아니다.
+
+CPU P-C-R 202는 depth 1·2와 메이트 응답 뒤 movetime 응답을 관측하지
+못했고 외부 실행기가 quit 뒤 SIGTERM으로 종료했다. 원 report와
+stdout/stderr·admission을 회수했으며 finished readback은 없었다.
+소스 대조에서 외부 10초 응답·15초 quit 관측이 제품의 원 hard deadline
+뒤 30초 cleanup보다 먼저 끝날 수 있음을 확인했다. 내부 교착 원인이나
+회복을 이 기록만으로 확정하지 않는다. 제품 한도를 유지하고 외부 관측
+창만 별도로 등록한 CPU 209에서는 P-C/P-C-R 각각 여덟 go 시나리오와
+stop·ponder·quit을 마쳤다. 두 실행 모두 강제 종료 없이 exit 0·pipe EOF를
+확인하고 원자료 다섯 개씩을 회수했다. 202의 실패를 지우거나 별도
+제품 receipt 없는 물리 완료를 인수한 것으로 표시하지 않는다.
+
+Hybrid P-C 209에서는 시작 진단의 source pin 구간이 약 43.5초였으며,
+마지막 관측은 runtime pin 진입이었다. 이 시간은 초기화 실패 위치를
+좁히는 진단이며 통제된 성능 자료가 아니다. 실행 중 등록 boot와 이후
+WSL boot가 달라졌고 원 실행·유지 프로세스가 종료됐다. 원 stdout/stderr와
+admission을 회수했지만 최종 product report·finished readback은 생성되지
+않았다. 물리 완료·실제 provider·첫 추론은 unknown으로 남긴다.
+가까운 시각 Windows의 자원 부족 이벤트는 전체 commit 약 99.2%와 WSL
+프로세스 commit 약 9GiB를 기록했다. 시간상 연관만으로 VM 재시작 원인을
+확정하지 않는다. 후속 GPU·cohort는 실행하지 않았다.
+
+소스 감사에서는 정상 cache-hit 완성 경로도 runtime 원 파일 검증,
+retained descriptor 재검증, cached 파일 검증을 각각 수행함을 확인했다.
+209가 실제로 완료한 pass나 cache 분기는 아직 unknown이다. 검증 guard를
+생략하지 않고 같은 소스의 release 실행물을 별도로 등록하는 후속을
+준비한다. 다음 로컬 기능 검증은 CPU 2개·memory.high 3GiB/max 4GiB를
+새 lock과 실제 readback에 명시한다. 기존 6/12GiB 자료와 섞어 비교하지
+않으며 원 실패를 낮은 한도의 성공으로 바꾸지 않는다. Windows commit
+여유의 고정 admission gate를 복원하지 않고, Full GC를 제품에 넣거나
+전역 WSL 설정을 변경하지 않는다.
+
+같은 `e3b02d2`의 원격 Linux·Windows CPU, CPU bindings, PALS model job은
+성공을 관측했다. native validation bundle은 이 체크포인트 조회에서
+진행 중이었다. 전체 CI 완료로 표시하지 않는다. cohort의 출처·소유권
+metadata 210/211은 준비됐으나 실제 세 arm·publication·별도 ACK·strict
+소비, update 0회 parent/child 종료, 일반 teacher·외부 R 인수는 남는다.
+실제 학습·원격 성능/기력 비교·병합은 계속 제외한다.
