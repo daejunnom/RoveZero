@@ -98,6 +98,12 @@ impl From<&AdaptiveManagerCounters> for CountersObservation {
 #[derive(Clone, Debug, Serialize)]
 struct RootPhysicalObservation {
     source: &'static str,
+    external_root_fence_present: Option<bool>,
+    external_root_fence_reusable: Option<bool>,
+    external_process_joined: Option<bool>,
+    external_process_close_proof_present: Option<bool>,
+    auxiliary_shutdown_confirmed: Option<bool>,
+    reported_external_outstanding_questions: Option<usize>,
     semantic_closure_confirmed: bool,
     native_root_fence_present: Option<bool>,
     native_root_fence_reusable: bool,
@@ -124,6 +130,12 @@ impl RootPhysicalObservation {
         let closure = value.shared_nnuec_closure();
         Self {
             source: "original_role_only_shutdown_receipt",
+            external_root_fence_present: None,
+            external_root_fence_reusable: None,
+            external_process_joined: None,
+            external_process_close_proof_present: None,
+            auxiliary_shutdown_confirmed: None,
+            reported_external_outstanding_questions: None,
             semantic_closure_confirmed: value.permits_semantic_closure(),
             native_root_fence_present: Some(value.root_fence().is_some()),
             native_root_fence_reusable: value
@@ -158,6 +170,12 @@ impl RootPhysicalObservation {
         // inferred from thread counts or from a successful protocol write.
         Self {
             source: "original_adaptive_shutdown_receipt",
+            external_root_fence_present: None,
+            external_root_fence_reusable: None,
+            external_process_joined: None,
+            external_process_close_proof_present: None,
+            auxiliary_shutdown_confirmed: None,
+            reported_external_outstanding_questions: None,
             semantic_closure_confirmed: value.permits_semantic_closure(),
             native_root_fence_present: None,
             native_root_fence_reusable: value.permits_root_reuse(),
@@ -180,6 +198,63 @@ impl RootPhysicalObservation {
             shared_nnuec_semantic_consumed_requests: None,
         }
     }
+}
+
+impl RootPhysicalObservation {
+    fn profiled(value: &crate::pals_adaptive::ProfiledExternalShutdownReceipt) -> Self {
+        Self {
+            source: "original_profiled_external_shutdown_receipt",
+            external_root_fence_present: Some(value.external_root_fence().is_some()),
+            external_root_fence_reusable: Some(value.external_root_fence().is_some_and(|fence| {
+                fence.authority() == value.authority()
+                    && fence.source().same_source(value.source())
+                    && fence.permits_reuse()
+            })),
+            external_process_joined: Some(value.external_process_joined()),
+            external_process_close_proof_present: Some(value.process_close_proof().is_some()),
+            auxiliary_shutdown_confirmed: Some(value.auxiliary_shutdown_confirmed()),
+            reported_external_outstanding_questions: value
+                .reported_work()
+                .map(|work| work.outstanding_questions),
+            semantic_closure_confirmed: value.permits_semantic_closure(),
+            native_root_fence_present: Some(value.native_root_fence().is_some()),
+            native_root_fence_reusable: value.native_root_fence().is_some_and(|fence| {
+                fence.authority() == value.authority() && fence.permits_reuse()
+            }),
+            native_process_joined: value.native_process_joined(),
+            native_physical_shutdown_confirmed: value.native_physical_shutdown_confirmed(),
+            pending_tickets: value.pending_tickets(),
+            retained_outputs: Some(value.retained_outputs()),
+            quarantined: value.quarantined(),
+            own_cpu_joined: None,
+            expected_own_cpu_owners: None,
+            own_cpu_panicked: None,
+            native_cpu_reserved: None,
+            shared_nnuec_closure_present: None,
+            shared_nnuec_issued_requests: None,
+            shared_nnuec_submitted_requests: None,
+            shared_nnuec_completed_requests: None,
+            shared_nnuec_cancelled_requests: None,
+            shared_nnuec_expired_requests: None,
+            shared_nnuec_failed_requests: None,
+            shared_nnuec_semantic_consumed_requests: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RetainedSessionObservation {
+    observation_point: &'static str,
+    stage: &'static str,
+    original_authority: Option<AuthorityObservation>,
+    next_authority: Option<AuthorityObservation>,
+    manager_phase: Option<&'static str>,
+    manager_first_retained_failure: Option<FailureObservation>,
+    manager_retained_failure_count: Option<usize>,
+    archive_operation: Option<&'static str>,
+    archive_quarantine_reason: Option<FailureObservation>,
+    physical: Option<RootPhysicalObservation>,
+    physical_read_failure: Option<FailureObservation>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -280,6 +355,8 @@ pub struct RoventProductLifecycleObservation {
     root: Option<RootObservation>,
     initial: Option<InitialObservation>,
     run_failure: Option<FailureObservation>,
+    retained_session: Option<RetainedSessionObservation>,
+    retained_session_after_finish: Option<RetainedSessionObservation>,
     finish_observed: bool,
     finish_result: &'static str,
     finish_failure: Option<FailureObservation>,
@@ -290,6 +367,7 @@ pub struct RoventProductLifecycleObservation {
     root_run_error_results: u64,
     root_rows_emitted: u64,
     diagnostics_complete: bool,
+    scope_incomplete: bool,
     diagnostic_failure: Option<&'static str>,
 }
 
@@ -304,7 +382,10 @@ struct State {
     finish_failure: Option<FailureObservation>,
     shared_nnuec_session: Option<SharedNnuecObservation>,
     first_issue: Option<&'static str>,
+    scope_incomplete: bool,
     latest: Option<RoventProductLifecycleObservation>,
+    retained_session: Option<RetainedSessionObservation>,
+    retained_session_after_finish: Option<RetainedSessionObservation>,
 }
 
 /// A read-only handle to this product's diagnostic state. Keeping the handle
@@ -351,6 +432,7 @@ impl RoventLifecycleDiagnostics {
     ) {
         let (mut source_status, root) = project_root(product, context);
         let initial = project_initial(product, context);
+        let retained = project_retained_session(product, "after_run");
         if root.is_none() && initial.is_some() {
             source_status = "original_initial_stop";
         }
@@ -358,6 +440,12 @@ impl RoventLifecycleDiagnostics {
             self.poisoned.store(true, Ordering::Release);
             return;
         };
+        match retained {
+            Ok(value) => state.retained_session = value,
+            Err(cause) => {
+                state.first_issue.get_or_insert(cause);
+            }
+        }
         state.root_runs = state.root_runs.saturating_add(1);
         if failure.is_some() {
             state.root_run_errors = state.root_run_errors.saturating_add(1);
@@ -389,6 +477,7 @@ impl RoventLifecycleDiagnostics {
             state.root_rows += 1;
         }
         row.diagnostics_complete = state.first_issue.is_none();
+        row.scope_incomplete |= state.scope_incomplete;
         row.diagnostic_failure = state.first_issue;
         state.latest = Some(row);
     }
@@ -397,6 +486,9 @@ impl RoventLifecycleDiagnostics {
         product: &RoventNativeProductDriver,
         result: &Result<Option<DriverPhysicalCompletion>, SearchSessionFailure>,
     ) {
+        // This is after the original finish call has returned. Do not replace
+        // the earlier root-cause snapshot, or infer Closed from its OS result.
+        let retained = project_retained_session(product, "after_finish");
         let shared = match product.inner.as_ref() {
             ActualProductDriver::Pc(driver) | ActualProductDriver::PcNnuec(driver) => {
                 driver.shared_nnuec_readback()
@@ -407,6 +499,12 @@ impl RoventLifecycleDiagnostics {
             self.poisoned.store(true, Ordering::Release);
             return;
         };
+        match retained {
+            Ok(value) => state.retained_session_after_finish = value,
+            Err(cause) => {
+                state.first_issue.get_or_insert(cause);
+            }
+        }
         state.finish_observed = true;
         state.finish_result = Some(match result {
             Ok(Some(value)) => physical(*value),
@@ -443,6 +541,7 @@ impl RoventLifecycleDiagnostics {
         }
         row.diagnostics_complete =
             state.first_issue.is_none() && !self.poisoned.load(Ordering::Acquire);
+        row.scope_incomplete |= state.scope_incomplete;
         row.diagnostic_failure = state.first_issue;
         state.latest = Some(row);
         match state.first_issue {
@@ -472,6 +571,8 @@ impl RoventLifecycleDiagnostics {
             root,
             initial: None,
             run_failure: None,
+            retained_session: state.retained_session.clone(),
+            retained_session_after_finish: state.retained_session_after_finish.clone(),
             finish_observed: state.finish_observed,
             finish_result: state.finish_result.unwrap_or("not_observed"),
             finish_failure: state.finish_failure.clone(),
@@ -482,6 +583,7 @@ impl RoventLifecycleDiagnostics {
                 "unknown"
             },
             protocol_succeeded: None,
+            scope_incomplete: state.scope_incomplete,
             root_runs_observed: state.root_runs,
             root_run_error_results: state.root_run_errors,
             root_rows_emitted: state.root_rows,
@@ -711,6 +813,24 @@ fn project_root(
             {
                 return ("original_root_scope_mismatch", None);
             }
+            let physical = match select_pcr_physical(
+                receipt.domain,
+                receipt.physical.as_ref().map(RootPhysicalObservation::pcr),
+                receipt
+                    .profiled_physical
+                    .as_ref()
+                    .map(RootPhysicalObservation::profiled),
+            ) {
+                Ok(value) => value,
+                Err(cause) => return (cause, None),
+            };
+            if receipt
+                .profiled_physical
+                .as_ref()
+                .is_some_and(|value| value.authority() != context.authority)
+            {
+                return ("original_profiled_root_scope_mismatch", None);
+            }
             (
                 "original_current_root",
                 Some(RootObservation::new(
@@ -718,11 +838,69 @@ fn project_root(
                     admission,
                     frontier,
                     &receipt.counters,
-                    receipt.physical.as_ref().map(RootPhysicalObservation::pcr),
+                    physical,
                 )),
             )
         }
     }
+}
+
+// A missing external receipt remains missing. Never fall back to a native
+// zero-ledger receipt, and never turn a metadata domain into a live proof.
+fn select_pcr_physical<T>(
+    domain: &str,
+    native: Option<T>,
+    profiled: Option<T>,
+) -> Result<Option<T>, &'static str> {
+    match domain {
+        crate::pals_adaptive::ROVENT_NATIVE_ROOT_DOMAIN if profiled.is_none() => Ok(native),
+        crate::pals_adaptive::ROVENT_PROFILED_EXTERNAL_ROOT_DOMAIN if native.is_none() => {
+            Ok(profiled)
+        }
+        _ => Err("original_researcher_receipt_kind_mismatch"),
+    }
+}
+
+fn project_retained_session(
+    product: &RoventNativeProductDriver,
+    observation_point: &'static str,
+) -> Result<Option<RetainedSessionObservation>, &'static str> {
+    let ActualProductDriver::Pcr(driver) = product.inner.as_ref() else {
+        return Ok(None);
+    };
+    let value = driver
+        .retained_session_observation()
+        .map_err(|_| "retained_session_readback_unavailable")?;
+    project_retained_observation(value, observation_point).map(Some)
+}
+fn project_retained_observation(
+    value: crate::pals_adaptive::AdaptiveRetainedSessionObservation,
+    observation_point: &'static str,
+) -> Result<RetainedSessionObservation, &'static str> {
+    // The retained manager/archive authority is explicitly separate from the
+    // outer attempted root. An old new-game source must not be relabeled.
+    let physical = match (&value.native_physical, &value.profiled_physical) {
+        (Some(native), None) => Some(RootPhysicalObservation::pcr(native)),
+        (None, Some(profiled)) => Some(RootPhysicalObservation::profiled(profiled)),
+        (None, None) => None,
+        (Some(_), Some(_)) => return Err("retained_researcher_receipt_kind_mismatch"),
+    };
+    Ok(RetainedSessionObservation {
+        observation_point,
+        stage: value.stage,
+        original_authority: value.authority.map(Into::into),
+        next_authority: value.next_authority.map(Into::into),
+        manager_phase: value.manager_phase,
+        manager_first_retained_failure: value
+            .manager_first_retained_failure
+            .as_ref()
+            .map(Into::into),
+        manager_retained_failure_count: value.manager_retained_failure_count,
+        archive_operation: value.archive_operation,
+        archive_quarantine_reason: value.archive_quarantine_reason.as_ref().map(Into::into),
+        physical,
+        physical_read_failure: value.physical_read_failure.as_ref().map(Into::into),
+    })
 }
 
 // Allocate only the registered row bound before serialization. serde's writer
@@ -740,6 +918,50 @@ impl Write for RowBuffer {
         Ok(())
     }
 }
+// Compact only observational detail. Keep original stage/authority/cause,
+// and explicitly revoke completeness; this creates no physical proof. The
+// same 8192-byte RowBuffer is reused, before any OS byte has been written.
+fn compact_failure(value: &FailureObservation) -> FailureObservation {
+    FailureObservation {
+        code: bounded(&value.code, 32),
+        code_truncated: value.code_truncated || value.code.len() > 32,
+        detail: bounded(&value.detail, 64),
+        detail_truncated: value.detail_truncated || value.detail.len() > 64,
+        physical_completion: value.physical_completion,
+    }
+}
+fn compact_row(value: &RoventProductLifecycleObservation) -> RoventProductLifecycleObservation {
+    let mut row = value.clone();
+    row.root = None;
+    row.initial = None;
+    row.shared_nnuec_session = None;
+    row.run_failure = row.run_failure.as_ref().map(compact_failure);
+    row.finish_failure = row.finish_failure.as_ref().map(compact_failure);
+    for retained in [
+        &mut row.retained_session,
+        &mut row.retained_session_after_finish,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        retained.physical = None;
+        retained.manager_first_retained_failure = retained
+            .manager_first_retained_failure
+            .as_ref()
+            .map(compact_failure);
+        retained.archive_quarantine_reason = retained
+            .archive_quarantine_reason
+            .as_ref()
+            .map(compact_failure);
+        retained.physical_read_failure =
+            retained.physical_read_failure.as_ref().map(compact_failure);
+    }
+    row.scope_incomplete = true;
+    row.diagnostics_complete = false;
+    row.diagnostic_failure
+        .get_or_insert("diagnostic_row_scope_incomplete");
+    row
+}
 fn write_row(
     output: &mut impl Write,
     row: &RoventProductLifecycleObservation,
@@ -751,10 +973,26 @@ fn write_row(
         .0
         .try_reserve_exact(MAX_ROW_BYTES)
         .map_err(|_| "diagnostic_allocation_failed")?;
-    serde_json::to_writer(&mut buffer, row).map_err(|_| "diagnostic_row_encoding_or_byte_limit")?;
-    buffer
-        .write_all(b"\n")
-        .map_err(|_| "diagnostic_row_byte_limit")?;
+    let row_exceeded = match serde_json::to_writer(&mut buffer, row) {
+        Ok(()) => buffer.write_all(b"\n").is_err(),
+        // RowBuffer's only IO error is its finite byte limit. Other codec
+        // failures are not repaired into a successful diagnostic row.
+        Err(error) if error.is_io() => true,
+        Err(_) => return Err("diagnostic_row_encoding_or_byte_limit"),
+    };
+    if row_exceeded {
+        buffer.0.clear();
+        let compacted = compact_row(row);
+        serde_json::to_writer(&mut buffer, &compacted)
+            .map_err(|_| "diagnostic_compact_row_encoding_or_byte_limit")?;
+        buffer
+            .write_all(b"\n")
+            .map_err(|_| "diagnostic_compact_row_byte_limit")?;
+        state.scope_incomplete = true;
+        state
+            .first_issue
+            .get_or_insert("diagnostic_row_scope_incomplete");
+    }
     let limit = if final_row {
         MAX_STREAM_BYTES
     } else {
@@ -843,6 +1081,18 @@ mod tests {
     }
 
     #[test]
+    fn external_physical_projection_never_substitutes_native_receipts() {
+        let external = crate::pals_adaptive::ROVENT_PROFILED_EXTERNAL_ROOT_DOMAIN;
+        let native = crate::pals_adaptive::ROVENT_NATIVE_ROOT_DOMAIN;
+        assert_eq!(select_pcr_physical::<u8>(external, None, None), Ok(None));
+        assert_eq!(select_pcr_physical(external, None, Some(7)), Ok(Some(7)));
+        assert!(select_pcr_physical(external, Some(3), None).is_err());
+        assert!(select_pcr_physical(native, None, Some(7)).is_err());
+        assert!(select_pcr_physical(native, Some(3), Some(7)).is_err());
+        assert!(select_pcr_physical::<u8>("unknown", None, None).is_err());
+    }
+
+    #[test]
     fn protocol_success_and_root_rows_cannot_manufacture_a_session_finish() {
         let diagnostics = diagnostic();
         let state = State::default();
@@ -870,7 +1120,28 @@ mod tests {
     #[test]
     fn bounded_stream_retains_the_final_incomplete_observation() {
         let diagnostics = diagnostic();
+        let mut raw_cause =
+            SearchSessionFailure::debug("RetainedManagerEarliestFailure", &"원인".repeat(1024));
+        raw_cause.physical_completion = DriverPhysicalCompletion::Unknown;
+        let projected_cause = FailureObservation::from(&raw_cause);
+        assert!(raw_cause.detail.len() <= 512 + " [cause truncated]".len());
+        assert!(raw_cause.detail.ends_with(" [cause truncated]"));
+        assert!(projected_cause.detail.len() <= 512);
+        assert!(projected_cause.detail_truncated);
         let mut state = State {
+            retained_session: Some(RetainedSessionObservation {
+                observation_point: "after_run",
+                stage: "manager_retained",
+                original_authority: None,
+                next_authority: None,
+                manager_phase: Some("quarantined"),
+                manager_first_retained_failure: Some(projected_cause),
+                manager_retained_failure_count: Some(1),
+                archive_operation: None,
+                archive_quarantine_reason: None,
+                physical: None,
+                physical_read_failure: None,
+            }),
             root_runs: MAX_ROOT_ROWS + 1,
             root_rows: MAX_ROOT_ROWS,
             bytes: MAX_STREAM_BYTES - MAX_ROW_BYTES,
@@ -896,8 +1167,238 @@ mod tests {
         assert_eq!(decoded["diagnostic_failure"], "root_row_limit");
         assert_eq!(decoded["root_runs_observed"], MAX_ROOT_ROWS + 1);
         assert_eq!(decoded["root_rows_emitted"], MAX_ROOT_ROWS);
+        let cause = &decoded["retained_session"]["manager_first_retained_failure"];
+        assert!(cause["detail"].as_str().unwrap().len() <= 512);
+        assert_eq!(cause["detail_truncated"], true);
+        assert_eq!(cause["physical_completion"], "unknown");
         assert_eq!(decoded["whole_session_physical"], "unknown");
         assert!(state.bytes <= MAX_STREAM_BYTES);
+    }
+
+    fn maximum_retained_projection(observation_point: &'static str) -> RetainedSessionObservation {
+        use rz_contracts::{GameGeneration, ProcessEpoch, RootGeneration};
+        let authority = SearchAuthority {
+            epoch: ProcessEpoch(u64::MAX),
+            game: GameGeneration(u64::MAX),
+            root: RootGeneration(u64::MAX),
+            implementation: Digest([255; 32]),
+        };
+        let mut cause =
+            SearchSessionFailure::debug("RetainedManagerEarliestFailure", &"\0".repeat(1024));
+        cause.physical_completion = DriverPhysicalCompletion::Unknown;
+        project_retained_observation(
+            crate::pals_adaptive::AdaptiveRetainedSessionObservation {
+                stage: "manager_retained",
+                authority: Some(authority),
+                next_authority: None,
+                manager_phase: Some("quarantined"),
+                manager_first_retained_failure: Some(cause.clone()),
+                manager_retained_failure_count: Some(64),
+                archive_operation: None,
+                archive_quarantine_reason: None,
+                native_physical: None,
+                profiled_physical: None,
+                physical_read_failure: Some(cause),
+            },
+            observation_point,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn maximum_retained_projection_keeps_root_and_reserved_final_cause() {
+        let diagnostics = diagnostic();
+        let retained = maximum_retained_projection("after_run");
+        assert_eq!(retained.stage, "manager_retained");
+        assert_eq!(retained.original_authority.as_ref().unwrap().root, u64::MAX);
+        assert!(
+            retained
+                .manager_first_retained_failure
+                .as_ref()
+                .unwrap()
+                .detail_truncated
+        );
+        let mut after_finish = maximum_retained_projection("after_finish");
+        // A failed finish may retain this same quarantined manager; a copied
+        // after-run observation must not be relabeled as an after-finish read.
+        let mut state = State {
+            root_runs: MAX_ROOT_ROWS,
+            root_rows: MAX_ROOT_ROWS - 1,
+            root_run_errors: MAX_ROOT_ROWS,
+            retained_session: Some(retained),
+            ..State::default()
+        };
+        let mut row = diagnostics.row(&state, "root", None, "original_current_root", None);
+        row.run_failure = state
+            .retained_session
+            .as_ref()
+            .unwrap()
+            .manager_first_retained_failure
+            .clone();
+        // Largest root observation scalar/identity fields, without inventing
+        // a live admission or a fence. No absent profiled receipt is filled in.
+        row.root = Some(RootObservation {
+            receipt_domain: crate::pals_adaptive::ROVENT_PROFILED_EXTERNAL_ROOT_DOMAIN,
+            root_admission_sha256: "f".repeat(64),
+            root_budget_sha256: "f".repeat(64),
+            deadline_seal_sha256: "f".repeat(64),
+            state_and_history_sha256: "f".repeat(64),
+            goal_status: "stopped_native_unknown",
+            completed_depth: Some(u16::MAX),
+            maximum_examined_ply: u16::MAX,
+            native_usage_known: false,
+            native_nodes: None,
+            native_qsearch_nodes: None,
+            reserved_native_nodes: u64::MAX,
+            outstanding_native_executions: usize::MAX,
+            counters: CountersObservation {
+                submitted_role_tickets: u64::MAX,
+                physical_role_completions: u64::MAX,
+                accepted_nn_inputs: Some(u64::MAX),
+                consumed_role_outputs: u64::MAX,
+                completed_nn_inputs: Some(u64::MAX),
+                consumed_nn_inputs: Some(u64::MAX),
+                unused_role_results: u64::MAX,
+                cpu_slice_receipts: u64::MAX,
+                validator_ticket_admissions: u64::MAX,
+            },
+            physical: None,
+            r_free_confirmed: None,
+            shared_nnuec: None,
+        });
+        let mut root_output = Vec::new();
+        write_row(&mut root_output, &row, &mut state, false).unwrap();
+        assert!(root_output.len() <= MAX_ROW_BYTES);
+        let root: serde_json::Value = serde_json::from_slice(&root_output).unwrap();
+        assert_eq!(root["retained_session"]["stage"], "manager_retained");
+        assert_eq!(
+            root["retained_session"]["original_authority"]["root"],
+            u64::MAX
+        );
+        assert_eq!(root["retained_session"]["observation_point"], "after_run");
+        assert!(root["retained_session_after_finish"].is_null());
+        // Adversarial escape expansion inside the already bounded DTO schema.
+        // This stress case is not evidence of a live root or authority.
+        let mut expanded = row.clone();
+        let extreme = FailureObservation {
+            code: "F".repeat(128),
+            code_truncated: false,
+            detail: "\0".repeat(512),
+            detail_truncated: false,
+            physical_completion: "unknown",
+        };
+        state.first_issue = Some("first_original_readback_failure");
+        expanded.diagnostic_failure = state.first_issue;
+        expanded.diagnostics_complete = false;
+        expanded.run_failure = Some(extreme.clone());
+        expanded.finish_failure = Some(extreme.clone());
+        let held = expanded.retained_session.as_mut().unwrap();
+        held.manager_first_retained_failure = Some(extreme.clone());
+        held.physical_read_failure = Some(extreme.clone());
+        assert!(serde_json::to_vec(&expanded).unwrap().len() > MAX_ROW_BYTES);
+        let mut expanded_output = Vec::new();
+        write_row(&mut expanded_output, &expanded, &mut state, false).unwrap();
+        let compacted: serde_json::Value = serde_json::from_slice(&expanded_output).unwrap();
+        assert!(expanded_output.len() <= MAX_ROW_BYTES);
+        assert_eq!(compacted["scope_incomplete"], true);
+        assert_eq!(compacted["diagnostics_complete"], false);
+        assert_eq!(compacted["retained_session"]["stage"], "manager_retained");
+        assert_eq!(
+            compacted["retained_session"]["original_authority"]["root"],
+            u64::MAX
+        );
+        assert_eq!(
+            compacted["retained_session"]["manager_first_retained_failure"]["detail_truncated"],
+            true
+        );
+        assert_eq!(compacted["whole_session_physical"], "unknown");
+        assert!(compacted["retained_session_after_finish"].is_null());
+        assert_eq!(
+            compacted["diagnostic_failure"],
+            "first_original_readback_failure"
+        );
+        // Preserve the original projected cause in State, not just the first
+        // compact copy. The reserved final output must survive this stress.
+        state.retained_session = expanded.retained_session;
+        after_finish.manager_first_retained_failure = Some(FailureObservation {
+            code: "AfterFinishPhysicalReceipt".into(),
+            ..extreme.clone()
+        });
+        after_finish.physical_read_failure = Some(extreme.clone());
+        state.retained_session_after_finish = Some(after_finish);
+        state.finish_observed = true;
+        state.finish_result = Some("failed");
+        state.finish_failure = Some(extreme);
+        state.bytes = MAX_STREAM_BYTES - MAX_ROW_BYTES;
+        let final_row = diagnostics.row(
+            &state,
+            "session",
+            None,
+            "whole_session_finish_observation",
+            None,
+        );
+        let mut final_output = Vec::new();
+        write_row(&mut final_output, &final_row, &mut state, true).unwrap();
+        let final_value: serde_json::Value = serde_json::from_slice(&final_output).unwrap();
+        assert!(final_output.len() <= MAX_ROW_BYTES);
+        assert!(state.bytes <= MAX_STREAM_BYTES);
+        assert_eq!(final_value["scope_incomplete"], true);
+        assert_eq!(final_value["retained_session"]["stage"], "manager_retained");
+        assert_eq!(
+            final_value["retained_session"]["original_authority"]["root"],
+            u64::MAX
+        );
+        assert_eq!(
+            final_value["retained_session"]["manager_first_retained_failure"]["code"],
+            "F".repeat(32)
+        );
+        assert_eq!(
+            final_value["retained_session"]["manager_first_retained_failure"]["code_truncated"],
+            true
+        );
+        assert_eq!(
+            final_value["retained_session"]["manager_first_retained_failure"]["detail"],
+            "\0".repeat(64)
+        );
+        assert_eq!(
+            final_value["retained_session"]["manager_first_retained_failure"]["detail_truncated"],
+            true
+        );
+        assert_eq!(
+            final_value["retained_session"]["observation_point"],
+            "after_run"
+        );
+        assert_eq!(
+            final_value["retained_session_after_finish"]["observation_point"],
+            "after_finish"
+        );
+        assert_eq!(
+            final_value["retained_session_after_finish"]["stage"],
+            "manager_retained"
+        );
+        assert_eq!(
+            final_value["retained_session_after_finish"]["original_authority"]["root"],
+            u64::MAX
+        );
+        assert!(final_value["retained_session_after_finish"]["next_authority"].is_null());
+        assert_eq!(
+            final_value["retained_session_after_finish"]["manager_first_retained_failure"]["code"],
+            "AfterFinishPhysicalReceipt"
+        );
+        assert_eq!(
+            final_value["retained_session_after_finish"]["physical_read_failure"]["detail_truncated"],
+            true
+        );
+        assert_eq!(
+            final_value["diagnostic_failure"],
+            "first_original_readback_failure"
+        );
+        assert_eq!(final_value["finish_observed"], true);
+        assert_eq!(final_value["finish_result"], "failed");
+        assert_eq!(
+            final_value["retained_session"]["manager_first_retained_failure"]["physical_completion"],
+            "unknown"
+        );
+        assert_eq!(final_value["whole_session_physical"], "unknown");
     }
 
     #[test]

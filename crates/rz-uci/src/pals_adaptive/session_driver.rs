@@ -494,6 +494,43 @@ pub struct AdaptiveSessionRetention {
     pub native_pending: usize,
     pub archive_owner_pending: bool,
 }
+/// Read-only projection of one retained owner. No decoder or constructor can
+/// turn these observations back into a worker, source, fence or live authority.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Clone, Debug)]
+pub(crate) struct AdaptiveRetainedSessionObservation {
+    pub stage: &'static str,
+    pub authority: Option<SearchAuthority>,
+    pub next_authority: Option<SearchAuthority>,
+    pub manager_phase: Option<&'static str>,
+    pub manager_first_retained_failure: Option<SearchSessionFailure>,
+    pub manager_retained_failure_count: Option<usize>,
+    pub archive_operation: Option<&'static str>,
+    pub archive_quarantine_reason: Option<SearchSessionFailure>,
+    pub native_physical: Option<AdaptiveShutdownReceipt>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub profiled_physical: Option<super::ProfiledExternalShutdownReceipt>,
+    pub physical_read_failure: Option<SearchSessionFailure>,
+}
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl AdaptiveRetainedSessionObservation {
+    fn new(stage: &'static str) -> Self {
+        Self {
+            stage,
+            authority: None,
+            next_authority: None,
+            manager_phase: None,
+            manager_first_retained_failure: None,
+            manager_retained_failure_count: None,
+            archive_operation: None,
+            archive_quarantine_reason: None,
+            native_physical: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            profiled_physical: None,
+            physical_read_failure: None,
+        }
+    }
+}
 struct PendingOutput {
     authority: SearchAuthority,
     report: Option<BoardMove>,
@@ -1537,6 +1574,106 @@ where
                 archive_owner_pending: true,
             },
         })
+    }
+    /// Only the explicitly enabled product diagnostic calls this after run
+    /// returns. Never wait behind a live owner, reopen an asset, poll a worker,
+    /// consume an event, acknowledge a fence or alter its failure/custody.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn retained_session_observation(
+        &self,
+    ) -> Result<AdaptiveRetainedSessionObservation, ContractError> {
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|_| poisoned("retained diagnostic owner unavailable or busy"))?;
+        let stage = match &*state {
+            SessionState::Idle(_) => "idle",
+            SessionState::Manager(_) => "manager_retained",
+            SessionState::AdmissionRejected(_) => "admission_rejected",
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledAdmissionRejected(_) => "profiled_admission_rejected",
+            SessionState::PortRejected { .. } => "port_rejected",
+            SessionState::SpawnRejected { .. } => "cpu_spawn_rejected",
+            SessionState::ArchivePending { .. } => "archive_pending",
+            SessionState::ArchiveQuarantined { .. } => "archive_quarantined",
+            SessionState::ArchiveJoinedPending { .. } => "archive_join_pending",
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledRetirementPending { .. } => "profiled_retirement_pending",
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledRetirementRetained { .. } => {
+                "profiled_retirement_return_rejected"
+            }
+            SessionState::Closed(_) => "process_closed",
+            SessionState::Moving => "owner_transfer_unknown",
+        };
+        let mut observed = AdaptiveRetainedSessionObservation::new(stage);
+        match &*state {
+            SessionState::Manager(manager) => {
+                observed.authority = manager.driver().port().map(|port| port.authority());
+                observed.manager_phase = Some(match manager.phase() {
+                    ManagerPhase::Running => "running",
+                    ManagerPhase::Draining => "draining",
+                    ManagerPhase::Quarantined => "quarantined",
+                    ManagerPhase::Finished => "finished",
+                });
+                observed.manager_retained_failure_count = Some(manager.failures().count());
+                observed.manager_first_retained_failure = manager
+                    .failures()
+                    .next()
+                    .map(|cause| retained_cause("RetainedManagerEarliestFailure", cause));
+                match self.root_shutdown_receipt(manager) {
+                    Ok(SessionRootFence::Native(receipt)) => {
+                        observed.authority = Some(receipt.authority);
+                        observed.native_physical = Some(receipt);
+                    }
+                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                    Ok(SessionRootFence::Profiled(receipt)) => {
+                        observed.authority = Some(receipt.authority());
+                        observed.profiled_physical = Some(receipt);
+                    }
+                    Err(cause) => {
+                        observed.physical_read_failure =
+                            Some(retained_cause("RetainedPhysicalReceiptRead", &cause))
+                    }
+                }
+            }
+            SessionState::ArchiveQuarantined { quarantine, .. } => {
+                use rz_search::pals::engine::adaptive_port::archive_worker::ArchiveOperationKind;
+                observed.authority = Some(quarantine.receipt.authority);
+                observed.next_authority = quarantine.receipt.next_authority;
+                observed.archive_operation = Some(match quarantine.receipt.operation {
+                    ArchiveOperationKind::PrepareRoot => "prepare_root",
+                    ArchiveOperationKind::LoadRoot => "load_root",
+                    ArchiveOperationKind::ReclaimHot => "reclaim_hot",
+                    ArchiveOperationKind::PrepareForeign => "prepare_foreign",
+                    ArchiveOperationKind::NewGame => "new_game",
+                    ArchiveOperationKind::PrepareProfiledForeign => "prepare_profiled_foreign",
+                    ArchiveOperationKind::PersistProfiledRetirement => {
+                        "persist_profiled_retirement"
+                    }
+                });
+                observed.archive_quarantine_reason =
+                    Some(retained_archive_cause(&quarantine.reason));
+            }
+            SessionState::ArchivePending { authority, .. } => observed.authority = Some(*authority),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledRetirementPending { authority, .. } => {
+                observed.authority = Some(*authority)
+            }
+            SessionState::AdmissionRejected(rejected) => {
+                observed.manager_first_retained_failure =
+                    Some(retained_cause("RetainedManagerAdmission", &rejected.error))
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledAdmissionRejected(rejected) => {
+                observed.manager_first_retained_failure = Some(retained_cause(
+                    "RetainedProfiledManagerAdmission",
+                    &rejected.error,
+                ))
+            }
+            _ => {}
+        }
+        Ok(observed)
     }
     pub fn latest_root_receipt(&self) -> Result<Option<AdaptiveShutdownReceipt>, ContractError> {
         self.latest_root
@@ -3037,6 +3174,28 @@ impl SearchSessionFailure {
         self
     }
 }
+// Debug formatting uses the existing bounded 512-byte writer, not an
+// unbounded format! allocation. The original truncation suffix is retained;
+// the JSON observation applies its own 512-byte field limit separately.
+// A cause projection never certifies completion.
+#[cfg(any(test, all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+fn retained_cause(code: &'static str, cause: &dyn std::fmt::Debug) -> SearchSessionFailure {
+    SearchSessionFailure::debug(code, cause).unknown_if_unclosed()
+}
+#[cfg(any(test, all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+fn retained_archive_cause(
+    cause: &rz_search::pals::engine::adaptive_port::archive_worker::ArchiveQuarantineReason,
+) -> SearchSessionFailure {
+    use rz_search::pals::engine::adaptive_port::archive_worker::ArchiveQuarantineReason;
+    let code = match cause {
+        ArchiveQuarantineReason::Operation(_) => "ArchiveQuarantineOperation",
+        ArchiveQuarantineReason::Panic => "ArchiveQuarantinePanic",
+        ArchiveQuarantineReason::Canceled => "ArchiveQuarantineCanceled",
+        ArchiveQuarantineReason::Deadline => "ArchiveQuarantineDeadline",
+        ArchiveQuarantineReason::InvalidReturn(_) => "ArchiveQuarantineInvalidReturn",
+    };
+    retained_cause(code, cause)
+}
 fn failed_root_closure(first: Option<&AdaptiveManagerError>) -> SearchSessionFailure {
     first.map_or_else(SearchSessionFailure::physical_completion_unknown, |cause| {
         SearchSessionFailure::debug("AdaptiveRootClosure", cause).unknown_if_unclosed()
@@ -3181,6 +3340,42 @@ mod tests {
         assert!(validate_output(&pending, authority(7), "d2d4", false).is_ok());
         assert!(validate_output(&pending, authority(7), "e2e5", false).is_err());
         assert!(validate_output(&pending, authority(7), "0000", false).is_err());
+    }
+    #[test]
+    fn retained_manager_cause_is_bounded_and_cannot_confirm_physical_completion() {
+        let cause = AdaptiveManagerError::Semantic("원인".repeat(1024));
+        let observed = retained_cause("RetainedManagerEarliestFailure", &cause);
+        assert_eq!(observed.code, "RetainedManagerEarliestFailure");
+        assert!(observed.detail.starts_with("Semantic("));
+        assert!(observed.detail.len() <= 512 + " [cause truncated]".len());
+        assert!(observed.detail.ends_with(" [cause truncated]"));
+        assert_eq!(
+            observed.physical_completion,
+            crate::search_driver::DriverPhysicalCompletion::Unknown
+        );
+        assert!(matches!(cause, AdaptiveManagerError::Semantic(ref value) if value.len() > 512));
+    }
+    #[test]
+    fn archive_cause_keeps_operation_failure_distinct_from_deadline_and_cancel() {
+        use rz_search::pals::engine::adaptive_port::archive_worker::ArchiveQuarantineReason;
+        let operation =
+            ArchiveQuarantineReason::Operation(rz_search::pals::engine::PalsError::Capacity);
+        let observed = retained_archive_cause(&operation);
+        assert_eq!(observed.code, "ArchiveQuarantineOperation");
+        assert!(observed.detail.contains("Capacity"));
+        assert_eq!(
+            retained_archive_cause(&ArchiveQuarantineReason::Deadline).code,
+            "ArchiveQuarantineDeadline"
+        );
+        assert_eq!(
+            retained_archive_cause(&ArchiveQuarantineReason::Canceled).code,
+            "ArchiveQuarantineCanceled"
+        );
+        assert_eq!(
+            observed.physical_completion,
+            crate::search_driver::DriverPhysicalCompletion::Unknown
+        );
+        assert!(matches!(operation, ArchiveQuarantineReason::Operation(_)));
     }
     #[test]
     fn process_receipt_requires_join_and_physical_finish_independently() {

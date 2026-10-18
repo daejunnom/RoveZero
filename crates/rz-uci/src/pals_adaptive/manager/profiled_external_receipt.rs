@@ -60,6 +60,12 @@ impl ProfiledExternalShutdownReceipt {
     pub fn pending_tickets(&self) -> usize {
         self.pending_tickets
     }
+    pub(crate) fn retained_outputs(&self) -> usize {
+        self.retained_outputs
+    }
+    pub(crate) fn auxiliary_shutdown_confirmed(&self) -> bool {
+        self.auxiliary_shutdown_confirmed
+    }
     pub fn quarantined(&self) -> bool {
         self.quarantined
     }
