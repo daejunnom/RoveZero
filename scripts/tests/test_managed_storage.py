@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -5,11 +6,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from managed_storage import ManagedBuild, StorageError, checked, read_record, remove_tree, tree_size
+from managed_storage import (ManagedBuild, StorageError, _record_stamp, checked,
+                             read_record, read_record_snapshot, remove_tree, tree_size)
 from managed_process import run_group
 
 
@@ -26,6 +29,59 @@ class StorageTests(unittest.TestCase):
 
     def acquire(self, source=None, **limits):
         return ManagedBuild(self.root, source or self.source, **limits).acquire()
+
+    def test_snapshot_preserves_raw_hash_and_original_fd_stamp(self):
+        record = self.source / "owner.json"
+        raw = b'{"schema":"rovezero.managed-build.v1","owner":"original"}\n'
+        record.write_bytes(raw)
+        with record.open("rb") as stream:
+            original = _record_stamp(os.fstat(stream.fileno()))
+        snapshot = read_record_snapshot(record)
+        self.assertEqual(snapshot, (json.loads(raw), hashlib.sha256(raw).hexdigest(), original))
+        self.assertEqual(read_record_snapshot(record), snapshot)
+
+    def test_windows_cross_source_creation_time_does_not_ignore_file_identity(self):
+        # The actual CPython 3.12+ path stat uses creation time for ctime,
+        # whereas fstat uses ChangeTime. Model both without depending on OS.
+        fields = dict(st_dev=7, st_ino=(1 << 100) + 11, st_mode=stat.S_IFREG | 0o666,
+                      st_nlink=1, st_size=40, st_mtime_ns=1000,
+                      st_ctime_ns=2000, st_birthtime_ns=900)
+        opened = SimpleNamespace(**fields)
+        named = SimpleNamespace(**{**fields, "st_ctime_ns": fields["st_birthtime_ns"]})
+        self.assertNotEqual(_record_stamp(opened), _record_stamp(named))
+        self.assertEqual(_record_stamp(opened, creation_time=True),
+                         _record_stamp(named, creation_time=True))
+        for field in ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size",
+                      "st_mtime_ns", "st_birthtime_ns"):
+            with self.subTest(field=field):
+                changed = SimpleNamespace(**{**vars(named), field: getattr(named, field) + 1})
+                self.assertNotEqual(_record_stamp(opened, creation_time=True),
+                                    _record_stamp(changed, creation_time=True))
+
+    def test_snapshot_rejects_fd_change_time_mutation(self):
+        record = self.source / "owner.json"
+        record.write_bytes(b'{"schema":"rovezero.managed-build.v1"}\n')
+        fstat = os.fstat
+        calls = 0
+
+        def changed_after_read(fd):
+            nonlocal calls
+            info = fstat(fd)
+            calls += 1
+            if calls == 1:
+                return info
+            fields = {name: getattr(info, name) for name in (
+                "st_dev", "st_ino", "st_mode", "st_nlink", "st_size",
+                "st_mtime_ns", "st_ctime_ns")}
+            fields["st_ctime_ns"] += 1
+            if hasattr(info, "st_birthtime_ns"):
+                fields["st_birthtime_ns"] = info.st_birthtime_ns
+            return SimpleNamespace(**fields)
+
+        with patch("managed_storage.os.fstat", side_effect=changed_after_read):
+            with self.assertRaisesRegex(StorageError, "identity changed while reading"):
+                read_record_snapshot(record)
+        self.assertEqual(record.read_bytes(), b'{"schema":"rovezero.managed-build.v1"}\n')
 
     def test_fixed_slot_reuse_and_cleanup_even_after_command_failure(self):
         first = self.acquire()

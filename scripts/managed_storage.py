@@ -188,11 +188,18 @@ def write_record(path: Path, value: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _record_stamp(info, *, creation_time=False):
+    # CPython 3.12+ on Windows exposes ChangeTime through fstat().st_ctime,
+    # while path stat retains creation time there. Only the cross-source
+    # comparison uses their common birthtime; FD stability and the retained
+    # snapshot still include the original change-time observation.
+    time = getattr(info, "st_birthtime_ns", info.st_ctime_ns) if creation_time else info.st_ctime_ns
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+            info.st_size, info.st_mtime_ns, time)
+
+
 def read_record_snapshot(path: Path, *, schema=SCHEMA):
     path = checked(path)
-    def stamp(info):
-        return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
-                info.st_size, info.st_mtime_ns, info.st_ctime_ns)
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -207,8 +214,10 @@ def read_record_snapshot(path: Path, *, schema=SCHEMA):
             if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= 8192:
                 raise StorageError("bounded single-link ownership record required")
             raw = stream.read(8193)
-            if (len(raw) != before.st_size or stamp(before) != stamp(os.fstat(stream.fileno()))
-                    or stamp(before) != stamp(checked(path).lstat())):
+            if (len(raw) != before.st_size
+                    or _record_stamp(before) != _record_stamp(os.fstat(stream.fileno()))
+                    or _record_stamp(before, creation_time=os.name == "nt")
+                    != _record_stamp(checked(path).lstat(), creation_time=os.name == "nt")):
                 raise StorageError("ownership file identity changed while reading")
         value = json.loads(raw, object_pairs_hook=unique,
                            parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite record")))
@@ -216,7 +225,7 @@ def read_record_snapshot(path: Path, *, schema=SCHEMA):
         raise StorageError("ownership record is invalid; preserve it") from exc
     if not isinstance(value, dict) or value.get("schema") != schema:
         raise StorageError("unrecognized ownership record; preserve it")
-    return value, hashlib.sha256(raw).hexdigest(), stamp(before)
+    return value, hashlib.sha256(raw).hexdigest(), _record_stamp(before)
 
 
 def read_record(path: Path) -> dict:
