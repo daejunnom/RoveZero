@@ -1790,6 +1790,7 @@ fn is_cpu_stage(stage: RefinementStage) -> bool {
             | RefinementStage::CpuDiscovery
             | RefinementStage::CounterValidation
             | RefinementStage::RepairValidation
+            | RefinementStage::RecheckCounterValidation
     )
 }
 

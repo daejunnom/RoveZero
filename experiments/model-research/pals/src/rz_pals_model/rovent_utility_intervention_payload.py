@@ -442,7 +442,7 @@ def _arm(arm, *, trial, original, neutral, source, config):
     full_proposal = [move.from_square | move.to_square << 6 | move.promotion << 12 for move in target_line]
     _query_prefix(query, trial["recipient"], neutral["original_first_move"], full_proposal)
     if query["counterexample"] is not None:
-        _moves(query["counterexample"], 256)
+        raise ValueError("intervention frozen-proposal arm cannot contain a counterexample")
     divergences = proof._array(query["divergences"], 256)
     for divergence in divergences:
         uint(divergence, 65535)

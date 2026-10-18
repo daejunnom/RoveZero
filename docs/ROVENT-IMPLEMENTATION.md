@@ -1251,3 +1251,50 @@ retained descriptor 재검증, cached 파일 검증을 각각 수행함을 확�
 metadata 210/211은 준비됐으나 실제 세 arm·publication·별도 ACK·strict
 소비, update 0회 parent/child 종료, 일반 teacher·외부 R 인수는 남는다.
 실제 학습·원격 성능/기력 비교·병합은 계속 제외한다.
+
+## 24차 체크포인트: release 기능 검사와 own CPU 재검토 분류 누락
+
+문서 HEAD `dbc58aa`의 원격 다섯 job은 모두 성공을 관측했다. Linux·Windows
+CPU, CPU bindings, PALS model, native validation bundle의 결과이며, 실제
+로컬 제품 실행 인수와는 구분한다. 이전 `e3b02d2` run의 native bundle은
+후속 push로 취소됐다는 상태도 보존한다.
+
+실제 제품 소스 `e3b02d2`의 release 빌드 215는 0~8단계 통과 뒤 독립 reader를
+빌드하던 9단계에서 유한 창이 만료되어 exit 124로 끝났다. 컴파일 실패로
+분류하지 않으며 자식 종료·scratch 정리와 보존된 관리 캐시를 확인했다.
+새 빌드 223은 11단계를 모두 통과했다. UCI 797개, Search 1069개/ignored 2개,
+inventory 1개와 엄격 workspace Clippy를 실행했고, release 제품 10개와
+독립 caller 2개의 원 바이트·의존 파일을 보존했다. 이후 관리 슬롯의 8GiB
+상한에 따른 cache reset도 확인했다. 빌드 성공 자체는 제품 실행 권한이 아니다.
+
+등록 224는 새 실행물과 CPU 2개·3GiB/4GiB의 lock·parent readback을 연결한
+passive metadata다. 모델·인코딩·NNUEC 의미 조건과 구현 식별을 구분하며
+Ready·root·NN 실행 권한을 합성하지 않는다. 수치 검사 230은 caller 번호
+치환이 고정 입력 바이트 수까지 변경한 총괄의 오류로 forward 이전에 거부됐다.
+원 입력·핀과 실패 기록은 보존했다. 전체 파생 caller의 숫자 AST를 대조해
+달라진 상수 두 곳을 복구한 뒤, 새 검사 234에서 실제 Rust forward 20개와
+독립 scalar FP32를 대조했다. 옛 수치 결과를 새 실행으로 세지 않는다.
+
+CPU P-C 224는 여덟 go·stop·ponder·newgame·quit와 exit 0·양 pipe EOF를
+관측했다. 별도 제품 receipt 없는 물리 완료는 unknown이다. CPU P-C-R은
+depth 1/2·mate 뒤 movetime에서 `RecheckCounterValidation` 질문을
+`not an open CPU frame`으로 거부했다. 정상 bestmove·exit 0이 있어도 의미
+실패로 판정하고 GPU·cohort 후속 실행을 멈췄으며 각 원자료 5개를 회수했다.
+
+원 producer·coordinator·외부 CPU·후속 Fresh 소비는 이미 이 단계를 지원하지만,
+own `is_cpu_stage`에만 누락돼 있음을 실제 trace와 두 독립 소스 감사로 확인했다.
+해당 단계를 추가하고 기존 P Repair와 실제 C CriticRecheck producer에서 생성한
+CPU 질문의 허용, role 입력과 닫힌 frame의 거부를 검사하는 회귀를 추가한다.
+Store task·paused token·closed frame 조건을 완화하지 않는다. 이 시점의 Rust
+회귀는 아직 컴파일·실행 전이다. 새 소스의 실제 실행은 별도로 다시 인수한다.
+
+Python 독립 reader도 `/2` producer·Rust reader와 같이 counterexample을 None으로
+제한한다. 원 trial·publication·ACK 핀을 다시 봉인한 비정상 입력도 거부하는
+부정 사례를 포함한 집중 검사 10개가 신경망 import 차단 상태에서 통과했다.
+이는 실제 학습이나 실제 cohort publication 증거가 아니다.
+
+보존 영역이 18GiB를 약 19MiB 초과하여 비활성 build 201의 실행물·의존 파일
+24개를 Windows 보존 영역에 복사·fsync·해시 대조한 뒤 정확한 Linux 원 roster만
+회수했다. 약 1.50GiB를 반환했으며 모델·데이터·기보·실패 보고서는 삭제하지
+않았다. 원 명령을 재현하기 전에는 보존된 custody mapping으로 원 경로를 복원한다.
+이 기록과 새 자원 프로필은 기능 검증용이며 성능 개선의 근거로 사용하지 않는다.

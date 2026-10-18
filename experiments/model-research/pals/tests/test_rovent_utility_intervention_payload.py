@@ -218,6 +218,23 @@ class InterventionPayloadTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reader._query_prefix({"proposal": [64], "prefix": [64]}, "route_p", 64, full)
 
+    def test_frozen_proposal_rejects_counterexample_even_with_matching_file_pins(self):
+        # Mutate the original nested query before the fixture seals its trial,
+        # materialization, publication and ACK. This is a policy rejection,
+        # not rejection of stale file hashes or a copied live authority.
+        for recipient_index in (0, 1):
+            for counterexample in ([], [64]):
+                with self.subTest(recipient=recipient_index, counterexample=counterexample):
+                    def change_arm(body, index):
+                        if index == recipient_index:
+                            body["arm_query"]["query"]["counterexample"] = copy.deepcopy(counterexample)
+                    _, registration, _, blobs = intervention_case(change_arm=change_arm)
+                    with tempfile.TemporaryDirectory() as directory:
+                        reference = write_case(Path(directory).resolve(), blobs)
+                        owner = files_module.read_intervention_files(reference, read_accounting=budget(4 << 20))
+                        with self.assertRaisesRegex(ValueError, "frozen-proposal arm cannot contain a counterexample"):
+                            reader.validate_intervention_payloads(owner, registration=registration)
+
     def test_neutral_hash_keeps_reference_bytes_and_original_serde_identity_order(self):
         _, _, blobs, _, _, case = full_cohort_case()
         neutral = neutral_from_input(case["input"])

@@ -1488,6 +1488,121 @@ fn repair_provenance_reaches_original_critic_query_and_first_consume_without_han
     assert_ne!(observed[0].0.producer_frame, observed[1].0.producer_frame);
 }
 #[test]
+fn original_critic_recheck_opens_native_cpu_question_but_closed_frame_stays_rejected() {
+    // Reuse the original accepted-output/Rules producer fixture. No worker,
+    // physical NN receipt or completed-depth claim is authored by this test.
+    let (mut port, repaired) = repair_provenance_source_fixture(false, 1);
+    let next = port
+        .critic_recheck_after_repaired_fresh(&repaired.input.question)
+        .unwrap();
+    let critic = materialize_authored_source_transition(&mut port, &repaired, next);
+    assert_eq!(critic.input.stage, RefinementStage::CriticRecheck);
+    let (evaluation_namespace, search_conditions) = port.cpu_namespace_digests().unwrap();
+    let profile = crate::cpu_worker::CpuWorkerProfile {
+        owner: rz_contracts::pals_adaptive::CpuWorkerId(1),
+        max_depth: port.engine.owned_descriptor().unwrap().config.max_depth,
+        evaluation_namespace,
+        search_conditions,
+    };
+    assert!(matches!(
+        port.prepare_cpu_question(&critic, &[profile], false),
+        Err(PalsError::Store(StoreError::InvalidConditions(
+            "not an open CPU frame"
+        )))
+    ));
+    assert!(port.cpu_admissions.is_empty());
+
+    let (ticket, mut output) = output(&critic, 3);
+    let chosen = BoardMove::from_uci("c7c5").unwrap();
+    let index = critic
+        .input
+        .view
+        .query()
+        .legal
+        .iter()
+        .position(|movement| *movement == chosen)
+        .expect("original repaired endpoint has the legal C alternative");
+    let RolePayload::Counterexample {
+        candidate_logits, ..
+    } = &mut output.payload
+    else {
+        panic!("the original CriticRecheck must consume C output");
+    };
+    candidate_logits[index] = 1.0;
+    let step = port.commit_role(&critic, &ticket, &output, None).unwrap();
+    port.role_consumed(&ticket, &critic.input.view).unwrap();
+    let next = port.materialize_step(step).unwrap();
+    let FrameTransition::Continue(input) = next.transition else {
+        panic!("the actual C reply must issue its native recheck validation");
+    };
+    let validation = Work { input, ..critic };
+    assert_eq!(
+        validation.input.stage,
+        RefinementStage::RecheckCounterValidation
+    );
+    assert_eq!(
+        validation.input.question.context.prefix.last(),
+        Some(&chosen)
+    );
+    assert_eq!(
+        validation.input.question.counter.as_deref(),
+        Some(validation.input.question.context.prefix.as_slice())
+    );
+    assert!(!port.closed.contains(&validation.frame));
+    let before = port.counters();
+    let prepared = port
+        .prepare_cpu_question(&validation, &[profile], false)
+        .unwrap()
+        .expect("the actual open C recheck has its original native CPU credit");
+    assert_eq!(prepared.target_depth, port.limits.cpu_depth);
+    assert_eq!(
+        prepared.total_native_node_credit,
+        port.limits
+            .max_cpu_nodes
+            .min(port.engine.config.cpu_nodes_per_task)
+    );
+    assert!(prepared.root_moves.is_none());
+    let admission = port
+        .cpu_admissions
+        .get(&validation.input.question_digest)
+        .unwrap();
+    assert_eq!(admission.frame, validation.frame);
+    assert_eq!(admission.stage, RefinementStage::RecheckCounterValidation);
+    assert_eq!(admission.first_move, validation.original_first_move);
+    assert!(
+        admission
+            .position
+            .snapshot()
+            .same_state(&validation.input.question.position.snapshot())
+    );
+    assert_eq!(
+        prepared.position.export().unwrap().snapshot().identity(),
+        admission.rules_identity
+    );
+    assert_eq!(port.counters(), before);
+    assert_eq!(port.cpu_admissions.len(), 1);
+
+    // Only logical closure is authored here. This does not claim a worker
+    // report, fence, root goal completion or original Store evidence deletion.
+    port.publish_closed(&ClosedFrame {
+        id: validation.frame,
+        original_first_move: validation.original_first_move,
+        evidence: vec![validation.input.question_digest],
+        unknown: Some("authored closed-frame admission guard"),
+        completion_scope: None,
+    })
+    .unwrap();
+    assert!(matches!(
+        port.prepare_cpu_question(&validation, &[profile], false),
+        Err(PalsError::Store(StoreError::InvalidConditions(
+            "not an open CPU frame"
+        )))
+    ));
+    assert_eq!(port.cpu_admissions.len(), 1);
+    assert_eq!(port.counters(), before);
+}
+
+#[test]
 fn zero_step_repair_does_not_inherit_an_earlier_p_line_identity() {
     let (mut port, prior) = repair_provenance_source_fixture(false, 1);
     let provenance = prior.input.question.diagnostic_repair_line.unwrap();
