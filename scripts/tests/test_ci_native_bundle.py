@@ -10,6 +10,7 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+import tarfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -19,6 +20,46 @@ import ci_native_bundle as bundle
 
 
 class NativeBundleTests(unittest.TestCase):
+    def test_compressed_artifact_and_uncompressed_payload_have_separate_bounds(self):
+        rows = {str(index): {'pin': {'bytes': size << 20}}
+                for index, size in enumerate((200, 200, 150))}
+        self.assertGreater(bundle.selected_elf_payload(rows), bundle.ARTIFACT_CAP)
+        self.assertLessEqual(bundle.selected_elf_payload(rows), bundle.ELF_PAYLOAD_CAP)
+        for sizes in ((200 << 20,) * 4, (bundle.ELF_CAP + 1,), (True,), (0,)):
+            with self.subTest(sizes=sizes), self.assertRaisesRegex(RuntimeError, 'SelectedELF'):
+                bundle.selected_elf_payload({str(i): {'pin': {'bytes': size}}
+                                             for i, size in enumerate(sizes)})
+
+    def test_compressed_writer_roundtrip_and_exact_byte_accounting(self):
+        payload = b'\0' * (2 << 20)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'synthetic.tar.gz'
+            with path.open('xb') as stream:
+                writer = bundle.BoundedArchiveWriter(stream, 16 << 10)
+                with tarfile.open(fileobj=writer, mode='w:gz', format=tarfile.USTAR_FORMAT) as archive:
+                    member = tarfile.TarInfo('bin/synthetic')
+                    member.size = len(payload)
+                    archive.addfile(member, io.BytesIO(payload))
+                self.assertEqual(writer.written, stream.tell())
+                self.assertLessEqual(writer.written, writer.maximum)
+            with tarfile.open(path, 'r:gz') as archive:
+                self.assertEqual(archive.getnames(), ['bin/synthetic'])
+                self.assertEqual(archive.extractfile('bin/synthetic').read(), payload)
+
+    def test_compressed_writer_refuses_before_crossing_disk_bound(self):
+        payload = b''.join(hashlib.sha256(str(i).encode()).digest() for i in range(2048))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'synthetic-overflow.tar.gz'
+            with path.open('xb') as stream:
+                writer = bundle.BoundedArchiveWriter(stream, 1024)
+                with self.assertRaisesRegex(RuntimeError, 'CompressedArchiveBudget'):
+                    with tarfile.open(fileobj=writer, mode='w:gz', format=tarfile.USTAR_FORMAT) as archive:
+                        member = tarfile.TarInfo('bin/synthetic')
+                        member.size = len(payload)
+                        archive.addfile(member, io.BytesIO(payload))
+                self.assertLessEqual(writer.written, 1024)
+                self.assertEqual(writer.written, stream.tell())
+
     def test_command_progress_preserves_original_failure_and_tree_closure(self):
         # No subprocess/ELF runs: exercise the actual log/receipt boundary with
         # supervisor outcomes, including exit 0 with an unclosed process tree.

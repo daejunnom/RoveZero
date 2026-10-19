@@ -34,6 +34,7 @@ from managed_storage import checked, tree_size
 ROOT_CAP = 12 << 30
 ARTIFACT_CAP = 512 << 20
 ELF_CAP = 256 << 20
+ELF_PAYLOAD_CAP = 768 << 20
 LOG_CAP = 8 << 20
 SOURCE_CAP = 128 << 20
 # Release compilation can exhaust the old 45-minute window after several
@@ -455,6 +456,34 @@ class Build:
         return raw
 
 
+def selected_elf_payload(binaries):
+    sizes = [row['pin']['bytes'] for row in binaries.values()]
+    require(sizes and all(type(size) is int and 0 < size <= ELF_CAP for size in sizes)
+            and sum(sizes) <= ELF_PAYLOAD_CAP, 'SelectedELF768MiBPayloadBudget')
+    return sum(sizes)
+
+
+class BoundedArchiveWriter:
+    """Bound compressed bytes separately from the verified ELF payload."""
+    def __init__(self, stream, maximum):
+        require(type(maximum) is int and maximum > 0, 'PositiveCompressedArchiveBudget')
+        self.stream, self.maximum, self.written = stream, maximum, 0
+        self.name = stream.name
+
+    def write(self, data):
+        require(self.written + len(data) <= self.maximum, 'CompressedArchiveBudget')
+        written = self.stream.write(data)
+        require(written == len(data), 'CompressedArchiveShortWrite')
+        self.written += written
+        return written
+
+    def flush(self):
+        self.stream.flush()
+
+    def tell(self):
+        return self.written
+
+
 def write_json(path, value):
     raw = (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + '\n').encode()
     require(len(raw) <= 4 << 20, 'SmallMetadata4MiBCap')
@@ -493,7 +522,8 @@ def run(source, root, expected_head, seconds):
                'source_commit': expected_head, 'commands': build.commands,
                'resource': {'cpu_affinity_actual': affinity, 'build_jobs': 2, 'seconds': seconds,
                             'child_affinity_guard': 'isolated_wrapper_exact_readback_before_exec',
-                            'managed_bytes_cap': ROOT_CAP, 'artifact_bytes_cap': ARTIFACT_CAP},
+                            'managed_bytes_cap': ROOT_CAP, 'artifact_bytes_cap': ARTIFACT_CAP,
+                            'uncompressed_elf_payload_bytes_cap': ELF_PAYLOAD_CAP},
                'neural_execution': False, 'gpu_execution': False, 'training_execution': False,
                'optimizer_updates': 0, 'mapped_image': None, 'numerical_or_runtime_acceptance': None,
                'host': {'machine': platform.machine(), 'libc_observed': platform.libc_ver(),
@@ -622,11 +652,13 @@ def run(source, root, expected_head, seconds):
                 'BundledLockOriginalFDChanged')
         require(file_pin(artifact / 'Cargo.lock') == lock_pin, 'BundledLockPin')
         members = sorted(receipt['binaries'])
-        total = sum(receipt['binaries'][name]['pin']['bytes'] for name in members)
-        require(total + (16 << 20) <= ARTIFACT_CAP, 'SelectedELF512MiBBundleBudget')
+        total = selected_elf_payload(receipt['binaries'])
         build.budget(total)
         bundle = artifact / 'native-validation-binaries.tar.gz'
-        with bundle.open('xb') as raw, tarfile.open(fileobj=raw, mode='w:gz', format=tarfile.USTAR_FORMAT) as archive:
+        compressed_cap = ARTIFACT_CAP - tree_size(artifact) - (16 << 20)
+        require(compressed_cap > 0, 'CompressedArchiveMetadataReserve')
+        with bundle.open('xb') as raw, tarfile.open(fileobj=BoundedArchiveWriter(raw, compressed_cap),
+                                                  mode='w:gz', format=tarfile.USTAR_FORMAT) as archive:
             for name in members:
                 stream, actual, before, _ = pinned_file(private / name, ELF_CAP)
                 with stream:
