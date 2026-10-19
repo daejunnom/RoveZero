@@ -40,6 +40,28 @@ def identity(path):
     return [info.st_dev, info.st_ino]
 
 
+def _catalog_rows(catalog):
+    rows = []
+    entries = list(catalog.iterdir())
+    if len(entries) > MAX_RUNS + 1:
+        raise StorageError("output catalog entry bound exceeded; archive review required")
+    for path in entries:
+        if path.name == "catalog.lock":
+            continue
+        row = _read(path)
+        target = checked(Path(row["output"]))
+        key = hashlib.sha256(os.path.normcase(str(target)).encode()).hexdigest()
+        pending = row.get("deferred") is True and row.get("identity") is None
+        if (path.name != key + ".json" or row.get("key") != key
+                or row.get("state") not in {"active", "retained", "interrupted_retained"}
+                or (pending and row["state"] != "active" and target.exists())
+                or (not pending and row.get("identity") != identity(target))
+                or (not row.get("deferred") and _read(target / ".rovezero-output.json") != row)):
+            raise StorageError("output custody changed or missing; preserve catalog")
+        rows.append((path, row, target))
+    return rows
+
+
 class _CreatedOutputDirectory:
     """In-process custody from exclusive mkdir; never reconstructed from a pathname."""
     def __init__(self, parent_fd, parent_identity, name, owner):
@@ -82,9 +104,20 @@ class _CreatedOutputDirectory:
 
 class OutputLease:
     def __init__(self, output, source, *, catalog=None, reserve=8 * GiB,
-                 total_limit=18 * GiB, retention_days=14, deferred=False, outer_supervised=False):
+                 total_limit=18 * GiB, retention_days=14, deferred=False, outer_supervised=False,
+                 quarantine_receipts=None):
+        if quarantine_receipts is not None:
+            if not isinstance(quarantine_receipts, (tuple, list)) or len(quarantine_receipts) > MAX_RUNS:
+                raise StorageError("bounded explicit custody receipt pins required")
+            if outer_supervised:
+                raise StorageError("outer finalizer does not carry explicit custody receipt pins")
         self.output, self.source = checked(output), checked(source)
         self.catalog = checked(catalog or canonical_catalog())
+        if quarantine_receipts is not None:
+            from managed_output_quarantine import registry_path
+            registry = registry_path(self.catalog)
+            if self.output.is_relative_to(registry) or registry.is_relative_to(self.output):
+                raise StorageError("output overlaps custody registry; no producer admission")
         for other in (self.source, self.catalog):
             if self.output.is_relative_to(other) or other.is_relative_to(self.output):
                 raise StorageError("output, checkout and catalog must be disjoint")
@@ -93,6 +126,8 @@ class OutputLease:
             raise StorageError("finite output reservation and retention required")
         self.reserve, self.total_limit, self.days = reserve, total_limit, retention_days
         self.deferred = deferred
+        self.quarantine_receipts = None if quarantine_receipts is None else tuple(dict(pin) for pin in quarantine_receipts)
+        self._quarantine_view = None
         self.key = hashlib.sha256(os.path.normcase(str(self.output)).encode()).hexdigest()
         self.guard = CatalogGuard(self.catalog / "catalog.lock")
         self.record = None
@@ -110,40 +145,57 @@ class OutputLease:
                           "scope": "inherited_outer_process_group_or_job"}
 
     def _rows(self):
-        rows = []
-        entries = list(self.catalog.iterdir())
-        if len(entries) > MAX_RUNS + 1:
-            raise StorageError("output catalog entry bound exceeded; archive review required")
-        for path in entries:
-            if path.name == "catalog.lock":
-                continue
-            row = _read(path)
-            target = checked(Path(row["output"]))
-            key = hashlib.sha256(os.path.normcase(str(target)).encode()).hexdigest()
-            pending = row.get("deferred") is True and row.get("identity") is None
-            if (path.name != key + ".json" or row.get("key") != key
-                    or row.get("state") not in {"active", "retained", "interrupted_retained"}
-                    or (pending and row["state"] != "active" and target.exists())
-                    or (not pending and row.get("identity") != identity(target))
-                    or (not row.get("deferred") and _read(target / ".rovezero-output.json") != row)):
-                raise StorageError("output custody changed or missing; preserve catalog")
-            rows.append((path, row, target))
+        rows = _catalog_rows(self.catalog)
+        if self.quarantine_receipts is not None:
+            from managed_output_quarantine import validate_quarantines
+            previous, self._quarantine_view = self._quarantine_view, None
+            try:
+                self._quarantine_view = validate_quarantines(self.catalog, rows, self.quarantine_receipts, self.guard)
+            finally:
+                if previous is not None:
+                    previous.close(sys.exc_info()[1])
         return rows
+
+    def _check_quarantine_view(self):
+        if self.quarantine_receipts is not None:
+            if self._quarantine_view is None:
+                raise StorageError("explicit custody validation has not completed")
+            self._quarantine_view.check()
+
+    def _close_quarantine_view(self, primary=None):
+        view, self._quarantine_view = getattr(self, "_quarantine_view", None), None
+        if view is not None:
+            view.close(primary)
+
+    def _release_guard(self, primary=None):
+        try:
+            self.guard.release()
+        except BaseException:
+            if self.quarantine_receipts is None or primary is None:
+                raise
+            if hasattr(primary, "add_note"):
+                primary.add_note("custody output catalog gate release also failed")
+
+    def _output_usage(self, rows, *, allow_disappearing=False):
+        if self._quarantine_view is not None:
+            return self._quarantine_view.usage(rows)
+        return sum(tree_size(target, allow_disappearing=allow_disappearing) for _, _, target in rows)
 
     def acquire(self):
         self.catalog.mkdir(parents=True, exist_ok=True)
         self.guard.acquire()
         try:
             rows = self._rows()
-            if any(row["state"] == "active" for _, row, _ in rows):
+            custody_keys = self._quarantine_view.keys if self._quarantine_view is not None else frozenset()
+            if any(row["state"] == "active" and row["key"] not in custody_keys for _, row, _ in rows):
                 raise StorageError("interrupted output requires explicit recovery")
             if len(rows) >= MAX_RUNS:
                 raise StorageError("output catalog full; archive review required")
             if any(self.output.is_relative_to(target) or target.is_relative_to(self.output)
                    for _, _, target in rows):
                 raise StorageError("overlapping output registration")
-            used = sum(tree_size(target) for _, _, target in rows)
-            if any(tree_size(target) > row["reserved_bytes"] for _, row, target in rows):
+            used = self._output_usage(rows)
+            if any(row["key"] not in custody_keys and tree_size(target) > row["reserved_bytes"] for _, row, target in rows):
                 raise StorageError("previous output exceeds its reservation; archive review required")
             if used + self.reserve > self.total_limit:
                 raise StorageError("retained results plus reservation exceed output catalog budget")
@@ -163,8 +215,11 @@ class OutputLease:
                 "classification": "retained_evidence", "automatic_expiry_deletion": False}
             self._write()
             return self
-        except BaseException:
-            self.guard.release()
+        except BaseException as error:
+            try:
+                self._close_quarantine_view(error)
+            finally:
+                self._release_guard(error)
             raise
 
     def create_deferred_directory(self):
@@ -239,6 +294,7 @@ class OutputLease:
             # still obey the existing record bound before any metadata write.
             if len((json.dumps(proposed, sort_keys=True) + "\n").encode()) > 8192:
                 raise StorageError("ownership record exceeds bound")
+            self._check_quarantine_view()
             self._directory_binding_stage = "catalog_write_pending"
             write_record(path, proposed)
             self._directory_binding_stage = "catalog_written_readback_pending"
@@ -283,13 +339,20 @@ class OutputLease:
             self._close_created_directory()
         except BaseException:
             pass  # Descriptor release only; no pathname mutation or row finish.
+        try:
+            self._close_quarantine_view()
+        except BaseException:
+            pass
 
     def _write(self):
         self.guard.assert_held()
         self._check_created_directory()
+        self._check_quarantine_view()
         if not self.deferred:
             write_record(self.output / ".rovezero-output.json", self.record)
         write_record(self.catalog / (self.key + ".json"), self.record)
+        if self.quarantine_receipts is not None:
+            self._check_quarantine_view()  # A late error keeps written metadata; no payload permission.
 
     def check_budget(self):
         self.guard.assert_held()
@@ -300,10 +363,11 @@ class OutputLease:
                 or (not self.deferred and _read(self.output / ".rovezero-output.json") != self.record)):
             raise StorageError("output owner changed; preserve all records")
         rows = self._rows()
-        actual = sum(tree_size(path, allow_disappearing=True) for _, _, path in rows)
+        actual = self._output_usage(rows, allow_disappearing=True)
         if tree_size(self.output, allow_disappearing=True) > self.reserve or actual > self.total_limit:
             raise OutputBudgetError("managed output byte budget exceeded; evidence retained")
         self._check_created_directory()
+        self._check_quarantine_view()
 
     def finish(self, *, status, tree_gone):
         # No file cleanup is implied by this method. In particular OS exit is
@@ -332,10 +396,23 @@ class OutputLease:
             try:
                 self._close_created_directory(sys.exc_info()[1] or error)
             finally:
-                self.guard.release()
+                try:
+                    self._close_quarantine_view(sys.exc_info()[1] or error)
+                finally:
+                    self._release_guard(sys.exc_info()[1] or error)
         if error:
             raise error
         return self.record
+
+
+def _refuse_custody_registry(catalog):
+    # Deny only: legacy recovery never interprets a receipt or adopts custody.
+    registry = catalog.with_name(catalog.name + ".interrupted-unbound-custody-v1")
+    try:
+        registry.lstat()  # A broken symlink/special/empty/partial registry also blocks.
+    except FileNotFoundError:
+        return
+    raise StorageError("custody registry present; legacy output recovery is forbidden")
 
 
 def recover_output(catalog, key, expected_sha256):
@@ -343,6 +420,8 @@ def recover_output(catalog, key, expected_sha256):
     if len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
         raise StorageError("exact output catalog key required")
     with CatalogGuard(catalog / "catalog.lock") as guard:
+        guard.assert_held()
+        _refuse_custody_registry(catalog)
         path = catalog / (key + ".json")
         row, digest, stamp = read_record_snapshot(path, schema=SCHEMA)
         if digest != expected_sha256:
@@ -355,9 +434,12 @@ def recover_output(catalog, key, expected_sha256):
                 or not reboot_proves_dead(row.get("lifetime"), lifetime())):
             raise StorageError("interrupted output termination not proven")
         guard.assert_held()
+        _refuse_custody_registry(catalog)
         if (read_record_snapshot(path, schema=SCHEMA) != (row, digest, stamp)
                 or (row.get("identity") is not None and row["identity"] != identity(target))):
             raise StorageError("output identity changed before recovery commit")
+        guard.assert_held()
+        _refuse_custody_registry(catalog)
         row.update(state="interrupted_retained", recovery_reason="verified_same_host_reboot",
                    recovered_ns=time.time_ns(), recovery_source_sha256=expected_sha256)
         if not row.get("deferred"):
@@ -395,13 +477,28 @@ def finalize_supervised_outputs(root, owner, catalog=None):
         sample_output_budget(catalog)
 
 
-def sample_output_budget(catalog=None):
-    """Read-only live supervision; does not acquire the producer's held gate.
+def sample_output_budget(catalog=None, *, quarantine_receipts=None, quarantine_guard=None):
+    """Sampled length cap, never a quota or physical completion witness.
 
-    Atomic catalog records identify fresh outputs. Final custody validation and
-    mutation still require the gate. This is a sampled length cap, not a quota.
+    V1 calls remain read-only without acquiring the producer's held gate. Aware
+    calls use an explicit original guard (live owner: prefer check_budget); only
+    independent sampling may omit it and acquire that gate. Busy/errors propagate.
     """
     catalog = checked(catalog or canonical_catalog())
+    if quarantine_receipts is not None:
+        from managed_output_quarantine import original_custody_gate, validate_quarantines
+        if quarantine_guard is None:
+            with original_custody_gate(catalog) as held:
+                return sample_output_budget(catalog, quarantine_receipts=quarantine_receipts, quarantine_guard=held)
+        view = validate_quarantines(catalog, _catalog_rows(catalog), quarantine_receipts, quarantine_guard)
+        try:
+            total = view.usage(_catalog_rows(catalog))
+            view.check()
+            return total
+        finally:
+            view.close(sys.exc_info()[1])
+    if quarantine_guard is not None:
+        raise StorageError("custody guard without explicit receipt pins is not a typed selection")
     if not catalog.exists():
         return 0
     total = 0

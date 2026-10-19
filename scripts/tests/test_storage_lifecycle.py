@@ -10,6 +10,7 @@ import sys
 import stat
 from types import SimpleNamespace
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
@@ -358,6 +359,8 @@ class CreatedDirectoryBindingTests(unittest.TestCase):
         return 102
 
     def lstat(self, path):
+        if path == self.catalog.with_name(self.catalog.name + ".interrupted-unbound-custody-v1"):
+            raise FileNotFoundError(path)
         self.assertEqual(path, self.parent)
         return self.named_parent
 
@@ -769,6 +772,793 @@ class CreatedDirectoryLinuxFilesystemTests(unittest.TestCase):
         self.assertIsNone(json.loads(row_path.read_text())["identity"])
         self.assertEqual((owner.output / "unsealed.txt").read_bytes(), b"keep unsealed fixture")
 
+
+class InterruptedUnboundQuarantineTests(unittest.TestCase):
+    """In-memory OS/metadata only; never applies maintenance to a real catalog."""
+    def setUp(self):
+        import managed_outputs as outputs
+        import managed_output_quarantine as custody
+        self.o, self.q = outputs, custody
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.base = Path(os.path.abspath("mock-unbound-custody"))
+        self.catalog, self.target = self.base / "storage" / "outputs", self.base / "private" / "retained"
+        self.registry = custody.registry_path(self.catalog)
+        self.now = {"host": "host", "boot": "new", "platform": "linux", "process_birth": "new-birth"}
+        self.key = hashlib.sha256(os.path.normcase(str(self.target)).encode()).hexdigest()
+        self.row_path = self.catalog / (self.key + ".json")
+        self.old = {"schema": "rovezero.managed-output.v1", "key": self.key, "output": str(self.target),
+            "source": str(self.base / "source"), "state": "active", "deferred": True, "identity": None,
+            "token": "original-only", "pid": 123, "lifetime": dict(self.now, boot="old", process_birth="old-birth"),
+            "reserved_bytes": 4096, "catalog_limit_bytes": 18 * 1024 ** 3, "legacy_unknown": None}
+        self.files, self.infos, self.fd_paths, self.actions = {}, {}, {}, []
+        for path in (self.catalog, self.catalog.parent, self.target.parent, self.target, self.base / "source"):
+            self.infos[path] = self.info(len(self.infos) + 10, stat.S_IFDIR | 0o700)
+        self.source_path = Path(custody.__file__).resolve()
+        self.put(self.source_path, b"independently pinned implementation")
+        self.reset_old()
+        self.source_pin = custody._pin(self.source_path, self.files[self.source_path])
+        self.gate = MagicMock(spec=CatalogGuard)
+        self.gate.path = self.catalog / "catalog.lock"
+        self.gate.acquire.return_value = self.gate
+        self.gate.__enter__.return_value = self.gate
+        test = self
+        class Held:
+            def __init__(self, seconds):
+                custody._need(0 < seconds <= 30, "original custody deadline")
+                self.until, self.blobs = time.monotonic() + seconds, []
+            def tick(self):
+                custody._need(time.monotonic() < self.until, "original custody deadline")
+            def directory(self, path):
+                path = Path(path)
+                custody._need(path in test.infos, "missing directory")
+                fd = len(test.fd_paths) + 100
+                test.fd_paths[fd] = path
+                return fd
+            def read(self, pin, path, maximum):
+                self.tick()
+                path = Path(path)
+                test.assertFalse(path == test.target or test.target in path.parents, "target payload content read")
+                custody._pin_shape(pin, path, maximum)
+                raw = test.files[path]
+                custody._need(custody._pin(path, raw) == pin, "raw pin mismatch")
+                self.blobs.append((path, raw))
+                return raw
+            def check(self):
+                self.tick()
+                custody._need(all(test.files.get(path) == raw for path, raw in self.blobs), "held metadata changed")
+            def close(self, primary=None):
+                self.blobs.clear()
+        class Observed:
+            def __init__(self, held, target):
+                self.target = target
+                self.parent_identity = custody._did(test.infos[target.parent])
+                self.identity = custody._did(test.infos[target])
+                self.mounts = {"namespace": [1, 2], "mountinfo_bytes": 10, "mountinfo_sha256": "a" * 64}
+                self.snapshot = test.manifest()
+            def check(self):
+                custody._need(self.snapshot == test.manifest() and self.identity == custody._did(test.infos[self.target])
+                              and self.parent_identity == custody._did(test.infos[self.target.parent]), "snapshot changed")
+        self.stack.enter_context(patch.object(custody, "_Held", Held))
+        self.stack.enter_context(patch.object(custody, "_Observed", Observed))
+        self.stack.enter_context(patch.object(custody, "checked", side_effect=lambda path: Path(path)))
+        self.stack.enter_context(patch.object(outputs, "checked", side_effect=lambda path: Path(path)))
+        self.stack.enter_context(patch.object(custody, "lifetime", side_effect=lambda: dict(self.now)))
+        self.stack.enter_context(patch.object(outputs, "lifetime", side_effect=lambda: dict(self.now)))
+        self.stack.enter_context(patch.object(custody, "CatalogGuard", return_value=self.gate))
+        self.stack.enter_context(patch.object(outputs, "CatalogGuard", return_value=self.gate))
+        self.stack.enter_context(patch.object(Path, "lstat", lambda path: self.infos[path] if path in self.infos else self.missing(path)))
+        self.stack.enter_context(patch.object(Path, "exists", lambda path: path in self.infos))
+        self.stack.enter_context(patch.object(Path, "mkdir", lambda path, *args, **kwargs: self.make(path, kwargs.get("exist_ok", False))))
+        self.stack.enter_context(patch.object(Path, "iterdir", lambda path: iter([item for item in self.files if item.parent == path])))
+        self.stack.enter_context(patch.object(outputs, "_read", side_effect=lambda path: custody._decode(self.files[path])))
+        self.stack.enter_context(patch.object(outputs, "identity", side_effect=lambda path: custody._did(self.infos[path])[:2]))
+        self.stack.enter_context(patch.object(outputs, "tree_size", side_effect=self.tree_bytes))
+        self.stack.enter_context(patch.object(custody, "tree_size", side_effect=self.tree_bytes))
+        self.stack.enter_context(patch.object(outputs, "write_record", side_effect=lambda path, row: self.put(path, custody._encode(row))))
+        self.fake_os = SimpleNamespace(geteuid=lambda: 1000, path=os.path,
+            scandir=self.scandir, fstat=lambda fd: self.infos[self.fd_paths[fd]],
+            stat=self.stat_at, mkdir=lambda path, *args: self.make(path, False),
+            fsync=lambda fd: None, major=lambda value: 0, minor=lambda value: value)
+        self.stack.enter_context(patch.object(custody, "os", self.fake_os))
+        self.stack.enter_context(patch.object(custody, "_exclusive", side_effect=self.exclusive))
+
+    @staticmethod
+    def missing(path):
+        raise FileNotFoundError(str(path))
+
+    @staticmethod
+    def info(inode, mode, size=0):
+        return SimpleNamespace(st_dev=7, st_ino=inode, st_mode=mode, st_uid=1000, st_gid=1000,
+            st_nlink=1, st_size=size, st_mtime_ns=100, st_ctime_ns=100)
+
+    def put(self, path, raw):
+        path = Path(path)
+        self.files[path] = raw
+        self.infos[path] = self.info(len(self.infos) + 100, stat.S_IFREG | 0o600, len(raw))
+
+    def reset_old(self):
+        self.old_raw = (json.dumps(self.old, indent=2) + chr(10)).encode()
+        self.put(self.row_path, self.old_raw)
+        self.old_pin = self.q._pin(self.row_path, self.old_raw)
+
+    def make(self, path, exist_ok=False):
+        path = Path(path)
+        if path in self.infos:
+            if not exist_ok:
+                raise FileExistsError(str(path))
+        else:
+            self.infos[path] = self.info(len(self.infos) + 10, stat.S_IFDIR | 0o700)
+
+    def manifest(self):
+        return {"schema": self.q.SCHEMA, "kind": "snapshot", "entry_count": 1, "regular_bytes": 8,
+            "entries": [{"name": ".", "stat": self.q._stamp(self.infos[self.target])}]}
+
+    def stat_at(self, name, *, dir_fd=None, follow_symlinks=True):
+        path = Path(name) if dir_fd is None else self.fd_paths[dir_fd] / name
+        return self.infos[path] if path in self.infos else self.missing(path)
+
+    def scandir(self, fd):
+        root = self.fd_paths[fd]
+        entries = [SimpleNamespace(name=path.name) for path in self.files if path.parent == root]
+        class Scan:
+            def __enter__(self):
+                return iter(entries)
+            def __exit__(self, *args):
+                return False
+        return Scan()
+
+    def tree_bytes(self, path, **kwargs):
+        if path == self.target:
+            return 8
+        return sum(len(raw) for item, raw in self.files.items() if item == path or path in item.parents)
+
+    def exclusive(self, held, fd, name, raw, maximum):
+        held.tick()
+        path = self.fd_paths[fd] / name
+        self.assertNotEqual(path, self.row_path)
+        self.assertLessEqual(len(raw), maximum)
+        if path in self.files:
+            raise FileExistsError(str(path))
+        self.actions.append(name)
+        self.put(path, raw)
+
+    def publish(self):
+        result = self.q.publish_custody_quarantine(self.catalog, self.old_pin, self.source_pin,
+            root_exclusive_writer=True, apply=True)
+        self.assertEqual(self.files[self.row_path], self.old_raw)
+        return result["receipt"]
+
+    def view(self, pins):
+        return self.q.validate_quarantines(self.catalog, self.o._catalog_rows(self.catalog), pins, self.gate)
+
+    def test_publication_marker_last_original_bytes_and_authority_unchanged(self):
+        receipt_pin = self.publish()
+        self.assertEqual([name.split(".")[-2] for name in self.actions], ["original", "snapshot", "receipt"])
+        receipt = self.q._decode(self.files[Path(receipt_pin["path"])])
+        self.assertIsNone(self.q._decode(self.files[self.row_path])["identity"])
+        self.assertFalse(receipt["original_generation_custody_reissued"])
+        self.assertFalse(receipt["original_generation_identity_known"])
+        self.assertEqual(receipt["physical_completion"], "unknown_unchanged")
+        view = self.view([receipt_pin])
+        try:
+            self.assertEqual(view.keys, frozenset([self.key]))
+            self.assertEqual(view.usage(self.o._catalog_rows(self.catalog)), 4096 + sum(len(raw) for path, raw in self.files.items() if path.parent == self.registry))
+        finally:
+            view.close()
+
+    def test_default_admission_still_blocks_and_explicit_all_boundaries_share_verifier(self):
+        receipt = self.publish()
+        with self.assertRaisesRegex(StorageError, "interrupted output"):
+            OutputLease(self.base / "default", self.base / "source", catalog=self.catalog).acquire()
+        with patch.object(self.q, "validate_quarantines", wraps=self.q.validate_quarantines) as verify:
+            owner = OutputLease(self.base / "fresh", self.base / "source", catalog=self.catalog,
+                                quarantine_receipts=[receipt], reserve=4096).acquire()
+            self.addCleanup(owner._close_quarantine_view)
+            owner.check_budget()
+            amount = sample_output_budget(self.catalog, quarantine_receipts=[receipt], quarantine_guard=owner.guard)
+            self.assertGreaterEqual(amount, 4096)
+            self.assertGreaterEqual(verify.call_count, 3)
+            owner.finish(status="finite-mock", tree_gone=True)
+        self.assertEqual(self.files[self.row_path], self.old_raw)
+
+    def test_outer_and_receipt_selection_rejected_before_any_path_io(self):
+        with patch.object(self.o, "checked", side_effect=AssertionError("no IO")) as read:
+            with self.assertRaisesRegex(StorageError, "outer finalizer"):
+                OutputLease(self.base / "unused", self.base / "source", outer_supervised=True, quarantine_receipts=[])
+        read.assert_not_called()
+        self.assertFalse(self.actions)
+
+    def test_same_boot_and_different_host_publication_refused(self):
+        for key, value in (("boot", "old"), ("host", "other")):
+            previous = self.now[key]
+            self.now[key] = value
+            with self.assertRaisesRegex(StorageError, "reboot contract"):
+                self.publish()
+            self.now[key] = previous
+        self.assertFalse(self.actions)
+        self.assertEqual(self.files[self.row_path], self.old_raw)
+
+    def test_no_implicit_receipt_selection_wrong_pin_and_boot_drift(self):
+        receipt = self.publish()
+        with self.assertRaisesRegex(StorageError, "explicit exact selection"):
+            self.view([])
+        with self.assertRaisesRegex(StorageError, "raw pin mismatch"):
+            self.view([dict(receipt, sha256="0" * 64)])
+        self.now["boot"] = "later-boot"
+        with self.assertRaisesRegex(StorageError, "current boot mismatch"):
+            self.view([receipt])
+
+    def test_snapshot_target_identity_and_parent_metadata_changes_refused(self):
+        receipt = self.publish()
+        for path, field in ((self.target, "st_mtime_ns"), (self.target, "st_ino"), (self.target.parent, "st_mode")):
+            original = getattr(self.infos[path], field)
+            setattr(self.infos[path], field, original + 1)
+            with self.assertRaises(StorageError):
+                self.view([receipt])
+            setattr(self.infos[path], field, original)
+
+    def test_marker_before_complete_publication_never_opens_admission(self):
+        original = self.exclusive
+        def fail_snapshot(held, fd, name, raw, maximum):
+            if name.endswith(".snapshot.json"):
+                raise OSError("snapshot sync failed")
+            original(held, fd, name, raw, maximum)
+        with patch.object(self.q, "_exclusive", side_effect=fail_snapshot):
+            with self.assertRaisesRegex(OSError, "snapshot sync failed"):
+                self.publish()
+        self.assertEqual(len(self.actions), 1)
+        self.assertEqual(self.files[self.row_path], self.old_raw)
+        with self.assertRaisesRegex(StorageError, "partial custody"):
+            self.view([])
+
+    def test_charge_keeps_reservation_and_registry_metadata_can_exhaust_cap(self):
+        self.old["reserved_bytes"] = 18 * 1024 ** 3
+        self.reset_old()
+        with self.assertRaisesRegex(StorageError, "registry metadata exceeds"):
+            self.publish()
+        self.assertFalse(self.actions)
+        self.assertEqual(self.files[self.row_path], self.old_raw)
+
+    def test_old_path_ancestors_descendants_and_other_active_row_stay_blocked(self):
+        receipt = self.publish()
+        for target in (self.target, self.target.parent, self.target / "child"):
+            with self.assertRaisesRegex(StorageError, "overlapping"):
+                OutputLease(target, self.base / "source", catalog=self.catalog, quarantine_receipts=[receipt]).acquire()
+        other_target = self.base / "another-active"
+        other_key = hashlib.sha256(os.path.normcase(str(other_target)).encode()).hexdigest()
+        other = dict(self.old, key=other_key, output=str(other_target))
+        self.put(self.catalog / (other_key + ".json"), self.q._encode(other))
+        with self.assertRaisesRegex(StorageError, "interrupted output"):
+            OutputLease(self.base / "new-root", self.base / "source", catalog=self.catalog, quarantine_receipts=[receipt]).acquire()
+
+    def test_registry_unknown_symlink_hardlink_and_metadata_bounds_refused(self):
+        receipt = self.publish()
+        receipt_path = Path(receipt["path"])
+        for field, value in (("st_mode", stat.S_IFLNK | 0o777), ("st_nlink", 2), ("st_size", 8193)):
+            old = getattr(self.infos[receipt_path], field)
+            setattr(self.infos[receipt_path], field, value)
+            with self.assertRaisesRegex(StorageError, "registry file"):
+                self.view([receipt])
+            setattr(self.infos[receipt_path], field, old)
+        self.put(self.registry / "unknown.json", b"x")
+        with self.assertRaisesRegex(StorageError, "unknown custody registry"):
+            self.view([receipt])
+
+
+
+    def test_held_guard_sampling_never_reacquires_and_busy_independent_sampling_fails(self):
+        receipt = self.publish()
+        with patch.object(self.o, "CatalogGuard", side_effect=AssertionError("no second live gate")):
+            self.assertGreater(sample_output_budget(self.catalog, quarantine_receipts=[receipt], quarantine_guard=self.gate), 4096)
+        self.gate.assert_held.assert_called()
+        with patch.object(self.q, "CatalogGuard", side_effect=StorageError("catalog gate busy")):
+            with self.assertRaisesRegex(StorageError, "gate busy"):
+                sample_output_budget(self.catalog, quarantine_receipts=[receipt])
+        with self.assertRaisesRegex(StorageError, "without explicit"):
+            sample_output_budget(self.catalog, quarantine_guard=self.gate)
+
+    def test_original_row_identity_raw_and_receipt_meaning_changes_refused(self):
+        receipt = self.publish()
+        row_info = self.infos[self.row_path]
+        row_info.st_ino += 1
+        with self.assertRaisesRegex(StorageError, "original catalog metadata"):
+            self.view([receipt])
+        row_info.st_ino -= 1
+        raw = self.files[self.row_path]
+        self.files[self.row_path] = raw + b" "
+        with self.assertRaisesRegex(StorageError, "raw pin mismatch"):
+            self.view([receipt])
+        self.files[self.row_path] = raw
+        path = Path(receipt["path"])
+        original = self.files[path]
+        value = self.q._decode(original)
+        for key, invalid in (("unregistered_field", True), ("original_generation_custody_reissued", True),
+                             ("physical_completion", "complete")):
+            changed = dict(value, **{key: invalid})
+            self.files[path] = self.q._encode(changed)
+            self.infos[path].st_size = len(self.files[path])
+            with self.assertRaises(StorageError):
+                self.view([self.q._pin(path, self.files[path])])
+        self.files[path] = original
+        self.infos[path].st_size = len(original)
+        self.files[self.source_path] = b"different publisher implementation"
+        with self.assertRaisesRegex(StorageError, "raw pin mismatch"):
+            self.view([receipt])
+
+    def test_receipt_write_failure_and_registry_caps_preserve_partial_evidence(self):
+        original = self.exclusive
+        def fail_marker(held, fd, name, raw, maximum):
+            if name.endswith(".receipt.json"):
+                raise OSError("receipt fsync uncertain")
+            return original(held, fd, name, raw, maximum)
+        with patch.object(self.q, "_exclusive", side_effect=fail_marker):
+            with self.assertRaisesRegex(OSError, "receipt fsync uncertain"):
+                self.publish()
+        self.assertEqual([name.split(".")[-2] for name in self.actions], ["original", "snapshot"])
+        self.assertEqual(self.files[self.row_path], self.old_raw)
+        with self.assertRaisesRegex(StorageError, "partial custody"):
+            self.view([])
+        with patch.object(self.q, "REGISTRY_LIMIT", 1):
+            with self.assertRaisesRegex(StorageError, "registry bound"):
+                self.view([])
+        with patch.object(self.q, "MAX_RUNS", 0):
+            with self.assertRaisesRegex(StorageError, "registry bound"):
+                self.view([])
+
+    def test_original_gate_release_failure_preserves_primary(self):
+        primary = StorageError("original publication failure")
+        self.gate.release.side_effect = OSError("secondary gate close failure")
+        with self.assertRaisesRegex(StorageError, "original publication failure") as caught:
+            with self.q.original_custody_gate(self.catalog):
+                raise primary
+        self.assertIs(caught.exception, primary)
+        self.assertTrue(any("gate release also failed" in note for note in primary.__notes__))
+
+    def test_registry_equal_parent_child_outputs_refused_before_mkdir_or_row_write(self):
+        receipt = self.publish()
+        before = dict(self.files)
+        with patch.object(Path, "mkdir", side_effect=AssertionError("no target creation")) as create, \
+                patch.object(self.o, "write_record", side_effect=AssertionError("no row write")) as write:
+            for target in (self.registry, self.registry / "child", self.registry.parent):
+                with self.subTest(target=target), self.assertRaisesRegex(StorageError, "overlaps custody registry"):
+                    OutputLease(target, self.base / "source", catalog=self.catalog,
+                                quarantine_receipts=[receipt])
+        create.assert_not_called()
+        write.assert_not_called()
+        self.assertEqual(self.files, before)
+        self.assertEqual(self.files[self.row_path], self.old_raw)
+
+    def test_common_verifier_refuses_existing_rows_overlapping_registry(self):
+        receipt = self.publish()
+        rows = self.o._catalog_rows(self.catalog)
+        for target in (self.registry, self.registry / "child", self.registry.parent):
+            key = hashlib.sha256(os.path.normcase(str(target)).encode()).hexdigest()
+            other = dict(self.old, key=key, output=str(target))
+            joined = rows + [(self.catalog / (key + ".json"), other, target)]
+            with self.subTest(target=target), self.assertRaisesRegex(StorageError, "row overlaps custody registry"):
+                self.q.validate_quarantines(self.catalog, joined, [receipt], self.gate)
+        self.assertEqual(self.files[self.row_path], self.old_raw)
+
+    def test_legacy_recovery_refuses_final_partial_empty_or_broken_registry_before_row_read(self):
+        receipt = self.publish()
+        self.infos.pop(self.target)  # Fault: original target name is now absent.
+        artifacts = {path: raw for path, raw in self.files.items() if path.parent == self.registry}
+        cases = (("final", stat.S_IFDIR | 0o700, artifacts),
+                 ("partial", stat.S_IFDIR | 0o700, {path: raw for path, raw in artifacts.items() if path.name.endswith(".snapshot.json")}),
+                 ("empty", stat.S_IFDIR | 0o700, {}),
+                 ("broken-symlink", stat.S_IFLNK | 0o777, {}),
+                 ("regular", stat.S_IFREG | 0o600, {}))
+        for label, mode, selected in cases:
+            for path in artifacts:
+                self.files.pop(path, None)  # In-memory fault state only; no filesystem deletion.
+            self.files.update(selected)
+            self.infos[self.registry].st_mode = mode
+            with self.subTest(case=label), \
+                    patch.object(self.o, "read_record_snapshot", side_effect=AssertionError("no original row read")) as read, \
+                    patch.object(self.o, "write_record", side_effect=AssertionError("no original row write")) as write:
+                with self.assertRaisesRegex(StorageError, "legacy output recovery is forbidden"):
+                    recover_output(self.catalog, self.key, self.old_pin["sha256"])
+                read.assert_not_called()
+                write.assert_not_called()
+            self.assertEqual(self.files[self.row_path], self.old_raw)
+
+    def test_registry_absent_legacy_recovery_keeps_original_absent_deferred_behavior(self):
+        self.infos.pop(self.target)
+        snapshot = (copy.deepcopy(self.old), self.old_pin["sha256"], "mock-stamp")
+        with patch.object(self.o, "read_record_snapshot", return_value=snapshot):
+            result = recover_output(self.catalog, self.key, self.old_pin["sha256"])
+        self.assertEqual(result["state"], "interrupted_retained")
+        self.assertIsNone(result["identity"])
+        self.assertNotIn(self.registry, self.infos)
+
+    def assert_postwrite_refusal(self, mutation, expected, secondary_close=False):
+        receipt = self.publish()
+        owner = OutputLease(self.base / "late-write", self.base / "source", catalog=self.catalog,
+                            deferred=True, quarantine_receipts=[receipt], reserve=4096)
+        self.addCleanup(owner._close_quarantine_view)
+        row_path = self.catalog / (owner.key + ".json")
+        def write_then_change(path, row):
+            self.put(path, self.q._encode(row))
+            if path == row_path:
+                mutation(owner)
+        if secondary_close:
+            self.gate.release.side_effect = OSError("secondary release failure")
+        with patch.object(self.o, "write_record", side_effect=write_then_change):
+            with self.assertRaisesRegex(StorageError, expected) as failure:
+                owner.acquire()
+        self.assertIn(row_path, self.files)
+        self.assertEqual(self.q._decode(self.files[row_path])["state"], "active")
+        self.assertFalse(owner.output.exists())
+        self.assertEqual(self.files[self.row_path], self.old_raw)
+        if secondary_close:
+            self.assertTrue(any("gate release also failed" in note for note in failure.exception.__notes__))
+
+    def test_postwrite_expired_observation_refuses_admission_without_rollback(self):
+        self.assert_postwrite_refusal(lambda owner: setattr(owner._quarantine_view.held, "until", 0), "original custody deadline")
+
+    def test_postwrite_boot_change_refuses_admission_without_rollback(self):
+        self.assert_postwrite_refusal(lambda owner: self.now.update(boot="changed-during-write"), "current custody boot changed")
+
+    def test_postwrite_snapshot_change_refuses_admission_without_rollback(self):
+        self.assert_postwrite_refusal(lambda owner: setattr(self.infos[self.target], "st_mtime_ns", 900), "snapshot changed")
+
+    def test_postwrite_failure_remains_primary_when_gate_release_also_fails(self):
+        self.assert_postwrite_refusal(lambda owner: setattr(self.infos[self.target], "st_mtime_ns", 900),
+                                     "snapshot changed", secondary_close=True)
+
+
+class QuarantineMetadataBoundaryTests(unittest.TestCase):
+    """Exercise production FD/metadata walkers against a closed in-memory OS."""
+    def setUp(self):
+        import managed_output_quarantine as custody
+        self.q = custody
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.target = Path("/custody-metadata/private/old")
+        self.nodes = {}
+        for inode, path in enumerate((self.target.parent, self.target, self.target / "sub"), 10):
+            self.nodes[path] = self.info(inode, stat.S_IFDIR | 0o700)
+        self.file = self.target / "result.log"
+        self.nodes[self.file] = self.info(20, stat.S_IFREG | 0o600, 8)
+        self.nodes[self.target / "sub" / "more.log"] = self.info(21, stat.S_IFREG | 0o600, 9)
+        self.fds, self.opened, self.closed = {}, [], []
+        self.namespace = self.info(90, stat.S_IFREG | 0o400)
+        self.mount_raw = b"1 0 0:7 / / rw - ext4 dev rw\n"
+        real_os = os
+        self.fake_os = SimpleNamespace(
+            O_RDONLY=real_os.O_RDONLY, O_DIRECTORY=getattr(real_os, "O_DIRECTORY", 65536),
+            O_NOFOLLOW=getattr(real_os, "O_NOFOLLOW", 131072), O_PATH=getattr(real_os, "O_PATH", 2097152),
+            O_WRONLY=real_os.O_WRONLY, O_CREAT=real_os.O_CREAT, O_EXCL=real_os.O_EXCL,
+            open=self.open, close=self.close, fstat=lambda fd: self.nodes[self.fds[fd]], stat=self.stat_at,
+            scandir=self.scandir, geteuid=lambda: 1000, major=lambda device: 0, minor=lambda device: device,
+            read=Mock(side_effect=AssertionError("payload reads forbidden")))
+        self.stack.enter_context(patch.object(custody, "os", self.fake_os))
+        self.stack.enter_context(patch.object(custody, "sys", SimpleNamespace(platform="linux", exc_info=sys.exc_info)))
+        self.stack.enter_context(patch.object(custody, "checked", side_effect=lambda path: Path(path)))
+        self.stack.enter_context(patch.object(custody, "_kernel", side_effect=lambda held, path, maximum: self.mount_raw))
+        self.stack.enter_context(patch.object(Path, "lstat", lambda path: self.nodes[path]))
+        self.held = custody._Held(30)
+        self.addCleanup(self.held.close)
+
+    @staticmethod
+    def info(inode, mode, size=0):
+        return SimpleNamespace(st_dev=7, st_ino=inode, st_mode=mode, st_uid=1000, st_gid=1000,
+            st_nlink=1, st_size=size, st_atime_ns=100, st_mtime_ns=100, st_ctime_ns=100)
+
+    def open(self, name, flags, *args, dir_fd=None):
+        path = Path(name) if dir_fd is None else self.fds[dir_fd] / name
+        if stat.S_ISREG(self.nodes[path].st_mode):
+            self.assertTrue(flags & self.fake_os.O_PATH, "regular payload must use O_PATH only")
+        self.assertTrue(flags & self.fake_os.O_NOFOLLOW)
+        fd = max([99, *self.fds]) + 1
+        self.fds[fd] = path
+        self.opened.append((path, flags))
+        return fd
+
+    def close(self, fd):
+        self.closed.append(fd)
+        del self.fds[fd]
+
+    def stat_at(self, name, *, dir_fd=None, follow_symlinks=True):
+        if str(name) == "/proc/self/ns/mnt":
+            return self.namespace
+        path = Path(name) if dir_fd is None else self.fds[dir_fd] / name
+        return self.nodes[path]
+
+    def scandir(self, fd):
+        children = [SimpleNamespace(name=path.name) for path in self.nodes if path.parent == self.fds[fd]]
+        class Scan:
+            def __enter__(self):
+                return iter(children)
+            def __exit__(self, *args):
+                return False
+        return Scan()
+
+    def test_real_walker_uses_path_fds_atime_and_sibling_parent_changes_are_allowed(self):
+        observed = self.q._Observed(self.held, self.target)
+        self.assertEqual(observed.snapshot["regular_bytes"], 17)
+        self.assertEqual(observed.snapshot["entry_count"], 4)
+        self.nodes[self.file].st_atime_ns += 500
+        self.nodes[self.target].st_atime_ns += 500
+        parent = self.nodes[self.target.parent]
+        parent.st_nlink += 1
+        parent.st_size += 1
+        parent.st_mtime_ns += 500
+        parent.st_ctime_ns += 500
+        self.nodes[self.target.parent / "fresh-sibling"] = self.info(30, stat.S_IFDIR | 0o700)
+        observed.check()
+        self.fake_os.read.assert_not_called()
+        files = [flags for path, flags in self.opened if stat.S_ISREG(self.nodes[path].st_mode)]
+        self.assertTrue(files and all(flags & self.fake_os.O_PATH for flags in files))
+        self.held.close()
+        self.assertFalse(self.fds)
+
+    def test_target_roster_mtime_ctime_and_parent_or_target_identity_changes_refused(self):
+        observed = self.q._Observed(self.held, self.target)
+        for path, field in ((self.file, "st_mtime_ns"), (self.file, "st_ctime_ns"), (self.file, "st_size"),
+                            (self.target, "st_nlink"), (self.target.parent, "st_ino"),
+                            (self.target.parent, "st_mode"), (self.target, "st_ino")):
+            before = getattr(self.nodes[path], field)
+            setattr(self.nodes[path], field, before + 1)
+            with self.subTest(path=path, field=field), self.assertRaises(StorageError):
+                observed.check()
+            setattr(self.nodes[path], field, before)
+        added = self.target / "new.log"
+        self.nodes[added] = self.info(50, stat.S_IFREG | 0o600, 1)
+        with self.assertRaisesRegex(StorageError, "snapshot changed"):
+            observed.check()
+
+    def test_symlink_hardlink_special_cross_device_and_duplicate_inode_refused(self):
+        fd = self.held.directory(self.target)
+        for field, value in (("st_mode", stat.S_IFLNK | 0o777), ("st_mode", stat.S_IFSOCK | 0o600),
+                             ("st_nlink", 2), ("st_dev", 8), ("st_uid", 1001), ("st_ino", 21)):
+            before = getattr(self.nodes[self.file], field)
+            setattr(self.nodes[self.file], field, value)
+            with self.subTest(field=field, value=value), self.assertRaises(StorageError):
+                self.q._snapshot(self.held, self.target, fd)
+            setattr(self.nodes[self.file], field, before)
+        self.fake_os.read.assert_not_called()
+
+    def test_roster_entry_and_snapshot_serialization_caps_are_fail_closed(self):
+        fd = self.held.directory(self.target)
+        with patch.object(self.q, "MAX_ENTRIES", 2), self.assertRaisesRegex(StorageError, "bound exceeded"):
+            self.q._snapshot(self.held, self.target, fd)
+        with patch.object(self.q, "SNAPSHOT_LIMIT", 128), self.assertRaisesRegex(StorageError, "metadata bound"):
+            self.q._snapshot(self.held, self.target, fd)
+
+    def test_current_mount_namespace_alias_nested_stack_and_drift_are_refused(self):
+        observed = self.q._Observed(self.held, self.target)
+        original = self.mount_raw
+        variants = (
+            b"2 1 0:7 /custody-metadata/private /alias rw - ext4 dev rw\n",
+            b"2 1 0:8 / /custody-metadata/private/old/sub rw - ext4 dev rw\n",
+            b"2 1 0:7 / / rw - ext4 dev rw\n",
+        )
+        for extra in variants:
+            self.mount_raw = original + extra
+            with self.subTest(extra=extra), self.assertRaises(StorageError):
+                self.q._mounts(self.held, self.target.parent, self.target, 7)
+        self.mount_raw = original
+        self.namespace.st_ino += 1
+        with self.assertRaisesRegex(StorageError, "namespace/mount"):
+            observed.check()
+        self.namespace.st_ino -= 1
+        self.mount_raw += b"3 1 0:8 / /unrelated rw - ext4 dev rw\n"
+        with self.assertRaisesRegex(StorageError, "namespace/mount"):
+            observed.check()
+
+    def test_directory_fd_cache_name_recheck_and_first_fstat_failure_close(self):
+        first = self.held.directory(self.target)
+        self.assertEqual(first, self.held.directory(self.target))
+        self.assertEqual(len(self.held.fds), 1)
+        info = self.nodes[self.target]
+        self.nodes[self.target] = self.info(900, info.st_mode)
+        with patch.object(self.fake_os, "fstat", return_value=info):
+            with self.assertRaisesRegex(StorageError, "directory name changed"):
+                self.held.directory(self.target)
+        self.nodes[self.target] = info
+        self.held.close()
+        self.assertFalse(self.fds)
+        with patch.object(self.fake_os, "fstat", side_effect=OSError("first fstat failed")):
+            with self.assertRaisesRegex(OSError, "first fstat failed") as failure:
+                try:
+                    self.q._Observed(self.held, self.target)
+                except BaseException as primary:
+                    self.held.close(primary)
+                    raise
+        self.assertFalse(self.fds)
+
+    def test_partial_exclusive_write_keeps_original_error_when_close_also_fails(self):
+        primary = OSError("primary write failure")
+        fake = SimpleNamespace(O_WRONLY=1, O_CREAT=2, O_EXCL=4, O_NOFOLLOW=8,
+            open=Mock(return_value=200), write=Mock(side_effect=primary),
+            close=Mock(side_effect=OSError("secondary close failure")), fsync=Mock())
+        with patch.object(self.q, "os", fake):
+            with self.assertRaisesRegex(OSError, "primary write failure") as caught:
+                self.q._exclusive(self.held, 10, "receipt.json", b"bounded", 8192)
+        self.assertIs(caught.exception, primary)
+        self.assertTrue(any("close also failed" in note for note in primary.__notes__))
+        fake.fsync.assert_not_called()
+
+    def test_related_readonly_mount_alias_allows_rw_superblock_and_records_scope(self):
+        self.mount_raw += b"2 1 0:7 / /readonly ro,relatime - ext4 dev rw,relatime\n"
+        observed = self.q._Observed(self.held, self.target)
+        aliases = observed.mounts["readonly_aliases"]
+        self.assertEqual(len(aliases), 1)
+        self.assertEqual(aliases[0]["mount_id"], "2")
+        self.assertEqual(aliases[0]["mount_options"], "ro,relatime")
+        self.assertEqual(aliases[0]["mountpoint"], str(Path("/readonly")))
+        observed.check()
+        self.fake_os.read.assert_not_called()
+
+    def test_related_writable_or_unknown_mount_options_never_use_superblock_ro(self):
+        original = self.mount_raw
+        for mount, superblock in (("rw,relatime", "ro"), ("ro,rw", "ro"),
+                                  ("relatime", "ro"), ("rofoo", "ro")):
+            self.mount_raw = original + ("2 1 0:7 / /readonly " + mount + " - ext4 dev " + superblock + "\n").encode()
+            with self.subTest(mount=mount, superblock=superblock), self.assertRaisesRegex(StorageError, "writable or unknown"):
+                self.q._mounts(self.held, self.target.parent, self.target, 7)
+
+    def test_readonly_alias_any_stacked_or_nested_mount_stays_forbidden(self):
+        original = self.mount_raw + b"2 1 0:7 / /readonly ro - ext4 dev rw\n"
+        for other in (b"3 1 0:8 / /readonly rw - other dev rw\n",
+                      b"3 1 0:8 / /readonly/unrelated-child ro - other dev ro\n"):
+            self.mount_raw = original + other
+            with self.subTest(other=other), self.assertRaisesRegex(StorageError, "stacked readonly|nested readonly"):
+                self.q._mounts(self.held, self.target.parent, self.target, 7)
+        # Canonical target nesting remains forbidden even if that mount is ro.
+        self.mount_raw = original + b"3 1 0:8 / /custody-metadata/private/old/sub ro - other dev ro\n"
+        with self.assertRaisesRegex(StorageError, "nested custody|nested readonly"):
+            self.q._mounts(self.held, self.target.parent, self.target, 7)
+
+    def test_readonly_alias_options_drift_refuses_previously_observed_view(self):
+        self.mount_raw += b"2 1 0:7 / /readonly ro,relatime - ext4 dev rw\n"
+        observed = self.q._Observed(self.held, self.target)
+        self.mount_raw = self.mount_raw.replace(b"/readonly ro,relatime", b"/readonly rw,relatime")
+        with self.assertRaisesRegex(StorageError, "writable or unknown"):
+            observed.check()
+
+
+@unittest.skipUnless(sys.platform == "linux", "Linux actual FD/fsync/mount metadata only; Root executes")
+class InterruptedUnboundQuarantineLinuxTests(unittest.TestCase):
+    """Private fixtures, real verifier/FDs; lifetime injection is not a reboot proof."""
+    def setUp(self):
+        import managed_outputs as outputs
+        import managed_output_quarantine as custody
+        self.o, self.q = outputs, custody
+        temporary = tempfile.TemporaryDirectory(prefix="rovezero-unbound-custody-")
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name).resolve()
+        self.base.chmod(0o700)
+        self.source, self.catalog = self.base / "source", self.base / "outputs"
+        self.parent = self.base / "private"
+        for path in (self.source, self.catalog, self.parent):
+            path.mkdir(mode=0o700)
+            path.chmod(0o700)
+        self.target = self.parent / "old"
+        self.target.mkdir(mode=0o700)
+        (self.target / "original.log").write_bytes(b"retained fixture payload")
+        nested = self.target / "sub"
+        nested.mkdir(mode=0o700)
+        (nested / "more.log").write_bytes(b"second fixture payload")
+        # Byte-identical implementation copy gives this fixture a private source
+        # owner/path. Only provenance location and lifetime are fault-injected;
+        # the Linux verifier, metadata walker, mount checks and writes stay real.
+        implementation = self.source / "managed_output_quarantine.py"
+        implementation.write_bytes(Path(custody.__file__).read_bytes())
+        implementation.chmod(0o600)
+        self.source_pin = custody._pin(implementation, implementation.read_bytes())
+        self.now = {"host": "fixture-only-host", "boot": "fixture-new-boot",
+                    "platform": "linux", "process_birth": "fixture-process-birth"}
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(custody, "__file__", str(implementation)))
+        self.stack.enter_context(patch.object(custody, "lifetime", side_effect=lambda: dict(self.now)))
+        self.stack.enter_context(patch.object(outputs, "lifetime", side_effect=lambda: dict(self.now)))
+        self.key = hashlib.sha256(os.path.normcase(str(self.target)).encode()).hexdigest()
+        self.row_path = self.catalog / (self.key + ".json")
+        self.row = {"schema": "rovezero.managed-output.v1", "key": self.key, "output": str(self.target),
+            "source": str(self.source), "state": "active", "deferred": True, "identity": None,
+            "token": "fixture-original-token", "pid": 123, "lifetime": dict(self.now, boot="fixture-old-boot"),
+            "reserved_bytes": 1 << 20, "catalog_limit_bytes": 18 * 1024 ** 3,
+            "original_result": {"failure": "preserved", "physical": "unknown"}}
+        self.raw = (json.dumps(self.row, indent=2) + chr(10)).encode()
+        self.row_path.write_bytes(self.raw)
+        self.row_path.chmod(0o600)
+        self.row_pin = custody._pin(self.row_path, self.raw)
+        self.registry = custody.registry_path(self.catalog)
+
+    def publish(self):
+        result = self.q.publish_custody_quarantine(self.catalog, self.row_pin, self.source_pin,
+            root_exclusive_writer=True, apply=True)
+        self.assertEqual(self.row_path.read_bytes(), self.raw)
+        return result["receipt"]
+
+    def fresh_owner(self, receipt):
+        owner = OutputLease(self.parent / "fresh", self.source, catalog=self.catalog,
+                            reserve=1 << 20, deferred=True, quarantine_receipts=[receipt]).acquire()
+        def close_descriptors_only():
+            try:
+                owner._close_created_directory()
+            finally:
+                try:
+                    owner._close_quarantine_view()
+                finally:
+                    owner.guard.release()
+        self.addCleanup(close_descriptors_only)
+        return owner
+
+    def assert_new_admission_refused(self, receipt):
+        with self.assertRaises(StorageError):
+            OutputLease(self.parent / "fresh", self.source, catalog=self.catalog,
+                        deferred=True, quarantine_receipts=[receipt]).acquire()
+        self.assertEqual(self.row_path.read_bytes(), self.raw)
+        self.assertIsNone(json.loads(self.row_path.read_bytes())["identity"])
+        self.assertFalse((self.parent / "fresh").exists())
+
+    def test_actual_publication_marker_last_and_same_parent_sibling_producer(self):
+        order = []
+        original = self.q._exclusive
+        def record(held, fd, name, raw, maximum):
+            if name.endswith(".receipt.json"):
+                self.assertTrue(any(self.registry.glob("*.original.json")))
+                self.assertTrue(any(self.registry.glob("*.snapshot.json")))
+                self.assertFalse(any(self.registry.glob("*.receipt.json")))
+            original(held, fd, name, raw, maximum)
+            order.append(name.split(".")[-2])
+        with patch.object(self.q, "_exclusive", side_effect=record):
+            receipt = self.publish()
+        self.assertEqual(order, ["original", "snapshot", "receipt"])
+        owner = self.fresh_owner(receipt)
+        before_parent = self.parent.stat()
+        owner.create_deferred_directory()
+        (owner.output / "new.log").write_bytes(b"fresh fixture payload")
+        self.assertTrue(owner.output.is_dir())
+        self.assertEqual(self.q._did(self.parent.stat()), self.q._did(before_parent))
+        owner.check_budget()
+        sampled = sample_output_budget(self.catalog, quarantine_receipts=[receipt], quarantine_guard=owner.guard)
+        self.assertGreaterEqual(sampled, self.row["reserved_bytes"])
+        finished = owner.finish(status="fixture-no-child", tree_gone=True)
+        self.assertEqual(finished["state"], "retained")
+        self.assertEqual(finished["physical_completion"], "not_inferred_from_output_lifecycle")
+        marker = json.loads(Path(receipt["path"]).read_bytes())
+        self.assertEqual(marker["physical_completion"], "unknown_unchanged")
+        self.assertFalse(marker["original_generation_custody_reissued"])
+        self.assertEqual(self.row_path.read_bytes(), self.raw)
+
+    def test_actual_target_rename_replacement_cannot_rebind_receipt(self):
+        receipt = self.publish()
+        self.target.rename(self.parent / "preserved-original")
+        self.target.mkdir(mode=0o700)
+        (self.target / "original.log").write_bytes(b"retained fixture payload")
+        self.assert_new_admission_refused(receipt)
+
+    def test_actual_parent_rename_replacement_cannot_rebind_receipt(self):
+        receipt = self.publish()
+        self.parent.rename(self.base / "preserved-parent")
+        self.parent.mkdir(mode=0o700)
+        self.target.mkdir(mode=0o700)
+        (self.target / "original.log").write_bytes(b"retained fixture payload")
+        self.assert_new_admission_refused(receipt)
+
+    def test_actual_partial_receipt_write_keeps_original_and_blocks_admission(self):
+        original = self.q._exclusive
+        def fail_marker(held, fd, name, raw, maximum):
+            if name.endswith(".receipt.json"):
+                raise OSError("fixture receipt write refused")
+            return original(held, fd, name, raw, maximum)
+        with patch.object(self.q, "_exclusive", side_effect=fail_marker):
+            with self.assertRaisesRegex(OSError, "fixture receipt write refused"):
+                self.publish()
+        self.assertTrue(any(self.registry.glob("*.original.json")))
+        self.assertTrue(any(self.registry.glob("*.snapshot.json")))
+        self.assertFalse(any(self.registry.glob("*.receipt.json")))
+        self.assertEqual(self.row_path.read_bytes(), self.raw)
+        with self.assertRaisesRegex(StorageError, "partial custody"):
+            OutputLease(self.parent / "fresh", self.source, catalog=self.catalog,
+                        deferred=True, quarantine_receipts=[]).acquire()
+        self.assertFalse((self.parent / "fresh").exists())
 
 if __name__ == "__main__":
     unittest.main()
