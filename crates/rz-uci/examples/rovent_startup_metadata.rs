@@ -865,6 +865,8 @@ mod metadata {
         fn own_nnuec_fixture() -> Vec<u8> {
             let mut value: serde_json::Value =
                 serde_json::from_slice(&fixture(ROVENT_STARTUP_CONFIGURATION_DOMAIN, "")).unwrap();
+            // Fixed uses the same controller validation; these two declarations
+            // match ControllerConfig::default().
             value["execution"] = serde_json::json!({
                 "assembly":"own_researcher", "event_order":"fixed",
                 "queues":{"waiting_jobs_max":8,"worker_commands_max":8,
@@ -878,8 +880,8 @@ mod metadata {
                 "value":{"value":"nnuec_v2","context_namespace_policy":"fixture-context",
                     "local_namespace_policy":"fixture-local"},
                 "controller":{"fixed_node_credit":64,"fixed_soft_lease_us":1000,
-                    "initial_workers":1,"max_workers":1,"consecutive_observations":1,
-                    "worker_cooldown_ms":1},
+                    "initial_workers":1,"max_workers":1,"consecutive_observations":3,
+                    "worker_cooldown_ms":2000},
                 "reciprocal":{"recipient":"critic","max_questions_per_job":1,
                     "node_interval":1,"first_question_sequence":1},
                 "peers":{"pc_peer":true,"researcher":true,"max_sources_per_root":1}
