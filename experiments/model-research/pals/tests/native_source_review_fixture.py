@@ -490,7 +490,7 @@ class FeedbackObservationFixtureTests(_fixture_unittest.TestCase):
 # idle/archive dependencies; archive_lifecycle.rs was already in the fourteen.
 # Its compiled fact is a synthetic label, never an actual binary, archive I/O,
 # native retirement, selected-view consumption, Rules or training authority.
-IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT = 'e3c9f68c567813ef8cf8ca723a019c12f455c0ef'
+IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT = 'afceff25bd3168fe2891f9cb37bb791875f6bf88'
 IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
         "bytes": 423651,
@@ -525,8 +525,8 @@ IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
         "sha256": "72e85351261631f7bf57e95a53f95d8c8a6a079e3a320f27efcbefec2e1f938a"
     },
     "crates/rz-search/src/pals/engine/archive_lifecycle.rs": {
-        "bytes": 162330,
-        "sha256": "b4a06dc34930decd69b1ad5ca0b4a578cf3ec8183196e7d42c63dea5ab66d415"
+        "bytes": 174025,
+        "sha256": "c56b00f70900365b7ada4156cd77e325f4ea5ae6c01769e8b8b55c20d7e68332"
     },
     "crates/rz-arena/src/pals_collect.rs": {
         "bytes": 182486,
@@ -549,12 +549,12 @@ IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
         "sha256": "d72fad02feee033ce223f8d8608bd4847e6adc954232b82dd0c3abfd2065a304"
     },
     "crates/rz-search/src/pals/engine/idle_archive.rs": {
-        "bytes": 32809,
-        "sha256": "028d9db2fef308ab68a33bc475879fa049761a0a3bb284524079b0b8ce97b810"
+        "bytes": 61470,
+        "sha256": "d7fc45d196adf239209a74af6eb2d554cc210fe24a7f2f9a1a6fedcc7140fb08"
     },
     "crates/rz-search/src/pals/engine/adaptive_port/archive_worker.rs": {
-        "bytes": 111725,
-        "sha256": "6905b29b4bcd3f9ae1c5509762cc31cbcb272900d68867c57e2cb573631ef8c1"
+        "bytes": 121261,
+        "sha256": "d5da6826be44d9e08994150488250ad328b1a0eb28e0713a9b7b4b3861455e71"
     },
     "crates/rz-search/src/pals/engine/preparing_root.rs": {
         "bytes": 13206,
@@ -565,8 +565,8 @@ IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
         "sha256": "482e1851bf4d135886c7383929fe087fbf9aadde717374440d409489fb92898f"
     },
     "crates/rz-search/src/pals/engine/adaptive_root.rs": {
-        "bytes": 28149,
-        "sha256": "708386d0e96a5b329529bc87bab0c40fcbedc2ddcf6752f40541ea579a90aa9a"
+        "bytes": 29813,
+        "sha256": "6ccfeda0e113f42167c7c694cf2324bf4557adb3d98c233d2a83bcc22a59c8c8"
     },
     "crates/rz-search/src/pals/store/archive.rs": {
         "bytes": 179458,
@@ -576,16 +576,16 @@ IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
 IDLE_ARCHIVE_REVIEWED_TRANSITION_PINS = {
     path: copy.deepcopy(IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS[path]) for path in (
         "crates/rz-search/src/pals/engine.rs", "crates/rz-arena/src/pals_collect/native.rs")}
-IDLE_ARCHIVE_REVIEWED_CLOSURE_SHA256 = '5e079727957f22e86bc3efad11988bdfe92a010214babba7d74af5631ff1bddb'
-# SHA-256 of b"synthetic independently declared compiled closure fact for reviewed unused idle archive source e3c9f68\n".
-IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT = 'd8d99bb44c7e9d094390cfa2a653a83f25f33ea8d5b66e5714be496d4d00c754'
+IDLE_ARCHIVE_REVIEWED_CLOSURE_SHA256 = '72e34e8533ae82330acd9f62ab9628a70ce3b7227df573b26fe162aa2ef7f4dd'
+# SHA-256 of b"synthetic independently declared compiled closure fact for reviewed engine idle source afceff2\n"; no actual compiled proof.
+IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT = '431ab7c9ab24953666ab4424d73f07481b7429475ed3fdf9834d017d307cc018'
 
 
 def idle_archive_fixture_profile(lane):
     if lane not in ("default_disabled", "legacy_single_reply"):
         raise ValueError("explicit synthetic idle-archive review lane required")
     return {"schema": "rz-pals-native-reviewed-transition-profile/1",
-        "review_id": "synthetic-reviewed-e3c9f68-idle-archive-twenty-source-" + lane,
+        "review_id": "synthetic-reviewed-afceff2-engine-idle-twenty-source-" + lane,
         "lane": lane, "transition_sources": copy.deepcopy(IDLE_ARCHIVE_REVIEWED_TRANSITION_PINS),
         "component_pins": copy.deepcopy(IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS),
         "compiled_search_implementation_sha256": IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT,
@@ -635,7 +635,7 @@ class IdleArchiveFixtureTests(_fixture_unittest.TestCase):
             "crates/rz-search/src/pals/engine/adaptive_root.rs",
             "crates/rz-search/src/pals/store/archive.rs"}
         current = banks.idle_archive_fixture_profile("default_disabled")
-        self.assertEqual(banks.idle_archive_fixture_manifest()["source_commit"], 'e3c9f68c567813ef8cf8ca723a019c12f455c0ef')
+        self.assertEqual(banks.idle_archive_fixture_manifest()["source_commit"], 'afceff25bd3168fe2891f9cb37bb791875f6bf88')
         self.assertEqual(set(current["component_pins"]),
                          set(prior[-1]["component_pins"]) | expected_extra)
         self.assertEqual(len(current["component_pins"]), 20)
