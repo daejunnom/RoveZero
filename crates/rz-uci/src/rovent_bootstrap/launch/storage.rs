@@ -906,13 +906,13 @@ fn io(stage: &'static str, source: std::io::Error) -> RoventStorageAdmissionErro
 #[cfg(test)]
 mod compiled_source_tests {
     use super::*;
-    use sha2::{Digest as _, Sha256};
+    use sha2::Sha256;
 
     fn artifact(path: &str, bytes: &[u8]) -> ArtifactRef {
         ArtifactRef {
             path: path.into(),
             bytes: bytes.len() as u64,
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: format!("{:x}", <Sha256 as sha2::Digest>::digest(bytes)),
             source: "https://example.org/compiled-storage-comparison-fixture".into(),
             license: "fixture-only".into(),
         }
@@ -978,7 +978,7 @@ mod compiled_source_tests {
         assert!(verify_compiled_storage_sources(refs(&changed), &inventory).is_err());
         changed = sources;
         let framed = rz_experiments::source_component_digest_v5(&inventory["first"]).unwrap();
-        changed[0].sha256 = format!("{:x}", Sha256::digest(framed));
+        changed[0].sha256 = format!("{:x}", <Sha256 as sha2::Digest>::digest(framed));
         assert!(verify_compiled_storage_sources(refs(&changed), &inventory).is_err());
         // Even an exact framed digest is not a raw archive.rs digest.
         changed[0].sha256 = framed.iter().map(|byte| format!("{byte:02x}")).collect();
