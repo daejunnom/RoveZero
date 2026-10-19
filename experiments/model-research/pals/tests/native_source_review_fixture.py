@@ -490,7 +490,7 @@ class FeedbackObservationFixtureTests(_fixture_unittest.TestCase):
 # idle/archive dependencies; archive_lifecycle.rs was already in the fourteen.
 # Its compiled fact is a synthetic label, never an actual binary, archive I/O,
 # native retirement, selected-view consumption, Rules or training authority.
-IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT = '9319dd8afe5959bbfe2b946681eb3818cd240f21'
+IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT = 'e3c9f68c567813ef8cf8ca723a019c12f455c0ef'
 IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
         "bytes": 423651,
@@ -549,8 +549,8 @@ IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
         "sha256": "d72fad02feee033ce223f8d8608bd4847e6adc954232b82dd0c3abfd2065a304"
     },
     "crates/rz-search/src/pals/engine/idle_archive.rs": {
-        "bytes": 32574,
-        "sha256": "913b4b95538100f5363937abad2cc2ba4b47852283f46f9e5bfea370bccdb3c2"
+        "bytes": 32809,
+        "sha256": "028d9db2fef308ab68a33bc475879fa049761a0a3bb284524079b0b8ce97b810"
     },
     "crates/rz-search/src/pals/engine/adaptive_port/archive_worker.rs": {
         "bytes": 111725,
@@ -576,16 +576,16 @@ IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
 IDLE_ARCHIVE_REVIEWED_TRANSITION_PINS = {
     path: copy.deepcopy(IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS[path]) for path in (
         "crates/rz-search/src/pals/engine.rs", "crates/rz-arena/src/pals_collect/native.rs")}
-IDLE_ARCHIVE_REVIEWED_CLOSURE_SHA256 = 'b76b9d099781313995e75d5ea6ab57ee7d33377e7391d8bd868764e6c541cdad'
-# SHA-256 of b"synthetic independently declared compiled closure fact for reviewed unused idle archive source 9319dd8\n".
-IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT = '3f5366684ea57035f502c02daf51de01e0c5423f0db467741b40a8c4dacaf5fe'
+IDLE_ARCHIVE_REVIEWED_CLOSURE_SHA256 = '5e079727957f22e86bc3efad11988bdfe92a010214babba7d74af5631ff1bddb'
+# SHA-256 of b"synthetic independently declared compiled closure fact for reviewed unused idle archive source e3c9f68\n".
+IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT = 'd8d99bb44c7e9d094390cfa2a653a83f25f33ea8d5b66e5714be496d4d00c754'
 
 
 def idle_archive_fixture_profile(lane):
     if lane not in ("default_disabled", "legacy_single_reply"):
         raise ValueError("explicit synthetic idle-archive review lane required")
     return {"schema": "rz-pals-native-reviewed-transition-profile/1",
-        "review_id": "synthetic-reviewed-9319dd8-idle-archive-twenty-source-" + lane,
+        "review_id": "synthetic-reviewed-e3c9f68-idle-archive-twenty-source-" + lane,
         "lane": lane, "transition_sources": copy.deepcopy(IDLE_ARCHIVE_REVIEWED_TRANSITION_PINS),
         "component_pins": copy.deepcopy(IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS),
         "compiled_search_implementation_sha256": IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT,
@@ -635,7 +635,7 @@ class IdleArchiveFixtureTests(_fixture_unittest.TestCase):
             "crates/rz-search/src/pals/engine/adaptive_root.rs",
             "crates/rz-search/src/pals/store/archive.rs"}
         current = banks.idle_archive_fixture_profile("default_disabled")
-        self.assertEqual(banks.idle_archive_fixture_manifest()["source_commit"], '9319dd8afe5959bbfe2b946681eb3818cd240f21')
+        self.assertEqual(banks.idle_archive_fixture_manifest()["source_commit"], 'e3c9f68c567813ef8cf8ca723a019c12f455c0ef')
         self.assertEqual(set(current["component_pins"]),
                          set(prior[-1]["component_pins"]) | expected_extra)
         self.assertEqual(len(current["component_pins"]), 20)
