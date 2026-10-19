@@ -889,7 +889,6 @@ impl<M: RoleModel> PalsEngine<M> {
     /// Closing the same bounded resident graph is useful both for the RAM
     /// frontier and for a self-contained persisted parent topology. Those
     /// selections have different lifetimes and must never share trim rules.
-
     fn reclaim_archive_for_root(
         &mut self,
         position: &Position,

@@ -329,6 +329,7 @@ impl<M: RoleModel> PalsEngine<M> {
         self.semantic
             .publish_review_record(&config, record, evidence)
     }
+    #[cfg(test)]
     pub(super) fn restore_review_context_after_load(&mut self) {
         let config = self.semantic_sequence_config();
         self.semantic.restore_review_context_after_load(&config);
