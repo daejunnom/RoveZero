@@ -482,3 +482,207 @@ class FeedbackObservationFixtureTests(_fixture_unittest.TestCase):
                             lane=lane)
             self.assertEqual(reviewed.REVIEWED_CLOSURE_PROFILES, before)
         self.assertEqual([factory("default_disabled") for factory in factories], prior)
+
+
+# A distinct test-local idle-archive successor at the explicit product source
+# commit below. All five prior banks above are retained byte-for-byte. The
+# eighteen-file scope contains the prior fourteen plus the four actual new
+# dependencies; archive_lifecycle.rs was already in the original fourteen.
+# Its compiled fact is a synthetic label, never an actual binary, archive I/O,
+# native retirement, selected-view consumption, Rules or training authority.
+IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT = 'af5061d19e1c4a5bf2a5a60e74072cb7f2a70705'
+IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
+    "crates/rz-search/src/pals/engine.rs": {
+        "bytes": 423651,
+        "sha256": "a5025b774b090f81a0ed8a49d0d2bee5f4981089363041abe0cd2476b525cc31"
+    },
+    "crates/rz-arena/src/pals_collect/native.rs": {
+        "bytes": 234273,
+        "sha256": "83d54753084c62ecc14dc1f6c7b33e7f93f0d1cd4e2a5e5ce5b27a8a86746cbb"
+    },
+    "crates/rz-search/src/pals/engine/semantic_state.rs": {
+        "bytes": 34003,
+        "sha256": "aecd3584f37b4e4ea1105d6f60a977719e040cad0adfa832801af1089c22812c"
+    },
+    "crates/rz-search/src/pals/engine/researcher_admission.rs": {
+        "bytes": 5957,
+        "sha256": "5a1838c122e0e7eddd13b501f73cc94d9ea668333c70c1047111e9c137d3fdcd"
+    },
+    "crates/rz-search/src/pals/engine/researcher_profile.rs": {
+        "bytes": 5443,
+        "sha256": "118239c55485dcc88f4d82e29f60e68f47d3c4ba1e95b717368f41fab99ee810"
+    },
+    "crates/rz-search/src/pals/engine/review_lifecycle.rs": {
+        "bytes": 37179,
+        "sha256": "4a2059282d54f92ef05fda27d08f6383c9f6ef95d2f944b62c889217d3a8dc72"
+    },
+    "crates/rz-search/src/pals/engine/cpu_lifecycle.rs": {
+        "bytes": 41911,
+        "sha256": "2ad824a55e1f9d4b4215bf3f56663827955ac4f6efec37e5a695f0c54866fe0f"
+    },
+    "crates/rz-search/src/pals/engine/followup_execution.rs": {
+        "bytes": 42122,
+        "sha256": "72e85351261631f7bf57e95a53f95d8c8a6a079e3a320f27efcbefec2e1f938a"
+    },
+    "crates/rz-search/src/pals/engine/archive_lifecycle.rs": {
+        "bytes": 158109,
+        "sha256": "779a312af67d084a722b85d27d505cd565fde803a2c5dabcd48a7c08c5fe984a"
+    },
+    "crates/rz-arena/src/pals_collect.rs": {
+        "bytes": 182486,
+        "sha256": "608ed3c18d4a25e03e686c060a3c332a85443f8370406bfd9ed8f5e963b9e2e6"
+    },
+    "crates/rz-arena/src/pals_collect/full_line.rs": {
+        "bytes": 18672,
+        "sha256": "6f79dd8e05add10c258ebe873fd3db2642e39727e616ebf4e256d0c7f3b4ce30"
+    },
+    "crates/rz-arena/src/pals_collect/divergence.rs": {
+        "bytes": 4980,
+        "sha256": "f2916c4128767ffc0fe06407bc39024e2b6c2ec2e1eb952faeef998d7d7b1efd"
+    },
+    "crates/rz-arena/src/pals_collect/continuation.rs": {
+        "bytes": 29927,
+        "sha256": "22ce51044c1a4d3b61b3e62f9eae23198a004611e30ef14b20825ea5206f3963"
+    },
+    "crates/rz-arena/src/pals_collect/producer.rs": {
+        "bytes": 21824,
+        "sha256": "d72fad02feee033ce223f8d8608bd4847e6adc954232b82dd0c3abfd2065a304"
+    },
+    "crates/rz-search/src/pals/engine/idle_archive.rs": {
+        "bytes": 11274,
+        "sha256": "b480e31944a9574f1612c663ae314ad43119a64e1ea21da6ae45d35bcc995e91"
+    },
+    "crates/rz-search/src/pals/engine/adaptive_port/archive_worker.rs": {
+        "bytes": 90560,
+        "sha256": "2a3e9d299c02ea715e2f8a38cac2dcc79f607f3863016fd4ee276e6fa8641f5e"
+    },
+    "crates/rz-search/src/pals/engine/preparing_root.rs": {
+        "bytes": 13206,
+        "sha256": "98d34d3ffd9f7f823215422d252c8b7b48f790161f24b182d606302e2ef41e31"
+    },
+    "crates/rz-search/src/pals/review_context.rs": {
+        "bytes": 82880,
+        "sha256": "482e1851bf4d135886c7383929fe087fbf9aadde717374440d409489fb92898f"
+    }
+}
+IDLE_ARCHIVE_REVIEWED_TRANSITION_PINS = {
+    path: copy.deepcopy(IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS[path]) for path in (
+        "crates/rz-search/src/pals/engine.rs", "crates/rz-arena/src/pals_collect/native.rs")}
+IDLE_ARCHIVE_REVIEWED_CLOSURE_SHA256 = '06363fb910c84a2aeef531b4910a88c85f622242c58521a9ad61d6afaae0bbe4'
+# Hash of the independent synthetic label documented by the source handoff.
+IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT = '1f10a7521cb6ba65932731ae6b35f817ee755cfea75b746f2891f5e78bed9855'
+
+
+def idle_archive_fixture_profile(lane):
+    if lane not in ("default_disabled", "legacy_single_reply"):
+        raise ValueError("explicit synthetic idle-archive review lane required")
+    return {"schema": "rz-pals-native-reviewed-transition-profile/1",
+        "review_id": "synthetic-reviewed-af5061d-idle-archive-eighteen-source-" + lane,
+        "lane": lane, "transition_sources": copy.deepcopy(IDLE_ARCHIVE_REVIEWED_TRANSITION_PINS),
+        "component_pins": copy.deepcopy(IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS),
+        "compiled_search_implementation_sha256": IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT,
+        "closure_sha256": IDLE_ARCHIVE_REVIEWED_CLOSURE_SHA256}
+
+
+@contextmanager
+def idle_archive_fixture_review_scope(lane):
+    """Only this synthetic review is temporary; production enrollment is empty."""
+    profile = idle_archive_fixture_profile(lane)
+    with patch.object(reviewed, "REVIEWED_CLOSURE_PROFILES", (profile,)):
+        yield profile
+
+
+def read_idle_archive_fixture_sources(repo):
+    """Match exact reviewed LF source bytes; never normalize or enroll files."""
+    sources = {}
+    for path, expected in IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS.items():
+        with (repo / path).open("rb") as stream:
+            actual = stream.read(expected["bytes"] + 1)
+        if {"bytes": len(actual), "sha256": hashlib.sha256(actual).hexdigest()} != expected:
+            raise AssertionError("reviewed idle-archive Rust fixture source pin changed: " + path)
+        sources[path] = actual
+    return sources
+
+
+def idle_archive_fixture_manifest():
+    return {"source_commit": IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT,
+        "files": [{"path": path, **copy.deepcopy(value)}
+                  for path, value in IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS.items()]}
+
+
+class IdleArchiveFixtureTests(_fixture_unittest.TestCase):
+    def test_idle_archive_bank_preserves_five_prior_banks_and_requires_its_own_fact(self):
+        import native_source_review_fixture as banks
+        from rz_pals_model import native_source_review as reviewed
+        factories = (banks.fixture_profile, banks.successor_fixture_profile,
+                     banks.pc_shared_fixture_profile, banks.bundle_capacity_fixture_profile,
+                     banks.feedback_observation_fixture_profile)
+        prior = [factory("default_disabled") for factory in factories]
+        old = copy.deepcopy(prior)
+        expected_extra = {
+            "crates/rz-search/src/pals/engine/idle_archive.rs",
+            "crates/rz-search/src/pals/engine/adaptive_port/archive_worker.rs",
+            "crates/rz-search/src/pals/engine/preparing_root.rs",
+            "crates/rz-search/src/pals/review_context.rs"}
+        current = banks.idle_archive_fixture_profile("default_disabled")
+        self.assertEqual(banks.idle_archive_fixture_manifest()["source_commit"], 'af5061d19e1c4a5bf2a5a60e74072cb7f2a70705')
+        self.assertEqual(set(current["component_pins"]),
+                         set(prior[-1]["component_pins"]) | expected_extra)
+        self.assertEqual(len(current["component_pins"]), 18)
+        self.assertEqual([path for path in prior[-1]["component_pins"]
+            if prior[-1]["component_pins"][path] != current["component_pins"][path]],
+            ["crates/rz-search/src/pals/engine.rs",
+             "crates/rz-search/src/pals/engine/archive_lifecycle.rs"])
+        self.assertEqual(len({profile["review_id"] for profile in [*prior, current]}), 6)
+        before = copy.deepcopy(reviewed.REVIEWED_CLOSURE_PROFILES)
+        for lane in ("default_disabled", "legacy_single_reply"):
+            with banks.idle_archive_fixture_review_scope(lane) as profile:
+                manifest = banks.idle_archive_fixture_manifest()
+                proof = reviewed.review_transition_sources(pair=profile["transition_sources"], manifest=manifest,
+                    source={"native": {"search_implementation_sha256": banks.IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT}},
+                    lane=lane)
+                self.assertEqual(proof["closure_sha256"], banks.IDLE_ARCHIVE_REVIEWED_CLOSURE_SHA256)
+                self.assertIs(proof["historical_metadata_only"], True)
+                for name in ("execution_authorized", "original_native_authority_reissued",
+                             "rules_proof_authorized", "training_target_authorized"):
+                    self.assertIs(proof[name], False)
+                for historical in prior:
+                    with self.assertRaisesRegex(ValueError, "compiled search closure differs"):
+                        reviewed.review_transition_sources(pair=profile["transition_sources"], manifest=manifest,
+                            source={"native": {"search_implementation_sha256": historical["compiled_search_implementation_sha256"]}},
+                            lane=lane)
+            self.assertEqual(reviewed.REVIEWED_CLOSURE_PROFILES, before)
+        self.assertEqual([factory("default_disabled") for factory in factories], old)
+
+    def test_idle_archive_actual_dependency_pins_cannot_be_omitted_or_substituted(self):
+        import native_source_review_fixture as banks
+        from rz_pals_model import native_source_review as reviewed
+        dependencies = (
+            "crates/rz-search/src/pals/engine/idle_archive.rs",
+            "crates/rz-search/src/pals/engine/archive_lifecycle.rs",
+            "crates/rz-search/src/pals/engine/adaptive_port/archive_worker.rs",
+            "crates/rz-search/src/pals/engine/preparing_root.rs",
+            "crates/rz-search/src/pals/review_context.rs")
+        before = copy.deepcopy(reviewed.REVIEWED_CLOSURE_PROFILES)
+        for lane in ("default_disabled", "legacy_single_reply"):
+            with banks.idle_archive_fixture_review_scope(lane) as profile:
+                source = {"native": {"search_implementation_sha256": banks.IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT}}
+                for path in dependencies:
+                    for omit in (False, True):
+                        manifest = banks.idle_archive_fixture_manifest()
+                        if omit:
+                            manifest["files"] = [row for row in manifest["files"] if row["path"] != path]
+                        else:
+                            next(row for row in manifest["files"] if row["path"] == path)["sha256"] = "f" * 64
+                        with self.subTest(lane=lane, path=path, omit=omit), self.assertRaisesRegex(
+                                ValueError, "helper closure differs"):
+                            reviewed.review_transition_sources(pair=profile["transition_sources"],
+                                manifest=manifest, source=source, lane=lane)
+                manifest = banks.idle_archive_fixture_manifest()
+                outside = "crates/rz-arena/src/rovent_training_process/utility/runtime.rs"
+                manifest["files"].append({"path": outside, "bytes": 1, "sha256": "e" * 64})
+                proof = reviewed.review_transition_sources(pair=profile["transition_sources"],
+                    manifest=manifest, source=source, lane=lane)
+                self.assertEqual(proof["unreviewed_manifest_files"], [outside])
+                self.assertIs(proof["execution_authorized"], False)
+            self.assertEqual(reviewed.REVIEWED_CLOSURE_PROFILES, before)

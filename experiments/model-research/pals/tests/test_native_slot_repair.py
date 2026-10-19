@@ -2,7 +2,7 @@
 
 The real strict parent/D/Repair/semantic factories are used. Build, launch,
 physical heads and Rules descriptors are explicitly synthetic caller facts.
-The fourteen literal reviewed Rust sources are read only to exercise a new
+The eighteen literal reviewed Rust sources are read only to exercise a new
 scoped synthetic review profile; no compiler, process, Rules replay, model or
 training runs. Historical two-file allow-lists remain unchanged.
 Known is conditional fixture coverage only. The usual engine path observes
@@ -30,12 +30,12 @@ from test_repair_context import RepairFixture
 from test_semantic_verifier import SemanticFixture, tokens
 import test_training as fixtures
 from native_source_review_fixture import (
-    FEEDBACK_OBSERVATION_REVIEWED_SOURCE_COMMIT as REVIEWED_SOURCE_COMMIT,
-    FEEDBACK_OBSERVATION_REVIEWED_TRANSITION_PINS as REVIEWED_TRANSITION_PINS,
-    FEEDBACK_OBSERVATION_SYNTHETIC_COMPILED_FACT as SYNTHETIC_COMPILED_FACT,
-    feedback_observation_fixture_manifest as fixture_manifest,
-    feedback_observation_fixture_review_scope as fixture_review_scope,
-    read_feedback_observation_fixture_sources as read_reviewed_fixture_sources,
+    IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT as REVIEWED_SOURCE_COMMIT,
+    IDLE_ARCHIVE_REVIEWED_TRANSITION_PINS as REVIEWED_TRANSITION_PINS,
+    IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT as SYNTHETIC_COMPILED_FACT,
+    idle_archive_fixture_manifest as fixture_manifest,
+    idle_archive_fixture_review_scope as fixture_review_scope,
+    read_idle_archive_fixture_sources as read_reviewed_fixture_sources,
 )
 
 
