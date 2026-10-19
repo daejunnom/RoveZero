@@ -335,7 +335,7 @@ fn idle_archive_worker_keeps_actual_pc_projection_and_restores_original_relation
         ArchiveOperation, ArchiveOwner, ArchiveWork, ArchiveWorker,
     };
     use crate::pals::review_context::ReviewQuerySequences;
-    use crate::pals::store::{ArchiveConfig, ArchiveRootCapability};
+    use crate::pals::store::{ArchiveConfig, ArchiveRuntimeLimits};
 
     let record_identity = |record: &RoleRecord| {
         (
@@ -355,7 +355,18 @@ fn idle_archive_worker_keeps_actual_pc_projection_and_restores_original_relation
     };
 
     let mut scratch = idle_archive_scratch();
-    let mut owner = idle_pc_after_actual_counter();
+    // Select the actual runtime profile before the original root starts. Keep
+    // this fixture's original ArchiveConfig quotas and 16MiB load/I/O bound.
+    let config = ArchiveConfig::new(scratch.0.clone(), std::env::current_dir().unwrap());
+    let limits = ArchiveRuntimeLimits {
+        game_bytes_max: config.game_bytes,
+        global_bytes_max: config.global_bytes,
+        record_payload_bytes_max: config.record_bytes,
+        load_bytes_max: 16 * 1024 * 1024,
+        ..idle_archive_limits()
+    };
+    let mut owner =
+        idle_pc_from_actual_counter(port_with_archive(1, 2, None, Some((&scratch.0, limits))));
     assert_eq!(std::mem::size_of_val(owner.researcher()), 0);
     assert_eq!(owner.stores().review_pin_count().unwrap(), 0);
     let original_owner = owner.stores().read_owner();
@@ -410,17 +421,9 @@ fn idle_archive_worker_keeps_actual_pc_projection_and_restores_original_relation
     let metadata = view.records_metadata().to_vec();
     let input_records = view.records().to_vec();
     drop(view);
-    let mut idle = owner
+    let idle = owner
         .into_idle_archive()
         .unwrap_or_else(|_| panic!("quiescent PC owner"));
-    let config = ArchiveConfig::new(scratch.0.clone(), std::env::current_dir().unwrap());
-    let held =
-        cap_std::fs::Dir::open_ambient_dir(&scratch.0, cap_std::ambient_authority()).unwrap();
-    idle.enable_archive_with_capability(
-        config,
-        ArchiveRootCapability::from_directory(scratch.0.clone(), held).unwrap(),
-    )
-    .unwrap();
     let next = SearchAuthority {
         root: RootGeneration(9),
         ..port_authority_for_idle_test()
@@ -570,7 +573,12 @@ fn idle_archive_worker_keeps_actual_pc_projection_and_restores_original_relation
         ArchiveOperation::FinishIdleGame,
         Instant::now() + Duration::from_secs(20),
     )
-    .unwrap_or_else(|_| panic!("original final checkpoint and close"));
+    .unwrap_or_else(|rejected| {
+        panic!(
+            "original final checkpoint and close: reason={:?}; receipt={:?}",
+            rejected.reason, rejected.receipt
+        )
+    });
     assert!(receipt.idle_checkpoint.is_some());
     assert!(
         idle.archive_owner_snapshot()
@@ -601,7 +609,7 @@ fn idle_archive_work(
                 max_io_bytes: 16 * 1024 * 1024,
             },
         )
-        .unwrap_or_else(|_| panic!("original idle command admitted"));
+        .unwrap_or_else(|rejected| panic!("original idle command admitted: {:?}", rejected.error));
     let completion = loop {
         if let Some(completion) = worker.try_receive(&transfer).unwrap() {
             break completion;
@@ -617,6 +625,61 @@ fn idle_archive_work(
             };
             (owner, receipt)
         })
+}
+
+fn prepare_idle_archive_for_transition(
+    worker: &mut adaptive_port::archive_worker::ArchiveWorker<LegalOrderRoleMock>,
+    idle: IdleArchiveOwner,
+    authority: SearchAuthority,
+    deadline: Instant,
+) -> IdleArchiveOwner {
+    let store = idle.stores().read_owner();
+    let hot = idle.stores().hot_stats();
+    let revisions: Vec<_> = idle
+        .semantic()
+        .records
+        .iter()
+        .map(|record| record.revision)
+        .collect();
+    // The selected owner needs its real bounded usage scan before NewGame
+    // admission. No hot pressure exists here, so this original worker command
+    // must preserve every source fact while establishing actual completeness.
+    let (idle, receipt) = idle_archive_work(
+        worker,
+        idle,
+        authority,
+        adaptive_port::archive_worker::ArchiveOperation::PrepareRoot {
+            position: Position::startpos(),
+        },
+        deadline,
+    )
+    .unwrap_or_else(|rejected| {
+        panic!(
+            "original bounded archive startup scan: reason={:?}; receipt={:?}",
+            rejected.reason, rejected.receipt
+        )
+    });
+    assert!(store.matches(idle.stores()));
+    assert_eq!(idle.stores().hot_stats(), hot);
+    assert_eq!(
+        idle.semantic()
+            .records
+            .iter()
+            .map(|record| record.revision)
+            .collect::<Vec<_>>(),
+        revisions
+    );
+    assert_eq!(receipt.io_bytes, Some(0));
+    assert!(receipt.idle_checkpoint.is_none());
+    let measured = idle.archive_owner_snapshot().unwrap().unwrap();
+    assert!(
+        measured.global_scan_complete
+            && measured.global_scan_after_last_commit
+            && measured.global_managed_bytes == Some(0)
+            && measured.complete
+            && !measured.admission_closed
+    );
+    idle
 }
 
 fn port_authority_for_idle_test() -> SearchAuthority {
@@ -831,6 +894,8 @@ fn idle_newgame_checkpoints_actual_pc_and_orphan_raw_before_unique_ledger_transf
     };
     let authority = idle.adaptive_archive_authority(next).unwrap();
     let mut worker = ArchiveWorker::start().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let idle = prepare_idle_archive_for_transition(&mut worker, idle, authority, deadline);
     let (idle, receipt) = idle_archive_work(
         &mut worker,
         idle,
@@ -838,9 +903,14 @@ fn idle_newgame_checkpoints_actual_pc_and_orphan_raw_before_unique_ledger_transf
         ArchiveOperation::NewGame {
             next_authority: next,
         },
-        Instant::now() + Duration::from_secs(20),
+        deadline,
     )
-    .unwrap_or_else(|_| panic!("durable final game checkpoint and unique replacement"));
+    .unwrap_or_else(|rejected| {
+        panic!(
+            "durable final game checkpoint and unique replacement: reason={:?}; receipt={:?}",
+            rejected.reason, rejected.receipt
+        )
+    });
     let checkpoint = receipt.idle_checkpoint.unwrap();
     assert_eq!(checkpoint.hot, hot);
     assert_eq!(checkpoint.records, 2);
@@ -957,10 +1027,9 @@ fn idle_newgame_cancel_at_actual_close_keeps_one_checkpoint_and_unspent_original
         Some((&scratch.0, idle_archive_limits())),
     ));
     let old = owner.stores().read_owner();
-    let mut idle = owner
+    let idle = owner
         .into_idle_archive()
         .unwrap_or_else(|_| panic!("original PC"));
-    idle.cancel_after_close_for_test();
     let next = SearchAuthority {
         game: GameGeneration(1),
         root: RootGeneration(9),
@@ -969,6 +1038,8 @@ fn idle_newgame_cancel_at_actual_close_keeps_one_checkpoint_and_unspent_original
     let authority = idle.adaptive_archive_authority(next).unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut worker = ArchiveWorker::start().unwrap();
+    let mut idle = prepare_idle_archive_for_transition(&mut worker, idle, authority, deadline);
+    idle.cancel_after_close_for_test();
     let rejected = idle_archive_work(
         &mut worker,
         idle,
@@ -1028,7 +1099,12 @@ fn idle_newgame_cancel_at_actual_close_keeps_one_checkpoint_and_unspent_original
         },
         deadline,
     )
-    .unwrap_or_else(|_| panic!("same original transition resumes without another checkpoint"));
+    .unwrap_or_else(|rejected| {
+        panic!(
+            "same original transition resumes without another checkpoint: reason={:?}; receipt={:?}",
+            rejected.reason, rejected.receipt
+        )
+    });
     assert_eq!(retried.idle_checkpoint, Some(Arc::clone(&first_checkpoint)));
     assert_eq!(retried.io_bytes, Some(0));
     assert_eq!(idle.transition_remaining_io(), pending.remaining_io_bytes);
@@ -1070,6 +1146,8 @@ fn idle_final_checkpoint_quota_failure_keeps_actual_hot_owner_and_pending_game()
     };
     let authority = idle.adaptive_archive_authority(next).unwrap();
     let mut worker = ArchiveWorker::start().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let idle = prepare_idle_archive_for_transition(&mut worker, idle, authority, deadline);
     let rejected = idle_archive_work(
         &mut worker,
         idle,
@@ -1077,7 +1155,7 @@ fn idle_final_checkpoint_quota_failure_keeps_actual_hot_owner_and_pending_game()
         ArchiveOperation::NewGame {
             next_authority: next,
         },
-        Instant::now() + Duration::from_secs(20),
+        deadline,
     )
     .err()
     .expect("actual final metadata exceeds selected segment quota");
