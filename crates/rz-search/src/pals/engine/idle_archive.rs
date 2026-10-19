@@ -178,6 +178,9 @@ impl<M: RoleModel> PcSemanticOwner<M> {
 }
 
 impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
+    // Rejected kind/setup transitions return the complete original linear
+    // owner. Keep this error move-only without a new allocation or lost custody.
+    #[allow(clippy::result_large_err)]
     pub fn into_researcher(self) -> Result<Box<ResearcherPreparingOwner<M>>, Self> {
         if self.pending.is_some() || self.setup_retained() {
             return Err(self);
@@ -187,6 +190,7 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
             IdleOwner::Pc(_) => Err(self),
         }
     }
+    #[allow(clippy::result_large_err)]
     pub fn into_pc(self) -> Result<Box<PcSemanticOwner<M>>, Self> {
         if self.pending.is_some() || self.setup_retained() {
             return Err(self);
