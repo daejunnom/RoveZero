@@ -253,7 +253,11 @@ mod tests {
         ROVENT_STARTUP_CONFIGURATION_DOMAIN, RoventStartupConfiguration,
         StartupConfigurationDocument,
     };
+    use crate::rovent_bootstrap::external_session::external_researcher_implementation_digest_from_metadata;
+    use crate::rovent_root_admission::RoventRootAdmissionPolicy;
+    use rz_contracts::rovent::ExecutionMode;
     use rz_eval::error::FailureKind;
+    use rz_experiments::RoventExecutionManifest;
     use serde_json::{Value, json};
 
     fn pc_wire() -> Value {
@@ -318,6 +322,167 @@ mod tests {
 
     fn decode(wire: &Value) -> Result<RoventStartupConfigurationV3, BackendError> {
         RoventStartupConfigurationV3::from_json(&serde_json::to_vec(wire).unwrap())
+    }
+
+    fn external_metadata_lock(document: &StartupConfigurationDocument) -> RoventInputLock {
+        let mut wire = crate::rovent_bootstrap::tests::wire(ExecutionMode::CpuPcr);
+        let fields = document.fields();
+        let ExecutionConfiguration::ExternalResearcher { profile, .. } = fields.execution else {
+            panic!("external metadata fixture requires its original external profile")
+        };
+        let mut binary = wire["engine"]["binary"].clone();
+        binary["path"] = json!("fixture/external-engine");
+        wire["engine"]["researcher"] = json!({"provider":"external", "profile":{
+            "domain":"rz-rovent-external-engine-profile/1", "profile":profile,
+            "canonical_sha256":"8".repeat(64), "capability_sha256":"9".repeat(64),
+            "purpose":"research_checker", "binary":binary, "source_commit":"b".repeat(40),
+            "requested_threads":1, "requested_hash_mib":256
+        }});
+        wire["resources"]["pools"][1]["actors"] = json!(["external_r"]);
+        wire["coordinator"]["policy_sha256"] = json!(crate::rovent_bootstrap::hex(
+            document.configuration_digest().unwrap()
+        ));
+        wire["engine"]["search"]["search_configuration_sha256"] = json!(
+            crate::rovent_bootstrap::hex(document.search_configuration_digest().unwrap())
+        );
+        wire["engine"]["search"]["registered_max_chess_plies"] =
+            json!(fields.frontier.maximum_goal_plies);
+        RoventExecutionManifest::from_json(&wire.to_string())
+            .unwrap()
+            .lock()
+            .unwrap()
+    }
+
+    #[test]
+    fn external_metadata_digest_joins_original_lock_and_policy_without_session() {
+        let document = StartupConfigurationDocument::V3(
+            decode(&external_wire(json!({"kind":"nodes", "reported_nodes":32}))).unwrap(),
+        );
+        let lock = external_metadata_lock(&document);
+        lock.validate().unwrap();
+        document.admit_against(&lock).unwrap();
+        let exact = external_researcher_implementation_digest_from_metadata(
+            &document,
+            &lock,
+            RoventRootAdmissionPolicy::ExactRegistered,
+        )
+        .unwrap();
+        let dynamic = external_researcher_implementation_digest_from_metadata(
+            &document,
+            &lock,
+            RoventRootAdmissionPolicy::DynamicGo,
+        )
+        .unwrap();
+        assert_ne!(exact, dynamic);
+
+        let mut changed_manifest = lock.manifest.clone();
+        changed_manifest.run_id.push_str("-next");
+        let changed_lock = changed_manifest.lock().unwrap();
+        document.admit_against(&changed_lock).unwrap();
+        assert_ne!(lock.canonical_sha256, changed_lock.canonical_sha256);
+        assert_ne!(
+            dynamic,
+            external_researcher_implementation_digest_from_metadata(
+                &document,
+                &changed_lock,
+                RoventRootAdmissionPolicy::DynamicGo,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn external_metadata_digest_rejects_mismatched_configuration_and_lock() {
+        let config = decode(&external_wire(json!({"kind":"nodes", "reported_nodes":32}))).unwrap();
+        let document = StartupConfigurationDocument::V3(config.clone());
+        let lock = external_metadata_lock(&document);
+
+        let mut changed_semantic = config.clone();
+        changed_semantic.semantic.max_nodes += 1;
+        changed_semantic.validate().unwrap();
+        let mut changed_question = config;
+        changed_question.external = ExternalConfigurationV3::Researcher {
+            question_limit: ExternalQuestionLimitV3::Nodes { reported_nodes: 31 },
+        };
+        changed_question.validate().unwrap();
+        for changed in [changed_semantic, changed_question] {
+            assert!(
+                external_researcher_implementation_digest_from_metadata(
+                    &StartupConfigurationDocument::V3(changed),
+                    &lock,
+                    RoventRootAdmissionPolicy::DynamicGo,
+                )
+                .is_err()
+            );
+        }
+
+        let mut invalid_lock = lock;
+        invalid_lock.canonical_sha256 = "A".repeat(64);
+        assert!(invalid_lock.validate().is_err());
+        assert!(
+            external_researcher_implementation_digest_from_metadata(
+                &document,
+                &invalid_lock,
+                RoventRootAdmissionPolicy::DynamicGo,
+            )
+            .is_err()
+        );
+        let roles_only = StartupConfigurationDocument::V3(decode(&pc_wire()).unwrap());
+        assert_eq!(
+            external_researcher_implementation_digest_from_metadata(
+                &roles_only,
+                &invalid_lock,
+                RoventRootAdmissionPolicy::DynamicGo,
+            )
+            .unwrap_err()
+            .kind,
+            FailureKind::UnsupportedModel
+        );
+    }
+
+    #[test]
+    fn external_metadata_digest_rejects_unjoined_backend_and_profile() {
+        let document = StartupConfigurationDocument::V3(
+            decode(&external_wire(json!({"kind":"nodes", "reported_nodes":32}))).unwrap(),
+        );
+        let lock = external_metadata_lock(&document);
+        let mut different_profile = serde_json::to_value(&lock.manifest).unwrap();
+        different_profile["engine"]["researcher"]["profile"]["profile"]["sha256"] =
+            json!("c".repeat(64));
+        let different_profile = RoventExecutionManifest::from_json(&different_profile.to_string())
+            .unwrap()
+            .lock()
+            .unwrap();
+        different_profile.validate().unwrap();
+        assert!(
+            external_researcher_implementation_digest_from_metadata(
+                &document,
+                &different_profile,
+                RoventRootAdmissionPolicy::DynamicGo,
+            )
+            .is_err()
+        );
+
+        let mut different_backend = serde_json::to_value(&lock.manifest).unwrap();
+        different_backend["engine"]["mode"] = json!("hybrid_pcr");
+        different_backend["engine"]["pc"]["backend"] = json!("ort_cuda");
+        different_backend["engine"]["pc"]["device"] = json!({
+            "device":"cuda", "ordinal":0, "registered_device":"fixture-declaration-only"
+        });
+        different_backend["resources"]["gpu_devices"] = json!(1);
+        let different_backend = RoventExecutionManifest::from_json(&different_backend.to_string())
+            .unwrap()
+            .lock()
+            .unwrap();
+        different_backend.validate().unwrap();
+        assert!(
+            external_researcher_implementation_digest_from_metadata(
+                &document,
+                &different_backend,
+                RoventRootAdmissionPolicy::DynamicGo,
+            )
+            .is_err()
+        );
     }
 
     #[test]

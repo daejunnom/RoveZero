@@ -1,7 +1,7 @@
 //! Product assembly for a pinned external R and the original native P/C owner.
 //! CPU_T has an independent Collection actor; no native R/PVS engine is created.
 
-use super::configuration::ExecutionConfiguration;
+use super::configuration::{ExecutionConfiguration, StartupConfigurationDocument};
 use super::{
     PreparedRoventNative, RoventNativeBackend, RoventPinnedExternalRSource,
     RoventPinnedNativeSources,
@@ -17,6 +17,8 @@ use crate::pals_adaptive::{
 use crate::rovent_root_admission::RoventRootAdmissionPolicy;
 use crate::search_driver::{PalsCheckerRegistration, SearchSessionFailure};
 use rz_contracts::Digest;
+use rz_eval::error::{BackendError, FailureKind};
+use rz_experiments::RoventInputLock;
 use rz_runtime::adaptive::ControllerConfig;
 use rz_search::external_cpu::{CpuEndpoint, CpuEndpointSelection};
 use rz_search::pals::engine::adaptive_port::profiled_retirement_archive::RegisteredProfiledRetirementSink;
@@ -29,6 +31,46 @@ use std::{num::NonZeroU16, sync::Arc};
 
 pub type RoventExternalProductSession =
     AdaptiveSessionDriver<RoventNativeBackend<AdaptivePortQuestion>>;
+
+fn external_researcher_base_implementation_digest(
+    configuration: &StartupConfigurationDocument,
+) -> Result<Digest, BackendError> {
+    let mut hash = Sha256::new();
+    hash.update(b"rz-rovent-external-product/1\0");
+    hash.update(include_bytes!("external_session.rs"));
+    hash.update(super::compiled_bootstrap_source_digest());
+    hash.update(configuration.configuration_digest()?);
+    Ok(Digest(hash.finalize().into()))
+}
+
+/// The final source/configuration/lock/policy identity only. This opens no
+/// assets and creates no native session, Ready, clock, worker or root owner.
+pub fn external_researcher_implementation_digest_from_metadata(
+    document: &StartupConfigurationDocument,
+    lock: &RoventInputLock,
+    root_policy: RoventRootAdmissionPolicy,
+) -> Result<Digest, BackendError> {
+    if !matches!(
+        document.fields().execution,
+        ExecutionConfiguration::ExternalResearcher { .. }
+    ) {
+        return Err(super::fail(
+            FailureKind::UnsupportedModel,
+            "external session metadata requires the external researcher assembly",
+        ));
+    }
+    // The existing admission validates the original lock and its exact join to
+    // this closed document. It does not construct a live execution capability.
+    document.admit_against(lock)?;
+    let implementation = external_researcher_base_implementation_digest(document)?;
+    Ok(
+        RoventExternalProductSession::rovent_root_policy_implementation_digest(
+            implementation,
+            lock,
+            root_policy,
+        ),
+    )
+}
 
 /// Every rejected transition retains its original physical/native/FD owners.
 // This is one startup rejection slot, not a queue. Preserve its actual rejected
@@ -221,17 +263,10 @@ pub fn external_researcher_session(
             )
             .map_err(|error| SearchSessionFailure::debug("RoventExternalBudget", &error))?,
         );
-        let mut hash = Sha256::new();
-        hash.update(b"rz-rovent-external-product/1\0");
-        hash.update(include_bytes!("external_session.rs"));
-        hash.update(super::compiled_bootstrap_source_digest());
-        hash.update(
-            configuration.configuration_digest().map_err(|error| {
-                SearchSessionFailure::debug("RoventExternalConfiguration", &error)
-            })?,
-        );
+        let implementation = external_researcher_base_implementation_digest(configuration)
+            .map_err(|error| SearchSessionFailure::debug("RoventExternalConfiguration", &error))?;
         let options = AdaptiveSessionOptions {
-            implementation: Digest(hash.finalize().into()),
+            implementation,
             identity,
             max_rounds: *max_rounds,
             // This is the external reported-work ceiling. The separate typed

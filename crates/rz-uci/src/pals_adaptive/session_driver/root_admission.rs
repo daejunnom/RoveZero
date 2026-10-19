@@ -27,6 +27,26 @@ where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    /// Pure framing over a lock already validated by the caller. This creates
+    /// no session, root policy registration or live admission authority.
+    #[cfg(feature = "pals-adaptive")]
+    pub(crate) fn rovent_root_policy_implementation_digest(
+        implementation: Digest,
+        lock: &rz_experiments::RoventInputLock,
+        policy: crate::rovent_root_admission::RoventRootAdmissionPolicy,
+    ) -> Digest {
+        let mut hash = Sha256::new();
+        hash.update(b"rz-rovent-pcr-startup-root-policy/1\0");
+        hash.update(implementation.0);
+        hash.update(lock.canonical_sha256.as_bytes());
+        hash.update([match policy {
+            crate::rovent_root_admission::RoventRootAdmissionPolicy::ExactRegistered => 0,
+            crate::rovent_root_admission::RoventRootAdmissionPolicy::DynamicGo => 1,
+        }]);
+        hash.update(include_bytes!("root_admission.rs"));
+        Digest(hash.finalize().into())
+    }
+
     /// Startup-only opt-in. The original lock's exact workload is unchanged;
     /// DynamicGo is a distinct per-root domain over the same admitted sources.
     #[cfg(feature = "pals-adaptive")]
@@ -89,16 +109,11 @@ where
         {
             return Err(SearchSessionFailure::physical_completion_unknown());
         }
-        let mut hash = Sha256::new();
-        hash.update(b"rz-rovent-pcr-startup-root-policy/1\0");
-        hash.update(self.options.implementation.0);
-        hash.update(lock.canonical_sha256.as_bytes());
-        hash.update([match policy {
-            crate::rovent_root_admission::RoventRootAdmissionPolicy::ExactRegistered => 0,
-            crate::rovent_root_admission::RoventRootAdmissionPolicy::DynamicGo => 1,
-        }]);
-        hash.update(include_bytes!("root_admission.rs"));
-        self.options.implementation = Digest(hash.finalize().into());
+        self.options.implementation = Self::rovent_root_policy_implementation_digest(
+            self.options.implementation,
+            &lock,
+            policy,
+        );
         self.rovent_root_policy = Some(RoventPcrRootPolicy { lock, policy });
         Ok(())
     }

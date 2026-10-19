@@ -3,7 +3,9 @@
 //! Usage: `rovent_startup_metadata --config=PATH.json [--backend-metadata=PATH.json]`
 //! Optional: `--position-command=position startpos moves e2e4` (one argv value).
 //! Optional: `--session-implementation-root-policy=dynamic-go|exact-registered`
-//! declares the existing PC/own-NNUEC session digest without constructing it.
+//! declares the existing session digest without constructing it. External R
+//! additionally requires `--input-lock-metadata=PATH.json`; the original typed
+//! lock and its configuration join are validated without admitting assets.
 //! Standalone: `--runtime-bundle-metadata=PATH.json` declares the original bundle
 //! JSON byte pin and its existing typed semantic digest, without opening libraries.
 //! The existing startup codec owns validation, canonicalization and domain hashes.
@@ -29,7 +31,7 @@ fn main() -> std::process::ExitCode {
 mod metadata {
     use rz_eval::error::BackendError;
     use rz_eval::runtime_pin::CudaRuntimeBundleSpec;
-    use rz_experiments::RoventDevice;
+    use rz_experiments::{ManifestError, RoventDevice, RoventInputLock};
     use rz_position::contracts::{profile_digest, rules_snapshot_semantic_digest};
     use rz_position::{BoardMove, Position, PositionError};
     use rz_uci::parser::{self, Command, ParseError, ParserLimits, PositionBase, PositionSpec};
@@ -39,6 +41,7 @@ mod metadata {
         v2::ROVENT_STARTUP_CONFIGURATION_V2_DOMAIN, v3::ROVENT_STARTUP_CONFIGURATION_V3_DOMAIN,
     };
     use rz_uci::rovent_bootstrap::configuration_digest_from_metadata;
+    use rz_uci::rovent_bootstrap::external_session::external_researcher_implementation_digest_from_metadata;
     use rz_uci::rovent_bootstrap::nnuec_session::RoventNnuecSessionDriver;
     use rz_uci::rovent_bootstrap::pc_session::RoventPcSessionDriver;
     use rz_uci::rovent_root_admission::RoventRootAdmissionPolicy;
@@ -54,6 +57,7 @@ mod metadata {
     use std::process::ExitCode;
 
     const INPUT_MAX_BYTES: usize = 64 << 10;
+    const LOCK_INPUT_MAX_BYTES: usize = 2 << 20;
     const OUTPUT_MAX_BYTES: usize = 256 << 10;
     // A failed/partial stdout write may still be followed by this one diagnostic.
     const DIAGNOSTIC_MAX_BYTES: usize = 4 << 10;
@@ -69,6 +73,9 @@ mod metadata {
         RuntimeBundleDeclaration(Box<BackendError>),
         SessionImplementationAssembly,
         SessionImplementation(Box<BackendError>),
+        SessionImplementationLock(&'static str),
+        InputLock(Box<ManifestError>),
+        InputLockBudget,
         PositionSyntax(ParseError),
         PositionCommand,
         PositionRules {
@@ -98,6 +105,9 @@ mod metadata {
                     "session_implementation_assembly_unsupported"
                 }
                 Self::SessionImplementation(_) => "session_implementation_declaration_rejected",
+                Self::SessionImplementationLock(_) => "session_implementation_input_lock_rejected",
+                Self::InputLock(_) => "input_lock_metadata_rejected",
+                Self::InputLockBudget => "input_lock_byte_budget",
                 Self::PositionSyntax(_) => "position_command_syntax_rejected",
                 Self::PositionCommand => "position_command_required",
                 Self::PositionRules { stage, .. } => stage,
@@ -113,13 +123,16 @@ mod metadata {
     impl fmt::Display for Error {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
-                Self::Arguments => f.write_str("expected --config=PATH.json and optional --backend-metadata=PATH.json / --position-command=POSITION / --session-implementation-root-policy=dynamic-go|exact-registered, or standalone --runtime-bundle-metadata=PATH.json, at most once each"),
+                Self::Arguments => f.write_str("expected --config=PATH.json and optional --backend-metadata=PATH.json / --position-command=POSITION / --session-implementation-root-policy=dynamic-go|exact-registered; external session metadata also requires --input-lock-metadata=PATH.json; or standalone --runtime-bundle-metadata=PATH.json, at most once each"),
                 Self::InputKind => f.write_str("input must be a regular non-symlink JSON file"),
                 Self::InputBudget => f.write_str("each input must contain 1..=65536 bytes"),
                 Self::BackendDeclaration(detail) => f.write_str(detail),
                 Self::RuntimeBundleDeclaration(cause) => write!(f, "runtime bundle declaration: {cause}"),
-                Self::SessionImplementationAssembly => f.write_str("session implementation metadata supports only roles-only PC or own-NNUEC PCR declarations"),
+                Self::SessionImplementationAssembly => f.write_str("session implementation metadata supports roles-only PC, own-NNUEC PCR, or external researcher declarations"),
                 Self::SessionImplementation(cause) => write!(f, "session implementation declaration: {cause}"),
+                Self::SessionImplementationLock(detail) => f.write_str(detail),
+                Self::InputLock(cause) => write!(f, "input lock metadata: {cause}"),
+                Self::InputLockBudget => f.write_str("input lock metadata requires 1..=2097152 bytes"),
                 Self::PositionSyntax(cause) => write!(f, "position command: {cause}"),
                 Self::PositionCommand => f.write_str("only one UCI position command is accepted"),
                 Self::PositionRules { stage, zero_based_ply, cause } => {
@@ -149,6 +162,7 @@ mod metadata {
         backend_metadata: Option<PathBuf>,
         position_command: Option<PositionCommand>,
         session_implementation_root_policy: Option<SessionImplementationPolicy>,
+        input_lock_metadata: Option<PathBuf>,
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum SessionImplementationPolicy {
@@ -205,6 +219,7 @@ mod metadata {
         let mut backend_metadata = None;
         let mut position_command = None;
         let mut session_implementation_root_policy = None;
+        let mut input_lock_metadata = None;
         let mut runtime_bundle_metadata = None;
         for argument in arguments {
             let text = argument.to_str().ok_or(Error::Arguments)?;
@@ -233,6 +248,11 @@ mod metadata {
                     "exact-registered" => SessionImplementationPolicy::ExactRegistered,
                     _ => return Err(Error::Arguments),
                 });
+            } else if let Some(path) = text.strip_prefix("--input-lock-metadata=") {
+                if input_lock_metadata.is_some() {
+                    return Err(Error::Arguments);
+                }
+                input_lock_metadata = Some(json_path(path)?);
             } else if let Some(path) = text.strip_prefix("--runtime-bundle-metadata=") {
                 if runtime_bundle_metadata.is_some() {
                     return Err(Error::Arguments);
@@ -247,26 +267,40 @@ mod metadata {
                 && backend_metadata.is_none()
                 && position_command.is_none()
                 && session_implementation_root_policy.is_none()
+                && input_lock_metadata.is_none()
             {
                 Ok(Invocation::RuntimeBundleMetadata(bundle))
             } else {
                 Err(Error::Arguments)
             };
         }
+        if input_lock_metadata.is_some() && session_implementation_root_policy.is_none() {
+            return Err(Error::Arguments);
+        }
         Ok(Invocation::Startup(Arguments {
             configuration: configuration.ok_or(Error::Arguments)?,
             backend_metadata,
             position_command,
             session_implementation_root_policy,
+            input_lock_metadata,
         }))
     }
 
     fn read_configuration(path: &std::path::Path) -> Result<Vec<u8>, Error> {
+        read_bounded_json(path, INPUT_MAX_BYTES)
+    }
+    fn read_input_lock(path: &std::path::Path) -> Result<Vec<u8>, Error> {
+        read_bounded_json(path, LOCK_INPUT_MAX_BYTES).map_err(|error| match error {
+            Error::InputBudget => Error::InputLockBudget,
+            other => other,
+        })
+    }
+    fn read_bounded_json(path: &std::path::Path, maximum: usize) -> Result<Vec<u8>, Error> {
         let before = std::fs::symlink_metadata(path).map_err(|e| io_error("input_metadata", e))?;
         if !before.file_type().is_file() || before.file_type().is_symlink() {
             return Err(Error::InputKind);
         }
-        if before.len() == 0 || before.len() > INPUT_MAX_BYTES as u64 {
+        if before.len() == 0 || before.len() > maximum as u64 {
             return Err(Error::InputBudget);
         }
         let file = File::open(path).map_err(|e| io_error("input_open", e))?;
@@ -278,10 +312,12 @@ mod metadata {
             return Err(Error::InputKind);
         }
         let mut bytes = Vec::with_capacity(before.len() as usize);
-        file.take((INPUT_MAX_BYTES + 1) as u64)
+        file.take((maximum + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|e| io_error("input_read", e))?;
-        check_input_budget(&bytes)?;
+        if bytes.is_empty() || bytes.len() > maximum {
+            return Err(Error::InputBudget);
+        }
         // The pin below identifies these actual read bytes, not an immutable
         // filesystem snapshot or the identity of any referenced native asset.
         Ok(bytes)
@@ -601,12 +637,23 @@ mod metadata {
         root_policy: &'static str,
         implementation_sha256: String,
         compiled_bootstrap_source_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_lock_canonical_sha256: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_lock_json: Option<BytePin>,
         actual_session_constructed: bool,
         root_authority: bool,
     }
     fn prepare_session_implementation(
         document: &StartupConfigurationDocument,
         policy: SessionImplementationPolicy,
+    ) -> Result<SessionImplementationMetadata, Error> {
+        prepare_session_implementation_with_lock(document, policy, None)
+    }
+    fn prepare_session_implementation_with_lock(
+        document: &StartupConfigurationDocument,
+        policy: SessionImplementationPolicy,
+        input_lock: Option<(&RoventInputLock, &[u8])>,
     ) -> Result<SessionImplementationMetadata, Error> {
         // The assembly comes from the original closed document. Neither an
         // arbitrary expected SHA nor a caller-selected incompatible family is
@@ -629,17 +676,46 @@ mod metadata {
                     policy.actual(),
                 ),
             ),
+            ExecutionConfiguration::ExternalResearcher { .. } => {
+                let (lock, _) = input_lock.ok_or(Error::SessionImplementationLock(
+                    "external session implementation metadata requires an explicit validated input lock",
+                ))?;
+                (
+                    "external_researcher_product_session",
+                    external_researcher_implementation_digest_from_metadata(
+                        document,
+                        lock,
+                        policy.actual(),
+                    ),
+                )
+            }
             _ => return Err(Error::SessionImplementationAssembly),
         };
+        if input_lock.is_some()
+            && !matches!(
+                document.fields().execution,
+                ExecutionConfiguration::ExternalResearcher { .. }
+            )
+        {
+            return Err(Error::SessionImplementationLock(
+                "input lock metadata is supported only for an external researcher session declaration",
+            ));
+        }
         let digest = digest.map_err(|cause| Error::SessionImplementation(Box::new(cause)))?;
         Ok(SessionImplementationMetadata {
-            scope: "compiled_source_configuration_policy_digest_only",
+            scope: if input_lock.is_some() {
+                "compiled_source_configuration_lock_policy_digest_only"
+            } else {
+                "compiled_source_configuration_policy_digest_only"
+            },
             family,
             root_policy: policy.wire_name(),
             implementation_sha256: hex(&digest.0),
             compiled_bootstrap_source_sha256: hex(
                 &rz_uci::rovent_bootstrap::compiled_bootstrap_source_digest(),
             ),
+            input_lock_canonical_sha256: input_lock.map(|(lock, _)| lock.canonical_sha256.clone()),
+            input_lock_json: input_lock.map(|(_, raw)| byte_pin(raw)),
             actual_session_constructed: false,
             root_authority: false,
         })
@@ -682,6 +758,21 @@ mod metadata {
         position: Option<&PositionCommand>,
         session_policy: Option<SessionImplementationPolicy>,
     ) -> Result<Vec<u8>, Error> {
+        prepare_metadata_with_options_and_input_lock(
+            bytes,
+            backend_raw,
+            position,
+            session_policy,
+            None,
+        )
+    }
+    fn prepare_metadata_with_options_and_input_lock(
+        bytes: &[u8],
+        backend_raw: Option<&[u8]>,
+        position: Option<&PositionCommand>,
+        session_policy: Option<SessionImplementationPolicy>,
+        input_lock_raw: Option<&[u8]>,
+    ) -> Result<Vec<u8>, Error> {
         check_input_budget(bytes)?;
         serde_json::from_slice::<UniqueJson>(bytes).map_err(Error::Json)?;
         let document =
@@ -697,9 +788,35 @@ mod metadata {
             "pending_independent_runtime_metadata"
         };
         let root_metadata = position.map(prepare_root_metadata).transpose()?;
-        let session_implementation = session_policy
-            .map(|policy| prepare_session_implementation(&document, policy))
-            .transpose()?;
+        let session_implementation = if let Some(raw) = input_lock_raw {
+            let policy = session_policy.ok_or(Error::SessionImplementationLock(
+                "input lock metadata requires an explicit session implementation root policy",
+            ))?;
+            if !matches!(
+                document.fields().execution,
+                ExecutionConfiguration::ExternalResearcher { .. }
+            ) {
+                return Err(Error::SessionImplementationLock(
+                    "input lock metadata is supported only for an external researcher session declaration",
+                ));
+            }
+            if raw.is_empty() || raw.len() > LOCK_INPUT_MAX_BYTES {
+                return Err(Error::InputLockBudget);
+            }
+            serde_json::from_slice::<UniqueJson>(raw).map_err(Error::Json)?;
+            let lock =
+                RoventInputLock::from_json(std::str::from_utf8(raw).map_err(Error::CanonicalUtf8)?)
+                    .map_err(|cause| Error::InputLock(Box::new(cause)))?;
+            Some(prepare_session_implementation_with_lock(
+                &document,
+                policy,
+                Some((&lock, raw)),
+            )?)
+        } else {
+            session_policy
+                .map(|policy| prepare_session_implementation(&document, policy))
+                .transpose()?
+        };
         let output = Metadata {
             schema: if session_implementation.is_some() {
                 "rz-rovent-startup-metadata/3"
@@ -738,7 +855,11 @@ mod metadata {
             checks: Checks {
                 unique_json_object_keys: "passed",
                 existing_closed_codec_and_declaration_constraints: "passed",
-                actual_lock_join: "pending_external_inputs",
+                actual_lock_join: if input_lock_raw.is_some() {
+                    "declared_configuration_and_input_lock_only_no_runtime_admission"
+                } else {
+                    "pending_external_inputs"
+                },
                 compiled_native_capability_admission: "not_performed",
                 referenced_asset_identity: "not_performed",
                 backend_runtime_configuration_digest: backend_scope,
@@ -809,12 +930,18 @@ mod metadata {
                     .as_deref()
                     .map(read_configuration)
                     .transpose()?;
+                let input_lock = arguments
+                    .input_lock_metadata
+                    .as_deref()
+                    .map(read_input_lock)
+                    .transpose()?;
                 match arguments.session_implementation_root_policy {
-                    Some(policy) => prepare_metadata_with_options(
+                    Some(policy) => prepare_metadata_with_options_and_input_lock(
                         &input,
                         backend.as_deref(),
                         arguments.position_command.as_ref(),
                         Some(policy),
+                        input_lock.as_deref(),
                     )?,
                     None => match arguments.position_command.as_ref() {
                         Some(position) => prepare_metadata_with_position(
@@ -887,6 +1014,124 @@ mod metadata {
                 "peers":{"pc_peer":true,"researcher":true,"max_sources_per_root":1}
             });
             serde_json::to_vec(&value).unwrap()
+        }
+
+        fn external_fixture() -> Vec<u8> {
+            let mut value: serde_json::Value = serde_json::from_slice(&fixture(
+                ROVENT_STARTUP_CONFIGURATION_V3_DOMAIN,
+                r#", "post_repair":"disabled", "external":{"kind":"absent"}"#,
+            ))
+            .unwrap();
+            value["execution"] = serde_json::json!({
+                "assembly":"external_researcher", "event_order":"fixed",
+                "queues":{"waiting_jobs_max":16,"worker_commands_max":8,
+                    "role_tickets_max":16,"paused_bytes_per_worker_max":1048576},
+                "max_rounds":64,"max_reported_nodes":64,"cpu_depth":8,"cpu_nodes_per_task":128,
+                "profile":{"path":"fixtures/external-profile.json","sha256":"a".repeat(64),
+                    "bytes":32,"source":"https://example.invalid/profile","license":"fixture"},
+                "slice":{"quantum_ms":1000,"stop_drain_reserve_ms":500,
+                    "requested_reported_nodes":256,"multipv":1},
+                "peers":{"pc_peer":true,"researcher":true,"max_sources_per_root":16}
+            });
+            value["external"] = serde_json::json!({"kind":"researcher",
+                "question_limit":{"kind":"nodes","reported_nodes":32}});
+            serde_json::to_vec(&value).unwrap()
+        }
+
+        #[test]
+        fn external_lock_arguments_are_explicit_and_cannot_mix_standalone_queries() {
+            let Invocation::Startup(arguments) = parse_arguments(
+                [
+                    "--config=config.json",
+                    "--input-lock-metadata=lock.json",
+                    "--session-implementation-root-policy=dynamic-go",
+                ]
+                .map(OsString::from),
+            )
+            .unwrap() else {
+                panic!("startup invocation required")
+            };
+            assert_eq!(
+                arguments.input_lock_metadata,
+                Some(PathBuf::from("lock.json"))
+            );
+            for args in [
+                vec!["--config=config.json", "--input-lock-metadata=lock.json"],
+                vec![
+                    "--config=config.json",
+                    "--session-implementation-root-policy=dynamic-go",
+                    "--input-lock-metadata=lock.json",
+                    "--input-lock-metadata=lock.json",
+                ],
+                vec![
+                    "--config=config.json",
+                    "--session-implementation-root-policy=dynamic-go",
+                    "--input-lock-metadata=.env",
+                ],
+                vec![
+                    "--runtime-bundle-metadata=bundle.json",
+                    "--input-lock-metadata=lock.json",
+                ],
+            ] {
+                assert!(parse_arguments(args.into_iter().map(OsString::from)).is_err());
+            }
+        }
+
+        #[test]
+        fn external_lock_decode_refuses_missing_invalid_duplicate_and_over_budget_inputs() {
+            let external = external_fixture();
+            assert!(prepare_metadata(&external, None).is_ok()); // Original declaration-only path.
+            let policy = Some(SessionImplementationPolicy::DynamicGo);
+            assert!(matches!(
+                prepare_metadata_with_options(&external, None, None, policy),
+                Err(Error::SessionImplementationLock(_))
+            ));
+            assert!(matches!(
+                prepare_metadata_with_options_and_input_lock(
+                    &external,
+                    None,
+                    None,
+                    None,
+                    Some(b"{}")
+                ),
+                Err(Error::SessionImplementationLock(_))
+            ));
+            assert!(matches!(
+                prepare_metadata_with_options_and_input_lock(
+                    &external,
+                    None,
+                    None,
+                    policy,
+                    Some(b"{}")
+                ),
+                Err(Error::InputLock(_))
+            ));
+            assert!(matches!(
+                prepare_metadata_with_options_and_input_lock(
+                    &external,
+                    None,
+                    None,
+                    policy,
+                    Some(br#"{"domain":null,"domain":null}"#)
+                ),
+                Err(Error::Json(_))
+            ));
+            let excessive = vec![b' '; LOCK_INPUT_MAX_BYTES + 1];
+            assert!(matches!(
+                prepare_metadata_with_options_and_input_lock(
+                    &external,
+                    None,
+                    None,
+                    policy,
+                    Some(&excessive)
+                ),
+                Err(Error::InputLockBudget)
+            ));
+            let pc = fixture(ROVENT_STARTUP_CONFIGURATION_DOMAIN, "");
+            assert!(matches!(
+                prepare_metadata_with_options_and_input_lock(&pc, None, None, policy, Some(b"{}")),
+                Err(Error::SessionImplementationLock(_))
+            ));
         }
 
         #[test]
@@ -1125,6 +1370,7 @@ mod metadata {
                     backend_metadata: None,
                     position_command: None,
                     session_implementation_root_policy: None,
+                    input_lock_metadata: None,
                 })
             );
             assert_eq!(
@@ -1137,6 +1383,7 @@ mod metadata {
                     backend_metadata: Some(PathBuf::from("b.json")),
                     position_command: None,
                     session_implementation_root_policy: None,
+                    input_lock_metadata: None,
                 })
             );
             assert_eq!(
