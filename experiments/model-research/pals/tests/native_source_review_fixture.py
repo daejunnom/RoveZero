@@ -490,7 +490,7 @@ class FeedbackObservationFixtureTests(_fixture_unittest.TestCase):
 # idle/archive dependencies; archive_lifecycle.rs was already in the fourteen.
 # Its compiled fact is a synthetic label, never an actual binary, archive I/O,
 # native retirement, selected-view consumption, Rules or training authority.
-IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT = '8c8e0807baaa10c5acaf80d0cbea94c4516d290d'
+IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT = 'c33252747469ea392fe9a1dcfbc0fa0ca949bb96'
 IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
         "bytes": 423651,
@@ -549,12 +549,12 @@ IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
         "sha256": "d72fad02feee033ce223f8d8608bd4847e6adc954232b82dd0c3abfd2065a304"
     },
     "crates/rz-search/src/pals/engine/idle_archive.rs": {
-        "bytes": 23857,
-        "sha256": "7fc96620a6eae1d9aa7ee92549948a2572dba96d75fb899b26e83f76661d8506"
+        "bytes": 32574,
+        "sha256": "913b4b95538100f5363937abad2cc2ba4b47852283f46f9e5bfea370bccdb3c2"
     },
     "crates/rz-search/src/pals/engine/adaptive_port/archive_worker.rs": {
-        "bytes": 98993,
-        "sha256": "5d067b1e2387c229e173d09c27a2d037fc7fe8dbfb8eb87a2c70806d0603f94f"
+        "bytes": 111718,
+        "sha256": "b504bceb63cc84b6b26ada11e86c0226dafc99d55253da0751a6de3a91b1c3ea"
     },
     "crates/rz-search/src/pals/engine/preparing_root.rs": {
         "bytes": 13206,
@@ -565,27 +565,27 @@ IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
         "sha256": "482e1851bf4d135886c7383929fe087fbf9aadde717374440d409489fb92898f"
     },
     "crates/rz-search/src/pals/engine/adaptive_root.rs": {
-        "bytes": 26418,
-        "sha256": "920feb47653b2f3fcaaa3934efcbed86beb1570a2352bcbf992e39907f0269b4"
+        "bytes": 28149,
+        "sha256": "708386d0e96a5b329529bc87bab0c40fcbedc2ddcf6752f40541ea579a90aa9a"
     },
     "crates/rz-search/src/pals/store/archive.rs": {
-        "bytes": 178847,
-        "sha256": "3c5cfe42689abb01745f256293843fa89f567692069f3412343f19abb8fa5ac6"
+        "bytes": 179458,
+        "sha256": "3ad811186f8783a8ec9ac5468471009c7ac026478c0cb8f0862efe9e61057b1a"
     }
 }
 IDLE_ARCHIVE_REVIEWED_TRANSITION_PINS = {
     path: copy.deepcopy(IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS[path]) for path in (
         "crates/rz-search/src/pals/engine.rs", "crates/rz-arena/src/pals_collect/native.rs")}
-IDLE_ARCHIVE_REVIEWED_CLOSURE_SHA256 = '4599f9b1ccbc8269f8a4528b3695a503d198ae2b89205a7eeacf6cd2e02b64ac'
-# Hash of the independent synthetic label documented by the source handoff.
-IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT = 'b9af579253b62ff13df7e0dae99fd808383a9f55cb67bd7bd65f41054972db87'
+IDLE_ARCHIVE_REVIEWED_CLOSURE_SHA256 = '01c58559059fd1f4d00bcd34550aed93556c73387eb001b29853efb250a16bb7'
+# SHA-256 of b"synthetic independently declared compiled closure fact for reviewed unused idle archive source c332527\n".
+IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT = '9f2302bbc69ee314347f3090eeaa3cce6c3d24306177112766981498a91214a4'
 
 
 def idle_archive_fixture_profile(lane):
     if lane not in ("default_disabled", "legacy_single_reply"):
         raise ValueError("explicit synthetic idle-archive review lane required")
     return {"schema": "rz-pals-native-reviewed-transition-profile/1",
-        "review_id": "synthetic-reviewed-8c8e080-idle-archive-twenty-source-" + lane,
+        "review_id": "synthetic-reviewed-c332527-idle-archive-twenty-source-" + lane,
         "lane": lane, "transition_sources": copy.deepcopy(IDLE_ARCHIVE_REVIEWED_TRANSITION_PINS),
         "component_pins": copy.deepcopy(IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS),
         "compiled_search_implementation_sha256": IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT,
@@ -635,7 +635,7 @@ class IdleArchiveFixtureTests(_fixture_unittest.TestCase):
             "crates/rz-search/src/pals/engine/adaptive_root.rs",
             "crates/rz-search/src/pals/store/archive.rs"}
         current = banks.idle_archive_fixture_profile("default_disabled")
-        self.assertEqual(banks.idle_archive_fixture_manifest()["source_commit"], '8c8e0807baaa10c5acaf80d0cbea94c4516d290d')
+        self.assertEqual(banks.idle_archive_fixture_manifest()["source_commit"], 'c33252747469ea392fe9a1dcfbc0fa0ca949bb96')
         self.assertEqual(set(current["component_pins"]),
                          set(prior[-1]["component_pins"]) | expected_extra)
         self.assertEqual(len(current["component_pins"]), 20)

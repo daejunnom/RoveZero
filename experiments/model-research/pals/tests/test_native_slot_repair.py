@@ -811,6 +811,7 @@ class NativeSlotRepairTests(unittest.TestCase):
                     slot_witness._source_review(values, self.fixture.source)
 
     def test_current_review_is_one_literal_pair_and_rejects_historical_hybrids(self):
+        self.assertEqual(REVIEWED_SOURCE_COMMIT, "c33252747469ea392fe9a1dcfbc0fa0ca949bb96")
         observed = {path: semantic.byte_pin(value) for path, value in zip(slot_witness._SOURCE_PATHS,
             (self.fixture.engine_raw, self.fixture.native_raw))}
         self.assertEqual(observed, REVIEWED_TRANSITION_PINS)
