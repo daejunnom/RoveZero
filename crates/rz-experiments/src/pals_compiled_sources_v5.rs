@@ -615,6 +615,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             ),
             source!("crates/rz-experiments/src/pals_startup_v5/content_admission/owned_files.rs"),
             source!("crates/rz-experiments/src/rovent_manifest.rs"),
+            source!("crates/rz-experiments/src/rovent_storage.rs"),
             source!("crates/rz-experiments/src/rovent_root_descriptor.rs"),
         ],
     ),

@@ -980,7 +980,7 @@ fn idle_newgame_cancel_at_actual_close_keeps_one_checkpoint_and_unspent_original
     )
     .err()
     .expect("real close precedes scheduled cancellation");
-    let first_checkpoint = rejected.receipt.idle_checkpoint.unwrap();
+    let first_checkpoint = Arc::clone(rejected.receipt.idle_checkpoint.as_ref().unwrap());
     let ArchiveOwner::Idle(mut idle) = rejected
         .into_owner_for_shutdown()
         .unwrap_or_else(|_| panic!("same closed transition retained"))
