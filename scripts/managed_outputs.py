@@ -105,7 +105,14 @@ class _CreatedOutputDirectory:
 class OutputLease:
     def __init__(self, output, source, *, catalog=None, reserve=8 * GiB,
                  total_limit=18 * GiB, retention_days=14, deferred=False, outer_supervised=False,
-                 quarantine_receipts=None):
+                 quarantine_receipts=None, quarantine_transition_receipts=None):
+        if quarantine_transition_receipts is not None:
+            if quarantine_receipts is not None:
+                raise StorageError("V1 and transition custody selectors are mutually exclusive")
+            if not isinstance(quarantine_transition_receipts, (tuple, list)) or len(quarantine_transition_receipts) > MAX_RUNS:
+                raise StorageError("bounded explicit transition tip pins required")
+            if outer_supervised:
+                raise StorageError("outer finalizer does not carry explicit transition tip pins")
         if quarantine_receipts is not None:
             if not isinstance(quarantine_receipts, (tuple, list)) or len(quarantine_receipts) > MAX_RUNS:
                 raise StorageError("bounded explicit custody receipt pins required")
@@ -113,7 +120,7 @@ class OutputLease:
                 raise StorageError("outer finalizer does not carry explicit custody receipt pins")
         self.output, self.source = checked(output), checked(source)
         self.catalog = checked(catalog or canonical_catalog())
-        if quarantine_receipts is not None:
+        if quarantine_receipts is not None or quarantine_transition_receipts is not None:
             from managed_output_quarantine import registry_path
             registry = registry_path(self.catalog)
             if self.output.is_relative_to(registry) or registry.is_relative_to(self.output):
@@ -127,6 +134,8 @@ class OutputLease:
         self.reserve, self.total_limit, self.days = reserve, total_limit, retention_days
         self.deferred = deferred
         self.quarantine_receipts = None if quarantine_receipts is None else tuple(dict(pin) for pin in quarantine_receipts)
+        self.quarantine_transition_receipts = (None if quarantine_transition_receipts is None
+                                               else tuple(dict(pin) for pin in quarantine_transition_receipts))
         self._quarantine_view = None
         self.key = hashlib.sha256(os.path.normcase(str(self.output)).encode()).hexdigest()
         self.guard = CatalogGuard(self.catalog / "catalog.lock")
@@ -146,18 +155,25 @@ class OutputLease:
 
     def _rows(self):
         rows = _catalog_rows(self.catalog)
-        if self.quarantine_receipts is not None:
+        if self.quarantine_transition_receipts is not None:
+            from managed_output_quarantine_transition import validate_transitions
+            validator, pins = validate_transitions, self.quarantine_transition_receipts
+        elif self.quarantine_receipts is not None:
             from managed_output_quarantine import validate_quarantines
-            previous, self._quarantine_view = self._quarantine_view, None
-            try:
-                self._quarantine_view = validate_quarantines(self.catalog, rows, self.quarantine_receipts, self.guard)
-            finally:
-                if previous is not None:
-                    previous.close(sys.exc_info()[1])
+            validator, pins = validate_quarantines, self.quarantine_receipts
+        else:
+            return rows
+        previous, self._quarantine_view = self._quarantine_view, None
+        try:
+            self._quarantine_view = validator(self.catalog, rows, pins, self.guard)
+        finally:
+            if previous is not None:
+                previous.close(sys.exc_info()[1])
         return rows
 
+
     def _check_quarantine_view(self):
-        if self.quarantine_receipts is not None:
+        if self.quarantine_receipts is not None or self.quarantine_transition_receipts is not None:
             if self._quarantine_view is None:
                 raise StorageError("explicit custody validation has not completed")
             self._quarantine_view.check()
@@ -171,7 +187,7 @@ class OutputLease:
         try:
             self.guard.release()
         except BaseException:
-            if self.quarantine_receipts is None or primary is None:
+            if (self.quarantine_receipts is None and self.quarantine_transition_receipts is None) or primary is None:
                 raise
             if hasattr(primary, "add_note"):
                 primary.add_note("custody output catalog gate release also failed")
@@ -351,7 +367,7 @@ class OutputLease:
         if not self.deferred:
             write_record(self.output / ".rovezero-output.json", self.record)
         write_record(self.catalog / (self.key + ".json"), self.record)
-        if self.quarantine_receipts is not None:
+        if self.quarantine_receipts is not None or self.quarantine_transition_receipts is not None:
             self._check_quarantine_view()  # A late error keeps written metadata; no payload permission.
 
     def check_budget(self):
@@ -477,14 +493,31 @@ def finalize_supervised_outputs(root, owner, catalog=None):
         sample_output_budget(catalog)
 
 
-def sample_output_budget(catalog=None, *, quarantine_receipts=None, quarantine_guard=None):
+def sample_output_budget(catalog=None, *, quarantine_receipts=None, quarantine_guard=None,
+                         quarantine_transition_receipts=None):
     """Sampled length cap, never a quota or physical completion witness.
 
     V1 calls remain read-only without acquiring the producer's held gate. Aware
     calls use an explicit original guard (live owner: prefer check_budget); only
     independent sampling may omit it and acquire that gate. Busy/errors propagate.
     """
+    if quarantine_receipts is not None and quarantine_transition_receipts is not None:
+        raise StorageError("V1 and transition custody selectors are mutually exclusive")
     catalog = checked(catalog or canonical_catalog())
+    if quarantine_transition_receipts is not None:
+        from managed_output_quarantine import original_custody_gate
+        from managed_output_quarantine_transition import validate_transitions
+        if quarantine_guard is None:
+            with original_custody_gate(catalog) as held:
+                return sample_output_budget(catalog, quarantine_guard=held,
+                                            quarantine_transition_receipts=quarantine_transition_receipts)
+        view = validate_transitions(catalog, _catalog_rows(catalog), quarantine_transition_receipts, quarantine_guard)
+        try:
+            total = view.usage(_catalog_rows(catalog))
+            view.check()
+            return total
+        finally:
+            view.close(sys.exc_info()[1])
     if quarantine_receipts is not None:
         from managed_output_quarantine import original_custody_gate, validate_quarantines
         if quarantine_guard is None:
