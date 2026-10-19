@@ -189,7 +189,7 @@ class NativeBundleTests(unittest.TestCase):
     def test_actual_cargo_artifact_must_join_source_kind_features_and_separate_slot(self):
         source = Path('/synthetic-source')
         target_root = Path('/synthetic-target-diagnostic')
-        spec = bundle.SPECS[-1]
+        spec = next(row for row in bundle.SPECS if row[2] == 'pals_continuation_diagnostic')
         logical = 'crates/rz-uci/examples/pals_continuation_diagnostic.rs'
         target = {'name': spec[2], 'kind': ['example'], 'crate_types': ['bin'],
                   'src_path': str(source / logical), 'edition': '2024'}
@@ -219,6 +219,95 @@ class NativeBundleTests(unittest.TestCase):
                 check(changed)
         with self.assertRaisesRegex(RuntimeError, 'ExactRegisteredCargoTarget'):
             check(messages, set())
+
+    def test_functional_bundle_keeps_legacy_targets_and_requires_exact_six_tools(self):
+        legacy = (
+            ('rz-arena', 'bin', 'rz-pals-g0-bootstrap-numerical', 'pals-collection-onnx,native-cuda'),
+            ('rz-arena', 'bin', 'rz-pals-g0-collection-deployment-numerical', 'pals-collection-onnx,native-cuda'),
+            ('rz-eval', 'example', 'virtual_review_numeric_capture', 'onnx,contracts'),
+            ('rz-uci', 'bin', 'rz-pals-adaptive', 'pals-adaptive,onnx-cuda'),
+            ('rz-uci', 'example', 'pals_rules_descriptor', 'pals-adaptive,onnx-cuda'),
+            ('rz-uci', 'bin', 'rz-rovent', 'pals-adaptive,onnx-cuda'),
+            ('rz-arena', 'bin', 'rz-rovent-trainer', 'pals-collection-onnx,native-cuda'),
+            ('rz-uci', 'example', 'pals_continuation_diagnostic', 'pals-adaptive-diagnostics'),
+        )
+        required = {'rz-rovent-native', 'rz-rovent-collect', 'rz-rovent-utility-trainer',
+                    'rovent_startup_metadata', 'virtual_review_numeric_capture', 'rz-experiments'}
+        legacy_names = {row[2] for row in legacy}
+        self.assertEqual(tuple(row for row in bundle.SPECS if row[2] in legacy_names), legacy)
+        self.assertEqual(len(bundle.SPECS), 13)
+        self.assertEqual({row[2] for row in bundle.FUNCTIONAL_SPECS}, required)
+        self.assertEqual(len(bundle.FUNCTIONAL_SPECS), 6)
+        self.assertEqual(sum(row[2] == 'virtual_review_numeric_capture' for row in bundle.SPECS), 1)
+        self.assertEqual(bundle.WARM, ('rz-uci', 'example', 'virtual_review_warm_numeric_capture',
+                                      'pals-adaptive,onnx-cpu,experimental-io-binding'))
+        bundle.validate_functional_specs(bundle.SPECS)
+        bundle.validate_functional_specs(bundle.SPECS + (bundle.WARM,))
+        for original, replacement in (('rz-rovent-native', 'rz-rovent'),
+                                      ('rz-rovent-utility-trainer', 'rz-rovent-trainer')):
+            changed = tuple((row[0], row[1], replacement, row[3]) if row[2] == original else row
+                            for row in bundle.SPECS)
+            with self.subTest(alias=original), self.assertRaises(RuntimeError):
+                bundle.validate_functional_specs(changed)
+        for name in required:
+            for index, replacement in ((1, 'example' if name.startswith('rz-') else 'bin'),
+                                       (3, 'unregistered-features')):
+                changed = tuple(tuple(replacement if cursor == index else part
+                                      for cursor, part in enumerate(row)) if row[2] == name else row
+                                for row in bundle.SPECS)
+                with self.subTest(name=name, field=index), self.assertRaises(RuntimeError):
+                    bundle.validate_functional_specs(changed)
+        with self.assertRaises(RuntimeError):
+            bundle.validate_functional_specs(bundle.SPECS[:-1])
+
+    def test_each_functional_tool_uses_exact_cargo_source_kind_and_feature_admission(self):
+        source = Path('/synthetic-source')
+        target_root = Path('/synthetic-target-functional')
+        paths = {
+            'rz-rovent-native': 'crates/rz-arena/src/bin/rovent-native.rs',
+            'rz-rovent-collect': 'crates/rz-arena/src/bin/rovent-collect.rs',
+            'rz-rovent-utility-trainer': 'crates/rz-arena/src/bin/rovent-utility-trainer.rs',
+            'rovent_startup_metadata': 'crates/rz-uci/examples/rovent_startup_metadata.rs',
+            'virtual_review_numeric_capture': 'crates/rz-eval/examples/virtual_review_numeric_capture.rs',
+            'rz-experiments': 'crates/rz-experiments/src/main.rs',
+        }
+        for spec in bundle.FUNCTIONAL_SPECS:
+            package, kind, name, features = spec
+            logical = paths[name]
+            target = {'name': name, 'kind': [kind], 'crate_types': ['bin'],
+                      'src_path': str(source / logical), 'edition': '2024'}
+            metadata = {'packages': [{'name': package, 'id': 'SYNTHETIC_PACKAGE',
+                                     'manifest_path': str(source / 'crates' / package / 'Cargo.toml'),
+                                     'targets': [target]}]}
+            output = target_root / 'release' / ('examples' if kind == 'example' else '') / name
+            artifact = {'reason': 'compiler-artifact', 'package_id': 'SYNTHETIC_PACKAGE',
+                        'target': copy.deepcopy(target), 'executable': str(output),
+                        'profile': {'test': False}, 'features': features.split(',')}
+            messages = [artifact, {'reason': 'build-finished', 'success': True}]
+            def check(value, actual_metadata=None, registered=None):
+                raw = b'\n'.join(json.dumps(row).encode() for row in value)
+                return bundle.cargo_artifact(raw, metadata if actual_metadata is None else actual_metadata,
+                    source, target_root, spec, {logical} if registered is None else registered)
+            with self.subTest(name=name, case='original'):
+                self.assertEqual(check(messages)[0], output)
+            for label, mutate in (
+                    ('wrong-kind', lambda rows: rows[0]['target'].update(kind=['lib'])),
+                    ('missing-feature', lambda rows: rows[0]['features'].pop()),
+                    ('wrong-package', lambda rows: rows[0].update(package_id='OTHER')),
+                    ('wrong-target-name', lambda rows: rows[0]['target'].update(name='different-tool')),
+                    ('wrong-slot', lambda rows: rows[0].update(executable='/other-target/tool'))):
+                changed = copy.deepcopy(messages)
+                mutate(changed)
+                with self.subTest(name=name, case=label), self.assertRaises(RuntimeError):
+                    check(changed)
+            with self.subTest(name=name, case='unregistered-source'), self.assertRaises(RuntimeError):
+                check(messages, registered=set())
+            foreign_metadata, foreign_messages = copy.deepcopy(metadata), copy.deepcopy(messages)
+            foreign = str(Path('/outside-source/unregistered.rs'))
+            foreign_metadata['packages'][0]['targets'][0]['src_path'] = foreign
+            foreign_messages[0]['target']['src_path'] = foreign
+            with self.subTest(name=name, case='outside-source'), self.assertRaises(RuntimeError):
+                check(foreign_messages, actual_metadata=foreign_metadata)
 
     def test_strict_metadata_rejects_duplicate_keys_and_nonfinite_values(self):
         for raw in (b'{"x":1,"x":2}', b'{"x":NaN}'):

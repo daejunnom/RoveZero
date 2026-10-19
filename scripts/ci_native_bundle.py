@@ -56,17 +56,44 @@ SPECS = (
     ('rz-uci', 'example', 'pals_rules_descriptor', 'pals-adaptive,onnx-cuda'),
     ('rz-uci', 'bin', 'rz-rovent', 'pals-adaptive,onnx-cuda'),
     ('rz-arena', 'bin', 'rz-rovent-trainer', 'pals-collection-onnx,native-cuda'),
+    ('rz-arena', 'bin', 'rz-rovent-native', 'pals-collection-onnx,native-cuda'),
+    ('rz-arena', 'bin', 'rz-rovent-collect', 'pals-collection-onnx,native-cuda'),
+    ('rz-arena', 'bin', 'rz-rovent-utility-trainer', 'pals-collection-onnx,native-cuda'),
+    ('rz-uci', 'example', 'rovent_startup_metadata', 'pals-adaptive,onnx-cuda'),
+    ('rz-experiments', 'bin', 'rz-experiments', 'pals-content-admission'),
     ('rz-uci', 'example', 'pals_continuation_diagnostic', 'pals-adaptive-diagnostics'),
 )
 WARM = ('rz-uci', 'example', 'virtual_review_warm_numeric_capture',
         'pals-adaptive,onnx-cpu,experimental-io-binding')
 # This standalone example calls the CUDA-enabled eval backend directly. Its
 # required features do not certify the separate engine/native_bootstrap path.
+FUNCTIONAL_SPECS = (
+    ('rz-arena', 'bin', 'rz-rovent-native', 'pals-collection-onnx,native-cuda'),
+    ('rz-arena', 'bin', 'rz-rovent-collect', 'pals-collection-onnx,native-cuda'),
+    ('rz-arena', 'bin', 'rz-rovent-utility-trainer', 'pals-collection-onnx,native-cuda'),
+    ('rz-uci', 'example', 'rovent_startup_metadata', 'pals-adaptive,onnx-cuda'),
+    ('rz-eval', 'example', 'virtual_review_numeric_capture', 'onnx,contracts'),
+    ('rz-experiments', 'bin', 'rz-experiments', 'pals-content-admission'),
+)
 
 
 def require(value, code):
     if not value:
         raise RuntimeError(code)
+
+
+def validate_functional_specs(specs):
+    # This only closes the existing producer's declared 13/optional-Warm 14
+    # targets. It grants no artifact, local ABI, provider or runtime admission.
+    require(type(specs) is tuple and len(specs) in (13, 14)
+            and all(type(row) is tuple and len(row) == 4
+                    and all(type(part) is str for part in row) for row in specs),
+            'ClosedFunctionalBundleSpecShape')
+    by_name = {row[2]: row for row in specs}
+    require(len(by_name) == len(specs), 'DuplicateBundleTarget')
+    require(all(by_name.get(row[2]) == row for row in FUNCTIONAL_SPECS),
+            'RequiredSixFunctionalTargetsKindsAndFeatures')
+    require(specs == SPECS or specs == SPECS + (WARM,), 'ClosedFunctionalBundleSpecRoster')
 
 
 def strict_json(raw):
@@ -485,7 +512,9 @@ def run(source, root, expected_head, seconds):
         require(metadata['workspace_root'] == str(source), 'ActualCargoWorkspace')
         manifest = tomllib.loads((source / 'crates/rz-uci/Cargo.toml').read_text())
         warm, receipt['warm_status'] = warm_spec(manifest, {r['path'] for r in rows})
-        for spec in SPECS + ((warm,) if warm else ()):
+        selected_specs = SPECS + ((warm,) if warm else ())
+        validate_functional_specs(selected_specs)
+        for spec in selected_specs:
             package, kind, name, features = spec
             slot = 'target-warm' if spec == warm else ('target-diagnostic' if name == 'pals_continuation_diagnostic' else 'target-native')
             env['CARGO_TARGET_DIR'] = str(root / slot)
