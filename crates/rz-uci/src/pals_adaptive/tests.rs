@@ -2175,7 +2175,34 @@ fn original_prepared_echo_after_cancel_retirement_never_recancels_or_admits() {
     assert_eq!(manager.roles.len(), 1);
     assert!(manager.roles[0].ticket.is_none());
     let original_view = Arc::downgrade(&manager.roles[0].input.view);
+    // Hold the actual owner after a scan that saw this still-open Prepared.
+    // Closing now fixes the race where cancellation and quiesce arrive in the
+    // same iteration after the ordinary unsubmitted-retirement scan.
+    assert!(matches!(
+        manager.native.pause_after_cancellation_scan_for_test(
+            PreparationId(preparation.0 + 1_000_000),
+            until
+        ),
+        Err(TicketServiceError::UnknownPreparation)
+    ));
+    let (scan_entered, release_scan) = manager
+        .native
+        .pause_after_cancellation_scan_for_test(preparation, until)
+        .unwrap();
+    scan_entered
+        .recv_timeout(until.saturating_duration_since(Instant::now()))
+        .expect("original owner did not reach the one-shot cancellation-scan gate");
+    assert!(matches!(
+        manager
+            .native
+            .pause_after_cancellation_scan_for_test(preparation, until),
+        Err(TicketServiceError::Duplicate)
+    ));
+    assert_eq!(manager.native.occupancy(), 1);
+    assert!(!facts.quiesce_called.load(Ordering::Acquire));
     manager.begin_root_quiesce(until).unwrap();
+    assert!(manager.roles[0].cancellation_requested);
+    release_scan.send(()).unwrap();
     // Do not pump manager events: let its real successful cancel and the
     // original worker retire the unticketed preparation first. The queued
     // PreparationFailed/RootQuiesced remain for their one original delivery.
@@ -2234,7 +2261,12 @@ fn original_prepared_echo_after_cancel_retirement_never_recancels_or_admits() {
                     failed = true;
                 }
                 TicketNativeEvent::RootQuiesced(fence) => {
+                    assert!(
+                        failed,
+                        "original preparation terminal must precede root fence"
+                    );
                     assert!(!fenced, "original root fenced more than once");
+                    assert!(facts.quiesce_called.load(Ordering::Acquire));
                     assert_eq!(fence.authority(), manager.registration.authority);
                     assert!(fence.permits_reuse());
                     fenced = true;
@@ -2245,7 +2277,10 @@ fn original_prepared_echo_after_cancel_retirement_never_recancels_or_admits() {
         } else {
             assert!(
                 Instant::now() < until,
-                "original terminal/fence did not arrive"
+                "original terminal/fence did not arrive: failed={failed}; fenced={fenced}; quiesce_called={}; occupancy={}; owner_fence={:?}",
+                facts.quiesce_called.load(Ordering::Acquire),
+                manager.native.occupancy(),
+                manager.native.root_fence()
             );
             manager
                 .native
@@ -2258,6 +2293,11 @@ fn original_prepared_echo_after_cancel_retirement_never_recancels_or_admits() {
     });
     assert!(manager.failures().next().is_none());
     assert!(manager.roles.is_empty());
+    assert!(original_view.upgrade().is_none());
+    assert!(
+        manager.native.poll().is_none(),
+        "original terminal delivered once"
+    );
     assert_eq!(manager.role_call_budget_usage(), (0, 0));
     assert_eq!(manager.counters().submitted_role_tickets, 0);
     assert_eq!(manager.counters().physical_role_completions, 0);

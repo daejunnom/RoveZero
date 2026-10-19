@@ -312,6 +312,19 @@ struct PreparationControl {
     /// queued execution is submitted work even before Held::ticket is set.
     queued_executions: usize,
 }
+#[cfg(test)]
+struct CancellationScanTestGate {
+    preparation: PreparationId,
+    entered: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+    until: Instant,
+}
+#[cfg(test)]
+#[derive(Default)]
+struct CancellationScanTestState {
+    installed: bool,
+    pending: Option<CancellationScanTestGate>,
+}
 struct Shared {
     controls: Mutex<BTreeMap<PreparationId, PreparationControl>>,
     pending_capacity: usize,
@@ -332,6 +345,8 @@ struct Shared {
             Result<rz_runtime::adaptive::CpuThreadReadback, rz_runtime::adaptive::CpuResourceError>,
         >,
     >,
+    #[cfg(test)]
+    cancellation_scan_test: Mutex<CancellationScanTestState>,
 }
 impl Shared {
     fn reports_available(&self) -> bool {
@@ -437,6 +452,8 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
             pending_reports: AtomicUsize::new(0),
             signal: CompletionSignal::default(),
             ready_cpu: Mutex::new(None),
+            #[cfg(test)]
+            cancellation_scan_test: Mutex::new(CancellationScanTestState::default()),
         });
         let event_sender = EventPublisher {
             sender: event_sender,
@@ -795,6 +812,50 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
             .unwrap_or_else(|e| e.into_inner())
             .len()
     }
+    /// Pause this test owner's cancellation scan once, only after the original
+    /// preparation is actually held. Dropping the release sender unblocks it;
+    /// no gate can wait past the caller's original deadline.
+    #[cfg(test)]
+    pub(crate) fn pause_after_cancellation_scan_for_test(
+        &self,
+        preparation: PreparationId,
+        until: Instant,
+    ) -> Result<(mpsc::Receiver<()>, mpsc::SyncSender<()>), TicketServiceError> {
+        if Instant::now() >= until
+            || self.shared.closed.load(Ordering::Acquire)
+            || self.shared.root_closed.load(Ordering::Acquire)
+        {
+            return Err(TicketServiceError::Closed);
+        }
+        if !self
+            .shared
+            .controls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&preparation)
+        {
+            return Err(TicketServiceError::UnknownPreparation);
+        }
+        let mut state = self
+            .shared
+            .cancellation_scan_test
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.installed {
+            return Err(TicketServiceError::Duplicate);
+        }
+        let (entered, observed) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        state.installed = true;
+        state.pending = Some(CancellationScanTestGate {
+            preparation,
+            entered,
+            release: released,
+            until,
+        });
+        self.shared.signal.notify();
+        Ok((observed, release))
+    }
     pub fn is_quarantined(&self) -> bool {
         self.shared.quarantine.load(Ordering::Acquire)
     }
@@ -912,6 +973,44 @@ struct Held<V, Q, P, O> {
 }
 type HeldTickets<V, Q, P, O> = BTreeMap<PreparationId, Held<V, Q, P, O>>;
 
+fn retire_canceled_unsubmitted<V, Q, P, O>(
+    held: &mut HeldTickets<V, Q, P, O>,
+    events: &EventPublisher<O>,
+    shared: &Shared,
+) {
+    let (unsubmitted, retired_preparations) = {
+        let mut controls = shared.controls.lock().unwrap_or_else(|e| e.into_inner());
+        let unsubmitted: Vec<_> = held
+            .iter()
+            .filter_map(|(id, value)| {
+                (value.ticket.is_none()
+                    && value.canceled.load(Ordering::Acquire)
+                    && controls
+                        .get(id)
+                        .is_none_or(|control| control.queued_executions == 0))
+                .then_some(*id)
+            })
+            .collect();
+        let mut retired = Vec::with_capacity(unsubmitted.len());
+        for id in &unsubmitted {
+            if let Some(value) = held.remove(id) {
+                retired.push(value);
+            }
+            controls.remove(id);
+        }
+        (unsubmitted, retired)
+    };
+    // Backend-prepared data and immutable view pins may have nontrivial
+    // destructors; never run those while holding the control mailbox lock.
+    drop(retired_preparations);
+    for id in unsubmitted {
+        let _ = events.send(TicketNativeEvent::PreparationFailed {
+            preparation: id,
+            failure: RoleFailure::Canceled,
+        });
+    }
+}
+
 fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>(
     mut backend: B,
     commands: mpsc::Receiver<Command<V, Q>>,
@@ -958,36 +1057,29 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
                 &acceptance_issuer,
             );
         }
-        let (unsubmitted, retired_preparations) = {
-            let mut controls = shared.controls.lock().unwrap_or_else(|e| e.into_inner());
-            let unsubmitted: Vec<_> = held
-                .iter()
-                .filter_map(|(id, value)| {
-                    (value.ticket.is_none()
-                        && value.canceled.load(Ordering::Acquire)
-                        && controls
-                            .get(id)
-                            .is_none_or(|control| control.queued_executions == 0))
-                    .then_some(*id)
-                })
-                .collect();
-            let mut retired = Vec::with_capacity(unsubmitted.len());
-            for id in &unsubmitted {
-                if let Some(value) = held.remove(id) {
-                    retired.push(value);
+        retire_canceled_unsubmitted(&mut held, &events, &shared);
+        #[cfg(test)]
+        {
+            let gate = {
+                let mut state = shared
+                    .cancellation_scan_test
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if state.pending.as_ref().is_some_and(|gate| {
+                    held.get(&gate.preparation)
+                        .is_some_and(|value| value.ticket.is_none())
+                }) {
+                    state.pending.take()
+                } else {
+                    None
                 }
-                controls.remove(id);
+            };
+            if let Some(gate) = gate {
+                let _ = gate.entered.send(());
+                let _ = gate
+                    .release
+                    .recv_timeout(gate.until.saturating_duration_since(Instant::now()));
             }
-            (unsubmitted, retired)
-        };
-        // Backend-prepared data and immutable view pins may have nontrivial
-        // destructors; never run those while holding the control mailbox lock.
-        drop(retired_preparations);
-        for id in unsubmitted {
-            let _ = events.send(TicketNativeEvent::PreparationFailed {
-                preparation: id,
-                failure: RoleFailure::Canceled,
-            });
         }
         let until = *shared
             .shutdown_until
@@ -1035,6 +1127,10 @@ fn worker<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V,
                     }
                 }
             }
+            // Cancellation may have arrived after this iteration's first scan.
+            // Retire the original never-submitted preparation exactly once,
+            // before physical quiesce clears its remaining root custody.
+            retire_canceled_unsubmitted(&mut held, &events, &shared);
             let cleanup_known = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 held.values().all(|value| {
                     value
