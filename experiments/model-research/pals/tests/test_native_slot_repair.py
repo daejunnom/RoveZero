@@ -824,7 +824,30 @@ class NativeSlotRepairTests(unittest.TestCase):
             with self.assertRaisesRegex(slot_witness._Unsupported, "unreviewed_collector_transition_source_pair"):
                 slot_witness._source_review(source_review_raws(self.fixture), self.fixture.source)
         proof = slot_witness._source_review(source_review_raws(self.fixture), self.fixture.source)["reviewed_transition_closure"]
-        self.assertEqual(len(proof["component_pins"]), 14)
+        expected_components = {
+            "crates/rz-search/src/pals/engine.rs",
+            "crates/rz-arena/src/pals_collect/native.rs",
+            "crates/rz-search/src/pals/engine/semantic_state.rs",
+            "crates/rz-search/src/pals/engine/researcher_admission.rs",
+            "crates/rz-search/src/pals/engine/researcher_profile.rs",
+            "crates/rz-search/src/pals/engine/review_lifecycle.rs",
+            "crates/rz-search/src/pals/engine/cpu_lifecycle.rs",
+            "crates/rz-search/src/pals/engine/followup_execution.rs",
+            "crates/rz-search/src/pals/engine/archive_lifecycle.rs",
+            "crates/rz-arena/src/pals_collect.rs",
+            "crates/rz-arena/src/pals_collect/full_line.rs",
+            "crates/rz-arena/src/pals_collect/divergence.rs",
+            "crates/rz-arena/src/pals_collect/continuation.rs",
+            "crates/rz-arena/src/pals_collect/producer.rs",
+            "crates/rz-search/src/pals/engine/idle_archive.rs",
+            "crates/rz-search/src/pals/engine/adaptive_port/archive_worker.rs",
+            "crates/rz-search/src/pals/engine/preparing_root.rs",
+            "crates/rz-search/src/pals/review_context.rs",
+        }
+        self.assertEqual(set(proof["component_pins"]), expected_components)
+        self.assertEqual(proof["component_pins"], {
+            row["path"]: {name: row[name] for name in ("bytes", "sha256")}
+            for row in self.fixture.manifest["files"]})
         self.assertEqual(proof["compiled_search_implementation_sha256"], SYNTHETIC_COMPILED_FACT)
         self.assertIs(proof["execution_authorized"], False)
         self.assertEqual(slot_witness._reviewed_source_pair(REVIEWED_CURRENT_SOURCE_PINS), REVIEWED_CURRENT_SOURCE_PINS)

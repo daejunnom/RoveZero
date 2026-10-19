@@ -490,7 +490,7 @@ class FeedbackObservationFixtureTests(_fixture_unittest.TestCase):
 # dependencies; archive_lifecycle.rs was already in the original fourteen.
 # Its compiled fact is a synthetic label, never an actual binary, archive I/O,
 # native retirement, selected-view consumption, Rules or training authority.
-IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT = 'af5061d19e1c4a5bf2a5a60e74072cb7f2a70705'
+IDLE_ARCHIVE_REVIEWED_SOURCE_COMMIT = '42e9c64908a43b01dd469e4610ae52ae27705f2b'
 IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
     "crates/rz-search/src/pals/engine.rs": {
         "bytes": 423651,
@@ -513,8 +513,8 @@ IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
         "sha256": "118239c55485dcc88f4d82e29f60e68f47d3c4ba1e95b717368f41fab99ee810"
     },
     "crates/rz-search/src/pals/engine/review_lifecycle.rs": {
-        "bytes": 37179,
-        "sha256": "4a2059282d54f92ef05fda27d08f6383c9f6ef95d2f944b62c889217d3a8dc72"
+        "bytes": 37196,
+        "sha256": "b669925a221980da56a91b691468243bb4c72a72141df5a4cf9a55c21eebff44"
     },
     "crates/rz-search/src/pals/engine/cpu_lifecycle.rs": {
         "bytes": 41911,
@@ -525,8 +525,8 @@ IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
         "sha256": "72e85351261631f7bf57e95a53f95d8c8a6a079e3a320f27efcbefec2e1f938a"
     },
     "crates/rz-search/src/pals/engine/archive_lifecycle.rs": {
-        "bytes": 158109,
-        "sha256": "779a312af67d084a722b85d27d505cd565fde803a2c5dabcd48a7c08c5fe984a"
+        "bytes": 158108,
+        "sha256": "6359c666c72865c6738665de3aad40921b2bb6b7db04023a004fa33a7ce1a94c"
     },
     "crates/rz-arena/src/pals_collect.rs": {
         "bytes": 182486,
@@ -568,16 +568,16 @@ IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS = {
 IDLE_ARCHIVE_REVIEWED_TRANSITION_PINS = {
     path: copy.deepcopy(IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS[path]) for path in (
         "crates/rz-search/src/pals/engine.rs", "crates/rz-arena/src/pals_collect/native.rs")}
-IDLE_ARCHIVE_REVIEWED_CLOSURE_SHA256 = '06363fb910c84a2aeef531b4910a88c85f622242c58521a9ad61d6afaae0bbe4'
+IDLE_ARCHIVE_REVIEWED_CLOSURE_SHA256 = 'ec2b76f848861ac788c7bd359db6e18108aaf0d91a10fefb27bd865c0b6b5b6a'
 # Hash of the independent synthetic label documented by the source handoff.
-IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT = '1f10a7521cb6ba65932731ae6b35f817ee755cfea75b746f2891f5e78bed9855'
+IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT = '0695b1d75a99725b7f940f1b1a8c9227ab32da3e3747256f32f9665957ec785f'
 
 
 def idle_archive_fixture_profile(lane):
     if lane not in ("default_disabled", "legacy_single_reply"):
         raise ValueError("explicit synthetic idle-archive review lane required")
     return {"schema": "rz-pals-native-reviewed-transition-profile/1",
-        "review_id": "synthetic-reviewed-af5061d-idle-archive-eighteen-source-" + lane,
+        "review_id": "synthetic-reviewed-42e9c64-idle-archive-eighteen-source-" + lane,
         "lane": lane, "transition_sources": copy.deepcopy(IDLE_ARCHIVE_REVIEWED_TRANSITION_PINS),
         "component_pins": copy.deepcopy(IDLE_ARCHIVE_REVIEWED_COMPONENT_PINS),
         "compiled_search_implementation_sha256": IDLE_ARCHIVE_SYNTHETIC_COMPILED_FACT,
@@ -625,13 +625,14 @@ class IdleArchiveFixtureTests(_fixture_unittest.TestCase):
             "crates/rz-search/src/pals/engine/preparing_root.rs",
             "crates/rz-search/src/pals/review_context.rs"}
         current = banks.idle_archive_fixture_profile("default_disabled")
-        self.assertEqual(banks.idle_archive_fixture_manifest()["source_commit"], 'af5061d19e1c4a5bf2a5a60e74072cb7f2a70705')
+        self.assertEqual(banks.idle_archive_fixture_manifest()["source_commit"], '42e9c64908a43b01dd469e4610ae52ae27705f2b')
         self.assertEqual(set(current["component_pins"]),
                          set(prior[-1]["component_pins"]) | expected_extra)
         self.assertEqual(len(current["component_pins"]), 18)
         self.assertEqual([path for path in prior[-1]["component_pins"]
             if prior[-1]["component_pins"][path] != current["component_pins"][path]],
             ["crates/rz-search/src/pals/engine.rs",
+             "crates/rz-search/src/pals/engine/review_lifecycle.rs",
              "crates/rz-search/src/pals/engine/archive_lifecycle.rs"])
         self.assertEqual(len({profile["review_id"] for profile in [*prior, current]}), 6)
         before = copy.deepcopy(reviewed.REVIEWED_CLOSURE_PROFILES)
