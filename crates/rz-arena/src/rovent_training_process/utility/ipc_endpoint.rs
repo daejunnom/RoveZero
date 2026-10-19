@@ -365,6 +365,12 @@ mod tests {
             (endpoint, listener)
         }
     }
+    fn anchored_endpoint_path(endpoint: &OwnedUtilityEndpoint) -> PathBuf {
+        // Keep the original directory owner alive while the OS resolves this short address.
+        PathBuf::from(format!("/proc/self/fd/{}", endpoint.directory.as_raw_fd()))
+            .join(&endpoint.name)
+    }
+
     impl Drop for Root {
         fn drop(&mut self) {
             for directory in [self.control(), self.0.join("moved")] {
@@ -380,7 +386,7 @@ mod tests {
     fn joined_listener_explicit_cleanup_removes_only_original_endpoint() {
         let root = Root::new();
         let (mut endpoint, listener) = root.bind();
-        let client = UnixStream::connect(root.path()).unwrap();
+        let client = UnixStream::connect(anchored_endpoint_path(&endpoint)).unwrap();
         let (accepted, _) = listener.accept().unwrap();
         drop(client);
         drop(accepted);
@@ -461,7 +467,7 @@ mod tests {
                     symlink("other.txt", root.path()).unwrap();
                     None
                 }
-                _ => Some(UnixListener::bind(root.path()).unwrap()),
+                _ => Some(UnixListener::bind(anchored_endpoint_path(&endpoint)).unwrap()),
             };
             drop(listener);
             assert!(endpoint.cleanup().is_err());

@@ -154,6 +154,18 @@ fn encode_startup(family: UtilityRuntimeFamily, mut startup: Value) -> Result<Ve
     }
     encode(&startup)
 }
+fn startup_registration_sha256(
+    registration: &RoventUtilityExecutionRegistration,
+    raw_file_sha256: &str,
+) -> Result<String, ArenaError> {
+    // The legacy startup records its retained file pin. Intervention /2 instead
+    // binds the embedded /3 declaration by its typed canonical digest; the raw
+    // file pin remains independently retained by read_json and the broker.
+    match registration.family() {
+        UtilityRuntimeFamily::CohortV1 => Ok(raw_file_sha256.to_owned()),
+        UtilityRuntimeFamily::InterventionV2 => registration.as_intervention()?.canonical_sha256(),
+    }
+}
 fn decode<T: DeserializeOwned>(raw: &[u8]) -> Result<T, ArenaError> {
     crate::decode_json(std::str::from_utf8(raw).map_err(|_| invalid("strict UTF8 JSON"))?)
 }
@@ -1753,7 +1765,9 @@ pub fn run_rovent_utility_from_cli(
             request.whole_deadline(),
         )?;
         budget.reserve(registration.max_child_read_bytes)?;
-        let startup = json!({"schema":registration.family().domain(STARTUP),"execution_id":registration.execution_id,"window_id":window.window_id,"registration_sha256":command.registration.sha256,"registration":registration,"control":{"socket_path":socket,"parent_pid":std::process::id(),"parent_start_ticks":parent_start,"control_device":control_device,"control_inode":control_inode},"original_started_ns":start_ns,"execution_until_ns":execution_ns,"whole_until_ns":whole_ns,"source_root":registration.output_root.join("source"),"package_root":registration.output_root.join("source").join(linux::PACKAGE),"source_files":sources,"dependency_directories":dependencies,"runtime_module_pins":registration.runtime_endpoints.iter().map(|p|p.artifact.clone()).collect::<Vec<_>>(),"python_runtime":{"version":registration.trainer_python_version,"executable":registration.trainer_python_executable},"resources":resources.startup_json()?,"artifact_watch_profile":{"schema":"rz-rovent-training-artifact-watch/1","maximum_total_bytes":registration.max_output_bytes-control_limit,"maximum_file_bytes":MAX_TENSOR,"maximum_files":registration.max_artifact_files,"scope":"new_trainer_owned_output_tree_only"},"child_read_credit":{"reserved_bytes":registration.max_child_read_bytes,"scope":"charged_in_parent_shared_budget_no_refund"}});
+        let registration_sha256 =
+            startup_registration_sha256(&registration, &command.registration.sha256)?;
+        let startup = json!({"schema":registration.family().domain(STARTUP),"execution_id":registration.execution_id,"window_id":window.window_id,"registration_sha256":registration_sha256,"registration":registration,"control":{"socket_path":socket,"parent_pid":std::process::id(),"parent_start_ticks":parent_start,"control_device":control_device,"control_inode":control_inode},"original_started_ns":start_ns,"execution_until_ns":execution_ns,"whole_until_ns":whole_ns,"source_root":registration.output_root.join("source"),"package_root":registration.output_root.join("source").join(linux::PACKAGE),"source_files":sources,"dependency_directories":dependencies,"runtime_module_pins":registration.runtime_endpoints.iter().map(|p|p.artifact.clone()).collect::<Vec<_>>(),"python_runtime":{"version":registration.trainer_python_version,"executable":registration.trainer_python_executable},"resources":resources.startup_json()?,"artifact_watch_profile":{"schema":"rz-rovent-training-artifact-watch/1","maximum_total_bytes":registration.max_output_bytes-control_limit,"maximum_file_bytes":MAX_TENSOR,"maximum_files":registration.max_artifact_files,"scope":"new_trainer_owned_output_tree_only"},"child_read_credit":{"reserved_bytes":registration.max_child_read_bytes,"scope":"charged_in_parent_shared_budget_no_refund"}});
         let startup_raw = encode_startup(registration.family(), startup)?;
         require(
             startup_raw.len() <= crate::MAX_ORIGINAL_INPUT_BYTES,
@@ -2381,6 +2395,121 @@ mod tests {
             "artifact_watch_profile": {"fixture": "original-output-bound"},
             "child_read_credit": {"fixture": "original-reserved-credit"}
         })
+    }
+
+    fn startup_registration(family: UtilityRuntimeFamily) -> RoventUtilityExecutionRegistration {
+        use crate::rovent_training_process::recovery::{
+            RoventTrainerRuntimeEndpoint, rovent_trainer_dependency_set_sha256,
+        };
+        let pin = |path: &str| json!({"path":path,"sha256":"1".repeat(64),"bytes":128});
+        let endpoints: Vec<RoventTrainerRuntimeEndpoint> = serde_json::from_value(json!([
+            {"name":"torch.__file__","artifact":pin("/deps/torch/__init__.py")},
+            {"name":"torch._C.__file__","artifact":pin("/deps/torch/native.so")}
+        ]))
+        .unwrap();
+        let mut value = json!({
+            "schema":"rz-rovent-utility-training-registration/3","data_family":"intervention_v2",
+            "execution_id":"startup-test","action":"train","export_request":null,
+            "preparation":pin("/input/preparation.json"),"window_spec":pin("/input/window.json"),
+            "trainer_source_sha256":"2".repeat(64),"trainer_python_executable":pin("/runtime/python3"),
+            "trainer_python_version":"3.12.2","dependency_directories":["/deps"],
+            "trainer_dependency_set_sha256":rovent_trainer_dependency_set_sha256(&endpoints).unwrap(),
+            "runtime_endpoints":endpoints,"current_dataset":{"root":"/input/utility-cohort",
+                "publication":pin("/input/utility-cohort/publication.json"),
+                "durable_ack":pin("/input/utility-cohort/ack.json")},
+            "ancestor_datasets":[],"initialization_source":{"mode":"initialize","utility":pin("/input/utility.json")},
+            "frozen_nnuec_base":pin("/input/base.json"),"frozen_pc_sources":[
+                {"role":"proposer","artifact":pin("/input/p.onnx"),"model_semantics_sha256":"3".repeat(64),"model_identity_sha256":"4".repeat(64),"encoding_sha256":"5".repeat(64)},
+                {"role":"critic","artifact":pin("/input/c.onnx"),"model_semantics_sha256":"3".repeat(64),"model_identity_sha256":"4".repeat(64),"encoding_sha256":"5".repeat(64)}],
+            "resources_policy":{"cpu_quota_millicpus":2000,"memory_high_bytes":6_u64<<30,"memory_max_bytes":12_u64<<30,"pids_max":64,"affinity":[0,2],"device":"cpu"},
+            "require_total_quota":true,"output_root":"/run/output","control_root":"/run/control",
+            "checkpoint_directory":"/run/output/checkpoints","receipt_path":"/run/output/receipt.json",
+            "max_rpc_messages":100,"max_rpc_bytes":1<<20,"max_read_bytes":4<<20,
+            "max_child_read_bytes":1<<20,"max_output_bytes":2<<20,"max_artifact_files":64
+        });
+        if family == UtilityRuntimeFamily::CohortV1 {
+            value["schema"] = json!("rz-rovent-utility-training-registration/2");
+            value.as_object_mut().unwrap().remove("data_family");
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn utility_legacy_startup_preserves_original_raw_registration_pin() {
+        let registration = startup_registration(UtilityRuntimeFamily::CohortV1);
+        let raw = serde_json::to_vec_pretty(&registration).unwrap();
+        let raw_sha256 = format!("{:x}", Sha256::digest(&raw));
+        let selected = startup_registration_sha256(&registration, &raw_sha256).unwrap();
+        assert_eq!(selected, raw_sha256);
+        assert_ne!(
+            selected,
+            registration
+                .as_cohort()
+                .unwrap()
+                .canonical_sha256()
+                .unwrap()
+        );
+        assert!(registration.as_intervention().is_err());
+        let mut draft = startup_draft(UtilityRuntimeFamily::CohortV1);
+        draft["registration"] = json!(registration);
+        draft["registration_sha256"] = json!(selected);
+        assert_eq!(
+            encode_startup(UtilityRuntimeFamily::CohortV1, draft.clone()).unwrap(),
+            encode(&draft).unwrap()
+        );
+    }
+
+    #[test]
+    fn utility_intervention_startup_uses_typed_canonical_registration_digest() {
+        let registration = startup_registration(UtilityRuntimeFamily::InterventionV2);
+        let original_raw = serde_json::to_vec_pretty(&registration).unwrap();
+        let raw_sha256 = format!("{:x}", Sha256::digest(&original_raw));
+        let selected = startup_registration_sha256(&registration, &raw_sha256).unwrap();
+        assert_eq!(
+            selected,
+            registration
+                .as_intervention()
+                .unwrap()
+                .canonical_sha256()
+                .unwrap()
+        );
+        assert_ne!(selected, raw_sha256);
+        assert!(registration.as_cohort().is_err());
+        let mut draft = startup_draft(UtilityRuntimeFamily::InterventionV2);
+        draft["registration"] = json!(registration);
+        draft["registration_sha256"] = json!(selected);
+        let decoded: Value =
+            decode(&encode_startup(UtilityRuntimeFamily::InterventionV2, draft).unwrap()).unwrap();
+        assert_eq!(
+            decoded["registration_sha256"],
+            generation_digest(
+                "rz-rovent-utility-training-registration/3",
+                &decoded["registration"]
+            )
+            .unwrap()
+        );
+        assert_eq!(decoded["data_family"], "intervention_v2");
+        assert_eq!(
+            serde_json::to_vec_pretty(&registration).unwrap(),
+            original_raw
+        );
+    }
+
+    #[test]
+    fn utility_intervention_startup_digest_cannot_use_legacy_domain_or_changed_declaration() {
+        let registration = startup_registration(UtilityRuntimeFamily::InterventionV2);
+        let selected = startup_registration_sha256(&registration, &"ab".repeat(32)).unwrap();
+        let mut changed = json!(registration);
+        assert_ne!(
+            selected,
+            generation_digest("rz-rovent-utility-training-registration/2", &changed).unwrap()
+        );
+        changed["execution_id"] = json!("changed-startup-test");
+        let changed: RoventUtilityExecutionRegistration = serde_json::from_value(changed).unwrap();
+        assert_ne!(
+            selected,
+            startup_registration_sha256(&changed, &"ab".repeat(32)).unwrap()
+        );
     }
 
     #[test]
