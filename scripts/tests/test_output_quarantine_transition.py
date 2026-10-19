@@ -295,6 +295,147 @@ class TransitionTests(unittest.TestCase):
         self.assert_originals_unchanged()
 
 
+    def test_mount_reobserve_needs_explicit_new_tip_and_keeps_active_view_strict(self):
+        anchor = self.anchor()
+        first = self.move(anchor)["receipt"]
+        before, original_life, original_sources = dict(self.files), dict(self.now), self.pins()
+        self.mounts.update(namespace=[1, 3], mountinfo_sha256="c" * 64)
+        with self.assertRaisesRegex(StorageError, "stale"):
+            self.view([first])
+        with self.assertRaisesRegex(StorageError, "reason mismatch"):
+            self.move(first, reason="publisher_upgrade", attempt="2" * 32)
+        self.assertEqual(self.files, before)
+        result = self.move(first, reason="mount_reobserve", attempt="2" * 32)
+        self.assertTrue(result["admission_ready"])
+        self.assertEqual(result["generation"], 2)
+        self.assertEqual(self.now, original_life)
+        self.assertEqual(self.pins(), original_sources)
+        receipt = v1._decode(self.files[Path(result["receipt"]["path"])])
+        self.assertEqual(receipt["reason"], "mount_reobserve")
+        self.assertEqual(receipt["predecessor"], first)
+        self.assertEqual(receipt["original_v1_receipt"], anchor)
+        self.assertEqual(receipt["mount_observation"], self.mounts)
+        self.assertEqual(receipt["physical_completion"], "unknown_unchanged")
+        self.assertIs(receipt["original_generation_custody_reissued"], False)
+        self.assertIs(receipt["numeric_success_issued"], False)
+        self.assertEqual([name.rsplit(".", 2)[1] for name in self.actions[-3:]], ["sources", "snapshot", "receipt"])
+        for path, raw in before.items():
+            self.assertEqual(self.files[path], raw)
+        owner = outputs.OutputLease(self.base / "mount-fresh", self.base / "source", catalog=self.catalog,
+            reserve=4096, quarantine_transition_receipts=[result["receipt"]]).acquire()
+        self.addCleanup(owner._close_quarantine_view)
+        owner.check_budget()
+        owner.finish(status="closed-mount-fixture-no-child", tree_gone=True)
+        view = self.view([result["receipt"]])
+        try:
+            self.mounts.update(namespace=[1, 4], mountinfo_sha256="d" * 64)
+            with self.assertRaisesRegex(StorageError, "namespace"):
+                view.check()
+        finally:
+            view.close()
+        self.assert_originals_unchanged()
+
+    def test_mount_reason_never_overrides_no_change_or_original_three_reasons(self):
+        first = self.move(self.anchor())["receipt"]
+        before = dict(self.files)
+        with self.assertRaisesRegex(StorageError, "no supported explicit reason"):
+            self.move(first, reason="mount_reobserve", attempt="2" * 32)
+        self.assertEqual(self.files, before)
+        self.mounts.update(namespace=[1, 3], mountinfo_sha256="c" * 64)
+        self.change_source()
+        with self.assertRaisesRegex(StorageError, "reason mismatch"):
+            self.move(first, reason="mount_reobserve", attempt="2" * 32)
+        second = self.move(first, reason="publisher_upgrade", attempt="2" * 32)["receipt"]
+        self.change_boot()
+        with self.assertRaisesRegex(StorageError, "reason mismatch"):
+            self.move(second, reason="mount_reobserve", attempt="3" * 32)
+        third = self.move(second, reason="reboot_reobserve", attempt="3" * 32)["receipt"]
+        self.now.update(boot="third-boot", process_birth="third-observer")
+        self.mounts.update(namespace=[1, 300], mountinfo_sha256="d" * 64)
+        self.change_source()
+        with self.assertRaisesRegex(StorageError, "reason mismatch"):
+            self.move(third, reason="mount_reobserve", attempt="4" * 32)
+        fourth = self.move(third, reason="both", attempt="4" * 32)["receipt"]
+        self.view([fourth]).close()
+        self.assert_originals_unchanged()
+
+    def test_mount_reason_refuses_malformed_previous_observation_before_publication(self):
+        first = self.move(self.anchor())["receipt"]
+        original = self.files[Path(first["path"])]
+        old_mounts = copy.deepcopy(self.mounts)
+        alias = {"mount_id": "82", "root": "/", "mountpoint": "/mnt/wslg/distro", "mount_options": "ro,relatime"}
+        bad_values = [
+            {}, dict(old_mounts, namespace=[True, 2]), dict(old_mounts, namespace=[1, 0]),
+            dict(old_mounts, mountinfo_bytes=True), dict(old_mounts, mountinfo_sha256="A" * 64),
+            dict(old_mounts, readonly_aliases={}),
+            dict(old_mounts, readonly_aliases=[dict(alias, root="relative")]),
+            dict(old_mounts, readonly_aliases=[dict(alias, mount_options="rw,relatime")]),
+            dict(old_mounts, readonly_aliases=[dict(alias, extra=True)]),
+            dict(old_mounts, readonly_aliases=[alias, dict(alias)]),
+        ]
+        self.mounts.update(namespace=[1, 3], mountinfo_sha256="c" * 64)
+        try:
+            for bad in bad_values:
+                self.put(Path(first["path"]), original)
+                changed = self.rewrite_tip(first, mount_observation=bad)
+                before = dict(self.files)
+                with self.subTest(bad=bad), self.assertRaisesRegex(StorageError, "mount"):
+                    self.move(changed, reason="mount_reobserve", attempt="2" * 32)
+                self.assertEqual(self.files, before)
+        finally:
+            self.put(Path(first["path"]), original)
+        self.assert_originals_unchanged()
+
+    def test_mount_history_recomputes_reason_and_rejects_malformed_recorded_mount(self):
+        first = self.move(self.anchor())["receipt"]
+        previous_mounts = copy.deepcopy(self.mounts)
+        self.mounts.update(namespace=[1, 3], mountinfo_sha256="c" * 64)
+        second = self.move(first, reason="mount_reobserve", attempt="2" * 32)["receipt"]
+        original = self.files[Path(second["path"])]
+        try:
+            for changes in ({"reason": "reboot_reobserve"}, {"mount_observation": previous_mounts},
+                            {"mount_observation": dict(self.mounts, namespace=[True, 3])}):
+                self.put(Path(second["path"]), original)
+                changed = self.rewrite_tip(second, **changes)
+                with self.subTest(changes=changes), self.assertRaises(StorageError):
+                    self.view([changed])
+        finally:
+            self.put(Path(second["path"]), original)
+        self.view([second]).close()
+        self.assert_originals_unchanged()
+
+    def test_mount_reason_keeps_original_identity_alias_and_eight_generation_limits(self):
+        first = self.move(self.anchor())["receipt"]
+        self.mounts.update(namespace=[1, 3], mountinfo_sha256="c" * 64)
+        old_device = self.infos[self.target].st_dev
+        self.infos[self.target].st_dev += 1
+        before = dict(self.files)
+        try:
+            with self.assertRaises(StorageError):
+                self.move(first, reason="mount_reobserve", attempt="2" * 32)
+        finally:
+            self.infos[self.target].st_dev = old_device
+        self.assertEqual(self.files, before)
+        self.mounts["readonly_aliases"] = [{"mount_id": "82", "root": "/", "mountpoint": "/mnt/wslg/distro",
+                                            "mount_options": "rw,relatime"}]
+        with self.assertRaisesRegex(StorageError, "readonly mount"):
+            self.move(first, reason="mount_reobserve", attempt="2" * 32)
+        self.assertEqual(self.files, before)
+        self.mounts["readonly_aliases"] = []
+        predecessor = first
+        for generation in range(2, 9):
+            self.mounts.update(namespace=[1, 100 + generation], mountinfo_sha256=f"{generation:064x}")
+            result = self.move(predecessor, reason="mount_reobserve", attempt=f"{generation:032x}")
+            self.assertEqual(result["generation"], generation)
+            predecessor = result["receipt"]
+        self.view([predecessor]).close()
+        self.mounts.update(namespace=[1, 109], mountinfo_sha256="9" * 64)
+        before = dict(self.files)
+        with self.assertRaisesRegex(StorageError, "bounded transition generation"):
+            self.move(predecessor, reason="mount_reobserve", attempt="9" * 32)
+        self.assertEqual(self.files, before)
+        self.assert_originals_unchanged()
+
     def leave_partial_sources(self, anchor):
         original = self.exclusive
         def fail_snapshot(held, fd, name, raw, maximum):
@@ -669,6 +810,44 @@ class TransitionLinuxTests(unittest.TestCase):
         self.assertEqual(Path(anchor["path"]).read_bytes(), old_marker)
         self.assertEqual(self.row_path.read_bytes(), self.raw)
         self.assertIsNone(json.loads(self.row_path.read_bytes())["identity"])
+
+    def test_real_mount_reobserve_preserves_raw_and_new_lease_but_active_view_stays_exact(self):
+        anchor = self.anchor()
+        first = self.move(anchor)["receipt"]
+        anchor_raw, first_raw = Path(anchor["path"]).read_bytes(), Path(first["path"]).read_bytes()
+        prior = v1._decode(first_raw)["mount_observation"]
+        changed = copy.deepcopy(prior)
+        changed["namespace"][1] += 1
+        changed["mountinfo_sha256"] = "0" * 64 if prior["mountinfo_sha256"] != "0" * 64 else "1" * 64
+        current = [changed]
+        # Real private files/FDs/fsync; only mount observations are injected.
+        # This fixture never changes the kernel namespace or proves a reboot.
+        with patch.object(v1, "_mounts", side_effect=lambda *args: copy.deepcopy(current[0])):
+            with prior_tests.CatalogGuard(self.catalog / "catalog.lock") as guard:
+                with self.assertRaisesRegex(StorageError, "stale"):
+                    successor.validate_transitions(self.catalog, outputs._catalog_rows(self.catalog), [first], guard)
+            result = successor.publish_custody_transition(self.catalog, self.row_pin, first, [first], self.pins(),
+                reason="mount_reobserve", attempt_id="2" * 32, root_exclusive_writer=True, apply=True)
+            self.assertTrue(result["admission_ready"])
+            receipt = json.loads(Path(result["receipt"]["path"]).read_bytes())
+            self.assertEqual(receipt["reason"], "mount_reobserve")
+            self.assertEqual(receipt["physical_completion"], "unknown_unchanged")
+            self.assertIs(receipt["original_generation_custody_reissued"], False)
+            owner = self.owner(result["receipt"])
+            owner.create_deferred_directory()
+            record = owner.finish(status="private-mount-fixture-no-child", tree_gone=True)
+            self.assertEqual(record["state"], "retained")
+            with prior_tests.CatalogGuard(self.catalog / "catalog.lock") as guard:
+                view = successor.validate_transitions(self.catalog, outputs._catalog_rows(self.catalog), [result["receipt"]], guard)
+                try:
+                    current[0] = dict(changed, namespace=[changed["namespace"][0], changed["namespace"][1] + 1])
+                    with self.assertRaisesRegex(StorageError, "namespace/mount"):
+                        view.check()
+                finally:
+                    view.close()
+        self.assertEqual(Path(anchor["path"]).read_bytes(), anchor_raw)
+        self.assertEqual(Path(first["path"]).read_bytes(), first_raw)
+        self.assertEqual(self.row_path.read_bytes(), self.raw)
 
     def test_real_partial_receipt_failure_resumes_existing_fd_fsync_without_overwrite(self):
         anchor = self.anchor()

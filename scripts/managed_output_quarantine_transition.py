@@ -10,7 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import sys
@@ -158,14 +158,58 @@ def _verify_sources(document, generation, base):
     return {role: dict(document["roles"][role]["pin"]) for role in ROLES}
 
 
-def _reason(previous, now, previous_sources, current_sources, generation):
+def _mount_observation(value):
+    """Validate the recorded kernel observation before using a mount-only delta."""
+    _fields(value, ("namespace", "mountinfo_bytes", "mountinfo_sha256", "readonly_aliases"),
+            "exact mount observation fields required")
+    namespace = value["namespace"]
+    _need(type(namespace) is list and len(namespace) == 2
+          and all(type(item) is int and 0 <= item < 1 << 64 for item in namespace)
+          and namespace[1] > 0, "bounded mount namespace identity required")
+    _need(type(value["mountinfo_bytes"]) is int and 0 < value["mountinfo_bytes"] <= v1.SNAPSHOT_LIMIT
+          and type(value["mountinfo_sha256"]) is str
+          and re.fullmatch(r"[0-9a-f]{64}", value["mountinfo_sha256"]), "bounded mountinfo raw observation required")
+    aliases = value["readonly_aliases"]
+    _need(type(aliases) is list and len(aliases) <= v1.RECEIPT_LIMIT, "bounded readonly mount aliases required")
+    order = []
+    for alias in aliases:
+        _fields(alias, ("mount_id", "root", "mountpoint", "mount_options"), "exact readonly mount alias fields required")
+        _need(type(alias["mount_id"]) is str and re.fullmatch(r"[1-9][0-9]{0,19}", alias["mount_id"]),
+              "bounded original mount ID required")
+        for key in ("root", "mountpoint"):
+            text = alias[key]
+            _need(type(text) is str and 0 < len(text) <= v1.RECEIPT_LIMIT
+                  and "\0" not in text and PurePosixPath(text).is_absolute()
+                  and str(PurePosixPath(text)) == text and ".." not in PurePosixPath(text).parts,
+                  "canonical absolute mount alias path required")
+        options = alias["mount_options"]
+        _need(type(options) is str and 0 < len(options) <= v1.RECEIPT_LIMIT,
+              "bounded readonly mount options required")
+        options = options.split(",")
+        _need("ro" in options and "rw" not in options
+              and all(option and not any(char.isspace() for char in option) for option in options),
+              "readonly mount alias options required")
+        order.append((alias["mountpoint"], alias["mount_id"]))
+    _need(order == sorted(order) and len({row[0] for row in order}) == len(order)
+          and len({row[1] for row in order}) == len(order), "canonical nonduplicate readonly mount aliases required")
+    try:
+        _need(len(v1._encode(value)) <= v1.RECEIPT_LIMIT, "recorded mount observation byte bound exceeded")
+    except (ValueError, UnicodeError) as error:
+        raise TransitionBlocked("invalid recorded mount observation encoding") from error
+
+
+def _reason(previous, now, previous_sources, current_sources, generation, previous_mounts, current_mounts):
     _life(previous)
     _life(now)
     _need(previous["host"] == now["host"] and previous["platform"] == now["platform"], "transition host/platform changed")
     boot_changed = previous["boot"] != now["boot"]
     source_changed = generation == 1 or previous_sources != current_sources
-    _need(boot_changed or source_changed, "transition has no supported explicit reason")
-    return "both" if boot_changed and source_changed else "reboot_reobserve" if boot_changed else "publisher_upgrade"
+    if boot_changed or source_changed:
+        return "both" if boot_changed and source_changed else "reboot_reobserve" if boot_changed else "publisher_upgrade"
+    _mount_observation(previous_mounts)
+    _mount_observation(current_mounts)
+    _need(previous_mounts != current_mounts, "transition has no supported explicit reason")
+    return "mount_reobserve"
 
 
 def _stem(key, digest):
@@ -375,7 +419,8 @@ def _history(held, catalog, rows, tip_pins, guard, allow_partial=None):
                   and value["current_postboot_observed_identity"] == previous["current_postboot_observed_identity"]
                   and v1._encode(next_tree) == v1._encode(tree), "transition immutable preservation comparison failed")
             _need(value["reason"] == _reason(previous["observed_lifetime"], value["observed_lifetime"],
-                                              source_pins, current_sources, generation), "explicit transition reason mismatch")
+                                              source_pins, current_sources, generation,
+                                              previous["mount_observation"], value["mount_observation"]), "explicit transition reason mismatch")
             next_charge = value["quarantine_charge_bytes"]
             _need(type(next_charge) is int and next_charge == max(row["reserved_bytes"], charge)
                   and next_tree["regular_bytes"] <= next_charge, "transition charge reduced or exceeded")
@@ -435,7 +480,7 @@ def publish_custody_transition(catalog, original_row_pin, predecessor_pin, curre
     """
     from managed_outputs import _catalog_rows
     _need(root_exclusive_writer is True, "explicit exclusive preservation writer required")
-    _need(isinstance(reason, str) and reason in {"reboot_reobserve", "publisher_upgrade", "both"}, "explicit supported transition reason required")
+    _need(isinstance(reason, str) and reason in {"reboot_reobserve", "publisher_upgrade", "both", "mount_reobserve"}, "explicit supported transition reason required")
     catalog = checked(Path(catalog))
     root = v1.registry_path(catalog)
     _need(type(predecessor_pin) is dict and isinstance(predecessor_pin.get("path"), str), "explicit predecessor raw pin required")
@@ -463,7 +508,8 @@ def publish_custody_transition(catalog, original_row_pin, predecessor_pin, curre
                   and detail["base"]["original_catalog_row"] == original_row_pin,
                   "predecessor/original row is not the explicitly selected current tip")
             _need(reason == _reason(detail["tip"]["observed_lifetime"], view.now,
-                                     detail["source_pins"], current_pins, generation), "explicit transition reason mismatch")
+                                     detail["source_pins"], current_pins, generation,
+                                     detail["tip"]["mount_observation"], detail["observation"].mounts), "explicit transition reason mismatch")
             if generation == 1:
                 historical = _historical_first_source(held, detail["base"], historical_source_snapshot)
             else:
