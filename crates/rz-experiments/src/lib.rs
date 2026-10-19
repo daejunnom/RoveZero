@@ -23,6 +23,7 @@ mod rovent_manifest;
 pub mod rovent_r_readout;
 mod rovent_root_allocation;
 mod rovent_root_descriptor;
+pub mod rovent_storage;
 pub mod rovent_submitted_input;
 pub mod rovent_utility_cohort;
 pub mod rovent_utility_intervention_preparation;
@@ -46,6 +47,7 @@ pub use pals_startup_v5::*;
 pub use rovent_manifest::*;
 pub use rovent_root_allocation::*;
 pub use rovent_root_descriptor::*;
+pub use rovent_storage::*;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
