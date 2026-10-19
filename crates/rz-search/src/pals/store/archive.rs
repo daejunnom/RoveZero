@@ -1988,6 +1988,22 @@ impl PalsStores {
     ) -> Result<(), StoreError> {
         self.enable_archive_inner(config, Some(capability))
     }
+    pub(in crate::pals) fn validate_unused_archive_setup(&self) -> Result<(), StoreError> {
+        if self.generation != 0
+            || self.root.is_some()
+            || self.hot_stats() != ArchiveStats::default()
+            || !self.derived.entries.is_empty()
+            || !self.checked_cpu_pvs.is_empty()
+            || self.review_pin_count()? != 0
+            || self.archive.is_some()
+            || self.archive_write_ledger.is_some()
+        {
+            return Err(StoreError::InvalidConditions(
+                "archive setup needs unused Store",
+            ));
+        }
+        Ok(())
+    }
     fn enable_archive_inner(
         &mut self,
         config: ArchiveConfig,

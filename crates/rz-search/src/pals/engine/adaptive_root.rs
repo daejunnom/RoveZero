@@ -29,6 +29,36 @@ struct RegisteredRoot {
     root: SituationId,
     snapshot: PositionSnapshot,
 }
+/// First-go readiness belongs to the original reset, not a registered root.
+/// Setup must preserve both this registry and the still-zero Store generation.
+pub(super) struct UnusedArchiveSetupSeal {
+    registry: Weak<()>,
+    store: StoreReadOwner,
+    scope: SearchAuthority,
+    next_nonce: u64,
+}
+impl UnusedArchiveSetupSeal {
+    pub(super) fn validate<M: RoleModel>(
+        &self,
+        semantic: &PalsSemanticState<M>,
+    ) -> Result<(), PalsError> {
+        semantic.ensure_adaptive_logical_quiescence()?;
+        let registry = &semantic.adaptive_root_registry;
+        if !self.registry.ptr_eq(&semantic.adaptive_registry_identity())
+            || !self.store.matches(&semantic.stores)
+            || semantic.stores.generation() != 0
+            || semantic.stores.root().is_some()
+            || semantic.game_generation != Some(self.scope.game.0)
+            || registry.last.is_some()
+            || registry.pending_nonce.is_some()
+            || registry.next_nonce != self.next_nonce
+            || registry.new_game_ready != Some(self.scope)
+        {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        Ok(())
+    }
+}
 /// NonClone and tied to one engine registry and its exact live Store. It proves
 /// a checked logical root registration only, never a physical release fence.
 pub struct AdaptiveRootRegistration {
@@ -74,6 +104,23 @@ impl IdleArchiveGameSeal {
 }
 
 impl<M: RoleModel> PalsSemanticState<M> {
+    pub(super) fn seal_unused_archive_setup(
+        &self,
+        scope: SearchAuthority,
+    ) -> Result<UnusedArchiveSetupSeal, PalsError> {
+        if self.adaptive_root_registry.next_nonce != 0 {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        let seal = UnusedArchiveSetupSeal {
+            registry: self.adaptive_registry_identity(),
+            store: self.stores.read_owner(),
+            scope,
+            next_nonce: self.adaptive_root_registry.next_nonce,
+        };
+        seal.validate(self)?;
+        Ok(seal)
+    }
+
     pub(super) fn validate_idle_new_game_target(
         &self,
         next: SearchAuthority,

@@ -1,7 +1,7 @@
 //! Exact archive maintenance while the original semantic owner has no root work.
 //! This custody is not a physical fence. The concrete UCI owner must retain its
 //! actual native/actor acknowledgements before lending either idle owner here.
-use super::adaptive_root::IdleArchiveGameSeal;
+use super::adaptive_root::{IdleArchiveGameSeal, UnusedArchiveSetupSeal};
 use super::archive_lifecycle::{
     IdleArchiveCheckpoint, SEARCH_ARCHIVE_IO_BYTES, allocation_controls,
     observe_selected_archive_usage,
@@ -58,6 +58,65 @@ pub struct IdleArchiveTransitionSnapshot {
     pub completion_unknown: bool,
 }
 
+/// Attribution to the caller's checked registration, never root/file authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnusedIdleArchiveSetupIdentity {
+    pub profile: rz_contracts::Digest,
+    pub input_lock: rz_contracts::Digest,
+    pub registration: rz_contracts::Digest,
+}
+pub struct UnusedIdleArchiveSetupControl {
+    pub deadline: Instant,
+    pub cancellation: Arc<AtomicBool>,
+    pub max_io_bytes: u64,
+}
+/// Move-only ownership of the original held capability and finite first-go
+/// control. Construction performs no archive I/O and issues no root authority.
+pub struct UnusedIdleArchiveSetup {
+    pub(super) config: ArchiveConfig,
+    pub(super) capability: ArchiveRootCapability,
+    pub(super) limits: ArchiveRuntimeLimits,
+    pub(super) identity: UnusedIdleArchiveSetupIdentity,
+    pub(super) control: UnusedIdleArchiveSetupControl,
+}
+impl UnusedIdleArchiveSetup {
+    pub fn new(
+        config: ArchiveConfig,
+        capability: ArchiveRootCapability,
+        limits: ArchiveRuntimeLimits,
+        identity: UnusedIdleArchiveSetupIdentity,
+        control: UnusedIdleArchiveSetupControl,
+    ) -> Self {
+        Self {
+            config,
+            capability,
+            limits,
+            identity,
+            control,
+        }
+    }
+    pub fn identity(&self) -> UnusedIdleArchiveSetupIdentity {
+        self.identity
+    }
+    pub fn runtime_limits(&self) -> ArchiveRuntimeLimits {
+        self.limits
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdleArchiveOwnerKind {
+    Pc,
+    Researcher,
+}
+#[derive(Clone, Debug)]
+pub struct UnusedIdleArchiveSetupSnapshot {
+    pub scope: SearchAuthority,
+    pub identity: UnusedIdleArchiveSetupIdentity,
+    pub original_deadline: Instant,
+    pub remaining_io_bytes: Option<u64>,
+    pub configuration_complete: bool,
+    pub completion_unknown: bool,
+}
+
 /// One original heap owner moves through the existing one-slot archive worker.
 /// No checker, TT, model execution, root authority or physical receipt is made.
 pub struct IdleSemanticArchiveOwner<M: RoleModel> {
@@ -66,6 +125,9 @@ pub struct IdleSemanticArchiveOwner<M: RoleModel> {
     pending: Option<Box<PendingIdleArchive>>,
     last_checkpoint: Option<Arc<IdleArchiveCheckpoint>>,
     last_transition_remaining: Option<u64>,
+    setup: Option<UnusedIdleArchiveSetupSnapshot>,
+    #[cfg(test)]
+    panic_setup_after_enable: bool,
     #[cfg(test)]
     cancel_after_close: bool,
 }
@@ -84,6 +146,9 @@ impl<M: RoleModel> ResearcherPreparingOwner<M> {
             pending: None,
             last_checkpoint: None,
             last_transition_remaining: None,
+            setup: None,
+            #[cfg(test)]
+            panic_setup_after_enable: false,
             #[cfg(test)]
             cancel_after_close: false,
         })
@@ -103,6 +168,9 @@ impl<M: RoleModel> PcSemanticOwner<M> {
             pending: None,
             last_checkpoint: None,
             last_transition_remaining: None,
+            setup: None,
+            #[cfg(test)]
+            panic_setup_after_enable: false,
             #[cfg(test)]
             cancel_after_close: false,
         })
@@ -111,7 +179,7 @@ impl<M: RoleModel> PcSemanticOwner<M> {
 
 impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
     pub fn into_researcher(self) -> Result<Box<ResearcherPreparingOwner<M>>, Self> {
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.setup_retained() {
             return Err(self);
         }
         match self.owner {
@@ -120,7 +188,7 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         }
     }
     pub fn into_pc(self) -> Result<Box<PcSemanticOwner<M>>, Self> {
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.setup_retained() {
             return Err(self);
         }
         match self.owner {
@@ -130,6 +198,161 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
     }
     pub fn stores(&self) -> &PalsStores {
         &self.semantic().stores
+    }
+    pub fn setup_snapshot(&self) -> Option<&UnusedIdleArchiveSetupSnapshot> {
+        self.setup.as_ref()
+    }
+    pub fn owner_kind(&self) -> IdleArchiveOwnerKind {
+        match &self.owner {
+            IdleOwner::Pc(_) => IdleArchiveOwnerKind::Pc,
+            IdleOwner::Researcher(_) => IdleArchiveOwnerKind::Researcher,
+        }
+    }
+    fn setup_retained(&self) -> bool {
+        self.setup
+            .as_ref()
+            .is_some_and(|state| !state.configuration_complete || state.completion_unknown)
+    }
+    #[cfg(test)]
+    pub(super) fn panic_setup_after_enable_for_test(&mut self) {
+        self.panic_setup_after_enable = true;
+    }
+    pub(super) fn seal_unused_setup(
+        &self,
+        scope: SearchAuthority,
+    ) -> Result<UnusedArchiveSetupSeal, PalsError> {
+        self.validate_idle()?;
+        let semantic = self.semantic();
+        semantic.stores.validate_unused_archive_setup()?;
+        if self.setup.is_some()
+            || !semantic.nodes.is_empty()
+            || !semantic.records.is_empty()
+            || semantic.revision != 0
+            || semantic.consumer_id != 0
+            || !semantic.repair_queue.is_empty()
+            || !semantic.repair_questions.is_empty()
+            || !semantic.repair_counts.is_empty()
+            || semantic.archive_state.config.is_some()
+            || semantic.archive_state.root_capability.is_some()
+            || semantic.archive_state.previous_closed_owner.is_some()
+            || semantic.archive_state.closed_current_owner.is_some()
+            || semantic.archive_state.deadline.is_some()
+            || semantic.archive_state.remaining_io != 0
+            || semantic.archive_state.active_search_pins != StorePins::default()
+            || semantic.last_engine_archive().is_some()
+            || self.last_checkpoint.is_some()
+            || self.last_transition_remaining.is_some()
+            || semantic.review_index.as_ref().is_none_or(|index| {
+                index.active_bundle_count() != 0 || index.indexed_record_count() != 0
+            })
+        {
+            return Err(
+                StoreError::InvalidConditions("archive setup needs unused semantic owner").into(),
+            );
+        }
+        semantic.seal_unused_archive_setup(scope)
+    }
+    pub(super) fn execute_unused_setup(
+        &mut self,
+        scope: SearchAuthority,
+        seal: &UnusedArchiveSetupSeal,
+        setup: &UnusedIdleArchiveSetup,
+    ) -> Result<(), PalsError> {
+        self.seal_unused_setup(scope)?;
+        seal.validate(self.semantic())?;
+        self.setup = Some(UnusedIdleArchiveSetupSnapshot {
+            scope,
+            identity: setup.identity,
+            original_deadline: setup.control.deadline,
+            remaining_io_bytes: Some(setup.control.max_io_bytes),
+            configuration_complete: false,
+            completion_unknown: false,
+        });
+        allocation_controls(Some((setup.control.deadline, &setup.control.cancellation)))?;
+        let semantic = self.semantic_mut();
+        semantic
+            .stores
+            .enable_archive_with_capability(setup.config.clone(), setup.capability.clone())?;
+        semantic.archive_state.config = Some(setup.config.clone());
+        semantic.archive_state.root_capability = Some(setup.capability.clone());
+        #[cfg(test)]
+        if std::mem::take(&mut self.panic_setup_after_enable) {
+            panic!("authored interruption after original archive enable");
+        }
+        let semantic = self.semantic_mut();
+        semantic.stores.set_archive_runtime_limits(setup.limits)?;
+        let config = semantic
+            .archive_state
+            .config
+            .as_mut()
+            .expect("original setup config");
+        config.game_bytes = setup.limits.game_bytes_max;
+        config.global_bytes = setup.limits.global_bytes_max;
+        config.record_bytes = setup.limits.record_payload_bytes_max;
+        config.max_load_pins = setup.limits.max_load_pins as usize;
+        allocation_controls(Some((setup.control.deadline, &setup.control.cancellation)))?;
+        let maximum_deadline = Instant::now()
+            .checked_add(Duration::from_millis(setup.limits.load_deadline_max_ms))
+            .ok_or(StoreError::InvalidConditions("archive setup load duration"))?;
+        let mut budget = ArchiveIoBudget {
+            deadline: setup.control.deadline.min(maximum_deadline),
+            max_bytes: setup.control.max_io_bytes.min(setup.limits.load_bytes_max),
+        };
+        let before = budget.max_bytes;
+        let result = self
+            .semantic_mut()
+            .stores
+            .measure_archive_usage_with_budget(&mut budget);
+        let remaining = setup
+            .control
+            .max_io_bytes
+            .checked_sub(before.saturating_sub(budget.max_bytes))
+            .ok_or(StoreError::ArchiveByteBudget)?;
+        self.setup
+            .as_mut()
+            .expect("original setup state")
+            .remaining_io_bytes = Some(remaining);
+        result?;
+        allocation_controls(Some((setup.control.deadline, &setup.control.cancellation)))?;
+        seal.validate(self.semantic())?;
+        let actual = self
+            .archive_owner_snapshot()?
+            .ok_or(StoreError::ArchiveDisabled)?;
+        if !actual.complete
+            || actual.admission_closed
+            || actual.runtime_limits != Some(setup.limits)
+        {
+            return Err(
+                StoreError::InvalidConditions("archive setup observation incomplete").into(),
+            );
+        }
+        self.setup
+            .as_mut()
+            .expect("original setup state")
+            .configuration_complete = true;
+        Ok(())
+    }
+    pub(super) fn retain_unused_setup_failure(&mut self) {
+        if let Some(state) = &mut self.setup {
+            state.configuration_complete = false;
+        }
+    }
+    pub(super) fn quarantine_unused_setup_panic(
+        &mut self,
+        scope: SearchAuthority,
+        setup: &UnusedIdleArchiveSetup,
+    ) {
+        let state = self.setup.get_or_insert(UnusedIdleArchiveSetupSnapshot {
+            scope,
+            identity: setup.identity,
+            original_deadline: setup.control.deadline,
+            remaining_io_bytes: None,
+            configuration_complete: false,
+            completion_unknown: true,
+        });
+        state.configuration_complete = false;
+        state.completion_unknown = true;
+        state.remaining_io_bytes = None;
     }
     pub fn archive_enabled(&self) -> bool {
         self.stores().archive_enabled()
@@ -231,7 +454,7 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         }
     }
     pub(super) fn validate_idle(&self) -> Result<(), PalsError> {
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.setup_retained() {
             return Err(
                 StoreError::InvalidConditions("idle archive transition is retained").into(),
             );

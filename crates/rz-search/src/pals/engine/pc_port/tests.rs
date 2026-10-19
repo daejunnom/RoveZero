@@ -81,6 +81,485 @@ fn idle_archive_segments(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     segments
 }
 
+fn unused_setup_pc(reset: bool, deadline: Instant) -> (IdleArchiveOwner, SearchAuthority) {
+    let mut owner = Box::new(
+        PcSemanticOwner::new_selected(
+            PalsSemanticConfig {
+                beam_width: 1,
+                line_plies: 2,
+                max_nodes: 257,
+                max_records: 128,
+                max_role_calls: 128,
+            },
+            LegalOrderRoleMock,
+            ReviewSelectionPolicy::default(),
+            ReviewIndexLimits::default(),
+        )
+        .unwrap(),
+    );
+    let scope = SearchAuthority {
+        game: GameGeneration(1),
+        ..port_authority_for_idle_test()
+    };
+    if reset {
+        owner
+            .try_adaptive_new_game(scope, deadline, &AtomicBool::new(false))
+            .unwrap();
+    }
+    (
+        owner
+            .into_idle_archive()
+            .unwrap_or_else(|_| panic!("original unused PC")),
+        scope,
+    )
+}
+fn unused_setup_payload(
+    root: &std::path::Path,
+    limits: crate::pals::store::ArchiveRuntimeLimits,
+    deadline: Instant,
+    cancellation: Arc<AtomicBool>,
+) -> super::super::idle_archive::UnusedIdleArchiveSetup {
+    use super::super::idle_archive::{
+        UnusedIdleArchiveSetup, UnusedIdleArchiveSetupControl, UnusedIdleArchiveSetupIdentity,
+    };
+    let held = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority()).unwrap();
+    UnusedIdleArchiveSetup::new(
+        crate::pals::store::ArchiveConfig::new(
+            root.to_path_buf(),
+            std::env::current_dir().unwrap(),
+        ),
+        crate::pals::store::ArchiveRootCapability::from_directory(root.to_path_buf(), held)
+            .unwrap(),
+        limits,
+        UnusedIdleArchiveSetupIdentity {
+            profile: ContractDigest([51; 32]),
+            input_lock: ContractDigest([52; 32]),
+            registration: ContractDigest([53; 32]),
+        },
+        UnusedIdleArchiveSetupControl {
+            deadline,
+            cancellation,
+            max_io_bytes: 16 * 1024 * 1024,
+        },
+    )
+}
+fn unused_setup_completion<M: RoleModel + 'static>(
+    worker: &mut adaptive_port::archive_worker::ArchiveWorker<M>,
+    transfer: &adaptive_port::archive_worker::ArchiveTransfer,
+    deadline: Instant,
+) -> adaptive_port::archive_worker::UnusedIdleArchiveSetupCompletion<M> {
+    loop {
+        if let Some(completion) = worker.try_receive_unused_idle_setup(transfer).unwrap() {
+            return completion;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bounded original setup completion"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn idle_unused_setup_preserves_first_go_readiness_then_registers_the_original_root() {
+    use adaptive_port::archive_worker::{ArchiveOperation, ArchiveWorker};
+    let mut scratch = idle_archive_scratch();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (idle, scope) = unused_setup_pc(true, deadline);
+    let store = idle.stores().read_owner();
+    let registry = idle.semantic().adaptive_registry_identity();
+    let setup = unused_setup_payload(
+        &scratch.0,
+        idle_archive_limits(),
+        deadline,
+        Arc::new(AtomicBool::new(false)),
+    );
+    let identity = setup.identity();
+    let mut worker = ArchiveWorker::start().unwrap();
+    let transfer = worker
+        .submit_unused_idle_setup(idle, scope, setup)
+        .unwrap_or_else(|rejected| panic!("setup admission: {}", rejected.error));
+    let completion = unused_setup_completion(&mut worker, &transfer, deadline);
+    let (idle, receipt) = completion
+        .install(scope, transfer.nonce(), identity)
+        .unwrap_or_else(|rejected| panic!("setup install: {:?}", rejected.failure()));
+    assert!(receipt.configuration_complete);
+    assert_eq!(receipt.remaining_io_bytes, Some(16 * 1024 * 1024));
+    assert_eq!(
+        receipt.archive_owner.unwrap().runtime_limits,
+        Some(idle_archive_limits())
+    );
+    assert!(receipt.archive_owner.unwrap().global_scan_complete);
+    assert!(store.matches(idle.stores()));
+    assert!(registry.ptr_eq(&idle.semantic().adaptive_registry_identity()));
+    assert_eq!(idle.stores().generation(), 0);
+    assert!(idle.stores().root().is_none());
+    assert_eq!(idle.semantic().last_adaptive_authority(), None);
+    assert_eq!(idle.semantic().adaptive_new_game_scope(), Some(scope));
+    assert_eq!(
+        idle.stores().hot_stats(),
+        crate::pals::store::ArchiveStats::default()
+    );
+    let duplicate = worker
+        .submit_unused_idle_setup(
+            idle,
+            scope,
+            unused_setup_payload(
+                &scratch.0,
+                idle_archive_limits(),
+                deadline,
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .err()
+        .expect("setup is one-shot");
+    assert!(store.matches(duplicate.owner.stores()));
+    let mut owner = duplicate
+        .owner
+        .into_pc()
+        .unwrap_or_else(|_| panic!("same PC kind"));
+    let registration = owner
+        .register_adaptive_root(&Position::startpos(), scope)
+        .unwrap();
+    assert_eq!(owner.stores().generation(), scope.root.0);
+    assert_eq!(owner.semantic.adaptive_new_game_scope(), None);
+    assert_eq!(owner.last_adaptive_authority(), Some(scope));
+    owner.abandon_unconsumed_adaptive_root(scope).unwrap();
+    drop(registration);
+    let idle = owner
+        .into_idle_archive()
+        .unwrap_or_else(|_| panic!("original unconsumed root"));
+    let authority = idle
+        .adaptive_archive_authority(SearchAuthority {
+            root: RootGeneration(scope.root.0 + 1),
+            ..scope
+        })
+        .unwrap();
+    let (_idle, _) = idle_archive_work(
+        &mut worker,
+        idle,
+        authority,
+        ArchiveOperation::FinishIdleGame,
+        deadline,
+    )
+    .unwrap_or_else(|rejected| panic!("original checkpoint: {:?}", rejected.reason));
+    worker.finish().unwrap();
+    scratch.1 = true;
+}
+
+#[test]
+fn idle_unused_setup_rejects_missing_reset_wrong_scope_live_pin_and_active_root() {
+    use adaptive_port::archive_worker::ArchiveWorker;
+    let mut scratch = idle_archive_scratch();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut worker = ArchiveWorker::start().unwrap();
+    for case in 0..4 {
+        let (mut idle, mut scope) = unused_setup_pc(case != 0, deadline);
+        let pin = if case == 2 {
+            Some(
+                idle.stores()
+                    .pin_review(crate::pals::store::StorePins::default())
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        if case == 1 {
+            scope.root.0 += 1;
+        }
+        if case == 3 {
+            let mut owner = idle.into_pc().unwrap_or_else(|_| panic!("unused PC kind"));
+            let _registration = owner
+                .register_adaptive_root(&Position::startpos(), scope)
+                .unwrap();
+            idle = owner
+                .into_idle_archive()
+                .unwrap_or_else(|_| panic!("logically idle unconsumed registration"));
+        }
+        let store = idle.stores().read_owner();
+        let rejected = worker
+            .submit_unused_idle_setup(
+                idle,
+                scope,
+                unused_setup_payload(
+                    &scratch.0,
+                    idle_archive_limits(),
+                    deadline,
+                    Arc::new(AtomicBool::new(false)),
+                ),
+            )
+            .err()
+            .expect("non-unused source rejected before I/O");
+        assert!(store.matches(rejected.owner.stores()));
+        assert!(!rejected.owner.archive_enabled());
+        assert!(rejected.owner.setup_snapshot().is_none());
+        drop(pin);
+    }
+    assert!(idle_archive_segments(&scratch.0).is_empty());
+    worker.finish().unwrap();
+    scratch.1 = true;
+}
+
+#[test]
+fn idle_unused_setup_partial_selector_scan_and_panic_keep_the_original_owner() {
+    use adaptive_port::archive_worker::{
+        ArchiveQuarantineReason, ArchiveWorker, UnusedIdleArchiveSetupShutdownParts,
+    };
+    for case in 0..3 {
+        let mut scratch = idle_archive_scratch();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let (mut idle, scope) = unused_setup_pc(true, deadline);
+        if case == 2 {
+            idle.panic_setup_after_enable_for_test();
+        }
+        if case == 1 {
+            std::fs::write(
+                scratch.0.join("foreign-not-an-archive"),
+                b"original scan rejection",
+            )
+            .unwrap();
+        }
+        let store = idle.stores().read_owner();
+        let limits = if case == 0 {
+            crate::pals::store::ArchiveRuntimeLimits {
+                record_payload_bytes_max: 0,
+                ..idle_archive_limits()
+            }
+        } else {
+            idle_archive_limits()
+        };
+        let setup = unused_setup_payload(
+            &scratch.0,
+            limits,
+            deadline,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let identity = setup.identity();
+        let mut worker = ArchiveWorker::start().unwrap();
+        let transfer = worker
+            .submit_unused_idle_setup(idle, scope, setup)
+            .unwrap_or_else(|rejected| panic!("unused setup admission: {}", rejected.error));
+        // A later caller nonce error must not replace the owner's first error.
+        let rejected = unused_setup_completion(&mut worker, &transfer, deadline)
+            .install(scope, transfer.nonce() + 1, identity)
+            .err()
+            .expect("actual selected startup stage must fail");
+        let UnusedIdleArchiveSetupShutdownParts {
+            owner: idle,
+            setup,
+            receipt,
+            result,
+        } = rejected.into_owner_and_setup_for_shutdown();
+        match case {
+            0 => assert!(matches!(
+                result,
+                Err(ArchiveQuarantineReason::Operation(PalsError::Store(
+                    StoreError::InvalidConditions("archive runtime selectors")
+                )))
+            )),
+            1 => assert!(matches!(
+                result,
+                Err(ArchiveQuarantineReason::Operation(PalsError::Store(
+                    StoreError::ArchiveIntegrity("archive root is not exclusively managed")
+                )))
+            )),
+            2 => assert!(matches!(result, Err(ArchiveQuarantineReason::Panic))),
+            _ => unreachable!("closed authored failure cases"),
+        }
+        assert!(store.matches(idle.stores()));
+        assert!(
+            idle.archive_enabled(),
+            "original partial enable remains owned"
+        );
+        assert_eq!(setup.identity(), identity);
+        assert_eq!(setup.runtime_limits(), limits);
+        assert!(!receipt.configuration_complete);
+        let pending = idle.setup_snapshot().unwrap();
+        assert_eq!(pending.original_deadline, deadline);
+        assert_eq!(
+            pending.remaining_io_bytes,
+            if case == 2 {
+                None
+            } else {
+                Some(16 * 1024 * 1024)
+            }
+        );
+        assert_eq!(pending.completion_unknown, case == 2);
+        if case == 1 {
+            assert_eq!(receipt.archive_owner.unwrap().runtime_limits, Some(limits));
+        }
+        assert!(
+            idle.into_pc().is_err(),
+            "partial/unknown setup cannot become a search owner"
+        );
+        worker.finish().unwrap();
+        scratch.1 = true;
+    }
+}
+
+#[test]
+fn idle_unused_setup_wrong_poll_install_and_busy_cancel_preserve_original_custody() {
+    use adaptive_port::archive_worker::{
+        ArchiveQuarantineReason, ArchiveWorker, ArchiveWorkerError,
+        UnusedIdleArchiveSetupShutdownParts,
+    };
+    let mut scratch = idle_archive_scratch();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (idle, scope) = unused_setup_pc(true, deadline);
+    let store = idle.stores().read_owner();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let setup = unused_setup_payload(
+        &scratch.0,
+        idle_archive_limits(),
+        deadline,
+        Arc::clone(&cancellation),
+    );
+    let identity = setup.identity();
+    let mut worker = ArchiveWorker::start().unwrap();
+    let mut other = ArchiveWorker::start().unwrap();
+    let transfer = worker
+        .submit_unused_idle_setup(idle, scope, setup)
+        .unwrap_or_else(|rejected| panic!("setup admission: {}", rejected.error));
+    assert!(matches!(
+        worker.try_receive(&transfer),
+        Err(ArchiveWorkerError::StaleTransfer)
+    ));
+    assert!(matches!(
+        other.try_receive_unused_idle_setup(&transfer),
+        Err(ArchiveWorkerError::StaleTransfer)
+    ));
+    let (second, _) = unused_setup_pc(true, deadline);
+    let second_store = second.stores().read_owner();
+    let busy = worker
+        .submit_unused_idle_setup(
+            second,
+            scope,
+            unused_setup_payload(
+                &scratch.0,
+                idle_archive_limits(),
+                deadline,
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .err()
+        .expect("one worker slot retains second original owner");
+    assert!(second_store.matches(busy.owner.stores()));
+    assert!(busy.owner.setup_snapshot().is_none());
+    let completion = unused_setup_completion(&mut worker, &transfer, deadline);
+    let rejected = completion
+        .install(scope, transfer.nonce() + 1, identity)
+        .err()
+        .expect("wrong setup nonce retains completed custody");
+    let UnusedIdleArchiveSetupShutdownParts {
+        owner: idle,
+        setup,
+        result,
+        ..
+    } = rejected.into_owner_and_setup_for_shutdown();
+    assert!(matches!(
+        result,
+        Err(ArchiveQuarantineReason::InvalidReturn(
+            "unused setup identity/nonce"
+        ))
+    ));
+    assert!(store.matches(idle.stores()));
+    assert!(Arc::ptr_eq(&setup.control.cancellation, &cancellation));
+    assert!(idle.into_pc().is_err());
+    let (idle, _) = unused_setup_pc(true, deadline);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let setup = unused_setup_payload(
+        &scratch.0,
+        idle_archive_limits(),
+        deadline,
+        Arc::clone(&cancellation),
+    );
+    let identity = setup.identity();
+    let store = idle.stores().read_owner();
+    let transfer = worker
+        .submit_unused_idle_setup(idle, scope, setup)
+        .unwrap_or_else(|rejected| panic!("next original setup: {}", rejected.error));
+    // The actual completed setup is still tied to its first go's cancellation.
+    // A late cancellation forbids installation, even after the worker returned.
+    let completion = unused_setup_completion(&mut worker, &transfer, deadline);
+    transfer.cancel();
+    let rejected = completion
+        .install(scope, transfer.nonce(), identity)
+        .err()
+        .expect("late original cancel is not success");
+    let UnusedIdleArchiveSetupShutdownParts {
+        owner: idle,
+        setup,
+        result,
+        ..
+    } = rejected.into_owner_and_setup_for_shutdown();
+    assert!(matches!(result, Err(ArchiveQuarantineReason::Canceled)));
+    assert!(store.matches(idle.stores()));
+    assert!(Arc::ptr_eq(&setup.control.cancellation, &cancellation));
+    assert!(cancellation.load(Ordering::Acquire));
+    assert!(idle.into_pc().is_err());
+    worker.finish().unwrap();
+    other.finish().unwrap();
+    scratch.1 = true;
+}
+
+#[test]
+fn idle_unused_researcher_setup_keeps_the_deferred_source_and_unconsumed_readiness() {
+    use adaptive_port::archive_worker::ArchiveWorker;
+    let mut scratch = idle_archive_scratch();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut owner = Box::new(super::super::preparing_root::tests::owner());
+    let model = Arc::clone(owner.source().model());
+    let scope = SearchAuthority {
+        game: GameGeneration(1),
+        ..port_authority_for_idle_test()
+    };
+    owner
+        .try_adaptive_new_game(scope, deadline, &AtomicBool::new(false))
+        .unwrap();
+    let store = owner.stores().read_owner();
+    let idle = owner
+        .into_idle_archive()
+        .unwrap_or_else(|_| panic!("unused original preparing owner"));
+    let setup = unused_setup_payload(
+        &scratch.0,
+        idle_archive_limits(),
+        deadline,
+        Arc::new(AtomicBool::new(false)),
+    );
+    let identity = setup.identity();
+    let mut worker = ArchiveWorker::start().unwrap();
+    let transfer = worker
+        .submit_unused_idle_setup(idle, scope, setup)
+        .unwrap_or_else(|rejected| panic!("preparing setup: {}", rejected.error));
+    let completion = unused_setup_completion(&mut worker, &transfer, deadline);
+    let (idle, receipt) = completion
+        .install(scope, transfer.nonce(), identity)
+        .unwrap_or_else(|rejected| panic!("preparing setup return: {:?}", rejected.failure()));
+    assert_eq!(
+        receipt.owner_kind,
+        super::super::idle_archive::IdleArchiveOwnerKind::Researcher
+    );
+    assert_eq!(idle.semantic().adaptive_new_game_scope(), Some(scope));
+    let owner = idle
+        .into_researcher()
+        .unwrap_or_else(|_| panic!("same preparing Box"));
+    assert!(store.matches(owner.stores()));
+    assert!(Arc::ptr_eq(owner.source().model(), &model));
+    assert!(owner.last_authority().is_none());
+    assert!(owner.stores().root().is_none());
+    assert_eq!(owner.stores().generation(), 0);
+    assert_eq!(
+        owner.stores().hot_stats(),
+        crate::pals::store::ArchiveStats::default()
+    );
+    let mut idle = owner
+        .into_idle_archive()
+        .unwrap_or_else(|_| panic!("same configured idle"));
+    assert!(idle.close_archive_owner().unwrap().unwrap().complete);
+    worker.finish().unwrap();
+    scratch.1 = true;
+}
+
 fn port(beam: usize, line_plies: usize) -> Port {
     port_with_observation_limit(beam, line_plies, None)
 }
