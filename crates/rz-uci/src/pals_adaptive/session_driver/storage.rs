@@ -58,6 +58,24 @@ where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    pub(crate) fn storage_observation(
+        &self,
+    ) -> Result<
+        Option<crate::rovent_bootstrap::storage_lifecycle::StorageLifecycleObservation>,
+        &'static str,
+    > {
+        let slot = self
+            .storage
+            .try_lock()
+            .map_err(|_| "storage_lifecycle_busy_or_poisoned")?;
+        Ok(slot.as_ref().map(|slot| {
+            let mut observation = slot.lifecycle.observation();
+            if slot.caller_panic.is_some() {
+                observation.complete = false;
+            }
+            observation
+        }))
+    }
     #[allow(clippy::result_large_err)]
     pub(crate) fn install_storage_registration(
         &self,

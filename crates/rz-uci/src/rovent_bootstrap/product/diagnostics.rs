@@ -20,6 +20,7 @@ use std::sync::{
 };
 
 pub const ROVENT_LIFECYCLE_DIAGNOSTIC_DOMAIN: &str = "rz-rovent-product-lifecycle-observation/1";
+pub const ROVENT_STORAGE_DIAGNOSTIC_DOMAIN: &str = "rz-rovent-storage-maintenance-observation/1";
 // Operational output limits, independent of search/node/role credit. Keep one
 // final row available even after an incomplete root stream reaches its bound.
 const MAX_ROOT_ROWS: u64 = 256;
@@ -422,6 +423,9 @@ struct State {
     latest: Option<RoventProductLifecycleObservation>,
     retained_session: Option<RetainedSessionObservation>,
     retained_session_after_finish: Option<RetainedSessionObservation>,
+    storage_sequence: u64,
+    storage_first_issue: Option<&'static str>,
+    storage_scope_incomplete: bool,
     #[cfg(feature = "pals-adaptive-diagnostics")]
     profiled_feedback: Option<crate::pals_adaptive::ContinuationDiagnostic>,
     #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -442,6 +446,98 @@ pub struct RoventLifecycleDiagnostics {
     mode: ExecutionMode,
 }
 impl RoventLifecycleDiagnostics {
+    /// This separate Serialize-only domain never changes the established
+    /// lifecycle row shape, result, source authority or physical fence.
+    pub(super) fn observe_storage(
+        &self,
+        product: &RoventNativeProductDriver,
+        authority: Option<SearchAuthority>,
+    ) {
+        if product.storage_registration.is_none() {
+            return;
+        }
+        let observed = match product.inner.as_ref() {
+            ActualProductDriver::Pc(driver) | ActualProductDriver::PcNnuec(driver) => {
+                driver.storage_observation()
+            }
+            ActualProductDriver::Nnuec(driver) => driver.storage_observation(),
+            ActualProductDriver::Pcr(driver) => driver.storage_observation(),
+        };
+        let Ok(mut state) = self.state.lock() else {
+            self.poisoned.store(true, Ordering::Release);
+            return;
+        };
+        let (mut storage, source_status) = match observed {
+            Ok(Some(value)) => (Some(value), "original_storage_custody"),
+            Ok(None) => {
+                state
+                    .storage_first_issue
+                    .get_or_insert("selected_storage_owner_absent");
+                (None, "selected_storage_owner_absent")
+            }
+            Err(cause) => {
+                state.storage_first_issue.get_or_insert(cause);
+                (None, "original_storage_readback_unavailable")
+            }
+        };
+        if let Some(storage) = storage.as_mut() {
+            match authority {
+                Some(authority) => storage.require_after_root(authority),
+                None => storage.require_after_finish(),
+            }
+        }
+        if storage.as_ref().is_some_and(|value| !value.complete) {
+            state
+                .storage_first_issue
+                .get_or_insert("original_storage_observation_incomplete");
+        }
+        match state.storage_sequence.checked_add(1) {
+            Some(sequence) => state.storage_sequence = sequence,
+            None => {
+                state
+                    .storage_first_issue
+                    .get_or_insert("storage_sequence_exhausted");
+                return;
+            }
+        }
+        if state.storage_sequence > MAX_ROOT_ROWS + 1 {
+            state.storage_first_issue.get_or_insert("storage_row_limit");
+            return;
+        }
+        let row = StorageObservationRow {
+            domain: ROVENT_STORAGE_DIAGNOSTIC_DOMAIN,
+            event: if authority.is_some() {
+                "after_root"
+            } else {
+                "after_finish"
+            },
+            sequence: state.storage_sequence,
+            input_lock_sha256: hex(self.lock),
+            implementation_sha256: hex(self.implementation),
+            mode: mode(self.mode),
+            observed_after_authority: authority.map(Into::into),
+            source_status,
+            storage: storage.as_ref(),
+            diagnostics_complete: state.storage_first_issue.is_none()
+                && !state.storage_scope_incomplete,
+            diagnostic_failure: state.storage_first_issue,
+            physical_completion_attested: false,
+            capabilities_reissued: false,
+        };
+        match write_storage_row(&mut io::stderr().lock(), row, &mut state) {
+            Ok(true) => {}
+            Ok(false) => {
+                state.storage_scope_incomplete = true;
+                state
+                    .storage_first_issue
+                    .get_or_insert("storage_row_scope_incomplete");
+            }
+            Err(cause) => {
+                state.storage_scope_incomplete = true;
+                state.storage_first_issue.get_or_insert(cause);
+            }
+        }
+    }
     #[cfg(feature = "pals-adaptive-diagnostics")]
     pub(super) fn install_profiled_feedback(
         &self,
@@ -1183,6 +1279,66 @@ fn write_row(
         .map_err(|_| "diagnostic_write_failed")?;
     output.flush().map_err(|_| "diagnostic_flush_failed")
 }
+
+#[derive(Serialize)]
+struct StorageObservationRow<'a> {
+    domain: &'static str,
+    event: &'static str,
+    sequence: u64,
+    input_lock_sha256: String,
+    implementation_sha256: String,
+    mode: &'static str,
+    observed_after_authority: Option<AuthorityObservation>,
+    source_status: &'static str,
+    storage: Option<&'a super::super::storage_lifecycle::StorageLifecycleObservation>,
+    diagnostics_complete: bool,
+    diagnostic_failure: Option<&'static str>,
+    physical_completion_attested: bool,
+    capabilities_reissued: bool,
+}
+
+fn write_storage_row(
+    output: &mut impl Write,
+    mut row: StorageObservationRow<'_>,
+    state: &mut State,
+) -> Result<bool, &'static str> {
+    let mut buffer = RowBuffer(Vec::new());
+    buffer
+        .0
+        .try_reserve_exact(MAX_ROW_BYTES)
+        .map_err(|_| "storage_diagnostic_allocation_failed")?;
+    let exceeded = match serde_json::to_writer(&mut buffer, &row) {
+        Ok(()) => buffer.write_all(b"\n").is_err(),
+        Err(error) if error.is_io() => true,
+        Err(_) => return Err("storage_diagnostic_encoding_failed"),
+    };
+    if exceeded {
+        // Do not turn truncated counters or a missing receipt into success.
+        buffer.0.clear();
+        row.storage = None;
+        row.source_status = "bounded_storage_row_incomplete";
+        row.diagnostics_complete = false;
+        row.diagnostic_failure = Some("storage_row_scope_incomplete");
+        serde_json::to_writer(&mut buffer, &row)
+            .map_err(|_| "storage_diagnostic_fallback_failed")?;
+        buffer
+            .write_all(b"\n")
+            .map_err(|_| "storage_diagnostic_fallback_byte_limit")?;
+    }
+    if buffer.0.len() > (MAX_STREAM_BYTES - MAX_ROW_BYTES).saturating_sub(state.bytes) {
+        return Err("storage_diagnostic_stream_byte_limit");
+    }
+    // Same global stream accounting/final lifecycle reserve. Never retry a
+    // partially written JSONL row and never alter product cleanup on failure.
+    state.bytes += buffer.0.len();
+    output
+        .write_all(&buffer.0)
+        .map_err(|_| "storage_diagnostic_write_failed")?;
+    output
+        .flush()
+        .map_err(|_| "storage_diagnostic_flush_failed")?;
+    Ok(!exceeded)
+}
 #[cfg(feature = "pals-adaptive-diagnostics")]
 fn write_profiled_feedback_row(
     output: &mut impl Write,
@@ -1341,6 +1497,36 @@ mod tests {
         assert!(decoded["root"].is_null());
         assert!(decoded["initial"].is_null());
         assert_eq!(output.last(), Some(&b'\n'));
+    }
+
+    #[test]
+    fn storage_domain_uses_original_stream_budget_without_issuing_physical_authority() {
+        let row = StorageObservationRow {
+            domain: ROVENT_STORAGE_DIAGNOSTIC_DOMAIN,
+            event: "after_finish",
+            sequence: 1,
+            input_lock_sha256: "1".repeat(64),
+            implementation_sha256: "2".repeat(64),
+            mode: "cpu_pc",
+            observed_after_authority: None,
+            source_status: "original_storage_readback_unavailable",
+            storage: None,
+            diagnostics_complete: false,
+            diagnostic_failure: Some("fixture_readback_unknown"),
+            physical_completion_attested: false,
+            capabilities_reissued: false,
+        };
+        let mut state = State::default();
+        let mut output = Vec::new();
+        assert!(write_storage_row(&mut output, row, &mut state).unwrap());
+        let decoded: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(decoded["domain"], ROVENT_STORAGE_DIAGNOSTIC_DOMAIN);
+        assert!(decoded["storage"].is_null());
+        assert_eq!(decoded["diagnostics_complete"], false);
+        assert_eq!(decoded["physical_completion_attested"], false);
+        assert_eq!(state.bytes, output.len());
+        assert!(state.first_issue.is_none());
+        assert!(state.latest.is_none());
     }
 
     #[test]

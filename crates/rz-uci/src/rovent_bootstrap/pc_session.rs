@@ -777,6 +777,40 @@ impl RoventPcSessionDriver {
             .map(|value| value.clone())
             .map_err(|_| poisoned())
     }
+    pub(crate) fn storage_observation(
+        &self,
+    ) -> Result<Option<super::storage_lifecycle::StorageLifecycleObservation>, &'static str> {
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|_| "storage_semantic_owner_busy_or_poisoned")?;
+        let storage = self
+            .storage
+            .try_lock()
+            .map_err(|_| "storage_lifecycle_busy_or_poisoned")?;
+        let Some(storage) = storage.as_ref() else {
+            return Ok(None);
+        };
+        let mut observation = storage.observation();
+        if let State::Idle(idle) = &*state {
+            if let Some(owner) = &idle.owner {
+                let archive = owner
+                    .stores()
+                    .archive_owner_snapshot()
+                    .map_err(|_| "storage_hot_owner_readback_failed")?;
+                observation.observe_hot_owner(
+                    owner.records().len(),
+                    owner.stores().hot_stats(),
+                    archive,
+                );
+            } else {
+                observation.complete = false;
+            }
+        } else if !matches!(&*state, State::Closed) {
+            observation.complete = false;
+        }
+        Ok(Some(observation))
+    }
     pub fn latest_initial(&self) -> Result<Option<Arc<RoventPcInitialReceipt>>, ContractError> {
         self.latest_initial
             .lock()

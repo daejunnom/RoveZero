@@ -829,6 +829,7 @@ impl SearchSessionDriver for RoventNativeProductDriver {
         }
         if let Some(diagnostics) = &self.lifecycle_diagnostics {
             diagnostics.observe_finish(self, &result);
+            diagnostics.observe_storage(self, None);
         }
         result
     }
@@ -850,6 +851,7 @@ impl SearchSessionDriver for RoventNativeProductDriver {
         let result = self.actual().run(position, context, progress);
         if let Some(diagnostics) = &self.lifecycle_diagnostics {
             diagnostics.observe_root(self, context, result.as_ref().err());
+            diagnostics.observe_storage(self, Some(context.authority));
             #[cfg(feature = "pals-adaptive-diagnostics")]
             diagnostics.observe_profiled_feedback(self, context);
         }

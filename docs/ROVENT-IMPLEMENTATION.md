@@ -1564,3 +1564,26 @@ Capacity/Unknown을 유지한다. native/CPU의 물리 종료 뒤 최종 checkpo
 archive worker join을 별도로 확인하며, 실패·panic·완료 불명은 원 owner와 함께
 보존한다. CPU/mock 검사·소스 검토는 실제 긴 게임의 archive 왕복, 목표 GPU,
 종단 UCI 정상 종료 및 성능 인수를 대신하지 않는다.
+
+`--lifecycle-diagnostics=stderr-v1`을 함께 선택하면 별도
+`rz-rovent-storage-maintenance-observation/1` 행으로 원 maintenance receipt의
+authority·nonce·hot 통계·archive owner의 commit/reclaim/load 계수와 실제 phase join을
+제한된 범위에서 관측한다. `after_root`는 해당 go의 원 phase와 일치해야 하며,
+`after_finish`는 실제 final checkpoint·close·join이 있어야 complete다. 이전 root의
+정상 join이나 초기 중단을 현재 phase의 성공으로 사용하지 않는다. 원 lifecycle
+domain·실행 결과·물리 완료 권한은 그대로이며, 누락·잠금 실패·출력 한도 초과는
+incomplete다. NNUEC/PCR의 미관측 live hot owner를 0이나 실측 peak로 해석하지 않는다.
+
+native CI의 `native-validation-diagnostics` feature는 기존 진단 접점을 포함하는
+기본 off validation alias다. 실제 stderr 관측에는 위 CLI opt-in이 계속 필요하다.
+이 빌드 등록과 CPU 검사는 실제 cold 회수·복원이나 외부 counter→Repair→C/Fresh의
+성공 증거가 아니며, 새 source와 실제 실행을 별도로 등록한다.
+
+2026-10-19의 source `3f953b8e164fe3f1ba325daee2c9ff119bf1667e`는 실제 startup
+metadata 자식16개, 독립 CPU reference와 RTX4050 native CUDA의 106 cases/212 NN
+inputs를 완료했다. 공식 Rust whole106/212와 같은 first12 raw의 subset100/200
+수치 판정 및 정상 물리 종료를 확인했고 원시 자료98개를 회수해 검증했다. 이는
+학습0·성능 주장0인 기능/수치/수명 인수다. 이후 저장소 tooling639의 CI 다섯 job
+성공, 새 관측 소스의 검사, 실제 archive/UCI 인수와 각각 구분한다. archive 준비의
+caller deadline 실패는 원 자식 종료와 함께 보존하며 실제 제품 실행 성공으로
+표시하지 않는다.

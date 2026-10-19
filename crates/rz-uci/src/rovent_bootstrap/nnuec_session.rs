@@ -749,6 +749,26 @@ impl RoventNnuecSessionDriver {
             .map(|r| r.clone())
             .map_err(|_| poisoned())
     }
+    pub(crate) fn storage_observation(
+        &self,
+    ) -> Result<Option<super::storage_lifecycle::StorageLifecycleObservation>, &'static str> {
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|_| "storage_semantic_owner_busy_or_poisoned")?;
+        let storage = self
+            .storage
+            .try_lock()
+            .map_err(|_| "storage_lifecycle_busy_or_poisoned")?;
+        let Some(storage) = storage.as_ref() else {
+            return Ok(None);
+        };
+        let mut observation = storage.observation();
+        if matches!(&*state, State::Retained { .. } | State::Moving) {
+            observation.complete = false;
+        }
+        Ok(Some(observation))
+    }
     pub fn latest_initial(&self) -> Result<Option<Arc<RoventNnuecInitialReceipt>>, ContractError> {
         self.latest_initial
             .lock()

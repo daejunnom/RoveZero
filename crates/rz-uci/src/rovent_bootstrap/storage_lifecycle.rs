@@ -34,6 +34,9 @@ use std::time::{Duration, Instant};
 const MAINTENANCE_IO_BYTES: u64 = 16 * 1024 * 1024;
 const RECEIPTS_MAX: usize = 64;
 
+mod observation;
+pub(crate) use observation::StorageLifecycleObservation;
+
 pub(crate) enum StorageSemanticOwner<M: RoleModel + 'static = AdaptivePortModel> {
     Pc(Box<PcSemanticOwner<M>>),
     Pcr(Box<ResearcherPreparingOwner<M>>),
@@ -135,6 +138,9 @@ struct WorkerCustody<M: RoleModel + 'static = AdaptivePortModel> {
     pending: Option<Pending>,
     setup_receipt: Option<UnusedIdleArchiveSetupReceipt>,
     receipts: VecDeque<ArchiveWorkReceipt>,
+    receipt_sequence: u64,
+    phase_receipt_start: u64,
+    observation_sequence_exhausted: bool,
     shutdown: Option<ArchiveShutdownReceipt>,
     shutdown_observed: Option<ArchiveShutdownReceipt>,
     phase_scope: Option<SearchAuthority>,
@@ -166,6 +172,9 @@ impl<M: RoleModel + 'static> WorkerCustody<M> {
             pending: None,
             setup_receipt: None,
             receipts: VecDeque::new(),
+            receipt_sequence: 0,
+            phase_receipt_start: 0,
+            observation_sequence_exhausted: false,
             shutdown: None,
             shutdown_observed: None,
             phase_scope: None,
@@ -208,6 +217,7 @@ impl<M: RoleModel + 'static> WorkerCustody<M> {
                     self.worker = Some(worker);
                     self.shutdown = None;
                     self.phase_scope = None;
+                    self.phase_receipt_start = self.receipt_sequence;
                 }
                 Err(error) => return Err(self.fail("RoventStorageWorker", error)),
             }
@@ -390,6 +400,10 @@ impl<M: RoleModel + 'static> WorkerCustody<M> {
         Ok(())
     }
     fn push_receipt(&mut self, receipt: ArchiveWorkReceipt) {
+        match self.receipt_sequence.checked_add(1) {
+            Some(next) => self.receipt_sequence = next,
+            None => self.observation_sequence_exhausted = true,
+        }
         if self.receipts.len() == RECEIPTS_MAX {
             self.receipts.pop_front();
         }
@@ -684,6 +698,11 @@ pub(crate) struct SessionStorageLifecycle<M: RoleModel + 'static = AdaptivePortM
     active_admission: Option<Arc<RoventRootAdmission>>,
 }
 impl<M: RoleModel + 'static> SessionStorageLifecycle<M> {
+    /// Read-only bounded facts from the original installed receipts. No owner,
+    /// archive I/O allowance or completion authority is transferred.
+    pub(crate) fn observation(&self) -> StorageLifecycleObservation {
+        observation::project(&self.core)
+    }
     pub(crate) fn new(registration: Arc<SharedRoventStorageRegistration>) -> Box<Self> {
         Box::new(Self {
             registration,
@@ -1112,6 +1131,34 @@ mod tests {
         core.join(until, &signal).unwrap();
         core.verify_empty_game_handoff(scope()).unwrap();
         assert!(core.phase_joins.back().unwrap().1.worker_joined);
+        let mut current_setup = observation::project(&core);
+        current_setup.require_after_root(scope());
+        assert!(current_setup.complete);
+        // StoppedInitial returns before storage.prepare for the attempted next
+        // go. Its current authority must not inherit this earlier setup phase.
+        let mut stopped_initial = observation::project(&core);
+        stopped_initial.require_after_root(SearchAuthority {
+            root: RootGeneration(scope().root.0 + 1),
+            ..scope()
+        });
+        assert!(!stopped_initial.complete);
+        // Native finish may fail before storage.finish is entered. Reading
+        // this joined setup is not coverage of a final checkpoint/close.
+        let mut unentered_finish = observation::project(&core);
+        unentered_finish.require_after_finish();
+        assert!(!unentered_finish.complete);
+        let setup_observation = serde_json::to_value(observation::project(&core)).unwrap();
+        assert_eq!(
+            setup_observation["facts"]["phase_receipts"],
+            serde_json::json!([])
+        );
+        assert_eq!(setup_observation["facts"]["setup_receipt_observed"], true);
+        assert!(setup_observation.get("after_root_scope").is_none());
+        assert!(setup_observation.get("after_finish_complete").is_none());
+        assert_eq!(
+            setup_observation["facts"]["original_phase_join"]["worker_joined"],
+            true
+        );
         core.worker.take();
         assert!(!core.finish_completed); // a setup-phase join is not final close
         let StorageSemanticOwner::Pc(mut owner) = core.restore().unwrap() else {
@@ -1159,7 +1206,35 @@ mod tests {
         )
         .unwrap();
         assert!(core.receipts.back().unwrap().loaded_root.is_none());
+        // A completed archive operation is still not a worker join.
+        assert!(!observation::project(&core).complete);
         core.join(until, &signal).unwrap();
+        let mut current_maintenance = observation::project(&core);
+        current_maintenance.require_after_root(same_game);
+        assert!(current_maintenance.complete);
+        let mut next_without_phase = observation::project(&core);
+        next_without_phase.require_after_root(SearchAuthority {
+            root: RootGeneration(same_game.root.0 + 1),
+            ..same_game
+        });
+        assert!(!next_without_phase.complete);
+        let mut native_finish_failed = observation::project(&core);
+        native_finish_failed.require_after_finish();
+        assert!(!native_finish_failed.complete);
+        let maintenance = serde_json::to_value(observation::project(&core)).unwrap();
+        let actual_receipts = maintenance["facts"]["phase_receipts"].as_array().unwrap();
+        assert_eq!(actual_receipts.len(), 2);
+        assert_eq!(actual_receipts[0]["operation"], "prepare_root");
+        assert_eq!(actual_receipts[1]["operation"], "restore_root_if_archived");
+        assert!(actual_receipts[1]["loaded_root"].is_null());
+        assert_eq!(
+            actual_receipts[1]["nonce"],
+            core.receipts.back().unwrap().nonce
+        );
+        assert_eq!(
+            maintenance["facts"]["original_phase_join"]["worker_joined"],
+            true
+        );
         core.worker.take();
         let StorageSemanticOwner::Pc(mut owner) = core.restore().unwrap() else {
             panic!("same PC kind after ordinary maintenance")
@@ -1197,6 +1272,12 @@ mod tests {
             .unwrap();
         core.join(until, &signal).unwrap();
         core.verify_empty_game_handoff(next).unwrap();
+        let mut current_newgame = observation::project(&core);
+        current_newgame.require_after_root(next);
+        assert!(current_newgame.complete);
+        let mut newgame_is_not_finish = observation::project(&core);
+        newgame_is_not_finish.require_after_finish();
+        assert!(!newgame_is_not_finish.complete);
         core.worker.take();
         let StorageSemanticOwner::Pc(mut owner) = core.restore().unwrap() else {
             panic!("same PC kind after actual NewGame")
@@ -1223,6 +1304,32 @@ mod tests {
         assert!(core.receipts.back().unwrap().idle_checkpoint.is_some());
         core.join(until, &signal).unwrap();
         assert_eq!(core.phase_joins.len(), 4);
+        let mut final_coverage = observation::project(&core);
+        final_coverage.require_after_finish();
+        assert!(final_coverage.complete);
+        let mut final_is_not_root = observation::project(&core);
+        final_is_not_root.require_after_root(next);
+        assert!(!final_is_not_root.complete);
+        let original_checkpoint = core.receipts.back_mut().unwrap().idle_checkpoint.take();
+        let mut checkpoint_missing = observation::project(&core);
+        checkpoint_missing.require_after_finish();
+        assert!(!checkpoint_missing.complete);
+        core.receipts.back_mut().unwrap().idle_checkpoint = original_checkpoint;
+        let finished = serde_json::to_value(observation::project(&core)).unwrap();
+        let final_receipt = &finished["facts"]["phase_receipts"][0];
+        assert_eq!(final_receipt["operation"], "finish_idle_game");
+        assert_eq!(
+            final_receipt["idle_checkpoint"]["committed_bytes"],
+            core.receipts
+                .back()
+                .unwrap()
+                .idle_checkpoint
+                .as_ref()
+                .unwrap()
+                .committed_bytes
+        );
+        assert_eq!(finished["facts"]["finish_completed"], true);
+        assert_eq!(finished["facts"]["physical_completion_attested"], false);
         let closed = core
             .idle
             .as_ref()
@@ -1232,6 +1339,32 @@ mod tests {
             .unwrap();
         assert!(closed.completed && closed.original_closed.unwrap().admission_closed);
         scratch.1 = true;
+    }
+
+    #[test]
+    fn storage_observation_lost_phase_never_uses_an_empty_success() {
+        let mut core = WorkerCustody::<AdaptivePortModel>::new();
+        core.phase_scope = Some(scope());
+        core.shutdown = Some(ArchiveShutdownReceipt {
+            worker_joined: true,
+            owners_returned: true,
+            admission_closed: true,
+        });
+        // Metadata-shaped join booleans alone cannot cover a missing actual
+        // setup/empty phase, ordinary pair of work receipts or final checkpoint.
+        let mut no_phase = observation::project(&core);
+        no_phase.require_after_root(scope());
+        assert!(!no_phase.complete);
+        let mut no_finish = observation::project(&core);
+        no_finish.require_after_finish();
+        assert!(!no_finish.complete);
+        core.receipt_sequence = 3;
+        let lost = serde_json::to_value(observation::project(&core)).unwrap();
+        assert_eq!(lost["complete"], false);
+        assert_eq!(lost["facts"]["phase_receipts_known"], false);
+        assert!(lost["facts"]["phase_receipts"].is_null());
+        core.observation_sequence_exhausted = true;
+        assert!(!observation::project(&core).complete);
     }
 
     #[test]
