@@ -2,6 +2,8 @@
 //!
 //! Usage: `rovent_startup_metadata --config=PATH.json [--backend-metadata=PATH.json]`
 //! Optional: `--position-command=position startpos moves e2e4` (one argv value).
+//! Optional: `--session-implementation-root-policy=dynamic-go|exact-registered`
+//! declares the existing PC/own-NNUEC session digest without constructing it.
 //! Standalone: `--runtime-bundle-metadata=PATH.json` declares the original bundle
 //! JSON byte pin and its existing typed semantic digest, without opening libraries.
 //! The existing startup codec owns validation, canonicalization and domain hashes.
@@ -32,10 +34,14 @@ mod metadata {
     use rz_position::{BoardMove, Position, PositionError};
     use rz_uci::parser::{self, Command, ParseError, ParserLimits, PositionBase, PositionSpec};
     use rz_uci::rovent_bootstrap::configuration::{
-        LoadingProfile, ROVENT_STARTUP_CONFIGURATION_DOMAIN, StartupConfigurationDocument,
+        ExecutionConfiguration, LoadingProfile, ROVENT_STARTUP_CONFIGURATION_DOMAIN,
+        ResearchValueConfiguration, StartupConfigurationDocument,
         v2::ROVENT_STARTUP_CONFIGURATION_V2_DOMAIN, v3::ROVENT_STARTUP_CONFIGURATION_V3_DOMAIN,
     };
     use rz_uci::rovent_bootstrap::configuration_digest_from_metadata;
+    use rz_uci::rovent_bootstrap::nnuec_session::RoventNnuecSessionDriver;
+    use rz_uci::rovent_bootstrap::pc_session::RoventPcSessionDriver;
+    use rz_uci::rovent_root_admission::RoventRootAdmissionPolicy;
     use serde::de::{MapAccess, SeqAccess, Visitor};
     use serde::{Deserialize, Deserializer, Serialize};
     use sha2::{Digest as _, Sha256};
@@ -61,6 +67,8 @@ mod metadata {
         InputBudget,
         BackendDeclaration(&'static str),
         RuntimeBundleDeclaration(Box<BackendError>),
+        SessionImplementationAssembly,
+        SessionImplementation(Box<BackendError>),
         PositionSyntax(ParseError),
         PositionCommand,
         PositionRules {
@@ -86,6 +94,10 @@ mod metadata {
                 Self::InputBudget => "configuration_byte_budget",
                 Self::BackendDeclaration(_) => "backend_metadata_declaration_rejected",
                 Self::RuntimeBundleDeclaration(_) => "runtime_bundle_declaration_rejected",
+                Self::SessionImplementationAssembly => {
+                    "session_implementation_assembly_unsupported"
+                }
+                Self::SessionImplementation(_) => "session_implementation_declaration_rejected",
                 Self::PositionSyntax(_) => "position_command_syntax_rejected",
                 Self::PositionCommand => "position_command_required",
                 Self::PositionRules { stage, .. } => stage,
@@ -101,11 +113,13 @@ mod metadata {
     impl fmt::Display for Error {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
-                Self::Arguments => f.write_str("expected --config=PATH.json and optional --backend-metadata=PATH.json / --position-command=POSITION, or standalone --runtime-bundle-metadata=PATH.json, at most once each"),
+                Self::Arguments => f.write_str("expected --config=PATH.json and optional --backend-metadata=PATH.json / --position-command=POSITION / --session-implementation-root-policy=dynamic-go|exact-registered, or standalone --runtime-bundle-metadata=PATH.json, at most once each"),
                 Self::InputKind => f.write_str("input must be a regular non-symlink JSON file"),
                 Self::InputBudget => f.write_str("each input must contain 1..=65536 bytes"),
                 Self::BackendDeclaration(detail) => f.write_str(detail),
                 Self::RuntimeBundleDeclaration(cause) => write!(f, "runtime bundle declaration: {cause}"),
+                Self::SessionImplementationAssembly => f.write_str("session implementation metadata supports only roles-only PC or own-NNUEC PCR declarations"),
+                Self::SessionImplementation(cause) => write!(f, "session implementation declaration: {cause}"),
                 Self::PositionSyntax(cause) => write!(f, "position command: {cause}"),
                 Self::PositionCommand => f.write_str("only one UCI position command is accepted"),
                 Self::PositionRules { stage, zero_based_ply, cause } => {
@@ -134,6 +148,26 @@ mod metadata {
         configuration: PathBuf,
         backend_metadata: Option<PathBuf>,
         position_command: Option<PositionCommand>,
+        session_implementation_root_policy: Option<SessionImplementationPolicy>,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SessionImplementationPolicy {
+        ExactRegistered,
+        DynamicGo,
+    }
+    impl SessionImplementationPolicy {
+        fn actual(self) -> RoventRootAdmissionPolicy {
+            match self {
+                Self::ExactRegistered => RoventRootAdmissionPolicy::ExactRegistered,
+                Self::DynamicGo => RoventRootAdmissionPolicy::DynamicGo,
+            }
+        }
+        fn wire_name(self) -> &'static str {
+            match self {
+                Self::ExactRegistered => "exact_registered",
+                Self::DynamicGo => "dynamic_go",
+            }
+        }
     }
     #[derive(Debug, PartialEq, Eq)]
     enum Invocation {
@@ -170,6 +204,7 @@ mod metadata {
         let mut configuration = None;
         let mut backend_metadata = None;
         let mut position_command = None;
+        let mut session_implementation_root_policy = None;
         let mut runtime_bundle_metadata = None;
         for argument in arguments {
             let text = argument.to_str().ok_or(Error::Arguments)?;
@@ -188,6 +223,16 @@ mod metadata {
                     return Err(Error::Arguments);
                 }
                 position_command = Some(parse_position_command(command)?);
+            } else if let Some(policy) = text.strip_prefix("--session-implementation-root-policy=")
+            {
+                if session_implementation_root_policy.is_some() {
+                    return Err(Error::Arguments);
+                }
+                session_implementation_root_policy = Some(match policy {
+                    "dynamic-go" => SessionImplementationPolicy::DynamicGo,
+                    "exact-registered" => SessionImplementationPolicy::ExactRegistered,
+                    _ => return Err(Error::Arguments),
+                });
             } else if let Some(path) = text.strip_prefix("--runtime-bundle-metadata=") {
                 if runtime_bundle_metadata.is_some() {
                     return Err(Error::Arguments);
@@ -201,6 +246,7 @@ mod metadata {
             return if configuration.is_none()
                 && backend_metadata.is_none()
                 && position_command.is_none()
+                && session_implementation_root_policy.is_none()
             {
                 Ok(Invocation::RuntimeBundleMetadata(bundle))
             } else {
@@ -211,6 +257,7 @@ mod metadata {
             configuration: configuration.ok_or(Error::Arguments)?,
             backend_metadata,
             position_command,
+            session_implementation_root_policy,
         }))
     }
 
@@ -548,6 +595,56 @@ mod metadata {
         })
     }
     #[derive(Serialize)]
+    struct SessionImplementationMetadata {
+        scope: &'static str,
+        family: &'static str,
+        root_policy: &'static str,
+        implementation_sha256: String,
+        compiled_bootstrap_source_sha256: String,
+        actual_session_constructed: bool,
+        root_authority: bool,
+    }
+    fn prepare_session_implementation(
+        document: &StartupConfigurationDocument,
+        policy: SessionImplementationPolicy,
+    ) -> Result<SessionImplementationMetadata, Error> {
+        // The assembly comes from the original closed document. Neither an
+        // arbitrary expected SHA nor a caller-selected incompatible family is
+        // accepted, and these pure producers issue no live capability.
+        let (family, digest) = match document.fields().execution {
+            ExecutionConfiguration::RolesOnly { .. } => (
+                "pc_native_session",
+                RoventPcSessionDriver::implementation_digest_from_metadata(
+                    document,
+                    policy.actual(),
+                ),
+            ),
+            ExecutionConfiguration::OwnResearcher {
+                value: ResearchValueConfiguration::NnuecV2 { .. },
+                ..
+            } => (
+                "own_nnuec_pcr_native_session",
+                RoventNnuecSessionDriver::implementation_digest_from_metadata(
+                    document,
+                    policy.actual(),
+                ),
+            ),
+            _ => return Err(Error::SessionImplementationAssembly),
+        };
+        let digest = digest.map_err(|cause| Error::SessionImplementation(Box::new(cause)))?;
+        Ok(SessionImplementationMetadata {
+            scope: "compiled_source_configuration_policy_digest_only",
+            family,
+            root_policy: policy.wire_name(),
+            implementation_sha256: hex(&digest.0),
+            compiled_bootstrap_source_sha256: hex(
+                &rz_uci::rovent_bootstrap::compiled_bootstrap_source_digest(),
+            ),
+            actual_session_constructed: false,
+            root_authority: false,
+        })
+    }
+    #[derive(Serialize)]
     struct Metadata<'a> {
         schema: &'static str,
         scope: &'static str,
@@ -565,6 +662,8 @@ mod metadata {
         training: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         root_metadata: Option<RootMetadata>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_implementation: Option<SessionImplementationMetadata>,
     }
 
     fn prepare_metadata(bytes: &[u8], backend_raw: Option<&[u8]>) -> Result<Vec<u8>, Error> {
@@ -574,6 +673,14 @@ mod metadata {
         bytes: &[u8],
         backend_raw: Option<&[u8]>,
         position: Option<&PositionCommand>,
+    ) -> Result<Vec<u8>, Error> {
+        prepare_metadata_with_options(bytes, backend_raw, position, None)
+    }
+    fn prepare_metadata_with_options(
+        bytes: &[u8],
+        backend_raw: Option<&[u8]>,
+        position: Option<&PositionCommand>,
+        session_policy: Option<SessionImplementationPolicy>,
     ) -> Result<Vec<u8>, Error> {
         check_input_budget(bytes)?;
         serde_json::from_slice::<UniqueJson>(bytes).map_err(Error::Json)?;
@@ -590,13 +697,20 @@ mod metadata {
             "pending_independent_runtime_metadata"
         };
         let root_metadata = position.map(prepare_root_metadata).transpose()?;
+        let session_implementation = session_policy
+            .map(|policy| prepare_session_implementation(&document, policy))
+            .transpose()?;
         let output = Metadata {
-            schema: if root_metadata.is_some() {
+            schema: if session_implementation.is_some() {
+                "rz-rovent-startup-metadata/3"
+            } else if root_metadata.is_some() {
                 "rz-rovent-startup-metadata/2"
             } else {
                 "rz-rovent-startup-metadata/1"
             },
-            scope: if root_metadata.is_some() {
+            scope: if session_implementation.is_some() {
+                "startup_and_session_implementation_metadata_only"
+            } else if root_metadata.is_some() {
                 "startup_and_rules_metadata_only"
             } else {
                 "startup_configuration_declarations_only"
@@ -635,6 +749,7 @@ mod metadata {
             native_authority: false,
             training: false,
             root_metadata,
+            session_implementation,
         };
         let mut encoded = serde_json::to_vec(&output).map_err(Error::OutputEncoding)?;
         encoded.push(b'\n');
@@ -694,11 +809,21 @@ mod metadata {
                     .as_deref()
                     .map(read_configuration)
                     .transpose()?;
-                match arguments.position_command.as_ref() {
-                    Some(position) => {
-                        prepare_metadata_with_position(&input, backend.as_deref(), Some(position))?
-                    }
-                    None => prepare_metadata(&input, backend.as_deref())?,
+                match arguments.session_implementation_root_policy {
+                    Some(policy) => prepare_metadata_with_options(
+                        &input,
+                        backend.as_deref(),
+                        arguments.position_command.as_ref(),
+                        Some(policy),
+                    )?,
+                    None => match arguments.position_command.as_ref() {
+                        Some(position) => prepare_metadata_with_position(
+                            &input,
+                            backend.as_deref(),
+                            Some(position),
+                        )?,
+                        None => prepare_metadata(&input, backend.as_deref())?,
+                    },
                 }
             }
             Invocation::RuntimeBundleMetadata(path) => {
@@ -737,6 +862,225 @@ mod metadata {
               "execution":{"assembly":"roles_only","event_order":"fixed","role_tickets_max":16,"shared_nnuec_readout":null}__VERSION_FIELDS__
             }"#.replace("__DOMAIN__", domain).replace("__VERSION_FIELDS__", version_fields).into_bytes()
         }
+        fn own_nnuec_fixture() -> Vec<u8> {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fixture(ROVENT_STARTUP_CONFIGURATION_DOMAIN, "")).unwrap();
+            value["execution"] = serde_json::json!({
+                "assembly":"own_researcher", "event_order":"fixed",
+                "queues":{"waiting_jobs_max":8,"worker_commands_max":8,
+                    "role_tickets_max":16,"paused_bytes_per_worker_max":1048576},
+                "max_rounds":16,"max_native_nodes":4096,"cpu_depth":2,
+                "cpu_nodes_per_task":1024,
+                "cpu_plan":{"profile":"independent","tt_entries":4096,
+                    "max_depth":8,"quiescence_ply":4,"ordering":"legal_see_v1",
+                    "paused_bytes_limit":1048576,"preserve_paused_side_scope":true,
+                    "affinity":null},
+                "value":{"value":"nnuec_v2","context_namespace_policy":"fixture-context",
+                    "local_namespace_policy":"fixture-local"},
+                "controller":{"fixed_node_credit":64,"fixed_soft_lease_us":1000,
+                    "initial_workers":1,"max_workers":1,"consecutive_observations":1,
+                    "worker_cooldown_ms":1},
+                "reciprocal":{"recipient":"critic","max_questions_per_job":1,
+                    "node_interval":1,"first_question_sequence":1},
+                "peers":{"pc_peer":true,"researcher":true,"max_sources_per_root":1}
+            });
+            serde_json::to_vec(&value).unwrap()
+        }
+
+        #[test]
+        fn session_policy_arguments_are_closed_and_cannot_supply_expected_identity() {
+            for (literal, policy) in [
+                ("dynamic-go", SessionImplementationPolicy::DynamicGo),
+                (
+                    "exact-registered",
+                    SessionImplementationPolicy::ExactRegistered,
+                ),
+            ] {
+                let flag = format!("--session-implementation-root-policy={literal}");
+                let Invocation::Startup(arguments) = parse_arguments([
+                    OsString::from("--config=a.json"),
+                    OsString::from(flag.as_str()),
+                ])
+                .unwrap() else {
+                    panic!("startup selection required")
+                };
+                assert_eq!(arguments.session_implementation_root_policy, Some(policy));
+                assert!(
+                    parse_arguments([
+                        OsString::from("--config=a.json"),
+                        OsString::from(flag.as_str()),
+                        OsString::from(flag.as_str()),
+                    ])
+                    .is_err()
+                );
+                assert!(
+                    parse_arguments([
+                        OsString::from("--runtime-bundle-metadata=a.json"),
+                        OsString::from(flag),
+                    ])
+                    .is_err()
+                );
+            }
+            for flag in [
+                "--session-implementation-root-policy=",
+                "--session-implementation-root-policy=true",
+                "--session-implementation-root-policy=dynamic_go",
+                "--session-implementation-root-policy=Dynamic-Go",
+                "--session-implementation-sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ] {
+                assert!(parse_arguments(["--config=a.json", flag].map(OsString::from),).is_err());
+            }
+            assert!(
+                parse_arguments([OsString::from(
+                    "--session-implementation-root-policy=dynamic-go"
+                ),])
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn explicit_session_metadata_preserves_legacy_shape_and_has_no_live_authority() {
+            let position = parse_position_command("position startpos").unwrap();
+            for (domain, fields) in [
+                (ROVENT_STARTUP_CONFIGURATION_DOMAIN, ""),
+                (
+                    ROVENT_STARTUP_CONFIGURATION_V2_DOMAIN,
+                    r#", "post_repair":"disabled""#,
+                ),
+                (
+                    ROVENT_STARTUP_CONFIGURATION_V3_DOMAIN,
+                    r#", "post_repair":"disabled", "external":{"kind":"absent"}"#,
+                ),
+            ] {
+                let raw = fixture(domain, fields);
+                let document = StartupConfigurationDocument::from_json(&raw).unwrap();
+                let legacy = prepare_metadata(&raw, None).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&legacy).unwrap()["schema"],
+                    "rz-rovent-startup-metadata/1"
+                );
+                assert!(
+                    !std::str::from_utf8(&legacy)
+                        .unwrap()
+                        .contains("session_implementation")
+                );
+                let old_position =
+                    prepare_metadata_with_position(&raw, None, Some(&position)).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&old_position).unwrap()["schema"],
+                    "rz-rovent-startup-metadata/2"
+                );
+                assert!(
+                    !std::str::from_utf8(&old_position)
+                        .unwrap()
+                        .contains("session_implementation")
+                );
+                for selected_position in [None, Some(&position)] {
+                    let raw_output = prepare_metadata_with_options(
+                        &raw,
+                        None,
+                        selected_position,
+                        Some(SessionImplementationPolicy::DynamicGo),
+                    )
+                    .unwrap();
+                    let output: serde_json::Value = serde_json::from_slice(&raw_output).unwrap();
+                    let session = &output["session_implementation"];
+                    assert_eq!(output["schema"], "rz-rovent-startup-metadata/3");
+                    assert_eq!(session["family"], "pc_native_session");
+                    assert_eq!(session["root_policy"], "dynamic_go");
+                    assert_eq!(
+                        session["implementation_sha256"],
+                        hex(&RoventPcSessionDriver::implementation_digest_from_metadata(
+                            &document,
+                            RoventRootAdmissionPolicy::DynamicGo,
+                        )
+                        .unwrap()
+                        .0,)
+                    );
+                    assert_eq!(
+                        session["scope"],
+                        "compiled_source_configuration_policy_digest_only"
+                    );
+                    assert_eq!(session["actual_session_constructed"], false);
+                    assert_eq!(session["root_authority"], false);
+                    for key in ["actual_startup_ready", "native_authority", "training"] {
+                        assert_eq!(output[key], false);
+                    }
+                    assert_eq!(
+                        output.get("root_metadata").is_some(),
+                        selected_position.is_some()
+                    );
+                    assert!(raw_output.len() <= STDOUT_MAX_BYTES);
+                }
+            }
+        }
+
+        #[test]
+        fn session_metadata_rejects_cross_family_and_unsupported_researcher_assembly() {
+            let pc_raw = fixture(ROVENT_STARTUP_CONFIGURATION_DOMAIN, "");
+            let pc = StartupConfigurationDocument::from_json(&pc_raw).unwrap();
+            let nnuec_raw = own_nnuec_fixture();
+            let nnuec = StartupConfigurationDocument::from_json(&nnuec_raw).unwrap();
+            let policy = RoventRootAdmissionPolicy::DynamicGo;
+            assert!(
+                RoventPcSessionDriver::implementation_digest_from_metadata(&nnuec, policy).is_err()
+            );
+            assert!(
+                RoventNnuecSessionDriver::implementation_digest_from_metadata(&pc, policy).is_err()
+            );
+            let own =
+                prepare_session_implementation(&nnuec, SessionImplementationPolicy::DynamicGo)
+                    .unwrap();
+            assert_eq!(own.family, "own_nnuec_pcr_native_session");
+            assert_eq!(
+                own.implementation_sha256,
+                hex(
+                    &RoventNnuecSessionDriver::implementation_digest_from_metadata(&nnuec, policy)
+                        .unwrap()
+                        .0
+                )
+            );
+            let mut baseline: serde_json::Value = serde_json::from_slice(&nnuec_raw).unwrap();
+            baseline["execution"]["value"] = serde_json::json!({"value":"baseline_board"});
+            let baseline = serde_json::to_vec(&baseline).unwrap();
+            assert!(prepare_metadata(&baseline, None).is_ok());
+            assert!(matches!(
+                prepare_metadata_with_options(
+                    &baseline,
+                    None,
+                    None,
+                    Some(SessionImplementationPolicy::DynamicGo),
+                ),
+                Err(Error::SessionImplementationAssembly)
+            ));
+            let mut shared: serde_json::Value = serde_json::from_slice(&pc_raw).unwrap();
+            shared["execution"]["shared_nnuec_readout"] = serde_json::json!({
+                "context_namespace_policy":"fixture-context",
+                "local_namespace_policy":"fixture-local",
+            });
+            let shared = serde_json::to_vec(&shared).unwrap();
+            let shared = StartupConfigurationDocument::from_json(&shared).unwrap();
+            let metadata =
+                prepare_session_implementation(&shared, SessionImplementationPolicy::DynamicGo)
+                    .unwrap();
+            assert_eq!(metadata.family, "pc_native_session");
+            assert_ne!(
+                metadata.implementation_sha256,
+                prepare_session_implementation(&pc, SessionImplementationPolicy::DynamicGo)
+                    .unwrap()
+                    .implementation_sha256
+            );
+            let mut invalid = pc;
+            let StartupConfigurationDocument::V1(configuration) = &mut invalid else {
+                panic!("original V1 fixture required")
+            };
+            configuration.semantic.line_plies = 0;
+            assert!(
+                RoventPcSessionDriver::implementation_digest_from_metadata(&invalid, policy)
+                    .is_err()
+            );
+        }
+
         #[test]
         fn exact_arguments_reject_missing_extra_unknown_and_non_json() {
             assert!(parse_arguments(Vec::<OsString>::new()).is_err());
@@ -778,6 +1122,7 @@ mod metadata {
                     configuration: PathBuf::from("선언.json"),
                     backend_metadata: None,
                     position_command: None,
+                    session_implementation_root_policy: None,
                 })
             );
             assert_eq!(
@@ -789,6 +1134,7 @@ mod metadata {
                     configuration: PathBuf::from("a.json"),
                     backend_metadata: Some(PathBuf::from("b.json")),
                     position_command: None,
+                    session_implementation_root_policy: None,
                 })
             );
             assert_eq!(

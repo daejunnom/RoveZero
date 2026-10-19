@@ -53,6 +53,7 @@ use retirement::{NnuecRootRetirement, NnuecRootRetirementPins, NnuecRootRetireme
 use rz_contracts::pals::SearchAuthority;
 use rz_contracts::pals_adaptive::CpuWorkerId;
 use rz_contracts::{ContractError, Digest};
+use rz_eval::error::{BackendError, FailureKind};
 use rz_position::{BoardMove, Position};
 use rz_runtime::adaptive::{ControllerConfig, CoordinatorPolicy};
 use rz_runtime::contracts::ContractClock;
@@ -410,6 +411,41 @@ pub struct RoventNnuecSessionDriver {
     storage: Mutex<Option<Box<SessionStorageLifecycle>>>,
 }
 impl RoventNnuecSessionDriver {
+    /// Source/configuration-derived identity only. The declared own-NNUEC
+    /// assembly is checked without loading weights or constructing any native
+    /// session, Ready, clock, worker or root authority.
+    pub fn implementation_digest_from_metadata(
+        document: &StartupConfigurationDocument,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Digest, BackendError> {
+        if !matches!(
+            document.fields().execution,
+            ExecutionConfiguration::OwnResearcher {
+                value: ResearchValueConfiguration::NnuecV2 { .. },
+                ..
+            }
+        ) {
+            return Err(super::fail(
+                FailureKind::UnsupportedModel,
+                "NNUEC session metadata requires the own-NNUEC assembly",
+            ));
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"rz-rovent-nnuec-native-session/1\0");
+        hash.update(super::compiled_bootstrap_source_digest());
+        hash.update(include_bytes!("nnuec_session.rs"));
+        hash.update(include_bytes!("nnuec_session/root_run.rs"));
+        hash.update(include_bytes!("nnuec_session/retirement.rs"));
+        hash.update(include_bytes!("nnuec_session/initial_cleanup.rs"));
+        // The existing digest producer validates the original closed document.
+        hash.update(document.configuration_digest()?);
+        hash.update([match root_policy {
+            RoventRootAdmissionPolicy::ExactRegistered => 0,
+            RoventRootAdmissionPolicy::DynamicGo => 1,
+        }]);
+        Ok(Digest(hash.finalize().into()))
+    }
+
     #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     pub fn new(
         prepared: PreparedRoventNative<AdaptivePortQuestion>,
@@ -578,26 +614,13 @@ impl RoventNnuecSessionDriver {
                 source,
             )
             .map_err(|e| SearchSessionFailure::debug("RoventNnuecSemantic", &e))?;
-            let mut hash = Sha256::new();
-            hash.update(b"rz-rovent-nnuec-native-session/1\0");
-            hash.update(super::compiled_bootstrap_source_digest());
-            hash.update(include_bytes!("nnuec_session.rs"));
-            hash.update(include_bytes!("nnuec_session/root_run.rs"));
-            hash.update(include_bytes!("nnuec_session/retirement.rs"));
-            hash.update(include_bytes!("nnuec_session/initial_cleanup.rs"));
-            hash.update(
-                document
-                    .configuration_digest()
-                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecConfiguration", &e))?,
-            );
-            hash.update([match root_policy {
-                RoventRootAdmissionPolicy::ExactRegistered => 0,
-                RoventRootAdmissionPolicy::DynamicGo => 1,
-            }]);
+            let implementation =
+                Self::implementation_digest_from_metadata(document, root_policy)
+                    .map_err(|e| SearchSessionFailure::debug("RoventNnuecConfiguration", &e))?;
             Ok((
                 owner,
                 collection_origin,
-                Digest(hash.finalize().into()),
+                implementation,
                 Digest(
                     document
                         .search_configuration_digest()

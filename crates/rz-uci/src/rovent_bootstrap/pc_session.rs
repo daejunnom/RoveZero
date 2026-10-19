@@ -28,6 +28,7 @@ use crate::search_driver::{
 };
 use rz_contracts::pals::SearchAuthority;
 use rz_contracts::{ContractError, Digest};
+use rz_eval::error::{BackendError, FailureKind};
 use rz_position::{BoardMove, Position};
 use rz_runtime::contracts::ContractClock;
 use rz_search::cpu_value::nnuec::v2::review::PreparationActor;
@@ -384,6 +385,35 @@ pub struct RoventPcSessionDriver {
     storage: Mutex<Option<Box<SessionStorageLifecycle>>>,
 }
 impl RoventPcSessionDriver {
+    /// Source/configuration-derived identity only. This pure calculation opens
+    /// no assets and constructs no session, Ready, clock or root authority.
+    /// Native construction uses this same producer after its actual admission.
+    pub fn implementation_digest_from_metadata(
+        configuration: &StartupConfigurationDocument,
+        root_policy: RoventRootAdmissionPolicy,
+    ) -> Result<Digest, BackendError> {
+        if !matches!(
+            configuration.fields().execution,
+            ExecutionConfiguration::RolesOnly { .. }
+        ) {
+            return Err(super::fail(
+                FailureKind::UnsupportedModel,
+                "P/C session metadata requires the R-free assembly",
+            ));
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"rz-rovent-pc-native-session/1\0");
+        hash.update(super::compiled_bootstrap_source_digest());
+        // The existing digest producer validates the original closed document.
+        hash.update(configuration.configuration_digest()?);
+        hash.update(include_bytes!("pc_session.rs"));
+        hash.update([match root_policy {
+            RoventRootAdmissionPolicy::ExactRegistered => 0,
+            RoventRootAdmissionPolicy::DynamicGo => 1,
+        }]);
+        Ok(Digest(hash.finalize().into()))
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn new(
         prepared: PreparedRoventNative<PcPortQuestion>,
@@ -608,19 +638,9 @@ impl RoventPcSessionDriver {
                     .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?,
             )
             .map_err(|e| SearchSessionFailure::debug("RoventPcSemanticOwner", &e))?;
-            let mut hash = Sha256::new();
-            hash.update(b"rz-rovent-pc-native-session/1\0");
-            hash.update(super::compiled_bootstrap_source_digest());
-            hash.update(
-                configuration
-                    .configuration_digest()
-                    .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?,
-            );
-            hash.update(include_bytes!("pc_session.rs"));
-            hash.update([match root_policy {
-                RoventRootAdmissionPolicy::ExactRegistered => 0,
-                RoventRootAdmissionPolicy::DynamicGo => 1,
-            }]);
+            let implementation =
+                Self::implementation_digest_from_metadata(&configuration, root_policy)
+                    .map_err(|e| SearchSessionFailure::debug("RoventPcConfiguration", &e))?;
             let selective_policy = Digest(
                 configuration
                     .search_configuration_digest()
@@ -635,7 +655,7 @@ impl RoventPcSessionDriver {
                 configuration,
                 collection_origin,
                 owner,
-                Digest(hash.finalize().into()),
+                implementation,
                 selective_policy,
                 frontier_limits,
             ))
