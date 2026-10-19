@@ -102,6 +102,28 @@ fn original_control_is_not_renewed_and_cancel_precedes_expiry() {
     );
 }
 
+#[test]
+fn owned_transfer_requires_same_startup_clock_and_cancellation_owner() {
+    let original = control();
+    verify_original_startup_control(&original, &original.clone()).unwrap();
+    let mut changed = original.clone();
+    changed.cancellation = Arc::new(AtomicBool::new(false));
+    assert!(verify_original_startup_control(&original, &changed).is_err());
+    changed = original.clone();
+    changed.until += Duration::from_nanos(1);
+    assert!(verify_original_startup_control(&original, &changed).is_err());
+    changed = original.clone();
+    changed.cleanup_until += Duration::from_nanos(1);
+    assert!(verify_original_startup_control(&original, &changed).is_err());
+    original.cancellation.store(true, Ordering::Release);
+    assert_eq!(
+        verify_original_startup_control(&original, &original.clone())
+            .unwrap_err()
+            .kind,
+        ProcessBoundaryFailure::Cancelled
+    );
+}
+
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn unsupported_platform_never_promotes_current_exe_file_to_mapped_proof() {
@@ -114,9 +136,11 @@ fn unsupported_platform_never_promotes_current_exe_file_to_mapped_proof() {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use cap_fs_ext::MetadataExt as _;
     use std::{
         fs,
         io::{Seek, SeekFrom},
+        os::fd::AsRawFd,
         path::PathBuf,
         sync::atomic::AtomicU64,
     };
@@ -177,6 +201,273 @@ mod linux {
                 let _ = fs::remove_dir(&self.root);
             }
         }
+    }
+
+    // Declarations for rejected ownership/pure-identity fixtures only. This
+    // lock does not match the actual compiled process and issues no proof.
+    fn unexecuted_lock(binary: ArtifactRef) -> Arc<RoventInputLock> {
+        let artifact = |name: &str| ArtifactRef {
+            path: format!("inputs/{name}"),
+            sha256: "b".repeat(64),
+            bytes: 1,
+            source: "https://example.org/unexecuted-process-boundary-fixture".into(),
+            license: "fixture-only".into(),
+        };
+        let model = serde_json::json!({
+            "semantics":"boundary-owner-fixture/1","encoding":"boundary-input/1",
+            "policy_head":"legal-candidates/1","value_head":"side-to-move-wdl/1",
+            "implementation_sha256":"b".repeat(64),"weights":artifact("weights.bin"),
+            "provenance":artifact("model.json"),"diagnostic":false
+        });
+        let commit = if env!("RZ_PALS_COMPILED_SOURCE_COMMIT") == "a".repeat(40) {
+            "b".repeat(40)
+        } else {
+            "a".repeat(40)
+        };
+        let value = serde_json::json!({
+            "domain":"rz-rovent-execution/1",
+            "contract_revision":rz_contracts::rovent::ROVENT_SEARCH_REVISION,
+            "run_id":"boundary-original-owner-fixture","purpose":"validation",
+            "engine":{
+                "source_commit":commit,"source_components":{"control":"c".repeat(64)},
+                "binary":binary,"mode":"cpu_pc",
+                "pc":{"proposer":model.clone(),"critic":model,"validator":null,
+                    "backend":"rust_cpu","device":{"device":"cpu"},
+                    "backend_configuration_sha256":"d".repeat(64),"runtime_artifacts":[],
+                    "fp32":true,"tf32":false,"batch_width":1,"ort_intra_threads":null,
+                    "ort_inter_threads":null,"ort_spinning":null},
+                "researcher":null,"teachers":[],"nnuec":null,
+                "search":{"node_unit":"rovent-position-visits/1","requested_nodes":null,
+                    "depth_plies":null,"mate_moves":null,"registered_max_chess_plies":64,
+                    "searchmoves":null,"search_configuration_sha256":"e".repeat(64),
+                    "root_state_and_history_sha256":"f".repeat(64),
+                    "rules_profile_sha256":"1".repeat(64)}},
+            "resources":{"cpu_quota_millicpus":2000,"pools":[
+                {"actors":["manager","pc_caller"],"max_threads":1,"cpu_charge_millicpus":1000}],
+                "memory_high_bytes":3u64<<30,"memory_max_bytes":4u64<<30,"gpu_devices":0,
+                "physical_nn_concurrency":1,"topology_policy":"shared-control/1"},
+            "coordinator":{"policy_sha256":"2".repeat(64),"questions_max":64,
+                "ancestor_depth_max":64,"waiting_jobs_max":64,"role_tickets_max":16,
+                "cpu_credit_limit":0,"original_root_budget_sha256":"3".repeat(64),
+                "original_deadline_seal_sha256":"4".repeat(64)},
+            "wall_time_max_ms":120000,"cleanup_max_ms":30000,"output_bytes_max":1u64<<20,
+            "agent_renewable":true,"provenance":[artifact("registration.json")]
+        });
+        Arc::new(
+            rz_experiments::RoventExecutionManifest::from_json(&value.to_string())
+                .unwrap()
+                .lock()
+                .unwrap(),
+        )
+    }
+
+    fn unexecuted_inputs(
+        fixture: &Fixture,
+        control: RoventStartupControl,
+    ) -> RoventProcessBoundaryInputs {
+        let (artifact, original_binary) = fixture.binary(b"unexecuted owned boundary fixture");
+        RoventProcessBoundaryInputs {
+            lock: unexecuted_lock(artifact),
+            original_binary,
+            original_root: fixture.capability(),
+            private_cwd: fixture.root.clone(),
+            control,
+        }
+    }
+
+    #[test]
+    fn owned_public_rejection_returns_original_lock_descriptors_cursor_and_controls() {
+        let fixture = Fixture::new();
+        for canceled in [false, true] {
+            let mut original_control = control();
+            if canceled {
+                original_control.cancellation.store(true, Ordering::Release);
+            } else {
+                original_control.until = Instant::now() - Duration::from_millis(1);
+            }
+            let mut inputs = unexecuted_inputs(&fixture, original_control.clone());
+            inputs.original_binary.seek(SeekFrom::Start(7)).unwrap();
+            let lock = Arc::clone(&inputs.lock);
+            let binary_fd = inputs.original_binary.as_raw_fd();
+            let root_fd = inputs.original_root.as_raw_fd();
+            let failure = verify_actual_owned_process_boundary(inputs).unwrap_err();
+            assert_eq!(
+                failure.error.kind,
+                if canceled {
+                    ProcessBoundaryFailure::Cancelled
+                } else {
+                    ProcessBoundaryFailure::Expired
+                }
+            );
+            let mut returned = failure.inputs;
+            assert!(Arc::ptr_eq(&returned.lock, &lock));
+            assert_eq!(returned.original_binary.as_raw_fd(), binary_fd);
+            assert_eq!(returned.original_root.as_raw_fd(), root_fd);
+            assert_eq!(returned.original_binary.stream_position().unwrap(), 7);
+            assert_eq!(returned.private_cwd, fixture.root);
+            assert_eq!(returned.control.until, original_control.until);
+            assert_eq!(
+                returned.control.cleanup_until,
+                original_control.cleanup_until
+            );
+            assert!(Arc::ptr_eq(
+                &returned.control.cancellation,
+                &original_control.cancellation
+            ));
+            assert!(returned.original_binary.metadata().unwrap().is_file());
+            assert!(returned.original_root.dir_metadata().unwrap().is_dir());
+        }
+    }
+
+    #[test]
+    fn owned_actual_verifier_partial_source_failure_keeps_complete_original_inputs() {
+        let fixture = Fixture::new();
+        let inputs = unexecuted_inputs(&fixture, control());
+        let lock = Arc::clone(&inputs.lock);
+        let cancellation = Arc::clone(&inputs.control.cancellation);
+        let until = inputs.control.until;
+        let original_binary = inputs.original_binary.as_raw_fd();
+        let original_root = inputs.original_root.as_raw_fd();
+        let failure = verify_actual_owned_process_boundary(inputs).unwrap_err();
+        assert_eq!(
+            failure.error.kind,
+            ProcessBoundaryFailure::SourceCommitRegistration
+        );
+        assert!(Arc::ptr_eq(&failure.inputs.lock, &lock));
+        assert!(Arc::ptr_eq(
+            &failure.inputs.control.cancellation,
+            &cancellation
+        ));
+        assert_eq!(failure.inputs.control.until, until);
+        assert_eq!(failure.inputs.original_binary.as_raw_fd(), original_binary);
+        assert_eq!(failure.inputs.original_root.as_raw_fd(), original_root);
+        assert!(failure.inputs.original_binary.metadata().unwrap().is_file());
+        assert!(
+            failure
+                .inputs
+                .original_root
+                .dir_metadata()
+                .unwrap()
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn owner_identity_rejects_equal_lock_and_reopened_same_inode_descriptors() {
+        let fixture = Fixture::new();
+        let original = unexecuted_inputs(&fixture, control());
+        let check = |lock: &RoventInputLock,
+                     binary: &File,
+                     root: &Dir,
+                     registered: &Arc<RoventInputLock>| {
+            verify_original_owner_objects(&original, lock, binary, root, registered)
+        };
+        check(
+            &original.lock,
+            &original.original_binary,
+            &original.original_root,
+            &original.lock,
+        )
+        .unwrap();
+        let equal_lock = Arc::new(original.lock.as_ref().clone());
+        assert_eq!(original.lock.canonical_sha256, equal_lock.canonical_sha256);
+        assert_eq!(
+            check(
+                &equal_lock,
+                &original.original_binary,
+                &original.original_root,
+                &equal_lock
+            )
+            .unwrap_err()
+            .kind,
+            ProcessBoundaryFailure::InvalidInputLock
+        );
+        assert!(
+            check(
+                &equal_lock,
+                &original.original_binary,
+                &original.original_root,
+                &original.lock
+            )
+            .is_err()
+        );
+        let reopened_binary = File::open(fixture.root.join("binary")).unwrap();
+        assert_eq!(
+            descriptor_identity(&original.original_binary).unwrap(),
+            descriptor_identity(&reopened_binary).unwrap()
+        );
+        assert_eq!(
+            check(
+                &original.lock,
+                &reopened_binary,
+                &original.original_root,
+                &original.lock
+            )
+            .unwrap_err()
+            .kind,
+            ProcessBoundaryFailure::BinaryDescriptor
+        );
+        let reopened_root = fixture.capability();
+        let original_metadata = original.original_root.dir_metadata().unwrap();
+        let reopened_metadata = reopened_root.dir_metadata().unwrap();
+        assert_eq!(
+            (original_metadata.dev(), original_metadata.ino()),
+            (reopened_metadata.dev(), reopened_metadata.ino())
+        );
+        assert_eq!(
+            check(
+                &original.lock,
+                &original.original_binary,
+                &reopened_root,
+                &original.lock
+            )
+            .unwrap_err()
+            .kind,
+            ProcessBoundaryFailure::WorkingDirectory
+        );
+        // Pure identity comparison never consumes or substitutes any owner.
+        check(
+            &original.lock,
+            &original.original_binary,
+            &original.original_root,
+            &original.lock,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn equal_numeric_observation_does_not_replace_the_same_actual_observation_owner() {
+        // Private comparison values only: no Verified{Owned}... proof is
+        // constructed, no actual process admission/success is manufactured.
+        let values = || ProcessBoundaryObservation {
+            executable: ExecutableIdentityV1 {
+                sha256: "b".repeat(64),
+                bytes: 7,
+                identity_source: ExecutableIdentitySourceV1::LinuxProcSelfExe,
+            },
+            input_lock: Digest([1; 32]),
+            source_aggregate: Digest([2; 32]),
+        };
+        let original = Arc::new(values());
+        let shared = Arc::clone(&original);
+        let independent = Arc::new(values());
+        assert!(same_observed_values(&original, &independent));
+        verify_original_observation(&original, &shared).unwrap();
+        assert_eq!(
+            verify_original_observation(&original, &independent)
+                .unwrap_err()
+                .kind,
+            ProcessBoundaryFailure::MappedExecutable
+        );
+        assert_eq!(Arc::strong_count(&original), 2);
+        assert_eq!(Arc::strong_count(&independent), 1);
+    }
+
+    #[test]
+    fn owned_types_hold_send_sync_static_inputs_without_borrowed_proofs() {
+        fn assert_static<T: Send + Sync + 'static>() {}
+        assert_static::<RoventProcessBoundaryInputs>();
+        assert_static::<VerifiedOwnedRoventProcessBoundary>();
     }
 
     #[test]

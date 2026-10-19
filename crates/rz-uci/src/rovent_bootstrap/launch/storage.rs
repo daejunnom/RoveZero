@@ -8,8 +8,8 @@
 
 use crate::rovent_bootstrap::RoventStartupControl;
 use crate::rovent_bootstrap::process_boundary::{
-    PROCESS_SOURCE_SCOPE, ProcessBoundaryError, VerifiedRoventProcessBoundary,
-    compiled_process_source_components,
+    PROCESS_SOURCE_SCOPE, ProcessBoundaryError, VerifiedOwnedRoventProcessBoundary,
+    VerifiedRoventProcessBoundary, compiled_process_source_components,
 };
 use crate::{engine::ProcessClock, rovent_root_admission::RoventRootAdmission};
 use cap_fs_ext::DirExt;
@@ -240,6 +240,118 @@ impl RoventStorageRuntimeRegistration<'_, '_> {
         admission: Arc<RoventRootAdmission>,
     ) -> Result<UnusedIdleArchiveSetup, RoventStorageSetupRejection> {
         split_unused_setup(&mut self.custody.custody, &mut self.state, admission)
+    }
+}
+
+/// Lifetime-free runtime registration retaining the same original FD owners
+/// and actual opaque process observation. No descriptor is reopened or cloned
+/// in the conversion, and the borrowed proof is not stored self-referentially.
+///
+/// This is a library ownership boundary only: CLI/static drivers do not yet
+/// retain it. Callers MUST keep this owner through setup completion and actual
+/// worker join, including unknown/quarantine shutdown. Drop issues no physical
+/// completion and does not return a capability already moved to Search.
+pub struct RoventStorageOwnedRuntimeRegistration {
+    custody: RoventStorageByteCustody,
+    boundary: Arc<VerifiedOwnedRoventProcessBoundary>,
+    state: StorageRuntimeState,
+}
+
+impl RoventStorageOwnedRuntimeRegistration {
+    pub fn owners(&self) -> &RoventStorageAdmissionOwners {
+        self.custody.owners()
+    }
+    pub fn profile(&self) -> &RoventStorageProfile {
+        self.custody.profile()
+    }
+    pub fn process_boundary(&self) -> &Arc<VerifiedOwnedRoventProcessBoundary> {
+        &self.boundary
+    }
+    /// Attribution only; neither this nor the owned process proof is a fence.
+    pub fn identity(&self) -> UnusedIdleArchiveSetupIdentity {
+        self.state.identity
+    }
+    pub fn issued_admission(&self) -> Option<&Arc<RoventRootAdmission>> {
+        self.state.issued_admission.as_ref()
+    }
+    pub fn retains_root_capability(&self) -> bool {
+        self.custody.retains_root_capability()
+    }
+    /// Same one-shot split and independently admitted original go as the
+    /// borrowed registration. No startup window is renewed or used as go
+    /// authority. The original non-capability FD owners stay here.
+    pub fn take_unused_idle_setup(
+        &mut self,
+        admission: Arc<RoventRootAdmission>,
+    ) -> Result<UnusedIdleArchiveSetup, RoventStorageSetupRejection> {
+        split_unused_setup(&mut self.custody, &mut self.state, admission)
+    }
+}
+
+/// A failed ownership conversion returns both exact original owners. Nothing
+/// is enabled, consumed or substituted with another lock/descriptor/proof.
+pub struct RoventStorageRuntimeOwnershipFailure<'boundary, 'process> {
+    pub error: RoventStorageRuntimeError,
+    pub registration: RoventStorageRuntimeRegistration<'boundary, 'process>,
+    pub candidate: Arc<VerifiedOwnedRoventProcessBoundary>,
+}
+impl fmt::Debug for RoventStorageRuntimeOwnershipFailure<'_, '_> {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        output
+            .debug_struct("RoventStorageRuntimeOwnershipFailure")
+            .field("error", &self.error)
+            .field(
+                "root_capability_retained",
+                &self.registration.retains_root_capability(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Transfer only from a view issued by this exact owned actual boundary and
+/// using the same Arc lock and original startup control. A separately observed
+/// process with equal bytes/digests, or another File/Dir handle to the same
+/// inode, is rejected. This must complete during the original startup window;
+/// later setup still requires its own opaque original-go admission.
+// Preserve complete partial FD custody directly on error, with no extra Box
+// allocation just to reduce the error's representation.
+#[allow(clippy::result_large_err)]
+pub fn own_rovent_storage_runtime_registration<'boundary, 'process>(
+    registration: RoventStorageRuntimeRegistration<'boundary, 'process>,
+    candidate: Arc<VerifiedOwnedRoventProcessBoundary>,
+) -> Result<
+    RoventStorageOwnedRuntimeRegistration,
+    RoventStorageRuntimeOwnershipFailure<'boundary, 'process>,
+> {
+    let checked = (|| {
+        candidate
+            .matches_original_view(
+                registration.custody.boundary,
+                &registration.custody.custody.owners.input_lock,
+                &registration.custody.custody.owners.control,
+            )
+            .map_err(RoventStorageCompiledError::CompiledBoundary)
+            .map_err(RoventStorageRuntimeError::Compiled)?;
+        registration
+            .custody
+            .revalidate_startup()
+            .map_err(RoventStorageRuntimeError::Compiled)?;
+        candidate
+            .revalidate_startup()
+            .map_err(RoventStorageCompiledError::CompiledBoundary)
+            .map_err(RoventStorageRuntimeError::Compiled)
+    })();
+    match checked {
+        Ok(()) => Ok(RoventStorageOwnedRuntimeRegistration {
+            custody: registration.custody.custody,
+            boundary: candidate,
+            state: registration.state,
+        }),
+        Err(error) => Err(RoventStorageRuntimeOwnershipFailure {
+            error,
+            registration,
+            candidate,
+        }),
     }
 }
 
@@ -1435,6 +1547,14 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
 
+    #[test]
+    fn owned_runtime_registration_has_no_process_borrow_or_missing_thread_bound() {
+        fn assert_static<T: Send + Sync + 'static>() {}
+        assert_static::<RoventStorageOwnedRuntimeRegistration>();
+        // This is a type boundary assertion only. Do not fabricate an actual
+        // process proof to claim public owned registration/driver acceptance.
+    }
+
     struct Scratch(PathBuf);
     impl Scratch {
         fn new() -> Self {
@@ -1588,7 +1708,12 @@ mod tests {
         let start = clock.runtime_clock().origin();
         let context = match issue_start(
             &position,
-            crate::parser::GoLimits::default(),
+            // Match the registered fixture work bound; the production start
+            // validator correctly rejects an otherwise unbounded default go.
+            crate::parser::GoLimits {
+                nodes: Some(4096),
+                ..crate::parser::GoLimits::default()
+            },
             rz_contracts::pals::SearchAuthority {
                 epoch: clock.epoch(),
                 game: rz_contracts::GameGeneration(1),
