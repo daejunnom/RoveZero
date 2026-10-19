@@ -2,7 +2,7 @@
 
 The real strict parent/D/Repair/semantic factories are used. Build, launch,
 physical heads and Rules descriptors are explicitly synthetic caller facts.
-The eighteen literal reviewed Rust sources are read only to exercise a new
+The twenty literal reviewed Rust sources are read only to exercise a new
 scoped synthetic review profile; no compiler, process, Rules replay, model or
 training runs. Historical two-file allow-lists remain unchanged.
 Known is conditional fixture coverage only. The usual engine path observes
@@ -843,6 +843,8 @@ class NativeSlotRepairTests(unittest.TestCase):
             "crates/rz-search/src/pals/engine/adaptive_port/archive_worker.rs",
             "crates/rz-search/src/pals/engine/preparing_root.rs",
             "crates/rz-search/src/pals/review_context.rs",
+            "crates/rz-search/src/pals/engine/adaptive_root.rs",
+            "crates/rz-search/src/pals/store/archive.rs",
         }
         self.assertEqual(set(proof["component_pins"]), expected_components)
         self.assertEqual(proof["component_pins"], {
