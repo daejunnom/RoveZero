@@ -1,13 +1,17 @@
 """Real temporary-file/owner boundaries; no NN, GPU, Cargo or real data cleanup."""
 import hashlib
+import contextlib
+import copy
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import stat
+from types import SimpleNamespace
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from managed_storage import ManagedBuild, StorageError, recover_build, tree_size, write_record
@@ -278,6 +282,371 @@ except StorageError:
         with self.assertRaisesRegex(StorageError, "budget exhausted"):
             publish_runtime(source, store, limit=1)
         self.assertEqual(source.read_bytes(), b"new runtime")
+
+
+class CreatedDirectoryBindingTests(unittest.TestCase):
+    """Windows-safe in-memory OS/catalog faults; never touch a real output tree."""
+    def setUp(self):
+        self.mocks = contextlib.ExitStack()
+        self.addCleanup(self.mocks.close)
+        self.base = Path(os.path.abspath("mock-created-output"))
+        self.parent = self.base / "private"
+        self.target = self.parent / "attempt"
+        self.catalog = self.base / "catalog"
+        self.life = {"host": "same-host", "boot": "original-boot",
+                     "platform": "linux", "process_birth": "original-birth"}
+        self.parent_info = self.info(20)
+        self.named_parent, self.named_child = self.parent_info, None
+        self.fd_info, self.events, self.size = {}, [], 0
+        self.version, self.writes, self.mkdir_calls = 0, 0, 0
+        self.write_error = self.sync_error = self.readback_error = None
+        self.gate = MagicMock(spec=CatalogGuard)
+        self.gate.__enter__.return_value = self.gate
+        self.gate.assert_held.side_effect = self.assert_held
+        self.held = True
+        self.mocks.enter_context(patch("managed_outputs.CatalogGuard", return_value=self.gate))
+        self.mocks.enter_context(patch("managed_outputs.checked", side_effect=lambda path: Path(path)))
+        self.mocks.enter_context(patch("managed_outputs.sys", SimpleNamespace(platform="linux", exc_info=sys.exc_info)))
+        self.fake_os = SimpleNamespace(path=os.path, O_RDONLY=os.O_RDONLY,
+            O_DIRECTORY=0x10000, O_NOFOLLOW=0x20000, getpid=lambda: 123, geteuid=lambda: 1000,
+            open=Mock(side_effect=self.open_fd), fstat=lambda fd: self.fd_info[fd],
+            stat=self.stat_name, mkdir=self.mkdir, fsync=self.fsync,
+            close=Mock(side_effect=lambda fd: self.events.append(("close", fd))),
+            unlink=Mock(side_effect=AssertionError("no deletion")))
+        self.mocks.enter_context(patch("managed_outputs.os", self.fake_os))
+        self.mocks.enter_context(patch("managed_outputs.lifetime", side_effect=lambda: dict(self.life)))
+        self.mocks.enter_context(patch.object(Path, "lstat", lambda path: self.lstat(path)))
+        self.mocks.enter_context(patch.object(Path, "exists", lambda path: path == self.catalog or (path == self.target and self.named_child is not None)))
+        self.mocks.enter_context(patch("managed_outputs.read_record_snapshot", side_effect=self.snapshot))
+        self.mocks.enter_context(patch("managed_outputs._read", side_effect=lambda path: copy.deepcopy(self.disk)))
+        self.mocks.enter_context(patch("managed_outputs.write_record", side_effect=self.write))
+        self.mocks.enter_context(patch("managed_outputs.tree_size", side_effect=lambda path, **kwargs: self.size if path == self.target else 0))
+        self.owner = OutputLease(self.target, self.base / "source", catalog=self.catalog,
+                                 deferred=True, reserve=4096, total_limit=8192)
+        self.owner.record = {"schema": "rovezero.managed-output.v1", "key": self.owner.key,
+            "output": str(self.target), "source": str(self.owner.source), "identity": None,
+            "token": "original-token", "deferred": True, "outer_supervisor": None,
+            "pid": 123, "lifetime": dict(self.life), "state": "active",
+            "reserved_bytes": 4096, "catalog_limit_bytes": 8192}
+        self.disk = copy.deepcopy(self.owner.record)
+        self.owner._rows = Mock(side_effect=lambda: [(self.row_path, copy.deepcopy(self.disk), self.target)])
+        self.addCleanup(self.owner._close_created_directory)
+
+    @property
+    def row_path(self):
+        return self.catalog / (self.owner.key + ".json")
+
+    @staticmethod
+    def info(inode, mode=None):
+        return SimpleNamespace(st_dev=7, st_ino=inode, st_mode=mode or (stat.S_IFDIR | 0o700),
+                               st_uid=1000, st_gid=1000, st_nlink=2)
+
+    def assert_held(self):
+        if not self.held:
+            raise StorageError("catalog gate not held")
+
+    def open_fd(self, path, flags, *, dir_fd=None):
+        self.assert_held()
+        self.assertTrue(flags & self.fake_os.O_DIRECTORY)
+        self.assertTrue(flags & self.fake_os.O_NOFOLLOW)
+        if dir_fd is None:
+            self.assertEqual(path, self.parent)
+            self.fd_info[101] = self.parent_info
+            return 101
+        self.assertEqual((path, dir_fd), ("attempt", 101))
+        self.fd_info[102] = self.named_child
+        return 102
+
+    def lstat(self, path):
+        self.assertEqual(path, self.parent)
+        return self.named_parent
+
+    def stat_name(self, name, *, dir_fd, follow_symlinks):
+        self.assertEqual((name, dir_fd, follow_symlinks), ("attempt", 101, False))
+        if self.named_child is None:
+            raise FileNotFoundError(name)
+        return self.named_child
+
+    def mkdir(self, name, mode, *, dir_fd):
+        self.assertEqual((name, mode, dir_fd), ("attempt", 0o700, 101))
+        if self.named_child is not None:
+            raise FileExistsError(name)
+        self.mkdir_calls += 1
+        self.named_child = self.info(30)
+        self.events.append(("mkdir", name))
+
+    def fsync(self, fd):
+        self.events.append(("fsync", fd))
+        if self.sync_error is not None:
+            raise self.sync_error
+
+    def snapshot(self, path, *, schema):
+        self.assertEqual((path, schema), (self.row_path, "rovezero.managed-output.v1"))
+        if self.writes and self.readback_error is not None:
+            raise self.readback_error
+        raw = (json.dumps(self.disk, sort_keys=True) + "\n").encode()
+        return copy.deepcopy(self.disk), hashlib.sha256(raw).hexdigest(), (self.version,)
+
+    def write(self, path, value):
+        self.assert_held()
+        self.assertEqual(path, self.row_path)
+        self.writes += 1
+        self.disk, self.version = copy.deepcopy(value), self.version + 1
+        self.events.append(("catalog_write", self.writes))
+        if self.write_error is not None:
+            raise self.write_error  # Simulate replace succeeding before directory fsync fails.
+
+    def assert_sticky_failure(self, primary):
+        self.assertIs(self.owner._directory_binding_error, primary)
+        count = self.writes
+        with self.assertRaises(StorageError) as blocked:
+            self.owner.finish(status="completed", tree_gone=True)
+        self.assertIs(blocked.exception.__cause__, primary)
+        self.assertEqual(self.writes, count)
+        self.assertEqual(self.disk["state"], "active")
+        self.assertFalse(self.gate.release.called)
+
+    def test_seal_precedes_payload_and_only_identity_changes(self):
+        original = copy.deepcopy(self.disk)
+        self.assertEqual(self.owner.create_deferred_directory(), self.target)
+        self.assertEqual(self.owner._directory_binding_stage, "sealed")
+        self.assertEqual(self.disk, dict(original, identity=[7, 30]))
+        self.assertEqual(self.writes, 1)
+        self.assertEqual(self.events[:3], [("mkdir", "attempt"), ("fsync", 102), ("fsync", 101)])
+        self.assertEqual(self.events[3], ("catalog_write", 1))
+        self.size = 100
+        self.owner.check_budget()
+        self.owner.finish(status="provider_unknown", tree_gone=False)
+        self.assertEqual(self.disk["identity"], [7, 30])
+        self.assertEqual(self.disk["state"], "active")
+        self.assertEqual(self.disk["physical_completion"], "not_inferred_from_output_lifecycle")
+        self.assertEqual(self.events[-2:], [("close", 102), ("close", 101)])
+        self.gate.release.assert_called_once()
+
+    def test_existing_directory_regular_and_symlink_are_never_adopted(self):
+        for mode in (stat.S_IFDIR | 0o700, stat.S_IFREG | 0o600, stat.S_IFLNK | 0o777):
+            with self.subTest(mode=mode):
+                self.owner._directory_binding_error = None
+                self.owner._created_directory = None
+                self.named_child = self.info(99, mode)
+                with self.assertRaisesRegex(StorageError, "exclusive fresh") as failure:
+                    self.owner.create_deferred_directory()
+                self.assertEqual(self.named_child.st_ino, 99)
+                self.assertEqual((self.mkdir_calls, self.writes), (0, 0))
+                self.assert_sticky_failure(failure.exception)
+                self.owner._close_created_directory()
+
+    def test_changed_token_process_lifetime_or_gate_cannot_bind(self):
+        for change in ("token", "lifetime", "gate"):
+            with self.subTest(change=change):
+                self.owner._directory_binding_error = None
+                if change == "token":
+                    self.disk["token"] = "replacement"
+                elif change == "lifetime":
+                    self.disk = copy.deepcopy(self.owner.record)
+                    self.life["boot"] = "other-boot"
+                else:
+                    self.life["boot"] = "original-boot"
+                    self.held = False
+                with self.assertRaises(StorageError):
+                    self.owner.create_deferred_directory()
+                self.assertEqual((self.mkdir_calls, self.writes), (0, 0))
+
+    def test_directory_and_parent_replacement_block_budget_and_finish(self):
+        self.owner.create_deferred_directory()
+        original = copy.deepcopy(self.disk)
+        self.named_child = self.info(99)
+        for action in (self.owner.check_budget, lambda: self.owner.finish(status="completed", tree_gone=True)):
+            with self.assertRaisesRegex(StorageError, "directory changed"):
+                action()
+        self.assertEqual(self.disk, original)
+        self.named_child = self.fd_info[102]
+        self.named_parent = self.info(98)
+        with self.assertRaisesRegex(StorageError, "parent changed"):
+            self.owner.check_budget()
+        self.assertEqual(self.disk, original)
+
+    def test_parent_fstat_failure_keeps_fd_owned_and_close_preserves_primary(self):
+        primary = OSError("parent fstat failed")
+        with patch("managed_outputs.os.fstat", side_effect=primary):
+            with self.assertRaises(OSError) as failure:
+                self.owner.create_deferred_directory()
+        self.assertIs(failure.exception, primary)
+        self.assertEqual(self.owner._created_directory.parent_fd, 101)
+        self.assertEqual((self.mkdir_calls, self.writes), (0, 0))
+        self.assert_sticky_failure(primary)
+        self.owner._close_created_directory(primary)
+        self.assertEqual(self.events, [("close", 101)])
+
+    def test_parent_identity_setup_failure_keeps_fd_owned_for_close(self):
+        primary = MemoryError("parent identity setup failed")
+        with patch("managed_outputs._CreatedOutputDirectory.directory_identity_of", side_effect=primary):
+            with self.assertRaises(MemoryError) as failure:
+                self.owner.create_deferred_directory()
+        self.assertIs(failure.exception, primary)
+        self.assertEqual(self.owner._created_directory.parent_fd, 101)
+        self.owner._close_created_directory(primary)
+        self.assertEqual(self.events, [("close", 101)])
+        self.assertEqual((self.mkdir_calls, self.writes), (0, 0))
+
+    def test_cap_initialization_failure_precedes_any_fd_open(self):
+        primary = MemoryError("cap initialization failed")
+        with patch("managed_outputs._CreatedOutputDirectory", side_effect=primary):
+            with self.assertRaises(MemoryError) as failure:
+                self.owner.create_deferred_directory()
+        self.assertIs(failure.exception, primary)
+        self.fake_os.open.assert_not_called()
+        self.assertEqual((self.mkdir_calls, self.writes), (0, 0))
+        self.assert_sticky_failure(primary)
+
+    def test_prepublication_sync_failure_preserves_null_row_and_directory(self):
+        self.sync_error = OSError("created directory sync failed")
+        with self.assertRaises(OSError) as failure:
+            self.owner.create_deferred_directory()
+        self.assertIs(failure.exception, self.sync_error)
+        self.assertEqual((self.mkdir_calls, self.writes), (1, 0))
+        self.assertIsNone(self.disk["identity"])
+        self.assertEqual(self.named_child.st_ino, 30)
+        self.assert_sticky_failure(failure.exception)
+
+    def test_replace_then_fsync_failure_is_not_rolled_back_or_finished(self):
+        self.write_error = OSError("catalog directory sync failed")
+        with self.assertRaises(OSError) as failure:
+            self.owner.create_deferred_directory()
+        self.assertIs(failure.exception, self.write_error)
+        self.assertEqual(self.owner._directory_binding_stage, "catalog_write_pending")
+        self.assertEqual(self.disk["identity"], [7, 30])
+        self.assertIsNone(self.owner.record["identity"])
+        self.assert_sticky_failure(failure.exception)
+
+    def test_readback_and_postwrite_budget_errors_never_release_payload(self):
+        self.readback_error = StorageError("readback unavailable")
+        with self.assertRaises(StorageError) as failure:
+            self.owner.create_deferred_directory()
+        self.assert_sticky_failure(failure.exception)
+        self.assertEqual(self.owner._directory_binding_stage, "catalog_written_readback_pending")
+
+    def test_postwrite_budget_overflow_keeps_identity_but_blocks_finish(self):
+        original_write = self.write
+        def grow_after_write(path, row):
+            original_write(path, row)
+            self.size = 5000
+        with patch("managed_outputs.write_record", side_effect=grow_after_write):
+            with self.assertRaises(OutputBudgetError) as failure:
+                self.owner.create_deferred_directory()
+        self.assertEqual(self.disk["identity"], [7, 30])
+        self.assert_sticky_failure(failure.exception)
+
+    def test_actual_catalog_encoding_bound_prevents_write_after_create(self):
+        size = len((json.dumps(dict(self.owner.record, padding=""), sort_keys=True) + "\n").encode())
+        self.owner.record["padding"] = "x" * (8191 - size)
+        self.disk = copy.deepcopy(self.owner.record)
+        with self.assertRaisesRegex(StorageError, "record exceeds bound") as failure:
+            self.owner.create_deferred_directory()
+        self.assertEqual((self.mkdir_calls, self.writes), (1, 0))
+        self.assertIsNone(self.disk["identity"])
+        self.assert_sticky_failure(failure.exception)
+
+    def test_legacy_deferred_regular_file_and_absent_path_remain_compatible(self):
+        with patch("managed_outputs.identity", return_value=[7, 88]):
+            self.named_child = self.info(88, stat.S_IFREG | 0o600)
+            self.owner.finish(status="completed", tree_gone=True)
+        self.assertEqual(self.disk["identity"], [7, 88])
+        self.assertEqual(self.writes, 1)
+        self.assertIsNone(self.owner._created_directory)
+        self.assertEqual(self.events, [("catalog_write", 1)])
+
+    def test_legacy_deferred_absent_row_rejects_unrelated_later_path(self):
+        self.owner.finish(status="not_started", tree_gone=True)
+        self.assertIsNone(self.disk["identity"])
+        with patch.object(Path, "iterdir", return_value=iter([self.row_path])):
+            self.assertEqual(len(OutputLease._rows(self.owner)), 1)
+        self.named_child = self.info(99, stat.S_IFREG | 0o600)
+        with patch.object(Path, "iterdir", return_value=iter([self.row_path])):
+            with self.assertRaisesRegex(StorageError, "custody changed"):
+                OutputLease._rows(self.owner)
+        self.assertEqual(self.writes, 1)
+        self.assertEqual(self.named_child.st_ino, 99)
+
+    def test_group_or_other_writable_parent_is_rejected_before_mkdir(self):
+        self.parent_info.st_mode = stat.S_IFDIR | 0o777
+        with self.assertRaisesRegex(StorageError, "without group/other writers") as failure:
+            self.owner.create_deferred_directory()
+        self.assertEqual((self.mkdir_calls, self.writes), (0, 0))
+        self.assert_sticky_failure(failure.exception)
+
+    def test_descriptor_close_failure_preserves_primary_write_error(self):
+        self.owner.create_deferred_directory()
+        self.write_error = OSError("original finish write failed")
+        with patch("managed_outputs.os.close", side_effect=OSError("secondary FD close failed")):
+            with self.assertRaises(OSError) as failure:
+                self.owner.finish(status="completed", tree_gone=True)
+        self.assertIs(failure.exception, self.write_error)
+        self.assertIn("close also failed", failure.exception.__notes__[0])
+        self.gate.release.assert_called_once()
+
+    def test_descriptor_close_failure_does_not_mask_recorded_budget_error(self):
+        self.owner.create_deferred_directory()
+        self.size = 5000
+        with patch("managed_outputs.os.close", side_effect=OSError("secondary FD close failed")):
+            with self.assertRaises(OutputBudgetError) as failure:
+                self.owner.finish(status="completed", tree_gone=True)
+        self.assertIn("close also failed", failure.exception.__notes__[0])
+        self.assertEqual(self.disk["status"], "failed_output_budget")
+        self.gate.release.assert_called_once()
+
+    def test_normal_descriptor_close_failure_is_not_success(self):
+        self.owner.create_deferred_directory()
+        with patch("managed_outputs.os.close", side_effect=OSError("FD close failed")):
+            with self.assertRaisesRegex(OSError, "FD close failed"):
+                self.owner.finish(status="completed", tree_gone=True)
+        self.gate.release.assert_called_once()
+
+    def test_unsupported_host_does_not_create_or_publish(self):
+        with patch("managed_outputs.sys.platform", "win32"):
+            with self.assertRaisesRegex(StorageError, "original active Linux"):
+                self.owner.create_deferred_directory()
+        self.assertEqual((self.mkdir_calls, self.writes), (0, 0))
+
+    def test_recovery_does_not_fill_historical_null_identity(self):
+        self.named_child = self.info(30)
+        rebooted = dict(self.life, boot="new-boot")
+        with patch("managed_outputs.lifetime", return_value=rebooted):
+            with self.assertRaisesRegex(StorageError, "termination not proven"):
+                recover_output(self.catalog, self.owner.key, self.snapshot(self.row_path, schema="rovezero.managed-output.v1")[1])
+        self.assertEqual(self.writes, 0)
+        self.assertIsNone(self.disk["identity"])
+
+    def test_reboot_recovery_uses_sealed_identity_and_same_boot_stays_rejected(self):
+        self.owner.create_deferred_directory()
+        digest = self.snapshot(self.row_path, schema="rovezero.managed-output.v1")[1]
+        with patch("managed_outputs.identity", return_value=[7, 30]):
+            with self.assertRaisesRegex(StorageError, "termination not proven"):
+                recover_output(self.catalog, self.owner.key, digest)
+            with patch("managed_outputs.lifetime", return_value=dict(self.life, boot="new-boot", host="other-host")):
+                with self.assertRaisesRegex(StorageError, "termination not proven"):
+                    recover_output(self.catalog, self.owner.key, digest)
+            with patch("managed_outputs.lifetime", return_value=dict(self.life, boot="new-boot")):
+                with self.assertRaisesRegex(StorageError, "digest changed"):
+                    recover_output(self.catalog, self.owner.key, "0" * 64)
+                with patch("managed_outputs.identity", return_value=[7, 99]):
+                    with self.assertRaisesRegex(StorageError, "termination not proven"):
+                        recover_output(self.catalog, self.owner.key, digest)
+                result = recover_output(self.catalog, self.owner.key, digest)
+        self.assertEqual(result["state"], "interrupted_retained")
+        self.assertEqual(result["identity"], [7, 30])
+        self.assertNotIn("physical_completion", result)
+
+    def test_active_bound_row_still_blocks_other_root_admission(self):
+        self.owner.create_deferred_directory()
+        other = OutputLease(self.base / "different", self.owner.source, catalog=self.catalog)
+        other._rows = Mock(return_value=[(self.row_path, copy.deepcopy(self.disk), self.target)])
+        with patch.object(Path, "mkdir") as make:
+            with self.assertRaisesRegex(StorageError, "interrupted output"):
+                other.acquire()
+        make.assert_called_once()  # Existing catalog check only; no new output.
+        self.assertEqual(self.writes, 1)
+        self.assertEqual(self.disk["state"], "active")
 
 
 if __name__ == "__main__":

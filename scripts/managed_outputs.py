@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 import time
 import uuid
 
@@ -39,6 +40,46 @@ def identity(path):
     return [info.st_dev, info.st_ino]
 
 
+class _CreatedOutputDirectory:
+    """In-process custody from exclusive mkdir; never reconstructed from a pathname."""
+    def __init__(self, parent_fd, parent_identity, name, owner):
+        self.parent_fd, self.fd = parent_fd, None
+        self.parent_identity, self.name = parent_identity, name
+        self.identity, self.directory_identity = None, None
+        self.owner, self.sealed = owner, False
+
+    @staticmethod
+    def directory_identity_of(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid)
+
+    def check(self, output):
+        parent = self.directory_identity_of(os.fstat(self.parent_fd))
+        named_parent = self.directory_identity_of(checked(output.parent).lstat())
+        if parent != self.parent_identity or named_parent != parent:
+            raise StorageError("created output parent changed; preserve evidence")
+        if self.fd is not None:
+            opened = os.fstat(self.fd)
+            named = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
+            if (self.directory_identity_of(opened) != self.directory_identity
+                    or self.directory_identity_of(named) != self.directory_identity
+                    or not stat.S_ISDIR(opened.st_mode) or opened.st_nlink == 0):
+                raise StorageError("created output directory changed; preserve evidence")
+
+    def close(self):
+        first = None
+        for name in ("fd", "parent_fd"):
+            fd = getattr(self, name)
+            setattr(self, name, None)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError as error:
+                    if first is None:
+                        first = error
+        if first is not None:
+            raise first
+
+
 class OutputLease:
     def __init__(self, output, source, *, catalog=None, reserve=8 * GiB,
                  total_limit=18 * GiB, retention_days=14, deferred=False, outer_supervised=False):
@@ -55,6 +96,9 @@ class OutputLease:
         self.key = hashlib.sha256(os.path.normcase(str(self.output)).encode()).hexdigest()
         self.guard = CatalogGuard(self.catalog / "catalog.lock")
         self.record = None
+        self._created_directory = None
+        self._directory_binding_error = None
+        self._directory_binding_stage = "not_started"
         self.outer = None
         if outer_supervised:
             from managed_storage import read_record
@@ -123,14 +167,133 @@ class OutputLease:
             self.guard.release()
             raise
 
+    def create_deferred_directory(self):
+        """Create and seal a fresh Linux directory before allowing producer work.
+
+        The acquired original producer must exclusively control the parent name.
+        No existing path/FD is adopted. A crash between mkdir and catalog fsync
+        remains unrecoverable by the unchanged identity-null recovery guard.
+        Publication failure is sticky: preserve the path and primary error, and
+        do not start payload/children or call success finish. No rollback occurs.
+        """
+        self.guard.assert_held()
+        if self.record is None or not self.deferred:
+            raise StorageError("an acquired deferred output lease is required")
+        if self._created_directory is not None or self._directory_binding_error is not None:
+            raise StorageError("created directory binding already attempted; preserve evidence")
+        try:
+            self._directory_binding_stage = "validating_original_reservation"
+            if (sys.platform != "linux" or self.record.get("state") != "active"
+                    or self.record.get("identity") is not None
+                    or self.record.get("deferred") is not True
+                    or self.record.get("key") != self.key
+                    or self.record.get("output") != str(self.output)
+                    or self.record.get("source") != str(self.source)
+                    or self.record.get("pid") != os.getpid()
+                    or self.record.get("lifetime") != lifetime()):
+                raise StorageError("original active Linux deferred producer required")
+            path = self.catalog / (self.key + ".json")
+            original = read_record_snapshot(path, schema=SCHEMA)
+            if original[0] != self.record:
+                raise StorageError("output owner changed; preserve all records")
+            self.check_budget()
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            owner = (self.record["token"], self.record["pid"], dict(self.record["lifetime"]))
+            cap = _CreatedOutputDirectory(None, None, self.output.name, owner)
+            self._created_directory = cap
+            # Transfer the descriptor before fstat/identity setup can fail.
+            cap.parent_fd = os.open(checked(self.output.parent), flags)
+            parent_fd = cap.parent_fd
+            parent = os.fstat(parent_fd)
+            cap.parent_identity = cap.directory_identity_of(parent)
+            if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid()
+                    or stat.S_IMODE(parent.st_mode) & 0o022):
+                raise StorageError("producer-owned parent without group/other writers required")
+            cap.check(self.output)
+            try:
+                os.stat(cap.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise StorageError("only exclusive fresh directory creation is allowed")
+            self._directory_binding_stage = "mkdir_pending"
+            os.mkdir(cap.name, 0o700, dir_fd=parent_fd)
+            self._directory_binding_stage = "directory_created_unsealed"
+            cap.fd = os.open(cap.name, flags, dir_fd=parent_fd)
+            directory = os.fstat(cap.fd)
+            if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid()
+                    or stat.S_IMODE(directory.st_mode) & 0o077):
+                raise StorageError("private original directory descriptor required")
+            cap.directory_identity = cap.directory_identity_of(directory)
+            cap.identity = [directory.st_dev, directory.st_ino]
+            cap.check(self.output)
+            os.fsync(cap.fd)
+            os.fsync(cap.parent_fd)
+            self.guard.assert_held()
+            if (read_record_snapshot(path, schema=SCHEMA) != original
+                    or owner != (self.record["token"], os.getpid(), lifetime())):
+                raise StorageError("original producer changed before directory seal")
+            cap.check(self.output)
+            proposed = dict(self.record, identity=cap.identity)
+            # The deferred row stays outside the payload tree; its actual bytes
+            # still obey the existing record bound before any metadata write.
+            if len((json.dumps(proposed, sort_keys=True) + "\n").encode()) > 8192:
+                raise StorageError("ownership record exceeds bound")
+            self._directory_binding_stage = "catalog_write_pending"
+            write_record(path, proposed)
+            self._directory_binding_stage = "catalog_written_readback_pending"
+            actual, digest, _ = read_record_snapshot(path, schema=SCHEMA)
+            if actual != proposed:
+                raise StorageError("created output catalog readback changed")
+            self.guard.assert_held()
+            cap.check(self.output)
+            self.record, cap.sealed = proposed, True
+            self._directory_binding_sha256 = digest
+            self.check_budget()
+            self._directory_binding_stage = "sealed"
+            return self.output
+        except BaseException as error:
+            self._directory_binding_error = error
+            raise
+
+    def _check_created_directory(self):
+        if self._directory_binding_error is not None:
+            raise StorageError("directory binding failed; no finish or further work is allowed") from self._directory_binding_error
+        cap = self._created_directory
+        if cap is not None:
+            if (not cap.sealed or self.record["identity"] != cap.identity
+                    or cap.owner != (self.record["token"], os.getpid(), lifetime())):
+                raise StorageError("original created directory lease changed")
+            cap.check(self.output)
+
+    def _close_created_directory(self, primary=None):
+        cap = getattr(self, "_created_directory", None)
+        if cap is not None:
+            try:
+                cap.close()
+            except OSError as error:
+                self._directory_close_error = error
+                if primary is None:
+                    raise
+                if hasattr(primary, "add_note"):
+                    primary.add_note("created directory descriptor close also failed")
+
+    def __del__(self):
+        try:
+            self._close_created_directory()
+        except BaseException:
+            pass  # Descriptor release only; no pathname mutation or row finish.
+
     def _write(self):
         self.guard.assert_held()
+        self._check_created_directory()
         if not self.deferred:
             write_record(self.output / ".rovezero-output.json", self.record)
         write_record(self.catalog / (self.key + ".json"), self.record)
 
     def check_budget(self):
         self.guard.assert_held()
+        self._check_created_directory()
         if self.record is None:
             raise StorageError("output lease not acquired")
         if (_read(self.catalog / (self.key + ".json")) != self.record
@@ -140,6 +303,7 @@ class OutputLease:
         actual = sum(tree_size(path, allow_disappearing=True) for _, _, path in rows)
         if tree_size(self.output, allow_disappearing=True) > self.reserve or actual > self.total_limit:
             raise OutputBudgetError("managed output byte budget exceeded; evidence retained")
+        self._check_created_directory()
 
     def finish(self, *, status, tree_gone):
         # No file cleanup is implied by this method. In particular OS exit is
@@ -154,7 +318,7 @@ class OutputLease:
                        "tree_gone": tree_gone, "finished_ns": time.time_ns(),
                        "budget_error": str(error) if error else None,
                        "physical_completion": "not_inferred_from_output_lifecycle"}
-        if self.deferred and self.output.exists():
+        if self.deferred and self._created_directory is None and self.output.exists():
             self.record["identity"] = identity(self.output)
         try:
             self._write()
@@ -165,7 +329,10 @@ class OutputLease:
                 self.record.update(status="failed_output_budget", budget_error=str(late_error))
                 self._write()
         finally:
-            self.guard.release()
+            try:
+                self._close_created_directory(sys.exc_info()[1] or error)
+            finally:
+                self.guard.release()
         if error:
             raise error
         return self.record
