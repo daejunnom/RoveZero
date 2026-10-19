@@ -6,6 +6,10 @@
 use super::ancestry::VerifiedUtilityAncestors;
 use super::cli::{RoventUtilityCliAction, RoventUtilityCliAdmissionRequest};
 use super::execution::{RoventUtilityExecutionAction, RoventUtilityInitializationSource};
+#[path = "ipc_endpoint.rs"]
+mod ipc_endpoint;
+
+use self::ipc_endpoint::{OwnedUtilityEndpoint, UtilityListener};
 use super::ledger::{
     InitialUtilityMeasurement, UtilityCheckpointBoundary, UtilityLedger, UtilityStateSeals,
 };
@@ -44,10 +48,7 @@ use std::{
     ffi::OsString,
     fs::File,
     io::{Read, Write},
-    os::unix::{
-        fs::MetadataExt,
-        net::{UnixListener, UnixStream},
-    },
+    os::unix::{fs::MetadataExt, net::UnixStream},
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock, Mutex,
@@ -400,7 +401,7 @@ impl Journal {
     }
 }
 struct Broker {
-    listener: UnixListener,
+    listener: UtilityListener,
     parent_pid: u32,
     parent_start: u64,
     interpreter: RoventTrainingFilePin,
@@ -1148,6 +1149,10 @@ struct Custody {
     journal: Arc<Mutex<Journal>>,
     process: Option<OriginalProcessOutput>,
     broker: Option<PendingBroker>,
+    endpoint: Option<OwnedUtilityEndpoint>,
+    // Secondary endpoint I/O failure stays with the original sticky owner.
+    // It cannot replace the primary error or alter the receipt wire schema.
+    _endpoint_cleanup_error: Option<String>,
     resources: Option<Arc<RoventTrainingResources>>,
     dataset: Option<VerifiedUtilityDataset>,
     ancestors: Option<Arc<VerifiedUtilityAncestors>>,
@@ -1172,6 +1177,8 @@ impl Custody {
             journal: Arc::new(Mutex::new(Journal::new())),
             process: None,
             broker: None,
+            endpoint: None,
+            _endpoint_cleanup_error: None,
             resources: None,
             dataset: None,
             ancestors: None,
@@ -1717,7 +1724,28 @@ pub fn run_rovent_utility_from_cli(
             .control_root
             .join(format!("utility-{}-{sequence}.sock", std::process::id()));
         require(socket.as_os_str().len() < 100, "utility Unix path bound")?;
-        let listener = UnixListener::bind(&socket).map_err(|_| invalid("utility socket bind"))?;
+        let control = {
+            let slot = custody
+                .held
+                .lock()
+                .map_err(|_| invalid("endpoint custody poisoned"))?;
+            slot.as_ref()
+                .ok_or_else(|| invalid("endpoint control custody absent"))?
+                .control
+                .try_clone()
+                .map_err(|_| invalid("endpoint control FD clone"))?
+        };
+        custody.endpoint = Some(OwnedUtilityEndpoint::prepare(
+            control,
+            &registration.control_root,
+            &socket,
+            request.whole_deadline(),
+        )?);
+        let listener = custody
+            .endpoint
+            .as_mut()
+            .ok_or_else(|| invalid("original endpoint owner absent"))?
+            .bind()?;
         let parent_start = process_start(std::process::id(), &budget)?;
         let (start_ns, execution_ns, whole_ns) = linux::original_ticks(
             request.original_started(),
@@ -2036,6 +2064,14 @@ pub fn run_rovent_utility_from_cli(
             !registration.require_total_quota || total_after.verified,
             "utility aggregate quota became unverified",
         )?;
+        // Both the original broker and actual numerical scope are closed.
+        // A cleanup error must enter the existing failed/unknown path before
+        // normal parent terminal publication; Drop alone cannot attest this.
+        custody
+            .endpoint
+            .as_mut()
+            .ok_or_else(|| invalid("original endpoint owner absent at normal close"))?
+            .cleanup()?;
         verify_retained(held, &budget)?;
         if let Some(file) = &journal.file {
             budget.verify_held(&file.file, &file.pin, false)?;
@@ -2222,6 +2258,20 @@ pub fn run_rovent_utility_from_cli(
             } else {
                 custody.broker.is_none()
             };
+            // An ended listener can retire its pathname without issuing any
+            // child/device physical fence. Unknown broker lifetime is retained.
+            if let Some(endpoint) = custody.endpoint.as_mut() {
+                if broker_closed && Instant::now() < request.whole_deadline() {
+                    if let Err(cleanup_error) = endpoint.cleanup() {
+                        custody._endpoint_cleanup_error = Some(cleanup_error.to_string());
+                    }
+                } else {
+                    custody._endpoint_cleanup_error = Some(
+                        "endpoint preserved: broker closure or original cleanup window unknown"
+                            .into(),
+                    );
+                }
+            }
             let observation = json!({"schema":custody.family.unwrap_or(UtilityRuntimeFamily::CohortV1).domain("rz-rovent-utility-parent-outcome/1"),"status":"failed","error":error.to_string(),"read_accounting":budget.observation(),"process_receipt":custody.process.as_ref().map(|p|&p.process().receipt),"physical_completion":"unknown","quarantined":true,"retry_authorized":false,"work_or_read_credit_refunded":false,"past_native_authority_reissued":false});
             let mut observation = observation;
             observation["broker_thread_joined"] = json!(broker_closed);
