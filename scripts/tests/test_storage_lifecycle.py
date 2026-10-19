@@ -649,5 +649,126 @@ class CreatedDirectoryBindingTests(unittest.TestCase):
         self.assertEqual(self.disk["state"], "active")
 
 
+@unittest.skipUnless(sys.platform == "linux", "real Linux directory descriptors and private temporary filesystem")
+class CreatedDirectoryLinuxFilesystemTests(unittest.TestCase):
+    """Only this test's private source/catalog/output; no production assets."""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="rovezero-created-directory-")
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.base.chmod(0o700)
+        self.source = self.base / "source"
+        self.source.mkdir(mode=0o700)
+        self.owners = []
+        self.addCleanup(self.close_owned_descriptors)
+
+    def close_owned_descriptors(self):
+        first = None
+        for owner in reversed(self.owners):
+            try:
+                owner._close_created_directory()
+            except OSError as error:
+                if first is None:
+                    first = error
+            finally:
+                owner.guard.release()
+        if first is not None:
+            raise first
+
+    def lease(self, label):
+        parent, catalog = self.base / (label + "-parent"), self.base / (label + "-catalog")
+        parent.mkdir(mode=0o700)
+        parent.chmod(0o700)
+        catalog.mkdir(mode=0o700)
+        owner = OutputLease(parent / "attempt", self.source, catalog=catalog,
+                            deferred=True, reserve=4096, total_limit=8192).acquire()
+        self.owners.append(owner)
+        return owner, parent, catalog / (owner.key + ".json")
+
+    def test_real_create_seals_before_payload_and_finish_closes_original_fds(self):
+        owner, _, row_path = self.lease("positive")
+        self.assertIsNone(json.loads(row_path.read_text())["identity"])
+        self.assertFalse(owner.output.exists())
+        self.assertEqual(owner.create_deferred_directory(), owner.output)
+        opened = os.fstat(owner._created_directory.fd)
+        original_identity = [opened.st_dev, opened.st_ino]
+        self.assertEqual(json.loads(row_path.read_text())["identity"], original_identity)
+        self.assertEqual([owner.output.stat().st_dev, owner.output.stat().st_ino], original_identity)
+        self.assertEqual(stat.S_IMODE(owner.output.stat().st_mode), 0o700)
+        self.assertFalse((owner.output / ".rovezero-output.json").exists())
+        payload = owner.output / "payload.txt"
+        with payload.open("xb") as stream:
+            stream.write(b"private finite fixture")
+        owner.check_budget()
+        result = owner.finish(status="temporary_fixture_written", tree_gone=True)
+        self.assertEqual(result["state"], "retained")
+        self.assertEqual(result["identity"], original_identity)
+        self.assertEqual(result["physical_completion"], "not_inferred_from_output_lifecycle")
+        self.assertEqual(payload.read_bytes(), b"private finite fixture")
+        self.assertIsNone(owner._created_directory.fd)
+        self.assertIsNone(owner._created_directory.parent_fd)
+        self.assertIsNone(owner.guard.stream)
+
+    def test_real_target_and_parent_rename_replacement_never_rebinds(self):
+        for replace_parent in (False, True):
+            with self.subTest(replace_parent=replace_parent):
+                label = "parent" if replace_parent else "target"
+                owner, parent, row_path = self.lease(label)
+                owner.create_deferred_directory()
+                (owner.output / "original.txt").write_bytes(b"keep original")
+                original_identity, original_pin = list(owner.record["identity"]), pin(row_path)
+                if replace_parent:
+                    moved_parent = self.base / "moved-parent"
+                    parent.rename(moved_parent)
+                    parent.mkdir(mode=0o700)
+                    original_path = moved_parent / "attempt"
+                else:
+                    original_path = parent / "moved-attempt"
+                    owner.output.rename(original_path)
+                owner.output.mkdir(mode=0o700)
+                (owner.output / "replacement.txt").write_bytes(b"keep replacement")
+                message = "parent changed" if replace_parent else "directory changed"
+                with self.assertRaisesRegex(StorageError, message):
+                    owner.check_budget()
+                with self.assertRaisesRegex(StorageError, message):
+                    owner.finish(status="must_not_finish", tree_gone=True)
+                self.assertEqual(pin(row_path), original_pin)
+                self.assertEqual(json.loads(row_path.read_text())["state"], "active")
+                opened = os.fstat(owner._created_directory.fd)
+                self.assertEqual([opened.st_dev, opened.st_ino], original_identity)
+                self.assertEqual((original_path / "original.txt").read_bytes(), b"keep original")
+                self.assertEqual((owner.output / "replacement.txt").read_bytes(), b"keep replacement")
+                # Cleanup closes only these original FDs/gate; it never calls finish.
+
+    def test_real_same_boot_recovery_rejects_bound_active_row(self):
+        owner, _, row_path = self.lease("same-boot")
+        owner.create_deferred_directory()
+        (owner.output / "payload.txt").write_bytes(b"keep same boot")
+        digest = pin(row_path)
+        owner._close_created_directory()
+        owner.guard.release()  # Releasing an OS gate is not a reboot/closure witness.
+        with self.assertRaisesRegex(StorageError, "termination not proven"):
+            recover_output(owner.catalog, owner.key, digest)
+        self.assertEqual(pin(row_path), digest)
+        self.assertEqual(json.loads(row_path.read_text())["state"], "active")
+        self.assertEqual((owner.output / "payload.txt").read_bytes(), b"keep same boot")
+
+    def test_real_existing_unsealed_directory_keeps_null_identity_and_payload(self):
+        owner, _, row_path = self.lease("unsealed")
+        owner.output.mkdir(mode=0o700)
+        (owner.output / "unsealed.txt").write_bytes(b"keep unsealed fixture")
+        digest = pin(row_path)
+        with self.assertRaisesRegex(StorageError, "exclusive fresh"):
+            owner.create_deferred_directory()
+        self.assertIsNone(json.loads(row_path.read_text())["identity"])
+        owner._close_created_directory()
+        owner.guard.release()
+        with self.assertRaisesRegex(StorageError, "termination not proven"):
+            recover_output(owner.catalog, owner.key, digest)
+        self.assertEqual(pin(row_path), digest)
+        self.assertIsNone(json.loads(row_path.read_text())["identity"])
+        self.assertEqual((owner.output / "unsealed.txt").read_bytes(), b"keep unsealed fixture")
+
+
 if __name__ == "__main__":
     unittest.main()
