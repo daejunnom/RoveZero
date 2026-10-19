@@ -42,10 +42,10 @@ where
                             // Cancellation normally makes install quarantine.
                             // If that contract ever changes, keep the complete
                             // owner/payload rather than silently dropping it.
-                            owners.engine = Some(Box::new(match owner {
-                                ArchiveOwner::Engine(engine) => engine,
-                                ArchiveOwner::Port(port) => port.into_engine(),
-                            }));
+                            match legacy_archive_engine(owner) {
+                                Ok(engine) => owners.engine = Some(engine),
+                                Err(owner) => owners.unexpected_archive_owner = Some(owner),
+                            }
                             SessionState::ProfiledRetirementRetained {
                                 owners,
                                 worker,
@@ -251,16 +251,22 @@ where
             Err(rejected) => {
                 let failure =
                     SearchSessionFailure::debug("RoventRetirementAdmission", &rejected.error);
-                owners.engine = Some(Box::new(match rejected.owner {
-                    ArchiveOwner::Engine(engine) => engine,
-                    ArchiveOwner::Port(port) => port.into_engine(),
-                }));
+                let unexpected = match legacy_archive_engine(rejected.owner) {
+                    Ok(engine) => {
+                        owners.engine = Some(engine);
+                        false
+                    }
+                    Err(owner) => {
+                        owners.unexpected_archive_owner = Some(owner);
+                        true
+                    }
+                };
                 let ArchiveOperation::PersistProfiledRetirement { payload } =
                     rejected.work.operation
                 else {
                     unreachable!("the original submitted operation is returned unchanged")
                 };
-                if payload.commit().is_some() {
+                if unexpected || payload.commit().is_some() {
                     worker.request_shutdown();
                     *state = SessionState::ProfiledRetirementRetained {
                         owners,
@@ -286,11 +292,10 @@ where
                     match completed.install_with_profiled_retirement(authority, transfer.nonce()) {
                         Ok((owner, receipt, payload)) => {
                             let is_engine = matches!(owner, ArchiveOwner::Engine(_));
-                            let engine = match owner {
-                                ArchiveOwner::Engine(engine) => engine,
-                                ArchiveOwner::Port(port) => port.into_engine(),
-                            };
-                            owners.engine = Some(Box::new(engine));
+                            match legacy_archive_engine(owner) {
+                                Ok(engine) => owners.engine = Some(engine),
+                                Err(owner) => owners.unexpected_archive_owner = Some(owner),
+                            }
                             let valid = is_engine
                                 && payload.commit().is_some_and(|commit| {
                                     commit

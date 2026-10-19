@@ -426,6 +426,61 @@ impl ReviewContextIndex {
         }
         Ok(())
     }
+    /// Preserve the existing bounded projection during idle Store maintenance.
+    /// This is not a submitted view, another lease, or consumption authority.
+    /// Keeping the source facts hot prevents optional cold-anchor skips from
+    /// changing an otherwise identical question after metadata reclamation.
+    pub(super) fn archive_projection_pins(
+        &self,
+        stores: &PalsStores,
+    ) -> Result<StorePins, ReviewError> {
+        self.check_owner(stores)?;
+        if self.bundles.len() > self.limits.active_bundles
+            || self.records.len() > self.limits.active_bundles * self.limits.records_per_bundle
+        {
+            return Err(ReviewError::IndexCapacity);
+        }
+        let mut pins = StorePins::default();
+        for (revision, entry) in &self.records {
+            let bundle = self
+                .bundles
+                .get(&entry.bundle)
+                .ok_or(ReviewError::RelationMismatch)?;
+            if entry.record.revision != *revision
+                || bundle.anchor != entry.record.origin_state
+                || bundle.revisions.len() > self.limits.records_per_bundle
+                || !bundle.revisions.contains(revision)
+            {
+                return Err(ReviewError::RelationMismatch);
+            }
+            for relation in [
+                entry.record.parent_revision,
+                entry.record.supersedes_revision,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if self
+                    .records
+                    .get(&relation)
+                    .is_none_or(|parent| parent.bundle != entry.bundle)
+                    || relation >= *revision
+                {
+                    return Err(ReviewError::MissingRelation(relation));
+                }
+            }
+            stores.states.get(entry.record.origin_state)?;
+            pins.states.insert(entry.record.origin_state);
+            for observation in [entry.evidence, entry.record.cpu_observation]
+                .into_iter()
+                .flatten()
+            {
+                stores.observations.get(observation)?;
+                pins.observations.insert(observation);
+            }
+        }
+        Ok(pins)
+    }
     /// Publication requires actual store ownership and a complete Rules line.
     /// Parent/supersedes records must have been published earlier in the same
     /// coherent original-first-move bundle; no guessed relationship is issued.
@@ -1800,6 +1855,14 @@ mod tests {
         assert_eq!(index.indexed_record_count(), 4);
         assert!(!index.contains_revision(5));
         assert!(view.validates(&stores));
+        let pins = index.archive_projection_pins(&stores).unwrap();
+        assert!(pins.states.contains(&state));
+        assert_eq!(index.bundle(bundle).unwrap().protected_consumptions(), 2);
+        let (foreign, _) = self::stores(&Position::startpos());
+        assert_eq!(
+            index.archive_projection_pins(&foreign),
+            Err(ReviewError::OwnerMismatch)
+        );
         assert_eq!(stores.review_pin_count().unwrap(), 1);
         // A protected second bundle makes the separate active-bundle cap
         // unreclaimable. It must retain the original general error class.

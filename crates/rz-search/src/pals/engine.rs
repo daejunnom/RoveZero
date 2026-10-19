@@ -42,6 +42,7 @@ mod archive_lifecycle;
 mod cpu_lifecycle;
 mod followup_execution;
 mod frozen_recheck;
+pub mod idle_archive;
 pub mod pc_port;
 pub mod preparing_root;
 mod researcher_admission;
@@ -241,6 +242,10 @@ pub fn compiled_search_implementation_sha256() -> [u8; 32] {
             (
                 "pals/engine/archive_lifecycle.rs",
                 include_str!("engine/archive_lifecycle.rs"),
+            ),
+            (
+                "pals/engine/idle_archive.rs",
+                include_str!("engine/idle_archive.rs"),
             ),
             (
                 "pals/engine/review_lifecycle.rs",

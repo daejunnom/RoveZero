@@ -258,6 +258,9 @@ where
 struct IdleOwners<B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>> {
     native: TicketedNativeService<ReviewView, AdaptivePortQuestion, B>,
     engine: Option<Box<PalsEngine<AdaptivePortModel>>>,
+    // A legacy Engine-only transfer must not reinterpret or discard an Idle
+    // owner. Retained/pending failure states keep this original value intact.
+    unexpected_archive_owner: Option<Box<ArchiveOwner<AdaptivePortModel>>>,
     cpu: Vec<PersistentCpuOwner>,
     external: Option<ExternalManagerWorker>,
     researcher_source: SessionResearcherSource,
@@ -774,6 +777,7 @@ where
                         external,
                         researcher_source: SessionResearcherSource::Legacy,
                         engine: None,
+                        unexpected_archive_owner: None,
                         continuation: Some(continuation),
                         native_finished,
                         native_joined,
@@ -820,6 +824,7 @@ where
                             external,
                         )),
                         engine: None,
+                        unexpected_archive_owner: None,
                         continuation: Some(continuation),
                         native_finished,
                         native_joined,
@@ -1225,6 +1230,7 @@ where
             state: Mutex::new(SessionState::Idle(Box::new(IdleOwners {
                 native,
                 engine: Some(Box::new(engine)),
+                unexpected_archive_owner: None,
                 cpu,
                 external,
                 researcher_source,
@@ -1482,7 +1488,7 @@ where
             retained_cpu_engines: owners.cpu.len(),
             retained_cpu_workers: workers,
             native_pending: owners.native.occupancy(),
-            archive_owner_pending: archive,
+            archive_owner_pending: archive || owners.unexpected_archive_owner.is_some(),
         };
         Ok(match &*state {
             SessionState::Idle(owners) => snapshot("idle", owners, 0, false),
@@ -1742,8 +1748,14 @@ where
             Err(rejected) => {
                 let error =
                     SearchSessionFailure::debug("AdaptiveArchiveAdmission", &rejected.error);
-                if let ArchiveOwner::Engine(engine) = rejected.owner {
-                    owners.engine = Some(Box::new(engine));
+                match rejected.owner {
+                    ArchiveOwner::Engine(engine) => owners.engine = Some(Box::new(engine)),
+                    owner @ (ArchiveOwner::Port(_) | ArchiveOwner::Idle(_)) => {
+                        owners.unexpected_archive_owner = Some(Box::new(owner));
+                        worker.request_shutdown();
+                        *state = SessionState::ArchiveJoinedPending { owners, worker };
+                        return Err(error.unknown_if_unclosed());
+                    }
                 }
                 owners = join_archive_lifecycle(state, owners, worker, context.shutdown_deadline)?;
                 *state = SessionState::Idle(owners);
@@ -1777,10 +1789,19 @@ where
                     }
                     Ok((owner, _)) => {
                         // Submission was Engine-only; retain any invalid owner.
-                        let ArchiveOwner::Port(port) = owner else {
-                            unreachable!()
-                        };
-                        owners.engine = Some(Box::new(port.into_engine()));
+                        match legacy_archive_engine(owner) {
+                            Ok(engine) => owners.engine = Some(engine),
+                            Err(owner) => {
+                                owners.unexpected_archive_owner = Some(owner);
+                                worker.request_shutdown();
+                                *state = SessionState::ArchiveJoinedPending { owners, worker };
+                                return Err(failure(
+                                    "AdaptiveArchiveReturn",
+                                    "returned Idle owner cannot replace the legacy Engine",
+                                )
+                                .unknown_if_unclosed());
+                            }
+                        }
                         owners = join_archive_lifecycle(
                             state,
                             owners,
@@ -3229,6 +3250,12 @@ where
     B::Output: ProposerRankingOutput,
 {
     worker.request_shutdown();
+    if owners.unexpected_archive_owner.is_some() {
+        // Joining the I/O worker cannot turn a retained owner-kind failure
+        // into an idle legacy Engine or a successful process-close receipt.
+        *state = SessionState::ArchiveJoinedPending { owners, worker };
+        return Err(SearchSessionFailure::physical_completion_unknown());
+    }
     loop {
         match worker.try_join() {
             Ok(Some(receipt))
@@ -3242,6 +3269,16 @@ where
                 return Err(SearchSessionFailure::physical_completion_unknown());
             }
         }
+    }
+}
+
+fn legacy_archive_engine(
+    owner: ArchiveOwner<AdaptivePortModel>,
+) -> Result<Box<PalsEngine<AdaptivePortModel>>, Box<ArchiveOwner<AdaptivePortModel>>> {
+    match owner {
+        ArchiveOwner::Engine(engine) => Ok(Box::new(engine)),
+        ArchiveOwner::Port(port) => Ok(Box::new(port.into_engine())),
+        owner @ ArchiveOwner::Idle(_) => Err(Box::new(owner)),
     }
 }
 fn owned_declarations_match(
@@ -3325,6 +3362,64 @@ mod tests {
             root: RootGeneration(root),
             implementation: Digest([4; 32]),
         }
+    }
+    #[test]
+    fn unexpected_idle_archive_return_retains_original_pc_owner_and_store() {
+        use rz_contracts::PrecisionProfile;
+        use rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace;
+        use rz_search::pals::engine::{PalsSemanticConfig, PcSemanticOwner};
+        use rz_search::pals::review_context::{ReviewIndexLimits, ReviewSelectionPolicy};
+        use rz_search::pals::value::{MODEL_WDL_VALUE_SEMANTICS, ModelValueIdentity};
+
+        let value = ModelValueIdentity {
+            semantics: MODEL_WDL_VALUE_SEMANTICS.into(),
+            model: "unexpected-idle-owner-fixture".into(),
+            encoding: "metadata-only-test".into(),
+            precision: "fp32".into(),
+            model_epoch: [9; 32],
+        };
+        let namespace = AdaptiveModelNamespace::new(
+            value.clone(),
+            Digest([9; 32]),
+            Digest([10; 32]),
+            PrecisionProfile::Fp32,
+            1,
+        )
+        .unwrap();
+        let model =
+            AdaptivePortModel::new_with_namespace(value.model.clone(), Some(value), namespace)
+                .unwrap();
+        let owner = Box::new(
+            PcSemanticOwner::new_selected(
+                PalsSemanticConfig {
+                    max_nodes: 257,
+                    max_records: 4,
+                    ..Default::default()
+                },
+                model,
+                ReviewSelectionPolicy::default(),
+                ReviewIndexLimits::default(),
+            )
+            .unwrap(),
+        );
+        let original_owner = std::ptr::from_ref(owner.as_ref());
+        let original_store = owner.stores().read_owner();
+        let idle = owner
+            .into_idle_archive()
+            .unwrap_or_else(|_| panic!("fresh original owner must be logically idle"));
+        let retained = match legacy_archive_engine(ArchiveOwner::Idle(idle)) {
+            Ok(_) => panic!("Idle cannot become a legacy Engine or Port"),
+            Err(retained) => retained,
+        };
+        let ArchiveOwner::Idle(idle) = *retained else {
+            panic!("the unexpected original owner kind must remain Idle")
+        };
+        assert!(original_store.matches(idle.stores()));
+        let restored = idle
+            .into_pc()
+            .unwrap_or_else(|_| panic!("the original PC owner kind must be preserved"));
+        assert_eq!(std::ptr::from_ref(restored.as_ref()), original_owner);
+        assert!(original_store.matches(restored.stores()));
     }
     #[test]
     fn uci_output_checks_exact_root_and_separates_report_from_legal_fallback() {

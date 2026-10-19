@@ -29,7 +29,7 @@ pub use retirement::{
 /// Root-independent semantic owner while no actual researcher exists.
 /// Early bounded roots return this same owner, not a newly allocated Store.
 pub struct ResearcherPreparingOwner<M: RoleModel> {
-    semantic: PalsSemanticState<M>,
+    pub(super) semantic: PalsSemanticState<M>,
     profile: ResearcherSemanticProfile,
     resolver: ResolverPolicy,
     post_repair_recheck: PostRepairRecheckPolicy,

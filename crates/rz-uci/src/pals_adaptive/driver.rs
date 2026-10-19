@@ -507,8 +507,11 @@ impl<M: RoleModel + 'static> AdaptivePortDriver<M> {
                 Ok(())
             }
             Err(rejected) => {
-                if let ArchiveOwner::Port(port) = rejected.owner {
-                    self.port = Some(Box::new(port));
+                match rejected.owner {
+                    ArchiveOwner::Port(port) => self.port = Some(Box::new(port)),
+                    owner @ (ArchiveOwner::Engine(_) | ArchiveOwner::Idle(_)) => {
+                        self.unexpected_archive_owner = Some(Box::new(owner));
+                    }
                 }
                 Err(semantic(rejected.error))
             }
@@ -1707,7 +1710,7 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
                         }
                         self.archive_receipts.push_back(receipt);
                     }
-                    Ok((owner @ ArchiveOwner::Engine(_), _)) => {
+                    Ok((owner @ (ArchiveOwner::Engine(_) | ArchiveOwner::Idle(_)), _)) => {
                         self.unexpected_archive_owner = Some(Box::new(owner));
                         return Err(AdaptiveManagerError::Invalid(
                             "archive returned a different semantic owner kind",

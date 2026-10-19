@@ -9,24 +9,36 @@ use super::*;
 use crate::cpu_value::CpuTrainingState;
 use std::collections::{BTreeMap, BTreeSet};
 
-const SEARCH_ARCHIVE_IO_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const SEARCH_ARCHIVE_IO_BYTES: u64 = 16 * 1024 * 1024;
 const NODE_METADATA_BYTES: usize = 4096;
 const NODE_METADATA_MAGIC: &[u8; 8] = b"RZENGN01";
+
+struct ArchiveRestorePolicy<'a> {
+    config: &'a PalsSemanticConfig,
+    cpu_value: Option<&'a CpuValueIdentity>,
+    legacy_model_wdl: bool,
+}
+
+struct RestoredEngineMetadata {
+    situations: Vec<(SituationId, SituationId)>,
+    nodes: Vec<EngineArchiveNode>,
+    records: Vec<RoleRecord>,
+}
 
 /// The directory/configuration is retained across ucinewgame; each new Store
 /// owns another game directory and any reopen failure remains a typed error.
 #[derive(Default)]
 pub(super) struct EngineArchiveLifecycle {
-    config: Option<ArchiveConfig>,
-    root_capability: Option<ArchiveRootCapability>,
-    reopen_error: Option<StoreError>,
-    deadline: Option<Instant>,
-    remaining_io: u64,
-    retried_allocation: bool,
+    pub(super) config: Option<ArchiveConfig>,
+    pub(super) root_capability: Option<ArchiveRootCapability>,
+    pub(super) reopen_error: Option<StoreError>,
+    pub(super) deadline: Option<Instant>,
+    pub(super) remaining_io: u64,
+    pub(super) retried_allocation: bool,
     last_receipt: Option<EngineArchiveReceipt>,
-    active_search_pins: StorePins,
+    pub(super) active_search_pins: StorePins,
     pub(super) previous_closed_owner: Option<ArchiveOwnerSnapshot>,
-    closed_current_owner: Option<ArchiveOwnerSnapshot>,
+    pub(super) closed_current_owner: Option<ArchiveOwnerSnapshot>,
 }
 
 impl<M: RoleModel> PalsSemanticState<M> {
@@ -824,51 +836,27 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 
     fn engine_archive_budget(&self) -> Result<ArchiveIoBudget, PalsError> {
-        let deadline =
-            self.semantic
-                .archive_state
-                .deadline
-                .ok_or(StoreError::InvalidConditions(
-                    "engine archive has no search budget",
-                ))?;
-        if Instant::now() >= deadline {
-            return Err(StoreError::ArchiveDeadline.into());
-        }
-        Ok(ArchiveIoBudget {
-            deadline,
-            max_bytes: self.semantic.archive_state.remaining_io,
-        })
+        self.semantic.engine_archive_budget()
     }
     pub(super) fn archive_remaining_io(&self) -> u64 {
-        self.semantic.archive_state.remaining_io
+        self.semantic.archive_remaining_io()
     }
 
     pub(super) fn charge_engine_archive_io(&mut self, bytes: u64) -> Result<(), PalsError> {
-        self.semantic.archive_state.remaining_io = self
-            .semantic
-            .archive_state
-            .remaining_io
-            .checked_sub(bytes)
-            .ok_or(StoreError::ArchiveByteBudget)?;
-        Ok(())
+        self.semantic.charge_engine_archive_io(bytes)
     }
 
     fn engine_archive_pressure(&self, position: &Position) -> bool {
-        let target_state = self.semantic.stores.states.find(&position.snapshot());
-        self.semantic.stores.archive_pressure()
-            || self.semantic.nodes.len().saturating_mul(5)
-                >= self.config.max_nodes.saturating_mul(4)
-            || (self.semantic.records.len().saturating_mul(5)
-                >= self.config.max_records.saturating_mul(4)
-                && self
-                    .semantic
-                    .records
-                    .iter()
-                    .any(|record| Some(record.origin_state) != target_state))
+        self.semantic
+            .engine_archive_pressure(&self.semantic_sequence_config(), position)
     }
 
     fn retire_stale_archive_checkpoints(&mut self, position: &Position) -> Result<(), PalsError> {
-        let current_frontier = self.archive_reachable_nodes(position, false)?;
+        let current_frontier =
+            self.semantic
+                .archive_reachable_nodes(position, false, &|token| {
+                    self.researcher.cpu.token_is_current(token)
+                })?;
         let mut live = BTreeSet::new();
         for (index, node) in self.semantic.nodes.iter_mut().enumerate() {
             if let Some(token) = &node.resume {
@@ -895,105 +883,12 @@ impl<M: RoleModel> PalsEngine<M> {
     }
 
     pub(super) fn resident_archive_pins(&self) -> Result<StorePins, PalsError> {
-        let mut pins = self.semantic.archive_state.active_search_pins.clone();
-        if let Some(custody) = &self.semantic.retired_goal_local {
-            custody.validate_owner(&self.semantic.stores)?;
-            let protected = custody.protected_pins()?;
-            pins.states.extend(&protected.states);
-            pins.lines.extend(&protected.lines);
-            pins.observations.extend(&protected.observations);
-            pins.situations.extend(&protected.situations);
-            pins.executions.extend(&protected.executions);
-        }
-        if let Some(custody) = &self.semantic.retired_profiled_external {
-            custody.validate_owner(&self.semantic.stores)?;
-            let protected = custody.protected_pins()?;
-            pins.states.extend(&protected.states);
-            pins.lines.extend(&protected.lines);
-            pins.observations.extend(&protected.observations);
-            pins.situations.extend(&protected.situations);
-            pins.executions.extend(&protected.executions);
-        }
-        for node in &self.semantic.nodes {
-            if !self
-                .semantic
-                .stores
-                .states
-                .get(node.state)?
-                .same_state(&node.position.snapshot())
-                || self.semantic.stores.situations.get(node.situation)?.state != node.state
-            {
-                return Err(StoreError::ArchiveIntegrity("resident engine exact state").into());
-            }
-            pins.states.insert(node.state);
-            pins.situations.insert(node.situation);
-            if let Some((observation, execution)) =
-                node.evidence.as_ref().and_then(|e| e.provenance)
-            {
-                pins.observations.insert(observation);
-                pins.executions.insert(execution);
-            }
-            pins.observations.extend(node.model_observation);
-        }
-        for record in &self.semantic.records {
-            pins.states.insert(record.origin_state);
-            pins.observations.extend(record.cpu_observation);
-        }
-        Ok(pins)
-    }
-
-    fn archive_reachable_nodes(
-        &self,
-        position: &Position,
-        include_tasks: bool,
-    ) -> Result<Vec<bool>, PalsError> {
-        let snapshot = position.snapshot();
-        let active_states: BTreeSet<_> = if include_tasks {
-            self.semantic.stores.tasks.active_states().collect()
-        } else {
-            BTreeSet::new()
-        };
-        let mut keep = vec![false; self.semantic.nodes.len()];
-        for (index, node) in self.semantic.nodes.iter().enumerate() {
-            keep[index] = node.position.snapshot().same_state(&snapshot)
-                || active_states.contains(&node.state)
-                || (include_tasks
-                    && node.resume.as_ref().is_some_and(|token| {
-                        token.is_paused_stack() && self.researcher.cpu.token_is_current(token)
-                    }));
-        }
-        self.archive_child_closure(keep)
+        self.semantic.resident_archive_pins()
     }
 
     /// Closing the same bounded resident graph is useful both for the RAM
     /// frontier and for a self-contained persisted parent topology. Those
     /// selections have different lifetimes and must never share trim rules.
-    fn archive_child_closure(&self, mut selected: Vec<bool>) -> Result<Vec<bool>, PalsError> {
-        if selected.len() != self.semantic.nodes.len() {
-            return Err(StoreError::ArchiveIntegrity("engine closure selection").into());
-        }
-        let mut pending = Vec::new();
-        pending
-            .try_reserve_exact(self.semantic.nodes.len())
-            .map_err(|_| StoreError::PinSaturated("archive frontier index allocation"))?;
-        for (index, &included) in selected.iter().enumerate() {
-            if included {
-                pending.push(index);
-            }
-        }
-        while let Some(index) = pending.pop() {
-            for edge in &self.semantic.nodes[index].edges {
-                if edge.child >= self.semantic.nodes.len() {
-                    return Err(StoreError::ArchiveIntegrity("engine edge index").into());
-                }
-                if !selected[edge.child] {
-                    selected[edge.child] = true;
-                    pending.push(edge.child);
-                }
-            }
-        }
-        Ok(selected)
-    }
 
     fn reclaim_archive_for_root(
         &mut self,
@@ -1001,226 +896,16 @@ impl<M: RoleModel> PalsEngine<M> {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<(), PalsError> {
-        archive_controls(deadline, cancel)?;
-        // Guard every still-resident reference, including immutable raw facts,
-        // before producing a DTO. No automatic Store I/O is enabled here.
-        self.semantic
-            .stores
-            .set_archive_pins(self.resident_archive_pins()?)?;
-        let keep = self.archive_reachable_nodes(position, true)?;
-        let kept_states: BTreeSet<_> = self
-            .semantic
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| keep[*index])
-            .map(|(_, node)| node.state)
-            .collect();
-        let mut kept_revisions: BTreeSet<_> = self
-            .semantic
-            .records
-            .iter()
-            .filter(|record| kept_states.contains(&record.origin_state))
-            .map(|record| record.revision)
-            .collect();
-        // Retain the actual record relationship closure in the bounded public
-        // projection; revisions are not substituted with current-root numbers.
-        loop {
-            let before = kept_revisions.len();
-            for record in &self.semantic.records {
-                if kept_revisions.contains(&record.revision) {
-                    kept_revisions.extend(record.parent_revision);
-                    kept_revisions.extend(record.supersedes_revision);
-                }
-            }
-            if kept_revisions.len() == before {
-                break;
-            }
-        }
-        // A parent can point into the new actual root. Persist the complete
-        // resident child metadata in this receipt as well, while preserving
-        // that child's independent hot pin and native checkpoint. The bounded
-        // closure copies consume the ordinary per-search and archive quotas.
-        let mut archive_selection = Vec::new();
-        archive_selection
-            .try_reserve_exact(keep.len())
-            .map_err(|_| StoreError::PinSaturated("engine archive closure allocation"))?;
-        archive_selection.extend(keep.iter().map(|&kept| !kept));
-        let archive_selection = self.archive_child_closure(archive_selection)?;
-        let archived_states: BTreeSet<_> = self
-            .semantic
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| archive_selection[*index])
-            .map(|(_, node)| node.state)
-            .collect();
-        let mut archived_revisions: BTreeSet<_> = self
-            .semantic
-            .records
-            .iter()
-            .filter(|record| {
-                !kept_revisions.contains(&record.revision)
-                    || archived_states.contains(&record.origin_state)
-            })
-            .map(|record| record.revision)
-            .collect();
-        loop {
-            let before = archived_revisions.len();
-            for record in &self.semantic.records {
-                if archived_revisions.contains(&record.revision) {
-                    archived_revisions.extend(record.parent_revision);
-                    archived_revisions.extend(record.supersedes_revision);
-                }
-            }
-            if archived_revisions.len() == before {
-                break;
-            }
-        }
-        let archived_records: Vec<_> = self
-            .semantic
-            .records
-            .iter()
-            .filter(|record| archived_revisions.contains(&record.revision))
-            .cloned()
-            .collect();
-        let mut archived_nodes = Vec::new();
-        let mut archived_pins = StorePins::default();
-        archived_nodes
-            .try_reserve_exact(
-                archive_selection
-                    .iter()
-                    .filter(|&&selected| selected)
-                    .count(),
-            )
-            .map_err(|_| StoreError::PinSaturated("engine archive DTO allocation"))?;
-        for (index, node) in self.semantic.nodes.iter().enumerate() {
-            if archive_selection[index] {
-                archived_nodes.push(if keep[index] {
-                    // A native handle belongs only to the retained hot task.
-                    // Its raw partial/complete scope stays historical metadata.
-                    encode_archive_node_projection(node, &self.semantic.nodes)?
-                } else {
-                    encode_archive_node(node, &self.semantic.nodes)?
-                });
-                if let Some((observation, execution)) =
-                    node.evidence.as_ref().and_then(|e| e.provenance)
-                {
-                    archived_pins.observations.insert(observation);
-                    archived_pins.executions.insert(execution);
-                }
-                archived_pins.observations.extend(node.model_observation);
-            }
-        }
-        let retire_previous_root = self.semantic.stores.root().is_some_and(|root| {
-            archived_nodes.iter().any(|node| node.situation == root)
-                && self
-                    .semantic
-                    .stores
-                    .situations
-                    .get(root)
-                    .is_ok_and(|situation| {
-                        self.semantic
-                            .stores
-                            .states
-                            .get(situation.state)
-                            .is_ok_and(|snapshot| !snapshot.same_state(&position.snapshot()))
-                    })
-        });
-        // Prepare all compaction allocations before the durable barrier.
-        let mut next_nodes = Vec::new();
-        next_nodes
-            .try_reserve_exact(self.config.max_nodes)
-            .map_err(|_| StoreError::PinSaturated("engine compact arena allocation"))?;
-        let mut next_records = Vec::new();
-        next_records
-            .try_reserve_exact(self.config.max_records)
-            .map_err(|_| StoreError::PinSaturated("engine compact records allocation"))?;
-        let mut remap = vec![usize::MAX; self.semantic.nodes.len()];
-        let mut next = 0;
-        for (index, &kept) in keep.iter().enumerate() {
-            if kept {
-                remap[index] = next;
-                next += 1;
-            }
-        }
-        for (index, node) in self.semantic.nodes.iter().enumerate() {
-            if keep[index]
-                && node
-                    .edges
-                    .iter()
-                    .any(|edge| remap[edge.child] == usize::MAX)
-            {
-                return Err(
-                    StoreError::ArchiveIntegrity("kept engine frontier is not closed").into(),
-                );
-            }
-        }
-        if !archived_nodes.is_empty() || !archived_records.is_empty() {
-            let mut budget = self.engine_archive_budget()?;
-            let initial = budget.max_bytes;
-            let result = self
-                .semantic
-                .stores
-                .archive_engine_records_with_pins_and_budget(
-                    &archived_records,
-                    &archived_nodes,
-                    archived_pins,
-                    &mut budget,
-                );
-            self.charge_engine_archive_io(initial - budget.max_bytes)?;
-            let receipt = result.map_err(PalsError::Store)?;
-            if retire_previous_root {
-                // The old root projection can reference every examined leaf.
-                // Only this checked receipt can expire its logical consumers.
-                self.semantic
-                    .stores
-                    .retire_actual_root_for_archive(&receipt)?;
-            }
-            self.semantic.archive_state.last_receipt = Some(receipt);
-            // Only the checked commit above grants permission to drop metadata.
-            for (index, mut node) in std::mem::take(&mut self.semantic.nodes)
-                .into_iter()
-                .enumerate()
-            {
-                if keep[index] {
-                    for edge in &mut node.edges {
-                        edge.child = remap[edge.child];
-                    }
-                    next_nodes.push(node);
-                }
-            }
-            for record in std::mem::take(&mut self.semantic.records) {
-                if kept_revisions.contains(&record.revision) {
-                    next_records.push(record);
-                }
-            }
-            self.semantic.nodes = next_nodes;
-            self.semantic.records = next_records;
-            let checkpoints: BTreeMap<_, _> = self
-                .semantic
-                .nodes
-                .iter()
-                .enumerate()
-                .map(|(index, node)| (node.state, index as u64))
-                .collect();
-            self.semantic
-                .stores
-                .tasks
-                .remap_paused_checkpoints(&checkpoints)?;
-        }
-        self.semantic
-            .stores
-            .set_archive_pins(self.resident_archive_pins()?)?;
-        let mut budget = self.engine_archive_budget()?;
-        let initial = budget.max_bytes;
-        let result = self
-            .semantic
-            .stores
-            .archive_inactive_with_budget(&mut budget);
-        self.charge_engine_archive_io(initial - budget.max_bytes)?;
-        result.map_err(PalsError::Store)?;
-        archive_controls(deadline, cancel)
+        let config = self.semantic_sequence_config();
+        let cpu = &self.researcher.cpu;
+        self.semantic.reclaim_archive_for_root(
+            &config,
+            &StorePins::default(),
+            &|token| cpu.token_is_current(token),
+            position,
+            deadline,
+            cancel,
+        )
     }
 
     /// Explicit cold restore. A caller supplies both deadline and aggregate I/O
@@ -1242,11 +927,62 @@ impl<M: RoleModel> PalsEngine<M> {
         position: &Position,
         budget: &mut ArchiveIoBudget,
     ) -> Result<usize, PalsError> {
+        let config = self.semantic_sequence_config();
+        self.semantic.load_archived_root_with_budget(
+            &config,
+            self.researcher.cpu_registered_value.as_ref(),
+            !self.followup_lane && !self.post_repair_recheck.uses_frozen_model_wdl(),
+            position,
+            budget,
+        )
+    }
+
+    #[cfg(test)]
+    fn validate_loaded_node_evidence(&self, node: &Node) -> Result<(), PalsError> {
+        self.semantic.validate_loaded_node_evidence(
+            &ArchiveRestorePolicy {
+                config: &self.semantic_sequence_config(),
+                cpu_value: self.researcher.cpu_registered_value.as_ref(),
+                legacy_model_wdl: !self.followup_lane
+                    && !self.post_repair_recheck.uses_frozen_model_wdl(),
+            },
+            node,
+        )
+    }
+
+    #[cfg(test)]
+    fn archive_reachable_nodes(
+        &self,
+        position: &Position,
+        include_tasks: bool,
+    ) -> Result<Vec<bool>, PalsError> {
+        self.semantic
+            .archive_reachable_nodes(position, include_tasks, &|token| {
+                self.researcher.cpu.token_is_current(token)
+            })
+    }
+}
+
+impl<M: RoleModel> PalsSemanticState<M> {
+    /// The same finite cold-load envelope serves legacy and idle owners.
+    pub(super) fn load_archived_root_with_budget(
+        &mut self,
+        config: &PalsSemanticConfig,
+        cpu_value: Option<&CpuValueIdentity>,
+        legacy_model_wdl: bool,
+        position: &Position,
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<usize, PalsError> {
         if budget.max_bytes > SEARCH_ARCHIVE_IO_BYTES {
             return Err(StoreError::InvalidConditions("engine cold load exceeds 16MiB").into());
         }
         let mut work = *budget;
-        if let Some(limits) = self.archive_runtime_limits() {
+        if let Some(limits) = self.stores.archive_runtime_limits().or_else(|| {
+            self.archive_state
+                .closed_current_owner
+                .as_ref()
+                .and_then(|owner| owner.runtime_limits.as_ref())
+        }) {
             work.max_bytes = work.max_bytes.min(limits.load_bytes_max);
             let selected_deadline = Instant::now()
                 .checked_add(Duration::from_millis(limits.load_deadline_max_ms))
@@ -1254,28 +990,381 @@ impl<M: RoleModel> PalsEngine<M> {
             work.deadline = work.deadline.min(selected_deadline);
         }
         let available = work.max_bytes;
-        let result = self.load_archived_root_inner(position, &mut work);
+        let result =
+            self.load_archived_root_inner(config, cpu_value, legacy_model_wdl, position, &mut work);
         budget.max_bytes = budget
             .max_bytes
             .saturating_sub(available.saturating_sub(work.max_bytes));
         result
     }
+}
 
-    fn load_archived_root_inner(
+impl<M: RoleModel> PalsSemanticState<M> {
+    pub(super) fn engine_archive_budget(&self) -> Result<ArchiveIoBudget, PalsError> {
+        let deadline = self
+            .archive_state
+            .deadline
+            .ok_or(StoreError::InvalidConditions(
+                "engine archive has no search budget",
+            ))?;
+        if Instant::now() >= deadline {
+            return Err(StoreError::ArchiveDeadline.into());
+        }
+        Ok(ArchiveIoBudget {
+            deadline,
+            max_bytes: self.archive_state.remaining_io,
+        })
+    }
+
+    pub(super) fn archive_remaining_io(&self) -> u64 {
+        self.archive_state.remaining_io
+    }
+
+    pub(super) fn charge_engine_archive_io(&mut self, bytes: u64) -> Result<(), PalsError> {
+        self.archive_state.remaining_io = self
+            .archive_state
+            .remaining_io
+            .checked_sub(bytes)
+            .ok_or(StoreError::ArchiveByteBudget)?;
+        Ok(())
+    }
+
+    pub(super) fn engine_archive_pressure(
+        &self,
+        config: &PalsSemanticConfig,
+        position: &Position,
+    ) -> bool {
+        let target_state = self.stores.states.find(&position.snapshot());
+        self.stores.archive_pressure()
+            || self.nodes.len().saturating_mul(5) >= config.max_nodes.saturating_mul(4)
+            || (self.records.len().saturating_mul(5) >= config.max_records.saturating_mul(4)
+                && self
+                    .records
+                    .iter()
+                    .any(|record| Some(record.origin_state) != target_state))
+    }
+
+    pub(super) fn resident_archive_pins(&self) -> Result<StorePins, PalsError> {
+        let mut pins = self.archive_state.active_search_pins.clone();
+        if let Some(custody) = &self.retired_goal_local {
+            custody.validate_owner(&self.stores)?;
+            let protected = custody.protected_pins()?;
+            pins.states.extend(&protected.states);
+            pins.lines.extend(&protected.lines);
+            pins.observations.extend(&protected.observations);
+            pins.situations.extend(&protected.situations);
+            pins.executions.extend(&protected.executions);
+        }
+        if let Some(custody) = &self.retired_profiled_external {
+            custody.validate_owner(&self.stores)?;
+            let protected = custody.protected_pins()?;
+            pins.states.extend(&protected.states);
+            pins.lines.extend(&protected.lines);
+            pins.observations.extend(&protected.observations);
+            pins.situations.extend(&protected.situations);
+            pins.executions.extend(&protected.executions);
+        }
+        for node in &self.nodes {
+            if !self
+                .stores
+                .states
+                .get(node.state)?
+                .same_state(&node.position.snapshot())
+                || self.stores.situations.get(node.situation)?.state != node.state
+            {
+                return Err(StoreError::ArchiveIntegrity("resident engine exact state").into());
+            }
+            pins.states.insert(node.state);
+            pins.situations.insert(node.situation);
+            if let Some((observation, execution)) =
+                node.evidence.as_ref().and_then(|e| e.provenance)
+            {
+                pins.observations.insert(observation);
+                pins.executions.insert(execution);
+            }
+            pins.observations.extend(node.model_observation);
+        }
+        for record in &self.records {
+            pins.states.insert(record.origin_state);
+            pins.observations.extend(record.cpu_observation);
+        }
+        Ok(pins)
+    }
+
+    pub(super) fn archive_reachable_nodes(
+        &self,
+        position: &Position,
+        include_tasks: bool,
+        token_is_current: &dyn Fn(&CpuResumeToken) -> bool,
+    ) -> Result<Vec<bool>, PalsError> {
+        let snapshot = position.snapshot();
+        let active_states: BTreeSet<_> = if include_tasks {
+            self.stores.tasks.active_states().collect()
+        } else {
+            BTreeSet::new()
+        };
+        let mut keep = vec![false; self.nodes.len()];
+        for (index, node) in self.nodes.iter().enumerate() {
+            keep[index] = node.position.snapshot().same_state(&snapshot)
+                || active_states.contains(&node.state)
+                || (include_tasks
+                    && node
+                        .resume
+                        .as_ref()
+                        .is_some_and(|token| token.is_paused_stack() && token_is_current(token)));
+        }
+        self.archive_child_closure(keep)
+    }
+
+    pub(super) fn archive_child_closure(
+        &self,
+        mut selected: Vec<bool>,
+    ) -> Result<Vec<bool>, PalsError> {
+        if selected.len() != self.nodes.len() {
+            return Err(StoreError::ArchiveIntegrity("engine closure selection").into());
+        }
+        let mut pending = Vec::new();
+        pending
+            .try_reserve_exact(self.nodes.len())
+            .map_err(|_| StoreError::PinSaturated("archive frontier index allocation"))?;
+        for (index, &included) in selected.iter().enumerate() {
+            if included {
+                pending.push(index);
+            }
+        }
+        while let Some(index) = pending.pop() {
+            for edge in &self.nodes[index].edges {
+                if edge.child >= self.nodes.len() {
+                    return Err(StoreError::ArchiveIntegrity("engine edge index").into());
+                }
+                if !selected[edge.child] {
+                    selected[edge.child] = true;
+                    pending.push(edge.child);
+                }
+            }
+        }
+        Ok(selected)
+    }
+
+    pub(super) fn reclaim_archive_for_root(
         &mut self,
+        config: &PalsSemanticConfig,
+        additional_pins: &StorePins,
+        token_is_current: &dyn Fn(&CpuResumeToken) -> bool,
+        position: &Position,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        archive_controls(deadline, cancel)?;
+        // Guard every still-resident reference, including immutable raw facts,
+        // before producing a DTO. No automatic Store I/O is enabled here.
+        self.stores
+            .set_archive_pins(self.resident_archive_pins_with(additional_pins)?)?;
+        let keep = self.archive_reachable_nodes(position, true, token_is_current)?;
+        let kept_states: BTreeSet<_> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| keep[*index])
+            .map(|(_, node)| node.state)
+            .collect();
+        let mut kept_revisions: BTreeSet<_> = self
+            .records
+            .iter()
+            .filter(|record| kept_states.contains(&record.origin_state))
+            .map(|record| record.revision)
+            .collect();
+        // Retain the actual record relationship closure in the bounded public
+        // projection; revisions are not substituted with current-root numbers.
+        loop {
+            let before = kept_revisions.len();
+            for record in &self.records {
+                if kept_revisions.contains(&record.revision) {
+                    kept_revisions.extend(record.parent_revision);
+                    kept_revisions.extend(record.supersedes_revision);
+                }
+            }
+            if kept_revisions.len() == before {
+                break;
+            }
+        }
+        // A parent can point into the new actual root. Persist the complete
+        // resident child metadata in this receipt as well, while preserving
+        // that child's independent hot pin and native checkpoint. The bounded
+        // closure copies consume the ordinary per-search and archive quotas.
+        let mut archive_selection = Vec::new();
+        archive_selection
+            .try_reserve_exact(keep.len())
+            .map_err(|_| StoreError::PinSaturated("engine archive closure allocation"))?;
+        archive_selection.extend(keep.iter().map(|&kept| !kept));
+        let archive_selection = self.archive_child_closure(archive_selection)?;
+        let archived_states: BTreeSet<_> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| archive_selection[*index])
+            .map(|(_, node)| node.state)
+            .collect();
+        let mut archived_revisions: BTreeSet<_> = self
+            .records
+            .iter()
+            .filter(|record| {
+                !kept_revisions.contains(&record.revision)
+                    || archived_states.contains(&record.origin_state)
+            })
+            .map(|record| record.revision)
+            .collect();
+        loop {
+            let before = archived_revisions.len();
+            for record in &self.records {
+                if archived_revisions.contains(&record.revision) {
+                    archived_revisions.extend(record.parent_revision);
+                    archived_revisions.extend(record.supersedes_revision);
+                }
+            }
+            if archived_revisions.len() == before {
+                break;
+            }
+        }
+        let archived_records: Vec<_> = self
+            .records
+            .iter()
+            .filter(|record| archived_revisions.contains(&record.revision))
+            .cloned()
+            .collect();
+        let mut archived_nodes = Vec::new();
+        let mut archived_pins = StorePins::default();
+        archived_nodes
+            .try_reserve_exact(
+                archive_selection
+                    .iter()
+                    .filter(|&&selected| selected)
+                    .count(),
+            )
+            .map_err(|_| StoreError::PinSaturated("engine archive DTO allocation"))?;
+        for (index, node) in self.nodes.iter().enumerate() {
+            if archive_selection[index] {
+                archived_nodes.push(if keep[index] {
+                    // A native handle belongs only to the retained hot task.
+                    // Its raw partial/complete scope stays historical metadata.
+                    encode_archive_node_projection(node, &self.nodes)?
+                } else {
+                    encode_archive_node(node, &self.nodes)?
+                });
+                if let Some((observation, execution)) =
+                    node.evidence.as_ref().and_then(|e| e.provenance)
+                {
+                    archived_pins.observations.insert(observation);
+                    archived_pins.executions.insert(execution);
+                }
+                archived_pins.observations.extend(node.model_observation);
+            }
+        }
+        let retire_previous_root = self.stores.root().is_some_and(|root| {
+            archived_nodes.iter().any(|node| node.situation == root)
+                && self.stores.situations.get(root).is_ok_and(|situation| {
+                    self.stores
+                        .states
+                        .get(situation.state)
+                        .is_ok_and(|snapshot| !snapshot.same_state(&position.snapshot()))
+                })
+        });
+        // Prepare all compaction allocations before the durable barrier.
+        let mut next_nodes = Vec::new();
+        next_nodes
+            .try_reserve_exact(config.max_nodes)
+            .map_err(|_| StoreError::PinSaturated("engine compact arena allocation"))?;
+        let mut next_records = Vec::new();
+        next_records
+            .try_reserve_exact(config.max_records)
+            .map_err(|_| StoreError::PinSaturated("engine compact records allocation"))?;
+        let mut remap = vec![usize::MAX; self.nodes.len()];
+        let mut next = 0;
+        for (index, &kept) in keep.iter().enumerate() {
+            if kept {
+                remap[index] = next;
+                next += 1;
+            }
+        }
+        for (index, node) in self.nodes.iter().enumerate() {
+            if keep[index]
+                && node
+                    .edges
+                    .iter()
+                    .any(|edge| remap[edge.child] == usize::MAX)
+            {
+                return Err(
+                    StoreError::ArchiveIntegrity("kept engine frontier is not closed").into(),
+                );
+            }
+        }
+        if !archived_nodes.is_empty() || !archived_records.is_empty() {
+            let mut budget = self.engine_archive_budget()?;
+            let initial = budget.max_bytes;
+            let result = self.stores.archive_engine_records_with_pins_and_budget(
+                &archived_records,
+                &archived_nodes,
+                archived_pins,
+                &mut budget,
+            );
+            self.charge_engine_archive_io(initial - budget.max_bytes)?;
+            let receipt = result.map_err(PalsError::Store)?;
+            if retire_previous_root {
+                // The old root projection can reference every examined leaf.
+                // Only this checked receipt can expire its logical consumers.
+                self.stores.retire_actual_root_for_archive(&receipt)?;
+            }
+            self.archive_state.last_receipt = Some(receipt);
+            // Only the checked commit above grants permission to drop metadata.
+            for (index, mut node) in std::mem::take(&mut self.nodes).into_iter().enumerate() {
+                if keep[index] {
+                    for edge in &mut node.edges {
+                        edge.child = remap[edge.child];
+                    }
+                    next_nodes.push(node);
+                }
+            }
+            for record in std::mem::take(&mut self.records) {
+                if kept_revisions.contains(&record.revision) {
+                    next_records.push(record);
+                }
+            }
+            self.nodes = next_nodes;
+            self.records = next_records;
+            let checkpoints: BTreeMap<_, _> = self
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| (node.state, index as u64))
+                .collect();
+            self.stores.tasks.remap_paused_checkpoints(&checkpoints)?;
+        }
+        self.stores
+            .set_archive_pins(self.resident_archive_pins_with(additional_pins)?)?;
+        let mut budget = self.engine_archive_budget()?;
+        let initial = budget.max_bytes;
+        let result = self.stores.archive_inactive_with_budget(&mut budget);
+        self.charge_engine_archive_io(initial - budget.max_bytes)?;
+        result.map_err(PalsError::Store)?;
+        archive_controls(deadline, cancel)
+    }
+
+    pub(super) fn load_archived_root_inner(
+        &mut self,
+        config: &PalsSemanticConfig,
+        cpu_value: Option<&CpuValueIdentity>,
+        legacy_model_wdl: bool,
         position: &Position,
         budget: &mut ArchiveIoBudget,
     ) -> Result<usize, PalsError> {
         let snapshot = position.snapshot();
         let state = self
-            .semantic
             .stores
             .lookup_cold_state_with_budget(&snapshot, budget)
             .map_err(PalsError::Store)?
             .ok_or(StoreError::ColdRecord("archived engine root"))?
             .original_id();
         let receipt = self
-            .semantic
             .stores
             .lookup_engine_node_archive_with_budget(state, budget)
             .map_err(PalsError::Store)?
@@ -1283,26 +1372,31 @@ impl<M: RoleModel> PalsEngine<M> {
         // Store checks dependency closure, owner/generation and quotas before
         // hot publication. Metadata validation precedes engine publication.
         let loaded = self
-            .semantic
             .stores
             .load_engine_archive_for_state_with_budget(&receipt, state, budget)
             .map_err(PalsError::Store)?;
         let pin = loaded.pin;
         let result = self.install_loaded_archive(
+            ArchiveRestorePolicy {
+                config,
+                cpu_value,
+                legacy_model_wdl,
+            },
             state,
             position,
             budget.deadline,
-            loaded.situations,
-            loaded.engine_nodes,
-            loaded.engine_records,
+            RestoredEngineMetadata {
+                situations: loaded.situations,
+                nodes: loaded.engine_nodes,
+                records: loaded.engine_records,
+            },
         );
-        let release = self.semantic.stores.release_loaded(pin);
+        let release = self.stores.release_loaded(pin);
         match result {
             Err(error) => Err(error),
             Ok(root) => {
                 release.map_err(PalsError::Store)?;
-                self.semantic
-                    .stores
+                self.stores
                     .set_archive_pins(self.resident_archive_pins()?)?;
                 Ok(root)
             }
@@ -1311,16 +1405,20 @@ impl<M: RoleModel> PalsEngine<M> {
 
     fn install_loaded_archive(
         &mut self,
+        policy: ArchiveRestorePolicy<'_>,
         root_state: StateId,
         expected: &Position,
         deadline: Instant,
-        situations: Vec<(SituationId, SituationId)>,
-        wires: Vec<EngineArchiveNode>,
-        records: Vec<RoleRecord>,
+        metadata: RestoredEngineMetadata,
     ) -> Result<usize, PalsError> {
+        let config = policy.config;
+        let RestoredEngineMetadata {
+            situations,
+            nodes: wires,
+            records,
+        } = metadata;
         let situation_map: BTreeMap<_, _> = situations.into_iter().collect();
         let mut indices: BTreeMap<_, _> = self
-            .semantic
             .nodes
             .iter()
             .enumerate()
@@ -1331,11 +1429,10 @@ impl<M: RoleModel> PalsEngine<M> {
             .filter(|wire| !indices.contains_key(&wire.state))
             .count();
         if self
-            .semantic
             .nodes
             .len()
             .checked_add(additions)
-            .is_none_or(|n| n > self.config.max_nodes)
+            .is_none_or(|n| n > config.max_nodes)
         {
             return Err(StoreError::PinSaturated("loaded engine nodes").into());
         }
@@ -1348,17 +1445,17 @@ impl<M: RoleModel> PalsEngine<M> {
             if indices.contains_key(&wire.state) {
                 continue;
             }
-            let snapshot = self.semantic.stores.states.get(wire.state)?;
+            let snapshot = self.stores.states.get(wire.state)?;
             let position = position_from_snapshot(snapshot)?;
             let situation = *situation_map
                 .get(&wire.situation)
                 .ok_or(StoreError::ArchiveIntegrity("engine situation restoration"))?;
-            if self.semantic.stores.situations.get(situation)?.state != wire.state {
+            if self.stores.situations.get(situation)?.state != wire.state {
                 return Err(StoreError::ArchiveIntegrity("engine restored situation state").into());
             }
             let node = decode_archive_node(wire, position, situation)?;
-            self.validate_loaded_node_evidence(&node)?;
-            let index = self.semantic.nodes.len() + new_nodes.len();
+            self.validate_loaded_node_evidence(&policy, &node)?;
+            let index = self.nodes.len() + new_nodes.len();
             indices.insert(wire.state, index);
             new_nodes.push(node);
         }
@@ -1367,10 +1464,10 @@ impl<M: RoleModel> PalsEngine<M> {
             let index = *indices
                 .get(&wire.state)
                 .ok_or(StoreError::ArchiveIntegrity("engine restored node index"))?;
-            if index < self.semantic.nodes.len() {
+            if index < self.nodes.len() {
                 continue;
             }
-            let node = &mut new_nodes[index - self.semantic.nodes.len()];
+            let node = &mut new_nodes[index - self.nodes.len()];
             node.edges
                 .try_reserve_exact(wire.edges.len())
                 .map_err(|_| StoreError::PinSaturated("loaded engine edge allocation"))?;
@@ -1383,10 +1480,7 @@ impl<M: RoleModel> PalsEngine<M> {
                 replay
                     .make_move(movement)
                     .map_err(|_| StoreError::ArchiveIntegrity("engine cold edge Rules legality"))?;
-                if !replay
-                    .snapshot()
-                    .same_state(self.semantic.stores.states.get(child)?)
-                {
+                if !replay.snapshot().same_state(self.stores.states.get(child)?) {
                     return Err(
                         StoreError::ArchiveIntegrity("engine cold edge exact history").into(),
                     );
@@ -1400,10 +1494,10 @@ impl<M: RoleModel> PalsEngine<M> {
         let root = *indices
             .get(&root_state)
             .ok_or(StoreError::ColdRecord("engine root topology"))?;
-        let restored = if root < self.semantic.nodes.len() {
-            &self.semantic.nodes[root].position
+        let restored = if root < self.nodes.len() {
+            &self.nodes[root].position
         } else {
-            &new_nodes[root - self.semantic.nodes.len()].position
+            &new_nodes[root - self.nodes.len()].position
         };
         if !restored.snapshot().same_state(&expected.snapshot()) {
             return Err(StoreError::ArchiveIntegrity("engine cold root exact history").into());
@@ -1412,7 +1506,6 @@ impl<M: RoleModel> PalsEngine<M> {
         for record in records {
             archive_deadline(deadline)?;
             if self
-                .semantic
                 .records
                 .iter()
                 .any(|old| old.revision == record.revision)
@@ -1422,37 +1515,38 @@ impl<M: RoleModel> PalsEngine<M> {
             added_records.push(record);
         }
         if self
-            .semantic
             .records
             .len()
             .checked_add(added_records.len())
-            .is_none_or(|n| n > self.config.max_records)
+            .is_none_or(|n| n > config.max_records)
         {
             return Err(StoreError::PinSaturated("loaded engine public records").into());
         }
-        self.semantic
-            .nodes
+        self.nodes
             .try_reserve_exact(new_nodes.len())
             .map_err(|_| StoreError::PinSaturated("restored engine node allocation"))?;
-        self.semantic
-            .records
+        self.records
             .try_reserve_exact(added_records.len())
             .map_err(|_| StoreError::PinSaturated("restored engine record allocation"))?;
         archive_deadline(deadline)?;
-        self.semantic.nodes.extend(new_nodes);
-        self.semantic.records.extend(added_records);
-        self.semantic.records.sort_by_key(|record| record.revision);
-        self.restore_review_context_after_load();
+        self.nodes.extend(new_nodes);
+        self.records.extend(added_records);
+        self.records.sort_by_key(|record| record.revision);
+        self.restore_review_context_after_load(config);
         Ok(root)
     }
 
-    fn validate_loaded_node_evidence(&self, node: &Node) -> Result<(), PalsError> {
+    fn validate_loaded_node_evidence(
+        &self,
+        policy: &ArchiveRestorePolicy<'_>,
+        node: &Node,
+    ) -> Result<(), PalsError> {
         if let Some(evidence) = &node.evidence {
-            if self.researcher.cpu_registered_value.as_ref() != Some(&evidence.value_identity) {
+            if policy.cpu_value != Some(&evidence.value_identity) {
                 return Err(StoreError::ArchiveIntegrity("engine restored CPU namespace").into());
             }
             if let Some((observation, execution)) = evidence.provenance {
-                let fact = self.semantic.stores.observations.get(observation)?;
+                let fact = self.stores.observations.get(observation)?;
                 let expected_score = if evidence.scope == CpuScoreScope::FrontierOnly {
                     RawScore::Estimate {
                         value: evidence.score as f32,
@@ -1475,17 +1569,17 @@ impl<M: RoleModel> PalsEngine<M> {
                         StoreError::ArchiveIntegrity("engine restored CPU observation").into(),
                     );
                 }
-                self.semantic.stores.tasks.get(execution)?;
+                self.stores.tasks.get(execution)?;
             }
         }
         if let Some(output) = &node.model_value {
-            if self.semantic.model_registered_value.as_ref() != Some(&output.identity) {
+            if self.model_registered_value.as_ref() != Some(&output.identity) {
                 return Err(StoreError::ArchiveIntegrity("engine restored model namespace").into());
             }
             let observation = node
                 .model_observation
                 .ok_or(StoreError::ArchiveIntegrity("engine model observation"))?;
-            let fact = self.semantic.stores.observations.get(observation)?;
+            let fact = self.stores.observations.get(observation)?;
             let same_value = |win, draw, loss, perspective| {
                 output.wdl == [win, draw, loss] && output.perspective == perspective
             };
@@ -1505,7 +1599,7 @@ impl<M: RoleModel> PalsEngine<M> {
                     draw,
                     loss,
                     perspective,
-                } if !self.followup_lane && !self.post_repair_recheck.uses_frozen_model_wdl() => {
+                } if policy.legacy_model_wdl => {
                     // Match the actual legacy publisher gate. This preserves
                     // an old raw reading without adding a revision or minting
                     // a new ContextWdl/frozen comparison proof.
@@ -1524,6 +1618,19 @@ impl<M: RoleModel> PalsEngine<M> {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn resident_archive_pins_with(
+        &self,
+        additional: &StorePins,
+    ) -> Result<StorePins, PalsError> {
+        let mut pins = self.resident_archive_pins()?;
+        pins.states.extend(&additional.states);
+        pins.lines.extend(&additional.lines);
+        pins.observations.extend(&additional.observations);
+        pins.situations.extend(&additional.situations);
+        pins.executions.extend(&additional.executions);
+        Ok(pins)
     }
 }
 

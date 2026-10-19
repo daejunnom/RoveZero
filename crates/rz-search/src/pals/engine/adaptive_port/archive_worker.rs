@@ -8,6 +8,7 @@ use super::profiled_retirement_archive::{
 };
 use super::{AdaptiveEnginePort, PalsEngine, PalsError, RoleModel};
 use super::{ProfiledExternalRetirementIdentity, ProfiledExternalRootRetirement};
+use crate::pals::engine::idle_archive::IdleSemanticArchiveOwner;
 use crate::pals::store::{
     ArchiveIoBudget, ArchiveOwnerSnapshot, ArchiveStats, ForeignAppendPermit, ForeignGoIssuedProof,
     Observation, ProfiledForeignAppendPermit, ProfiledForeignGoIssuedProof, SituationId,
@@ -33,19 +34,34 @@ const MAX_IO_BYTES: u64 = 16 * 1024 * 1024;
 pub enum ArchiveOwner<M: RoleModel> {
     Engine(PalsEngine<M>),
     Port(AdaptiveEnginePort<M>),
+    Idle(IdleSemanticArchiveOwner<M>),
 }
 impl<M: RoleModel> ArchiveOwner<M> {
-    fn engine(&self) -> &PalsEngine<M> {
+    fn legacy_engine(&self) -> Result<&PalsEngine<M>, PalsError> {
         match self {
-            Self::Engine(engine) => engine,
-            Self::Port(port) => &port.engine,
+            Self::Engine(engine) => Ok(engine),
+            Self::Port(port) => Ok(&port.engine),
+            Self::Idle(_) => {
+                Err(StoreError::InvalidConditions("idle owner is not an Engine").into())
+            }
         }
     }
-    fn engine_mut(&mut self) -> &mut PalsEngine<M> {
+    fn legacy_engine_mut(&mut self) -> Result<&mut PalsEngine<M>, PalsError> {
         match self {
-            Self::Engine(engine) => engine,
-            Self::Port(port) => &mut port.engine,
+            Self::Engine(engine) => Ok(engine),
+            Self::Port(port) => Ok(&mut port.engine),
+            Self::Idle(_) => {
+                Err(StoreError::InvalidConditions("idle owner is not an Engine").into())
+            }
         }
+    }
+    #[cfg(test)]
+    fn engine(&self) -> &PalsEngine<M> {
+        self.legacy_engine().unwrap()
+    }
+    #[cfg(test)]
+    fn engine_mut(&mut self) -> &mut PalsEngine<M> {
+        self.legacy_engine_mut().unwrap()
     }
 }
 
@@ -277,6 +293,7 @@ struct ArchiveSeal {
     registry_owner: Weak<()>,
     next_game: Option<SearchAuthority>,
     is_port: bool,
+    idle_owner: Option<Weak<()>>,
 }
 
 #[derive(Clone, Debug)]
@@ -555,7 +572,13 @@ impl<M: RoleModel> ArchiveCompletion<M> {
         if !permit_shape_matches {
             return Err(invalid("archive typed permit differs from operation"));
         }
-        let engine = self.owner.engine();
+        if let ArchiveOwner::Idle(owner) = &self.owner {
+            return self.validate_idle_return(owner);
+        }
+        let engine = self
+            .owner
+            .legacy_engine()
+            .map_err(ArchiveQuarantineReason::Operation)?;
         if self.receipt.operation == ArchiveOperationKind::NewGame {
             let next = self
                 .seal
@@ -725,6 +748,68 @@ impl<M: RoleModel> ArchiveCompletion<M> {
                 return Err(invalid("active port authority"));
             }
         }
+        Ok(())
+    }
+
+    fn validate_idle_return(
+        &self,
+        owner: &IdleSemanticArchiveOwner<M>,
+    ) -> Result<(), ArchiveQuarantineReason> {
+        let invalid = ArchiveQuarantineReason::InvalidReturn;
+        let semantic = owner.semantic();
+        if self.seal.is_port
+            || !self
+                .seal
+                .idle_owner
+                .as_ref()
+                .is_some_and(|id| id.ptr_eq(&owner.identity()))
+            || !self
+                .seal
+                .registry_owner
+                .ptr_eq(&semantic.adaptive_registry_identity())
+            || !self.seal.store_owner.matches(owner.stores())
+            || semantic.game_generation != self.seal.game_generation
+            || semantic.revision != self.seal.revision
+            || !matches!(
+                self.receipt.operation,
+                ArchiveOperationKind::PrepareRoot | ArchiveOperationKind::LoadRoot
+            )
+        {
+            return Err(invalid("idle semantic owner, registry or operation"));
+        }
+        owner
+            .validate_idle()
+            .map_err(ArchiveQuarantineReason::Operation)?;
+        let generation = owner.stores().generation();
+        if generation != self.seal.store_generation {
+            let retired = self.receipt.operation == ArchiveOperationKind::PrepareRoot
+                && self.seal.root.is_some()
+                && owner.stores().root().is_none()
+                && self.seal.store_generation.checked_add(1) == Some(generation)
+                && semantic.last_engine_archive().is_some_and(|receipt| {
+                    receipt.actual_root().is_some_and(|(root, _, old)| {
+                        Some(root) == self.seal.root && old == self.seal.store_generation
+                    })
+                });
+            if !retired {
+                return Err(invalid("idle Store generation"));
+            }
+        } else if owner.stores().root() != self.seal.root {
+            return Err(invalid("idle Store root"));
+        }
+        let actual = owner
+            .archive_owner_snapshot()
+            .map_err(ArchiveQuarantineReason::Operation)?;
+        match (self.seal.archive_owner, actual) {
+            (Some(before), Some(after))
+                if before.owner_id == after.owner_id
+                    && before.root_sha256 == after.root_sha256
+                    && before.repository_sha256 == after.repository_sha256
+                    && !after.admission_closed => {}
+            _ => return Err(invalid("idle original archive owner")),
+        }
+        validate_pins(owner.stores(), &self.seal.review_pins)
+            .map_err(|_| invalid("idle original index/source pins"))?;
         Ok(())
     }
 }
@@ -971,7 +1056,10 @@ fn seal_owner<M: RoleModel>(
     authority: SearchAuthority,
     work: &ArchiveWork,
 ) -> Result<ArchiveSeal, PalsError> {
-    let engine = owner.engine();
+    if let ArchiveOwner::Idle(idle) = owner {
+        return seal_idle_owner(idle, authority, work);
+    }
+    let engine = owner.legacy_engine()?;
     let is_profiled_retirement = matches!(
         &work.operation,
         ArchiveOperation::PersistProfiledRetirement { .. }
@@ -1134,6 +1222,79 @@ fn seal_owner<M: RoleModel>(
         registry_owner: engine.adaptive_registry_identity(),
         next_game,
         is_port: matches!(owner, ArchiveOwner::Port(_)),
+        idle_owner: None,
+    })
+}
+
+fn seal_idle_owner<M: RoleModel>(
+    owner: &IdleSemanticArchiveOwner<M>,
+    authority: SearchAuthority,
+    work: &ArchiveWork,
+) -> Result<ArchiveSeal, PalsError> {
+    owner.validate_idle()?;
+    let semantic = owner.semantic();
+    let last = semantic
+        .last_adaptive_authority()
+        .ok_or(StoreError::StaleConsumer)?;
+    if last.epoch != authority.epoch
+        || last.implementation != authority.implementation
+        || last.game != authority.game
+        || semantic.game_generation != Some(authority.game.0)
+        || owner.stores().generation() != authority.root.0
+    {
+        return Err(StoreError::StaleConsumer.into());
+    }
+    if !matches!(
+        work.operation,
+        ArchiveOperation::PrepareRoot { .. } | ArchiveOperation::LoadRoot { .. }
+    ) {
+        return Err(
+            StoreError::InvalidConditions("idle owner only prepares or restores a root").into(),
+        );
+    }
+    if work.max_io_bytes == 0
+        || work.max_io_bytes > MAX_IO_BYTES
+        || (matches!(work.operation, ArchiveOperation::PrepareRoot { .. })
+            && work.max_io_bytes != MAX_IO_BYTES)
+    {
+        return Err(StoreError::ArchiveByteBudget.into());
+    }
+    if Instant::now() >= work.deadline {
+        return Err(StoreError::ArchiveDeadline.into());
+    }
+    let archive_owner = owner.archive_owner_snapshot()?;
+    if !owner.archive_enabled() || archive_owner.is_none_or(|value| value.admission_closed) {
+        return Err(StoreError::ArchiveDisabled.into());
+    }
+    let mut review_pins = owner.projection_pins()?;
+    merge_pins(&mut review_pins, &owner.stores().review_pin_union()?);
+    validate_pins(owner.stores(), &review_pins)?;
+    Ok(ArchiveSeal {
+        authority,
+        store_owner: owner.stores().read_owner(),
+        store_generation: owner.stores().generation(),
+        game_generation: semantic.game_generation,
+        root: owner.stores().root(),
+        revision: semantic.revision,
+        node_handles: semantic
+            .nodes
+            .iter()
+            .map(|node| (node.state, node.situation))
+            .collect(),
+        record_revisions: semantic
+            .records
+            .iter()
+            .map(|record| record.revision)
+            .collect(),
+        review_pins,
+        active_cpu_pins: StorePins::default(),
+        profiled_retirement_pins: StorePins::default(),
+        profiled_retirement_identity: None,
+        archive_owner,
+        registry_owner: semantic.adaptive_registry_identity(),
+        next_game: None,
+        is_port: false,
+        idle_owner: Some(owner.identity()),
     })
 }
 
@@ -1172,9 +1333,89 @@ fn catch_archive_work(
     catch_unwind(AssertUnwindSafe(operation)).unwrap_or(Err(ArchiveQuarantineReason::Panic))
 }
 
-fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
+fn execute_idle<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
     let began = Instant::now();
-    let before = command.owner.engine().stores().hot_stats();
+    let ArchiveOwner::Idle(owner) = &mut command.owner else {
+        unreachable!("only the sealed idle branch calls execute_idle");
+    };
+    let before = owner.stores().hot_stats();
+    let kind = command.work.operation.kind();
+    let mut loaded_root = None;
+    let mut budget = ArchiveIoBudget {
+        deadline: command.work.deadline,
+        max_bytes: command.work.max_io_bytes,
+    };
+    let result = catch_archive_work(|| {
+        if command.cancel.load(Ordering::Acquire) {
+            return Err(ArchiveQuarantineReason::Canceled);
+        }
+        if Instant::now() >= command.work.deadline {
+            return Err(ArchiveQuarantineReason::Deadline);
+        }
+        let operation = match command.work.operation {
+            ArchiveOperation::PrepareRoot { position } => {
+                let result = owner.prepare_root(&position, command.work.deadline, &command.cancel);
+                budget.max_bytes = owner.remaining_io();
+                result
+            }
+            ArchiveOperation::LoadRoot { position } => owner
+                .load_root(&position, &mut budget)
+                .map(|root| loaded_root = Some(root)),
+            _ => Err(StoreError::InvalidConditions("unsealed idle archive operation").into()),
+        };
+        operation.map_err(ArchiveQuarantineReason::Operation)?;
+        if command.cancel.load(Ordering::Acquire) {
+            return Err(ArchiveQuarantineReason::Canceled);
+        }
+        if Instant::now() >= command.work.deadline {
+            return Err(ArchiveQuarantineReason::Deadline);
+        }
+        Ok(())
+    });
+    let receipt = ArchiveWorkReceipt {
+        nonce: command.nonce,
+        authority: command.seal.authority,
+        operation: kind,
+        generation_before: command.seal.store_generation,
+        generation_after: owner.stores().generation(),
+        hot_before: before,
+        hot_after: owner.stores().hot_stats(),
+        io_bytes: if matches!(result, Err(ArchiveQuarantineReason::Panic))
+            || (kind == ArchiveOperationKind::PrepareRoot && result.is_err())
+        {
+            None
+        } else {
+            command.work.max_io_bytes.checked_sub(budget.max_bytes)
+        },
+        elapsed: began.elapsed(),
+        loaded_root,
+        archive_owner: owner.archive_owner_snapshot().ok().flatten(),
+        next_authority: None,
+    };
+    ArchiveCompletion {
+        owner: command.owner,
+        seal: command.seal,
+        receipt,
+        result,
+        deadline: command.work.deadline,
+        cancel: command.cancel,
+        foreign_permit: None,
+        profiled_foreign_permit: None,
+        profiled_retirement: None,
+    }
+}
+
+fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
+    if matches!(command.owner, ArchiveOwner::Idle(_)) {
+        return execute_idle(command);
+    }
+    let began = Instant::now();
+    let before = command
+        .owner
+        .legacy_engine()
+        .expect("sealed Engine/Port owner")
+        .stores()
+        .hot_stats();
     let mut budget = ArchiveIoBudget {
         deadline: command.work.deadline,
         max_bytes: command.work.max_io_bytes,
@@ -1200,7 +1441,10 @@ fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
         if Instant::now() >= command.work.deadline {
             return Err(ArchiveQuarantineReason::Deadline);
         }
-        let engine = command.owner.engine_mut();
+        let engine = command
+            .owner
+            .legacy_engine_mut()
+            .map_err(ArchiveQuarantineReason::Operation)?;
         let operation: Result<(), PalsError> = if let Some(payload) = profiled_retirement.as_mut() {
             // persist borrows the move-only owners and returns the actual ACK.
             // Save that ACK before any post-operation cancellation checks.
@@ -1314,7 +1558,10 @@ fn execute<M: RoleModel>(mut command: Command<M>) -> ArchiveCompletion<M> {
             budget.max_bytes = 0;
         }
     }
-    let engine = command.owner.engine();
+    let engine = command
+        .owner
+        .legacy_engine()
+        .expect("original Engine/Port owner");
     let receipt = ArchiveWorkReceipt {
         nonce: command.nonce,
         authority: command.seal.authority,
