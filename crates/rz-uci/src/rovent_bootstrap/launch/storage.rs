@@ -11,14 +11,20 @@ use crate::rovent_bootstrap::process_boundary::{
     PROCESS_SOURCE_SCOPE, ProcessBoundaryError, VerifiedRoventProcessBoundary,
     compiled_process_source_components,
 };
+use crate::{engine::ProcessClock, rovent_root_admission::RoventRootAdmission};
 use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
-use rz_contracts::Digest;
+use rz_contracts::{ContractError, Digest};
 use rz_experiments::{
     ArtifactRef, CompiledSourceInventoryV5, ManifestError, RoventInputLock, RoventStorageProfile,
 };
-use rz_search::pals::store::{ArchiveRootCapability, StoreError};
-#[cfg(target_os = "linux")]
+use rz_runtime::contracts::ContractClock;
+use rz_search::pals::engine::idle_archive::{
+    UnusedIdleArchiveSetup, UnusedIdleArchiveSetupControl, UnusedIdleArchiveSetupIdentity,
+};
+use rz_search::pals::store::{
+    ArchiveConfig, ArchiveRootCapability, ArchiveRuntimeLimits, StoreError,
+};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
@@ -39,6 +45,7 @@ const PRIVATE: usize = 2;
 const PROTECTED: usize = 3;
 // These are supported native-bridge limits, not codec/default selectors.
 const NATIVE_MAINTENANCE_IO_BYTES: u64 = 16 * 1024 * 1024;
+const RUNTIME_REGISTRATION_DOMAIN: &[u8] = b"rz-rovent-storage-runtime-registration/1";
 // Role order is the profile's source/codec/launch order, never its snapshot
 // artifact path. Snapshot paths remain inputs/... and do not become repo paths.
 const COMPILED_STORAGE_SOURCE_PATHS: [&str; 3] = [
@@ -181,6 +188,400 @@ impl RoventStorageCompiledCustody<'_, '_> {
     pub fn into_byte_custody(self) -> RoventStorageByteCustody {
         self.custody
     }
+}
+
+/// Original registration FD custody retained by the launcher, not the archive
+/// worker. The caller MUST retain this owner through setup completion and the
+/// actual worker join/physical shutdown. Dropping it attests neither event.
+///
+/// The clock/implementation captured here are expected namespace selections,
+/// not authority: only the later opaque original RoventRootAdmission can admit
+/// the first go. No CLI/session currently creates or consumes this entry.
+pub struct RoventStorageRuntimeRegistration<'boundary, 'process> {
+    custody: RoventStorageCompiledCustody<'boundary, 'process>,
+    state: StorageRuntimeState,
+}
+
+struct StorageRuntimeState {
+    expected_clock: ProcessClock,
+    expected_implementation: Digest,
+    identity: UnusedIdleArchiveSetupIdentity,
+    issued_admission: Option<Arc<RoventRootAdmission>>,
+}
+
+impl RoventStorageRuntimeRegistration<'_, '_> {
+    pub fn owners(&self) -> &RoventStorageAdmissionOwners {
+        self.custody.owners()
+    }
+    pub fn profile(&self) -> &RoventStorageProfile {
+        self.custody.profile()
+    }
+    /// Attribution only; this digest is not a worker/physical completion proof.
+    pub fn identity(&self) -> UnusedIdleArchiveSetupIdentity {
+        self.state.identity
+    }
+    pub fn issued_admission(&self) -> Option<&Arc<RoventRootAdmission>> {
+        self.state.issued_admission.as_ref()
+    }
+    pub fn retains_root_capability(&self) -> bool {
+        self.custody.retains_root_capability()
+    }
+    /// Take the original capability once, after every fallible validation.
+    /// Failure leaves this exact registration/capability with the caller and
+    /// returns its exact admission. Success keeps all other original FD owners
+    /// here and retains that admission; this owner must outlive worker closure.
+    ///
+    /// No startup deadline is renewed/reused here. The finite control is copied
+    /// only from an existing live original-go admission. Search still checks
+    /// its actual unused Idle/new_game_ready seal on submission. This makes no
+    /// worker, performs no archive IO and does not claim physical readiness.
+    pub fn take_unused_idle_setup(
+        &mut self,
+        admission: Arc<RoventRootAdmission>,
+    ) -> Result<UnusedIdleArchiveSetup, RoventStorageSetupRejection> {
+        split_unused_setup(&mut self.custody.custody, &mut self.state, admission)
+    }
+}
+
+#[derive(Debug)]
+pub enum RoventStorageRuntimeError {
+    Compiled(RoventStorageCompiledError),
+    Namespace(&'static str),
+    GoControl(ContractError),
+    GoNoLongerLive,
+    AlreadyIssued,
+    MissingCapability,
+}
+impl fmt::Display for RoventStorageRuntimeError {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Compiled(error) => write!(output, "storage runtime registration: {error}"),
+            Self::Namespace(reason) => write!(output, "storage expected namespace: {reason}"),
+            Self::GoControl(error) => write!(output, "storage original go control: {error}"),
+            Self::GoNoLongerLive => write!(output, "storage original go is stopped or expired"),
+            Self::AlreadyIssued => write!(output, "storage setup capability was already issued"),
+            Self::MissingCapability => write!(output, "storage original capability is absent"),
+        }
+    }
+}
+impl Error for RoventStorageRuntimeError {}
+
+/// Rejected startup-to-runtime conversion retains every original input owner
+/// plus the caller's exact expected namespace values. It issues no go authority.
+pub struct RoventStorageRuntimeRegistrationFailure<'boundary, 'process> {
+    pub error: RoventStorageRuntimeError,
+    pub custody: RoventStorageCompiledCustody<'boundary, 'process>,
+    pub expected_process_clock: ProcessClock,
+    pub expected_session_implementation: Digest,
+}
+impl fmt::Debug for RoventStorageRuntimeRegistrationFailure<'_, '_> {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        output
+            .debug_struct("RoventStorageRuntimeRegistrationFailure")
+            .field("error", &self.error)
+            .field(
+                "root_capability_retained",
+                &self.custody.retains_root_capability(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// The registration remains borrowed in-place on rejection. Only this exact
+/// original admission is returned; no replacement control/deadline is minted.
+#[derive(Debug)]
+pub struct RoventStorageSetupRejection {
+    pub error: RoventStorageRuntimeError,
+    pub admission: Arc<RoventRootAdmission>,
+}
+
+/// Freeze successful startup custody while its original startup control is
+/// still live. Expected clock/implementation must later come from the original
+/// driver constructor, not from the first admission being compared with them.
+/// They are selections, not source/physical authority, and cannot issue setup
+/// without an independently admitted original go. No worker/IO starts here.
+#[allow(clippy::result_large_err)]
+pub fn register_rovent_storage_runtime<'boundary, 'process>(
+    custody: RoventStorageCompiledCustody<'boundary, 'process>,
+    expected_process_clock: ProcessClock,
+    expected_session_implementation: Digest,
+) -> Result<
+    RoventStorageRuntimeRegistration<'boundary, 'process>,
+    RoventStorageRuntimeRegistrationFailure<'boundary, 'process>,
+> {
+    let prepared = (|| {
+        custody
+            .revalidate_startup()
+            .map_err(RoventStorageRuntimeError::Compiled)?;
+        let state = prepare_runtime_state(
+            &custody.custody,
+            &expected_process_clock,
+            expected_session_implementation,
+        )?;
+        // Identity framing/allocation must not cross the original startup
+        // boundary and then publish a new runtime registration as if live.
+        check(&custody.custody.owners.control)
+            .map_err(RoventStorageCompiledError::Admission)
+            .map_err(RoventStorageRuntimeError::Compiled)?;
+        Ok(state)
+    })();
+    match prepared {
+        Ok(state) => Ok(RoventStorageRuntimeRegistration { custody, state }),
+        Err(error) => Err(RoventStorageRuntimeRegistrationFailure {
+            error,
+            custody,
+            expected_process_clock,
+            expected_session_implementation,
+        }),
+    }
+}
+
+fn prepare_runtime_state(
+    custody: &RoventStorageByteCustody,
+    expected_clock: &ProcessClock,
+    expected_implementation: Digest,
+) -> Result<StorageRuntimeState, RoventStorageRuntimeError> {
+    if expected_clock.epoch().0 == 0 || expected_implementation == Digest([0; 32]) {
+        return Err(RoventStorageRuntimeError::Namespace(
+            "nonzero expected clock/implementation required",
+        ));
+    }
+    validate_runtime_profile(custody)?;
+    if !custody.retains_root_capability() {
+        return Err(RoventStorageRuntimeError::MissingCapability);
+    }
+    let identity = runtime_identity(custody, expected_clock, expected_implementation)?;
+    Ok(StorageRuntimeState {
+        expected_clock: expected_clock.clone(),
+        expected_implementation,
+        identity,
+        issued_admission: None,
+    })
+}
+
+fn validate_runtime_profile(
+    custody: &RoventStorageByteCustody,
+) -> Result<(), RoventStorageRuntimeError> {
+    verify_native_allowance(custody.profile().maintenance_io_bytes_max)
+        .map_err(RoventStorageRuntimeError::Compiled)?;
+    custody
+        .profile()
+        .validate_for_manifest(&custody.owners.input_lock.manifest)
+        .map_err(RoventStorageCompiledError::Input)
+        .map_err(RoventStorageRuntimeError::Compiled)
+}
+
+fn runtime_identity(
+    custody: &RoventStorageByteCustody,
+    clock: &ProcessClock,
+    implementation: Digest,
+) -> Result<UnusedIdleArchiveSetupIdentity, RoventStorageRuntimeError> {
+    let fail = RoventStorageRuntimeError::Compiled;
+    let profile_text = custody
+        .profile()
+        .canonical_sha256()
+        .map_err(RoventStorageCompiledError::Input)
+        .map_err(fail)?;
+    let profile = compiled_digest(&profile_text).map_err(fail)?;
+    let input_lock = compiled_digest(custody.input_lock_sha256()).map_err(fail)?;
+    let aggregate = rz_experiments::rovent_source_aggregate_sha256(
+        &custody.owners.input_lock.manifest.engine.source_commit,
+        &custody.owners.input_lock.manifest.engine.source_components,
+    )
+    .map_err(RoventStorageCompiledError::Input)
+    .map_err(fail)?;
+    let mut hash = Sha256::new();
+    hash_frame(&mut hash, RUNTIME_REGISTRATION_DOMAIN);
+    hash.update(profile.0);
+    hash.update(input_lock.0);
+    hash.update(compiled_digest(&aggregate).map_err(fail)?.0);
+    hash_frame(&mut hash, PROCESS_SOURCE_SCOPE.as_bytes());
+    hash_frame(
+        &mut hash,
+        custody
+            .owners
+            .input_lock
+            .manifest
+            .engine
+            .source_commit
+            .as_bytes(),
+    );
+    // Expected epoch/implementation are framed as selections, not proof. The
+    // raw Instant origin is never serialized; the retained clock is compared
+    // directly with the actual admitted clock on first use.
+    hash.update(clock.epoch().0.to_le_bytes());
+    hash.update(implementation.0);
+    for (role, directory) in [b"archive".as_slice(), b"checkout", b"private", b"protected"]
+        .into_iter()
+        .zip(&custody.owners.directories)
+    {
+        let directory = directory
+            .as_ref()
+            .ok_or(RoventStorageRuntimeError::Namespace(
+                "original runtime directory is absent",
+            ))?;
+        hash_frame(&mut hash, role);
+        hash.update(directory.identity.0.to_le_bytes());
+        hash.update(directory.identity.1.to_le_bytes());
+    }
+    let artifact = custody
+        .owners
+        .artifact
+        .as_ref()
+        .ok_or(RoventStorageRuntimeError::Namespace(
+            "original profile artifact is absent",
+        ))?;
+    hash.update(artifact.bytes.to_le_bytes());
+    hash.update(compiled_digest(&artifact.sha256).map_err(fail)?.0);
+    Ok(UnusedIdleArchiveSetupIdentity {
+        profile,
+        input_lock,
+        registration: Digest(hash.finalize().into()),
+    })
+}
+
+fn hash_frame(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_le_bytes());
+    hash.update(value);
+}
+
+struct PreparedSetupValues {
+    config: ArchiveConfig,
+    limits: ArchiveRuntimeLimits,
+    control: UnusedIdleArchiveSetupControl,
+}
+
+fn validate_original_setup_go(
+    custody: &RoventStorageByteCustody,
+    state: &StorageRuntimeState,
+    admission: &RoventRootAdmission,
+) -> Result<(), RoventStorageRuntimeError> {
+    if state.issued_admission.is_some() {
+        return Err(RoventStorageRuntimeError::AlreadyIssued);
+    }
+    validate_runtime_profile(custody)?;
+    let actual = admission.runtime_clock();
+    let expected = state.expected_clock.runtime_clock();
+    let context = admission.original_context();
+    if admission.startup_lock_digest() != state.identity.input_lock
+        || compiled_digest(custody.input_lock_sha256())
+            .map_err(RoventStorageRuntimeError::Compiled)?
+            != state.identity.input_lock
+        || admission.authority().epoch != state.expected_clock.epoch()
+        || admission.authority().implementation != state.expected_implementation
+        || actual.domain() != expected.domain()
+        || actual.origin() != expected.origin()
+    {
+        return Err(RoventStorageRuntimeError::Namespace(
+            "original go lock/epoch/implementation/clock differs",
+        ));
+    }
+    for (instant, sealed) in [
+        (context.control.deadline, admission.hard_deadline()),
+        (context.control.soft_deadline, admission.soft_deadline()),
+        (
+            context.control.admission_deadline,
+            admission.admission_deadline(),
+        ),
+        (context.shutdown_deadline, admission.cleanup_deadline()),
+    ] {
+        if state
+            .expected_clock
+            .deadline(instant)
+            .map_err(RoventStorageRuntimeError::GoControl)?
+            != sealed
+        {
+            return Err(RoventStorageRuntimeError::Namespace(
+                "original go clock/control seal differs",
+            ));
+        }
+    }
+    if !context
+        .accepts()
+        .map_err(RoventStorageRuntimeError::GoControl)?
+    {
+        return Err(RoventStorageRuntimeError::GoNoLongerLive);
+    }
+    Ok(())
+}
+
+fn prepare_setup_values(
+    custody: &RoventStorageByteCustody,
+    state: &StorageRuntimeState,
+    admission: &RoventRootAdmission,
+) -> Result<PreparedSetupValues, RoventStorageRuntimeError> {
+    validate_original_setup_go(custody, state, admission)?;
+    if !custody.retains_root_capability() {
+        return Err(RoventStorageRuntimeError::MissingCapability);
+    }
+    let selected = custody.profile().archive_limits;
+    let limits = ArchiveRuntimeLimits {
+        game_bytes_max: selected.game_bytes_max,
+        global_bytes_max: selected.global_bytes_max,
+        index_entries_max: selected.index_entries_max,
+        index_bytes_max: selected.index_bytes_max,
+        load_bytes_max: selected.load_bytes_max,
+        load_deadline_max_ms: selected.load_deadline_max_ms,
+        record_payload_bytes_max: selected.record_payload_bytes_max,
+        max_load_pins: selected.max_load_pins,
+    };
+    let root = custody.owners.directories[ARCHIVE].as_ref().ok_or(
+        RoventStorageRuntimeError::Namespace("original archive directory is absent"),
+    )?;
+    let checkout = custody.owners.directories[CHECKOUT].as_ref().ok_or(
+        RoventStorageRuntimeError::Namespace("original checkout directory is absent"),
+    )?;
+    // validate_for_manifest checked max_load_pins <= 16, which fits usize on
+    // every supported native target; no runtime selector/default is invented.
+    let max_load_pins = selected.max_load_pins as usize;
+    Ok(PreparedSetupValues {
+        config: ArchiveConfig {
+            root: root.path.clone(),
+            repository_root: checkout.path.clone(),
+            game_bytes: selected.game_bytes_max,
+            global_bytes: selected.global_bytes_max,
+            record_bytes: selected.record_payload_bytes_max,
+            max_load_pins,
+        },
+        limits,
+        control: UnusedIdleArchiveSetupControl {
+            deadline: admission.original_context().control.deadline,
+            cancellation: Arc::clone(&admission.original_context().control.cancellation),
+            max_io_bytes: custody.profile().maintenance_io_bytes_max,
+        },
+    })
+}
+
+fn split_unused_setup(
+    custody: &mut RoventStorageByteCustody,
+    state: &mut StorageRuntimeState,
+    admission: Arc<RoventRootAdmission>,
+) -> Result<UnusedIdleArchiveSetup, RoventStorageSetupRejection> {
+    let prepared = match prepare_setup_values(custody, state, &admission).and_then(|prepared| {
+        // Last fallible/liveness check precedes the sole capability take.
+        validate_original_setup_go(custody, state, &admission)?;
+        Ok(prepared)
+    }) {
+        Ok(prepared) => prepared,
+        Err(error) => return Err(RoventStorageSetupRejection { error, admission }),
+    };
+    let Some(capability) = custody.owners.capability.take() else {
+        return Err(RoventStorageSetupRejection {
+            error: RoventStorageRuntimeError::MissingCapability,
+            admission,
+        });
+    };
+    // Every following operation is an infallible move/Arc increment. The
+    // original startup control and all other original FDs remain untouched.
+    let setup = UnusedIdleArchiveSetup::new(
+        prepared.config,
+        capability,
+        prepared.limits,
+        state.identity,
+        prepared.control,
+    );
+    state.issued_admission = Some(admission);
+    Ok(setup)
 }
 
 #[derive(Debug)]
@@ -1074,6 +1475,9 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::with_maintenance(1 << 20)
+        }
+        fn with_maintenance(maintenance_io_bytes_max: u64) -> Self {
             let scratch = Scratch::new();
             let private_path = scratch.0.join("private");
             let checkout = scratch.0.join("checkout");
@@ -1106,7 +1510,7 @@ mod tests {
                     record_payload_bytes_max: 1024,
                     max_load_pins: 1,
                 },
-                maintenance_io_bytes_max: 1 << 20,
+                maintenance_io_bytes_max,
                 worker_threads: 1,
                 command_capacity: 1,
                 completion_capacity: 1,
@@ -1165,6 +1569,58 @@ mod tests {
         }
     }
 
+    fn runtime_fixture() -> Fixture {
+        let mut fixture = Fixture::with_maintenance(NATIVE_MAINTENANCE_IO_BYTES);
+        let mut manifest = fixture.lock.manifest.clone();
+        manifest.engine.search.rules_profile_sha256 =
+            crate::rovent_bootstrap::hex(rz_position::contracts::profile_digest().0);
+        fixture.lock = Arc::new(manifest.lock().unwrap());
+        fixture
+    }
+
+    fn original_go_admission(
+        lock: &RoventInputLock,
+        clock: &ProcessClock,
+        implementation: Digest,
+    ) -> Arc<RoventRootAdmission> {
+        use crate::engine::driver_start_fixture::{FixtureStart, issue_start};
+        let position = rz_position::Position::startpos();
+        let start = clock.runtime_clock().origin();
+        let context = match issue_start(
+            &position,
+            crate::parser::GoLimits::default(),
+            rz_contracts::pals::SearchAuthority {
+                epoch: clock.epoch(),
+                game: rz_contracts::GameGeneration(1),
+                root: rz_contracts::RootGeneration(1),
+                implementation,
+            },
+            clock,
+            start,
+            crate::bridge::BuildSearchSettings {
+                time_config: rz_search::time::TimeBudgetConfig::default(),
+                max_simulations: 4096,
+                untimed_limit: Duration::from_secs(10),
+            },
+            Duration::from_millis(500),
+        )
+        .unwrap()
+        {
+            FixtureStart::Started(context) => context,
+            FixtureStart::RulesOnly(_) => panic!("ongoing actual Rules Start is required"),
+        };
+        Arc::new(
+            RoventRootAdmission::admit(
+                lock,
+                crate::rovent_root_admission::RoventRootAdmissionPolicy::DynamicGo,
+                &position,
+                &context,
+                clock,
+            )
+            .unwrap(),
+        )
+    }
+
     fn artifact(path: &str, raw: &[u8]) -> ArtifactRef {
         ArtifactRef {
             path: path.into(),
@@ -1217,6 +1673,177 @@ mod tests {
             "agent_renewable":true,"provenance":provenance
         });
         RoventExecutionManifest::from_json(&value.to_string()).unwrap()
+    }
+
+    #[test]
+    fn runtime_split_is_one_shot_and_uses_original_go_control_after_startup_ends() {
+        use std::os::fd::AsRawFd;
+        let fixture = runtime_fixture();
+        let clock = ProcessClock::new(rz_contracts::ProcessEpoch(7201));
+        let implementation = Digest([9; 32]);
+        let mut custody = fixture.admit().unwrap();
+        // Test only the private split core; do not fabricate a compiled/process
+        // proof or a public RuntimeRegistration for the synthetic source files.
+        let mut state = prepare_runtime_state(&custody, &clock, implementation).unwrap();
+        let original_startup_until = custody.owners.control.until;
+        let original_profile_fd = custody.owners().profile_file().unwrap().as_raw_fd();
+        let original_source_fd = custody.owners().source_file(0).unwrap().as_raw_fd();
+        let admission = original_go_admission(&fixture.lock, &clock, implementation);
+        let before = prepare_setup_values(&custody, &state, &admission).unwrap();
+        assert_eq!(
+            before.control.deadline,
+            admission.original_context().control.deadline
+        );
+        assert_eq!(before.control.max_io_bytes, NATIVE_MAINTENANCE_IO_BYTES);
+        assert!(Arc::ptr_eq(
+            &before.control.cancellation,
+            &admission.original_context().control.cancellation
+        ));
+        // Mark the retained startup-only control stopped, without renewing it.
+        // The independent live original go still owns its different cancel Arc.
+        custody.owners.control.until = Instant::now();
+        custody
+            .owners
+            .control
+            .cancellation
+            .store(true, Ordering::Release);
+        assert!(custody.revalidate_startup().is_err());
+        let setup = split_unused_setup(&mut custody, &mut state, Arc::clone(&admission)).unwrap();
+        assert_eq!(setup.identity(), state.identity);
+        assert_eq!(setup.runtime_limits(), before.limits);
+        assert!(Arc::ptr_eq(
+            state.issued_admission.as_ref().unwrap(),
+            &admission
+        ));
+        assert!(!custody.retains_root_capability());
+        assert_eq!(
+            custody.owners().profile_file().unwrap().as_raw_fd(),
+            original_profile_fd
+        );
+        assert_eq!(
+            custody.owners().source_file(0).unwrap().as_raw_fd(),
+            original_source_fd
+        );
+        assert!(custody.owners.control.until <= original_startup_until);
+        assert!(custody.owners.control.cancellation.load(Ordering::Acquire));
+        let duplicate = split_unused_setup(&mut custody, &mut state, Arc::clone(&admission))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            duplicate.error,
+            RoventStorageRuntimeError::AlreadyIssued
+        ));
+        assert!(Arc::ptr_eq(&duplicate.admission, &admission));
+        // Creating/moving the payload starts no worker and creates no game.
+        assert_eq!(fs::read_dir(&fixture.archive).unwrap().count(), 0);
+        drop(setup);
+    }
+
+    #[test]
+    fn runtime_split_rejects_other_opaque_lock_implementation_epoch_and_clock_origin() {
+        let fixture = runtime_fixture();
+        let clock = ProcessClock::new(rz_contracts::ProcessEpoch(7202));
+        let implementation = Digest([10; 32]);
+        let mut custody = fixture.admit().unwrap();
+        let mut state = prepare_runtime_state(&custody, &clock, implementation).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+        let same_epoch_other_clock = ProcessClock::new(clock.epoch());
+        assert_ne!(
+            same_epoch_other_clock.runtime_clock().origin(),
+            clock.runtime_clock().origin()
+        );
+        let other_epoch = ProcessClock::new(rz_contracts::ProcessEpoch(7203));
+        let mut other_lock = fixture.lock.manifest.clone();
+        other_lock.run_id = "other-original-startup-lock".into();
+        let other_lock = other_lock.lock().unwrap();
+        let admissions = [
+            original_go_admission(&other_lock, &clock, implementation),
+            original_go_admission(&fixture.lock, &clock, Digest([11; 32])),
+            original_go_admission(&fixture.lock, &same_epoch_other_clock, implementation),
+            original_go_admission(&fixture.lock, &other_epoch, implementation),
+        ];
+        for admission in admissions {
+            let original_cap = custody.owners.capability.as_ref().unwrap() as *const _;
+            let rejected = split_unused_setup(&mut custody, &mut state, Arc::clone(&admission))
+                .err()
+                .unwrap();
+            assert!(matches!(
+                rejected.error,
+                RoventStorageRuntimeError::Namespace(_)
+            ));
+            assert!(Arc::ptr_eq(&rejected.admission, &admission));
+            assert!(Arc::ptr_eq(custody.owners().input_lock(), &fixture.lock));
+            assert_eq!(
+                custody.owners.capability.as_ref().unwrap() as *const _,
+                original_cap
+            );
+            assert!(state.issued_admission.is_none());
+        }
+        assert_eq!(fs::read_dir(&fixture.archive).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn runtime_split_stopped_original_go_preserves_the_complete_unissued_custody() {
+        use std::os::fd::AsRawFd;
+        let fixture = runtime_fixture();
+        let clock = ProcessClock::new(rz_contracts::ProcessEpoch(7204));
+        let implementation = Digest([12; 32]);
+        let mut custody = fixture.admit().unwrap();
+        let mut state = prepare_runtime_state(&custody, &clock, implementation).unwrap();
+        let admission = original_go_admission(&fixture.lock, &clock, implementation);
+        let fd = custody.owners().source_file(2).unwrap().as_raw_fd();
+        admission
+            .original_context()
+            .control
+            .cancellation
+            .store(true, Ordering::Release);
+        let rejected = split_unused_setup(&mut custody, &mut state, Arc::clone(&admission))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            rejected.error,
+            RoventStorageRuntimeError::GoNoLongerLive
+        ));
+        assert!(Arc::ptr_eq(&rejected.admission, &admission));
+        assert!(state.issued_admission.is_none());
+        assert!(custody.retains_root_capability());
+        assert_eq!(custody.owners().source_file(2).unwrap().as_raw_fd(), fd);
+        assert!(custody.revalidate_startup().is_ok());
+        assert_eq!(fs::read_dir(&fixture.archive).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn runtime_state_keeps_exact_profile_and_rejects_smaller_native_maintenance() {
+        let fixture = Fixture::new();
+        let custody = fixture.admit().unwrap();
+        let clock = ProcessClock::new(rz_contracts::ProcessEpoch(7205));
+        let original = custody.profile().clone();
+        let error = prepare_runtime_state(&custody, &clock, Digest([13; 32]))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            RoventStorageRuntimeError::Compiled(
+                RoventStorageCompiledError::UnsupportedMaintenanceIoBytes {
+                    requested: 1048576,
+                    ..
+                }
+            )
+        ));
+        assert_eq!(custody.profile(), &original);
+        assert!(custody.retains_root_capability());
+        assert!(Arc::ptr_eq(custody.owners().input_lock(), &fixture.lock));
+        let fixture = runtime_fixture();
+        let mut custody = fixture.admit().unwrap();
+        let mut manifest = custody.owners.input_lock.manifest.clone();
+        manifest.resources.pools.retain(|pool| {
+            !pool
+                .actors
+                .contains(&rz_experiments::RoventActor::RuntimeHelper)
+        });
+        custody.owners.input_lock = Arc::new(manifest.lock().unwrap());
+        assert!(prepare_runtime_state(&custody, &clock, Digest([13; 32])).is_err());
+        assert!(custody.retains_root_capability());
     }
 
     #[test]
