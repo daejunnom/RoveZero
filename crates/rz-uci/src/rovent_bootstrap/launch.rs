@@ -708,7 +708,7 @@ fn run_inner<'a>(
         ));
     }
     let selection_file = selected[0]
-        .open_verified_at(&root, MAX_SELECTION_BYTES)
+        .open_verified_at(root, MAX_SELECTION_BYTES)
         .map_err(|failure| error("Assets", failure))?;
     let selection = SelectionWire::parse(&read_bounded(&selection_file, MAX_SELECTION_BYTES)?)?;
     let collection_preload = teacher_selections
@@ -779,7 +779,7 @@ fn run_inner<'a>(
                 ));
             }
             let mapping = matching[0]
-                .open_verified_at(&root, MAX_SELECTION_BYTES)
+                .open_verified_at(root, MAX_SELECTION_BYTES)
                 .map_err(|failure| error("ExternalSources", failure))?;
             let selected =
                 ExternalSelectionWire::parse(&read_bounded(&mapping, MAX_SELECTION_BYTES)?)?;
@@ -814,7 +814,7 @@ fn run_inner<'a>(
             Some(
                 LaunchRetirementEvidence::open(
                     &lock,
-                    &root,
+                    root,
                     registration,
                     managed_root,
                     &cwd,
