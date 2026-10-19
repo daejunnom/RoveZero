@@ -49,6 +49,7 @@ const MAX_SELECTION_BYTES: u64 = 64 << 10;
 mod cohort_prepare;
 mod collection;
 mod evidence;
+pub mod storage;
 pub use cohort_prepare::{
     EXPECTED_UTILITY_COHORT_PREPARATION, ExpectedUtilityCohortPreparation,
     prepare_expected_utility_cohort_source_pins,
