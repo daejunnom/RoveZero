@@ -1650,6 +1650,8 @@ where
                 observed.archive_operation = Some(match quarantine.receipt.operation {
                     ArchiveOperationKind::PrepareRoot => "prepare_root",
                     ArchiveOperationKind::LoadRoot => "load_root",
+                    ArchiveOperationKind::RestoreRootIfArchived => "restore_root_if_archived",
+                    ArchiveOperationKind::FinishIdleGame => "finish_idle_game",
                     ArchiveOperationKind::ReclaimHot => "reclaim_hot",
                     ArchiveOperationKind::PrepareForeign => "prepare_foreign",
                     ArchiveOperationKind::NewGame => "new_game",

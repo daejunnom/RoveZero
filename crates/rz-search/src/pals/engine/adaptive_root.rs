@@ -5,7 +5,7 @@
 
 use super::archive_lifecycle::allocation_controls;
 use super::*;
-use crate::pals::store::StoreReadOwner;
+use crate::pals::store::{ArchiveOwnerSnapshot, ArchiveStats, StoreReadOwner};
 use rz_contracts::pals::SearchAuthority;
 use std::sync::{Arc, Weak};
 
@@ -41,7 +41,124 @@ pub struct AdaptiveRootRegistration {
     snapshot: PositionSnapshot,
 }
 
+/// Private, move-only permission for one already idle archive-game transition.
+/// It binds the old Store and unspent registry state, not merely a next tuple.
+pub(super) struct IdleArchiveGameSeal {
+    registry: Weak<()>,
+    store: StoreReadOwner,
+    generation: u64,
+    game: u64,
+    last: Option<SearchAuthority>,
+    nonce: u64,
+    next: SearchAuthority,
+    archive: ArchiveOwnerSnapshot,
+}
+impl IdleArchiveGameSeal {
+    pub(super) fn validate<M: RoleModel>(
+        &self,
+        semantic: &PalsSemanticState<M>,
+    ) -> Result<(), PalsError> {
+        semantic.ensure_adaptive_logical_quiescence()?;
+        if !self.registry.ptr_eq(&semantic.adaptive_registry_identity())
+            || !self.store.matches(&semantic.stores)
+            || semantic.stores.generation() != self.generation
+            || semantic.game_generation != Some(self.game)
+            || semantic.last_adaptive_authority() != self.last
+            || semantic.adaptive_root_registry.next_nonce != self.nonce
+            || semantic.adaptive_root_registry.pending_nonce.is_some()
+        {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        Ok(())
+    }
+}
+
 impl<M: RoleModel> PalsSemanticState<M> {
+    pub(super) fn validate_idle_new_game_target(
+        &self,
+        next: SearchAuthority,
+    ) -> Result<IdleArchiveGameSeal, PalsError> {
+        self.ensure_archive_admission_open()?;
+        self.ensure_adaptive_logical_quiescence()?;
+        self.validate_adaptive_namespace(next)?;
+        let game = self.game_generation.ok_or(StoreError::StaleConsumer)?;
+        if next.game.0 <= game || self.adaptive_root_registry.pending_nonce.is_some() {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        let archive = self
+            .stores
+            .archive_owner_snapshot()?
+            .ok_or(StoreError::ArchiveDisabled)?;
+        if archive.admission_closed || !archive.complete {
+            return Err(
+                StoreError::InvalidConditions("idle newgame archive owner is not open").into(),
+            );
+        }
+        Ok(IdleArchiveGameSeal {
+            registry: self.adaptive_registry_identity(),
+            store: self.stores.read_owner(),
+            generation: self.stores.generation(),
+            game,
+            last: self.last_adaptive_authority(),
+            nonce: self.adaptive_root_registry.next_nonce,
+            next,
+            archive,
+        })
+    }
+
+    pub(super) fn commit_idle_new_game_scope(
+        &mut self,
+        seal: &IdleArchiveGameSeal,
+        replacement: &mut Option<Box<PalsStores>>,
+    ) -> Result<(), PalsError> {
+        seal.validate(self)?;
+        let previous =
+            self.archive_state
+                .closed_current_owner
+                .ok_or(StoreError::InvalidConditions(
+                    "idle newgame original close missing",
+                ))?;
+        let next_store = replacement.as_ref().ok_or(StoreError::InvalidConditions(
+            "idle newgame original replacement missing",
+        ))?;
+        let next = next_store
+            .archive_owner_snapshot()?
+            .ok_or(StoreError::ArchiveDisabled)?;
+        if previous.owner_id != seal.archive.owner_id
+            || !previous.admission_closed
+            || !previous.complete
+            || next.owner_id == previous.owner_id
+            || next.admission_closed
+            || !next.complete
+            || next.root_sha256 != previous.root_sha256
+            || next.repository_sha256 != previous.repository_sha256
+            || next.runtime_limits != previous.runtime_limits
+            || next.session_write_ledger_id != previous.session_write_ledger_id
+            || next.session_write_bytes_max != previous.session_write_bytes_max
+            || next.session_write_bytes_consumed != previous.session_write_bytes_consumed
+            || next.write_bytes_reserved != 0
+            || next_store.generation() != 0
+            || next_store.root().is_some()
+            || next_store.hot_stats() != ArchiveStats::default()
+            || seal.store.matches(next_store)
+        {
+            return Err(StoreError::InvalidConditions(
+                "idle newgame original Store/ledger transfer",
+            )
+            .into());
+        }
+        // A model callback can panic. Keep both actual Stores in their owner
+        // slots until it returns; all later publication steps are infallible.
+        self.model.new_game_with_generation(Some(seal.next.game.0));
+        self.publish_idle_archive_game(
+            seal.next,
+            replacement.take().expect("validated original replacement"),
+            previous,
+        );
+        self.adaptive_root_registry.new_game_ready = Some(seal.next);
+        Ok(())
+    }
+
     pub(super) fn adaptive_registry_identity(&self) -> Weak<()> {
         Arc::downgrade(&self.adaptive_root_registry.identity)
     }

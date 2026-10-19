@@ -3249,6 +3249,52 @@ impl PalsStores {
         self.archive = Some(manager);
         result
     }
+    /// Final idle-game checkpoint, including raw cancelled/unconsumed facts.
+    /// This changes no task status, acceptance, consumption or hot ownership.
+    /// The concrete caller owns the physical fence; this guard checks only the
+    /// original Store's logical work and private IDs before the existing codec.
+    pub(crate) fn archive_all_hot_engine_records_with_budget(
+        &mut self,
+        records: &[crate::pals::engine::RoleRecord],
+        nodes: &[EngineArchiveNode],
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<EngineArchiveReceipt, StoreError> {
+        self.reject_archive_allocation_scope()?;
+        budget.check()?;
+        if self.review_pin_count()? != 0 || self.tasks.active_states().next().is_some() {
+            return Err(StoreError::InvalidConditions(
+                "final archive checkpoint still owns logical work",
+            ));
+        }
+        let selection = StorePins {
+            states: self
+                .states
+                .snapshots
+                .entries()
+                .map(|(id, _)| StateId(id))
+                .collect(),
+            lines: self
+                .lines
+                .chunks
+                .entries()
+                .map(|(id, _)| LineId(id))
+                .collect(),
+            observations: self
+                .observations
+                .observations
+                .entries()
+                .map(|(id, _)| ObservationId(id))
+                .collect(),
+            situations: self.situations.iter().map(|(id, _)| id).collect(),
+            executions: self
+                .tasks
+                .tasks
+                .entries()
+                .map(|(id, _)| ExecutionId(id))
+                .collect(),
+        };
+        self.archive_engine_records_with_pins_and_budget(records, nodes, selection, budget)
+    }
     pub fn lookup_cold_state(
         &self,
         snapshot: &PositionSnapshot,

@@ -1,12 +1,16 @@
 //! Exact archive maintenance while the original semantic owner has no root work.
 //! This custody is not a physical fence. The concrete UCI owner must retain its
 //! actual native/actor acknowledgements before lending either idle owner here.
-use super::archive_lifecycle::{SEARCH_ARCHIVE_IO_BYTES, allocation_controls};
+use super::adaptive_root::IdleArchiveGameSeal;
+use super::archive_lifecycle::{
+    IdleArchiveCheckpoint, SEARCH_ARCHIVE_IO_BYTES, allocation_controls,
+    observe_selected_archive_usage,
+};
 use super::preparing_root::ResearcherPreparingOwner;
 use super::*;
 use crate::pals::store::{
     ArchiveConfig, ArchiveIoBudget, ArchiveOwnerSnapshot, ArchiveRootCapability,
-    ArchiveRuntimeLimits, StorePins,
+    ArchiveRuntimeLimits, ArchiveStats, StorePins,
 };
 use rz_contracts::pals::SearchAuthority;
 use std::sync::Weak;
@@ -16,11 +20,54 @@ enum IdleOwner<M: RoleModel> {
     Pc(Box<PcSemanticOwner<M>>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IdleArchiveTransitionKind {
+    NewGame(SearchAuthority),
+    Finish,
+}
+struct PendingIdleArchive {
+    kind: IdleArchiveTransitionKind,
+    seal: Option<IdleArchiveGameSeal>,
+    store: crate::pals::store::StoreReadOwner,
+    generation: u64,
+    revision: u64,
+    deadline: Instant,
+    remaining_io: u64,
+    preflight_complete: bool,
+    checkpoint: Option<Arc<IdleArchiveCheckpoint>>,
+    replacement: Option<Box<PalsStores>>,
+    replacement_inherited: bool,
+    replacement_observed: bool,
+    completed: bool,
+    completion_unknown: bool,
+    #[cfg(test)]
+    cancel_after_close: bool,
+}
+
+/// Read-only bounded transition facts. These grant no root, archive or physical
+/// authority; a failed/closed transition remains inside its original wrapper.
+#[derive(Clone, Debug)]
+pub struct IdleArchiveTransitionSnapshot {
+    pub next_authority: Option<SearchAuthority>,
+    pub original_deadline: Instant,
+    pub remaining_io_bytes: u64,
+    pub checkpoint: Option<Arc<IdleArchiveCheckpoint>>,
+    pub original_closed: Option<ArchiveOwnerSnapshot>,
+    pub replacement: Option<ArchiveOwnerSnapshot>,
+    pub completed: bool,
+    pub completion_unknown: bool,
+}
+
 /// One original heap owner moves through the existing one-slot archive worker.
 /// No checker, TT, model execution, root authority or physical receipt is made.
 pub struct IdleSemanticArchiveOwner<M: RoleModel> {
     owner: IdleOwner<M>,
     identity: Arc<()>,
+    pending: Option<Box<PendingIdleArchive>>,
+    last_checkpoint: Option<Arc<IdleArchiveCheckpoint>>,
+    last_transition_remaining: Option<u64>,
+    #[cfg(test)]
+    cancel_after_close: bool,
 }
 
 impl<M: RoleModel> ResearcherPreparingOwner<M> {
@@ -34,6 +81,11 @@ impl<M: RoleModel> ResearcherPreparingOwner<M> {
         Ok(IdleSemanticArchiveOwner {
             owner: IdleOwner::Researcher(self),
             identity: Arc::new(()),
+            pending: None,
+            last_checkpoint: None,
+            last_transition_remaining: None,
+            #[cfg(test)]
+            cancel_after_close: false,
         })
     }
 }
@@ -48,18 +100,29 @@ impl<M: RoleModel> PcSemanticOwner<M> {
         Ok(IdleSemanticArchiveOwner {
             owner: IdleOwner::Pc(self),
             identity: Arc::new(()),
+            pending: None,
+            last_checkpoint: None,
+            last_transition_remaining: None,
+            #[cfg(test)]
+            cancel_after_close: false,
         })
     }
 }
 
 impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
     pub fn into_researcher(self) -> Result<Box<ResearcherPreparingOwner<M>>, Self> {
+        if self.pending.is_some() {
+            return Err(self);
+        }
         match self.owner {
             IdleOwner::Researcher(owner) => Ok(owner),
             IdleOwner::Pc(_) => Err(self),
         }
     }
     pub fn into_pc(self) -> Result<Box<PcSemanticOwner<M>>, Self> {
+        if self.pending.is_some() {
+            return Err(self);
+        }
         match self.owner {
             IdleOwner::Pc(owner) => Ok(owner),
             IdleOwner::Researcher(_) => Err(self),
@@ -81,6 +144,12 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
     /// the original Store archive and preserves its closed observation.
     pub fn close_archive_owner(&mut self) -> Result<Option<ArchiveOwnerSnapshot>, PalsError> {
         self.validate_idle()?;
+        if self.stores().hot_stats() != ArchiveStats::default() {
+            return Err(StoreError::InvalidConditions(
+                "hot idle game requires its final checkpoint before close",
+            )
+            .into());
+        }
         let semantic = self.semantic_mut();
         let closed = semantic.stores.close_archive_owner()?;
         semantic.archive_state.closed_current_owner = closed;
@@ -162,6 +231,11 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         }
     }
     pub(super) fn validate_idle(&self) -> Result<(), PalsError> {
+        if self.pending.is_some() {
+            return Err(
+                StoreError::InvalidConditions("idle archive transition is retained").into(),
+            );
+        }
         if let Some(error) = &self.semantic().archive_state.reopen_error {
             return Err(PalsError::Store(error.clone()));
         }
@@ -221,6 +295,170 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
     pub(super) fn remaining_io(&self) -> u64 {
         self.semantic().archive_remaining_io()
     }
+
+    pub fn last_checkpoint(&self) -> Option<Arc<IdleArchiveCheckpoint>> {
+        self.pending
+            .as_ref()
+            .and_then(|pending| pending.checkpoint.clone())
+            .or_else(|| self.last_checkpoint.clone())
+    }
+    pub fn transition_snapshot(&self) -> Result<Option<IdleArchiveTransitionSnapshot>, PalsError> {
+        self.pending
+            .as_ref()
+            .map(|pending| {
+                Ok(IdleArchiveTransitionSnapshot {
+                    next_authority: match pending.kind {
+                        IdleArchiveTransitionKind::NewGame(next) => Some(next),
+                        IdleArchiveTransitionKind::Finish => None,
+                    },
+                    original_deadline: pending.deadline,
+                    remaining_io_bytes: pending.remaining_io,
+                    checkpoint: pending.checkpoint.clone(),
+                    original_closed: self.semantic().archive_state.closed_current_owner,
+                    replacement: pending
+                        .replacement
+                        .as_ref()
+                        .map(|store| store.archive_owner_snapshot())
+                        .transpose()?
+                        .flatten(),
+                    completed: pending.completed,
+                    completion_unknown: pending.completion_unknown,
+                })
+            })
+            .transpose()
+    }
+    pub(super) fn transition_remaining_io(&self) -> u64 {
+        self.pending
+            .as_ref()
+            .map(|pending| pending.remaining_io)
+            .or(self.last_transition_remaining)
+            .unwrap_or(SEARCH_ARCHIVE_IO_BYTES)
+    }
+    pub(super) fn pending_transition_io(&self) -> Option<u64> {
+        self.pending.as_ref().map(|pending| pending.remaining_io)
+    }
+    pub(super) fn quarantine_transition_unknown(&mut self) {
+        if let Some(pending) = &mut self.pending {
+            pending.completion_unknown = true;
+            // A panic can interrupt a real commit before its debit returns.
+            // Keep the original owners and reserve, never refund that allowance.
+            pending.remaining_io = 0;
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn cancel_after_close_for_test(&mut self) {
+        self.cancel_after_close = true;
+    }
+    pub(super) fn validate_transition_request(
+        &self,
+        kind: IdleArchiveTransitionKind,
+        deadline: Instant,
+    ) -> Result<(), PalsError> {
+        self.semantic().ensure_adaptive_logical_quiescence()?;
+        if let Some(pending) = &self.pending {
+            if pending.kind != kind
+                || deadline > pending.deadline
+                || pending.completed
+                || pending.completion_unknown
+                || !pending.store.matches(self.stores())
+                || pending.generation != self.stores().generation()
+                || pending.revision != self.semantic().revision
+            {
+                return Err(StoreError::StaleConsumer.into());
+            }
+            if let Some(seal) = &pending.seal {
+                seal.validate(self.semantic())?;
+            }
+        } else {
+            self.validate_idle()?;
+            if let IdleArchiveTransitionKind::NewGame(next) = kind {
+                self.semantic().validate_idle_new_game_target(next)?;
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn advance_transition(
+        &mut self,
+        kind: IdleArchiveTransitionKind,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        self.validate_transition_request(kind, deadline)?;
+        allocation_controls(Some((deadline, cancel)))?;
+        if self.pending.is_none() {
+            let seal = match kind {
+                IdleArchiveTransitionKind::NewGame(next) => {
+                    Some(self.semantic().validate_idle_new_game_target(next)?)
+                }
+                IdleArchiveTransitionKind::Finish => None,
+            };
+            self.pending = Some(Box::new(PendingIdleArchive {
+                kind,
+                seal,
+                store: self.stores().read_owner(),
+                generation: self.stores().generation(),
+                revision: self.semantic().revision,
+                deadline,
+                remaining_io: SEARCH_ARCHIVE_IO_BYTES,
+                preflight_complete: false,
+                checkpoint: None,
+                replacement: None,
+                replacement_inherited: false,
+                replacement_observed: false,
+                completed: false,
+                completion_unknown: false,
+                #[cfg(test)]
+                cancel_after_close: std::mem::take(&mut self.cancel_after_close),
+            }));
+        }
+        let config = self.config();
+        // Borrow separate heap-owned slots; panic/error cannot drop a local
+        // replacement or make the original transition lose its remaining bound.
+        let semantic = match &mut self.owner {
+            IdleOwner::Researcher(owner) => &mut owner.semantic,
+            IdleOwner::Pc(owner) => &mut owner.semantic,
+        };
+        let pending = self.pending.as_mut().expect("original transition slot");
+        advance_pending(semantic, &config, pending, deadline, cancel)?;
+        self.last_checkpoint = pending.checkpoint.clone();
+        self.last_transition_remaining = Some(pending.remaining_io);
+        if matches!(kind, IdleArchiveTransitionKind::NewGame(_)) {
+            self.pending = None;
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore_root_if_archived(
+        &mut self,
+        position: &Position,
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<Option<usize>, PalsError> {
+        self.validate_idle()?;
+        let config = self.config();
+        let cpu = self.cpu_value().cloned();
+        let pins = self.projection_pins()?;
+        let semantic = self.semantic_mut();
+        semantic
+            .stores
+            .set_archive_pins(semantic.resident_archive_pins_with(&pins)?)?;
+        let result = semantic.load_archived_root_if_present_with_budget(
+            &config,
+            cpu.as_ref(),
+            false,
+            position,
+            budget,
+        );
+        let restore = semantic
+            .resident_archive_pins_with(&pins)
+            .and_then(|pins| semantic.stores.set_archive_pins(pins).map_err(Into::into));
+        match result {
+            Err(error) => Err(error),
+            Ok(root) => {
+                restore?;
+                Ok(root)
+            }
+        }
+    }
     pub(super) fn load_root(
         &mut self,
         position: &Position,
@@ -253,6 +491,91 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
             }
         }
     }
+}
+
+fn advance_pending<M: RoleModel>(
+    semantic: &mut PalsSemanticState<M>,
+    config: &PalsSemanticConfig,
+    pending: &mut PendingIdleArchive,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<(), PalsError> {
+    let deadline = deadline.min(pending.deadline);
+    allocation_controls(Some((deadline, cancel)))?;
+    if !pending.preflight_complete {
+        if matches!(pending.kind, IdleArchiveTransitionKind::NewGame(_)) {
+            semantic.model.preflight_new_game(deadline, cancel)?;
+        }
+        pending.preflight_complete = true;
+    }
+    if pending.checkpoint.is_none() {
+        let mut budget = ArchiveIoBudget {
+            deadline,
+            max_bytes: pending.remaining_io,
+        };
+        let result = semantic.checkpoint_idle_archive_game(&mut budget);
+        pending.remaining_io = budget.max_bytes;
+        pending.checkpoint = Some(Arc::new(result?));
+    }
+    allocation_controls(Some((deadline, cancel)))?;
+    if matches!(pending.kind, IdleArchiveTransitionKind::NewGame(_)) {
+        if pending.replacement.is_none() {
+            // Put the unused Store in its retained slot before any fallible I/O.
+            pending.replacement = Some(Box::new(PalsStores::new(config.store_limits())));
+        }
+        let next = pending
+            .replacement
+            .as_mut()
+            .expect("original unused replacement");
+        if !next.archive_enabled() {
+            let archive = semantic
+                .archive_state
+                .config
+                .as_ref()
+                .ok_or(StoreError::ArchiveDisabled)?
+                .clone();
+            let held = semantic.archive_state.root_capability.as_ref().ok_or(
+                StoreError::InvalidConditions("idle newgame needs original held archive root"),
+            )?;
+            next.enable_archive_with_capability(archive, held.clone())?;
+        }
+        if next.archive_runtime_limits().is_none() {
+            if let Some(limits) = semantic.stores.archive_runtime_limits().copied() {
+                next.set_archive_runtime_limits(limits)?;
+            }
+        }
+        if !pending.replacement_inherited {
+            next.inherit_archive_write_budget_from(&semantic.stores)?;
+            pending.replacement_inherited = true;
+        }
+        if !pending.replacement_observed {
+            // This existing finite metadata scan has zero payload-byte debit.
+            // It retains the original deadline and selected read limits.
+            observe_selected_archive_usage(next, deadline, cancel)?;
+            pending.replacement_observed = true;
+        }
+    }
+    allocation_controls(Some((deadline, cancel)))?;
+    if semantic.archive_state.closed_current_owner.is_none() {
+        semantic.archive_state.closed_current_owner = semantic.stores.close_archive_owner()?;
+    }
+    #[cfg(test)]
+    if std::mem::take(&mut pending.cancel_after_close) {
+        // Schedule a control change at the real irreversible close, without a
+        // fake close result, sleep, replacement receipt or public authority.
+        cancel.store(true, Ordering::Release);
+    }
+    // Closing cannot be undone. A control change here keeps this same original
+    // closed Store, checkpoint and replacement in pending, without a new budget.
+    allocation_controls(Some((deadline, cancel)))?;
+    if matches!(pending.kind, IdleArchiveTransitionKind::NewGame(_)) {
+        semantic.commit_idle_new_game_scope(
+            pending.seal.as_ref().expect("original newgame seal"),
+            &mut pending.replacement,
+        )?;
+    }
+    pending.completed = true;
+    Ok(())
 }
 
 #[cfg(test)]

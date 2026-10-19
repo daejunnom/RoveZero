@@ -7,6 +7,7 @@ use super::super::store::{
 };
 use super::*;
 use crate::cpu_value::CpuTrainingState;
+use rz_contracts::pals::SearchAuthority;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) const SEARCH_ARCHIVE_IO_BYTES: u64 = 16 * 1024 * 1024;
@@ -23,6 +24,18 @@ struct RestoredEngineMetadata {
     situations: Vec<(SituationId, SituationId)>,
     nodes: Vec<EngineArchiveNode>,
     records: Vec<RoleRecord>,
+}
+
+/// Bounded observation of the original final checkpoint, never a physical fence
+/// or acceptance/consumption authority. Raw cancelled facts retain their status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdleArchiveCheckpoint {
+    pub hot: crate::pals::store::ArchiveStats,
+    pub records: usize,
+    pub nodes: usize,
+    pub committed_bytes: u64,
+    pub io_bytes: u64,
+    pub owner: ArchiveOwnerSnapshot,
 }
 
 /// The directory/configuration is retained across ucinewgame; each new Store
@@ -972,6 +985,27 @@ impl<M: RoleModel> PalsSemanticState<M> {
         position: &Position,
         budget: &mut ArchiveIoBudget,
     ) -> Result<usize, PalsError> {
+        self.load_archived_root_if_present_with_budget(
+            config,
+            cpu_value,
+            legacy_model_wdl,
+            position,
+            budget,
+        )?
+        .ok_or_else(|| StoreError::ColdRecord("archived engine root").into())
+    }
+
+    /// Only an exact Store lookup's normal None means an unarchived target.
+    /// A known cold state without its engine metadata, I/O and integrity errors
+    /// remain failures; no failed restoration is relabelled a cache miss.
+    pub(super) fn load_archived_root_if_present_with_budget(
+        &mut self,
+        config: &PalsSemanticConfig,
+        cpu_value: Option<&CpuValueIdentity>,
+        legacy_model_wdl: bool,
+        position: &Position,
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<Option<usize>, PalsError> {
         if budget.max_bytes > SEARCH_ARCHIVE_IO_BYTES {
             return Err(StoreError::InvalidConditions("engine cold load exceeds 16MiB").into());
         }
@@ -989,8 +1023,13 @@ impl<M: RoleModel> PalsSemanticState<M> {
             work.deadline = work.deadline.min(selected_deadline);
         }
         let available = work.max_bytes;
-        let result =
-            self.load_archived_root_inner(config, cpu_value, legacy_model_wdl, position, &mut work);
+        let result = self.load_archived_root_if_present_inner(
+            config,
+            cpu_value,
+            legacy_model_wdl,
+            position,
+            &mut work,
+        );
         budget.max_bytes = budget
             .max_bytes
             .saturating_sub(available.saturating_sub(work.max_bytes));
@@ -999,6 +1038,75 @@ impl<M: RoleModel> PalsSemanticState<M> {
 }
 
 impl<M: RoleModel> PalsSemanticState<M> {
+    /// Persist every remaining original hot fact before a new game can end its
+    /// lifetime. The Store keeps its private raw status/acceptance unchanged and
+    /// the existing durable codec is the sole barrier; no RAM is reclaimed here.
+    pub(super) fn checkpoint_idle_archive_game(
+        &mut self,
+        budget: &mut ArchiveIoBudget,
+    ) -> Result<IdleArchiveCheckpoint, PalsError> {
+        self.ensure_adaptive_logical_quiescence()?;
+        archive_deadline(budget.deadline)?;
+        let mut nodes = Vec::new();
+        nodes
+            .try_reserve_exact(self.nodes.len())
+            .map_err(|_| StoreError::PinSaturated("final engine archive DTO allocation"))?;
+        for node in &self.nodes {
+            archive_deadline(budget.deadline)?;
+            nodes.push(encode_archive_node(node, &self.nodes)?);
+        }
+        let receipt = self.stores.archive_all_hot_engine_records_with_budget(
+            &self.records,
+            &nodes,
+            budget,
+        )?;
+        let observed = IdleArchiveCheckpoint {
+            hot: receipt.archive.before,
+            records: receipt.records,
+            nodes: receipt.nodes,
+            committed_bytes: receipt.archive.committed_bytes,
+            io_bytes: receipt.archive.io_bytes,
+            owner: self
+                .stores
+                .archive_owner_snapshot()?
+                .ok_or(StoreError::ArchiveDisabled)?,
+        };
+        self.archive_state.last_receipt = Some(receipt);
+        Ok(observed)
+    }
+
+    /// All fallible checks and the original model callback precede this call.
+    /// Old hot lifetimes end only after the caller retained the durable final
+    /// checkpoint and the actual old archive close, under its private seal.
+    pub(super) fn publish_idle_archive_game(
+        &mut self,
+        next: SearchAuthority,
+        stores: Box<PalsStores>,
+        previous: ArchiveOwnerSnapshot,
+    ) {
+        self.stores = *stores;
+        self.game_generation = Some(next.game.0);
+        self.nodes.clear();
+        self.records.clear();
+        self.reset_review_context();
+        self.revision = 0;
+        self.consumer_id = 0;
+        self.last_search_counters = None;
+        self.last_recheck_observer_error = None;
+        self.repair_queue.clear();
+        self.repair_questions.clear();
+        self.repair_counts.clear();
+        self.new_game_transition_error = None;
+        self.archive_state.deadline = None;
+        self.archive_state.remaining_io = 0;
+        self.archive_state.retried_allocation = false;
+        self.archive_state.active_search_pins = StorePins::default();
+        self.archive_state.last_receipt = None;
+        self.archive_state.reopen_error = None;
+        self.archive_state.previous_closed_owner = Some(previous);
+        self.archive_state.closed_current_owner = None;
+    }
+
     pub(super) fn engine_archive_budget(&self) -> Result<ArchiveIoBudget, PalsError> {
         let deadline = self
             .archive_state
@@ -1348,21 +1456,23 @@ impl<M: RoleModel> PalsSemanticState<M> {
         archive_controls(deadline, cancel)
     }
 
-    pub(super) fn load_archived_root_inner(
+    fn load_archived_root_if_present_inner(
         &mut self,
         config: &PalsSemanticConfig,
         cpu_value: Option<&CpuValueIdentity>,
         legacy_model_wdl: bool,
         position: &Position,
         budget: &mut ArchiveIoBudget,
-    ) -> Result<usize, PalsError> {
+    ) -> Result<Option<usize>, PalsError> {
         let snapshot = position.snapshot();
-        let state = self
+        let Some(state) = self
             .stores
             .lookup_cold_state_with_budget(&snapshot, budget)
             .map_err(PalsError::Store)?
-            .ok_or(StoreError::ColdRecord("archived engine root"))?
-            .original_id();
+        else {
+            return Ok(None);
+        };
+        let state = state.original_id();
         let receipt = self
             .stores
             .lookup_engine_node_archive_with_budget(state, budget)
@@ -1397,7 +1507,7 @@ impl<M: RoleModel> PalsSemanticState<M> {
                 release.map_err(PalsError::Store)?;
                 self.stores
                     .set_archive_pins(self.resident_archive_pins()?)?;
-                Ok(root)
+                Ok(Some(root))
             }
         }
     }
@@ -1647,7 +1757,7 @@ pub(super) fn allocation_controls(
     Ok(())
 }
 
-fn observe_selected_archive_usage(
+pub(super) fn observe_selected_archive_usage(
     stores: &mut PalsStores,
     deadline: Instant,
     cancel: &AtomicBool,
