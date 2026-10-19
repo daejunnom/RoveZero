@@ -18,7 +18,7 @@ concurrency:
 jobs:
   native-validation-bundle:
     runs-on: ubuntu-latest
-    timeout-minutes: 100
+    timeout-minutes: 190
     env:
       CARGO_BUILD_JOBS: '2'
       PYTHONDONTWRITEBYTECODE: '1'
@@ -39,7 +39,7 @@ jobs:
         env:
           RZ_EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          python -I -S -B scripts/ci_native_bundle.py --expected-head "$RZ_EXPECTED_HEAD" --timeout 5400 --output-root "$RUNNER_TEMP/RoveZero/native-validation-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python -I -S -B scripts/ci_native_bundle.py --expected-head "$RZ_EXPECTED_HEAD" --timeout 10800 --output-root "$RUNNER_TEMP/RoveZero/native-validation-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
       - name: Preserve bounded binaries and source metadata for local validation
         if: always() && steps.bundle.outputs.artifact_ready == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

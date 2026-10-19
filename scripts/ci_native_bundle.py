@@ -39,7 +39,7 @@ SOURCE_CAP = 128 << 20
 # Release compilation can exhaust the old 45-minute window after several
 # feature profiles have already completed. Keep an explicit finite build-only
 # ceiling; the requested window is recorded in the original resource receipt.
-MAX_BUILD_SECONDS = 5400
+MAX_BUILD_SECONDS = 10800
 SINGLETONS = {'Cargo.toml', 'Cargo.lock', 'LICENSE', 'rust-toolchain.toml',
               'experiments/model-research/pals/pyproject.toml',
               'experiments/baselines/fastchess-clock-ponder-v2.patch'}
@@ -394,6 +394,21 @@ class Build:
             'CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL', 'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT')}
         row['cargo_target_dir'] = env.get('CARGO_TARGET_DIR')
         self.commands.append(row)
+        started = time.monotonic()
+
+        def observe(event, **values):
+            # Progress is best effort; command and process-tree receipts decide admission.
+            try:
+                print(json.dumps({
+                    'event': event, 'label': label,
+                    'elapsed_seconds': round(time.monotonic() - started, 3),
+                    'stdout_log': str(out), 'stderr_log': str(err), **values,
+                }, sort_keys=True, allow_nan=False), file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass
+
+        observe('native_bundle_command_start', status='starting', argv=argv,
+                cargo_target_dir=row['cargo_target_dir'])
 
         def check():
             self.budget()
@@ -422,6 +437,11 @@ class Build:
                 os.fsync(stdout.fileno())
                 os.fsync(stderr.fileno())
         row.update(exit_code=code, original_tree_cleanup_verified=gone, supervisor_error=failure)
+        observe('native_bundle_command_terminal',
+                status='process_and_tree_closed' if code == 0 and gone is True and failure is None
+                else 'command_or_original_tree_failed',
+                exit_code=code, original_tree_cleanup_verified=gone,
+                supervisor_error=None if failure is None else str(failure)[:2048])
         require(code == 0 and gone is True and failure is None, 'CommandOrOriginalTreeClosureFailed:' + label)
         check()
         stream, row['stdout_pin'], before, _ = pinned_file(out, LOG_CAP)
@@ -516,8 +536,8 @@ def run(source, root, expected_head, seconds):
         validate_functional_specs(selected_specs)
         for spec in selected_specs:
             package, kind, name, features = spec
-            slot = 'target-warm' if spec == warm else ('target-diagnostic' if name == 'pals_continuation_diagnostic' else 'target-native')
-            env['CARGO_TARGET_DIR'] = str(root / slot)
+            # Reuse Cargo's fingerprinted dependencies, retaining separate invocations
+            # and exact feature admission. Copy each target privately before the next build.
             argv = [tools['cargo'], 'build', '--locked', '--release', '--no-default-features',
                     '-p', package, '--features', features, '--' + kind, name, '--message-format=json-render-diagnostics']
             output, compiled = cargo_artifact(build.command('build-' + name, argv, env), metadata, source,

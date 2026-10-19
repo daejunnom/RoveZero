@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,43 @@ import ci_native_bundle as bundle
 
 
 class NativeBundleTests(unittest.TestCase):
+    def test_command_progress_preserves_original_failure_and_tree_closure(self):
+        # No subprocess/ELF runs: exercise the actual log/receipt boundary with
+        # supervisor outcomes, including exit 0 with an unclosed process tree.
+        for code, gone, failure in ((0, True, None),
+                                    (125, True, 'OriginalWholeBuildDeadline'),
+                                    (0, False, None)):
+            with self.subTest(code=code, gone=gone), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                build = bundle.Build(root, root, 60)
+                env = {key: 'synthetic' for key in ('CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL',
+                       'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT', 'CARGO_TARGET_DIR')}
+                observed = io.StringIO()
+
+                def supervise(*_args):
+                    os.write(1, b'synthetic command output\n')
+                    return code, gone, failure
+
+                with patch.object(bundle, 'run_group', supervise), patch.object(bundle.sys, 'stderr', observed):
+                    if code == 0 and gone is True and failure is None:
+                        self.assertEqual(build.command('synthetic', ['no-executable'], env),
+                                         b'synthetic command output\n')
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'CommandOrOriginalTreeClosureFailed:synthetic'):
+                            build.command('synthetic', ['no-executable'], env)
+                events = [json.loads(line) for line in observed.getvalue().splitlines()]
+                self.assertEqual([row['event'] for row in events],
+                                 ['native_bundle_command_start', 'native_bundle_command_terminal'])
+                terminal = events[-1]
+                self.assertEqual(terminal['status'], 'process_and_tree_closed'
+                                 if code == 0 and gone is True and failure is None
+                                 else 'command_or_original_tree_failed')
+                self.assertEqual(terminal['exit_code'], code)
+                self.assertEqual(terminal['original_tree_cleanup_verified'], gone)
+                self.assertEqual(terminal['supervisor_error'], failure)
+                self.assertEqual(build.commands[0]['exit_code'], code)
+                self.assertEqual(build.commands[0]['original_tree_cleanup_verified'], gone)
+
     def test_cross_source_creation_time_preserves_all_named_file_identity_fields(self):
         fields = dict(st_dev=7, st_ino=(1 << 100) + 11, st_mode=stat.S_IFREG | 0o666,
                       st_nlink=1, st_size=40, st_mtime_ns=1000,
@@ -186,9 +224,9 @@ class NativeBundleTests(unittest.TestCase):
         manifest['example'][0]['required-features'] = ['onnx-cpu']
         self.assertEqual(bundle.warm_spec(manifest, {logical})[1], 'NOT_READY_REQUIRED_FEATURE_OR_SOURCE_CONTRACT')
 
-    def test_actual_cargo_artifact_must_join_source_kind_features_and_separate_slot(self):
+    def test_actual_cargo_artifact_must_join_source_kind_features_and_shared_target_custody(self):
         source = Path('/synthetic-source')
-        target_root = Path('/synthetic-target-diagnostic')
+        target_root = Path('/synthetic-target-native')
         spec = next(row for row in bundle.SPECS if row[2] == 'pals_continuation_diagnostic')
         logical = 'crates/rz-uci/examples/pals_continuation_diagnostic.rs'
         target = {'name': spec[2], 'kind': ['example'], 'crate_types': ['bin'],
