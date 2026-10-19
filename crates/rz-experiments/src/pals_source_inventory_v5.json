@@ -473,6 +473,7 @@
       "crates/rz-uci/src/rovent_bootstrap/process_boundary.rs",
       "crates/rz-uci/src/rovent_bootstrap/product.rs",
       "crates/rz-uci/src/rovent_bootstrap/product/diagnostics.rs",
+      "crates/rz-uci/src/rovent_bootstrap/product/storage.rs",
       "crates/rz-uci/src/rovent_driver.rs",
       "crates/rz-uci/src/rovent_external_launch.rs",
       "crates/rz-uci/src/rovent_external_launch/actual_root.rs",
@@ -575,6 +576,7 @@
       "crates/rz-uci/src/rovent_bootstrap/pinned/nnuec.rs",
       "crates/rz-uci/src/rovent_bootstrap/product.rs",
       "crates/rz-uci/src/rovent_bootstrap/product/diagnostics.rs",
+      "crates/rz-uci/src/rovent_bootstrap/product/storage.rs",
       "experiments/model-research/pals/src/rz_pals_model/rovent_root_descriptor.py"
     ],
     "model_encoding": [

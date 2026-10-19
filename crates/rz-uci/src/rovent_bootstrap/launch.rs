@@ -4,9 +4,13 @@
 use super::configuration::{ExecutionConfiguration, NativeNnuecSelection};
 use super::external_session::RoventExternalProductStartupOwners;
 use super::nnuec_source::LoadedRoventNnuecSource;
-use super::process_boundary::verify_actual_process_boundary;
+use super::process_boundary::{
+    RoventProcessBoundaryInputs, VerifiedOwnedRoventProcessBoundary, VerifiedRoventProcessBoundary,
+    verify_actual_owned_process_boundary, verify_actual_process_boundary,
+};
 use super::product::{
     RoventNativeProductDriver, RoventProductStartupOwners, RoventProductStartupRejection,
+    RoventProductStorageStartupRejection,
 };
 use super::{
     NativeStartupDiagnostic, NativeStartupDiagnosticPhase, NativeStartupDiagnosticStage,
@@ -32,6 +36,7 @@ use rz_experiments::{ArtifactRef, RoventDevice, RoventInputLock};
 use rz_search::pals::engine::{adaptive_port::AdaptivePortQuestion, pc_port::PcPortQuestion};
 use serde::Deserialize;
 use std::{
+    cell::Cell,
     error::Error,
     fmt,
     fs::File,
@@ -96,7 +101,21 @@ struct Arguments {
     root_policy: RoventRootAdmissionPolicy,
     startup_diagnostics: bool,
     lifecycle_diagnostics: bool,
+    storage: Option<StorageArguments>,
 }
+
+/// A complete explicit selection, not an archive-on default. The private
+/// snapshot root is deliberately absent: only the actual process cwd supplies it.
+#[derive(Debug, Eq, PartialEq)]
+struct StorageArguments {
+    profile: String,
+    profile_sha256: String,
+    profile_bytes: u64,
+    archive_root: PathBuf,
+    checkout_root: PathBuf,
+    protected_root: PathBuf,
+}
+
 impl Arguments {
     fn parse(arguments: &[String]) -> Result<Self, RoventLaunchError> {
         let mut input_lock = None;
@@ -109,6 +128,12 @@ impl Arguments {
         let mut root_policy = None;
         let mut startup_diagnostics = None;
         let mut lifecycle_diagnostics = None;
+        let mut storage_profile = None;
+        let mut storage_sha256 = None;
+        let mut storage_bytes = None;
+        let mut archive_root = None;
+        let mut storage_checkout_root = None;
+        let mut storage_protected_root = None;
         for argument in arguments {
             let (name, value) = argument
                 .split_once('=')
@@ -126,6 +151,34 @@ impl Arguments {
                 }
                 "--evidence-root" if evidence_root.is_none() => {
                     evidence_root = Some(managed_path(value)?)
+                }
+                "--storage-profile" if storage_profile.is_none() => {
+                    storage_profile = Some(private_path(value)?)
+                }
+                "--storage-profile-sha256" if storage_sha256.is_none() => {
+                    if value.len() != 64
+                        || !value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    {
+                        return Err(error(
+                            "Arguments",
+                            "explicit lowercase storage SHA256 required",
+                        ));
+                    }
+                    storage_sha256 = Some(value.to_owned());
+                }
+                "--storage-profile-bytes" if storage_bytes.is_none() => {
+                    storage_bytes = Some(number(value, rz_experiments::MAX_MANIFEST_BYTES as u64)?)
+                }
+                "--archive-root" if archive_root.is_none() => {
+                    archive_root = Some(managed_path(value)?)
+                }
+                "--storage-checkout-root" if storage_checkout_root.is_none() => {
+                    storage_checkout_root = Some(managed_path(value)?)
+                }
+                "--storage-protected-root" if storage_protected_root.is_none() => {
+                    storage_protected_root = Some(managed_path(value)?)
                 }
                 "--process-epoch" if process_epoch.is_none() => {
                     process_epoch = Some(number(value, u64::MAX)?)
@@ -170,6 +223,37 @@ impl Arguments {
                 _ => return Err(error("Arguments", "unknown or repeated option")),
             }
         }
+        let storage = match (
+            storage_profile,
+            storage_sha256,
+            storage_bytes,
+            archive_root,
+            storage_checkout_root,
+            storage_protected_root,
+        ) {
+            (None, None, None, None, None, None) => None,
+            (
+                Some(profile),
+                Some(profile_sha256),
+                Some(profile_bytes),
+                Some(archive_root),
+                Some(checkout_root),
+                Some(protected_root),
+            ) => Some(StorageArguments {
+                profile,
+                profile_sha256,
+                profile_bytes,
+                archive_root,
+                checkout_root,
+                protected_root,
+            }),
+            _ => {
+                return Err(error(
+                    "Arguments",
+                    "storage requires all six explicit options",
+                ));
+            }
+        };
         Ok(Self {
             input_lock: input_lock.ok_or_else(|| error("Arguments", "--input-lock is required"))?,
             native_assets: native_assets
@@ -184,6 +268,7 @@ impl Arguments {
                 .ok_or_else(|| error("Arguments", "--root-policy is required"))?,
             startup_diagnostics: startup_diagnostics.unwrap_or(false),
             lifecycle_diagnostics: lifecycle_diagnostics.unwrap_or(false),
+            storage,
         })
     }
 }
@@ -222,6 +307,182 @@ fn number(value: &str, maximum: u64) -> Result<u64, RoventLaunchError> {
         return Err(error("Arguments", "integer bound"));
     }
     Ok(number)
+}
+
+/// The off path still uses the public borrowed verifier. Only explicit storage
+/// selection moves the same original objects into its actual owned sibling.
+enum LaunchProcessOwners {
+    Off(RoventProcessBoundaryInputs),
+    Storage {
+        boundary: Arc<VerifiedOwnedRoventProcessBoundary>,
+        transferred: Cell<bool>,
+    },
+}
+impl LaunchProcessOwners {
+    fn verify(
+        inputs: RoventProcessBoundaryInputs,
+        storage: bool,
+    ) -> Result<Self, RoventLaunchError> {
+        if storage {
+            match verify_actual_owned_process_boundary(inputs) {
+                Ok(boundary) => Ok(Self::Storage {
+                    boundary,
+                    transferred: Cell::new(false),
+                }),
+                Err(rejected) => {
+                    let cause = error("ProcessBoundary", &rejected.error);
+                    // No replacement FD/proof is created. Preserve even partial
+                    // original custody on this selected-path rejection.
+                    let _quarantine = Box::leak(Box::new(rejected));
+                    Err(cause)
+                }
+            }
+        } else {
+            Ok(Self::Off(inputs))
+        }
+    }
+    fn original_root(&self) -> &Dir {
+        match self {
+            Self::Off(inputs) => &inputs.original_root,
+            Self::Storage { boundary, .. } => boundary.original_root(),
+        }
+    }
+    fn startup_view(&self) -> Result<VerifiedRoventProcessBoundary<'_>, RoventLaunchError> {
+        match self {
+            Self::Off(inputs) => verify_actual_process_boundary(
+                &inputs.lock,
+                &inputs.lock.manifest.engine.binary,
+                &inputs.original_binary,
+                &inputs.private_cwd,
+                &inputs.original_root,
+                &inputs.control,
+            ),
+            Self::Storage { boundary, .. } => boundary.startup_view(),
+        }
+        .map_err(|failure| error("ProcessBoundary", failure))
+    }
+
+    /// This only records an actual ownership handoff to the product or its
+    /// returned rejection. It never records physical completion or readiness.
+    fn transferred_to_product(&self) {
+        if let Self::Storage { transferred, .. } = self {
+            transferred.set(true);
+        }
+    }
+}
+impl Drop for LaunchProcessOwners {
+    fn drop(&mut self) {
+        if let Self::Storage {
+            boundary,
+            transferred,
+        } = self
+        {
+            if !transferred.get() {
+                // Factory rejection may retain model sources but not this
+                // original File/Dir. Keep both until an actual owner adopted
+                // them; early errors cannot stand in for a physical fence.
+                std::mem::forget(Arc::clone(boundary));
+            }
+        }
+    }
+}
+
+/// Startup errors cannot silently release selected storage while a partially
+/// prepared product may still own physical work. A successful product attach
+/// removes the custody here and adopts the same original owners instead.
+struct PendingLaunchStorage<'boundary, 'process> {
+    custody: Option<storage::RoventStorageCompiledCustody<'boundary, 'process>>,
+    boundary: Arc<VerifiedOwnedRoventProcessBoundary>,
+}
+impl Drop for PendingLaunchStorage<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(custody) = self.custody.take() {
+            std::mem::forget((
+                custody.into_byte_custody().into_owners(),
+                Arc::clone(&self.boundary),
+            ));
+        }
+    }
+}
+
+fn prepare_launch_storage<'boundary, 'process>(
+    selection: Option<&StorageArguments>,
+    owners: &LaunchProcessOwners,
+    view: &'boundary VerifiedRoventProcessBoundary<'process>,
+    lock: &Arc<RoventInputLock>,
+    control: &RoventStartupControl,
+) -> Result<Option<PendingLaunchStorage<'boundary, 'process>>, RoventLaunchError> {
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
+    let LaunchProcessOwners::Storage { boundary, .. } = owners else {
+        return Err(error(
+            "StorageCustody",
+            "original owned process boundary is required",
+        ));
+    };
+    let custody = match storage::open_rovent_storage_byte_custody(
+        Arc::clone(lock),
+        boundary.original_root(),
+        storage::RoventStorageAdmissionRequest {
+            profile_path: &selection.profile,
+            profile_sha256: &selection.profile_sha256,
+            profile_bytes: selection.profile_bytes,
+            archive_root: &selection.archive_root,
+            checkout_root: &selection.checkout_root,
+            private_snapshot_root: boundary.private_cwd(),
+            protected_execution_root: &selection.protected_root,
+        },
+        control.clone(),
+    ) {
+        Ok(custody) => custody,
+        Err(rejected) => {
+            let cause = error("StorageCustody", &rejected.error);
+            std::mem::forget((rejected.owners, Arc::clone(boundary)));
+            return Err(cause);
+        }
+    };
+    match storage::check_rovent_storage_compiled_custody(custody, view) {
+        Ok(custody) => Ok(Some(PendingLaunchStorage {
+            custody: Some(custody),
+            boundary: Arc::clone(boundary),
+        })),
+        Err(rejected) => {
+            let cause = error("StorageCompiledCustody", &rejected.error);
+            std::mem::forget((rejected.custody.into_owners(), Arc::clone(boundary)));
+            Err(cause)
+        }
+    }
+}
+
+/// Staged source integration only. Until the worker/Store setup bridge exists,
+/// an explicit storage selection must never reach UCI serve or report ready.
+fn reject_unconnected_storage_runtime(
+    driver: RoventNativeProductDriver,
+    attachment: Result<(), RoventProductStorageStartupRejection<'_, '_>>,
+    cleanup_until: Instant,
+) -> Result<(), RoventLaunchError> {
+    let primary = attachment.as_ref().err().map(|rejected| &rejected.failure);
+    let shutdown = driver.finish_session(cleanup_until);
+    let result = match shutdown {
+        Ok(Some(crate::search_driver::DriverPhysicalCompletion::Confirmed)) => match primary {
+            Some(failure) => Err(error("StorageRuntimeRegistration", &failure.detail)),
+            None => Err(error("UnsupportedStorageRuntime", "storage custody registered; archive worker and Store setup are not connected")),
+        },
+        Ok(_) => Err(error("PhysicalCompletionUnknown", match primary {
+            Some(failure) => format!("storage registration failed: {}; original product shutdown is unknown", failure.detail),
+            None => "UnsupportedStorageRuntime: archive worker and Store setup are not connected; original product shutdown is unknown".into(),
+        })),
+        Err(failure) => Err(error("PhysicalCompletionUnknown", match primary {
+            Some(original) => format!("storage registration failed: {}; original shutdown failed: {}: {}", original.detail, failure.code, failure.detail),
+            None => format!("UnsupportedStorageRuntime: archive worker and Store setup are not connected; original shutdown failed: {}: {}", failure.code, failure.detail),
+        })),
+    };
+    // Both retain the same physical-close flag. Unknown Drop quarantines the
+    // rejected registration as well as the real product inner/source owners.
+    drop(attachment);
+    drop(driver);
+    result
 }
 
 #[derive(Deserialize)]
@@ -402,15 +663,25 @@ fn run_inner<'a>(
         .binary
         .open_verified_at(&root, 128 << 20)
         .map_err(|failure| error("Binary", failure))?;
-    let boundary = verify_actual_process_boundary(
+    let process_owners = LaunchProcessOwners::verify(
+        RoventProcessBoundaryInputs {
+            lock: Arc::clone(&lock),
+            original_binary: binary,
+            original_root: root,
+            private_cwd: cwd.clone(),
+            control: control.clone(),
+        },
+        arguments.storage.is_some(),
+    )?;
+    let root = process_owners.original_root();
+    let boundary = process_owners.startup_view()?;
+    let mut pending_storage = prepare_launch_storage(
+        arguments.storage.as_ref(),
+        &process_owners,
+        &boundary,
         &lock,
-        &lock.manifest.engine.binary,
-        &binary,
-        &cwd,
-        &root,
         &control,
-    )
-    .map_err(|failure| error("ProcessBoundary", failure))?;
+    )?;
     if let Some(admit_resource) = resource_admission {
         // This is the same parsed and process-verified source owner. No model,
         // ORT provider, teacher preload, external process or worker exists yet.
@@ -713,6 +984,19 @@ fn run_inner<'a>(
         NativeStartupDiagnosticStage::ProductAssembly,
         NativeStartupDiagnosticPhase::Exit,
     );
+    if let Some(mut pending) = pending_storage.take() {
+        let custody = pending
+            .custody
+            .take()
+            .expect("selected original storage custody");
+        let attached = driver.attach_storage_runtime_registration(
+            custody,
+            Arc::clone(&pending.boundary),
+            &clock,
+        );
+        process_owners.transferred_to_product();
+        return reject_unconnected_storage_runtime(driver, attached, cleanup_until);
+    }
     let lifecycle_diagnostics = arguments
         .lifecycle_diagnostics
         .then(|| driver.enable_lifecycle_stderr_diagnostics());
@@ -776,14 +1060,10 @@ fn run_inner<'a>(
             }
         },
     };
+    drop(pending_storage);
     drop(boundary);
-    drop((
-        external_selection_file,
-        selection_file,
-        binary,
-        lock_file,
-        root,
-    ));
+    drop((external_selection_file, selection_file, lock_file));
+    drop(process_owners);
     result
 }
 

@@ -52,10 +52,12 @@ use std::{
 
 type PcrDriver = AdaptiveSessionDriver<RoventNativeBackend<AdaptivePortQuestion>>;
 mod diagnostics;
+mod storage;
 pub use diagnostics::{
     ROVENT_LIFECYCLE_DIAGNOSTIC_DOMAIN, RoventLifecycleDiagnostics,
     RoventProductLifecycleObservation,
 };
+pub use storage::RoventProductStorageStartupRejection;
 // A product's single Arc owns exactly one selected driver for the whole
 // session, including physical shutdown and retained-source custody.
 #[allow(clippy::large_enum_variant)]
@@ -71,9 +73,11 @@ enum ActualProductDriver {
 pub struct RoventNativeProductDriver {
     inner: Arc<ActualProductDriver>,
     sources: Arc<RoventPinnedNativeSources>,
+    process_clock: ProcessClock,
     physically_closed: Arc<AtomicBool>,
     retirement_sources: Option<Arc<LaunchRetirementRegistrationCustody>>,
     lifecycle_diagnostics: Option<RoventLifecycleDiagnostics>,
+    storage_registration: Option<storage::RetainedStorageRegistration>,
 }
 
 /// Read-only observation of the same product's existing finish boundary.
@@ -131,6 +135,7 @@ impl RoventNativeProductDriver {
         hooks: Option<AdaptiveSessionCollectionHooks<RoventNativeBackend<AdaptivePortQuestion>>>,
     ) -> Result<Self, RoventProductStartupRejection> {
         let sources = Arc::clone(prepared.sources());
+        let process_clock = clock.clone();
         if retirement_evidence.input_lock_digest() != sources.lock_digest() {
             return Err(RoventProductStartupRejection {
                 failure: failure(
@@ -170,6 +175,8 @@ impl RoventNativeProductDriver {
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: Some(registration),
             lifecycle_diagnostics: None,
+            process_clock,
+            storage_registration: None,
         })
     }
 
@@ -183,6 +190,7 @@ impl RoventNativeProductDriver {
         root_policy: RoventRootAdmissionPolicy,
     ) -> Result<Self, RoventProductStartupRejection> {
         let sources = Arc::clone(prepared.sources());
+        let process_clock = clock.clone();
         let driver =
             RoventNnuecSessionDriver::new(prepared, loaded, clock, owners, identity, root_policy)
                 .map_err(|rejected| RoventProductStartupRejection {
@@ -196,6 +204,8 @@ impl RoventNativeProductDriver {
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
             lifecycle_diagnostics: None,
+            process_clock,
+            storage_registration: None,
         })
     }
     #[allow(clippy::too_many_arguments, clippy::result_large_err)]
@@ -209,6 +219,7 @@ impl RoventNativeProductDriver {
         hooks: RoventNnuecCollectionHooks,
     ) -> Result<Self, RoventProductStartupRejection> {
         let sources = Arc::clone(prepared.sources());
+        let process_clock = clock.clone();
         let driver = RoventNnuecSessionDriver::new_with_collection_hooks(
             prepared,
             loaded,
@@ -229,6 +240,8 @@ impl RoventNativeProductDriver {
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
             lifecycle_diagnostics: None,
+            process_clock,
+            storage_registration: None,
         })
     }
 
@@ -241,6 +254,7 @@ impl RoventNativeProductDriver {
         root_policy: RoventRootAdmissionPolicy,
     ) -> Result<Self, RoventProductStartupRejection> {
         let sources = Arc::clone(prepared.sources());
+        let process_clock = clock.clone();
         let driver = RoventPcSessionDriver::new(prepared, clock, owners, identity, root_policy)
             .map_err(|rejected| RoventProductStartupRejection {
                 failure: rejected.failure,
@@ -253,6 +267,8 @@ impl RoventNativeProductDriver {
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
             lifecycle_diagnostics: None,
+            process_clock,
+            storage_registration: None,
         })
     }
 
@@ -266,6 +282,7 @@ impl RoventNativeProductDriver {
         hooks: RoventPcCollectionHooks,
     ) -> Result<Self, RoventProductStartupRejection> {
         let sources = Arc::clone(prepared.sources());
+        let process_clock = clock.clone();
         let driver = RoventPcSessionDriver::new_with_collection_hooks(
             prepared,
             clock,
@@ -285,6 +302,8 @@ impl RoventNativeProductDriver {
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
             lifecycle_diagnostics: None,
+            process_clock,
+            storage_registration: None,
         })
     }
 
@@ -300,6 +319,7 @@ impl RoventNativeProductDriver {
         root_policy: RoventRootAdmissionPolicy,
     ) -> Result<Self, RoventProductStartupRejection> {
         let sources = Arc::clone(prepared.sources());
+        let process_clock = clock.clone();
         let driver = RoventPcSessionDriver::from_prepared_with_shared_nnuec(
             prepared,
             loaded,
@@ -322,6 +342,8 @@ impl RoventNativeProductDriver {
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
             lifecycle_diagnostics: None,
+            process_clock,
+            storage_registration: None,
         })
     }
 
@@ -336,6 +358,7 @@ impl RoventNativeProductDriver {
         hooks: RoventPcCollectionHooks,
     ) -> Result<Self, RoventProductStartupRejection> {
         let sources = Arc::clone(prepared.sources());
+        let process_clock = clock.clone();
         let driver = RoventPcSessionDriver::from_prepared_with_shared_nnuec_and_collection_hooks(
             prepared,
             loaded,
@@ -359,6 +382,8 @@ impl RoventNativeProductDriver {
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
             lifecycle_diagnostics: None,
+            process_clock,
+            storage_registration: None,
         })
     }
 
@@ -401,6 +426,7 @@ impl RoventNativeProductDriver {
         >,
     ) -> Result<Self, RoventProductStartupRejection> {
         let pins = Arc::clone(prepared.sources());
+        let process_clock = clock.clone();
         let collection = match (pins.lock().manifest.purpose, collection_hooks) {
             (rz_experiments::RoventPurpose::Collection, Some(hooks))
                 if hooks.root_admission.is_some() =>
@@ -694,6 +720,8 @@ impl RoventNativeProductDriver {
             physically_closed: Arc::new(AtomicBool::new(false)),
             retirement_sources: None,
             lifecycle_diagnostics: None,
+            process_clock,
+            storage_registration: None,
         })
     }
     pub(crate) fn physical_close_observation(&self) -> RoventProductPhysicalClose {

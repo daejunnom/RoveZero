@@ -21,6 +21,7 @@ fn product_arguments_require_one_explicit_closed_selection_and_policy() {
     assert_eq!(args.external_r_sources, None);
     assert!(!args.startup_diagnostics);
     assert!(!args.lifecycle_diagnostics);
+    assert!(args.storage.is_none());
     let mut lifecycle = arguments();
     lifecycle.push("--lifecycle-diagnostics=stderr-v1".into());
     assert!(Arguments::parse(&lifecycle).unwrap().lifecycle_diagnostics);
@@ -137,4 +138,84 @@ fn native_asset_wire_cannot_admit_a_legacy_or_incomplete_selection() {
         SelectionWire::parse(br#"{"domain":"rz-rovent-native-assets/1","graphs":[]}"#).is_err()
     );
     assert!(SelectionWire::parse(br#"{} {}"#).is_err());
+}
+
+fn storage_arguments() -> Vec<String> {
+    let root = std::env::current_dir().unwrap();
+    vec![
+        "--storage-profile=inputs/storage-profile.json".into(),
+        format!("--storage-profile-sha256={}", "a".repeat(64)),
+        "--storage-profile-bytes=1024".into(),
+        format!("--archive-root={}", root.join("archive").display()),
+        format!(
+            "--storage-checkout-root={}",
+            root.join("checkout").display()
+        ),
+        format!(
+            "--storage-protected-root={}",
+            root.join("protected").display()
+        ),
+    ]
+}
+
+#[test]
+fn storage_is_off_by_default_and_requires_all_six_explicit_options() {
+    assert!(Arguments::parse(&arguments()).unwrap().storage.is_none());
+    let selection = storage_arguments();
+    let mut complete = arguments();
+    complete.extend(selection.clone());
+    let parsed = Arguments::parse(&complete).unwrap();
+    let storage = parsed.storage.unwrap();
+    assert_eq!(storage.profile, "inputs/storage-profile.json");
+    assert_eq!(storage.profile_sha256, "a".repeat(64));
+    assert_eq!(storage.profile_bytes, 1024);
+    // Enumerate every partial subset, rather than only one missing option.
+    for mask in 1_u8..63 {
+        let mut partial = arguments();
+        partial.extend(
+            selection
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1 << *index) != 0)
+                .map(|(_, value)| value.clone()),
+        );
+        assert!(Arguments::parse(&partial).is_err(), "subset {mask}");
+    }
+    for repeated in selection {
+        let mut repeated_args = complete.clone();
+        repeated_args.push(repeated);
+        assert!(Arguments::parse(&repeated_args).is_err());
+    }
+}
+
+#[test]
+fn storage_options_reject_unpinned_inputs_and_any_selected_private_root() {
+    let mut complete = arguments();
+    complete.extend(storage_arguments());
+    for bad in [
+        "--storage-profile=../storage.json",
+        "--storage-profile=/tmp/storage.json",
+        "--storage-profile-sha256=abcd",
+        "--storage-profile-sha256=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "--storage-profile-bytes=0",
+        "--storage-profile-bytes=18446744073709551616",
+        "--archive-root=relative/archive",
+        "--storage-checkout-root=relative/checkout",
+        "--storage-protected-root=relative/protected",
+        "--storage-private-root=/tmp/not-actual-cwd",
+        "--private-snapshot-root=/tmp/not-actual-cwd",
+    ] {
+        let key = bad.split_once('=').unwrap().0;
+        let mut changed = complete.clone();
+        changed.retain(|argument| argument.split_once('=').unwrap().0 != key);
+        changed.push(bad.into());
+        assert!(Arguments::parse(&changed).is_err(), "{bad}");
+    }
+    let mut too_large = complete;
+    too_large.retain(|argument| !argument.starts_with("--storage-profile-bytes="));
+    too_large.push(format!(
+        "--storage-profile-bytes={}",
+        rz_experiments::MAX_MANIFEST_BYTES + 1
+    ));
+    assert!(Arguments::parse(&too_large).is_err());
 }
