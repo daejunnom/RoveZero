@@ -315,6 +315,21 @@ class NativeBundleTests(unittest.TestCase):
         legacy_names = {row[2] for row in legacy}
         self.assertEqual(tuple(row for row in bundle.SPECS if row[2] in legacy_names), legacy)
         self.assertEqual(len(bundle.SPECS), 13)
+        native = ('rz-arena', 'bin', 'rz-rovent-native',
+                  'pals-collection-onnx,native-cuda,native-validation-diagnostics')
+        self.assertIn(native, bundle.SPECS)
+        self.assertIn(native, bundle.FUNCTIONAL_SPECS)
+        arena = bundle.tomllib.loads((Path(__file__).resolve().parents[2]
+            / 'crates/rz-arena/Cargo.toml').read_text(encoding='utf-8'))
+        self.assertEqual(arena['features']['native-validation-diagnostics'],
+                         ['rz-uci/pals-adaptive-diagnostics'])
+        self.assertEqual(arena['features'].get('default', []), [])
+        self.assertEqual(next(t for t in arena['bin'] if t['name'] == 'rz-rovent-native')
+                         ['required-features'], ['pals-collection-onnx'])
+        regular = tuple((*row[:3], 'pals-collection-onnx,native-cuda')
+                        if row[2] == 'rz-rovent-native' else row for row in bundle.SPECS)
+        with self.assertRaises(RuntimeError):
+            bundle.validate_functional_specs(regular)
         self.assertEqual({row[2] for row in bundle.FUNCTIONAL_SPECS}, required)
         self.assertEqual(len(bundle.FUNCTIONAL_SPECS), 6)
         self.assertEqual(sum(row[2] == 'virtual_review_numeric_capture' for row in bundle.SPECS), 1)

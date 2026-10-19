@@ -57,7 +57,7 @@ SPECS = (
     ('rz-uci', 'example', 'pals_rules_descriptor', 'pals-adaptive,onnx-cuda'),
     ('rz-uci', 'bin', 'rz-rovent', 'pals-adaptive,onnx-cuda'),
     ('rz-arena', 'bin', 'rz-rovent-trainer', 'pals-collection-onnx,native-cuda'),
-    ('rz-arena', 'bin', 'rz-rovent-native', 'pals-collection-onnx,native-cuda'),
+    ('rz-arena', 'bin', 'rz-rovent-native', 'pals-collection-onnx,native-cuda,native-validation-diagnostics'),
     ('rz-arena', 'bin', 'rz-rovent-collect', 'pals-collection-onnx,native-cuda'),
     ('rz-arena', 'bin', 'rz-rovent-utility-trainer', 'pals-collection-onnx,native-cuda'),
     ('rz-uci', 'example', 'rovent_startup_metadata', 'pals-adaptive,onnx-cuda'),
@@ -69,7 +69,7 @@ WARM = ('rz-uci', 'example', 'virtual_review_warm_numeric_capture',
 # This standalone example calls the CUDA-enabled eval backend directly. Its
 # required features do not certify the separate engine/native_bootstrap path.
 FUNCTIONAL_SPECS = (
-    ('rz-arena', 'bin', 'rz-rovent-native', 'pals-collection-onnx,native-cuda'),
+    ('rz-arena', 'bin', 'rz-rovent-native', 'pals-collection-onnx,native-cuda,native-validation-diagnostics'),
     ('rz-arena', 'bin', 'rz-rovent-collect', 'pals-collection-onnx,native-cuda'),
     ('rz-arena', 'bin', 'rz-rovent-utility-trainer', 'pals-collection-onnx,native-cuda'),
     ('rz-uci', 'example', 'rovent_startup_metadata', 'pals-adaptive,onnx-cuda'),
