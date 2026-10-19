@@ -1,24 +1,86 @@
-//! Staged product ownership only. No setup capability leaves this module, no
-//! worker/Store is configured, and registration never means archive-on. The
-//! native close flag is sufficient to release these unused owners only while
-//! this module cannot issue setup; future worker integration must also join
-//! that actual worker before releasing registration custody.
+//! Original registration shared with exactly one admitted session. A setup is
+//! issued only against its original opaque go; registration is not readiness.
+//! A session using setup must include archive owner return and worker join in
+//! its actual Confirmed finish before product custody can be released.
 
-use super::RoventNativeProductDriver;
+use super::{ActualProductDriver, RoventNativeProductDriver};
 use crate::engine::ProcessClock;
 use crate::rovent_bootstrap::launch::storage::{
     RoventStorageAdmissionOwners, RoventStorageCompiledCustody,
-    RoventStorageOwnedRuntimeRegistration, RoventStorageRuntimeOwnershipFailure,
-    RoventStorageRuntimeRegistrationFailure, own_rovent_storage_runtime_registration,
+    RoventStorageOwnedRuntimeRegistration, RoventStorageRuntimeError,
+    RoventStorageRuntimeOwnershipFailure, RoventStorageRuntimeRegistrationFailure,
+    RoventStorageSetupRejection, own_rovent_storage_runtime_registration,
     register_rovent_storage_runtime,
 };
 use crate::rovent_bootstrap::process_boundary::VerifiedOwnedRoventProcessBoundary;
+use crate::rovent_root_admission::RoventRootAdmission;
 use crate::search_driver::{DriverPhysicalCompletion, SearchSessionFailure};
+use rz_experiments::{RoventInputLock, RoventStorageProfile};
 use rz_runtime::contracts::ContractClock;
+use rz_search::pals::engine::idle_archive::{
+    UnusedIdleArchiveSetup, UnusedIdleArchiveSetupIdentity,
+};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+
+/// The same move-only registration remains in one mutex. Immutable copies are
+/// bounded attribution/profile selections, never runtime or physical proof.
+pub(crate) struct SharedRoventStorageRegistration {
+    original: Mutex<RoventStorageOwnedRuntimeRegistration>,
+    input_lock: Arc<RoventInputLock>,
+    profile: RoventStorageProfile,
+    identity: UnusedIdleArchiveSetupIdentity,
+}
+impl SharedRoventStorageRegistration {
+    pub(crate) fn new(original: RoventStorageOwnedRuntimeRegistration) -> Self {
+        Self {
+            input_lock: Arc::clone(original.owners().input_lock()),
+            profile: original.profile().clone(),
+            identity: original.identity(),
+            original: Mutex::new(original),
+        }
+    }
+    pub(crate) fn identity(&self) -> UnusedIdleArchiveSetupIdentity {
+        self.identity
+    }
+    pub(crate) fn profile(&self) -> &RoventStorageProfile {
+        &self.profile
+    }
+    pub(crate) fn input_lock_owner(&self) -> &Arc<RoventInputLock> {
+        &self.input_lock
+    }
+    /// The mutex is held only for the original one-shot split. No archive IO,
+    /// await, drain, worker completion or join is performed under this lock.
+    pub(crate) fn take_unused_setup(
+        &self,
+        admission: Arc<RoventRootAdmission>,
+    ) -> Result<UnusedIdleArchiveSetup, RoventStorageSetupRejection> {
+        match self.original.try_lock() {
+            Ok(mut original) => {
+                if !Arc::ptr_eq(original.owners().input_lock(), self.input_lock_owner()) {
+                    return Err(RoventStorageSetupRejection {
+                        error: RoventStorageRuntimeError::Namespace(
+                            "shared storage attribution no longer names the original owner",
+                        ),
+                        admission,
+                    });
+                }
+                original.take_unused_idle_setup(admission)
+            }
+            Err(cause) => Err(RoventStorageSetupRejection {
+                error: RoventStorageRuntimeError::Namespace(match cause {
+                    std::sync::TryLockError::WouldBlock => "original storage registration is busy",
+                    std::sync::TryLockError::Poisoned(_) => {
+                        "original storage registration is poisoned"
+                    }
+                }),
+                admission,
+            }),
+        }
+    }
+}
 
 /// Move-only custody. Unknown Drop deliberately retains the original value;
 /// neither Drop nor a diagnostic can mark the actual product physically closed.
@@ -47,7 +109,7 @@ impl<T> Drop for RetainedOnUnknown<T> {
     }
 }
 pub(super) type RetainedStorageRegistration =
-    RetainedOnUnknown<RoventStorageOwnedRuntimeRegistration>;
+    RetainedOnUnknown<Arc<SharedRoventStorageRegistration>>;
 
 // Preserve the exact partial proof/owners from each original API. No borrowed
 // failure is decoded into a replacement registration or new FD capability.
@@ -62,6 +124,10 @@ enum RejectedStorageOwners<'boundary, 'process> {
         boundary: Arc<VerifiedOwnedRoventProcessBoundary>,
     },
     Ownership(RoventStorageRuntimeOwnershipFailure<'boundary, 'process>),
+    Session {
+        registration: RoventStorageOwnedRuntimeRegistration,
+        failure: SearchSessionFailure,
+    },
 }
 
 /// A rejection returns the same original partial custody and owned process
@@ -72,11 +138,20 @@ pub struct RoventProductStorageStartupRejection<'boundary, 'process> {
     retained: RetainedOnUnknown<RejectedStorageOwners<'boundary, 'process>>,
 }
 impl RoventProductStorageStartupRejection<'_, '_> {
+    /// Preserve a session-install failure separately from bounded CLI prose.
+    pub fn retained_session_failure(&self) -> Option<&SearchSessionFailure> {
+        match self.retained.original() {
+            RejectedStorageOwners::Session { failure, .. } => Some(failure),
+            _ => None,
+        }
+    }
+
     pub fn owners(&self) -> &RoventStorageAdmissionOwners {
         match self.retained.original() {
             RejectedStorageOwners::Pending { custody, .. } => custody.owners(),
             RejectedStorageOwners::Registration { rejected, .. } => rejected.custody.owners(),
             RejectedStorageOwners::Ownership(rejected) => rejected.registration.owners(),
+            RejectedStorageOwners::Session { registration, .. } => registration.owners(),
         }
     }
     pub fn process_boundary(&self) -> &Arc<VerifiedOwnedRoventProcessBoundary> {
@@ -84,6 +159,7 @@ impl RoventProductStorageStartupRejection<'_, '_> {
             RejectedStorageOwners::Pending { boundary, .. }
             | RejectedStorageOwners::Registration { boundary, .. } => boundary,
             RejectedStorageOwners::Ownership(rejected) => &rejected.candidate,
+            RejectedStorageOwners::Session { registration, .. } => registration.process_boundary(),
         }
     }
 }
@@ -158,16 +234,51 @@ impl RoventNativeProductDriver {
             }
         };
         match own_rovent_storage_runtime_registration(registration, boundary) {
-            Ok(registration) => {
-                self.storage_registration = Some(RetainedOnUnknown::new(
-                    registration,
-                    Arc::clone(&self.physically_closed),
-                ));
-                Ok(())
-            }
+            Ok(registration) => match self.install_session_storage(registration) {
+                Ok(shared) => {
+                    self.storage_registration = Some(RetainedOnUnknown::new(
+                        shared,
+                        Arc::clone(&self.physically_closed),
+                    ));
+                    Ok(())
+                }
+                Err((registration, failure)) => Err(self.reject_storage(
+                    format!("{}: {}", failure.code, failure.detail),
+                    RejectedStorageOwners::Session {
+                        registration,
+                        failure,
+                    },
+                )),
+            },
             Err(rejected) => Err(self.reject_storage(
                 rejected.error.to_string(),
                 RejectedStorageOwners::Ownership(rejected),
+            )),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn install_session_storage(
+        &self,
+        registration: RoventStorageOwnedRuntimeRegistration,
+    ) -> Result<
+        Arc<SharedRoventStorageRegistration>,
+        (RoventStorageOwnedRuntimeRegistration, SearchSessionFailure),
+    > {
+        match self.inner.as_ref() {
+            ActualProductDriver::Pc(driver) | ActualProductDriver::PcNnuec(driver) => {
+                driver.install_storage_registration(registration)
+            }
+            ActualProductDriver::Nnuec(driver) => driver.install_storage_registration(registration),
+            ActualProductDriver::Pcr(_) => Err((
+                registration,
+                SearchSessionFailure {
+                    physical_completion: DriverPhysicalCompletion::Unknown,
+                    code: "UnsupportedStorageRuntime",
+                    detail:
+                        "legacy Engine PCR archive setup requires its own retained owner bridge"
+                            .into(),
+                },
             )),
         }
     }

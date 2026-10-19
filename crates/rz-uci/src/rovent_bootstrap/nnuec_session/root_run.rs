@@ -87,6 +87,10 @@ struct RootRunCustody {
     /// cannot replace its primary diagnostic or create a physical fence.
     collection_failure: Option<crate::pals_adaptive::AdaptiveCollectionError>,
     finished: Option<Box<RootReturn>>,
+    retained_failure: Option<RootRunFailure>,
+    retained_actor_error: Option<PreparationError>,
+    retained_native_error: Option<SearchSessionFailure>,
+    retained_storage_error: Option<SearchSessionFailure>,
 }
 
 impl RootRunCustody {
@@ -135,6 +139,10 @@ impl RootRunCustody {
             semantic_failures: None,
             collection_failure: None,
             finished: None,
+            retained_failure: None,
+            retained_actor_error: None,
+            retained_native_error: None,
+            retained_storage_error: None,
         })
     }
 
@@ -200,12 +208,66 @@ impl RoventNnuecSessionDriver {
                 .expect("completed phase has its original return"),
             Err(failed) => {
                 self.closed.store(true, Ordering::Release);
-                Err((
-                    State::Retained { _owners: run },
-                    unknown(failed.code, &failed.detail),
-                ))
+                let error = unknown(failed.code, &failed.detail);
+                run.retained_failure = Some(failed);
+                Err((State::Retained { _owners: run }, error))
             }
         }
+    }
+
+    /// Best-effort bounded drain for an already failed root. Even real joins
+    /// cannot erase its original semantic failure or turn Retained into Closed.
+    /// In particular first-go setup failures still own the original Idle/native
+    /// custody here, and the archive worker must not be left unobserved.
+    pub(super) fn drain_retained_storage(
+        &self,
+        retained: &mut (dyn Any + Send),
+        until: Instant,
+    ) -> Result<(), SearchSessionFailure> {
+        let Some(run) = retained.downcast_mut::<RootRunCustody>() else {
+            return Err(SearchSessionFailure::physical_completion_unknown());
+        };
+        let original = run.retained_failure.as_ref().map_or_else(
+            SearchSessionFailure::physical_completion_unknown,
+            |failed| unknown(failed.code, &failed.detail),
+        );
+        let until = until.min(run.admission.original_context().shutdown_deadline);
+        let mut storage = self.storage.try_lock().map_err(|_| original.clone())?;
+        let Some(storage) = storage.as_mut() else {
+            return Err(original);
+        };
+        let signal = if let Some(idle) = run.idle.as_mut() {
+            let signal = idle.native.service.signal();
+            if let Some(actor) = idle.actor.as_mut() {
+                actor.request_shutdown();
+                loop {
+                    match actor.try_join() {
+                        Ok(Some(())) => {
+                            idle.actor.take();
+                            break;
+                        }
+                        Ok(None) if Instant::now() < until => std::thread::yield_now(),
+                        Ok(None) => break,
+                        Err(error) => {
+                            run.retained_actor_error.get_or_insert(error);
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Err(error) = idle.native.finish(until) {
+                run.retained_native_error.get_or_insert(error);
+            }
+            signal
+        } else if let Some(signal) = &run.signal {
+            signal.clone()
+        } else {
+            return Err(original);
+        };
+        if let Err(error) = storage.abort_and_join(original.clone(), until, &signal) {
+            run.retained_storage_error.get_or_insert(error);
+        }
+        Err(original)
     }
 
     #[inline(never)]
@@ -218,16 +280,66 @@ impl RoventNnuecSessionDriver {
         let idle = run.idle.as_mut().expect("original idle custody");
         let reset = self.reset_requested.swap(false, Ordering::AcqRel)
             || idle.game != Some(context.authority.game.0);
-        if reset {
-            if let Err(error) = idle.owner.try_adaptive_new_game(
-                context.authority,
-                context.control.deadline,
-                &context.control.cancellation,
-            ) {
+        let mut storage = match self.storage.try_lock() {
+            Ok(storage) => storage,
+            Err(_) => {
+                return Err(run.fail(
+                    "RoventNnuecStorage",
+                    "original storage slot is busy/poisoned",
+                ));
+            }
+        };
+        if reset && !storage.as_ref().is_some_and(|storage| storage.configured()) {
+            if let Err(error) = idle
+                .owner
+                .as_mut()
+                .expect("original semantic owner")
+                .try_adaptive_new_game(
+                    context.authority,
+                    context.control.deadline,
+                    &context.control.cancellation,
+                )
+            {
                 return Err(run.retain_failure("RoventNnuecNewGame", error.to_string(), error));
             }
             idle.game = Some(context.authority.game.0);
         }
+        if let Some(storage) = storage.as_mut() {
+            let owner = idle.owner.take().expect("original semantic owner");
+            let signal = idle.native.service.signal();
+            match storage.prepare(
+                StorageSemanticOwner::Pcr(owner),
+                Arc::clone(&run.admission),
+                reset,
+                position,
+                &signal,
+            ) {
+                Ok(StorageSemanticOwner::Pcr(owner)) => {
+                    idle.owner = Some(owner);
+                    idle.game = Some(context.authority.game.0);
+                }
+                Ok(owner) => {
+                    storage.retain_wrong_return(owner);
+                    return Err(
+                        run.fail("RoventNnuecStorageReturn", "returned semantic kind differs")
+                    );
+                }
+                Err(mut rejected) => {
+                    if let Some(owner) = rejected.owner.take() {
+                        match owner {
+                            StorageSemanticOwner::Pcr(owner) => idle.owner = Some(owner),
+                            owner => storage.retain_wrong_return(owner),
+                        }
+                    }
+                    return Err(run.retain_failure(
+                        "RoventNnuecStorage",
+                        rejected.failure.detail.clone(),
+                        rejected.failure,
+                    ));
+                }
+            }
+        }
+        drop(storage);
         let deadline = match self.clock.deadline(context.control.deadline) {
             Ok(deadline) => deadline,
             Err(error) => {
@@ -242,6 +354,7 @@ impl RoventNnuecSessionDriver {
             game,
             previous_root: _,
         } = *run.idle.take().expect("same original idle");
+        let owner = owner.expect("original semantic owner returned from archive");
         run.native = Some(native);
         run.actor = actor;
         run.next_request_sequence = next_request_sequence;
@@ -1181,7 +1294,7 @@ impl RoventNnuecSessionDriver {
             .first_request_sequence();
         let idle = Box::new(Idle {
             native: run.native.take().expect("same original native service"),
-            owner: Box::new(retired.owner),
+            owner: Some(Box::new(retired.owner)),
             actor: Some(retired.actor),
             next_request_sequence,
             game: run.game,

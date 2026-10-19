@@ -455,32 +455,38 @@ fn prepare_launch_storage<'boundary, 'process>(
     }
 }
 
-/// Staged source integration only. Until the worker/Store setup bridge exists,
-/// an explicit storage selection must never reach UCI serve or report ready.
-fn reject_unconnected_storage_runtime(
+/// A rejected attachment retains its original custody until the real product
+/// shutdown. Successful attachment proceeds to the normal UCI owner; setup is
+/// still deferred until the first admitted go, before root registration.
+fn reject_storage_runtime_registration(
     driver: RoventNativeProductDriver,
-    attachment: Result<(), RoventProductStorageStartupRejection<'_, '_>>,
+    rejected: RoventProductStorageStartupRejection<'_, '_>,
     cleanup_until: Instant,
 ) -> Result<(), RoventLaunchError> {
-    let primary = attachment.as_ref().err().map(|rejected| &rejected.failure);
+    let primary = &rejected.failure;
     let shutdown = driver.finish_session(cleanup_until);
     let result = match shutdown {
-        Ok(Some(crate::search_driver::DriverPhysicalCompletion::Confirmed)) => match primary {
-            Some(failure) => Err(error("StorageRuntimeRegistration", &failure.detail)),
-            None => Err(error("UnsupportedStorageRuntime", "storage custody registered; archive worker and Store setup are not connected")),
-        },
-        Ok(_) => Err(error("PhysicalCompletionUnknown", match primary {
-            Some(failure) => format!("storage registration failed: {}; original product shutdown is unknown", failure.detail),
-            None => "UnsupportedStorageRuntime: archive worker and Store setup are not connected; original product shutdown is unknown".into(),
-        })),
-        Err(failure) => Err(error("PhysicalCompletionUnknown", match primary {
-            Some(original) => format!("storage registration failed: {}; original shutdown failed: {}: {}", original.detail, failure.code, failure.detail),
-            None => format!("UnsupportedStorageRuntime: archive worker and Store setup are not connected; original shutdown failed: {}: {}", failure.code, failure.detail),
-        })),
+        Ok(Some(crate::search_driver::DriverPhysicalCompletion::Confirmed)) => {
+            Err(error("StorageRuntimeRegistration", &primary.detail))
+        }
+        Ok(_) => Err(error(
+            "PhysicalCompletionUnknown",
+            format!(
+                "storage registration failed: {}; original product shutdown is unknown",
+                primary.detail
+            ),
+        )),
+        Err(failure) => Err(error(
+            "PhysicalCompletionUnknown",
+            format!(
+                "storage registration failed: {}; original shutdown failed: {}: {}",
+                primary.detail, failure.code, failure.detail
+            ),
+        )),
     };
     // Both retain the same physical-close flag. Unknown Drop quarantines the
     // rejected registration as well as the real product inner/source owners.
-    drop(attachment);
+    drop(rejected);
     drop(driver);
     result
 }
@@ -995,7 +1001,9 @@ fn run_inner<'a>(
             &clock,
         );
         process_owners.transferred_to_product();
-        return reject_unconnected_storage_runtime(driver, attached, cleanup_until);
+        if let Err(rejected) = attached {
+            return reject_storage_runtime_registration(driver, rejected, cleanup_until);
+        }
     }
     let lifecycle_diagnostics = arguments
         .lifecycle_diagnostics

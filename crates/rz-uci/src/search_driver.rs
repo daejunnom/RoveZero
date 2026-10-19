@@ -87,6 +87,28 @@ impl SearchSessionContext {
                 .load(std::sync::atomic::Ordering::Acquire)
             && Instant::now() < self.control.deadline)
     }
+
+    /// Admission while another owner lock is held must not wait for UCI.
+    /// Contention remains an error, not a false stale/canceled observation.
+    #[cfg(any(feature = "pals-adaptive", test))]
+    pub(crate) fn try_accepts(&self) -> Result<bool, ContractError> {
+        let current = self.current.try_lock().map_err(|cause| match cause {
+            TryLockError::WouldBlock => ContractError::new(
+                ErrorCode::ResourceExhausted,
+                Stage::Admission,
+                "UCI search authority is busy",
+            ),
+            TryLockError::Poisoned(_) => ContractError::new(
+                ErrorCode::BackendFailure,
+                Stage::Admission,
+                "UCI search authority poisoned",
+            ),
+        })?;
+        Ok(*current == SessionScope::Search(self.authority)
+            && !self.cancellation.is_canceled()
+            && !self.control.cancellation.load(Ordering::Acquire)
+            && Instant::now() < self.control.deadline)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2601,6 +2623,47 @@ mod tests {
             shutdown_deadline: now + Duration::from_secs(6),
             current: Arc::new(Mutex::new(SessionScope::Search(authority))),
         }
+    }
+
+    #[test]
+    fn nonblocking_authority_observation_preserves_busy_and_live_checks() {
+        let driver = CpuSessionDriver::new(CpuConfig::default(), 64).unwrap();
+        let mut context = checker_context(&driver);
+        assert!(context.try_accepts().unwrap());
+        {
+            // Holding this exact mutex on this thread proves the observer
+            // cannot wait for it, rather than relying on a timing threshold.
+            let _held = context.current.lock().unwrap();
+            let failure = context.try_accepts().unwrap_err();
+            assert_eq!(failure.code, ErrorCode::ResourceExhausted);
+            assert_eq!(failure.stage, Stage::Admission);
+        }
+        assert!(context.try_accepts().unwrap());
+        context.cancellation.cancel();
+        assert!(!context.try_accepts().unwrap());
+        context.cancellation = CancelToken::new();
+        context.control.cancellation.store(true, Ordering::Release);
+        assert!(!context.try_accepts().unwrap());
+        context.control.cancellation.store(false, Ordering::Release);
+        let original = *context.current.lock().unwrap();
+        *context.current.lock().unwrap() = SessionScope::Search(SearchAuthority {
+            root: RootGeneration(2),
+            ..context.authority
+        });
+        assert!(!context.try_accepts().unwrap());
+        *context.current.lock().unwrap() = original;
+        context.control.deadline = Instant::now();
+        assert!(!context.try_accepts().unwrap());
+        let current = Arc::clone(&context.current);
+        let poisoned = thread::spawn(move || {
+            let _held = current.lock().unwrap();
+            panic!("intentional authority poison");
+        });
+        assert!(poisoned.join().is_err());
+        assert_eq!(
+            context.try_accepts().unwrap_err().code,
+            ErrorCode::BackendFailure
+        );
     }
 
     #[test]

@@ -2,7 +2,10 @@
 //! checker metadata exists in this state machine.
 
 use super::configuration::{ExecutionConfiguration, StartupConfigurationDocument};
+use super::launch::storage::RoventStorageOwnedRuntimeRegistration;
 use super::nnuec_source::LoadedRoventNnuecSource;
+use super::product::SharedRoventStorageRegistration;
+use super::storage_lifecycle::{SessionStorageLifecycle, StorageSemanticOwner};
 use super::{
     PreparedRoventNative, RoventNativeBackend, RoventNativeService, RoventNativeStartupSnapshot,
     RoventPinnedNativeSources,
@@ -191,7 +194,7 @@ enum IdleCustody {
 }
 struct Idle {
     native: NativeOwner,
-    owner: Box<PcSemanticOwner<Model>>,
+    owner: Option<Box<PcSemanticOwner<Model>>>,
     next_request_sequence: u64,
     game: Option<u64>,
     custody: IdleCustody,
@@ -276,6 +279,9 @@ enum State {
     RejectedOwner {
         native: NativeOwner,
         owner: Box<PcSemanticOwner<Model>>,
+    },
+    ArchiveRetained {
+        native: NativeOwner,
     },
     Closed,
     Moving,
@@ -375,6 +381,7 @@ pub struct RoventPcSessionDriver {
     /// The exclusive root owner permits at most one such in-progress report.
     retained_repair: Mutex<Option<rz_search::pals::engine::pc_port::PcRepairReport>>,
     shared_nnuec: Option<SharedNnuecOwner>,
+    storage: Mutex<Option<Box<SessionStorageLifecycle>>>,
 }
 impl RoventPcSessionDriver {
     #[allow(clippy::result_large_err)]
@@ -669,7 +676,7 @@ impl RoventPcSessionDriver {
             reset_requested: AtomicBool::new(false),
             state: Mutex::new(State::Idle(Box::new(Idle {
                 native: NativeOwner::new(native),
-                owner: Box::new(owner),
+                owner: Some(Box::new(owner)),
                 next_request_sequence: 1,
                 game: None,
                 custody: IdleCustody::StartupReady,
@@ -681,7 +688,74 @@ impl RoventPcSessionDriver {
                 loaded,
                 actor: Mutex::new(SharedNnuecActor::default()),
             }),
+            storage: Mutex::new(None),
         })
+    }
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn install_storage_registration(
+        &self,
+        original: RoventStorageOwnedRuntimeRegistration,
+    ) -> Result<
+        Arc<SharedRoventStorageRegistration>,
+        (RoventStorageOwnedRuntimeRegistration, SearchSessionFailure),
+    > {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(_) => {
+                return Err((
+                    original,
+                    physical_unknown_at(
+                        "RoventPcStorageInstall",
+                        "original session owner is busy/poisoned",
+                    ),
+                ));
+            }
+        };
+        let mut slot = match self.storage.try_lock() {
+            Ok(slot) => slot,
+            Err(_) => {
+                return Err((
+                    original,
+                    physical_unknown_at("RoventPcStorageInstall", "storage slot is busy/poisoned"),
+                ));
+            }
+        };
+        let valid_idle = matches!(&*state, State::Idle(idle)
+            if matches!(idle.custody, IdleCustody::StartupReady)
+                && idle.game.is_none() && idle.owner.as_ref().is_some_and(|owner| owner.stores().generation() == 0 && owner.stores().root().is_none())
+                && idle.native.finished.is_none() && !idle.native.joined
+                && !idle.native.service.is_quarantined() && idle.native.service.occupancy() == 0);
+        if slot.is_some() || self.closed.load(Ordering::Acquire) || !valid_idle {
+            return Err((
+                original,
+                physical_unknown_at(
+                    "RoventPcStorageInstall",
+                    "storage requires the unused original native StartupReady owner",
+                ),
+            ));
+        }
+        if let Err(error) = original.validate_session_attachment(
+            self.sources.lock(),
+            &self.clock,
+            self.implementation,
+        ) {
+            return Err((
+                original,
+                SearchSessionFailure::debug("RoventPcStorageNamespace", &error),
+            ));
+        }
+        if let Err(error) = original
+            .profile()
+            .validate_for_manifest(&self.sources.lock().manifest)
+        {
+            return Err((
+                original,
+                SearchSessionFailure::debug("RoventPcStorageResources", &error),
+            ));
+        }
+        let shared = Arc::new(SharedRoventStorageRegistration::new(original));
+        *slot = Some(SessionStorageLifecycle::new(Arc::clone(&shared)));
+        Ok(shared)
     }
     pub fn shared_nnuec_readback(
         &self,
@@ -801,6 +875,7 @@ impl RoventPcSessionDriver {
             State::Idle(idle)
                 if idle.native.finished.is_none()
                     && !idle.native.joined
+                    && idle.owner.is_some()
                     && !idle.native.service.is_quarantined() =>
             {
                 idle
@@ -870,20 +945,75 @@ impl RoventPcSessionDriver {
         }
         let reset = self.reset_requested.swap(false, Ordering::AcqRel)
             || idle.game != Some(context.authority.game.0);
-        if reset {
-            if let Err(error) = idle.owner.try_adaptive_new_game(
-                context.authority,
-                context.control.deadline,
-                &context.control.cancellation,
-            ) {
+        let mut storage = match self.storage.try_lock() {
+            Ok(storage) => storage,
+            Err(_) => {
+                *state = State::Idle(idle);
+                self.closed.store(true, Ordering::Release);
+                return Err(physical_unknown_at(
+                    "RoventPcStorage",
+                    "original storage slot is busy/poisoned",
+                ));
+            }
+        };
+        if reset && !storage.as_ref().is_some_and(|storage| storage.configured()) {
+            if let Err(error) = idle
+                .owner
+                .as_mut()
+                .expect("original semantic owner")
+                .try_adaptive_new_game(
+                    context.authority,
+                    context.control.deadline,
+                    &context.control.cancellation,
+                )
+            {
                 *state = State::Idle(idle);
                 self.closed.store(true, Ordering::Release);
                 return Err(SearchSessionFailure::debug("RoventPcNewGame", &error));
             }
             idle.game = Some(context.authority.game.0);
         }
+        if let Some(storage) = storage.as_mut() {
+            let owner = idle.owner.take().expect("original semantic owner");
+            let signal = idle.native.service.signal();
+            match storage.prepare(
+                StorageSemanticOwner::Pc(owner),
+                Arc::clone(&root_admission),
+                reset,
+                position,
+                &signal,
+            ) {
+                Ok(StorageSemanticOwner::Pc(owner)) => {
+                    idle.owner = Some(owner);
+                    idle.game = Some(context.authority.game.0);
+                }
+                Ok(owner) => {
+                    storage.retain_wrong_return(owner);
+                    *state = State::Idle(idle);
+                    self.closed.store(true, Ordering::Release);
+                    return Err(physical_unknown_at(
+                        "RoventPcStorageReturn",
+                        "returned semantic kind differs",
+                    ));
+                }
+                Err(mut rejected) => {
+                    if let Some(owner) = rejected.owner.take() {
+                        match owner {
+                            StorageSemanticOwner::Pc(owner) => idle.owner = Some(owner),
+                            owner => storage.retain_wrong_return(owner),
+                        }
+                    }
+                    *state = State::Idle(idle);
+                    self.closed.store(true, Ordering::Release);
+                    return Err(rejected.failure);
+                }
+            }
+        }
+        drop(storage);
         let registration = match idle
             .owner
+            .as_mut()
+            .expect("original semantic owner")
             .register_adaptive_root(position, context.authority)
         {
             Ok(value) => value,
@@ -952,6 +1082,7 @@ impl RoventPcSessionDriver {
             game: _,
             custody: _,
         } = *idle;
+        let owner = owner.expect("original semantic owner returned from archive");
         let mut port = match PcSemanticPort::new_registered_retaining(
             *owner,
             position.clone(),
@@ -1416,7 +1547,7 @@ impl RoventPcSessionDriver {
         let owner = port.into_owner();
         *state = State::Idle(Box::new(Idle {
             native,
-            owner: Box::new(owner),
+            owner: Some(Box::new(owner)),
             next_request_sequence: next,
             game: Some(context.authority.game.0),
             custody: IdleCustody::RetiredRoot(Arc::clone(&receipt)),
@@ -1452,6 +1583,10 @@ impl RoventPcSessionDriver {
             .map(|owner| owner.actor.try_lock())
             .transpose()
             .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+        let mut storage = self
+            .storage
+            .try_lock()
+            .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
         let mut retained = std::mem::replace(&mut *state, State::Moving);
         loop {
             match retained {
@@ -1467,7 +1602,33 @@ impl RoventPcSessionDriver {
                         }
                     }
                     let result = idle.native.finish(until);
+                    if storage.is_some() && result.is_err() {
+                        *state = State::Idle(idle);
+                        return result.map_err(storage_unknown_failure);
+                    }
                     if idle.native.joined && idle.native.finished == Some(true) {
+                        if let Some(storage) = storage.as_mut() {
+                            let signal = idle.native.service.signal();
+                            match storage.finish(
+                                idle.owner.take().map(StorageSemanticOwner::Pc),
+                                until,
+                                &signal,
+                            ) {
+                                Ok(()) => {}
+                                Err(mut rejected) => {
+                                    if let Some(owner) = rejected.owner.take() {
+                                        match owner {
+                                            StorageSemanticOwner::Pc(owner) => {
+                                                idle.owner = Some(owner)
+                                            }
+                                            owner => storage.retain_wrong_return(owner),
+                                        }
+                                    }
+                                    *state = State::Idle(idle);
+                                    return Err(rejected.failure);
+                                }
+                            }
+                        }
                         *state = State::Closed;
                     } else {
                         *state = State::Idle(idle);
@@ -1482,7 +1643,32 @@ impl RoventPcSessionDriver {
                         }
                     }
                     let result = native.finish(until);
+                    if storage.is_some() && result.is_err() {
+                        *state = State::RejectedOwner { native, owner };
+                        return result.map_err(storage_unknown_failure);
+                    }
                     if native.joined && native.finished == Some(true) {
+                        if let Some(storage) = storage.as_mut() {
+                            let signal = native.service.signal();
+                            if let Err(mut rejected) = storage.finish(
+                                Some(StorageSemanticOwner::Pc(owner)),
+                                until,
+                                &signal,
+                            ) {
+                                *state = match rejected.owner.take() {
+                                    Some(StorageSemanticOwner::Pc(owner)) => {
+                                        State::RejectedOwner { native, owner }
+                                    }
+                                    other => {
+                                        if let Some(owner) = other {
+                                            storage.retain_wrong_return(owner);
+                                        }
+                                        State::ArchiveRetained { native }
+                                    }
+                                };
+                                return Err(rejected.failure);
+                            }
+                        }
                         *state = State::Closed;
                     } else {
                         *state = State::RejectedOwner { native, owner };
@@ -1497,12 +1683,71 @@ impl RoventPcSessionDriver {
                         }
                     }
                     let result = native.finish(until);
+                    if storage.is_some() {
+                        if result.is_err() || !native.joined || native.finished != Some(true) {
+                            *state = State::RejectedPort { native, port };
+                            return result
+                                .map_err(storage_unknown_failure)
+                                .and(Err(SearchSessionFailure::physical_completion_unknown()));
+                        }
+                        let Some(receipt) = native._root_closure.as_ref() else {
+                            *state = State::RejectedPort { native, port };
+                            return Err(physical_unknown_at(
+                                "RoventPcArchivePort",
+                                "original semantic closure receipt absent",
+                            ));
+                        };
+                        match port.into_port(receipt) {
+                            Ok(port) => {
+                                retained = State::RejectedOwner {
+                                    native,
+                                    owner: Box::new(port.into_owner()),
+                                };
+                                continue;
+                            }
+                            Err((port, error)) => {
+                                *state = State::RejectedPort { native, port };
+                                return Err(storage
+                                    .as_mut()
+                                    .expect("selected storage")
+                                    .retain_port_error(error));
+                            }
+                        }
+                    }
                     if native.joined && native.finished == Some(true) {
                         *state = State::Closed;
                     } else {
                         *state = State::RejectedPort { native, port };
                     }
                     return result;
+                }
+                State::ArchiveRetained { mut native } => {
+                    if let Some(actor) = shared_actor.as_mut() {
+                        if let Err(error) = actor.finish(until) {
+                            *state = State::ArchiveRetained { native };
+                            return Err(error);
+                        }
+                    }
+                    if let Err(error) = native.finish(until) {
+                        *state = State::ArchiveRetained { native };
+                        return Err(storage_unknown_failure(error));
+                    }
+                    let outcome = match storage.as_mut() {
+                        Some(storage) => {
+                            match storage.finish(None, until, &native.service.signal()) {
+                                Ok(()) => Ok(()),
+                                Err(mut rejected) => {
+                                    if let Some(owner) = rejected.owner.take() {
+                                        storage.retain_wrong_return(owner);
+                                    }
+                                    Err(rejected.failure)
+                                }
+                            }
+                        }
+                        None => Err(SearchSessionFailure::physical_completion_unknown()),
+                    };
+                    *state = State::ArchiveRetained { native };
+                    return outcome.and(Err(SearchSessionFailure::physical_completion_unknown()));
                 }
                 State::Manager(mut manager) => {
                     let actor = shared_actor.as_ref().and_then(|owner| owner.actor.as_ref());
@@ -1679,6 +1924,13 @@ impl Drop for RoventPcSessionDriver {
                 // quarantined with the physical source instead.
                 std::mem::forget(owner);
             }
+            let storage = self
+                .storage
+                .get_mut()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(storage) = storage.take() {
+                std::mem::forget(storage);
+            }
         }
     }
 }
@@ -1710,6 +1962,10 @@ fn physical_unknown_at(stage: &'static str, detail: impl std::fmt::Debug) -> Sea
     let mut failure = SearchSessionFailure::physical_completion_unknown();
     failure.detail = format!("{stage}: {detail:?}");
     failure
+}
+fn storage_unknown_failure(mut error: SearchSessionFailure) -> SearchSessionFailure {
+    error.physical_completion = DriverPhysicalCompletion::Unknown;
+    error
 }
 fn failure(code: &'static str, detail: &str) -> SearchSessionFailure {
     SearchSessionFailure {

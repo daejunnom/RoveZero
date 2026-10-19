@@ -14,11 +14,14 @@ mod root_run;
 use super::configuration::{
     ExecutionConfiguration, ResearchValueConfiguration, StartupConfigurationDocument,
 };
+use super::launch::storage::RoventStorageOwnedRuntimeRegistration;
 use super::nnuec_preparing::{
     InitialNnuecFailure, InitialNnuecPhase, InitialNnuecPreparing, InitialNnuecReady,
     InitialNnuecStep,
 };
 use super::nnuec_source::LoadedRoventNnuecSource;
+use super::product::SharedRoventStorageRegistration;
+use super::storage_lifecycle::{SessionStorageLifecycle, StorageSemanticOwner};
 use super::{
     PreparedRoventNative, RoventNativeBackend, RoventNativeService, RoventNativeStartupSnapshot,
     RoventPinnedNativeSources,
@@ -355,7 +358,7 @@ impl NativeOwner {
 }
 struct Idle {
     native: NativeOwner,
-    owner: Box<SemanticOwner>,
+    owner: Option<Box<SemanticOwner>>,
     actor: Option<PreparationActor>,
     next_request_sequence: u64,
     game: Option<u64>,
@@ -404,6 +407,7 @@ pub struct RoventNnuecSessionDriver {
     latest: Mutex<Option<Arc<RoventNnuecRootReceipt>>>,
     latest_initial: Mutex<Option<Arc<RoventNnuecInitialReceipt>>>,
     latest_checker: Mutex<Option<PalsCheckerRegistration>>,
+    storage: Mutex<Option<Box<SessionStorageLifecycle>>>,
 }
 impl RoventNnuecSessionDriver {
     #[allow(clippy::too_many_arguments, clippy::result_large_err)]
@@ -660,7 +664,7 @@ impl RoventNnuecSessionDriver {
             reset_requested: AtomicBool::new(false),
             state: Mutex::new(State::Idle(Box::new(Idle {
                 native: NativeOwner::new(native),
-                owner: Box::new(owner),
+                owner: Some(Box::new(owner)),
                 actor: None,
                 next_request_sequence: 1,
                 game: None,
@@ -669,7 +673,71 @@ impl RoventNnuecSessionDriver {
             latest: Mutex::new(None),
             latest_initial: Mutex::new(None),
             latest_checker: Mutex::new(None),
+            storage: Mutex::new(None),
         })
+    }
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn install_storage_registration(
+        &self,
+        original: RoventStorageOwnedRuntimeRegistration,
+    ) -> Result<
+        Arc<SharedRoventStorageRegistration>,
+        (RoventStorageOwnedRuntimeRegistration, SearchSessionFailure),
+    > {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(_) => {
+                return Err((
+                    original,
+                    SearchSessionFailure::physical_completion_unknown(),
+                ));
+            }
+        };
+        let mut slot = match self.storage.try_lock() {
+            Ok(slot) => slot,
+            Err(_) => {
+                return Err((
+                    original,
+                    SearchSessionFailure::physical_completion_unknown(),
+                ));
+            }
+        };
+        let valid_idle = matches!(&*state, State::Idle(idle)
+            if idle.previous_root.is_none() && idle.actor.is_none() && idle.game.is_none()
+                && idle.owner.as_ref().is_some_and(|owner| owner.stores().generation() == 0 && owner.stores().root().is_none())
+                && idle.native.finished.is_none() && !idle.native.joined
+                && !idle.native.service.is_quarantined() && idle.native.service.occupancy() == 0);
+        if slot.is_some() || self.closed.load(Ordering::Acquire) || !valid_idle {
+            return Err((
+                original,
+                unknown(
+                    "RoventNnuecStorageInstall",
+                    "storage requires the unused original native StartupReady owner",
+                ),
+            ));
+        }
+        if let Err(error) = original.validate_session_attachment(
+            self.sources.lock(),
+            &self.clock,
+            self.implementation,
+        ) {
+            return Err((
+                original,
+                SearchSessionFailure::debug("RoventNnuecStorageNamespace", &error),
+            ));
+        }
+        if let Err(error) = original
+            .profile()
+            .validate_for_manifest(&self.sources.lock().manifest)
+        {
+            return Err((
+                original,
+                SearchSessionFailure::debug("RoventNnuecStorageResources", &error),
+            ));
+        }
+        let shared = Arc::new(SharedRoventStorageRegistration::new(original));
+        *slot = Some(SessionStorageLifecycle::new(Arc::clone(&shared)));
+        Ok(shared)
     }
 
     /// Original read-only Frontier/work observation. A later owner transfer
@@ -900,7 +968,7 @@ impl RoventNnuecSessionDriver {
         Ok((
             Box::new(Idle {
                 native,
-                owner: Box::new(retired.owner),
+                owner: Some(Box::new(retired.owner)),
                 actor,
                 next_request_sequence,
                 game,
@@ -1150,6 +1218,7 @@ impl RoventNnuecSessionDriver {
                     && idle.native.finished.is_none()
                     && !idle.native.joined
                     && !idle.native.service.is_quarantined()
+                    && idle.owner.is_some()
                     && idle.native.service.occupancy() == 0 =>
             {
                 idle
@@ -1215,6 +1284,9 @@ impl RoventNnuecSessionDriver {
         }
         let idle = match &mut *state {
             State::Idle(idle) => idle,
+            State::Retained { _owners } => {
+                return self.drain_retained_storage(_owners.as_mut(), until);
+            }
             _ => return Err(SearchSessionFailure::physical_completion_unknown()),
         };
         if let Some(actor) = &mut idle.actor {
@@ -1230,6 +1302,26 @@ impl RoventNnuecSessionDriver {
         }
         idle.native.finish(until)?;
         if idle.native.joined && idle.native.finished == Some(true) {
+            let mut storage = self
+                .storage
+                .try_lock()
+                .map_err(|_| SearchSessionFailure::physical_completion_unknown())?;
+            if let Some(storage) = storage.as_mut() {
+                let signal = idle.native.service.signal();
+                if let Err(mut rejected) = storage.finish(
+                    idle.owner.take().map(StorageSemanticOwner::Pcr),
+                    until,
+                    &signal,
+                ) {
+                    if let Some(owner) = rejected.owner.take() {
+                        match owner {
+                            StorageSemanticOwner::Pcr(owner) => idle.owner = Some(owner),
+                            owner => storage.retain_wrong_return(owner),
+                        }
+                    }
+                    return Err(rejected.failure);
+                }
+            }
             *state = State::Closed;
             Ok(())
         } else {
@@ -1332,6 +1424,13 @@ impl Drop for RoventNnuecSessionDriver {
                 std::mem::forget(receipt);
             }
             std::mem::forget(Arc::clone(&self.sources));
+            let storage = self
+                .storage
+                .get_mut()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(storage) = storage.take() {
+                std::mem::forget(storage);
+            }
             std::mem::forget(Arc::clone(self.loaded.model()));
         }
     }

@@ -1,10 +1,11 @@
-//! Independent opt-in storage admission; no CLI/session currently calls it.
+//! Opt-in storage admission and original one-shot setup custody.
 //!
 //! The original lock, verified profile/source descriptors and actual directory
 //! capability stay together. This starts no model, worker or Store archive IO.
-//! Byte admission and the separate checked-compiled conversion are library
-//! entries only. Neither is connected to CLI/session assembly, enables an
-//! archive, or attests worker, native-root or physical-completion readiness.
+//! CLI/session attachment retains these same owners. Archive setup is deferred
+//! until an admitted go, before registering its root. Byte admission and the
+//! checked-compiled conversion do not attest worker, native-root or physical
+//! completion readiness.
 
 use crate::rovent_bootstrap::RoventStartupControl;
 use crate::rovent_bootstrap::process_boundary::{
@@ -258,6 +259,29 @@ pub struct RoventStorageOwnedRuntimeRegistration {
 }
 
 impl RoventStorageOwnedRuntimeRegistration {
+    /// Namespace/owner selection only. This neither renews startup nor admits
+    /// a go; setup still requires the original opaque live root admission.
+    pub(crate) fn validate_session_attachment(
+        &self,
+        lock: &RoventInputLock,
+        clock: &ProcessClock,
+        implementation: Digest,
+    ) -> Result<(), RoventStorageRuntimeError> {
+        let original = self.state.expected_clock.runtime_clock();
+        let actual = clock.runtime_clock();
+        if !std::ptr::eq(self.custody.owners.input_lock.as_ref(), lock)
+            || clock.epoch() != self.state.expected_clock.epoch()
+            || actual.domain() != original.domain()
+            || actual.origin() != original.origin()
+            || implementation != self.state.expected_implementation
+        {
+            return Err(RoventStorageRuntimeError::Namespace(
+                "session and original storage lock/clock/implementation differ",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn owners(&self) -> &RoventStorageAdmissionOwners {
         self.custody.owners()
     }
@@ -609,7 +633,7 @@ fn validate_original_setup_go(
         }
     }
     if !context
-        .accepts()
+        .try_accepts()
         .map_err(RoventStorageRuntimeError::GoControl)?
     {
         return Err(RoventStorageRuntimeError::GoNoLongerLive);

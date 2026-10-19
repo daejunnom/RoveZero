@@ -14,6 +14,7 @@ pub mod pc_session;
 mod pinned;
 pub mod process_boundary;
 pub mod product;
+pub(crate) mod storage_lifecycle;
 
 pub use pinned::{
     RoventCollectionPreloadSources, RoventCollectionTeacherSourceCustody,
@@ -966,6 +967,7 @@ pub fn compiled_bootstrap_source_digest() -> [u8; 32] {
         include_str!("rovent_bootstrap/pc_session.rs"),
         include_str!("rovent_bootstrap/product.rs"),
         include_str!("rovent_bootstrap/product/storage.rs"),
+        include_str!("rovent_bootstrap/storage_lifecycle.rs"),
         include_str!("rovent_bootstrap/launch.rs"),
         include_str!("rovent_bootstrap/launch/collection.rs"),
         include_str!("rovent_bootstrap/launch/evidence.rs"),

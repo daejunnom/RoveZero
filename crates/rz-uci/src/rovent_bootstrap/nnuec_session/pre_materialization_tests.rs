@@ -22,7 +22,7 @@ use rz_search::time::TimeBudgetConfig;
 use serde_json::{Value, json};
 use std::sync::atomic::AtomicU64;
 
-fn model_source() -> (DeferredNnuecRSource, Arc<Model>) {
+pub(in crate::rovent_bootstrap) fn model_source() -> (DeferredNnuecRSource, Arc<Model>) {
     let checkpoint = Checkpoint {
         schema: SCHEMA.into(),
         semantics: SEMANTICS.into(),
