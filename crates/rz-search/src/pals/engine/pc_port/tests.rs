@@ -416,7 +416,7 @@ fn idle_unused_setup_wrong_poll_install_and_busy_cancel_preserve_original_custod
     );
     let identity = setup.identity();
     let mut worker = ArchiveWorker::start().unwrap();
-    let mut other = ArchiveWorker::start().unwrap();
+    let mut other = ArchiveWorker::<LegalOrderRoleMock>::start().unwrap();
     let transfer = worker
         .submit_unused_idle_setup(idle, scope, setup)
         .unwrap_or_else(|rejected| panic!("setup admission: {}", rejected.error));
