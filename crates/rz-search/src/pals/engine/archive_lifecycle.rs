@@ -26,6 +26,25 @@ struct RestoredEngineMetadata {
     records: Vec<RoleRecord>,
 }
 
+/// Initial logical game preparation remains in the original Engine, including
+/// an interrupted callback/reset. It is neither a UCI admission nor a fence.
+pub(super) struct UnusedEngineArchiveGamePreparation {
+    seal: super::adaptive_root::UnusedArchiveSetupSeal,
+    scope: SearchAuthority,
+    pub(super) deadline: Instant,
+    model_preflight_completed: bool,
+    pub(super) reset_attempted: bool,
+    pub(super) reset_completed: bool,
+    callback_attempted: bool,
+    callback_completed: bool,
+    pub(super) completed: bool,
+    pub(super) first_error: Option<PalsError>,
+    // Keep the original payload without making read-only semantic receipts
+    // require a Sync panic object. No consumer takes or rewrites the payload.
+    pub(super) panic: Option<std::sync::Mutex<Box<dyn std::any::Any + Send>>>,
+    pub(super) completion_unknown: bool,
+}
+
 /// Bounded observation of the original final checkpoint, never a physical fence
 /// or acceptance/consumption authority. Raw cancelled facts retain their status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +61,7 @@ pub struct IdleArchiveCheckpoint {
 /// owns another game directory and any reopen failure remains a typed error.
 #[derive(Default)]
 pub(super) struct EngineArchiveLifecycle {
+    pub(super) unused_engine_game: Option<Box<UnusedEngineArchiveGamePreparation>>,
     pub(super) config: Option<ArchiveConfig>,
     pub(super) root_capability: Option<ArchiveRootCapability>,
     pub(super) reopen_error: Option<StoreError>,
@@ -125,6 +145,256 @@ impl<M: RoleModel> PalsSemanticState<M> {
 }
 
 impl<M: RoleModel> PalsEngine<M> {
+    /// Initial-only same-game binding. The actual caller already holds its
+    /// opaque go and has reset/armed the original CPU mirror. This consumes no
+    /// new root nonce and never changes a game number to make a request fit.
+    pub fn prepare_unused_archive_game(
+        &mut self,
+        scope: SearchAuthority,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        if let Some(original) = &self.semantic.archive_state.unused_engine_game {
+            if original.scope != scope || deadline > original.deadline {
+                return Err(StoreError::StaleConsumer.into());
+            }
+            if let Some(error) = &original.first_error {
+                return Err(error.clone());
+            }
+            if original.completion_unknown {
+                return Err(StoreError::InvalidConditions(
+                    "original unused Engine game completion unknown",
+                )
+                .into());
+            }
+            if original.completed {
+                allocation_controls(Some((deadline, cancel)))?;
+                self.validate_unused_engine_game_contents()?;
+                self.semantic.seal_unused_archive_setup(scope)?;
+                return Ok(());
+            }
+        } else {
+            allocation_controls(Some((deadline, cancel)))?;
+            self.validate_engine_idle_archive_owner()?;
+            self.validate_unused_engine_game_contents()?;
+            if let Some(ready) = self.semantic.adaptive_new_game_scope() {
+                if ready != scope {
+                    return Err(StoreError::StaleConsumer.into());
+                }
+                self.semantic.seal_unused_archive_setup(scope)?;
+                return Ok(());
+            }
+            let seal = self.semantic.seal_unused_engine_game_preparation(scope)?;
+            self.semantic.archive_state.unused_engine_game =
+                Some(Box::new(UnusedEngineArchiveGamePreparation {
+                    seal,
+                    scope,
+                    deadline,
+                    model_preflight_completed: false,
+                    reset_attempted: false,
+                    reset_completed: false,
+                    callback_attempted: false,
+                    callback_completed: false,
+                    completed: false,
+                    first_error: None,
+                    panic: None,
+                    completion_unknown: false,
+                }));
+        }
+        self.semantic
+            .archive_state
+            .unused_engine_game
+            .as_ref()
+            .expect("original initial game")
+            .seal
+            .validate_engine_game_preparation(&self.semantic)?;
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), PalsError> {
+                let original = self
+                    .semantic
+                    .archive_state
+                    .unused_engine_game
+                    .as_mut()
+                    .expect("original initial game");
+                let deadline = deadline.min(original.deadline);
+                allocation_controls(Some((deadline, cancel)))?;
+                if !original.model_preflight_completed {
+                    self.semantic.model.preflight_new_game(deadline, cancel)?;
+                    original.model_preflight_completed = true;
+                }
+                if original.reset_attempted && !original.reset_completed {
+                    return Err(StoreError::InvalidConditions(
+                        "original unused Engine reset completion unknown",
+                    )
+                    .into());
+                }
+                if !original.reset_completed {
+                    original.reset_attempted = true;
+                    self.researcher.cpu.new_game(deadline, cancel)?;
+                    original.reset_completed = true;
+                }
+                allocation_controls(Some((deadline, cancel)))?;
+                if original.callback_attempted && !original.callback_completed {
+                    return Err(StoreError::InvalidConditions(
+                        "original unused Engine model callback unknown",
+                    )
+                    .into());
+                }
+                if !original.callback_completed {
+                    original.callback_attempted = true;
+                    self.semantic
+                        .model
+                        .new_game_with_generation(Some(scope.game.0));
+                    original.callback_completed = true;
+                }
+                allocation_controls(Some((deadline, cancel)))?;
+                Ok(())
+            }));
+        let result = match result {
+            Ok(result) => result,
+            Err(payload) => {
+                let original = self
+                    .semantic
+                    .archive_state
+                    .unused_engine_game
+                    .as_mut()
+                    .expect("original initial game");
+                original
+                    .panic
+                    .get_or_insert_with(|| std::sync::Mutex::new(payload));
+                original.completion_unknown = true;
+                Err(
+                    StoreError::InvalidConditions("original unused Engine game panic/unknown")
+                        .into(),
+                )
+            }
+        };
+        if let Err(error) = result {
+            let original = self
+                .semantic
+                .archive_state
+                .unused_engine_game
+                .as_mut()
+                .expect("original initial game");
+            return Err(original.first_error.get_or_insert(error).clone());
+        }
+        let completed = (|| {
+            self.validate_engine_idle_checker_namespace()?;
+            self.validate_unused_engine_game_contents()?;
+            self.semantic
+                .archive_state
+                .unused_engine_game
+                .as_ref()
+                .expect("original initial game")
+                .seal
+                .validate_engine_game_preparation(&self.semantic)?;
+            self.semantic.commit_unused_engine_game_preparation(scope)
+        })();
+        let original = self
+            .semantic
+            .archive_state
+            .unused_engine_game
+            .as_mut()
+            .expect("original initial game");
+        if let Err(error) = completed {
+            return Err(original.first_error.get_or_insert(error).clone());
+        }
+        original.completed = true;
+        self.researcher.checker_new_game_pending = false;
+        Ok(())
+    }
+
+    fn validate_unused_engine_game_contents(&self) -> Result<(), PalsError> {
+        self.ensure_adaptive_logical_quiescence()?;
+        self.semantic.stores.validate_unused_archive_setup()?;
+        if !self.semantic.nodes.is_empty()
+            || !self.semantic.records.is_empty()
+            || self.semantic.revision != 0
+            || self.semantic.consumer_id != 0
+            || !self.semantic.repair_queue.is_empty()
+            || !self.semantic.repair_questions.is_empty()
+            || !self.semantic.repair_counts.is_empty()
+            || self.semantic.archive_state.config.is_some()
+            || self.semantic.archive_state.root_capability.is_some()
+            || self.semantic.last_engine_archive().is_some()
+            || self.semantic.review_index.as_ref().is_none_or(|index| {
+                index.active_bundle_count() != 0 || index.indexed_record_count() != 0
+            })
+        {
+            return Err(StoreError::InvalidConditions("initial Engine game must be unused").into());
+        }
+        Ok(())
+    }
+
+    /// Exact full-Engine custody for the explicit native own-R idle adapter.
+    /// Unlike a semantic-only owner it also retains and checks the original
+    /// checker namespace and excludes a held CPU task or deferred replacement.
+    pub(super) fn validate_engine_idle_archive_owner(&self) -> Result<(), PalsError> {
+        self.ensure_adaptive_logical_quiescence()?;
+        if self
+            .semantic
+            .archive_state
+            .unused_engine_game
+            .as_ref()
+            .is_some_and(|original| !original.completed)
+        {
+            return Err(
+                StoreError::InvalidConditions("unused Engine game preparation retained").into(),
+            );
+        }
+        self.validate_engine_idle_checker_namespace()
+    }
+    fn validate_engine_idle_checker_namespace(&self) -> Result<(), PalsError> {
+        self.validate_checker_namespace()?;
+        if !matches!(
+            self.researcher.checker_registered_identity,
+            CheckerIdentity::Owned(_)
+        ) || self.researcher.cpu.identity() != &self.researcher.checker_registered_identity
+            || self.cpu_condition() != self.researcher.cpu_registered_condition
+            || match &self.researcher.checker_registered_identity {
+                CheckerIdentity::Owned(identity) => {
+                    self.researcher.cpu_registered_value.as_ref() != Some(identity)
+                }
+                CheckerIdentity::ExternalUci(_) => true,
+            }
+            || self.deferred_researcher_source.is_some()
+            || self.deferred_researcher_initial.is_some()
+        {
+            return Err(StoreError::InvalidConditions(
+                "original own Engine idle checker namespace",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Invoked once by the retained Engine-idle transition, after the concrete
+    /// caller's real CPU/TT reset and arm. This consumes the existing checker's
+    /// reset delivery; it never clears/rebuilds a peer CPU or manufactures an arm.
+    pub(super) fn preflight_engine_idle_archive_reset(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), PalsError> {
+        // The one caller checked this same owner just before retaining its
+        // reset_attempted marker. The very next operation consumes the arm.
+        self.researcher.cpu.new_game(deadline, cancel)?;
+        self.validate_engine_idle_archive_owner()?;
+        allocation_controls(Some((deadline, cancel)))?;
+        Ok(())
+    }
+
+    /// Only the successfully published new Store reaches this infallible tail.
+    /// Preserve the same per-game cleanup as the existing Engine newgame path;
+    /// all physical checker/CPU owners remain in their original slots.
+    pub(super) fn complete_engine_idle_archive_new_game(&mut self) {
+        self.researcher.checker_new_game_pending = false;
+        self.researcher.external_attempts.clear();
+        self.researcher.last_external_attempt = None;
+        self.last_cpu_checkpoint_cleanup_error = None;
+        self.clear_followup_game();
+    }
+
     /// Explicit opt-in. Paths and the 256MiB/game, 4GiB/global ceilings are
     /// validated by the Store; no game evidence is deleted to satisfy them.
     pub fn enable_archive(&mut self, config: ArchiveConfig) -> Result<(), PalsError> {

@@ -15,6 +15,8 @@ mod root_admission;
 mod rovent;
 #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
 mod rovent_external;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod storage;
 use completion_observation::CompletionJournal;
 pub use completion_observation::{
     AdaptiveCompletionDiagnostic, AdaptiveCompletionFailure, AdaptiveCompletionObservation,
@@ -555,6 +557,8 @@ where
     checker_metadata: AdaptiveCheckerMetadata,
     external_metadata_bound: AtomicBool,
     state: Mutex<SessionState<B>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    storage: Mutex<Option<storage::EngineStorageSlot>>,
     work: ProcessWorkJournal,
     completion: Mutex<CompletionJournal>,
     reset_requests: AtomicU64,
@@ -1243,6 +1247,8 @@ where
                 #[cfg(feature = "pals-adaptive")]
                 rovent_idle_custody: RoventPcrIdleCustody::StartupReady,
             }))),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            storage: Mutex::new(None),
             work,
             reset_requests: AtomicU64::new(0),
             closed: AtomicBool::new(false),
@@ -2001,7 +2007,25 @@ where
                 return Err(SearchSessionFailure::debug("AdaptiveRootNamespace", &error));
             }
         };
-        if game != context.authority.game {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let storage_prepared = match self.prepare_engine_storage(
+            &mut owners,
+            root_admission.as_ref(),
+            game != context.authority.game,
+            position,
+            context,
+            &mut initial_game.armed,
+        ) {
+            Ok(selected) => selected,
+            Err(error) => {
+                self.closed.store(true, Ordering::Release);
+                *state = SessionState::Idle(owners);
+                return Err(error.unknown_if_unclosed());
+            }
+        };
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        let storage_prepared = false;
+        if !storage_prepared && game != context.authority.game {
             if let Err(error) = self.reset_actual_cpu(&mut owners, context, &mut initial_game.armed)
             {
                 // A failed reset may have changed an actual external game or
@@ -2031,11 +2055,12 @@ where
                 }
             };
         }
-        if owners
-            .engine
-            .as_ref()
-            .expect("Search owner")
-            .archive_enabled()
+        if !storage_prepared
+            && owners
+                .engine
+                .as_ref()
+                .expect("Search owner")
+                .archive_enabled()
         {
             owners = self.archive_operation(
                 &mut state,
@@ -2862,19 +2887,37 @@ where
             }
         };
         if let Err(error) = self.finish_idle_physical_owners(&mut owners, until) {
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            let error = self.abort_engine_storage(error, &owners, until);
             *state = SessionState::Idle(owners);
             return Err(error);
         }
         #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
         let mut owners = self.persist_profiled_retirement(&mut state, owners, until)?;
-        let engine = owners.engine.as_mut().expect("quiescent Search owner");
-        let last_authority = engine.last_adaptive_authority();
-        let closed = match catch_unwind(AssertUnwindSafe(|| engine.finish_followup_owners(until))) {
-            Ok(Ok(snapshot)) => snapshot
-                .archive
-                .as_ref()
-                .is_ok_and(|archive| archive.as_ref().is_none_or(|a| a.admission_closed)),
-            _ => false,
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let storage_finished = match self.finish_engine_storage(&mut owners, until) {
+            Ok(result) => result,
+            Err(error) => {
+                *state = SessionState::Idle(owners);
+                return Err(error.unknown_if_unclosed());
+            }
+        };
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        let storage_finished: Option<Option<SearchAuthority>> = None;
+        let (last_authority, closed) = match storage_finished {
+            Some(last_authority) => (last_authority, true),
+            None => {
+                let engine = owners.engine.as_mut().expect("quiescent Search owner");
+                let last_authority = engine.last_adaptive_authority();
+                let closed =
+                    match catch_unwind(AssertUnwindSafe(|| engine.finish_followup_owners(until))) {
+                        Ok(Ok(snapshot)) => snapshot.archive.as_ref().is_ok_and(|archive| {
+                            archive.as_ref().is_none_or(|a| a.admission_closed)
+                        }),
+                        _ => false,
+                    };
+                (last_authority, closed)
+            }
         };
         if !closed {
             *state = SessionState::Idle(owners);
@@ -3179,7 +3222,8 @@ where
             .get_mut()
             .unwrap_or_else(|poison| poison.into_inner());
         let retained = std::mem::replace(state, SessionState::Moving);
-        if matches!(retained, SessionState::Closed(_)) {
+        let physically_closed = matches!(retained, SessionState::Closed(_));
+        if physically_closed {
             drop(retained);
         } else {
             // At most one complete process owner per driver is retained. This
@@ -3187,6 +3231,16 @@ where
             // particular, dropping an Arc must not detach the native service
             // or block while dropping live CPU workers and free their Store.
             let _quarantined_owner: &'static mut SessionState<B> = Box::leak(Box::new(retained));
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if !physically_closed {
+            let storage = self
+                .storage
+                .get_mut()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(original) = storage.take() {
+                std::mem::forget(original);
+            }
         }
     }
 }

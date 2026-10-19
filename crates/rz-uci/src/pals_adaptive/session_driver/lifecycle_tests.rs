@@ -28,6 +28,150 @@ use rz_search::pals::review_context::{ReviewIndexLimits, ReviewSelectionPolicy};
 use rz_search::pals::value::{MODEL_WDL_VALUE_SEMANTICS, ModelValueIdentity};
 use sha2::Sha256;
 
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[test]
+fn engine_storage_initial_game_zero_and_next_game_consume_the_actual_mirror_reset_once() {
+    // Actual fixture CPU + its original metadata mirror; this does not create
+    // an opaque product/storage admission or claim NN/OS acceptance.
+    for game in [0, 1] {
+        let (driver, facts, clock, actual_owner) = fixture();
+        let original = context(&clock, 1, game);
+        {
+            let mut state = driver.state.lock().unwrap();
+            let SessionState::Idle(owners) = &mut *state else {
+                panic!("original idle owner")
+            };
+            let mut initial_bound = false;
+            driver
+                .prepare_initial_engine_archive_game(
+                    owners,
+                    &original,
+                    game != 0,
+                    &mut initial_bound,
+                )
+                .unwrap();
+            assert_eq!(
+                owners.cpu[0]
+                    .engine
+                    .paused_stack_snapshot()
+                    .unwrap()
+                    .owner_id,
+                actual_owner
+            );
+            let engine = owners.engine.as_mut().unwrap();
+            assert_eq!(engine.stores().generation(), 0);
+            assert!(engine.stores().root().is_none());
+            assert!(engine.last_adaptive_authority().is_none());
+            // Same exact ready may be checked twice without another CPU arm.
+            engine
+                .prepare_unused_archive_game(
+                    original.authority,
+                    original.control.deadline,
+                    &original.control.cancellation,
+                )
+                .unwrap();
+            let mut duplicate = driver.checker_metadata.clone().into_mirror();
+            assert!(
+                rz_search::cpu_checker::CpuChecker::new_game(
+                    &mut duplicate,
+                    original.control.deadline,
+                    &original.control.cancellation
+                )
+                .is_err(),
+                "the actual mirror reset arm was consumed exactly once"
+            );
+            let root = engine
+                .register_adaptive_root(&Position::startpos(), original.authority)
+                .unwrap();
+            assert_eq!(engine.last_adaptive_authority(), Some(original.authority));
+            engine
+                .abandon_unconsumed_adaptive_root(original.authority)
+                .unwrap();
+            drop(root);
+        }
+        assert_eq!(facts.role_runs.load(Ordering::Acquire), 0);
+        assert!(
+            driver
+                .finish_process(original.shutdown_deadline)
+                .unwrap()
+                .permits_process_close()
+        );
+    }
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[test]
+fn engine_storage_unused_selection_closes_after_an_actual_root_without_replacing_cpu() {
+    let (driver, facts, clock, actual_owner) = fixture();
+    {
+        let state = driver.state.lock().unwrap();
+        let SessionState::Idle(owners) = &*state else {
+            panic!("original idle owner")
+        };
+        assert!(storage::unused_engine_storage_owner(owners));
+        assert_eq!(
+            owners.cpu[0]
+                .engine
+                .paused_stack_snapshot()
+                .unwrap()
+                .owner_id,
+            actual_owner
+        );
+        assert!(
+            driver.storage.lock().unwrap().is_none(),
+            "ordinary PALS stays archive-off"
+        );
+    }
+    let root = context(&clock, 1, 0);
+    let terminal = Position::from_fen("7k/6Q1/5K2/8/8/8/8/8 b - - 0 1").unwrap();
+    driver.run(&terminal, &root, &mut |_| {}).unwrap();
+    {
+        let state = driver.state.lock().unwrap();
+        let SessionState::Idle(owners) = &*state else {
+            panic!("same fenced idle owner")
+        };
+        assert!(!storage::unused_engine_storage_owner(owners));
+        assert_eq!(
+            owners.cpu[0]
+                .engine
+                .paused_stack_snapshot()
+                .unwrap()
+                .owner_id,
+            actual_owner
+        );
+        assert!(
+            owners
+                .engine
+                .as_ref()
+                .unwrap()
+                .last_adaptive_authority()
+                .is_some()
+        );
+    }
+    assert!(facts.quiesces.load(Ordering::Acquire) > 0);
+    assert!(
+        driver
+            .finish_process(root.shutdown_deadline)
+            .unwrap()
+            .permits_process_close()
+    );
+}
+
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[test]
+fn engine_storage_rejects_legacy_budget_without_issuing_a_replacement_original_go() {
+    let legacy = RoventPcrRootAdmission {
+        budget: Digest([19; 32]),
+        original: None,
+    };
+    for admission in [None, Some(&legacy)] {
+        let rejected = storage::original_storage_admission(admission).unwrap_err();
+        assert_eq!(rejected.code, "RoventEngineStorageAdmission");
+        assert_eq!(legacy.budget, Digest([19; 32]));
+        assert!(legacy.original.is_none());
+    }
+}
+
 #[test]
 fn failed_root_closure_keeps_first_cause_without_confirming_physical_completion() {
     let original = [

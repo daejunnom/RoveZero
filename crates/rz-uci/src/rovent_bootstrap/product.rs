@@ -707,7 +707,7 @@ impl RoventNativeProductDriver {
             sources: Arc::clone(&pins),
         })?;
         if let Err(failure) =
-            driver.register_rovent_root_policy(Arc::new(pins.lock().clone()), root_policy)
+            driver.register_rovent_root_policy(Arc::clone(pins.lock_owner()), root_policy)
         {
             return Err(RoventProductStartupRejection {
                 failure,

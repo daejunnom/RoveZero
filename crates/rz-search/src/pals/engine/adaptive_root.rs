@@ -38,6 +38,28 @@ pub(super) struct UnusedArchiveSetupSeal {
     next_nonce: u64,
 }
 impl UnusedArchiveSetupSeal {
+    pub(super) fn validate_engine_game_preparation<M: RoleModel>(
+        &self,
+        semantic: &PalsSemanticState<M>,
+    ) -> Result<(), PalsError> {
+        semantic.ensure_adaptive_logical_quiescence()?;
+        semantic.stores.validate_unused_archive_setup()?;
+        let registry = &semantic.adaptive_root_registry;
+        if !self.registry.ptr_eq(&semantic.adaptive_registry_identity())
+            || !self.store.matches(&semantic.stores)
+            || semantic.game_generation != Some(self.scope.game.0)
+            || registry.last.is_some()
+            || registry.pending_nonce.is_some()
+            || registry.next_nonce != 0
+            || self.next_nonce != 0
+            || registry
+                .new_game_ready
+                .is_some_and(|ready| ready != self.scope)
+        {
+            return Err(StoreError::StaleConsumer.into());
+        }
+        Ok(())
+    }
     pub(super) fn validate<M: RoleModel>(
         &self,
         semantic: &PalsSemanticState<M>,
@@ -104,6 +126,27 @@ impl IdleArchiveGameSeal {
 }
 
 impl<M: RoleModel> PalsSemanticState<M> {
+    pub(super) fn seal_unused_engine_game_preparation(
+        &self,
+        scope: SearchAuthority,
+    ) -> Result<UnusedArchiveSetupSeal, PalsError> {
+        let seal = UnusedArchiveSetupSeal {
+            registry: self.adaptive_registry_identity(),
+            store: self.stores.read_owner(),
+            scope,
+            next_nonce: self.adaptive_root_registry.next_nonce,
+        };
+        seal.validate_engine_game_preparation(self)?;
+        Ok(seal)
+    }
+    pub(super) fn commit_unused_engine_game_preparation(
+        &mut self,
+        scope: SearchAuthority,
+    ) -> Result<(), PalsError> {
+        self.seal_unused_engine_game_preparation(scope)?;
+        self.adaptive_root_registry.new_game_ready = Some(scope);
+        Ok(())
+    }
     pub(super) fn seal_unused_archive_setup(
         &self,
         scope: SearchAuthority,
@@ -464,7 +507,7 @@ impl<M: RoleModel> PalsEngine<M> {
         self.semantic.adaptive_archive_authority(next)
     }
 
-    fn ensure_adaptive_logical_quiescence(&self) -> Result<(), PalsError> {
+    pub(super) fn ensure_adaptive_logical_quiescence(&self) -> Result<(), PalsError> {
         self.semantic.ensure_adaptive_logical_quiescence()?;
         if self.held_cpu_task.is_some() {
             return Err(StoreError::InvalidConditions(

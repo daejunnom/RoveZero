@@ -305,6 +305,10 @@ impl RoventPinnedNativeSources {
     pub fn lock(&self) -> &RoventInputLock {
         &self.lock
     }
+    /// Borrow the original allocation; equal bytes in a new Arc are not custody.
+    pub(crate) fn lock_owner(&self) -> &Arc<RoventInputLock> {
+        &self.lock
+    }
     pub fn collection_preload_sources(&self) -> Option<&Arc<RoventCollectionPreloadSources>> {
         self.collection.as_ref()
     }

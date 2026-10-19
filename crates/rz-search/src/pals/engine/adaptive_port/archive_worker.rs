@@ -2218,6 +2218,231 @@ mod tests {
             max_io_bytes: bytes,
         }
     }
+    fn engine_unused_setup_fixture() -> (
+        Box<PalsEngine<LegalOrderRoleMock>>,
+        Scratch,
+        SearchAuthority,
+        UnusedIdleArchiveSetup,
+    ) {
+        use crate::pals::engine::idle_archive::UnusedIdleArchiveSetupControl;
+        use crate::pals::review_context::{ReviewIndexLimits, ReviewSelectionPolicy};
+        use crate::pals::store::{ArchiveRootCapability, ArchiveRuntimeLimits};
+        let (mut engine, scratch) = fixture(false);
+        let scope = SearchAuthority {
+            epoch: ProcessEpoch(1),
+            game: GameGeneration(1),
+            root: RootGeneration(1),
+            implementation: Digest([7; 32]),
+        };
+        let until = Instant::now() + Duration::from_secs(20);
+        engine
+            .try_adaptive_new_game(scope, until, &AtomicBool::new(false))
+            .unwrap();
+        let engine = Box::new(
+            engine
+                .with_selected_review_context(
+                    ReviewSelectionPolicy::default(),
+                    ReviewIndexLimits::default(),
+                )
+                .unwrap(),
+        );
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(&scratch.0, cap_std::ambient_authority()).unwrap();
+        let setup = UnusedIdleArchiveSetup::new(
+            ArchiveConfig::new(scratch.0.clone(), PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            ArchiveRootCapability::from_directory(scratch.0.clone(), directory).unwrap(),
+            ArchiveRuntimeLimits {
+                game_bytes_max: 1 << 20,
+                global_bytes_max: 4 << 20,
+                index_entries_max: 256,
+                index_bytes_max: 512 << 10,
+                load_bytes_max: 512 << 10,
+                load_deadline_max_ms: 20_000,
+                record_payload_bytes_max: 512 << 10,
+                max_load_pins: 16,
+            },
+            UnusedIdleArchiveSetupIdentity {
+                profile: Digest([82; 32]),
+                input_lock: Digest([83; 32]),
+                registration: Digest([84; 32]),
+            },
+            UnusedIdleArchiveSetupControl {
+                deadline: until,
+                cancellation: Arc::new(AtomicBool::new(false)),
+                max_io_bytes: MAX_IO_BYTES,
+            },
+        );
+        (engine, scratch, scope, setup)
+    }
+    fn receive_engine_unused_setup(
+        worker: &mut ArchiveWorker<LegalOrderRoleMock>,
+        transfer: &ArchiveTransfer,
+    ) -> UnusedIdleArchiveSetupCompletion<LegalOrderRoleMock> {
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(completed) = worker.try_receive_unused_idle_setup(transfer).unwrap() {
+                return completed;
+            }
+            assert!(Instant::now() < until, "bounded Engine setup completion");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn engine_idle_setup_uses_original_worker_nonce_and_returns_same_full_box() {
+        let (engine, scratch, scope, setup) = engine_unused_setup_fixture();
+        let original = std::ptr::from_ref(engine.as_ref());
+        let store = engine.stores().read_owner();
+        let checker = std::ptr::from_ref(engine.researcher.cpu.as_ref());
+        let identity = setup.identity();
+        let idle = engine
+            .into_idle_archive()
+            .unwrap_or_else(|_| panic!("original Engine idle"));
+        let mut worker = ArchiveWorker::start().unwrap();
+        let transfer = worker
+            .submit_unused_idle_setup(idle, scope, setup)
+            .unwrap_or_else(|_| panic!("original unused setup"));
+        let completed = receive_engine_unused_setup(&mut worker, &transfer);
+        let (mut idle, receipt) = completed
+            .install(scope, transfer.nonce(), identity)
+            .unwrap_or_else(|_| panic!("original Engine setup install"));
+        assert_eq!(receipt.owner_kind, IdleArchiveOwnerKind::EnginePcr);
+        assert_eq!(receipt.nonce, transfer.nonce());
+        assert!(receipt.configuration_complete);
+        assert!(store.matches(idle.stores()));
+        assert!(idle.last_registered_scope().is_none());
+        assert_eq!(idle.stores().generation(), 0);
+        assert!(idle.stores().root().is_none());
+        assert!(
+            idle.close_archive_owner()
+                .unwrap()
+                .unwrap()
+                .admission_closed
+        );
+        worker.finish().unwrap();
+        let engine = idle.into_engine().unwrap_or_else(|_| panic!("same Engine"));
+        assert_eq!(std::ptr::from_ref(engine.as_ref()), original);
+        assert!(std::ptr::eq(
+            std::ptr::from_ref(engine.researcher.cpu.as_ref()),
+            checker
+        ));
+        assert!(store.matches(engine.stores()));
+        drop(engine);
+        drop(scratch);
+    }
+
+    #[test]
+    fn engine_idle_wrong_setup_install_retains_original_engine_payload_and_first_cause() {
+        let (engine, scratch, scope, setup) = engine_unused_setup_fixture();
+        let store = engine.stores().read_owner();
+        let identity = setup.identity();
+        let idle = engine
+            .into_idle_archive()
+            .unwrap_or_else(|_| panic!("original Engine"));
+        let mut worker = ArchiveWorker::start().unwrap();
+        let transfer = worker
+            .submit_unused_idle_setup(idle, scope, setup)
+            .unwrap_or_else(|_| panic!("unused setup"));
+        let completed = receive_engine_unused_setup(&mut worker, &transfer);
+        let rejected = completed
+            .install(
+                SearchAuthority {
+                    root: RootGeneration(99),
+                    ..scope
+                },
+                transfer.nonce(),
+                identity,
+            )
+            .err()
+            .expect("wrong install rejected");
+        assert!(matches!(
+            rejected.failure(),
+            Some(ArchiveQuarantineReason::InvalidReturn(
+                "unused setup identity/nonce"
+            ))
+        ));
+        let original = rejected.into_owner_and_setup_for_shutdown();
+        assert!(store.matches(original.owner.stores()));
+        assert_eq!(original.receipt.owner_kind, IdleArchiveOwnerKind::EnginePcr);
+        assert_eq!(original.setup.identity(), identity);
+        assert!(original.result.is_err());
+        assert!(original.owner.into_engine().is_err());
+        worker.finish().unwrap();
+        std::mem::forget(scratch); // preserve the actual failed/partial archive fixture
+    }
+
+    #[test]
+    fn engine_idle_setup_panic_keeps_partial_archive_original_store_and_payload() {
+        let (engine, scratch, scope, setup) = engine_unused_setup_fixture();
+        let store = engine.stores().read_owner();
+        let identity = setup.identity();
+        let mut idle = engine
+            .into_idle_archive()
+            .unwrap_or_else(|_| panic!("original Engine"));
+        idle.panic_setup_after_enable_for_test();
+        let mut worker = ArchiveWorker::start().unwrap();
+        let transfer = worker
+            .submit_unused_idle_setup(idle, scope, setup)
+            .unwrap_or_else(|_| panic!("original setup"));
+        let rejected = receive_engine_unused_setup(&mut worker, &transfer)
+            .install(scope, transfer.nonce(), identity)
+            .err()
+            .expect("partial panic retained");
+        assert!(matches!(
+            rejected.failure(),
+            Some(ArchiveQuarantineReason::Panic)
+        ));
+        let parts = rejected.into_owner_and_setup_for_shutdown();
+        assert!(store.matches(parts.owner.stores()));
+        assert_eq!(parts.receipt.owner_kind, IdleArchiveOwnerKind::EnginePcr);
+        assert_eq!(parts.setup.identity(), identity);
+        assert!(parts.owner.setup_snapshot().unwrap().completion_unknown);
+        assert!(parts.owner.archive_owner_snapshot().unwrap().is_some());
+        assert!(parts.owner.into_engine().is_err());
+        worker.finish().unwrap();
+        std::mem::forget(scratch);
+    }
+
+    #[test]
+    fn legacy_engine_submit_still_rejects_idle_only_restore_and_finish() {
+        for operation in [
+            ArchiveOperation::RestoreRootIfArchived {
+                position: Position::startpos(),
+            },
+            ArchiveOperation::FinishIdleGame,
+        ] {
+            let (engine, scratch, _, _) = engine_unused_setup_fixture();
+            let authority = authority(&engine);
+            let original = engine.stores().read_owner();
+            let mut worker = ArchiveWorker::start().unwrap();
+            let rejected = worker
+                .submit(
+                    ArchiveOwner::Engine(*engine),
+                    authority,
+                    ArchiveWork {
+                        operation,
+                        deadline: Instant::now() + Duration::from_secs(20),
+                        max_io_bytes: MAX_IO_BYTES,
+                    },
+                )
+                .err()
+                .expect("ordinary Engine is not explicit Engine-idle");
+            assert!(matches!(
+                rejected.error,
+                PalsError::Store(StoreError::InvalidConditions(
+                    "operation requires original idle semantic owner"
+                ))
+            ));
+            let ArchiveOwner::Engine(engine) = rejected.owner else {
+                panic!("original Engine kind")
+            };
+            assert!(original.matches(engine.stores()));
+            worker.finish().unwrap();
+            drop(engine);
+            drop(scratch);
+        }
+    }
     fn receive(
         worker: &mut ArchiveWorker<LegalOrderRoleMock>,
         transfer: &ArchiveTransfer,

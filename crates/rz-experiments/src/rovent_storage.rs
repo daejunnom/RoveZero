@@ -187,9 +187,8 @@ impl RoventStorageProfile {
             }
             ExecutionMode::CpuPcr | ExecutionMode::HybridPcr => {
                 require(
-                    matches!(&engine.researcher, Some(RoventResearcher::Own { .. }))
-                        && engine.nnuec.is_some(),
-                    "storage supports native NNUEC PCR, not OwnBoard or external-R legacy",
+                    matches!(&engine.researcher, Some(RoventResearcher::Own { .. })),
+                    "storage requires an explicit native own researcher; external R is unsupported",
                 )?;
                 0
             }
@@ -657,11 +656,14 @@ mod tests {
     }
 
     #[test]
-    fn own_board_and_external_researcher_do_not_silently_accept_storage() {
+    fn own_board_storage_is_explicit_and_external_researcher_stays_unsupported() {
         let mut own_board = manifest(ExecutionMode::CpuPcr);
         own_board.engine.nnuec = None;
         assert!(own_board.validate().is_ok());
-        assert!(profile().validate_for_manifest(&own_board).is_err());
+        assert!(profile().validate_for_manifest(&own_board).is_ok());
+        let mut wrong_helpers = profile();
+        wrong_helpers.helpers.shared_nnuec = 1;
+        assert!(wrong_helpers.validate_for_manifest(&own_board).is_err());
         let mut external = manifest(ExecutionMode::CpuPcr);
         external.engine.researcher = Some(RoventResearcher::External {
             profile: Box::new(RoventExternalProfilePin {

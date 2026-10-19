@@ -1538,3 +1538,29 @@ retained catalog/sidecar 일치를 확인했다. 이 결과는 외부 R 실행�
 C/Fresh 연결, 실제 dataset 이후 update0 IPC, 현재 네 mode와 독립 Fresh GPU 수치·
 물리 종료다. 준비 문서·metadata·빌드와 각 실제 결과를 계속 구분한다.
 실제 학습·원격 성능/기력 비교·병합은 이번 범위 밖이다.
+
+## 명시적 archive-on 저장 프로필
+
+긴 같은 게임의 저장 용량 회복은 별도 archive-on 프로필로 선택한다. 기본은
+archive-off이며 저장 프로필을 생략한 기존 실행을 자동 전환하지 않는다.
+`--storage-profile`, `--storage-profile-bytes`, `--storage-profile-sha256`,
+`--archive-root`, `--storage-checkout-root`, `--storage-protected-root`의 여섯
+옵션을 함께 지정한다. 프로필은 기존 실행 lock과 별도 domain으로 경로·quota·I/O·index/load
+한도와 archive helper 자원을 고정하며, 이 선언 자체가 Store·root·물리 완료 권한을
+발급하지 않는다. 실제 원 process/lock·directory capability·최초 go의 opaque
+admission을 검증한 뒤에만 원 semantic owner를 archive worker에 이동한다.
+
+PC, NNUEC PCR, own-board PCR은 각각 원 소유 종류를 보존한다. own-board PCR은
+전체 Engine Box와 원 CPU checker mirror·TT·Store를 함께 유지하고 PC나 deferred
+Researcher로 바꾸지 않는다. 외부 R의 archive-on은 계속 명시적으로 거절한다.
+기존 NNUEC 공유 helper와 archive helper를 구별하고 전체 helper 예산에 계수한다.
+초기 game 0과 이후 NewGame의 실제 reset은 각각 한 번만 소비하며, 같은 게임의
+후속 root에는 새 Store나 대체 권한을 발급하지 않는다.
+
+착수 사이에는 원 선택 문맥·부모 관계·증거를 checkpoint하고 필요한 자료만 원
+authority로 복원한다. 디스크 이동을 증거 삭제나 handle 재발급으로 처리하지
+않는다. 필수 pin 자료·quota·I/O·deadline 한도를 충족하지 못하면 원 오류와
+Capacity/Unknown을 유지한다. native/CPU의 물리 종료 뒤 최종 checkpoint·close와
+archive worker join을 별도로 확인하며, 실패·panic·완료 불명은 원 owner와 함께
+보존한다. CPU/mock 검사·소스 검토는 실제 긴 게임의 archive 왕복, 목표 GPU,
+종단 UCI 정상 종료 및 성능 인수를 대신하지 않는다.

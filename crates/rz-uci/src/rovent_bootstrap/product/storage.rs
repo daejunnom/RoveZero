@@ -270,16 +270,7 @@ impl RoventNativeProductDriver {
                 driver.install_storage_registration(registration)
             }
             ActualProductDriver::Nnuec(driver) => driver.install_storage_registration(registration),
-            ActualProductDriver::Pcr(_) => Err((
-                registration,
-                SearchSessionFailure {
-                    physical_completion: DriverPhysicalCompletion::Unknown,
-                    code: "UnsupportedStorageRuntime",
-                    detail:
-                        "legacy Engine PCR archive setup requires its own retained owner bridge"
-                            .into(),
-                },
-            )),
+            ActualProductDriver::Pcr(driver) => driver.install_storage_registration(registration),
         }
     }
 

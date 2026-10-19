@@ -10,7 +10,6 @@ use rz_contracts::RootGeneration;
 use rz_contracts::pals::SearchAuthority;
 use rz_position::Position;
 use rz_runtime::CompletionSignal;
-use rz_search::pals::engine::PcSemanticOwner;
 use rz_search::pals::engine::adaptive_port::AdaptivePortModel;
 use rz_search::pals::engine::adaptive_port::archive_worker::{
     ArchiveOperation, ArchiveOperationKind, ArchiveOwner, ArchiveQuarantine,
@@ -22,6 +21,7 @@ use rz_search::pals::engine::idle_archive::{
     UnusedIdleArchiveSetupIdentity,
 };
 use rz_search::pals::engine::preparing_root::ResearcherPreparingOwner;
+use rz_search::pals::engine::{PalsEngine, PcSemanticOwner, RoleModel};
 use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -34,18 +34,19 @@ use std::time::{Duration, Instant};
 const MAINTENANCE_IO_BYTES: u64 = 16 * 1024 * 1024;
 const RECEIPTS_MAX: usize = 64;
 
-pub(crate) enum StorageSemanticOwner {
-    Pc(Box<PcSemanticOwner<AdaptivePortModel>>),
-    Pcr(Box<ResearcherPreparingOwner<AdaptivePortModel>>),
+pub(crate) enum StorageSemanticOwner<M: RoleModel + 'static = AdaptivePortModel> {
+    Pc(Box<PcSemanticOwner<M>>),
+    Pcr(Box<ResearcherPreparingOwner<M>>),
+    EnginePcr(Box<PalsEngine<M>>),
 }
 
-pub(crate) struct StorageLifecycleFailure {
+pub(crate) struct StorageLifecycleFailure<M: RoleModel + 'static = AdaptivePortModel> {
     /// Present only when submission never took the incoming original owner.
     /// The caller must put it back in its same-kind retained session slot.
-    pub(crate) owner: Option<StorageSemanticOwner>,
+    pub(crate) owner: Option<StorageSemanticOwner<M>>,
     pub(crate) failure: SearchSessionFailure,
 }
-impl From<SearchSessionFailure> for StorageLifecycleFailure {
+impl<M: RoleModel + 'static> From<SearchSessionFailure> for StorageLifecycleFailure<M> {
     fn from(failure: SearchSessionFailure) -> Self {
         Self {
             owner: None,
@@ -53,25 +54,17 @@ impl From<SearchSessionFailure> for StorageLifecycleFailure {
         }
     }
 }
-impl StorageSemanticOwner {
-    fn last_registered_scope(&self) -> Option<SearchAuthority> {
-        match self {
-            Self::Pc(owner) => owner.last_adaptive_authority(),
-            Self::Pcr(owner) => owner.last_authority(),
-        }
-    }
+impl<M: RoleModel + 'static> StorageSemanticOwner<M> {
     fn kind(&self) -> IdleArchiveOwnerKind {
         match self {
             Self::Pc(_) => IdleArchiveOwnerKind::Pc,
             Self::Pcr(_) => IdleArchiveOwnerKind::Researcher,
+            Self::EnginePcr(_) => IdleArchiveOwnerKind::EnginePcr,
         }
     }
     fn into_idle(
         self,
-    ) -> Result<
-        IdleSemanticArchiveOwner<AdaptivePortModel>,
-        (Self, rz_search::pals::engine::PalsError),
-    > {
+    ) -> Result<IdleSemanticArchiveOwner<M>, (Self, rz_search::pals::engine::PalsError)> {
         match self {
             Self::Pc(owner) => owner
                 .into_idle_archive()
@@ -79,6 +72,9 @@ impl StorageSemanticOwner {
             Self::Pcr(owner) => owner
                 .into_idle_archive()
                 .map_err(|(owner, error)| (Self::Pcr(owner), error)),
+            Self::EnginePcr(owner) => owner
+                .into_idle_archive()
+                .map_err(|(owner, error)| (Self::EnginePcr(owner), error)),
         }
     }
 }
@@ -126,15 +122,15 @@ impl Pending {
 
 /// Retained on every failed caller path. A pending owner lives in the original
 /// worker/orphan slot, never in a replacement Store or a newly opened archive.
-struct WorkerCustody {
-    worker: Option<ArchiveWorker<AdaptivePortModel>>,
-    original: Option<StorageSemanticOwner>,
-    idle: Option<IdleSemanticArchiveOwner<AdaptivePortModel>>,
-    unexpected: Option<Box<ArchiveOwner<AdaptivePortModel>>>,
+struct WorkerCustody<M: RoleModel + 'static = AdaptivePortModel> {
+    worker: Option<ArchiveWorker<M>>,
+    original: Option<StorageSemanticOwner<M>>,
+    idle: Option<IdleSemanticArchiveOwner<M>>,
+    unexpected: Option<Box<ArchiveOwner<M>>>,
     setup: Option<UnusedIdleArchiveSetup>,
     setup_admission_rejection: Option<RoventStorageSetupRejection>,
-    setup_rejected: Option<Box<UnusedIdleArchiveSetupCompletion<AdaptivePortModel>>>,
-    quarantine: Option<Box<ArchiveQuarantine<AdaptivePortModel>>>,
+    setup_rejected: Option<Box<UnusedIdleArchiveSetupCompletion<M>>>,
+    quarantine: Option<Box<ArchiveQuarantine<M>>>,
     rejected_work: Option<Box<ArchiveWork>>,
     pending: Option<Pending>,
     setup_receipt: Option<UnusedIdleArchiveSetupReceipt>,
@@ -155,7 +151,7 @@ struct WorkerCustody {
     original_kind: Option<IdleArchiveOwnerKind>,
     finish_completed: bool,
 }
-impl WorkerCustody {
+impl<M: RoleModel + 'static> WorkerCustody<M> {
     fn new() -> Self {
         Self {
             worker: None,
@@ -220,8 +216,8 @@ impl WorkerCustody {
     }
     fn adopt(
         &mut self,
-        original: StorageSemanticOwner,
-    ) -> Result<(), (StorageSemanticOwner, SearchSessionFailure)> {
+        original: StorageSemanticOwner<M>,
+    ) -> Result<(), (StorageSemanticOwner<M>, SearchSessionFailure)> {
         // The caller moves exactly one owner only after the prior root fence.
         // Even a violated invariant retains the incoming owner without a drop.
         if self.original.is_some()
@@ -240,7 +236,6 @@ impl WorkerCustody {
             ));
         }
         let kind = original.kind();
-        let registered_scope = original.last_registered_scope();
         self.original = Some(original);
         if self.original_kind.is_some_and(|expected| expected != kind) {
             let original = self.original.take().expect("same rejected semantic owner");
@@ -250,21 +245,23 @@ impl WorkerCustody {
             ));
         }
         self.original_kind = Some(kind);
-        self.last_registered_scope = registered_scope;
         match self
             .original
             .take()
             .expect("original semantic owner")
             .into_idle()
         {
-            Ok(idle) => self.idle = Some(idle),
+            Ok(idle) => {
+                self.last_registered_scope = idle.last_registered_scope();
+                self.idle = Some(idle);
+            }
             Err((original, error)) => {
                 return Err((original, self.operation_failure("RoventStorageIdle", error)));
             }
         }
         Ok(())
     }
-    fn restore(&mut self) -> Result<StorageSemanticOwner, SearchSessionFailure> {
+    fn restore(&mut self) -> Result<StorageSemanticOwner<M>, SearchSessionFailure> {
         if let Some(failure) = &self.first_failure {
             return Err(failure.clone());
         }
@@ -275,6 +272,9 @@ impl WorkerCustody {
             Some(IdleArchiveOwnerKind::Pc) => idle.into_pc().map(StorageSemanticOwner::Pc),
             Some(IdleArchiveOwnerKind::Researcher) => {
                 idle.into_researcher().map(StorageSemanticOwner::Pcr)
+            }
+            Some(IdleArchiveOwnerKind::EnginePcr) => {
+                idle.into_engine().map(StorageSemanticOwner::EnginePcr)
             }
             None => Err(idle),
         };
@@ -678,12 +678,12 @@ impl WorkerCustody {
 
 /// One optional archive helper per actual native session. The shared original
 /// registration remains held by this value and the product until full closure.
-pub(crate) struct SessionStorageLifecycle {
+pub(crate) struct SessionStorageLifecycle<M: RoleModel + 'static = AdaptivePortModel> {
     registration: Arc<SharedRoventStorageRegistration>,
-    core: WorkerCustody,
+    core: WorkerCustody<M>,
     active_admission: Option<Arc<RoventRootAdmission>>,
 }
-impl SessionStorageLifecycle {
+impl<M: RoleModel + 'static> SessionStorageLifecycle<M> {
     pub(crate) fn new(registration: Arc<SharedRoventStorageRegistration>) -> Box<Self> {
         Box::new(Self {
             registration,
@@ -694,7 +694,7 @@ impl SessionStorageLifecycle {
     pub(crate) fn configured(&self) -> bool {
         self.core.setup_receipt.is_some()
     }
-    fn retain_panic(&mut self, payload: Box<dyn Any + Send>) -> StorageLifecycleFailure {
+    fn retain_panic(&mut self, payload: Box<dyn Any + Send>) -> StorageLifecycleFailure<M> {
         self.core.caller_panic.get_or_insert(payload);
         self.core
             .fail(
@@ -718,7 +718,7 @@ impl SessionStorageLifecycle {
             .expect("original archive failure")
             .clone())
     }
-    pub(crate) fn retain_wrong_return(&mut self, owner: StorageSemanticOwner) {
+    pub(crate) fn retain_wrong_return(&mut self, owner: StorageSemanticOwner<M>) {
         // Only a returned same-call value enters this slot; restore removed
         // the prior value, and the session closes before any subsequent go.
         debug_assert!(self.core.original.is_none());
@@ -738,12 +738,12 @@ impl SessionStorageLifecycle {
     }
     pub(crate) fn prepare(
         &mut self,
-        owner: StorageSemanticOwner,
+        owner: StorageSemanticOwner<M>,
         admission: Arc<RoventRootAdmission>,
         reset: bool,
         position: &Position,
         signal: &CompletionSignal,
-    ) -> Result<StorageSemanticOwner, StorageLifecycleFailure> {
+    ) -> Result<StorageSemanticOwner<M>, StorageLifecycleFailure<M>> {
         match catch_unwind(AssertUnwindSafe(|| {
             self.prepare_inner(owner, admission, reset, position, signal)
         })) {
@@ -753,12 +753,12 @@ impl SessionStorageLifecycle {
     }
     fn prepare_inner(
         &mut self,
-        owner: StorageSemanticOwner,
+        owner: StorageSemanticOwner<M>,
         admission: Arc<RoventRootAdmission>,
         reset: bool,
         position: &Position,
         signal: &CompletionSignal,
-    ) -> Result<StorageSemanticOwner, StorageLifecycleFailure> {
+    ) -> Result<StorageSemanticOwner<M>, StorageLifecycleFailure<M>> {
         self.active_admission = Some(Arc::clone(&admission));
         self.core
             .adopt(owner)
@@ -879,10 +879,10 @@ impl SessionStorageLifecycle {
     /// as a searchable PC/PCR owner. Join is an independent actual observation.
     pub(crate) fn finish(
         &mut self,
-        owner: Option<StorageSemanticOwner>,
+        owner: Option<StorageSemanticOwner<M>>,
         until: Instant,
         signal: &CompletionSignal,
-    ) -> Result<(), StorageLifecycleFailure> {
+    ) -> Result<(), StorageLifecycleFailure<M>> {
         match catch_unwind(AssertUnwindSafe(|| self.finish_inner(owner, until, signal))) {
             Ok(result) => result,
             Err(payload) => Err(self.retain_panic(payload)),
@@ -890,10 +890,10 @@ impl SessionStorageLifecycle {
     }
     fn finish_inner(
         &mut self,
-        owner: Option<StorageSemanticOwner>,
+        owner: Option<StorageSemanticOwner<M>>,
         until: Instant,
         signal: &CompletionSignal,
-    ) -> Result<(), StorageLifecycleFailure> {
+    ) -> Result<(), StorageLifecycleFailure<M>> {
         if self.core.finish_completed
             && self.core.shutdown.is_some()
             && self.core.first_failure.is_none()

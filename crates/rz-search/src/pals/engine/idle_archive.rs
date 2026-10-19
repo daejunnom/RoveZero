@@ -18,6 +18,7 @@ use std::sync::Weak;
 enum IdleOwner<M: RoleModel> {
     Researcher(Box<ResearcherPreparingOwner<M>>),
     Pc(Box<PcSemanticOwner<M>>),
+    Engine(Box<PalsEngine<M>>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +35,9 @@ struct PendingIdleArchive {
     deadline: Instant,
     remaining_io: u64,
     preflight_complete: bool,
+    engine_reset_attempted: bool,
+    engine_reset_completed: bool,
+    engine_reset_error: Option<PalsError>,
     checkpoint: Option<Arc<IdleArchiveCheckpoint>>,
     replacement: Option<Box<PalsStores>>,
     replacement_inherited: bool,
@@ -106,6 +110,7 @@ impl UnusedIdleArchiveSetup {
 pub enum IdleArchiveOwnerKind {
     Pc,
     Researcher,
+    EnginePcr,
 }
 #[derive(Clone, Debug)]
 pub struct UnusedIdleArchiveSetupSnapshot {
@@ -177,6 +182,32 @@ impl<M: RoleModel> PcSemanticOwner<M> {
     }
 }
 
+impl<M: RoleModel> PalsEngine<M> {
+    /// Retain this complete own-R engine, including its original registered
+    /// checker mirror. This does not turn it into a deferred or PC owner and
+    /// grants no root, CPU reset, archive or physical-completion authority.
+    #[allow(clippy::result_large_err)]
+    pub fn into_idle_archive(
+        self: Box<Self>,
+    ) -> Result<IdleSemanticArchiveOwner<M>, (Box<Self>, PalsError)> {
+        if let Err(error) = self.validate_engine_idle_archive_owner() {
+            return Err((self, error));
+        }
+        Ok(IdleSemanticArchiveOwner {
+            owner: IdleOwner::Engine(self),
+            identity: Arc::new(()),
+            pending: None,
+            last_checkpoint: None,
+            last_transition_remaining: None,
+            setup: None,
+            #[cfg(test)]
+            panic_setup_after_enable: false,
+            #[cfg(test)]
+            cancel_after_close: false,
+        })
+    }
+}
+
 impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
     // Rejected kind/setup transitions return the complete original linear
     // owner. Keep this error move-only without a new allocation or lost custody.
@@ -187,7 +218,7 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         }
         match self.owner {
             IdleOwner::Researcher(owner) => Ok(owner),
-            IdleOwner::Pc(_) => Err(self),
+            IdleOwner::Pc(_) | IdleOwner::Engine(_) => Err(self),
         }
     }
     #[allow(clippy::result_large_err)]
@@ -197,11 +228,26 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         }
         match self.owner {
             IdleOwner::Pc(owner) => Ok(owner),
-            IdleOwner::Researcher(_) => Err(self),
+            IdleOwner::Researcher(_) | IdleOwner::Engine(_) => Err(self),
+        }
+    }
+    #[allow(clippy::result_large_err)]
+    pub fn into_engine(self) -> Result<Box<PalsEngine<M>>, Self> {
+        if self.pending.is_some() || self.setup_retained() {
+            return Err(self);
+        }
+        match self.owner {
+            IdleOwner::Engine(owner) => Ok(owner),
+            IdleOwner::Pc(_) | IdleOwner::Researcher(_) => Err(self),
         }
     }
     pub fn stores(&self) -> &PalsStores {
         &self.semantic().stores
+    }
+    /// Read-only original registration attribution, not a root or maintenance
+    /// permit. The worker still seals this same owner and current generation.
+    pub fn last_registered_scope(&self) -> Option<SearchAuthority> {
+        self.semantic().last_adaptive_authority()
     }
     pub fn setup_snapshot(&self) -> Option<&UnusedIdleArchiveSetupSnapshot> {
         self.setup.as_ref()
@@ -210,6 +256,7 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         match &self.owner {
             IdleOwner::Pc(_) => IdleArchiveOwnerKind::Pc,
             IdleOwner::Researcher(_) => IdleArchiveOwnerKind::Researcher,
+            IdleOwner::Engine(_) => IdleArchiveOwnerKind::EnginePcr,
         }
     }
     fn setup_retained(&self) -> bool {
@@ -434,12 +481,14 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         match &self.owner {
             IdleOwner::Researcher(owner) => &owner.semantic,
             IdleOwner::Pc(owner) => &owner.semantic,
+            IdleOwner::Engine(owner) => &owner.semantic,
         }
     }
     fn semantic_mut(&mut self) -> &mut PalsSemanticState<M> {
         match &mut self.owner {
             IdleOwner::Researcher(owner) => &mut owner.semantic,
             IdleOwner::Pc(owner) => &mut owner.semantic,
+            IdleOwner::Engine(owner) => &mut owner.semantic,
         }
     }
     pub(super) fn identity(&self) -> Weak<()> {
@@ -449,12 +498,22 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         match &self.owner {
             IdleOwner::Researcher(owner) => owner.profile().sequence_config(),
             IdleOwner::Pc(owner) => owner.profile.sequence_config(),
+            IdleOwner::Engine(owner) => owner.semantic_sequence_config(),
         }
     }
     fn cpu_value(&self) -> Option<&CpuValueIdentity> {
         match &self.owner {
             IdleOwner::Researcher(owner) => Some(owner.source().model().identity()),
             IdleOwner::Pc(_) => None,
+            IdleOwner::Engine(owner) => owner.researcher.cpu_registered_value.as_ref(),
+        }
+    }
+    fn legacy_model_wdl(&self) -> bool {
+        match &self.owner {
+            IdleOwner::Engine(owner) => {
+                !owner.followup_lane && !owner.post_repair_recheck.uses_frozen_model_wdl()
+            }
+            IdleOwner::Researcher(_) | IdleOwner::Pc(_) => false,
         }
     }
     pub(super) fn validate_idle(&self) -> Result<(), PalsError> {
@@ -467,7 +526,12 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
             return Err(PalsError::Store(error.clone()));
         }
         self.semantic().ensure_archive_admission_open()?;
-        self.semantic().ensure_adaptive_logical_quiescence()
+        match &self.owner {
+            IdleOwner::Engine(owner) => owner.validate_engine_idle_archive_owner(),
+            IdleOwner::Researcher(_) | IdleOwner::Pc(_) => {
+                self.semantic().ensure_adaptive_logical_quiescence()
+            }
+        }
     }
     pub(super) fn projection_pins(&self) -> Result<StorePins, PalsError> {
         match &self.semantic().review_index {
@@ -582,6 +646,9 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         deadline: Instant,
     ) -> Result<(), PalsError> {
         self.semantic().ensure_adaptive_logical_quiescence()?;
+        if let IdleOwner::Engine(owner) = &self.owner {
+            owner.validate_engine_idle_archive_owner()?;
+        }
         if let Some(pending) = &self.pending {
             if pending.kind != kind
                 || deadline > pending.deadline
@@ -628,6 +695,9 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
                 deadline,
                 remaining_io: SEARCH_ARCHIVE_IO_BYTES,
                 preflight_complete: false,
+                engine_reset_attempted: false,
+                engine_reset_completed: false,
+                engine_reset_error: None,
                 checkpoint: None,
                 replacement: None,
                 replacement_inherited: false,
@@ -641,12 +711,53 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         let config = self.config();
         // Borrow separate heap-owned slots; panic/error cannot drop a local
         // replacement or make the original transition lose its remaining bound.
-        let semantic = match &mut self.owner {
-            IdleOwner::Researcher(owner) => &mut owner.semantic,
-            IdleOwner::Pc(owner) => &mut owner.semantic,
-        };
         let pending = self.pending.as_mut().expect("original transition slot");
-        advance_pending(semantic, &config, pending, deadline, cancel)?;
+        match &mut self.owner {
+            IdleOwner::Engine(owner) => {
+                if matches!(kind, IdleArchiveTransitionKind::NewGame(_))
+                    && !pending.preflight_complete
+                {
+                    if let Some(error) = &pending.engine_reset_error {
+                        return Err(error.clone());
+                    }
+                    if pending.engine_reset_attempted && !pending.engine_reset_completed {
+                        return Err(StoreError::InvalidConditions(
+                            "original Engine reset completion unknown",
+                        )
+                        .into());
+                    }
+                    owner
+                        .semantic
+                        .model
+                        .preflight_new_game(deadline.min(pending.deadline), cancel)?;
+                    owner.validate_engine_idle_archive_owner()?;
+                    // The original caller already reset and armed its actual
+                    // CPU. Mark this before consuming that mirror arm, even on
+                    // canceled delivery; a retry must not consume another arm.
+                    pending.engine_reset_attempted = true;
+                    match owner
+                        .preflight_engine_idle_archive_reset(deadline.min(pending.deadline), cancel)
+                    {
+                        Ok(()) => pending.engine_reset_completed = true,
+                        Err(error) => {
+                            pending.engine_reset_error = Some(error.clone());
+                            return Err(error);
+                        }
+                    }
+                    pending.preflight_complete = true;
+                }
+                advance_pending(&mut owner.semantic, &config, pending, deadline, cancel)?;
+                if matches!(kind, IdleArchiveTransitionKind::NewGame(_)) {
+                    owner.complete_engine_idle_archive_new_game();
+                }
+            }
+            IdleOwner::Researcher(owner) => {
+                advance_pending(&mut owner.semantic, &config, pending, deadline, cancel)?;
+            }
+            IdleOwner::Pc(owner) => {
+                advance_pending(&mut owner.semantic, &config, pending, deadline, cancel)?;
+            }
+        }
         self.last_checkpoint = pending.checkpoint.clone();
         self.last_transition_remaining = Some(pending.remaining_io);
         if matches!(kind, IdleArchiveTransitionKind::NewGame(_)) {
@@ -663,6 +774,7 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         self.validate_idle()?;
         let config = self.config();
         let cpu = self.cpu_value().cloned();
+        let legacy_model_wdl = self.legacy_model_wdl();
         let pins = self.projection_pins()?;
         let semantic = self.semantic_mut();
         semantic
@@ -671,7 +783,7 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         let result = semantic.load_archived_root_if_present_with_budget(
             &config,
             cpu.as_ref(),
-            false,
+            legacy_model_wdl,
             position,
             budget,
         );
@@ -694,14 +806,20 @@ impl<M: RoleModel> IdleSemanticArchiveOwner<M> {
         self.validate_idle()?;
         let config = self.config();
         let cpu = self.cpu_value().cloned();
+        let legacy_model_wdl = self.legacy_model_wdl();
         let pins = self.projection_pins()?;
         let semantic = self.semantic_mut();
         semantic
             .stores
             .set_archive_pins(semantic.resident_archive_pins_with(&pins)?)?;
         // Rovent never accepts a legacy Wdl observation as ContextWdl.
-        let result =
-            semantic.load_archived_root_with_budget(&config, cpu.as_ref(), false, position, budget);
+        let result = semantic.load_archived_root_with_budget(
+            &config,
+            cpu.as_ref(),
+            legacy_model_wdl,
+            position,
+            budget,
+        );
         let restored_pins = semantic
             .resident_archive_pins_with(&pins)
             .and_then(|restored| {
@@ -808,6 +926,604 @@ fn advance_pending<M: RoleModel>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cpu::{CpuConfig, CpuEngine, CpuLimits};
+    use crate::cpu_checker::{
+        CheckerAttempt, CheckerCapabilities, CheckerError, CheckerReport, CpuChecker,
+        OwnedCheckerDescriptor, OwnedCpuChecker,
+    };
+    use rz_contracts::{Digest, GameGeneration, ProcessEpoch, RootGeneration};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    // Authored reset-delivery fixture around a real own checker. It observes
+    // calls/arm consumption; it is not an actual native-worker reset proof.
+    struct ResetProbe {
+        checker: OwnedCpuChecker<CpuEngine>,
+        calls: Arc<AtomicUsize>,
+        armed: Arc<AtomicBool>,
+        fail: Arc<AtomicBool>,
+        panic_on_reset: Arc<AtomicBool>,
+    }
+    impl CpuChecker for ResetProbe {
+        fn identity(&self) -> &CheckerIdentity {
+            self.checker.identity()
+        }
+        fn conditions(&self) -> &str {
+            self.checker.conditions()
+        }
+        fn capabilities(&self) -> CheckerCapabilities {
+            self.checker.capabilities()
+        }
+        fn validate_namespace(&self) -> Result<(), CheckerError> {
+            self.checker.validate_namespace()
+        }
+        fn owned_descriptor(&self) -> Option<OwnedCheckerDescriptor> {
+            self.checker.owned_descriptor()
+        }
+        fn last_attempt(&self) -> Option<&CheckerAttempt> {
+            self.checker.last_attempt()
+        }
+        fn reset_attempt(&mut self) {
+            self.checker.reset_attempt();
+        }
+        fn analyze(
+            &mut self,
+            _: &Position,
+            _: CpuLimits,
+            _: &AtomicBool,
+        ) -> Result<CheckerReport, CheckerError> {
+            Err(CheckerError::Unsupported(
+                "no search in Engine idle fixture",
+            ))
+        }
+        fn new_game(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<(), CheckerError> {
+            if !self.armed.swap(false, Ordering::AcqRel) {
+                return Err(CheckerError::Invalid("original fixture reset arm absent"));
+            }
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if self.panic_on_reset.swap(false, Ordering::AcqRel) {
+                panic!("original fixture reset panic");
+            }
+            if self.fail.swap(false, Ordering::AcqRel) {
+                return Err(CheckerError::Invalid(
+                    "original fixture reset delivery failure",
+                ));
+            }
+            self.checker.new_game(deadline, cancel)
+        }
+        fn shutdown(
+            &mut self,
+            deadline: Instant,
+        ) -> Result<crate::cpu_checker::CheckerShutdown, CheckerError> {
+            self.checker.shutdown(deadline)
+        }
+    }
+    struct EngineFixture {
+        owner: Box<PalsEngine<LegalOrderRoleMock>>,
+        calls: Arc<AtomicUsize>,
+        armed: Arc<AtomicBool>,
+        fail: Arc<AtomicBool>,
+        panic_on_reset: Arc<AtomicBool>,
+    }
+    fn engine_scope() -> SearchAuthority {
+        SearchAuthority {
+            epoch: ProcessEpoch(9401),
+            game: GameGeneration(1),
+            root: RootGeneration(1),
+            implementation: Digest([81; 32]),
+        }
+    }
+    fn unused_game_zero_fixture(_until: Instant) -> EngineFixture {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let armed = Arc::new(AtomicBool::new(true));
+        let fail = Arc::new(AtomicBool::new(false));
+        let panic_on_reset = Arc::new(AtomicBool::new(false));
+        let checker = ResetProbe {
+            checker: OwnedCpuChecker::new(
+                CpuEngine::new(CpuConfig {
+                    tt_entries: 64,
+                    max_depth: 4,
+                    quiescence_ply: 4,
+                    ..CpuConfig::default()
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+            calls: Arc::clone(&calls),
+            armed: Arc::clone(&armed),
+            fail: Arc::clone(&fail),
+            panic_on_reset: Arc::clone(&panic_on_reset),
+        };
+        let owner = Box::new(
+            PalsEngine::new_with_boxed_checker_and_rovent_profile(
+                ResearcherSemanticProfile {
+                    config: PalsConfig {
+                        beam_width: 1,
+                        line_plies: 2,
+                        max_nodes: 257,
+                        max_records: 128,
+                        max_role_calls: 128,
+                        cpu_nodes_per_task: 256,
+                    },
+                    maximum_root_prefix_plies: 16,
+                },
+                LegalOrderRoleMock,
+                Box::new(checker),
+                ResolverPolicy::ModelWdlRestricted,
+                PostRepairRecheckPolicy::Disabled,
+            )
+            .unwrap()
+            .with_selected_review_context(
+                ReviewSelectionPolicy::default(),
+                ReviewIndexLimits::default(),
+            )
+            .unwrap(),
+        );
+        EngineFixture {
+            owner,
+            calls,
+            armed,
+            fail,
+            panic_on_reset,
+        }
+    }
+    fn engine_fixture(until: Instant) -> EngineFixture {
+        let mut fixture = unused_game_zero_fixture(until);
+        fixture
+            .owner
+            .try_adaptive_new_game(engine_scope(), until, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(fixture.calls.swap(0, Ordering::AcqRel), 1);
+        fixture
+    }
+
+    #[test]
+    fn engine_unused_same_game_zero_preparation_keeps_scope_and_consumes_reset_once() {
+        let until = Instant::now() + Duration::from_secs(20);
+        let mut fixture = unused_game_zero_fixture(until);
+        let scope = SearchAuthority {
+            game: GameGeneration(0),
+            ..engine_scope()
+        };
+        let store = fixture.owner.stores().read_owner();
+        fixture
+            .owner
+            .prepare_unused_archive_game(scope, until, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(fixture.owner.semantic.game_generation, Some(0));
+        assert_eq!(
+            fixture.owner.semantic.adaptive_new_game_scope(),
+            Some(scope)
+        );
+        assert_eq!(fixture.owner.last_adaptive_authority(), None);
+        assert!(store.matches(fixture.owner.stores()));
+        fixture
+            .owner
+            .prepare_unused_archive_game(scope, until, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(fixture.calls.load(Ordering::Acquire), 1);
+        assert!(!fixture.armed.load(Ordering::Acquire));
+        let other = SearchAuthority {
+            root: RootGeneration(2),
+            ..scope
+        };
+        assert!(
+            fixture
+                .owner
+                .prepare_unused_archive_game(other, until, &AtomicBool::new(false))
+                .is_err()
+        );
+        assert!(
+            fixture
+                .owner
+                .prepare_unused_archive_game(
+                    scope,
+                    until + Duration::from_secs(1),
+                    &AtomicBool::new(false)
+                )
+                .is_err()
+        );
+        assert_eq!(fixture.calls.load(Ordering::Acquire), 1);
+        let idle = fixture
+            .owner
+            .into_idle_archive()
+            .unwrap_or_else(|_| panic!("prepared original Engine"));
+        idle.seal_unused_setup(scope).unwrap();
+    }
+
+    #[test]
+    fn engine_unused_game_reset_failure_preserves_first_error_and_blocks_setup_or_replay() {
+        let until = Instant::now() + Duration::from_secs(20);
+        let mut fixture = unused_game_zero_fixture(until);
+        let scope = SearchAuthority {
+            game: GameGeneration(0),
+            ..engine_scope()
+        };
+        let store = fixture.owner.stores().read_owner();
+        fixture.fail.store(true, Ordering::Release);
+        let first = fixture
+            .owner
+            .prepare_unused_archive_game(scope, until, &AtomicBool::new(false))
+            .unwrap_err();
+        fixture.armed.store(true, Ordering::Release);
+        let repeated = fixture
+            .owner
+            .prepare_unused_archive_game(scope, until, &AtomicBool::new(false))
+            .unwrap_err();
+        assert_eq!(format!("{first:?}"), format!("{repeated:?}"));
+        assert_eq!(fixture.calls.load(Ordering::Acquire), 1);
+        assert!(fixture.armed.load(Ordering::Acquire));
+        assert_eq!(fixture.owner.semantic.adaptive_new_game_scope(), None);
+        assert!(store.matches(fixture.owner.stores()));
+        let (owner, _) = fixture
+            .owner
+            .into_idle_archive()
+            .err()
+            .expect("failed preparation retained");
+        assert!(store.matches(owner.stores()));
+        let pending = owner
+            .semantic
+            .archive_state
+            .unused_engine_game
+            .as_ref()
+            .unwrap();
+        assert!(pending.reset_attempted && !pending.reset_completed);
+        assert!(pending.first_error.is_some() && !pending.completed);
+        assert_eq!(pending.deadline, until);
+    }
+
+    #[test]
+    fn engine_unused_game_panic_keeps_original_payload_and_unknown_without_another_reset() {
+        let until = Instant::now() + Duration::from_secs(20);
+        let mut fixture = unused_game_zero_fixture(until);
+        let scope = SearchAuthority {
+            game: GameGeneration(0),
+            ..engine_scope()
+        };
+        let store = fixture.owner.stores().read_owner();
+        fixture.panic_on_reset.store(true, Ordering::Release);
+        let first = fixture
+            .owner
+            .prepare_unused_archive_game(scope, until, &AtomicBool::new(false))
+            .unwrap_err();
+        fixture.armed.store(true, Ordering::Release);
+        let repeated = fixture
+            .owner
+            .prepare_unused_archive_game(scope, until, &AtomicBool::new(false))
+            .unwrap_err();
+        assert_eq!(format!("{first:?}"), format!("{repeated:?}"));
+        assert_eq!(fixture.calls.load(Ordering::Acquire), 1);
+        assert!(fixture.armed.load(Ordering::Acquire));
+        assert!(store.matches(fixture.owner.stores()));
+        let pending = fixture
+            .owner
+            .semantic
+            .archive_state
+            .unused_engine_game
+            .as_ref()
+            .unwrap();
+        assert!(pending.panic.is_some() && pending.completion_unknown && !pending.completed);
+        assert!(pending.reset_attempted && !pending.reset_completed);
+        assert_eq!(fixture.owner.semantic.adaptive_new_game_scope(), None);
+    }
+    struct EngineScratch(PathBuf, bool);
+    impl EngineScratch {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "rz-engine-idle-archive-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path, false)
+        }
+    }
+    impl Drop for EngineScratch {
+        fn drop(&mut self) {
+            if self.1
+                && self.0.parent() == Some(std::env::temp_dir().as_path())
+                && self.0.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with("rz-engine-idle-archive-")
+                })
+                && std::fs::symlink_metadata(&self.0)
+                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+    fn engine_setup(scratch: &EngineScratch, until: Instant) -> UnusedIdleArchiveSetup {
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(&scratch.0, cap_std::ambient_authority()).unwrap();
+        UnusedIdleArchiveSetup::new(
+            ArchiveConfig::new(scratch.0.clone(), PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            ArchiveRootCapability::from_directory(scratch.0.clone(), directory).unwrap(),
+            ArchiveRuntimeLimits {
+                game_bytes_max: 1 << 20,
+                global_bytes_max: 4 << 20,
+                index_entries_max: 256,
+                index_bytes_max: 512 << 10,
+                load_bytes_max: 512 << 10,
+                load_deadline_max_ms: 20_000,
+                record_payload_bytes_max: 512 << 10,
+                max_load_pins: 16,
+            },
+            UnusedIdleArchiveSetupIdentity {
+                profile: Digest([82; 32]),
+                input_lock: Digest([83; 32]),
+                registration: Digest([84; 32]),
+            },
+            UnusedIdleArchiveSetupControl {
+                deadline: until,
+                cancellation: Arc::new(AtomicBool::new(false)),
+                max_io_bytes: SEARCH_ARCHIVE_IO_BYTES,
+            },
+        )
+    }
+    fn configured_engine(
+        fixture: EngineFixture,
+        scratch: &EngineScratch,
+        until: Instant,
+    ) -> (
+        IdleSemanticArchiveOwner<LegalOrderRoleMock>,
+        Arc<AtomicUsize>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+    ) {
+        let mut owner = fixture
+            .owner
+            .into_idle_archive()
+            .unwrap_or_else(|_| panic!("original Engine idle"));
+        let seal = owner.seal_unused_setup(engine_scope()).unwrap();
+        owner
+            .execute_unused_setup(engine_scope(), &seal, &engine_setup(scratch, until))
+            .unwrap();
+        (owner, fixture.calls, fixture.armed, fixture.fail)
+    }
+    fn register_engine_root(
+        owner: &mut Box<PalsEngine<LegalOrderRoleMock>>,
+        scope: SearchAuthority,
+    ) {
+        let position = Position::startpos();
+        let registered = owner.register_adaptive_root(&position, scope).unwrap();
+        owner.abandon_unconsumed_adaptive_root(scope).unwrap();
+        drop(registered);
+        owner.intern(position).unwrap();
+    }
+
+    #[test]
+    fn engine_idle_preserves_whole_box_checker_store_and_rejects_other_kinds_and_live_pin() {
+        let until = Instant::now() + Duration::from_secs(20);
+        let EngineFixture { owner, calls, .. } = engine_fixture(until);
+        let original = std::ptr::from_ref(owner.as_ref());
+        let store = owner.stores().read_owner();
+        let checker = std::ptr::from_ref(owner.researcher.cpu.as_ref());
+        let pin = owner.stores().pin_review(StorePins::default()).unwrap();
+        let (owner, _) = owner
+            .into_idle_archive()
+            .err()
+            .expect("live original pin rejected");
+        assert_eq!(std::ptr::from_ref(owner.as_ref()), original);
+        assert!(store.matches(owner.stores()));
+        drop(pin);
+        let idle = owner
+            .into_idle_archive()
+            .unwrap_or_else(|_| panic!("original idle"));
+        assert_eq!(idle.owner_kind(), IdleArchiveOwnerKind::EnginePcr);
+        let idle = idle.into_pc().err().expect("Engine is not PC");
+        let idle = idle
+            .into_researcher()
+            .err()
+            .expect("Engine is not preparing");
+        let owner = idle
+            .into_engine()
+            .unwrap_or_else(|_| panic!("same full Engine"));
+        assert_eq!(std::ptr::from_ref(owner.as_ref()), original);
+        assert!(std::ptr::eq(
+            std::ptr::from_ref(owner.researcher.cpu.as_ref()),
+            checker
+        ));
+        assert!(store.matches(owner.stores()));
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn engine_idle_newgame_consumes_reset_once_checkpoints_hot_and_finish_is_separate() {
+        let mut scratch = EngineScratch::new();
+        let until = Instant::now() + Duration::from_secs(20);
+        let (idle, calls, armed, _) = configured_engine(engine_fixture(until), &scratch, until);
+        let mut owner = idle
+            .into_engine()
+            .unwrap_or_else(|_| panic!("configured Engine"));
+        let original = std::ptr::from_ref(owner.as_ref());
+        register_engine_root(&mut owner, engine_scope());
+        let old_store = owner.stores().read_owner();
+        let old_archive = owner.archive_owner_snapshot().unwrap().unwrap();
+        let old_hot = owner.stores().hot_stats();
+        let mut idle = owner
+            .into_idle_archive()
+            .unwrap_or_else(|_| panic!("retired Engine"));
+        let next = SearchAuthority {
+            game: GameGeneration(2),
+            root: RootGeneration(2),
+            ..engine_scope()
+        };
+        armed.store(true, Ordering::Release);
+        idle.advance_transition(
+            IdleArchiveTransitionKind::NewGame(next),
+            until,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        let checkpoint = idle.last_checkpoint().unwrap();
+        assert_eq!(checkpoint.hot, old_hot);
+        assert!(checkpoint.committed_bytes > 0);
+        let actual = idle.archive_owner_snapshot().unwrap().unwrap();
+        assert_ne!(actual.owner_id, old_archive.owner_id);
+        assert_eq!(
+            actual.session_write_ledger_id,
+            old_archive.session_write_ledger_id
+        );
+        assert_eq!(
+            actual.session_write_bytes_consumed,
+            checkpoint.owner.session_write_bytes_consumed
+        );
+        assert!(
+            actual.session_write_bytes_consumed.unwrap()
+                >= old_archive.session_write_bytes_consumed.unwrap()
+        );
+        assert!(!old_store.matches(idle.stores()));
+        let mut owner = idle
+            .into_engine()
+            .unwrap_or_else(|_| panic!("same full Engine after NewGame"));
+        assert_eq!(std::ptr::from_ref(owner.as_ref()), original);
+        register_engine_root(&mut owner, next);
+        let mut idle = owner
+            .into_idle_archive()
+            .unwrap_or_else(|_| panic!("new-game Engine"));
+        idle.advance_transition(
+            IdleArchiveTransitionKind::Finish,
+            until,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(idle.transition_snapshot().unwrap().unwrap().completed);
+        assert!(idle.last_checkpoint().unwrap().owner.complete);
+        assert!(
+            idle.archive_owner_snapshot()
+                .unwrap()
+                .unwrap()
+                .admission_closed
+        );
+        assert!(idle.into_engine().is_err());
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        scratch.1 = true;
+    }
+
+    #[test]
+    fn engine_idle_failed_reset_retains_original_error_and_does_not_consume_another_arm() {
+        let scratch = EngineScratch::new();
+        let until = Instant::now() + Duration::from_secs(20);
+        let (idle, calls, armed, fail) = configured_engine(engine_fixture(until), &scratch, until);
+        let mut owner = idle
+            .into_engine()
+            .unwrap_or_else(|_| panic!("original Engine"));
+        register_engine_root(&mut owner, engine_scope());
+        let store = owner.stores().read_owner();
+        let mut idle = owner
+            .into_idle_archive()
+            .unwrap_or_else(|_| panic!("original idle"));
+        let kind = IdleArchiveTransitionKind::NewGame(SearchAuthority {
+            game: GameGeneration(2),
+            root: RootGeneration(2),
+            ..engine_scope()
+        });
+        armed.store(true, Ordering::Release);
+        fail.store(true, Ordering::Release);
+        let first = idle
+            .advance_transition(kind, until, &AtomicBool::new(false))
+            .unwrap_err();
+        assert!(matches!(
+            first,
+            PalsError::Checker(CheckerError::Invalid(
+                "original fixture reset delivery failure"
+            ))
+        ));
+        armed.store(true, Ordering::Release); // not permission for this original command
+        let repeated = idle
+            .advance_transition(kind, until, &AtomicBool::new(false))
+            .unwrap_err();
+        assert_eq!(format!("{first:?}"), format!("{repeated:?}"));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(armed.load(Ordering::Acquire));
+        assert!(store.matches(idle.stores()));
+        let pending = idle.pending.as_ref().unwrap();
+        assert!(pending.engine_reset_attempted && !pending.engine_reset_completed);
+        assert!(pending.engine_reset_error.is_some());
+        assert_eq!(pending.deadline, until);
+        assert_eq!(pending.remaining_io, SEARCH_ARCHIVE_IO_BYTES);
+        assert!(pending.checkpoint.is_none() && pending.replacement.is_none());
+        assert!(idle.into_engine().is_err());
+    }
+
+    #[test]
+    fn engine_idle_restore_policy_preserves_actual_registered_value_and_recheck_semantics() {
+        let until = Instant::now() + Duration::from_secs(20);
+        let mut fixture = engine_fixture(until);
+        fixture.owner.followup_lane = false;
+        let value = fixture.owner.researcher.cpu_registered_value.clone();
+        let mut idle = fixture
+            .owner
+            .into_idle_archive()
+            .unwrap_or_else(|_| panic!("Engine"));
+        assert_eq!(idle.cpu_value(), value.as_ref());
+        assert!(idle.legacy_model_wdl());
+        let IdleOwner::Engine(owner) = &mut idle.owner else {
+            unreachable!()
+        };
+        owner.followup_lane = true;
+        assert!(!idle.legacy_model_wdl());
+        let IdleOwner::Engine(owner) = &mut idle.owner else {
+            unreachable!()
+        };
+        owner.followup_lane = false;
+        owner.post_repair_recheck = PostRepairRecheckPolicy::FrozenModelWdlV2;
+        assert!(!idle.legacy_model_wdl());
+        assert_eq!(idle.cpu_value(), value.as_ref());
+    }
+
+    #[test]
+    fn engine_idle_typed_restore_distinguishes_real_absence_from_present_engine_metadata() {
+        let mut scratch = EngineScratch::new();
+        let until = Instant::now() + Duration::from_secs(20);
+        let (idle, _, _, _) = configured_engine(engine_fixture(until), &scratch, until);
+        let mut owner = idle
+            .into_engine()
+            .unwrap_or_else(|_| panic!("original Engine"));
+        register_engine_root(&mut owner, engine_scope());
+        let store = owner.stores().read_owner();
+        let value = owner.researcher.cpu_registered_value.clone();
+        let mut idle = owner
+            .into_idle_archive()
+            .unwrap_or_else(|_| panic!("actual idle"));
+        let position = Position::startpos();
+        let mut budget = ArchiveIoBudget {
+            deadline: until,
+            max_bytes: SEARCH_ARCHIVE_IO_BYTES,
+        };
+        assert_eq!(
+            idle.restore_root_if_archived(&position, &mut budget)
+                .unwrap(),
+            None
+        );
+        let committed = idle
+            .semantic_mut()
+            .checkpoint_idle_archive_game(&mut budget)
+            .unwrap();
+        assert!(committed.nodes > 0 && committed.committed_bytes > 0);
+        let root = idle
+            .restore_root_if_archived(&position, &mut budget)
+            .unwrap()
+            .expect("actual committed Engine metadata");
+        assert!(
+            idle.semantic().nodes[root]
+                .position
+                .snapshot()
+                .same_state(&position.snapshot())
+        );
+        assert_eq!(idle.cpu_value(), value.as_ref());
+        assert!(store.matches(idle.stores()));
+        idle.advance_transition(
+            IdleArchiveTransitionKind::Finish,
+            until,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        scratch.1 = true;
+    }
 
     #[test]
     fn preparing_idle_transfer_preserves_actual_source_and_rejects_a_live_view() {
