@@ -1227,7 +1227,7 @@ impl<M: RoleModel + 'static> ArchiveWorker<M> {
             setup.control.deadline,
             &setup.control.cancellation,
         ))) {
-            return Err(rejected(owner, setup, error));
+            return Err(rejected(owner, setup, error.into()));
         }
         let seal = match owner.seal_unused_setup(scope) {
             Ok(seal) => seal,
