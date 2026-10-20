@@ -7,8 +7,13 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import tarfile
+import zipfile
+import zlib
 
 sys.dont_write_bytecode = True
+# Permit an isolated -I -S invocation without caller PYTHONPATH or user packages.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from managed_storage import StorageError, checked, recover_build, tree_size
 from managed_outputs import recover_output
 
@@ -46,13 +51,31 @@ def main():
     output.add_argument("--catalog", type=Path, required=True)
     output.add_argument("--key", required=True)
     output.add_argument("--record-sha256", required=True)
+    research = commands.add_parser("verify-research", help="verify a pinned research ZIP; never delete")
+    research.add_argument("--archive", type=Path, required=True)
+    research.add_argument("--archive-bytes", type=int, required=True)
+    research.add_argument("--archive-sha256", required=True)
+    research.add_argument("--seconds", type=int, default=180)
+    code = commands.add_parser("audit-code-cache", help="audit registered ELF duplicates; no unlink authority")
+    code.add_argument("--plan", type=Path, required=True)
+    code.add_argument("--plan-bytes", type=int, required=True)
+    code.add_argument("--plan-sha256", required=True)
+    code.add_argument("--seconds", type=int, default=300)
     args = parser.parse_args()
     if args.operation == "inventory":
         result = inventory(args.root)
     elif args.operation == "recover-build":
         result = recover_build(args.root, args.owner_sha256)
-    else:
+    elif args.operation == "recover-output":
         result = recover_output(args.catalog, args.key, args.record_sha256)
+    elif args.operation == "verify-research":
+        from storage_artifact_review import verify_research
+        result = verify_research({"path": str(args.archive), "bytes": args.archive_bytes,
+                                  "sha256": args.archive_sha256}, seconds=args.seconds)
+    else:
+        from storage_artifact_review import audit_code_cache
+        result = audit_code_cache({"path": str(args.plan), "bytes": args.plan_bytes,
+                                   "sha256": args.plan_sha256}, seconds=args.seconds)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 
@@ -60,6 +83,6 @@ def main():
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, KeyError, StorageError) as error:
+    except (OSError, ValueError, KeyError, StorageError, zipfile.BadZipFile, tarfile.TarError, EOFError, zlib.error) as error:
         print(f"storage_maintenance_error={error}; unknown artifacts and leases preserved", file=sys.stderr)
         raise SystemExit(125)

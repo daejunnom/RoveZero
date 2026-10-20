@@ -96,3 +96,43 @@ inventory는 최대 16개의 **명시적·겹치지 않는 root**만 길이 기�
 등록 카탈로그 밖의 임의 스크립트·수동 복사는 이 한도를 우회할 수 있다. 새 대형
 producer는 `OutputLease` 또는 기존 native retention 접점에 연결해야 한다.
 기존 미등록 자료의 분류·회수는 실제 소유자·사용 여부·보존 근거 확인 후의 별도 작업이다.
+
+## 연구 ZIP·중복 ELF 검증 자동화
+
+`storage_maintenance.py verify-research`는 원 byte 수와 SHA-256으로 고정한 연구 ZIP의
+CRC, `inventory.json`, 모든 member의 크기·SHA-256을 한 번에 검사한다. 목록 밖 파일,
+중복 member·JSON key, link/비밀 이름, 손상·과도한 해제 크기는 거부한다. 이 명령은
+자료 회수·native 종료·물리 완료를 증명하거나 원 자료를 삭제하지 않는다. 구형 inventory의
+다른 필드 형식을 자동 변환하지 않으며, 당시 원문과 검증기를 그대로 보존한다.
+
+`storage_maintenance.py audit-code-cache`는 아래 닫힌 plan의 원 byte 수·SHA-256을
+받아 연구 ZIP과 공식 artifact의 nested TAR를 반복 가능한 방식으로 대조한다.
+표준 카탈로그의 원 row digest·output inode·marker·종료·owner 사망을 확인하고,
+held FD로 읽은 명시적 `selected4/` 또는 `private-elf/`의 제품 ELF만 대상으로 한다.
+공식 archive는 추출하지 않고 stream으로 검사한다. 모델·runtime DSO·입력·workspace·
+원시 결과를 재생성 코드로 분류하지 않는다.
+
+```powershell
+python scripts/storage_maintenance.py verify-research --archive <absolute-research-zip> --archive-bytes <exact-bytes> --archive-sha256 <original-sha256>
+python scripts/storage_maintenance.py audit-code-cache --plan <absolute-plan-json> --plan-bytes <exact-bytes> --plan-sha256 <original-sha256>
+```
+
+plan의 필드는 `schema=rovezero.code-cache-audit.v1`, `catalog`, `key`,
+`record_sha256`, `artifact`, `archive_member`, `code`, `research`다. `artifact`와
+`research`는 `{path, bytes, sha256}`의 절대 경로 raw pin이다. `archive_member`는
+공식 ZIP 안의 `native-validation-binaries.tar.gz` 같은 정확한 member다. `code`의
+각 항목은 `{relative, tar_member, bytes, sha256}`이며 원 output 상대 경로와 공식
+TAR의 정확한 member를 구분한다. basename만 같은 파일을 같은 자산으로 취급하지 않는다.
+
+이 자동화는 **읽기 전용 검증**이다. 성공 응답에도 `retirement_authority_issued=false`와
+`deletion_performed=false`를 남긴다. audit 결과 파일을 삭제 권한이나 만료 lease의
+복구 증거로 사용하지 않는다. 실제 정리 직전의 원 custody 재검증, 현재 exe/FD/maps 사용
+조사, 같은 held inode/name 대조와 durable 정리 journal은 기존 소유권별 처리기에 남는다.
+기존 interrupted-unbound custody registry가 있으면 자동 채택하지 않고 즉시 거부한다.
+따라서 현재 특수 custody 자료의 destructive apply는 이 명령에 자동 연결하지 않았다.
+
+입력 수·압축 해제량과 요청한 1~600초의 내부 관측 창을 제한한다. OS I/O 중단까지의
+hard timeout과 자식 트리 종료가 필요하면 기존 `run_managed.py` 감독 아래 실행한다.
+새 예약을 늘리거나 카탈로그를 수정하지 않고, 보존 결과의 18GiB·14일 검토 정책,
+만료가 삭제 권한이 아니라는 규칙, GPU physical unknown의 보존을 유지한다. 반복 실행의
+검증 결과도 실제 source·plan·환경과 함께 보관하며 과거 성공을 현재 apply에 재사용하지 않는다.
