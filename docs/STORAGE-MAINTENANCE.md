@@ -136,3 +136,46 @@ hard timeout과 자식 트리 종료가 필요하면 기존 `run_managed.py` 감
 새 예약을 늘리거나 카탈로그를 수정하지 않고, 보존 결과의 18GiB·14일 검토 정책,
 만료가 삭제 권한이 아니라는 규칙, GPU physical unknown의 보존을 유지한다. 반복 실행의
 검증 결과도 실제 source·plan·환경과 함께 보관하며 과거 성공을 현재 apply에 재사용하지 않는다.
+
+## 새 출력 한정 preservation session
+
+`OutputLease(..., preservation_session=PreservationSelection(...))`는 별도의 명시적
+선택 정책이다. 기본 실행에는 활성화하지 않으며 기존 V1·transition 선택자 및 outer
+finalizer와 함께 지정할 수 없다. 이 선택자는 역사 tip raw pin과 현재 source6 raw pin의
+설정일 뿐, JSON·과거 영수증·선택자 객체 자체가 실행 권한을 부여하지 않는다.
+
+기존 transition generation 1~8, `MAX_TRANSITIONS=8`, 현재 tip의 boot/source/mount를
+요구하는 기존 validator는 그대로 둔다. 새 정책은 9번째 transition을 발행하거나 tip8을
+현재 tip으로 바꾸지 않는다. 원 catalog row·원본 복사·snapshot·records1~8·physical
+unknown은 읽기 전용으로 보존하며, 원 owner·삭제 권한·물리 완료를 재발급하지 않는다.
+
+새 정책은 같은 canonical catalog의 원 OS gate 아래에서 역사 chain 전체를 검증한
+뒤, 현재 boot·mount namespace·source6를 실제 held FD로 다시 관측한다. 역사 anchor와
+새 출력에 한정한 `CurrentExclusionSession`은 별도 타입이다. 원 unknown subtree와 그
+모든 ancestor/descendant는 새 출력 범위에서 제외한다. 원 reservation charge·registry
+metadata·새 출력의 journal/payload를 동일한 18GiB 합계와 새 reserve에 포함한다.
+
+현재 관측은 최대 30초이며 원 관측의 deadline을 늘리지 않는다. 다음 관측은 독립된
+새 실제 검증으로 만들고 이전 관측을 닫는다. 이 갱신은 제품 요청·실험의 원 hard
+deadline을 연장하지 않는다. boot/source/mount/FD 변경이나 증거 불명확은 거부하며,
+기존 출력이나 다른 active row를 현재 producer로 채택하지 않는다.
+
+새 출력은 현재 producer가 fresh 경로로 등록해야 한다. 비deferred 출력은 acquire가
+반환되기 전에, deferred 출력은 원 `create_deferred_directory`가 반환되기 전에 필수
+관측 증거를 저장한다. unbound deferred acquire는 metadata 예약일 뿐 payload 허용이
+아니다. 저장·fsync·readback 실패 시 payload를 시작하지 않고 실패와 부분 자료를 보존한다.
+
+관측 증거는 새 출력의 owner 전용 `.rovezero-preservation-session.jsonl` 한 파일에
+append한다. 각 entry는 이전 entry의 digest·새 관측 digest·current source6·역사 tip·
+현재 mount/identity·원 snapshot digest·reservation charge를 보존하고 fsync/readback한다.
+파일은 원 producer의 실제 FD·inode·token에 묶으며 저장된 journal을 읽어 새 owner로
+복원하지 않는다. 상한은 lease당 4,096관측·파일 16MiB·entry 1MiB다. 한도를 채우거나
+partial append·파일 교체·다른 writer 흔적이 있으면 실패를 유지하며 자동 truncate,
+rollover, 성공 보정, 원 자료 삭제를 하지 않는다.
+
+새 정책으로 묶은 producer가 중단돼도 저장된 journal이나 active row를 다음 producer가
+자동 채택하지 않는다. 현재 기존 recovery 경로는 기존 current-tip 조건을 계속 요구하므로,
+새 정책의 중단 출력에 대한 별도 복구 인수가 끝나기 전에는 자료와 예약을 보존하고 차단한다.
+
+이 정책 등록과 CPU fixture 성공은 실제 실행 승인·신경망·GPU 수명 인수를 대신하지
+않는다. 실제 재관측과 제품 검증은 새 실행 ID·기존 자원/시간/보존 조건으로 별도 기록한다.
