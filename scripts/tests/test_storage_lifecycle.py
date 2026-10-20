@@ -35,6 +35,12 @@ class LifecycleTests(unittest.TestCase):
         self.source.mkdir()
         self.catalog = self.base / "outputs"
         self.build = self.base / "build"
+        # Exercise the real default finalizer in this private fixture. Tests
+        # with explicit catalog overrides and outer-supervisor ownership still
+        # use their existing real code paths, never the user's live catalog.
+        catalog_patch = patch("managed_outputs.canonical_catalog", return_value=self.catalog)
+        catalog_patch.start()
+        self.addCleanup(catalog_patch.stop)
 
     def lease(self, name="run", **kwargs):
         owner = OutputLease(self.base / name, self.source, catalog=self.catalog, **kwargs).acquire()
@@ -243,8 +249,10 @@ from managed_storage import ManagedBuild, StorageError
 owner=ManagedBuild(Path({str(self.build)!r}),Path({str(self.source)!r})).acquire()
 (owner.scratch/'input').write_bytes(b'owned')
 try:
-    with patch('managed_storage.remove_tree',side_effect=StorageError('synthetic crash after closure')):
-        owner.finish(exit_code=0,tree_gone=True)
+    # A new Python process cannot inherit the parent's unittest.mock patch.
+    with patch('managed_outputs.canonical_catalog',return_value=Path({str(self.catalog)!r})):
+        with patch('managed_storage.remove_tree',side_effect=StorageError('synthetic crash after closure')):
+            owner.finish(exit_code=0,tree_gone=True)
 except StorageError:
     os._exit(17)
 """

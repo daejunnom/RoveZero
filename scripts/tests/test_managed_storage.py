@@ -24,11 +24,31 @@ class StorageTests(unittest.TestCase):
         self.source = self.base / "source"
         self.source.mkdir()
         self.root = self.base / "owned-build"
+        # ManagedBuild.finish/recover_build call the real output finalizer.
+        # Keep its default lookup in this fixture instead of the user's live
+        # catalog; explicit catalog arguments remain unaffected.
+        self.output_catalog = self.base / "outputs"
+        self.output_catalog.mkdir()
+        catalog_patch = patch("managed_outputs.canonical_catalog", return_value=self.output_catalog)
+        self.default_catalog = catalog_patch.start()
+        self.addCleanup(catalog_patch.stop)
         self.model = self.source / "original-model.bin"
         self.model.write_bytes(b"retained-original")
 
     def acquire(self, source=None, **limits):
         return ManagedBuild(self.root, source or self.source, **limits).acquire()
+
+    def test_finish_real_finalizer_uses_only_the_fixture_default_catalog(self):
+        owner = self.acquire()
+        (owner.scratch / "owned-remnant").write_bytes(b"fixture temporary")
+        result = owner.finish(exit_code=0, tree_gone=True)
+        self.default_catalog.assert_called_once_with()
+        self.assertEqual({path.name for path in self.output_catalog.iterdir()}, {"catalog.lock"})
+        self.assertTrue(result["tree_cleanup_verified"])
+        self.assertTrue(result["temporary_removed"])
+        self.assertFalse(owner.lock.exists())
+        self.assertFalse(owner.scratch.exists())
+        self.assertEqual(self.model.read_bytes(), b"retained-original")
 
     def test_snapshot_preserves_raw_hash_and_original_fd_stamp(self):
         record = self.source / "owner.json"
