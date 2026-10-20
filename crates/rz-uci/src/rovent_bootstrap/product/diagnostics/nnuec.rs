@@ -81,6 +81,8 @@ impl RoventLifecycleDiagnostics {
             state.scope_incomplete = true;
             state.first_issue.get_or_insert(cause);
         }
+        drop(state);
+        self.observe_nnuec_cpu_slices(product, context);
     }
 }
 

@@ -63,6 +63,13 @@ depth·mate 요청이 없는 선택 탐색은 별도 `selective_frontier` 상태
 설치 성공만으로 추론하지 않는다. 마지막 engine의 stack 계수는 해당 engine 수명의
 값으로 표시하며 root 전체의 재개 합계로 사용하지 않는다.
 
+같은 opt-in에서 원 manager의 bounded CPU slice handle을 root 입장 전에 설치하고,
+root 반환 뒤 `rz-rovent-nnuec-cpu-slice-observation/1`로 실제 정산 prefix를 관측한다.
+root당 최대32개이며 원 Job·질문·view·grant·ExecutionId·Yield ack·정산·worker 재개
+시간을 보존한다. 원 admission과 같은 authority로 대조해야 하며, 누락·overflow 뒤의
+전체 건수는 unknown이다. 이 관측은 token 권한·accepted C·조건부 value·물리 완료를
+발급하지 않는다. 기존8KiB 행·1MiB stream과 마지막 lifecycle 행의 예약을 공유한다.
+
 mate는 실제 Rules terminal에서 OR/AND로 전파한다. 한 유효 공격과 필요한 모든 합법
 방어의 근거가 닫히면 강제 승리·패배 모두 조기 종료할 수 있다. 거리 상한과 정확 최단
 거리를 구분하고 처음에는 정확 거리만 `score mate`로 출력한다. NN값·외부 mate·단일

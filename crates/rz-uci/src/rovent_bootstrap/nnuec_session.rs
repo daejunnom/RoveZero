@@ -442,6 +442,7 @@ impl RoventNnuecSessionDriver {
         hash.update(include_bytes!("nnuec_session/retirement.rs"));
         hash.update(include_bytes!("nnuec_session/initial_cleanup.rs"));
         hash.update(include_bytes!("nnuec_session/diagnostics.rs"));
+        hash.update(include_bytes!("nnuec_session/diagnostics/cpu_slices.rs"));
         // The existing digest producer validates the original closed document.
         hash.update(document.configuration_digest()?);
         hash.update([match root_policy {
@@ -715,6 +716,12 @@ impl RoventNnuecSessionDriver {
         &self,
     ) -> Result<Option<diagnostics::NnuecOwnerObservation>, &'static str> {
         self.nnuec_diagnostics.snapshot()
+    }
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    pub(crate) fn nnuec_cpu_slice_observation(
+        &self,
+    ) -> Result<Option<diagnostics::cpu_slices::CpuSliceOwnerObservation>, &'static str> {
+        self.nnuec_diagnostics.cpu_slice_snapshot()
     }
     #[allow(clippy::result_large_err)]
     pub(crate) fn install_storage_registration(

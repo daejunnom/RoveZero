@@ -741,6 +741,8 @@ impl RoventNnuecSessionDriver {
         let mut collection_failure = None;
         let execution = {
             let manager = run.manager.as_mut().expect("actual admitted manager");
+            #[cfg(feature = "pals-adaptive-diagnostics")]
+            self.nnuec_diagnostics.install_cpu_slices(manager);
             let actor = run.actor.as_ref().expect("same preparation actor");
             let admission = &run.admission;
             catch_unwind(AssertUnwindSafe(|| -> Result<(), AdaptiveManagerError> {

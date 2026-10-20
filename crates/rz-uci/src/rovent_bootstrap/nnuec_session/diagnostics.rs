@@ -5,6 +5,7 @@ use crate::pals_adaptive::NnuecPreparationRecord;
 use rz_search::cpu_value::nnuec::v2::review::{PreparationStatus, Provenance};
 use rz_search::cpu_worker::{NnuecReadyRegistration, ValueInstallReceipt};
 use serde::Serialize;
+pub(crate) mod cpu_slices;
 
 const DETAIL_LIMIT: usize = 8;
 
@@ -218,6 +219,7 @@ pub(super) struct NnuecDiagnosticJournal {
     enabled: AtomicBool,
     unavailable: AtomicBool,
     latest: Mutex<Option<NnuecOwnerObservation>>,
+    cpu_slices: cpu_slices::CpuSliceJournal,
 }
 impl NnuecDiagnosticJournal {
     pub(super) fn enable(&self) {
@@ -252,6 +254,20 @@ impl NnuecDiagnosticJournal {
             }
             Err(_) => self.unavailable.store(true, Ordering::Release),
         }
+        self.cpu_slices.begin(authority, root_admission);
+    }
+    pub(super) fn install_cpu_slices(&self, manager: &Manager) {
+        if self.enabled.load(Ordering::Acquire) {
+            self.cpu_slices.install(manager);
+        }
+    }
+    pub(super) fn cpu_slice_snapshot(
+        &self,
+    ) -> Result<Option<cpu_slices::CpuSliceOwnerObservation>, &'static str> {
+        if !self.enabled.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        self.cpu_slices.snapshot()
     }
     fn update(&self, apply: impl FnOnce(&mut NnuecOwnerObservation)) {
         if !self.enabled.load(Ordering::Acquire) {

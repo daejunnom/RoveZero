@@ -23,6 +23,8 @@ pub const ROVENT_LIFECYCLE_DIAGNOSTIC_DOMAIN: &str = "rz-rovent-product-lifecycl
 pub const ROVENT_STORAGE_DIAGNOSTIC_DOMAIN: &str = "rz-rovent-storage-maintenance-observation/1";
 #[cfg(feature = "pals-adaptive-diagnostics")]
 mod nnuec;
+#[cfg(feature = "pals-adaptive-diagnostics")]
+mod nnuec_cpu_slices;
 // Operational output limits, independent of search/node/role credit. Keep one
 // final row available even after an incomplete root stream reaches its bound.
 const MAX_ROOT_ROWS: u64 = 256;
