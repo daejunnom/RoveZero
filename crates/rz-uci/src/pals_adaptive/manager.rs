@@ -148,6 +148,8 @@ mod role_only;
 use cleanup::{CleanupBoundary, automatic_cleanup_deadline};
 pub use collection::*;
 pub use frontier::{RoventNativeAccountingObservation, RoventReviewLeaseObservation};
+#[cfg(feature = "pals-adaptive-diagnostics")]
+pub use nnuec::NnuecPreparationAckObservation;
 pub use nnuec::{
     AdaptiveNnuecRetiredOwner, AdaptiveNnuecRootParts, NnuecPreparationRecord, NnuecWorkError,
 };
@@ -911,6 +913,13 @@ pub trait AdaptiveSearchDriver<Q> {
     fn rovent_publication_capacity_closed(&self) -> Result<bool, AdaptiveManagerError> {
         Ok(self.rovent_public_record_capacity_closed()?
             || self.rovent_public_review_index_capacity_closed()?)
+    }
+    fn close_rovent_role_call_budget(
+        &mut self,
+        _: u64,
+        _: u64,
+    ) -> Result<(), AdaptiveManagerError> {
+        Ok(())
     }
     fn rovent_frame_admitted(
         &mut self,
@@ -3598,12 +3607,20 @@ where
                         // completion/ack/semantic commit obligations. Budget
                         // exhaustion only closes new work; it cannot discard
                         // an already reserved output to manufacture success.
-                        || (self.role_call_limit_reached() && self.roles.is_empty() && self.accepted_roles.is_empty()))
+                        || (self.role_call_limit_reached() && self.roles.is_empty() && self.accepted_roles.is_empty() && self.driver.semantic_owner_available()))
                 {
                     let until = self.cleanup_until()?;
                     if exclusive_completed {
                         self.begin_root_quiesce(until)?;
                     } else {
+                        let limit = self.role_call_limit.ok_or(AdaptiveManagerError::Invalid(
+                            "settled role-call limit absent",
+                        ))?;
+                        let (spent, _) = self.role_call_budget_usage();
+                        if let Err(error) = self.driver.close_rovent_role_call_budget(spent, limit)
+                        {
+                            self.record_failure(error);
+                        }
                         self.begin_selected_shutdown(until)?;
                     }
                 }

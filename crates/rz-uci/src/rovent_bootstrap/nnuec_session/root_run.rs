@@ -190,6 +190,9 @@ impl RoventNnuecSessionDriver {
         admission: Arc<RoventRootAdmission>,
         progress: &mut dyn FnMut(BoardMove),
     ) -> RootReturn {
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        self.nnuec_diagnostics
+            .begin(context.authority, admission.digest());
         let mut run = RootRunCustody::new(idle, admission);
         let outcome = (|| {
             if !self.prepare_admitted_root(&mut run, position, context)? {
@@ -207,6 +210,16 @@ impl RoventNnuecSessionDriver {
                 .take()
                 .expect("completed phase has its original return"),
             Err(failed) => {
+                #[cfg(feature = "pals-adaptive-diagnostics")]
+                {
+                    self.nnuec_diagnostics.failure(failed.code);
+                    if let Some(manager) = run.manager.as_ref() {
+                        self.nnuec_diagnostics.preparations(
+                            manager.nnuec_preparation_observations(),
+                            manager.nnuec_preparation_observations_omitted(),
+                        );
+                    }
+                }
                 self.closed.store(true, Ordering::Release);
                 let error = unknown(failed.code, &failed.detail);
                 run.retained_failure = Some(failed);
@@ -596,6 +609,13 @@ impl RoventNnuecSessionDriver {
                 .expect("original handoff")
                 .root_moves,
         ));
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        self.nnuec_diagnostics.initial_ready(
+            &run.preparing_custody
+                .as_ref()
+                .expect("original handoff")
+                .ready,
+        );
         let (ledger, root_budget, cleanup_deadline, pins) = NnuecRootRetirementPins::from_custody(
             *run.preparing_custody.take().expect("same original handoff"),
             run.metadata.take().expect("same actual metadata"),
@@ -1028,6 +1048,11 @@ impl RoventNnuecSessionDriver {
         context: &SearchSessionContext,
     ) -> Result<(), RootRunFailure> {
         let manager = run.manager.take().expect("same fenced manager");
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        self.nnuec_diagnostics.preparations(
+            manager.nnuec_preparation_observations(),
+            manager.nnuec_preparation_observations_omitted(),
+        );
         run.parts = match (*manager).into_nnuec_root_parts() {
             Ok(parts) => Some(Box::new(parts)),
             Err(rejection) => {
@@ -1036,6 +1061,12 @@ impl RoventNnuecSessionDriver {
             }
         };
         let parts = run.parts.as_ref().expect("same original root parts");
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        {
+            if let Some(owner) = parts.cpu.first() {
+                self.nnuec_diagnostics.joined(owner);
+            }
+        }
         if parts.cpu.len() != 1 || parts.external.is_some() {
             return Err(run.fail(
                 "RoventNnuecCpuTransfer",
@@ -1115,6 +1146,8 @@ impl RoventNnuecSessionDriver {
             match retirement.step() {
                 NnuecRootRetirementStep::Pending(pending) => run.retirement = Some(pending),
                 NnuecRootRetirementStep::Ready(retired) => {
+                    #[cfg(feature = "pals-adaptive-diagnostics")]
+                    self.nnuec_diagnostics.retired(&retired);
                     run.retired = Some(retired);
                     break;
                 }

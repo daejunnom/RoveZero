@@ -21,6 +21,8 @@ use std::sync::{
 
 pub const ROVENT_LIFECYCLE_DIAGNOSTIC_DOMAIN: &str = "rz-rovent-product-lifecycle-observation/1";
 pub const ROVENT_STORAGE_DIAGNOSTIC_DOMAIN: &str = "rz-rovent-storage-maintenance-observation/1";
+#[cfg(feature = "pals-adaptive-diagnostics")]
+mod nnuec;
 // Operational output limits, independent of search/node/role credit. Keep one
 // final row available even after an incomplete root stream reaches its bound.
 const MAX_ROOT_ROWS: u64 = 256;
@@ -1410,11 +1412,13 @@ fn goal(value: FrontierGoalStatus) -> &'static str {
         FrontierGoalStatus::Pending => "pending",
         FrontierGoalStatus::DepthSatisfied => "depth_satisfied",
         FrontierGoalStatus::MateSatisfied => "mate_satisfied",
+        FrontierGoalStatus::SelectiveFrontier => "selective_frontier",
         FrontierGoalStatus::GoalUnresolved => "goal_unresolved",
         FrontierGoalStatus::Stopped(reason) => match reason {
             FrontierStop::Canceled => "stopped_canceled",
             FrontierStop::Deadline => "stopped_deadline",
             FrontierStop::WorkBudget => "stopped_work_budget",
+            FrontierStop::RoleBudget => "stopped_role_budget",
             FrontierStop::Capacity => "stopped_capacity",
             FrontierStop::NativeUnknown => "stopped_native_unknown",
             FrontierStop::EvidenceReclaimed => "stopped_evidence_reclaimed",

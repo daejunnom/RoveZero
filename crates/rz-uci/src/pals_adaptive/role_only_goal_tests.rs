@@ -201,6 +201,13 @@ impl RoleOnlySearchDriver<PcPortQuestion> for ActualGoalDriver {
     fn is_complete(&self) -> bool {
         self.inner.is_complete()
     }
+    fn close_role_call_budget(
+        &mut self,
+        admitted: u64,
+        limit: u64,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.inner.close_role_call_budget(admitted, limit)
+    }
     fn role_consumption_recorded(
         &self,
         ticket: &RoleTicketEnvelope,
@@ -223,6 +230,13 @@ type ActualGoalManager =
     RoleOnlyExecutionManager<PcPortQuestion, GoalNativeFixture, ActualGoalDriver>;
 
 fn fixture(goal: SearchGoal) -> (ActualGoalManager, Arc<NativeFacts>, Instant) {
+    fixture_with_role_limit(goal, 128)
+}
+
+fn fixture_with_role_limit(
+    goal: SearchGoal,
+    role_limit: u64,
+) -> (ActualGoalManager, Arc<NativeFacts>, Instant) {
     let clock = ContractSystemClock::new(ProcessEpoch(717));
     let until = clock.origin() + WINDOW;
     let authority = SearchAuthority {
@@ -256,7 +270,7 @@ fn fixture(goal: SearchGoal) -> (ActualGoalManager, Arc<NativeFacts>, Instant) {
                 line_plies: 2,
                 max_nodes: 257,
                 max_records: 128,
-                max_role_calls: 128,
+                max_role_calls: role_limit,
             },
             maximum_root_prefix_plies: 16,
         },
@@ -343,7 +357,7 @@ fn fixture(goal: SearchGoal) -> (ActualGoalManager, Arc<NativeFacts>, Instant) {
             token_budget: 512,
             first_request_sequence: 1,
             role_tickets_max: 2,
-            role_call_limit: 128,
+            role_call_limit: role_limit,
             event_order: CoordinatorPolicy::Fixed,
         },
         clock,
@@ -518,5 +532,55 @@ fn actual_no_researcher_depth_completion_survives_fence_and_frontier_retirement(
             .iter()
             .any(|ticket| ticket.representation.record_revision > 0)
     );
+    close_and_recover(manager, until);
+}
+
+#[test]
+fn actual_no_goal_selected_completion_survives_the_original_native_fence() {
+    let (mut manager, _, until) = fixture(SearchGoal::default());
+    let receipt = manager
+        .run_root_until(until, &AtomicBool::new(false))
+        .unwrap();
+    assert!(receipt.permits_semantic_closure(), "{receipt:?}");
+    assert!(manager.failures().next().is_none());
+    let snapshot = manager
+        .driver()
+        .inner
+        .port()
+        .rovent_frontier_receipt()
+        .unwrap()
+        .snapshot;
+    assert_eq!(snapshot.goal, FrontierGoalStatus::SelectiveFrontier);
+    assert!(snapshot.selection_sealed && snapshot.registered_frames > 0);
+    assert_eq!(snapshot.completed_frames, snapshot.registered_frames);
+    assert_eq!(snapshot.horizon.completed_depth, None);
+    assert!(!snapshot.horizon.target_satisfied);
+    assert_eq!(snapshot.work.native_nodes, 0);
+    assert_eq!(snapshot.work.outstanding_native_executions, 0);
+    assert!(manager.driver().inner.result().counters.accepted_fresh > 0);
+    assert_eq!(receipt.counters.validator_ticket_admissions, 0);
+    assert_eq!(receipt.counters.cpu_slice_receipts, 0);
+    close_and_recover(manager, until);
+}
+
+#[test]
+fn actual_role_limit_closes_only_after_the_original_head_is_settled() {
+    use rz_search::pals::rovent_frontier::FrontierStop;
+    let (mut manager, _, until) = fixture_with_role_limit(SearchGoal::default(), 1);
+    let receipt = manager
+        .run_root_until(until, &AtomicBool::new(false))
+        .unwrap();
+    assert!(receipt.permits_semantic_closure(), "{receipt:?}");
+    assert!(manager.failures().next().is_none());
+    let port = manager.driver().inner.port();
+    let snapshot = port.rovent_frontier_receipt().unwrap().snapshot;
+    assert_eq!(
+        snapshot.goal,
+        FrontierGoalStatus::Stopped(FrontierStop::RoleBudget)
+    );
+    assert_eq!(port.finish_materialized().counters.submitted_role_calls, 1);
+    assert_eq!(port.finish_materialized().counters.consumed_role_outputs, 1);
+    assert_eq!(receipt.pending_tickets, 0);
+    assert_eq!(snapshot.horizon.completed_depth, None);
     close_and_recover(manager, until);
 }

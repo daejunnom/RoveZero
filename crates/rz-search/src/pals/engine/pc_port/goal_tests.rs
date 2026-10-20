@@ -188,6 +188,163 @@ fn consumed_policy_heads_remain_charged_when_the_last_child_exhausts_quota() {
 }
 
 #[test]
+fn time_only_selective_completion_requires_accepted_nonempty_sealed_responsibilities() {
+    use crate::pals::rovent_frontier::FrontierStop;
+    let roots = [BoardMove::from_uci("e2e4").unwrap()];
+    let mut port = goal_port(Position::startpos(), SearchGoal::default(), Some(&roots));
+    assert_eq!(
+        port.rovent_frontier_receipt().unwrap().snapshot.goal,
+        FrontierGoalStatus::Pending
+    );
+    let mut calls = 0;
+    let mut saw_unfinished_responsibility = false;
+    while let Some(input) = port.next_role().unwrap() {
+        calls += 1;
+        assert!(
+            calls <= 32,
+            "finite selected policy must retire its actual work"
+        );
+        let before = port.rovent_frontier_receipt().unwrap().snapshot;
+        assert_ne!(before.goal, FrontierGoalStatus::SelectiveFrontier);
+        saw_unfinished_responsibility |= before.completed_frames < before.registered_frames;
+        let (proof, output) = accepted(&mut port, &input, calls);
+        port.consume_accepted(
+            &input,
+            &proof,
+            &output,
+            Some(evidence(&port, &input, calls)),
+        )
+        .unwrap();
+    }
+    let snapshot = port.rovent_frontier_receipt().unwrap().snapshot;
+    assert!(saw_unfinished_responsibility);
+    assert_eq!(port.completion, PcPortCompletion::SelectiveFrontier);
+    assert_eq!(snapshot.goal, FrontierGoalStatus::SelectiveFrontier);
+    assert!(snapshot.selection_sealed && snapshot.registered_frames > 0);
+    assert_eq!(snapshot.completed_frames, snapshot.registered_frames);
+    assert_eq!(snapshot.horizon.completed_depth, None);
+    assert!(!snapshot.horizon.target_satisfied);
+    assert_eq!(snapshot.work.native_nodes, 0);
+    assert_eq!(snapshot.work.reserved_native_nodes, 0);
+    assert_eq!(snapshot.work.outstanding_native_executions, 0);
+    assert_eq!(port.counters.submitted_role_calls, calls);
+    assert_eq!(port.counters.consumed_role_outputs, calls);
+    assert!(port.counters.accepted_fresh > 0);
+    // A later explicit revoke remains a control stop, never a successful
+    // selected frontier reinterpreted as depth/mate completion.
+    port.revoke();
+    assert_eq!(
+        port.rovent_frontier_receipt().unwrap().snapshot.goal,
+        FrontierGoalStatus::Stopped(FrontierStop::Canceled)
+    );
+}
+
+#[test]
+fn time_only_role_budget_does_not_complete_the_selected_frontier() {
+    use crate::pals::rovent_frontier::FrontierStop;
+    let roots = [BoardMove::from_uci("e2e4").unwrap()];
+    let mut port = goal_port(Position::startpos(), SearchGoal::default(), Some(&roots));
+    port.owner.config.max_role_calls = 1;
+    let input = port.next_role().unwrap().unwrap();
+    let (proof, output) = accepted(&mut port, &input, 1);
+    port.consume_accepted(&input, &proof, &output, Some(evidence(&port, &input, 1)))
+        .unwrap();
+    assert!(port.next_role().unwrap().is_none());
+    assert_eq!(port.completion, PcPortCompletion::RoleBudget);
+    let snapshot = port.rovent_frontier_receipt().unwrap().snapshot;
+    assert_eq!(
+        snapshot.goal,
+        FrontierGoalStatus::Stopped(FrontierStop::RoleBudget)
+    );
+    assert!(!snapshot.selection_sealed);
+    assert_eq!(snapshot.horizon.completed_depth, None);
+    assert_eq!(
+        snapshot.horizon.interruption,
+        Some(crate::pals::rovent_goals::HorizonInterruption::RoleBudget)
+    );
+}
+
+#[test]
+fn exact_role_limit_keeps_the_actual_completed_goal_instead_of_a_budget_stop() {
+    let roots = [BoardMove::from_uci("e2e4").unwrap()];
+    for goal in [
+        SearchGoal::default(),
+        SearchGoal {
+            depth_plies: NonZeroU16::new(2),
+            mate_moves: None,
+        },
+    ] {
+        let mut expected_calls = 0;
+        let mut reference = goal_port(Position::startpos(), goal, Some(&roots));
+        while let Some(input) = reference.next_role().unwrap() {
+            expected_calls += 1;
+            assert!(expected_calls <= 32);
+            let (proof, output) = accepted(&mut reference, &input, expected_calls);
+            reference
+                .consume_accepted(
+                    &input,
+                    &proof,
+                    &output,
+                    Some(evidence(&reference, &input, expected_calls)),
+                )
+                .unwrap();
+        }
+        let expected_goal = reference.rovent_frontier_receipt().unwrap().snapshot.goal;
+        assert!(matches!(
+            expected_goal,
+            FrontierGoalStatus::SelectiveFrontier | FrontierGoalStatus::DepthSatisfied
+        ));
+        let mut exact = goal_port(Position::startpos(), goal, Some(&roots));
+        exact.owner.config.max_role_calls = expected_calls;
+        let mut calls = 0;
+        while let Some(input) = exact.next_role().unwrap() {
+            calls += 1;
+            assert!(calls <= expected_calls);
+            let (proof, output) = accepted(&mut exact, &input, calls);
+            exact
+                .consume_accepted(
+                    &input,
+                    &proof,
+                    &output,
+                    Some(evidence(&exact, &input, calls)),
+                )
+                .unwrap();
+        }
+        assert_eq!(calls, expected_calls);
+        exact.close_role_call_budget(calls, expected_calls).unwrap();
+        assert_eq!(
+            exact.rovent_frontier_receipt().unwrap().snapshot.goal,
+            expected_goal
+        );
+        assert_eq!(exact.completion, PcPortCompletion::SelectiveFrontier);
+    }
+}
+
+#[test]
+fn role_limit_cannot_override_inflight_custody_or_a_prior_port_failure() {
+    let roots = [BoardMove::from_uci("e2e4").unwrap()];
+    let mut port = goal_port(Position::startpos(), SearchGoal::default(), Some(&roots));
+    port.owner.config.max_role_calls = 1;
+    let input = port.next_role().unwrap().unwrap();
+    let (proof, output) = accepted(&mut port, &input, 1);
+    assert!(port.close_role_call_budget(1, 1).is_err());
+    assert_eq!(port.completion, PcPortCompletion::Active);
+    assert_eq!(
+        port.rovent_frontier_receipt().unwrap().snapshot.goal,
+        FrontierGoalStatus::Pending
+    );
+    port.consume_accepted(&input, &proof, &output, Some(evidence(&port, &input, 1)))
+        .unwrap();
+    port.completion = PcPortCompletion::Failed;
+    port.close_role_call_budget(1, 1).unwrap();
+    assert_eq!(port.completion, PcPortCompletion::Failed);
+    assert_eq!(
+        port.rovent_frontier_receipt().unwrap().snapshot.goal,
+        FrontierGoalStatus::Pending
+    );
+}
+
+#[test]
 fn original_pc_goal_reaches_depth_beyond_its_generation_chunk() {
     let roots = [BoardMove::from_uci("e2e4").unwrap()];
     let mut port = goal_port(

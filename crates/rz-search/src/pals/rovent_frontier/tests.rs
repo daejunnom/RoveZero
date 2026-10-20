@@ -33,6 +33,28 @@ fn unrelated_capacity_stop_does_not_certify_public_record_exhaustion() {
 }
 
 #[test]
+fn sealing_an_empty_policy_does_not_complete_time_only_or_depth_work() {
+    for goal in [
+        SearchGoal::default(),
+        SearchGoal {
+            depth_plies: NonZeroU16::new(3),
+            mate_moves: None,
+        },
+    ] {
+        let mut fixture = Fixture::new(Position::startpos(), goal, None, false);
+        fixture
+            .frontier
+            .seal_selected_policy(fixture.clock.domain(), fixture.clock.now().unwrap())
+            .unwrap();
+        let snapshot = fixture.frontier.snapshot();
+        assert!(snapshot.selection_sealed);
+        assert_eq!(snapshot.registered_frames, 0);
+        assert_eq!(snapshot.goal, FrontierGoalStatus::Pending);
+        assert_eq!(snapshot.horizon.completed_depth, None);
+    }
+}
+
+#[test]
 fn paid_cpu_pv_adopts_root_and_nonroot_suffix_without_another_frontier_visit() {
     let mut fixture = Fixture::new(Position::startpos(), SearchGoal::default(), None, false);
     let moves = [mv("e2e4"), mv("e7e5")];
@@ -908,6 +930,7 @@ fn foreign_and_unknown_native_work_quarantine_without_refunding() {
         } else {
             fixture.frontier.native_usage_unknown(&reservation).unwrap();
         }
+        fixture.frontier.close_role_call_budget();
         let snapshot = fixture.frontier.snapshot();
         assert_eq!(snapshot.work.reserved_native_nodes, 8);
         assert_eq!(snapshot.work.native_nodes, 0);

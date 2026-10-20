@@ -587,6 +587,32 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
             })
     }
 
+    /// The concrete manager invokes this at its settled role-admission bound,
+    /// before normal quiescence. Legacy owners have no Frontier to change.
+    pub fn close_rovent_role_call_budget(
+        &mut self,
+        admitted: u64,
+        limit: u64,
+    ) -> Result<(), PalsError> {
+        if self.rovent_frontier().is_none() {
+            return Ok(());
+        }
+        if limit != self.engine.config.max_role_calls
+            || admitted < limit
+            || self.counters.role_calls > admitted
+        {
+            return Err(PalsError::InvalidConfig);
+        }
+        self.check_rovent_scan_live()?;
+        self.engine
+            .semantic
+            .rovent_frontier
+            .as_deref_mut()
+            .ok_or(PalsError::InvalidConfig)?
+            .close_role_call_budget();
+        Ok(())
+    }
+
     /// The concrete owner must first drain role/CPU workers and recover this
     /// receipt. Unknown/outstanding native usage keeps the opaque owner beside
     /// its Store, including across legacy into_engine ownership transfers.

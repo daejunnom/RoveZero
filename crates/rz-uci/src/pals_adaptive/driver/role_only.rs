@@ -211,6 +211,15 @@ impl<M: RoleModel> RoleOnlySearchDriver<PcPortQuestion> for PcPortDriver<M> {
     fn is_complete(&self) -> bool {
         self.port.is_complete()
     }
+    fn close_role_call_budget(
+        &mut self,
+        admitted: u64,
+        limit: u64,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.port
+            .close_role_call_budget(admitted, limit)
+            .map_err(semantic)
+    }
     fn quiesce_satisfied_goal(&mut self) -> Result<(), AdaptiveManagerError> {
         self.port
             .quiesce_satisfied_goal()

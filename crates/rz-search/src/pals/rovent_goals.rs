@@ -106,6 +106,7 @@ pub enum HorizonInterruption {
     Stop,
     Deadline,
     WorkBudget,
+    RoleBudget,
     Capacity,
     EvidenceReclaimed,
     Failed,

@@ -656,6 +656,36 @@ impl<M: RoleModel> PcSemanticPort<M> {
         }
     }
 
+    /// Manager admission and semantic acceptance are distinct counters. The
+    /// original registered limit and empty pending custody are checked here;
+    /// only the manager can supply its settled registry admission count.
+    pub fn close_role_call_budget(&mut self, admitted: u64, limit: u64) -> Result<(), PalsError> {
+        if limit != self.owner.config.max_role_calls
+            || admitted < limit
+            || self.counters.submitted_role_calls > admitted
+            || !self.pending.is_empty()
+        {
+            return Err(PalsError::InvalidConfig);
+        }
+        if !matches!(
+            self.completion,
+            PcPortCompletion::Active | PcPortCompletion::RoleBudget
+        ) {
+            return Ok(());
+        }
+        if Instant::now() >= self.hard_deadline {
+            return self.close_original_deadline();
+        }
+        if let Some(frontier) = self.owner.semantic.rovent_frontier.as_deref_mut() {
+            frontier.close_role_call_budget();
+        }
+        if self.completion == PcPortCompletion::Active {
+            self.completion = PcPortCompletion::RoleBudget;
+            self.ready.clear();
+        }
+        Ok(())
+    }
+
     pub fn review_lease_admission(&self) -> Result<AdaptiveReviewLeaseAdmission, PalsError> {
         let stores = &self.owner.semantic.stores;
         let current = stores.review_pin_count()?;
@@ -727,7 +757,10 @@ impl<M: RoleModel> PcSemanticPort<M> {
             ) >= self.owner.config.max_role_calls
         {
             if self.pending.is_empty() {
-                self.completion = PcPortCompletion::RoleBudget;
+                self.close_role_call_budget(
+                    self.counters.submitted_role_calls,
+                    self.owner.config.max_role_calls,
+                )?;
             }
             return Ok(None);
         }

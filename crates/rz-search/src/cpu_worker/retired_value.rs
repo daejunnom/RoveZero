@@ -102,6 +102,11 @@ impl RecoveredNnuecEngine {
     pub fn provenance(&self) -> &Provenance {
         self.value_owner.provenance()
     }
+    /// Scalar readback of this exact joined engine only. This is not a root
+    /// aggregate, token authority, admission closure or release acknowledgement.
+    pub fn paused_stack_snapshot(&self) -> Option<crate::cpu::CpuPausedStackSnapshot> {
+        self.engine.paused_stack_snapshot()
+    }
     pub fn matches_source(&self, source: &DeferredNnuecRSource) -> bool {
         self.source.same_authority(source)
     }

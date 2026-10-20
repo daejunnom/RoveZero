@@ -118,6 +118,11 @@ pub trait RoleOnlySearchDriver<Q> {
         ticket: Option<&RoleTicketEnvelope>,
     ) -> Result<(), AdaptiveManagerError>;
     fn is_complete(&self) -> bool;
+    /// Optional typed observation from the original settled registry. Legacy
+    /// drivers retain their existing close behavior.
+    fn close_role_call_budget(&mut self, _: u64, _: u64) -> Result<(), AdaptiveManagerError> {
+        Ok(())
+    }
     fn quiesce_satisfied_goal(&mut self) -> Result<(), AdaptiveManagerError> {
         Err(AdaptiveManagerError::Invalid(
             "driver has no actual satisfied root goal",
@@ -1725,6 +1730,18 @@ where
                 Err(error) => self.record_failure(error),
             }
             let spent = self.registry.cumulative_observation().admitted;
+            if self.failures.is_empty()
+                && self.bindings.is_empty()
+                && self.pending_input.is_none()
+                && spent >= self.registration.role_call_limit
+            {
+                if let Err(error) = self
+                    .driver
+                    .close_role_call_budget(spent, self.registration.role_call_limit)
+                {
+                    self.record_failure(error);
+                }
+            }
             if !self.failures.is_empty()
                 || (self.bindings.is_empty()
                     && self.pending_input.is_none()

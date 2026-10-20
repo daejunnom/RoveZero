@@ -5,6 +5,8 @@
 //! create the session's preparation actor and materialize its real researcher.
 //! Unknown transfers retain all original owners rather than replacing them.
 
+#[cfg(feature = "pals-adaptive-diagnostics")]
+pub(crate) mod diagnostics;
 mod initial_cleanup;
 #[cfg(test)]
 pub(in crate::rovent_bootstrap) mod pre_materialization_tests;
@@ -409,6 +411,8 @@ pub struct RoventNnuecSessionDriver {
     latest_initial: Mutex<Option<Arc<RoventNnuecInitialReceipt>>>,
     latest_checker: Mutex<Option<PalsCheckerRegistration>>,
     storage: Mutex<Option<Box<SessionStorageLifecycle>>>,
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    nnuec_diagnostics: diagnostics::NnuecDiagnosticJournal,
 }
 impl RoventNnuecSessionDriver {
     /// Source/configuration-derived identity only. The declared own-NNUEC
@@ -437,6 +441,7 @@ impl RoventNnuecSessionDriver {
         hash.update(include_bytes!("nnuec_session/root_run.rs"));
         hash.update(include_bytes!("nnuec_session/retirement.rs"));
         hash.update(include_bytes!("nnuec_session/initial_cleanup.rs"));
+        hash.update(include_bytes!("nnuec_session/diagnostics.rs"));
         // The existing digest producer validates the original closed document.
         hash.update(document.configuration_digest()?);
         hash.update([match root_policy {
@@ -697,7 +702,19 @@ impl RoventNnuecSessionDriver {
             latest_initial: Mutex::new(None),
             latest_checker: Mutex::new(None),
             storage: Mutex::new(None),
+            #[cfg(feature = "pals-adaptive-diagnostics")]
+            nnuec_diagnostics: diagnostics::NnuecDiagnosticJournal::default(),
         })
+    }
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    pub(crate) fn enable_nnuec_diagnostics(&self) {
+        self.nnuec_diagnostics.enable();
+    }
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    pub(crate) fn nnuec_owner_observation(
+        &self,
+    ) -> Result<Option<diagnostics::NnuecOwnerObservation>, &'static str> {
+        self.nnuec_diagnostics.snapshot()
     }
     #[allow(clippy::result_large_err)]
     pub(crate) fn install_storage_registration(
@@ -1490,9 +1507,13 @@ fn should_quiesce(manager: &Manager) -> Result<bool, AdaptiveManagerError> {
         FrontierGoalStatus::Pending => Ok(false),
         FrontierGoalStatus::DepthSatisfied
         | FrontierGoalStatus::MateSatisfied
+        | FrontierGoalStatus::SelectiveFrontier
         | FrontierGoalStatus::GoalUnresolved
         | FrontierGoalStatus::Stopped(
-            FrontierStop::Canceled | FrontierStop::Deadline | FrontierStop::WorkBudget,
+            FrontierStop::Canceled
+            | FrontierStop::Deadline
+            | FrontierStop::WorkBudget
+            | FrontierStop::RoleBudget,
         ) => Ok(true),
         FrontierGoalStatus::Stopped(FrontierStop::Capacity) => {
             if manager.driver().rovent_publication_capacity_closed()? {

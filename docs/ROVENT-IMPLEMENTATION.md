@@ -46,6 +46,23 @@ depth는 root-relative 선택적 chess-ply horizon이다. 실제 경계 평가�
 반박·Repair 의무가 완료돼야 한다. 생성 길이·R 지역 depth·빈 큐를 완료로 대체하지 않는다.
 전폭 또는1..D 전역 barrier를 필수로 두지 않고 시간제 go에 새 depth pass를 강제하지 않는다.
 
+depth·mate 요청이 없는 선택 탐색은 별도 `selective_frontier` 상태로 완료를 기록한다.
+명시적으로 봉인한 비어 있지 않은 책임 집합이 모두 완료되고 실제 native 사용량과
+예약·미완료 실행이 정산돼야 한다. 빈 큐·빈 seal·role budget 소진만으로 이 상태를
+발행하지 않으며, depth·mate 증명이나 물리 완료를 대신하지 않는다. 이전 소스의
+`pending` 원자료는 새 상태로 재분류하지 않고 새 바이너리의 실제 실행으로 확인한다.
+
+원 role-call 상한이 실제로 소진된 종료는 `stopped_role_budget`으로 구분한다.
+이는 `go nodes`의 `stopped_work_budget`과 다른 원인이며, 수락 중인 role 결과를
+버리거나 이미 완료한 depth·mate·선택 탐색을 중단으로 덮는 근거가 아니다.
+
+`native-validation-diagnostics`의 NNUEC 상세 관측은 기존 root receipt와 별도
+`rz-rovent-nnuec-owner-observation/1` domain을 쓴다. 원 authority와 admission seal,
+실제 준비·설치 ACK·joined engine·퇴역 readback의 제한 크기 사본이며 새 capability가
+아니다. 상세 누락과 미관측은 보존하고, accepted C의 의미 연결이나 조건부 scalar value를
+설치 성공만으로 추론하지 않는다. 마지막 engine의 stack 계수는 해당 engine 수명의
+값으로 표시하며 root 전체의 재개 합계로 사용하지 않는다.
+
 mate는 실제 Rules terminal에서 OR/AND로 전파한다. 한 유효 공격과 필요한 모든 합법
 방어의 근거가 닫히면 강제 승리·패배 모두 조기 종료할 수 있다. 거리 상한과 정확 최단
 거리를 구분하고 처음에는 정확 거리만 `score mate`로 출력한다. NN값·외부 mate·단일

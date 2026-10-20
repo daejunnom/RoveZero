@@ -409,6 +409,8 @@ pub enum FrontierStop {
     Canceled,
     Deadline,
     WorkBudget,
+    /// Registered logical role-call admissions, independent of `go nodes`.
+    RoleBudget,
     Capacity,
     NativeUnknown,
     EvidenceReclaimed,
@@ -420,6 +422,10 @@ pub enum FrontierGoalStatus {
     Pending,
     DepthSatisfied,
     MateSatisfied,
+    /// No depth/mate was requested. The explicitly sealed selective policy's
+    /// nonempty responsibility journal is complete; this proves neither a
+    /// depth/mate goal nor the native owners' separate physical fence.
+    SelectiveFrontier,
     GoalUnresolved,
     Stopped(FrontierStop),
 }
@@ -2154,6 +2160,17 @@ impl RoventFrontier {
         self.interrupt(FrontierStop::Canceled);
     }
 
+    /// The same semantic owner calls this only after its role-call admission
+    /// limit is exhausted and all admitted role heads have settled. It does
+    /// not attest a worker fence or turn a satisfied/failed goal into a stop.
+    pub(crate) fn close_role_call_budget(&mut self) {
+        if self.work.native_usage_known
+            && matches!(self.snapshot().goal, FrontierGoalStatus::Pending)
+        {
+            self.interrupt(FrontierStop::RoleBudget);
+        }
+    }
+
     /// Read-only cause evidence from this same controller. A generic capacity
     /// stop, copied snapshot or error value cannot set the private marker.
     pub fn public_record_capacity_refused(&self) -> bool {
@@ -2224,6 +2241,15 @@ impl RoventFrontier {
             FrontierGoalStatus::GoalUnresolved
         } else if horizon.target_satisfied {
             FrontierGoalStatus::DepthSatisfied
+        } else if self.registration.goal.depth_plies.is_none()
+            && self.registration.goal.mate_moves.is_none()
+            && self.selection_sealed
+            && !self.frames.is_empty()
+            && completed_frames == self.frames.len()
+            && self.work.native_usage_known
+            && self.work.reserved_native_nodes == 0
+        {
+            FrontierGoalStatus::SelectiveFrontier
         } else {
             FrontierGoalStatus::Pending
         };
@@ -2341,6 +2367,7 @@ impl RoventFrontier {
             FrontierStop::Canceled => HorizonInterruption::Stop,
             FrontierStop::Deadline => HorizonInterruption::Deadline,
             FrontierStop::WorkBudget => HorizonInterruption::WorkBudget,
+            FrontierStop::RoleBudget => HorizonInterruption::RoleBudget,
             FrontierStop::Capacity => HorizonInterruption::Capacity,
             FrontierStop::EvidenceReclaimed => HorizonInterruption::EvidenceReclaimed,
             _ => HorizonInterruption::Failed,

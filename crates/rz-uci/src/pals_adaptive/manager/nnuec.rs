@@ -38,6 +38,24 @@ pub struct NnuecPreparationRecord {
     pub cpu_thread_time: Option<Duration>,
     pub cancellation_requested: bool,
     pub manager_error: Option<NnuecWorkError>,
+    /// Read-only scalar copy of this preparation's actual acknowledgement.
+    /// No Bound/view/worker authority is cloned into diagnostic history.
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    pub original_ack: NnuecPreparationAckObservation,
+}
+
+#[cfg(feature = "pals-adaptive-diagnostics")]
+#[derive(Clone, Debug)]
+pub struct NnuecPreparationAckObservation {
+    pub stage: String,
+    pub actor_terminal_ack_observed: bool,
+    pub driver_attested: bool,
+    pub installation_requested_sequence: Option<u64>,
+    pub installation_receipt_sequence: Option<u64>,
+    pub installation_succeeded: Option<bool>,
+    pub binding: Option<Digest>,
+    pub installed_owner: Option<CpuWorkerId>,
+    pub actual_stack_owner_id: Option<u64>,
 }
 
 /// The same joined worker's engine, to be moved to the Session's retained actor.
@@ -415,6 +433,38 @@ impl<Q> NnuecWorkPreparation<Q> {
             cpu_thread_time: None,
             cancellation_requested: self.canceled.load(Ordering::Acquire),
             manager_error: self.failure.clone(),
+            #[cfg(feature = "pals-adaptive-diagnostics")]
+            original_ack: NnuecPreparationAckObservation {
+                stage: format!("{:?}", self.work.input.stage)
+                    .chars()
+                    .take(32)
+                    .collect(),
+                actor_terminal_ack_observed: self.terminal_ack.is_some(),
+                driver_attested: self.attested,
+                installation_requested_sequence: self.installation.map(|(id, _, _)| id.sequence()),
+                installation_receipt_sequence: self
+                    .receipt
+                    .as_ref()
+                    .map(|r| r.installation_id().sequence()),
+                installation_succeeded: self
+                    .receipt
+                    .as_ref()
+                    .map(ValueInstallReceipt::is_installed),
+                binding: self
+                    .receipt
+                    .as_ref()
+                    .map(ValueInstallReceipt::binding_digest),
+                installed_owner: self
+                    .receipt
+                    .as_ref()
+                    .and_then(ValueInstallReceipt::installed_profile)
+                    .map(|p| p.owner),
+                actual_stack_owner_id: self
+                    .receipt
+                    .as_ref()
+                    .and_then(|r| r.result().ok())
+                    .map(|r| r.actual_stack_owner_id()),
+            },
         }
     }
 

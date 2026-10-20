@@ -747,6 +747,10 @@ impl RoventNativeProductDriver {
                 )
             })
             .clone();
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        if first_enable && let ActualProductDriver::Nnuec(driver) = self.inner.as_ref() {
+            driver.enable_nnuec_diagnostics();
+        }
         // Existing explicit opt-in only, and only the externally profiled R
         // assembly. The diagnostic never constructs R/native work or a permit.
         #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -853,7 +857,10 @@ impl SearchSessionDriver for RoventNativeProductDriver {
             diagnostics.observe_root(self, context, result.as_ref().err());
             diagnostics.observe_storage(self, Some(context.authority));
             #[cfg(feature = "pals-adaptive-diagnostics")]
-            diagnostics.observe_profiled_feedback(self, context);
+            {
+                diagnostics.observe_profiled_feedback(self, context);
+                diagnostics.observe_nnuec_owner(self, context);
+            }
         }
         result
     }

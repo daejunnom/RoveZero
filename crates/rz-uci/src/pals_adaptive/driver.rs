@@ -1530,6 +1530,15 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
         }
         Ok(frontier.public_record_capacity_refused())
     }
+    fn close_rovent_role_call_budget(
+        &mut self,
+        admitted: u64,
+        limit: u64,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.hot()?
+            .close_rovent_role_call_budget(admitted, limit)
+            .map_err(semantic)
+    }
     fn rovent_public_review_index_capacity_closed(&self) -> Result<bool, AdaptiveManagerError> {
         let port = self
             .port

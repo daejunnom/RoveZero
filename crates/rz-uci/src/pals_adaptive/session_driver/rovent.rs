@@ -425,9 +425,13 @@ where
             FrontierGoalStatus::Pending => Ok(false),
             FrontierGoalStatus::DepthSatisfied
             | FrontierGoalStatus::MateSatisfied
+            | FrontierGoalStatus::SelectiveFrontier
             | FrontierGoalStatus::GoalUnresolved
             | FrontierGoalStatus::Stopped(
-                FrontierStop::Canceled | FrontierStop::Deadline | FrontierStop::WorkBudget,
+                FrontierStop::Canceled
+                | FrontierStop::Deadline
+                | FrontierStop::WorkBudget
+                | FrontierStop::RoleBudget,
             ) => Ok(true),
             FrontierGoalStatus::Stopped(FrontierStop::NativeUnknown) => {
                 Err(AdaptiveManagerError::PhysicalUnknown)

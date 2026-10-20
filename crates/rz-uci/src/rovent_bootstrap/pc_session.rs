@@ -1324,9 +1324,11 @@ impl RoventPcSessionDriver {
                                 | FrontierGoalStatus::MateSatisfied => {
                                     manager.begin_goal_quiesce(context.shutdown_deadline)?
                                 }
-                                FrontierGoalStatus::GoalUnresolved
+                                FrontierGoalStatus::SelectiveFrontier
+                                | FrontierGoalStatus::GoalUnresolved
                                 | FrontierGoalStatus::Stopped(
                                     FrontierStop::WorkBudget
+                                    | FrontierStop::RoleBudget
                                     | FrontierStop::Deadline
                                     | FrontierStop::Canceled,
                                 ) => manager.begin_root_quiesce(context.shutdown_deadline)?,

@@ -555,6 +555,28 @@ fn run_same_preparing_owner(endpoints: CpuEndpointSelection) {
     assert_eq!(installations.len(), 1);
     let last_install = &installations[0].1;
     assert!(last_install.is_installed());
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    {
+        let observations: Vec<_> = manager.nnuec_preparation_observations().collect();
+        let observed = observations
+            .iter()
+            .find(|observation| {
+                observation.original_ack.installation_receipt_sequence
+                    == Some(last_install.installation_id().sequence())
+            })
+            .expect("same actual owner installation is available to opt-in diagnostics");
+        assert!(observed.original_ack.actor_terminal_ack_observed);
+        assert!(observed.original_ack.driver_attested);
+        assert_eq!(observed.original_ack.installation_succeeded, Some(true));
+        assert_eq!(
+            observed.original_ack.binding,
+            Some(last_install.binding_digest())
+        );
+        assert_eq!(
+            observed.original_ack.actual_stack_owner_id,
+            Some(last_install.result().unwrap().actual_stack_owner_id())
+        );
+    }
     assert_eq!(
         last_install.installed_profile().unwrap().owner,
         CpuWorkerId(0)
