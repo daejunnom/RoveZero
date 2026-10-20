@@ -6,6 +6,7 @@ use crate::rovent_bootstrap::nnuec_session::diagnostics::cpu_slices::{
 };
 
 const DOMAIN: &str = "rz-rovent-nnuec-cpu-slice-observation/1";
+mod chain;
 
 #[derive(Serialize)]
 struct SliceRow<'a> {
@@ -109,11 +110,13 @@ impl RoventLifecycleDiagnostics {
             state.scope_incomplete = true;
             state.first_issue.get_or_insert(cause);
         }
+        drop(state);
+        self.observe_nnuec_chain(context, status, failure, snapshot.as_ref());
     }
 }
-fn write_slice_row(
+fn write_slice_row<T: Serialize>(
     output: &mut impl Write,
-    row: &SliceRow<'_>,
+    row: &T,
     state: &mut State,
 ) -> Result<(), &'static str> {
     let mut buffer = RowBuffer(Vec::new());

@@ -1223,6 +1223,20 @@ impl<M: RoleModel + 'static> AdaptiveSearchDriver<AdaptivePortQuestion> for Adap
             .accept_accepted_role_source(work, accepted, output)
             .map_err(semantic)
     }
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    fn diagnostic_accepted_source_revision(
+        &self,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+    ) -> Option<u64> {
+        // Observation only: do not invoke hot(), mutate archive ownership or
+        // turn absent/failed publication evidence into a manager error.
+        if self.quarantine.is_some() {
+            return None;
+        }
+        self.port
+            .as_deref()?
+            .diagnostic_accepted_source_revision(accepted)
+    }
     fn consume_accepted_role_reciprocal(
         &mut self,
         work: &CoordinatorWork<ReviewView, AdaptivePortQuestion>,

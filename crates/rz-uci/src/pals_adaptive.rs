@@ -69,6 +69,10 @@ pub fn adaptive_execution_manager_source_digest() -> [u8; 32] {
             include_bytes!("pals_adaptive/cpu_slice_observation.rs").as_slice(),
         ),
         (
+            "pals_adaptive/cpu_slice_observation/nnuec_chain.rs",
+            include_bytes!("pals_adaptive/cpu_slice_observation/nnuec_chain.rs").as_slice(),
+        ),
+        (
             "pals_adaptive/projection.rs",
             include_bytes!("pals_adaptive/projection.rs").as_slice(),
         ),

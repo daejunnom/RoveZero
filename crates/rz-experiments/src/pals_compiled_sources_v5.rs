@@ -316,6 +316,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_adaptive.rs"),
             source!("crates/rz-uci/src/pals_adaptive/continuation_diagnostic.rs"),
             source!("crates/rz-uci/src/pals_adaptive/cpu_slice_observation.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/cpu_slice_observation/nnuec_chain.rs"),
             source!("crates/rz-uci/src/pals_adaptive/driver.rs"),
             source!("crates/rz-uci/src/pals_adaptive/driver/profiled_external.rs"),
             source!("crates/rz-uci/src/pals_adaptive/driver/role_only.rs"),
@@ -454,6 +455,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/pals_adaptive.rs"),
             source!("crates/rz-uci/src/pals_adaptive/continuation_diagnostic.rs"),
             source!("crates/rz-uci/src/pals_adaptive/cpu_slice_observation.rs"),
+            source!("crates/rz-uci/src/pals_adaptive/cpu_slice_observation/nnuec_chain.rs"),
             source!("crates/rz-uci/src/pals_adaptive/driver.rs"),
             source!("crates/rz-uci/src/pals_adaptive/driver/profiled_external.rs"),
             source!("crates/rz-uci/src/pals_adaptive/driver/role_only.rs"),
@@ -579,6 +581,9 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/rovent_bootstrap/product/diagnostics.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/product/diagnostics/nnuec.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/product/diagnostics/nnuec_cpu_slices.rs"),
+            source!(
+                "crates/rz-uci/src/rovent_bootstrap/product/diagnostics/nnuec_cpu_slices/chain.rs"
+            ),
             source!("crates/rz-uci/src/rovent_bootstrap/product/storage.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/storage_lifecycle.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/storage_lifecycle/observation.rs"),
@@ -700,6 +705,9 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/rovent_bootstrap/product/diagnostics.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/product/diagnostics/nnuec.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/product/diagnostics/nnuec_cpu_slices.rs"),
+            source!(
+                "crates/rz-uci/src/rovent_bootstrap/product/diagnostics/nnuec_cpu_slices/chain.rs"
+            ),
             source!("crates/rz-uci/src/rovent_bootstrap/product/storage.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/storage_lifecycle.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/storage_lifecycle/observation.rs"),

@@ -1108,6 +1108,13 @@ pub trait AdaptiveSearchDriver<Q> {
             "driver has no staged accepted role source consumer",
         ))
     }
+    #[cfg(feature = "pals-adaptive-diagnostics")]
+    fn diagnostic_accepted_source_revision(
+        &self,
+        _: &rz_search::pals::coordinator::AcceptedRoleStep,
+    ) -> Option<u64> {
+        None
+    }
     fn consume_accepted_role_reciprocal(
         &mut self,
         _: &CoordinatorWork<ReviewView, Q>,
@@ -7535,6 +7542,41 @@ where
                 execution: grant.execution,
             },
         )?;
+        #[cfg(feature = "pals-adaptive-diagnostics")]
+        if let (Some(diagnostic), Some(binding)) = (
+            self.cpu_slice_diagnostic.get(),
+            self.own[index].binding.as_ref(),
+        ) {
+            if let Some(custody) = &binding.nnuec {
+                // The worker acknowledged this actual custody before Begin.
+                // This row attests enqueue + frame bind only; invocation,
+                // numeric readout and paused resume need their own receipts.
+                diagnostic.record_nnuec_chain(
+                    super::cpu_slice_observation::NnuecChainEvent::NnuecJobBound(
+                        super::cpu_slice_observation::NnuecJobBindingObservation {
+                            frame: binding.work.frame,
+                            question: binding.work.input.question_digest,
+                            view: binding.work.input.view_seal,
+                            full_view: custody.seal.full_view_digest(),
+                            job: binding.envelope,
+                            first_grant: binding.grant,
+                            installation_sequence: custody.receipt.installation_id().sequence(),
+                            installation_succeeded: custody.receipt.is_installed(),
+                            binding: custody.receipt.binding_digest(),
+                            installed_owner: custody
+                                .receipt
+                                .installed_profile()
+                                .map(|profile| profile.owner),
+                            actual_stack_owner_id: custody
+                                .receipt
+                                .result()
+                                .ok()
+                                .map(|readback| readback.actual_stack_owner_id()),
+                        },
+                    ),
+                );
+            }
+        }
         Ok(())
     }
     fn resume_cpu(

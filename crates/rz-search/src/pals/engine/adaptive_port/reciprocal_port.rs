@@ -392,6 +392,7 @@ mod tests {
     #[test]
     fn first_accepted_policy_publishes_its_raw_opinion_before_the_dependent_view() {
         let (mut port, work, accepted, output) = source();
+        assert_eq!(port.diagnostic_accepted_source_revision(&accepted), None);
         assert!(port.engine.semantic.records.is_empty());
         assert!(work.input.view.records().is_empty());
         let prepare = |port: &mut Port, sequence, recipient| {
@@ -445,12 +446,27 @@ mod tests {
             .unwrap();
         assert_eq!(raw.score, RawScore::Unknown);
         let revision = port.engine.semantic.revision;
+        assert_eq!(
+            port.diagnostic_accepted_source_revision(&accepted),
+            Some(revision)
+        );
+        assert!(
+            peer.input
+                .view
+                .records_metadata()
+                .iter()
+                .any(|record| record.source_revision == revision)
+        );
         let _researcher = prepare(&mut port, 2, SearchRecipient::Researcher);
         assert_eq!(port.engine.semantic.revision, revision);
         assert_eq!(port.engine.semantic.records.len(), 1);
         assert_eq!(port.reciprocal.source_publications.len(), 1);
         assert_eq!(port.counters.consumed_role_outputs, 1);
         assert!(work.input.view.records().is_empty());
+        assert_eq!(
+            port.diagnostic_accepted_source_revision(&accepted),
+            Some(revision)
+        );
     }
 
     #[test]
@@ -721,6 +737,35 @@ impl<M: RoleModel> AdaptiveEnginePort<M> {
         request: RequestId,
     ) -> Option<&Result<AdaptiveSourceOpinion, PalsError>> {
         self.reciprocal.source_publications.get(&request)
+    }
+
+    /// Read-only diagnostic projection of the original successful publication.
+    /// The public record revision already lives in that exact observation's
+    /// Model scope. No latest-record scan, replay, new publication or authority.
+    pub fn diagnostic_accepted_source_revision(&self, accepted: &AcceptedRoleStep) -> Option<u64> {
+        let source = self
+            .reciprocal
+            .source_publications
+            .get(&accepted.ticket().id)?
+            .as_ref()
+            .ok()?;
+        if source.ticket != *accepted.ticket() || source.output != accepted.output_digest() {
+            return None;
+        }
+        let original = self
+            .engine
+            .semantic
+            .stores
+            .observations
+            .get(source.observation)
+            .ok()?;
+        if original.state != source.source_root || original.line != Some(source.line) {
+            return None;
+        }
+        match original.scope {
+            EvidenceScope::Model { input, .. } => Some(input),
+            _ => None,
+        }
     }
 
     fn publish_accepted_source_opinion(

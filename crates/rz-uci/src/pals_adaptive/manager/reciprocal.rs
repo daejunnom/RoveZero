@@ -392,6 +392,44 @@ where
                 DependentFrameAdmission::Admitted(id) => (id, PeerFollowupDisposition::Admitted),
                 DependentFrameAdmission::Joined(id) => (id, PeerFollowupDisposition::Joined),
             };
+            #[cfg(feature = "pals-adaptive-diagnostics")]
+            if source.role == Role::Critic && recipient == SearchRecipient::Researcher {
+                if let Some(diagnostic) = self.cpu_slice_diagnostic.get() {
+                    let revision = self.driver.diagnostic_accepted_source_revision(accepted);
+                    // Joined children retain their ORIGINAL view. Inspect that
+                    // actual frame, never a relabelled joining caller's input.
+                    let actual = self.machine.frame(child);
+                    let selected = revision.and_then(|revision| {
+                        actual?
+                            .input
+                            .view
+                            .records_metadata()
+                            .iter()
+                            .position(|record| record.source_revision == revision)
+                            .and_then(|index| u16::try_from(index).ok())
+                    });
+                    diagnostic.record_nnuec_chain(
+                        super::super::cpu_slice_observation::NnuecChainEvent::AcceptedCriticChild(
+                            super::super::cpu_slice_observation::AcceptedCriticChildObservation {
+                                source_frame: work.frame,
+                                ticket: *accepted.ticket(),
+                                output: accepted.output_digest(),
+                                origin_seal: prepared.origin.seal_digest(),
+                                question: prepared.question,
+                                child,
+                                joined: matches!(disposition, PeerFollowupDisposition::Joined),
+                                actual_child_view: actual.map(|frame| frame.input.view_seal),
+                                actual_child_public_context: actual
+                                    .map(|frame| frame.input.public_context),
+                                published_record_revision: revision,
+                                selected_record_index: selected,
+                                selected_record_count: actual
+                                    .map(|frame| frame.input.view.records_metadata().len()),
+                            },
+                        ),
+                    );
+                }
+            }
             held.child = Some(child);
             held.alias = Some(prepared.question);
             self.utility_register_peer(work.frame, child)?;

@@ -98,6 +98,12 @@ impl CpuSliceJournal {
 pub(crate) struct CpuSliceOwnerObservation {
     pub summary: CpuSliceSummary,
     pub records: Vec<SettledSlice>,
+    // A separate versioned writer consumes these; existing slice JSON stays
+    // unchanged. Missing handle never becomes an empty observed chain.
+    #[serde(skip)]
+    pub nnuec_chain: Vec<crate::pals_adaptive::NnuecChainObservation>,
+    #[serde(skip)]
+    pub nnuec_chain_dropped: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct CpuSliceSummary {
@@ -126,7 +132,7 @@ fn project(
 ) -> Result<CpuSliceOwnerObservation, &'static str> {
     if snapshot
         .as_ref()
-        .is_some_and(|s| s.records.len() > RECORDS_MAX)
+        .is_some_and(|s| s.records.len().saturating_add(s.nnuec_chain.len()) > RECORDS_MAX)
     {
         return Err("original_slice_snapshot_bound_exceeded");
     }
@@ -167,6 +173,11 @@ fn project(
             scope: "original_manager_settled_receipt_prefix_not_token_or_semantic_authority",
         },
         records,
+        nnuec_chain: snapshot
+            .as_ref()
+            .map(|s| s.nnuec_chain.clone())
+            .unwrap_or_default(),
+        nnuec_chain_dropped: snapshot.as_ref().map(|s| s.nnuec_chain_dropped),
     })
 }
 
@@ -428,6 +439,8 @@ mod tests {
                     crate::pals_adaptive::AdaptiveCpuSliceDiagnosticUnavailable::Overflow,
                 ),
                 records: Vec::new(),
+                nnuec_chain: Vec::new(),
+                nnuec_chain_dropped: 0,
             }),
         )
         .unwrap();
@@ -449,6 +462,8 @@ mod tests {
                 records_max: RECORDS_MAX,
                 unavailable: None,
                 records: Vec::new(),
+                nnuec_chain: Vec::new(),
+                nnuec_chain_dropped: 0,
             }),
         )
         .unwrap();
@@ -470,6 +485,8 @@ mod tests {
                 records_max: RECORDS_MAX,
                 unavailable: None,
                 records: Vec::new(),
+                nnuec_chain: Vec::new(),
+                nnuec_chain_dropped: 0,
             }),
         )
         .unwrap();
