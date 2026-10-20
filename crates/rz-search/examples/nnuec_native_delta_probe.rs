@@ -16,12 +16,12 @@
 #![forbid(unsafe_code)]
 
 use rz_position::{BoardMove, Color, Position};
+use rz_search::cpu_value::nnuec::NNUEC_MAX_BYTES;
 use rz_search::cpu_value::nnuec::v2::cpu::V2CpuValue;
 use rz_search::cpu_value::nnuec::v2::review::{
     BoundNnuecReviewContext, PreparationActor, Request as PreparationRequest,
 };
 use rz_search::cpu_value::nnuec::v2::{self, Model, Output};
-use rz_search::cpu_value::nnuec::NNUEC_MAX_BYTES;
 use rz_search::cpu_value::{CpuAccumulator, CpuValueEvaluator, CpuValueIdentity};
 use rz_search::pals::engine::{RecordKind, RoleQueryPurpose, RoleRecord};
 use rz_search::pals::review_context::{
@@ -35,8 +35,8 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -258,8 +258,11 @@ fn argument_pin(path: String, size: String, digest: String, maximum: usize) -> R
 }
 fn arguments() -> Result<Arguments> {
     let values: Vec<String> = std::env::args().skip(1).collect();
-    need(values.len() == 16, "CLI",
-        "use --checkpoint PATH --checkpoint-bytes N --checkpoint-sha256 SHA --request PATH --request-bytes N --request-sha256 SHA --work-ms N --cleanup-ms N")?;
+    need(
+        values.len() == 16,
+        "CLI",
+        "use --checkpoint PATH --checkpoint-bytes N --checkpoint-sha256 SHA --request PATH --request-bytes N --request-sha256 SHA --work-ms N --cleanup-ms N",
+    )?;
     let names = [
         "--checkpoint",
         "--checkpoint-bytes",
@@ -446,11 +449,17 @@ struct Input {
 }
 impl Input {
     fn validate(&self, model: &Model) -> Result<()> {
-        need(self.schema == "rovent.nnuec-native-delta-request/1"
-            && self.context_lineage == "diagnostic_rules_admission",
-            "InputScope", "only diagnostic Rules/Stores admission is supported; serialized PALS authority is not supported")?;
-        need(digest_text(&self.declared_library_source, 40), "SourceDeclaration",
-            "explicit full40 declaration required; Root verifies the library source outside this tool")?;
+        need(
+            self.schema == "rovent.nnuec-native-delta-request/1"
+                && self.context_lineage == "diagnostic_rules_admission",
+            "InputScope",
+            "only diagnostic Rules/Stores admission is supported; serialized PALS authority is not supported",
+        )?;
+        need(
+            digest_text(&self.declared_library_source, 40),
+            "SourceDeclaration",
+            "explicit full40 declaration required; Root verifies the library source outside this tool",
+        )?;
         need(
             &self.expected_model_identity == model.identity()
                 && model.identity().semantics == v2::SEMANTICS,
@@ -723,20 +732,31 @@ fn check_cleanup(
     let not_restored = record
         .deltas_applied
         .checked_sub(record.owned_restores + record.failure_cleanup_restores);
-    Err(ProbeError::new("CleanupDeadline", format!(
-        "original cleanup window expired at {phase}; owned_undos_pending_at_stop={owned_pending}; native_deltas_not_restored={not_restored:?}; no numeric restoration is inferred"
-    )))
+    Err(ProbeError::new(
+        "CleanupDeadline",
+        format!(
+            "original cleanup window expired at {phase}; owned_undos_pending_at_stop={owned_pending}; native_deltas_not_restored={not_restored:?}; no numeric restoration is inferred"
+        ),
+    ))
 }
+struct DeltaWindow {
+    work_until: Instant,
+    cleanup_until: Instant,
+}
+
 fn run_deltas(
     evaluator: &V2CpuValue,
     model: &Model,
     bound: &BoundNnuecReviewContext,
     root: &Position,
     movements: &[BoardMove],
-    until: Instant,
-    cleanup_until: Instant,
+    window: DeltaWindow,
     record: &mut CaseResult,
 ) -> Result<()> {
+    let DeltaWindow {
+        work_until: until,
+        cleanup_until,
+    } = window;
     let mut rules = root.clone();
     let mut value = evaluator
         .initialize(&rules)
@@ -1004,7 +1024,11 @@ fn run_case(
             SealExpectation::MatchBytes { sha256 } => {
                 let matches = digest_text(sha256, 64) && *sha256 == seal_hex;
                 record.view_seal_bytes_matched = Some(matches);
-                need(matches, "ViewSealBytes", "supplied seal bytes differ; matching bytes would still not recover original PALS authority")?;
+                need(
+                    matches,
+                    "ViewSealBytes",
+                    "supplied seal bytes differ; matching bytes would still not recover original PALS authority",
+                )?;
             }
         }
         let request = PreparationRequest::admit(
@@ -1071,8 +1095,10 @@ fn run_case(
             &bound,
             &root,
             &movements,
-            until,
-            cleanup_until,
+            DeltaWindow {
+                work_until: until,
+                cleanup_until,
+            },
             &mut record,
         )
     })();
