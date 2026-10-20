@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import tarfile
 import time
 import zipfile
@@ -134,7 +135,18 @@ def zip_entries(z, maximum_total):
     total = 0
     for item in infos:
         member_name(item.filename)
-        need(not item.is_dir() and item.file_size >= 0 and not item.flag_bits & 1, "plain unencrypted ZIP files required")
+        # ZIP has no dedicated symlink predicate. Unix producers declare the
+        # file type in the upper external-attribute bits; DOS producers often
+        # leave those bits zero. Permissions without a type also occur in
+        # Python ZIPs. Preserve those ordinary files, but never accept a link,
+        # special inode, DOS directory/volume label, or an unknown file type.
+        # Check declared Unix types even when create_system names another OS:
+        # a mismatched host marker must not turn a symlink into a plain file.
+        file_type = stat.S_IFMT(item.external_attr >> 16)
+        need(not item.is_dir() and file_type in (0, stat.S_IFREG)
+             and not item.external_attr & (0x10 | 0x08)
+             and item.file_size >= 0 and not item.flag_bits & 1,
+             "plain unencrypted ZIP files required")
         total += item.file_size
         need(total <= maximum_total, "ZIP uncompressed budget exceeded")
     return {item.filename: item for item in infos}

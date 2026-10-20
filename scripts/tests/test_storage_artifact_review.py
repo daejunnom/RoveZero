@@ -5,6 +5,7 @@ import gzip
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tarfile
@@ -122,6 +123,39 @@ lease.finish(status="fixture_original_children_closed",tree_gone=True)
             self.write_research(**kw)
             with self.assertRaisesRegex(StorageError, expected):
                 review.verify_research(pin(self.research), seconds=30)
+        self.assertTrue(self.code.exists())
+
+    def test_zip_member_types_reject_links_special_and_dos_directories(self):
+        raw = b'{"scope":"fixture_no_native_execution"}'
+        rows = [{"member": "original/result.json", "bytes": len(raw),
+                 "sha256": hashlib.sha256(raw).hexdigest()}]
+
+        def archive(external_attr, create_system):
+            member = zipfile.ZipInfo(rows[0]["member"])
+            member.create_system = create_system
+            member.external_attr = external_attr
+            with zipfile.ZipFile(self.research, "w") as z:
+                z.writestr(member, raw)
+                z.writestr("inventory.json", json.dumps(rows))
+
+        # Unix mode declarations must not be laundered by a DOS host marker.
+        for create_system in (0, 3):
+            for kind in (stat.S_IFLNK, stat.S_IFIFO, stat.S_IFCHR, stat.S_IFBLK,
+                         stat.S_IFSOCK, stat.S_IFDIR, 0o150000):
+                with self.subTest(create_system=create_system, kind=kind):
+                    archive((kind | 0o600) << 16, create_system)
+                    with self.assertRaisesRegex(StorageError, "plain unencrypted ZIP"):
+                        review.verify_research(pin(self.research), seconds=30)
+        for dos_type in (0x10, 0x08):
+            archive((stat.S_IFREG | 0o600) << 16 | dos_type, 0)
+            with self.assertRaisesRegex(StorageError, "plain unencrypted ZIP"):
+                review.verify_research(pin(self.research), seconds=30)
+        for create_system, attrs in ((0, 0), (3, 0o600 << 16),
+                                     (3, (stat.S_IFREG | 0o644) << 16), (0, 0x20)):
+            with self.subTest(create_system=create_system, attrs=attrs):
+                archive(attrs, create_system)
+                self.assertTrue(review.verify_research(pin(self.research), seconds=30)
+                                ["crc_and_every_member_verified"])
         self.assertTrue(self.code.exists())
 
     def test_original_owner_alive_even_after_tree_closed_remains_rejected(self):
