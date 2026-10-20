@@ -671,6 +671,271 @@ mod tests {
     }
 
     #[test]
+    fn paused_stack_v2_preserves_native_lifo_bits_and_uninterrupted_work() {
+        use crate::cpu::{
+            CpuCompletion, CpuConfig, CpuEngine, CpuLimits, CpuOrderingPolicy, CpuResumePolicy,
+            CpuWork,
+        };
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct NativeTrace {
+            initializations: u64,
+            deltas: u64,
+            restores: u64,
+            root_restores: u64,
+            peak: usize,
+            local_changed: bool,
+            before: Vec<Output>,
+        }
+        struct TracedV2 {
+            inner: V2CpuValue,
+            root: Position,
+            trace: Arc<Mutex<NativeTrace>>,
+        }
+        impl CpuValueEvaluator for TracedV2 {
+            fn identity(&self) -> &CpuValueIdentity {
+                self.inner.identity()
+            }
+            fn provenance(&self) -> &'static str {
+                self.inner.provenance()
+            }
+            fn job_binding_digest(&self) -> Result<Option<Digest>, CpuValueError> {
+                self.inner.job_binding_digest()
+            }
+            fn nnuec_retirement_owner(
+                &self,
+            ) -> Option<crate::cpu_value::nnuec::v2::retirement::NnuecValueRetirementOwner>
+            {
+                self.inner.nnuec_retirement_owner()
+            }
+            fn initialize(&self, position: &Position) -> Result<CpuAccumulator, CpuValueError> {
+                let value = self.inner.initialize(position)?;
+                assert!(self.root.snapshot().same_state(&position.snapshot()));
+                self.trace.lock().unwrap().initializations += 1;
+                Ok(value)
+            }
+            fn cache_context(
+                &self,
+                value: &CpuAccumulator,
+                position: &Position,
+            ) -> Result<CpuValueCacheContext, CpuValueError> {
+                self.inner.cache_context(value, position)
+            }
+            fn score(
+                &self,
+                value: &CpuAccumulator,
+                position: &Position,
+            ) -> Result<i32, CpuValueError> {
+                self.inner.score(value, position)
+            }
+            fn apply_delta(
+                &self,
+                value: &mut CpuAccumulator,
+                delta: &RuleMoveDelta,
+            ) -> Result<CpuAccumulatorUndo, CpuValueError> {
+                let position = Position::from_snapshot(&delta.before, Default::default()).unwrap();
+                let before = self.inner.observe(value, &position)?;
+                // Only the original V2 evaluator creates/mutates the native
+                // accumulator and its uncloneable owned undo.
+                let undo = self.inner.apply_delta(value, delta)?;
+                let state = value.nnuec.as_ref().unwrap();
+                assert!(Arc::ptr_eq(
+                    &state.context_authority,
+                    &self.inner.bound.context().authority,
+                ));
+                let after = self.inner.observe(value, &state.local.work)?;
+                let mut trace = self.trace.lock().unwrap();
+                assert!(trace.before.len() < 16, "bounded fixture native undo depth");
+                trace.local_changed |= bits(&before.numeric.local_accumulator)
+                    != bits(&after.numeric.local_accumulator);
+                trace.before.push(before);
+                trace.deltas += 1;
+                trace.peak = trace.peak.max(trace.before.len());
+                Ok(undo)
+            }
+            fn restore(
+                &self,
+                value: &mut CpuAccumulator,
+                undo: CpuAccumulatorUndo,
+                position: &Position,
+            ) -> Result<(), CpuValueError> {
+                self.inner.restore(value, undo, position)?;
+                let actual = self.inner.observe(value, position)?;
+                let state = value.nnuec.as_ref().unwrap();
+                assert!(Arc::ptr_eq(
+                    &state.context_authority,
+                    &self.inner.bound.context().authority,
+                ));
+                let mut trace = self.trace.lock().unwrap();
+                let before = trace
+                    .before
+                    .pop()
+                    .expect("actual native delta owns one LIFO undo");
+                assert_output_bits(&actual, &before);
+                trace.restores += 1;
+                if trace.before.is_empty() {
+                    // This is the actual search work Position after unmake,
+                    // not merely the unchanged caller's borrowed root.
+                    assert!(self.root.snapshot().same_state(&position.snapshot()));
+                    assert!(state.local.moves().is_empty());
+                    trace.root_restores += 1;
+                }
+                Ok(())
+            }
+        }
+
+        let fixture = prepare_fixture(checkpoint());
+        let position = Position::startpos();
+        let before = position.snapshot();
+        let frozen_context = bits(fixture.bound.context().values());
+        assert!(
+            fixture
+                .bound
+                .context()
+                .values()
+                .iter()
+                .any(|value| *value != 0.0)
+        );
+        let root_moves = ["e2e4".parse::<BoardMove>().unwrap()];
+        let config = CpuConfig {
+            tt_entries: 16,
+            max_depth: 3,
+            quiescence_ply: 4,
+            ..CpuConfig::default()
+        };
+        let limits = |max_nodes| CpuLimits {
+            max_depth: 3,
+            max_nodes,
+            deadline: None,
+        };
+        let cancellation = AtomicBool::new(false);
+        let traced = |trace: &Arc<Mutex<NativeTrace>>| -> Arc<dyn CpuValueEvaluator> {
+            Arc::new(TracedV2 {
+                inner: fixture.evaluator(),
+                root: position.clone(),
+                trace: Arc::clone(trace),
+            })
+        };
+        let full_trace = Arc::new(Mutex::new(NativeTrace::default()));
+        let mut full = CpuEngine::with_evaluator_and_ordering(
+            config.clone(),
+            traced(&full_trace),
+            CpuOrderingPolicy::LegacyMvvLvaV1,
+        )
+        .unwrap();
+        let expected = full
+            .analyze_root_moves(&position, &root_moves, limits(20_000), &cancellation)
+            .unwrap();
+        assert_eq!(expected.completion, CpuCompletion::DepthLimit);
+        assert_eq!(expected.completed_depth, 3);
+        let expected_work = full.last_attempt_work().unwrap();
+        let expected_trace = {
+            let trace = full_trace.lock().unwrap();
+            assert!(trace.before.is_empty());
+            assert_eq!(trace.initializations, 1);
+            assert_eq!(trace.deltas, trace.restores);
+            assert!(trace.peak >= 3 && trace.local_changed && trace.root_restores > 0);
+            (
+                trace.deltas,
+                trace.restores,
+                trace.root_restores,
+                trace.peak,
+            )
+        };
+
+        for interval in [1_u64, 7] {
+            let trace = Arc::new(Mutex::new(NativeTrace::default()));
+            let mut sliced = CpuEngine::with_evaluator_ordering_and_resume_policy(
+                config.clone(),
+                traced(&trace),
+                CpuOrderingPolicy::LegacyMvvLvaV1,
+                CpuResumePolicy::PausedStack,
+            )
+            .unwrap();
+            let owner = sliced.paused_stack_snapshot().unwrap().owner_id;
+            let mut report = sliced
+                .analyze_root_moves(&position, &root_moves, limits(interval), &cancellation)
+                .unwrap();
+            let mut total = CpuWork::default();
+            let mut saw_nested_pause = false;
+            for _ in 0..20_000 {
+                let work = sliced.last_attempt_work().unwrap();
+                assert_eq!(
+                    work,
+                    CpuWork {
+                        nodes: report.nodes,
+                        quiescence_nodes: report.quiescence_nodes,
+                        tt_hits: report.tt_hits,
+                    }
+                );
+                assert!(work.nodes <= interval);
+                total.nodes = total.nodes.checked_add(work.nodes).unwrap();
+                total.quiescence_nodes = total
+                    .quiescence_nodes
+                    .checked_add(work.quiescence_nodes)
+                    .unwrap();
+                total.tt_hits = total.tt_hits.checked_add(work.tt_hits).unwrap();
+                assert!(before.same_state(&position.snapshot()));
+                if report.completion != CpuCompletion::NodeLimit {
+                    break;
+                }
+                saw_nested_pause |= trace.lock().unwrap().before.len() >= 2;
+                let token = report
+                    .resume
+                    .take()
+                    .expect("actual V2 stack pause owns a token");
+                assert!(token.is_paused_stack() && sliced.token_is_current(&token));
+                assert_eq!(token.cumulative_work(), Some(total));
+                assert_eq!(token.paused_stack_bytes(), sliced.paused_stack_bytes());
+                let paused = sliced.paused_stack_snapshot().unwrap();
+                assert!(paused.complete && paused.owner_id == owner);
+                assert_eq!(paused.tokens_retained, 1);
+                assert!(paused.bytes_current > 0);
+                report = sliced
+                    .resume(&position, &token, limits(interval), &cancellation)
+                    .unwrap();
+                assert!(!sliced.token_is_current(&token));
+            }
+            assert_eq!(report.completion, CpuCompletion::DepthLimit);
+            assert_eq!(
+                (report.score, &report.pv, report.completed_depth),
+                (expected.score, &expected.pv, expected.completed_depth),
+            );
+            assert_eq!(total, expected_work);
+            assert!(
+                saw_nested_pause,
+                "the original V2 undo chain must survive a pause"
+            );
+            let observed = trace.lock().unwrap();
+            assert!(observed.before.is_empty() && observed.local_changed);
+            assert_eq!(
+                observed.initializations, 1,
+                "resume must retain the original V2 L"
+            );
+            assert_eq!(
+                (
+                    observed.deltas,
+                    observed.restores,
+                    observed.root_restores,
+                    observed.peak,
+                ),
+                expected_trace,
+            );
+            let complete = sliced.paused_stack_snapshot().unwrap();
+            assert!(complete.complete && complete.owner_id == owner);
+            assert_eq!(complete.tokens_retained, 0);
+            assert_eq!(complete.bytes_current, 0);
+            assert_eq!(complete.replayed_consumed_work, 0);
+            assert!(complete.tokens_created > 0 && complete.tokens_resumed > 0);
+            assert!(!complete.admission_closed && !complete.owner_released);
+            assert!(sliced.paused_stack_bytes().is_none());
+            assert!(before.same_state(&position.snapshot()));
+            assert_eq!(bits(fixture.bound.context().values()), frozen_context);
+        }
+    }
+
+    #[test]
     fn equal_numeric_contexts_with_distinct_authority_cannot_share_native_state() {
         let first = prepare_fixture(checkpoint());
         let second = prepare_fixture(checkpoint());
