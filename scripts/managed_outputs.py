@@ -40,6 +40,43 @@ def identity(path):
     return [info.st_dev, info.st_ino]
 
 
+def _attach_sampled_identity_observation(error, record_key, target, expected, observed):
+    """Best-effort scalar diagnostics; never a custody or recovery authority.
+
+    Called only after the original sample guard failed. No path lookup, stat,
+    row copy or identity retry is performed. A malformed/unbounded source stays
+    an ordinary original StorageError rather than a manufactured observation.
+    """
+    try:
+        if (type(record_key) is not str or len(record_key) != 64
+                or any(character not in "0123456789abcdef" for character in record_key)):
+            return
+        normalized = str(target)  # Already normalized by the original checked().
+        if len(normalized) > 4096:
+            return
+        for pair in (expected, observed):
+            if (type(pair) is not list or len(pair) != 2
+                    or any(type(value) is not int or not 0 <= value < 1 << 128 for value in pair)):
+                return
+        error.managed_output_identity_observation = {
+            "schema": "rovezero.managed-output-identity-observation.v1",
+            "record_key": record_key,
+            "normalized_target": normalized,
+            "expected_identity": list(expected),
+            "observed_identity": list(observed),
+            "read_only_observation": True,
+            "identity_equivalence_attested": False,
+            "storage_lifetime_authority_issued": False,
+            "recovery_authorized": False,
+            "deletion_authorized": False,
+            "physical_completion_attested": False,
+            "performance_evidence": False,
+        }
+    except Exception:
+        # Observation failure cannot replace or suppress the original guard.
+        pass
+
+
 def _catalog_rows(catalog):
     rows = []
     entries = list(catalog.iterdir())
@@ -611,8 +648,11 @@ def sample_output_budget(catalog=None, *, quarantine_receipts=None, quarantine_g
             continue
         row = _read(path)
         target = checked(Path(row["output"]))
-        if row.get("identity") is not None and row["identity"] != identity(target):
-            raise StorageError("live output identity changed")
+        if row.get("identity") is not None and row["identity"] != (observed_identity := identity(target)):
+            error = StorageError("live output identity changed")
+            _attach_sampled_identity_observation(error, row.get("key"), target,
+                                                 row["identity"], observed_identity)
+            raise error
         amount = tree_size(target, allow_disappearing=True)
         if amount > row["reserved_bytes"]:
             raise StorageError("managed output exceeds reservation")

@@ -12,6 +12,22 @@ from managed_process import run_group
 from managed_outputs import sample_output_budget
 
 
+def _emit_storage_failure_observation(error):
+    """Additional bounded JSON only; original failure/cleanup owns the result."""
+    try:
+        observation = getattr(error, "managed_output_identity_observation", None)
+        if (type(observation) is not dict
+                or observation.get("schema") != "rovezero.managed-output-identity-observation.v1"):
+            return
+        raw = json.dumps(observation, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if len(raw.encode("utf-8")) + 1 <= 32 << 10:
+            print(raw, file=sys.stderr)
+    except Exception:
+        # A closed diagnostic pipe or encoding failure must not replace the
+        # original StorageError, supervisor status or uncertain lease state.
+        pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parent.parent)
@@ -27,6 +43,7 @@ def main() -> int:
     if program is None or Path(program).suffix.lower() in {".bat", ".cmd"}:
         parser.error("command must resolve to an executable, not a shell batch file")
     command[0] = program
+    budget_failure = None
     try:
         manager = ManagedBuild(canonical_root(), args.source_root, purpose=args.purpose)
         manager.acquire()
@@ -37,16 +54,29 @@ def main() -> int:
             raise
 
         def check_budget():
-            sample_output_budget()
+            nonlocal budget_failure
+            try:
+                sample_output_budget()
+            except StorageError as exc:
+                # run_group preserves the original failure string while it
+                # drains children. Keep this original instance for diagnostics
+                # after that same cleanup; do not alter its type or message.
+                budget_failure = exc
+                raise
             if tree_size(manager.root / "slots", allow_disappearing=True) > manager.total_limit:
                 raise StorageError("live managed build catalog exceeds 12 GiB")
 
         code, gone, failure = run_group(command, manager.source, environment, args.timeout, check_budget)
         receipt = manager.finish(exit_code=code, tree_gone=gone, supervisor_error=failure)
         print("managed_storage=" + json.dumps(receipt, sort_keys=True), file=sys.stderr)
+        if budget_failure is not None:
+            _emit_storage_failure_observation(budget_failure)
         return code
     except (StorageError, OSError, RuntimeError) as exc:
         print(f"managed_storage_error={exc}; uncertain artifacts/leases are preserved", file=sys.stderr)
+        if budget_failure is not None and budget_failure is not exc:
+            _emit_storage_failure_observation(budget_failure)
+        _emit_storage_failure_observation(exc)
         return 125
 
 

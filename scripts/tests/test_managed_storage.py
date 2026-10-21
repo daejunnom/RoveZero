@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from managed_storage import (ManagedBuild, StorageError, _record_stamp, checked,
                              read_record, read_record_snapshot, remove_tree, tree_size)
 from managed_process import run_group
+import managed_outputs as outputs
 
 
 class StorageTests(unittest.TestCase):
@@ -37,6 +39,107 @@ class StorageTests(unittest.TestCase):
 
     def acquire(self, source=None, **limits):
         return ManagedBuild(self.root, source or self.source, **limits).acquire()
+
+    def sampled_identity_fixture(self, expected):
+        target = self.base / "retained-output"
+        target.mkdir(exist_ok=True)
+        payload = target / "evidence.txt"
+        payload.write_bytes(b"original retained evidence")
+        record = self.output_catalog / (("a" * 64) + ".json")
+        row = {"schema": outputs.SCHEMA, "key": "a" * 64,
+               "output": str(target), "identity": expected, "reserved_bytes": 4096}
+        raw = json.dumps(row).encode()
+        record.write_bytes(raw)
+        return target, payload, record, raw
+
+    def test_sampled_identity_failure_keeps_original_error_and_one_identity_call(self):
+        expected, observed = [67, (1 << 100) + 11], [193, (1 << 100) + 11]
+        target, payload, record, raw = self.sampled_identity_fixture(expected)
+        with patch.object(outputs, "identity", return_value=observed) as identity_call:
+            with patch.object(outputs, "tree_size") as size_call:
+                with self.assertRaisesRegex(StorageError, "^live output identity changed$") as caught:
+                    outputs.sample_output_budget(self.output_catalog)
+        self.assertIs(type(caught.exception), StorageError)
+        self.assertEqual(caught.exception.args, ("live output identity changed",))
+        identity_call.assert_called_once_with(checked(target))
+        size_call.assert_not_called()  # The original failure still precedes size sampling.
+        observation = caught.exception.managed_output_identity_observation
+        self.assertEqual(observation["record_key"], "a" * 64)
+        self.assertEqual(observation["normalized_target"], str(checked(target)))
+        self.assertEqual(observation["expected_identity"], expected)
+        self.assertEqual(observation["observed_identity"], observed)
+        self.assertIs(observation["read_only_observation"], True)
+        for key in ("identity_equivalence_attested", "storage_lifetime_authority_issued",
+                    "recovery_authorized", "deletion_authorized", "physical_completion_attested",
+                    "performance_evidence"):
+            self.assertIs(observation[key], False)
+        self.assertEqual(record.read_bytes(), raw)
+        self.assertEqual(payload.read_bytes(), b"original retained evidence")
+        self.assertEqual(expected, [67, (1 << 100) + 11])
+        self.assertEqual(observed, [193, (1 << 100) + 11])
+
+    def test_sampled_identity_success_and_none_keep_original_identity_call_count(self):
+        for expected in ([67, 11], None):
+            with self.subTest(expected=expected):
+                target, _payload, record, raw = self.sampled_identity_fixture(expected)
+                with patch.object(outputs, "identity", return_value=expected) as identity_call:
+                    with patch.object(outputs, "tree_size", return_value=23) as size_call:
+                        self.assertEqual(outputs.sample_output_budget(self.output_catalog), 23)
+                if expected is None:
+                    identity_call.assert_not_called()
+                else:
+                    identity_call.assert_called_once_with(checked(target))
+                size_call.assert_called_once_with(checked(target), allow_disappearing=True)
+                self.assertEqual(record.read_bytes(), raw)
+
+    def test_run_managed_preserves_budget_failure_after_original_supervisor_stringifies_it(self):
+        import run_managed
+        target, payload, record, raw = self.sampled_identity_fixture([67, 11])
+        original_errors, finished = [], []
+
+        def original_supervisor(_command, _source, _environment, _timeout, check_budget):
+            try:
+                check_budget()
+            except StorageError as error:
+                original_errors.append(error)
+                # Existing run_group converts the original exception to its
+                # message after attempting the original process-tree cleanup.
+                return 125, False, str(error)
+            self.fail("original sample guard did not reject the changed identity")
+
+        def finish(**arguments):
+            finished.append(arguments)
+            return {"failure": arguments["supervisor_error"], "tree_gone": arguments["tree_gone"]}
+
+        manager = SimpleNamespace(acquire=lambda: None, environment=lambda: {}, finish=finish,
+                                  root=self.root, source=self.source, total_limit=12 << 30)
+        error_stream = io.StringIO()
+        with patch.object(run_managed, "ManagedBuild", return_value=manager):
+            with patch.object(run_managed, "canonical_root", return_value=self.root):
+                with patch.object(run_managed.shutil, "which", return_value=sys.executable):
+                    with patch.object(run_managed, "run_group", side_effect=original_supervisor):
+                        with patch.object(outputs, "identity", return_value=[193, 11]) as identity_call:
+                            with patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]):
+                                with patch.object(sys, "stderr", error_stream):
+                                    self.assertEqual(run_managed.main(), 125)
+        identity_call.assert_called_once_with(checked(target))
+        self.assertEqual(len(original_errors), 1)
+        self.assertEqual(finished, [{"exit_code": 125, "tree_gone": False,
+                                     "supervisor_error": "live output identity changed"}])
+        lines = error_stream.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("managed_storage="))
+        self.assertEqual(json.loads(lines[1]), original_errors[0].managed_output_identity_observation)
+        self.assertEqual(record.read_bytes(), raw)
+        self.assertEqual(payload.read_bytes(), b"original retained evidence")
+
+    def test_storage_observation_write_failure_does_not_replace_original_error(self):
+        import run_managed
+        error = StorageError("live output identity changed")
+        outputs._attach_sampled_identity_observation(error, "a" * 64, self.base, [67, 11], [193, 11])
+        with patch.object(sys, "stderr", SimpleNamespace(write=lambda _value: (_ for _ in ()).throw(OSError("closed fixture pipe")))):
+            run_managed._emit_storage_failure_observation(error)
+        self.assertEqual(error.args, ("live output identity changed",))
 
     def test_finish_real_finalizer_uses_only_the_fixture_default_catalog(self):
         owner = self.acquire()
