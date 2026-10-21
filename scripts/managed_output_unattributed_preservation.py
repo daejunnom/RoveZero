@@ -587,23 +587,37 @@ class CatalogView:
         self.until, self.closed, self.failed = min(held.until, history.held.until), False, False
 
     def rows(self):
-        self.check()
-        return _rows(self.catalog, self.details)
+        return self._checked_rows()
 
     def check(self):
+        self._checked_rows()
+
+    def _checked_rows(self):
         need(not self.closed and not self.failed, "observation closed/failed; preserve original failure")
         try:
             self.held.tick()
             self.guard.assert_held()
             self.held.check()
             self.history.check()  # Existing historical chain/records1..8/MAX8 remain unmodified.
-            _rows(self.catalog, self.details)
+            return _rows(self.catalog, self.details)
         except BaseException:
             self.failed = True
             raise
 
     def usage(self, rows):
         self.check()
+        return self._usage_after_check(rows)
+
+    def checked_usage(self):
+        """One full current observation, then its rows and unchanged charge.
+
+        The original catalog gate stays held throughout. This is not a cached
+        result, permission renewal, or a way to skip a later cleanup boundary.
+        """
+        rows = self._checked_rows()
+        return rows, self._usage_after_check(rows)
+
+    def _usage_after_check(self, rows):
         charges = {record.key: record.charge_bytes for record in self.history.records}
         need(not set(charges) & set(self.details), "distinct history and unattributed classification required")
         charges.update({key: value["charge_bytes"] for key, value in self.details.items()})
@@ -1043,8 +1057,10 @@ class _RecoveryCatalogHold:
             self._verify()
             self._held.check()
             _assert_recovery_source_scope(self.root, self.selection)
-            self._view.check()  # The original <=30s observation is never replaced or extended.
-            rows = self._view.rows()
+            # One complete observation per boundary; do not recursively repeat
+            # the same held-file walk through check -> rows -> usage.
+            # The original <=30s observation is never replaced or extended.
+            rows, _ = self._view.checked_usage()
             expected = {"root": str(self.root), "owner": self._original_owner,
                         "scope": "inherited_outer_process_group_or_job"}
             before, table = _mount_table()
@@ -1061,7 +1077,6 @@ class _RecoveryCatalogHold:
                      "registered evidence aliases recovery cleanup root")
             after, _ = _mount_table()
             need(before == after, "recovery output-scope mount changed")
-            self._view.usage(rows)
             self._held.check()
             self._verify()
             self._catalog_guard.assert_held()
@@ -1072,7 +1087,10 @@ class _RecoveryCatalogHold:
 
     def audit_fields(self):
         """Small metadata, never a saved owner/lease/admission capability."""
-        self.check()
+        need(not self._closed and not self._failed, "recovery observation closed/failed")
+        self._held.tick()
+        self._build_guard.assert_held()
+        self._catalog_guard.assert_held()
         return {"schema": BUILD_RECOVERY_SCHEMA, "scope": "original_cache_recovery_only",
                 "policy": POLICY, "selected_unattributed_rows": len(self._view.details),
                 "output_rows_modified": False, "old_output_finalization_performed": False,
