@@ -136,6 +136,7 @@ class _Held:
         need(type(hard_until) in (int, float) and math.isfinite(hard_until), "original finite deadline required")
         self.until = min(time.monotonic() + seconds, hard_until)
         self.fds, self.files, self.directories, self.trees = [], [], {}, []
+        self.file_parents = {}
         self.blobs = []
         try:
             self.tick()
@@ -163,31 +164,46 @@ class _Held:
 
     def directory(self, path):
         self.tick()
-        path = checked(Path(path))
+        path = Path(path)
         if path not in self.directories:
-            fd = self._own(os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC))
+            path = checked(path)
+            need(path.is_absolute(), "absolute held directory required")
+            need(len(self.directories) < 512, "held directory bound exceeded")
+            if path == Path("/"):
+                fd = self._own(os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC))
+                named = path.lstat()
+            else:
+                parent = self.directory(path.parent)
+                need(len(self.directories) < 512, "held directory bound exceeded")
+                named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                fd = self._own(os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                       dir_fd=parent))
             before = custody._did(os.fstat(fd))
-            need(before == custody._did(path.lstat()), "directory FD/name changed")
+            need(stat.S_ISDIR(named.st_mode) and before == custody._did(named), "directory FD/name changed")
             self.directories[path] = (fd, before)
         fd, before = self.directories[path]
-        need(custody._did(os.fstat(fd)) == before == custody._did(path.lstat()), "held directory changed")
+        named = (path.lstat() if path == Path("/") else
+                 os.stat(path.name, dir_fd=self.directories[path.parent][0], follow_symlinks=False))
+        need(custody._did(os.fstat(fd)) == before == custody._did(named), "held directory changed")
         return fd
 
     def open_file(self, path, maximum, *, expected=None, root_owned=False):
         self.tick()
         path = checked(Path(path))
-        fd = self._own(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC))
+        parent = self.directory(path.parent)
+        fd = self._own(os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent))
         info = os.fstat(fd)
         stamp = custody._stamp(info)
         need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
              and 0 <= info.st_size <= maximum, "plain bounded single-link file required")
         if root_owned:
             need(info.st_uid == os.geteuid(), "actual current policy metadata/source owner required")
-        need(stamp == custody._stamp(path.lstat()), "file FD/name changed")
+        need(stamp == custody._stamp(os.stat(path.name, dir_fd=parent, follow_symlinks=False)), "file FD/name changed")
         if expected is not None:
             _pin(expected, maximum)
             need(str(path) == expected["path"] and info.st_size == expected["bytes"], "raw pin path/length changed")
         self.files.append((path, fd, stamp, expected))
+        self.file_parents[fd] = parent
         return fd, stamp
 
     def bytes(self, fd, size):
@@ -231,10 +247,13 @@ class _Held:
         need((current.st_dev, current.st_ino) == self.namespace, "current mount namespace changed")
         for path, (fd, before) in self.directories.items():
             self.tick()
-            need(custody._did(os.fstat(fd)) == before == custody._did(checked(path).lstat()), "held directory changed")
+            named = (path.lstat() if path == Path("/") else
+                     os.stat(path.name, dir_fd=self.directories[path.parent][0], follow_symlinks=False))
+            need(custody._did(os.fstat(fd)) == before == custody._did(named), "held directory changed")
         for path, fd, before, _ in self.files:
             self.tick()
-            need(custody._stamp(os.fstat(fd)) == before == custody._stamp(checked(path).lstat()), "held file/owner/length changed")
+            named = os.stat(path.name, dir_fd=self.file_parents[fd], follow_symlinks=False)
+            need(custody._stamp(os.fstat(fd)) == before == custody._stamp(named), "held file/owner/length changed")
         for fd, before, pin in self.blobs:
             self.tick()
             need(_sha(self.bytes(fd, pin["bytes"])) == pin["sha256"]
@@ -286,7 +305,7 @@ class _Tree:
             need(len(names) + len(seen) <= MAX_ENTRIES, "changed corpus roster exceeded bound")
             for child_name in sorted(names):
                 self.held.tick()
-                child, rel = checked(path / child_name), relative / child_name
+                child, rel = path / child_name, relative / child_name
                 key = rel.as_posix()
                 info = os.stat(child_name, dir_fd=fd, follow_symlinks=False)
                 need(key in self.expected and custody._stamp(info) == self.expected[key],

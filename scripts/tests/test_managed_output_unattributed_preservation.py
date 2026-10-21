@@ -309,6 +309,38 @@ class UnattributedInventoryTests(unittest.TestCase):
         finally:
             held.close(sys.exc_info()[1])
 
+    def test_held_ancestor_replacement_is_rejected_with_identical_payload(self):
+        parent = self.root / "held-ancestor"
+        parent.mkdir(mode=0o700)
+        source = parent / "input.txt"
+        source.write_bytes(b"same bytes do not prove the same ancestor")
+        held = policy._Held(30, time.monotonic() + 30)
+        try:
+            held.read(rawpin(source), policy.MAX_METADATA)
+            parent.rename(self.root / "preserved-ancestor")
+            parent.mkdir(mode=0o700)
+            source.write_bytes(b"same bytes do not prove the same ancestor")
+            with self.assertRaisesRegex(StorageError, "held directory"):
+                held.check()
+        finally:
+            held.close(sys.exc_info()[1])
+
+    def test_held_ancestor_symlink_is_rejected_before_admission(self):
+        parent = self.root / "held-ancestor"
+        parent.mkdir(mode=0o700)
+        source = parent / "input.txt"
+        source.write_bytes(b"original current input")
+        held = policy._Held(30, time.monotonic() + 30)
+        try:
+            held.read(rawpin(source), policy.MAX_METADATA)
+            preserved = self.root / "preserved-ancestor"
+            parent.rename(preserved)
+            parent.symlink_to(preserved, target_is_directory=True)
+            with self.assertRaisesRegex(StorageError, "held directory"):
+                held.check()
+        finally:
+            held.close(sys.exc_info()[1])
+
     def test_expired_observation_is_not_renewed(self):
         selection = self.selection()
         held = policy._Held(30, selection.original_hard_until)
