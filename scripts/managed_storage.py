@@ -251,8 +251,18 @@ class ManagedBuild:
     after checking the original process tree, paths and source ownership.
     """
     def __init__(self, root: Path, source: Path, *, slot_limit=8 * GiB,
-                 total_limit=12 * GiB, slots_limit=4, purpose=None):
+                 total_limit=12 * GiB, slots_limit=4, purpose=None, output_preservation=None):
+        if output_preservation is not None:
+            from managed_output_unattributed_preservation import UnattributedSelection
+            if (type(output_preservation) is not UnattributedSelection
+                    or output_preservation._bound_deadline is None):
+                raise StorageError('exact source7 original-deadline selection required')
+        self.output_preservation = output_preservation
+        self._output_budget_observer = None
         self.root = checked(root)
+        if output_preservation is not None:
+            from managed_output_unattributed_preservation import assert_manager_preservation_scope
+            assert_manager_preservation_scope(self.root, output_preservation)
         self.source = Path(os.path.realpath(source))
         if self.root.is_relative_to(self.source) or self.source.is_relative_to(self.root):
             raise StorageError("build storage must be outside the checkout")
@@ -354,6 +364,9 @@ class ManagedBuild:
 
     def acquire(self) -> "ManagedBuild":
         checked(self.root)
+        if self.output_preservation is not None:
+            from managed_output_unattributed_preservation import assert_manager_preservation_scope
+            assert_manager_preservation_scope(self.root, self.output_preservation)
         self.root.mkdir(parents=True, exist_ok=True)
         self.guard.acquire()
         if any(p.name not in {"owner.json", "slots", "catalog.lock", "maintenance.json", "closure.json"} for p in self.root.iterdir()):
@@ -412,6 +425,17 @@ class ManagedBuild:
                    RZ_MANAGED_BUILD_ROOT=str(self.root), RZ_MANAGED_BUILD_TOKEN=self.token)
         return env
 
+    def sample_output_budget(self):
+        """Explicit original object only; default sampler retains its strict guards."""
+        if self.output_preservation is None:
+            from managed_outputs import sample_output_budget
+            return sample_output_budget()
+        self._assert_owner()
+        if self._output_budget_observer is None:
+            from managed_output_unattributed_preservation import create_budget_observer
+            self._output_budget_observer = create_budget_observer(self, self.output_preservation)
+        return self._output_budget_observer.sample()
+
     def finish(self, *, exit_code: int, tree_gone: bool, supervisor_error=None) -> dict:
         self._assert_owner()
         if not tree_gone:
@@ -422,7 +446,11 @@ class ManagedBuild:
         write_record(self.root / "closure.json", {"schema": SCHEMA,
                      "owner": self._identity(), "tree_gone": True})
         from managed_outputs import finalize_supervised_outputs
-        finalize_supervised_outputs(self.root, self._identity())
+        if self.output_preservation is None:
+            finalize_supervised_outputs(self.root, self._identity())
+        else:
+            from managed_output_unattributed_preservation import finalize_original_manager
+            finalize_original_manager(self, self.output_preservation)
         observed = tree_size(self.slot)
         remove_tree(self.scratch, self.slot)
         reset = tree_size(self.slot) > self.slot_limit
@@ -443,6 +471,8 @@ class ManagedBuild:
         self._assert_owner()
         self.lock.unlink()
         self.finished = True
+        if self._output_budget_observer is not None:
+            self._output_budget_observer.close()
         self.guard.release()
         return result
 

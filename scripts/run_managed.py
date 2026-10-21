@@ -28,7 +28,7 @@ def _emit_storage_failure_observation(error):
         pass
 
 
-def main() -> int:
+def main(*, output_preservation=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--timeout", type=int, default=1200)
@@ -45,10 +45,13 @@ def main() -> int:
     command[0] = program
     budget_failure = None
     try:
-        manager = ManagedBuild(canonical_root(), args.source_root, purpose=args.purpose)
+        manager = ManagedBuild(canonical_root(), args.source_root, purpose=args.purpose,
+                               output_preservation=output_preservation)
         manager.acquire()
         try:
             environment = manager.environment()
+            if output_preservation is not None:
+                manager.sample_output_budget()  # Must succeed before any payload child is launched.
         except StorageError:
             manager.finish(exit_code=125, tree_gone=True)  # No child was launched.
             raise
@@ -56,7 +59,10 @@ def main() -> int:
         def check_budget():
             nonlocal budget_failure
             try:
-                sample_output_budget()
+                if output_preservation is None:
+                    sample_output_budget()  # Preserve the original default monkeypatch/consumer seam.
+                else:
+                    manager.sample_output_budget()
             except StorageError as exc:
                 # run_group preserves the original failure string while it
                 # drains children. Keep this original instance for diagnostics

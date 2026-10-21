@@ -179,3 +179,38 @@ rollover, 성공 보정, 원 자료 삭제를 하지 않는다.
 
 이 정책 등록과 CPU fixture 성공은 실제 실행 승인·신경망·GPU 수명 인수를 대신하지
 않는다. 실제 재관측과 제품 검증은 새 실행 ID·기존 자원/시간/보존 조건으로 별도 기록한다.
+
+## 식별 연속성을 확인하지 못한 자료의 명시적 보존
+
+기존 bound 출력의 기록된 device/inode와 현재 관측이 다르면 기본 경로는 계속
+거절한다. inode 일치, 파일 내용 일치 또는 나중에 같은 device 번호가 관측된 사실만으로
+과거 소유권이나 물리 객체의 연속성을 인정하지 않는다. 원 행의 identity를 다시 쓰지 않는다.
+
+별도 `UnattributedSelection`은 원 catalog/marker와 독립 연구 ZIP을 명시한 여섯 자료를
+미귀속 보존 대상으로만 처리하는 제한된 실험 경로다. 기존 `PreservationSelection`의
+source6과 다른 source7 domain이며 자동 변환하지 않는다. 기본값은 계속 선택하지 않은
+상태다. 이 타입 자체나 저장된 JSON은 owner·gate·종료·복구·삭제 권한이 아니다.
+
+현재 실행의 실제 catalog gate·FD·boot·mount·원 절대 deadline 아래에서 원 행과 marker의
+정확한 bytes, bounded corpus와 독립 ZIP의 모든 파일을 대조한다. ZIP은 중앙 디렉터리를
+할당하기 전에 개수·크기를 제한하며, 이번 형식은 ZIP64와 분할 archive를 거절한다.
+현재 corpus의 UID나 관측 identity는 원 owner의 증거로 사용하지 않는다. 원 reservation
+이상과 회수 ZIP·registry·관측 문서·새 active reservation을 18GiB에서 보수적으로 계수한다.
+범위를 맞추기 위해 원 예약을 줄이거나 실패 자료를 삭제하지 않는다.
+
+새 producer는 기존 자료·회수본·control 경로와 분리된 fresh 출력만 등록한다. 관리 빌드의
+acquire/prune 전에 cleanup root와 이 자료의 경로 및 현재 bind alias 겹침을 거절한다.
+owner 전용 journal의 fsync/readback 이후에만 payload를 허용하며 기존 journal 상한을
+유지한다. 원 여섯 행과 기존 transition1~8·MAX8·physical unknown은 그대로 보존한다.
+
+`ManagedBuild(..., output_preservation=...)`와 `run_managed.main(output_preservation=...)`는
+명시적으로 등록된 현재 호출자가 사용할 접점이다. 반복 budget observer는 producer가
+보유한 gate를 기다리지 않으며 새로운 실행 권한을 발급하지 않는다. 비선택 active 행의
+marker 중간쓰기는 budget 관측에 한해 구분하고, 실제 admission과 종료는 엄격한 gate
+검사를 유지한다. 원 manager의 자식 종료 확인 뒤에만 별도 gate에서 종료를 처리한다.
+
+소스·CPU fixture 검사는 실제 source7 준비와 원 tip/current-owner 연결 검사를 대신하지
+않는다. 기존 source6/18을 현재 변경된 경로로 재열 수 없으면 새 producer를 명시 등록해야
+하며, 역사 자료를 현재 소유권으로 재표시하지 않는다. 전체 corpus/ZIP을 다시 해시하는
+초기 경로의 비용은 성능 개선 근거로 사용하지 않는다. 14일은 보존 검토 시점이며, 만료나
+연구 ZIP 검증 완료만으로 원 자료를 삭제하지 않는다.

@@ -143,7 +143,14 @@ class OutputLease:
     def __init__(self, output, source, *, catalog=None, reserve=8 * GiB,
                  total_limit=18 * GiB, retention_days=14, deferred=False, outer_supervised=False,
                  quarantine_receipts=None, quarantine_transition_receipts=None,
-                 preservation_session=None):
+                 preservation_session=None, unattributed_preservation=None):
+        if unattributed_preservation is not None:
+            from managed_output_unattributed_preservation import UnattributedSelection
+            if (type(unattributed_preservation) is not UnattributedSelection
+                    or unattributed_preservation._bound_deadline is None
+                    or preservation_session is not None or quarantine_receipts is not None
+                    or quarantine_transition_receipts is not None or outer_supervised):
+                raise StorageError('explicit source7 unattributed policy is mutually exclusive')
         if preservation_session is not None:
             from managed_output_preservation_session import PreservationSelection
             if (type(preservation_session) is not PreservationSelection or quarantine_receipts is not None
@@ -163,10 +170,10 @@ class OutputLease:
                 raise StorageError("outer finalizer does not carry explicit custody receipt pins")
         self.output, self.source = checked(output), checked(source)
         self.catalog = checked(catalog or canonical_catalog())
-        if preservation_session is not None and self.catalog != checked(canonical_catalog()):
+        if (preservation_session is not None or unattributed_preservation is not None) and self.catalog != checked(canonical_catalog()):
             raise StorageError("preservation policy requires the canonical output catalog")
         if (quarantine_receipts is not None or quarantine_transition_receipts is not None
-                or preservation_session is not None):
+                or preservation_session is not None or unattributed_preservation is not None):
             from managed_output_quarantine import registry_path
             registry = registry_path(self.catalog)
             if self.output.is_relative_to(registry) or registry.is_relative_to(self.output):
@@ -183,6 +190,8 @@ class OutputLease:
         self.quarantine_transition_receipts = (None if quarantine_transition_receipts is None
                                                else tuple(dict(pin) for pin in quarantine_transition_receipts))
         self.preservation_session = preservation_session
+        self.unattributed_preservation = unattributed_preservation
+        self._preservation_enabled = preservation_session is not None or unattributed_preservation is not None
         self._preservation_journal = None
         self._preservation_error = None
         self._quarantine_view = None
@@ -203,8 +212,19 @@ class OutputLease:
                           "scope": "inherited_outer_process_group_or_job"}
 
     def _rows(self):
+        if self.unattributed_preservation is not None:
+            from managed_output_unattributed_preservation import observe_fresh_output
+            previous, self._quarantine_view = self._quarantine_view, None
+            try:
+                self._quarantine_view = observe_fresh_output(self.catalog,
+                    self.unattributed_preservation, self.guard, output=self.output,
+                    source=self.source, producer_record=self.record)
+                return self._quarantine_view.rows()
+            finally:
+                if previous is not None:
+                    previous.close(sys.exc_info()[1])
         rows = _catalog_rows(self.catalog)
-        if self.preservation_session is not None:
+        if self._preservation_enabled:
             from managed_output_preservation_session import observe_new_output
             previous, self._quarantine_view = self._quarantine_view, None
             try:
@@ -233,7 +253,7 @@ class OutputLease:
 
     def _check_quarantine_view(self):
         if (self.quarantine_receipts is not None or self.quarantine_transition_receipts is not None
-                or self.preservation_session is not None):
+                or self._preservation_enabled):
             if self._quarantine_view is None:
                 raise StorageError("explicit custody validation has not completed")
             self._quarantine_view.check()
@@ -244,7 +264,7 @@ class OutputLease:
             view.close(primary)
 
     def _seal_preservation_session(self):
-        if self.preservation_session is None:
+        if not self._preservation_enabled:
             return
         if self._preservation_error is not None:
             raise StorageError("preservation evidence failed; no further payload permission") from self._preservation_error
@@ -272,7 +292,7 @@ class OutputLease:
             self.guard.release()
         except BaseException:
             if (self.quarantine_receipts is None and self.quarantine_transition_receipts is None
-                    and self.preservation_session is None) or primary is None:
+                    and not self._preservation_enabled) or primary is None:
                 raise
             if hasattr(primary, "add_note"):
                 primary.add_note("custody output catalog gate release also failed")
@@ -303,7 +323,7 @@ class OutputLease:
             if self.output.exists():
                 raise StorageError("only fresh output can be registered; no historical adoption")
             if not self.deferred:
-                self.output.mkdir(parents=True, mode=0o700 if self.preservation_session is not None else 0o777)
+                self.output.mkdir(parents=True, mode=0o700 if self._preservation_enabled else 0o777)
             now = time.time_ns()
             self.record = {"schema": SCHEMA, "key": self.key, "output": str(self.output),
                 "identity": None if self.deferred else identity(self.output), "token": uuid.uuid4().hex,
@@ -314,14 +334,14 @@ class OutputLease:
                 "review_after_ns": now + self.days * 86400 * 10**9,
                 "reserved_bytes": self.reserve, "catalog_limit_bytes": self.total_limit,
                 "classification": "retained_evidence", "automatic_expiry_deletion": False}
-            if self.preservation_session is not None:
+            if self._preservation_enabled:
                 self._quarantine_view.bind_producer(self.record)
             self._write()
             self._seal_preservation_session()
-            if self.preservation_session is not None:
+            if self._preservation_enabled:
                 # Mandatory journal bytes also consume the original reservation.
                 if (tree_size(self.output) > self.reserve
-                        or self._output_usage(_catalog_rows(self.catalog)) > self.total_limit):
+                        or self._output_usage(self._quarantine_view.rows() if self.unattributed_preservation is not None else _catalog_rows(self.catalog)) > self.total_limit):
                     raise OutputBudgetError("preservation evidence exceeds original output reservation")
             return self
         except BaseException as error:
@@ -468,7 +488,7 @@ class OutputLease:
             write_record(self.output / ".rovezero-output.json", self.record)
         write_record(self.catalog / (self.key + ".json"), self.record)
         if (self.quarantine_receipts is not None or self.quarantine_transition_receipts is not None
-                or self.preservation_session is not None):
+                or self._preservation_enabled):
             self._check_quarantine_view()  # A late error keeps written metadata; no payload permission.
 
     def check_budget(self):
