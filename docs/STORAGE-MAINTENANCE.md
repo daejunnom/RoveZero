@@ -214,3 +214,13 @@ marker 중간쓰기는 budget 관측에 한해 구분하고, 실제 admission과
 하며, 역사 자료를 현재 소유권으로 재표시하지 않는다. 전체 corpus/ZIP을 다시 해시하는
 초기 경로의 비용은 성능 개선 근거로 사용하지 않는다. 14일은 보존 검토 시점이며, 만료나
 연구 ZIP 검증 완료만으로 원 자료를 삭제하지 않는다.
+
+원 빌드 감독이 종료 증거를 남긴 뒤 출력 검사에서 멈춘 경우에는
+`recover_build(..., output_preservation=...)`로 같은 typed 선택을 명시할 수 있다.
+원 build gate·owner raw digest·root/slot identity와 기존 reboot 또는 정확한
+closure/owner-dead 검증을 모두 유지한다. 이후 실제 output gate에서 현재 자료를
+읽기 전용으로 관측한다. 과거 owner에 정확히 연결된 active supervised 출력이
+하나라도 있으면 선택된 자료라도 복구를 거절하며 출력 행을 대신 종료하지 않는다.
+현재 정책 소스와 회수본도 cache cleanup 범위 밖에 있어야 한다. 한 번의 30초 관측이
+만료되면 갱신하지 않고 실패한다. 이 경로는 기존 재생성 cache/scratch의 복구만
+허용하며 과거 source 권한·실행 owner·물리 완료·출력 삭제 권한을 발급하지 않는다.

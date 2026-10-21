@@ -8,6 +8,7 @@ Archived sources are historical bytes, never a substitute for live sources.
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -24,7 +25,7 @@ import managed_output_preservation_session as legacy
 import managed_output_quarantine as custody
 import managed_output_quarantine_transition as transitions
 from managed_storage import GiB, StorageError, checked, read_record_snapshot, tree_size, write_record
-from storage_guard import lifetime
+from storage_guard import CatalogGuard, lifetime
 
 SCHEMA = "rovezero.unattributed-output-preservation.v1"
 RECOVERY_SCHEMA = "rovezero.unattributed-research-recovery.v1"
@@ -952,3 +953,152 @@ def finalize_original_manager(manager, selection):
             view.usage(view.rows())
         finally:
             view.close(sys.exc_info()[1])
+
+
+BUILD_RECOVERY_SCHEMA = "rovezero.unattributed-build-cache-recovery.v1"
+
+
+def _assert_recovery_source_scope(root, selection):
+    """Recovery may delete its build cache; every live source7 must be outside."""
+    assert_manager_preservation_scope(root, selection)
+    before, table = _mount_table()
+    device, coordinate = _physical_scope(root, table)
+    for pin in selection.sources.values():
+        path = checked(Path(pin["path"]))
+        need(not (path.is_relative_to(root) or root.is_relative_to(path)),
+             "current recovery source7 overlaps build cleanup root")
+        source_device, source_coordinate = _physical_scope(path, table)
+        need(not (source_device == device and
+                  (source_coordinate.is_relative_to(coordinate) or coordinate.is_relative_to(source_coordinate))),
+             "current recovery source7 aliases build cleanup root")
+    after, _ = _mount_table()
+    need(before == after, "recovery source cleanup-scope mount changed")
+
+
+class _RecoveryCatalogHold:
+    """One read-only catalog exclusion during ORIGINAL cache recovery only.
+
+    Constructed after recover_build's original dead/root/closure/slot checks.
+    It never acquires a ManagedBuild, issues a current execution owner, closes
+    an old output row or interprets the old owner JSON as execution authority.
+    """
+    def __init__(self, token, root, owner_sha256, selection, build_guard, verify_recovery):
+        need(token is _TOKEN and type(selection) is UnattributedSelection,
+             "actual recovery call and exact typed preservation selection required")
+        root = checked(Path(root))
+        need(type(build_guard) is CatalogGuard and Path(build_guard.path) == root / "catalog.lock"
+             and callable(verify_recovery), "actual original build guard/verifier required")
+        need(selection._bound_deadline is not None, "original finite maintenance clock required")
+        self.root, self.selection = root, selection
+        self._build_guard, self._verify = build_guard, verify_recovery
+        self._held = self._view = self._catalog_context = self._catalog_guard = None
+        self._closed, self._failed = False, False
+        try:
+            build_guard.assert_held()
+            verify_recovery()  # Existing actual root/slot/raw-owner proof, not a saved ready flag.
+            _assert_recovery_source_scope(root, selection)
+            self._held = _Held(selection.maximum_seconds, selection.original_hard_until)
+            owner_path = root / "owner.json"
+            owner, digest, stamp = read_record_snapshot(owner_path)
+            need(digest == owner_sha256, "original recovery owner digest changed")
+            owner_pin = {"path": str(owner_path), "bytes": stamp[4], "sha256": digest}
+            owner_raw = self._held.read(owner_pin, MAX_METADATA, root_owned=True)
+            need(_decode(owner_raw) == owner and read_record_snapshot(owner_path) == (owner, digest, stamp),
+                 "actual original owner raw/FD changed")
+            self._original_owner = owner  # Comparison data only. Never loaded as a current owner.
+            self._original_owner_pin = owner_pin
+            import managed_outputs as outputs
+            self._catalog_context = custody.original_custody_gate(outputs.canonical_catalog())
+            self._catalog_guard = self._catalog_context.__enter__()
+            self._view = observe_catalog(outputs.canonical_catalog(), selection, self._catalog_guard,
+                                         hard_until=self._held.until)
+            self.check()
+        except BaseException as error:
+            self.close(error)
+            raise
+
+    def check(self):
+        need(not self._closed and not self._failed, "recovery observation closed/failed; no refresh")
+        try:
+            self._build_guard.assert_held()
+            self._verify()
+            self._held.check()
+            _assert_recovery_source_scope(self.root, self.selection)
+            self._view.check()  # The original <=30s observation is never replaced or extended.
+            rows = self._view.rows()
+            expected = {"root": str(self.root), "owner": self._original_owner,
+                        "scope": "inherited_outer_process_group_or_job"}
+            before, table = _mount_table()
+            device, coordinate = _physical_scope(self.root, table)
+            for _, row, target in rows:
+                # Selected/unattributed rows receive NO exception to this rule.
+                need(not (row.get("state") == "active" and row.get("outer_supervisor") == expected),
+                     "old-owner active supervised output prevents cache recovery")
+                need(not (target.is_relative_to(self.root) or self.root.is_relative_to(target)),
+                     "registered evidence overlaps recovery cleanup root")
+                output_device, output_coordinate = _physical_scope(target, table)
+                need(not (output_device == device and (output_coordinate.is_relative_to(coordinate)
+                         or coordinate.is_relative_to(output_coordinate))),
+                     "registered evidence aliases recovery cleanup root")
+            after, _ = _mount_table()
+            need(before == after, "recovery output-scope mount changed")
+            self._view.usage(rows)
+            self._held.check()
+            self._verify()
+            self._catalog_guard.assert_held()
+            self._build_guard.assert_held()
+        except BaseException:
+            self._failed = True
+            raise
+
+    def audit_fields(self):
+        """Small metadata, never a saved owner/lease/admission capability."""
+        self.check()
+        return {"schema": BUILD_RECOVERY_SCHEMA, "scope": "original_cache_recovery_only",
+                "policy": POLICY, "selected_unattributed_rows": len(self._view.details),
+                "output_rows_modified": False, "old_output_finalization_performed": False,
+                "old_owner_reissued": False, "source6_historical_authority_reissued": False,
+                "physical_completion": "unknown_unchanged", "observation_refresh": False}
+
+    def close(self, primary=None):
+        if self._closed:
+            return
+        self._closed = True
+        first = None
+        for name in ("_view", "_held"):
+            value = getattr(self, name, None)
+            setattr(self, name, None)
+            if value is not None:
+                try:
+                    value.close(primary)
+                except BaseException as error:
+                    first = first or error
+        context, self._catalog_context = self._catalog_context, None
+        if context is not None:
+            try:
+                if self._catalog_guard is not None:
+                    context.__exit__(type(primary) if primary is not None else None, primary,
+                                     primary.__traceback__ if primary is not None else None)
+            except BaseException as error:
+                first = first or error
+        self._catalog_guard = None
+        if first is not None:
+            if primary is None:
+                raise first
+            if hasattr(primary, "add_note"):
+                primary.add_note("read-only recovery observation close also failed")
+
+
+@contextmanager
+def recovery_catalog_exclusion(root, owner_sha256, selection, build_guard, verify_recovery):
+    """Explicit typed selection for original recover_build's existing cleanup.
+
+    Saved JSON is not accepted as a live guard/verifier/owner.  All original
+    termination checks must already have succeeded in recover_build.  There is
+    no generation update, output finalizer, observation refresh or new run.
+    """
+    hold = _RecoveryCatalogHold(_TOKEN, root, owner_sha256, selection, build_guard, verify_recovery)
+    try:
+        yield hold
+    finally:
+        hold.close(sys.exc_info()[1])

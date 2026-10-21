@@ -477,7 +477,7 @@ class ManagedBuild:
         return result
 
 
-def recover_build(root: Path, owner_sha256: str) -> dict:
+def recover_build(root: Path, owner_sha256: str, *, output_preservation=None) -> dict:
     """Explicit exact-owner recovery after reboot or original terminal closure.
 
     PID absence/reuse cannot establish that no orphan detached from its group.
@@ -520,18 +520,36 @@ def recover_build(root: Path, owner_sha256: str) -> dict:
                  "recovered": False, "reason": "prior_boot_processes_cannot_survive" if reboot
                  else "original_terminal_closure_and_owner_dead"}
         write_record(root / "maintenance.json", audit)
-        from managed_outputs import finalize_supervised_outputs
-        finalize_supervised_outputs(root, owner)
-        verify_recovery()
-        remove_tree(manager.scratch, manager.slot)
-        verify_recovery()
-        remove_tree(manager.target, manager.slot)
-        record = {**matches[0][1], "state": "complete", "finished_ns": time.time_ns()}
-        write_record(manager.slot / "record.json", record)
-        audit.update(recovered=True, regenerable_cache_removed=True, temporary_removed=True)
-        write_record(root / "maintenance.json", audit)
-        verify_recovery()
-        if read_record(root / "owner.json") != owner:
-            raise StorageError("recovery owner changed; preserve lock")
-        (root / "owner.json").unlink()
-        return audit
+        def complete_original_recovery(preservation_check=None):
+            # None executes the original cache-recovery operations/checks in
+            # their original order. Extra checks belong only to the opt-in.
+            if preservation_check is not None:
+                preservation_check()
+            verify_recovery()
+            remove_tree(manager.scratch, manager.slot)
+            if preservation_check is not None:
+                preservation_check()
+            verify_recovery()
+            remove_tree(manager.target, manager.slot)
+            if preservation_check is not None:
+                preservation_check()
+            record = {**matches[0][1], "state": "complete", "finished_ns": time.time_ns()}
+            write_record(manager.slot / "record.json", record)
+            audit.update(recovered=True, regenerable_cache_removed=True, temporary_removed=True)
+            write_record(root / "maintenance.json", audit)
+            verify_recovery()
+            if read_record(root / "owner.json") != owner:
+                raise StorageError("recovery owner changed; preserve lock")
+            if preservation_check is not None:
+                preservation_check()  # Both actual gates/FDs still held immediately before unlink.
+            (root / "owner.json").unlink()
+            return audit
+        if output_preservation is None:
+            from managed_outputs import finalize_supervised_outputs
+            finalize_supervised_outputs(root, owner)
+            return complete_original_recovery()
+        from managed_output_unattributed_preservation import recovery_catalog_exclusion
+        with recovery_catalog_exclusion(root, digest, output_preservation, guard, verify_recovery) as preserved:
+            audit["output_preservation"] = preserved.audit_fields()
+            write_record(root / "maintenance.json", audit)
+            return complete_original_recovery(preserved.check)
