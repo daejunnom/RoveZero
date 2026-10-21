@@ -227,7 +227,17 @@ class LifecycleTests(unittest.TestCase):
         (owner.target / "cache").write_bytes(b"regenerable")
         owner.guard.release()
         original = pin(owner.lock)
-        current = {**owner.lifetime, "boot": "different-test-boot"}
+        # A format change is not a reboot.  Inject a later counter in the same
+        # Windows domain; Linux retains its distinct per-boot UUID contract.
+        if owner.lifetime["platform"] == "win32":
+            from storage_guard import WINDOWS_BOOT_COUNTER_PREFIX, _windows_boot_count
+            count = _windows_boot_count(owner.lifetime["boot"])
+            self.assertIsNotNone(count)
+            self.assertLess(count, 0xffffffff)
+            fixture_boot = WINDOWS_BOOT_COUNTER_PREFIX + str(count + 1)
+        else:
+            fixture_boot = "different-test-boot"
+        current = {**owner.lifetime, "boot": fixture_boot}
         with patch("managed_storage.lifetime", return_value=current):
             with self.assertRaisesRegex(StorageError, "digest changed"):
                 recover_build(self.build, "0" * 64)

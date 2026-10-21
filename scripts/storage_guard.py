@@ -13,6 +13,45 @@ import stat
 import sys
 
 
+WINDOWS_BOOT_COUNTER_PREFIX = "windows-boot-counter-v1:"
+WINDOWS_BOOT_COUNTER_KEY = (
+    r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"
+)
+
+
+def _windows_boot_identifier(registry):
+    """Read the OS-owned successful-boot counter; never estimate from clocks.
+
+    Microsoft's memory-integrity enablement documentation defines this BootId
+    as a counter incremented on each successful boot.  The BootIdentifier in
+    SystemBootEnvironmentInformation identifies a boot loader entry and is not
+    sufficient to distinguish successive boots of the same Windows install.
+    Missing, denied or malformed counters remain unavailable; no fallback can
+    turn such an observation into a recovery proof.
+
+    Reference: https://learn.microsoft.com/windows-hardware/design/device-experiences/oem-hvci-enablement
+    """
+    access = registry.KEY_READ | registry.KEY_WOW64_64KEY
+    with registry.OpenKey(registry.HKEY_LOCAL_MACHINE, WINDOWS_BOOT_COUNTER_KEY, 0, access) as key:
+        count, kind = registry.QueryValueEx(key, "BootId")
+    if kind != registry.REG_DWORD or type(count) is not int or not 0 <= count <= 0xffffffff:
+        raise OSError("Windows successful-boot counter unavailable or malformed")
+    return WINDOWS_BOOT_COUNTER_PREFIX + str(count)
+
+
+def _windows_boot_count(identifier):
+    """Parse only the new domain; legacy loader GUIDs never imply a reboot."""
+    if not isinstance(identifier, str) or not identifier.startswith(WINDOWS_BOOT_COUNTER_PREFIX):
+        return None
+    value = identifier[len(WINDOWS_BOOT_COUNTER_PREFIX):]
+    if not value or len(value) > 10 or not value.isascii() or not value.isdecimal():
+        return None
+    count = int(value)
+    if str(count) != value or not 0 <= count <= 0xffffffff:
+        return None
+    return count
+
+
 class CatalogGuard:
     def __init__(self, path):
         self.path, self.stream = Path(path), None
@@ -87,13 +126,7 @@ def lifetime():
         from ctypes import wintypes as w
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as key:
             host = winreg.QueryValueEx(key, "MachineGuid")[0]
-        # SystemBootEnvironmentInformation contains the boot GUID, not an
-        # estimate from wall clock minus uptime (which can drift).
-        data = (ctypes.c_ubyte * 32)()
-        status = ctypes.WinDLL("ntdll").NtQuerySystemInformation(90, data, ctypes.sizeof(data), None)
-        if status < 0:
-            raise OSError("Windows boot identity unavailable")
-        boot = bytes(data[:16]).hex()
+        boot = _windows_boot_identifier(winreg)
         k = ctypes.WinDLL("kernel32", use_last_error=True)
         k.GetCurrentProcess.restype = w.HANDLE
         k.GetProcessTimes.argtypes = [w.HANDLE, *([ctypes.POINTER(w.FILETIME)] * 4)]
@@ -113,11 +146,20 @@ def reboot_proves_dead(previous, current):
     # Same-boot PID death/reuse says nothing about orphan descendants. Legacy
     # owners without this evidence are deliberately not recoverable here.
     keys = {"host", "boot", "process_birth", "platform"}
-    return (isinstance(previous, dict) and set(previous) == keys
+    compatible = (isinstance(previous, dict) and set(previous) == keys
+            and isinstance(current, dict) and set(current) == keys
             and all(isinstance(v, str) and v for v in previous.values())
+            and all(isinstance(v, str) and v for v in current.values())
             and previous["host"] == current["host"]
-            and previous["platform"] == current["platform"]
-            and previous["boot"] != current["boot"])
+            and previous["platform"] == current["platform"])
+    if not compatible:
+        return False
+    if previous["platform"] == "win32":
+        old_count, new_count = _windows_boot_count(previous["boot"]), _windows_boot_count(current["boot"])
+        # A format change, rollback, wrap or reset is not a reboot proof.  Old
+        # loader-GUID records stay preserved for explicit legacy maintenance.
+        return old_count is not None and new_count is not None and new_count > old_count
+    return previous["boot"] != current["boot"]
 
 
 def owner_proven_dead(pid, previous, current):
