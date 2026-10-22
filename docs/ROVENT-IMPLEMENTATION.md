@@ -1747,3 +1747,38 @@ metadata 소비 통과를 원 실패 실행의 성공이나 제품·NNUEC·N05 �
 검사, 이전 GPU 자료 및 현재 제품 인수를 계속 구분한다. 후속 실제 실행에는 새 source
 pin과 namespace가 필요하다. 31개 필수 항목의 잔여 범위는 축소하지 않으며 학습·원격
 성능/기력 비교·병합은 없다.
+
+## 35차 체크포인트: 저장소 한도 유지와 후속 시간 수명 분리
+
+source007을 연결한 후속 N05는 새 namespace로 한 번 실행했다. 최초 owner 생성 전에
+capture config를 포함한 실제 입력 80개·180,251,969 bytes와 Python AST 50개를
+Main이 확인했고, 독립 감사에서 변경을 source007 연결·새 실행 식별·핀 갱신으로
+한정했음을 확인했다. 기존 source·실행·실패 자료는 덮어쓰지 않았다.
+
+이번 실행은 원 18GiB 예산 검사와 metadata 게시 반환까지 진행했다. 그러나 최초
+P metadata의 고정 20분 기한을 뒤의 handoff와 M 상한도 함께 소비하는 구조를
+확인했다. 게시 호출에만 약 806.7초가 경과해 반환 시 그 기한의 잔여 상한은 약
+393.3초였다. 후속 native와 strict에 요구하는 610초보다 작다. API272의 생성자
+상한은 별도로 30분이며, 고정 20분만 늘리는 것으로 모든 후속 준비가 원 전체
+기한 안에 맞는다는 근거는 없다. 다음 최초 P/M 배정과 원 Root work 기한의
+정합성을 맞추는 작업은 남아 있다. 발급된 기한을 소급 갱신하지 않았다.
+
+Main은 후속 필수 창을 확보할 수 없는 원 실행에 작업을 더 발주하지 않도록
+등록 Root의 source·부모·PID birth·PGID·SID·실제 unit 소속을 확인한 뒤 PID FD로
+SIGTERM을 한 번 요청했다. 전체 unit 신호·강제 kill·WSL 재시작은 하지 않았다.
+Root의 관측 실패는 이 취소에 따른 KeyboardInterrupt이며, 자연 발생한 시간
+오류나 N05 인수 성공으로 재표시하지 않는다. 제품 요청은 발주되지 않았다.
+
+원 unit exit 2와 capture exit 0을 구분했다. 원 자식 tree 종료, FD 종료, manager
+finish를 확인했고 close/cleanup 오류는 없었다. P는 원 취소 결과와 budget error
+없음을 retained로 남겼으며 새 Linux owner는 남지 않았다. Main의 종료 후 읽기
+검사에서도 owner 부재와 선택한 catalog 여섯 행·history tip의 원 hash 일치를
+확인했다. 기존 Windows owner/출력과 과거 physical unknown은 보존한다.
+
+종료 후 같은 tree-size 구현의 검증 ROOT는 18,258,940,919 bytes다. 기존 18GiB
+한도 안에 있으므로 추가 6GiB와 최종 24GiB는 적용하지 않았다. 정리의 논리 제거량과
+실제 실행 중 새로 남긴 자료를 구분하며 물리 공간 반환·VHD 압축은 주장하지 않는다.
+부모 준비에서 Windows 마운트 RPC 대기를 관측했지만 원인 비중이나 성능 개선은
+확정하지 않는다. 원시 결과와 취소·정리 기록은 회수했고 실제 학습·성능 비교·대국
+인수로 사용하지 않는다. 현재 제품 b567과 최신 PR의 외부 CPU 종료 경합 수정도
+별도 범위로 유지한다.
