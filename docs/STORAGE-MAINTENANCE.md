@@ -341,6 +341,23 @@ closure/owner-dead 검증을 모두 유지한다. 이후 실제 output gate에�
 만료되면 갱신하지 않고 실패한다. 이 경로는 기존 재생성 cache/scratch의 복구만
 허용하며 과거 source 권한·실행 owner·물리 완료·출력 삭제 권한을 발급하지 않는다.
 
+## 같은 관측 안의 읽기 전용 예산 재검사
+
+`OutputLease.poll_budget()`은 Source7을 선택한 원 producer가 이미 봉인한 관측을
+원래 30초 수명 안에서 재검사하는 명시적 접점이다. 최초 archive/member/corpus의
+전체 hash와 journal의 durable seal을 대신하지 않는다. 같은 guard·producer·record·
+selection 구성·journal 객체/FD·원 deadline을 확인하고 현재 사용량과 보수적 예약을
+다시 계수한다. 작은 source/metadata는 재해시하고 archive/corpus는 원 held FD/name·
+전체 stat stamp·정확한 entry roster를 검사한다. stat까지 동일한 내용 변조를 이
+검사가 검출했다고 주장하지 않으며 새 archive byte 증거나 종료 권한을 발급하지 않는다.
+
+진입 전에 관측이 만료됐다면 기존 전체 관측을 새로 수행한다. poll 도중 만료·변경·
+불명확이 발생하면 최초 오류를 보존하고 같은 호출에서 새 관측으로 재시도하지 않는다.
+기한 갱신·journal append·관측 봉인 해제·과거 행 채택은 없다. 기본 `check_budget()`과
+`finish()`는 기존 전체 검증을 유지한다. 실제 publication·실행 admission·종료·복구의
+검사를 고빈도 읽기 전용 poll로 대체하지 않는다. 이 접점의 fixture 성공은 실제
+관측 등록·원 실행의 정상 종료나 제품 인수를 대신하지 않는다.
+
 ## 보존 관측과 별개의 중단 deferred 행 복구
 
 `storage_preserved_output_recovery.inspect_preserved_output_recovery(...)`는 기본적으로

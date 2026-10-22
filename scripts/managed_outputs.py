@@ -505,6 +505,48 @@ class OutputLease:
                 self._preservation_error = error
             raise
 
+    def poll_budget(self):
+        """Read this sealed source7 view only; expiry selects a new full observation.
+
+        A failure after entering the poll is sticky and never retried here.
+        This does not append an observation or extend the original view deadline.
+        """
+        if self.unattributed_preservation is None:
+            return self.check_budget()
+        if self._preservation_error is not None:
+            raise StorageError("preservation evidence failed; no further payload permission") from self._preservation_error
+        try:
+            from managed_output_unattributed_preservation import FreshOutputView
+            view, journal = self._quarantine_view, self._preservation_journal
+            if view is None and journal is None:
+                return self._check_budget_current()
+            if (type(view) is not FreshOutputView or journal is None
+                    or view.guard is not self.guard or view.catalog != self.catalog
+                    or view.output != self.output or view.source != self.source
+                    or view.inventory.selection is not self.unattributed_preservation):
+                raise StorageError("same original sealed preservation view required")
+            if view._closed or view.inventory.closed or view.inventory.failed:
+                raise StorageError("preservation observation closed or failed; no retry")
+            if view._budget_binding is None:
+                return self._check_budget_current()  # Initial acquisition has no poll binding yet.
+            until = view._poll_deadline(self.record, journal, reserve=self.reserve, total_limit=self.total_limit)
+            if time.monotonic() >= until:
+                return self._check_budget_current()  # Before poll entry; never reuse expired proof.
+            self.guard.assert_held()
+            self._check_created_directory()
+            if _read(self.catalog / (self.key + ".json")) != self.record:
+                raise StorageError("output owner changed; preserve all records")
+            error = view.poll_budget(self.record, journal, reserve=self.reserve, total_limit=self.total_limit)
+            self._check_created_directory()
+            if error is not None:
+                raise error
+        except OutputBudgetError:
+            raise  # Preserve the existing known-budget finalization path.
+        except BaseException as error:
+            if self._preservation_error is None:
+                self._preservation_error = error
+            raise
+
     def _check_budget_current(self):
         self.guard.assert_held()
         self._check_created_directory()

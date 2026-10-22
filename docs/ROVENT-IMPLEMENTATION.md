@@ -1782,3 +1782,39 @@ finish를 확인했고 close/cleanup 오류는 없었다. P는 원 취소 결과
 확정하지 않는다. 원시 결과와 취소·정리 기록은 회수했고 실제 학습·성능 비교·대국
 인수로 사용하지 않는다. 현재 제품 b567과 최신 PR의 외부 CPU 종료 경합 수정도
 별도 범위로 유지한다.
+
+## 36차 체크포인트: 같은 관측의 예산 재검사와 다음 실행 준비
+
+고빈도 읽기 콜백이 매번 새 Source7 관측을 만들어 archive/member/corpus 전체를
+재검증하는 연결을 확인했다. 새 `OutputLease.poll_budget()`은 이미 봉인한 같은
+관측의 원 기한 안에서만 현재 사용량·보수적 예약과 원 guard·producer·record·
+selection·journal/FD를 재검사한다. 기존 전체 검증과 finish 경로는 유지한다.
+진입 전 만료는 기존 전체 관측을 선택하고, 진입 후 만료·변경·오류는 최초 실패를
+보존한다. journal append·기한 갱신·과거 자료 채택이나 삭제 권한을 발급하지 않는다.
+같은 stat에 드러나지 않는 내용 변조를 검출했다고 주장하지 않는다.
+
+Main이 기존 관련 다섯 suite의 Linux 96개를 통과시켰고, Windows는 23개 통과와
+Linux 전용 73개 skip을 확인했다. 새 private poll fixture는 Linux 38개 통과,
+Windows 2개 통과와 Linux 전용 36개 skip이다. 각 검사에서 두 runtime 소스의
+전후 hash 일치를, 새 poll 검사에서는 해당 fixture의 전후 hash도 확인했다.
+이는 운영 catalog나 과거 owner를 수정한
+실행이 아니며 실제 N05 인수와 별개다. source7의 일곱 runtime 입력 합계는
+237,936B로 기존 256KiB 한도 안이다.
+
+별도 준비 소스는 최초 P/M 할당만 원 Root work 3600초·cleanup 30초에 결합했다.
+기존 일반 생성자의 30분 상한은 유지하며 발급된 기한을 소급 변경하지 않는다.
+Main의 순수·실제 in-process 객체 검사는 Linux 12개 통과, Windows 6개 통과와
+POSIX 전용 6개 skip이다. 고빈도 콜백만 poll로 연결한 새 소비자의 정적 검사 9개도
+통과했다. 원 source008과 실행 기록은 그대로 보존했고 새 source009는 아직 전체
+실행 graph·관리 source image·실제 제품 요청으로 등록하거나 실행하지 않았다.
+
+최신 제품 `63a2737`의 공식 CI archive 136,609,697B는 원 Windows Job 감독 아래
+메모리에서 raw SHA-256과 60개 member 목록을 확인한 뒤 해제했다. 디스크 payload
+사본이나 ELF 실행은 없다. 기존 b567 NNUEC metadata의 명시적 재사용 계약과 새 제품의
+compiled source 등록은 별도 인수이며, 이 archive 확인으로 이를 대신하지 않는다.
+
+같은 구현으로 재측정한 검증 ROOT는 18,258,940,919B다. 정리 뒤의 기존 18GiB
+한도를 유지하며 추가 6GiB·최종 24GiB는 적용하지 않았다. Linux 관리 owner는 없었다.
+기존 Windows owner와 원시 실패 자료·여섯 보존 행·history는 그대로 유지한다.
+다음 단계는 새 관리 source image와 실행 입력 등록, 최신 제품 등록, 실제 연결 인수다.
+31개 필수 항목·학습 제외 범위와 기존 미측정·physical unknown의 의미는 바꾸지 않는다.

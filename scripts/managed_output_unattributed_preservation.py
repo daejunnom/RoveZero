@@ -707,6 +707,7 @@ class FreshOutputView(legacy.CurrentExclusionSession):
         need(token is _TOKEN and type(view) is CatalogView, "actual original-gate view required")
         self.inventory = view
         self._hard_until = view.until
+        self._budget_binding = None
         legacy_selection = legacy.PreservationSelection(view.selection.tips,
             {role: view.selection.sources[role] for role in legacy.SOURCE_ROLES},
             root_exclusive_writer=True, maximum_seconds=view.selection.maximum_seconds)
@@ -773,6 +774,73 @@ class FreshOutputView(legacy.CurrentExclusionSession):
         self.inventory.held.tick()
         self._held.tick()
 
+    def _poll_deadline(self, record, journal, *, reserve, total_limit):
+        """Validate original bindings without ticking an already expired view."""
+        try:
+            bound = self._budget_binding
+            need(not self._closed and self._sealed and not self.inventory.closed
+                 and not self.inventory.failed and type(bound) is tuple and len(bound) == 9,
+                 "open original sealed budget observation required")
+            need(type(journal) is legacy._EvidenceJournal and journal is bound[0]
+                 and not journal.failed and journal.fd is not None and journal.directory is not None
+                 and record == bound[1] and reserve == bound[2] and total_limit == bound[3]
+                 and self.guard is bound[4] and self.inventory is bound[5]
+                 and self._producer_token is not None
+                 and legacy._owner_fields(record, self.output, self.source, self.now) == self._producer_token,
+                 "same original producer/reservation/journal required")
+            deadlines = (self._hard_until, self.until, self.inventory.until,
+                         self._held.until, self.inventory.held.until, self.inventory.history.held.until)
+            journal_state = (journal.fd, journal.directory, journal.size,
+                             journal.entries, journal.head, tuple(journal.stamp))
+            need(deadlines == bound[6] and journal_state == bound[7],
+                 "original view deadlines or journal FD/length/head changed")
+            selection = self.inventory.selection
+            digest = _sha(custody._encode({"rows": selection.rows, "sources": selection.sources,
+                "tips": selection.tips, "maximum_seconds": selection.maximum_seconds}))
+            need(selection is bound[8][0] and selection._configuration_digest == digest == bound[8][1]
+                 and selection.original_hard_until == bound[8][2],
+                 "original selection configuration/deadline changed")
+            return min(deadlines)
+        except BaseException:
+            self.inventory.failed = True
+            raise
+
+    def poll_budget(self, record, journal, *, reserve, total_limit):
+        """Read-only sample of one original <=30s view; not a new archive proof.
+
+        Initial full archive/member/corpus hashes remain bound to these held
+        FDs. Existing inventory checks rehash source/metadata blobs and compare
+        every archive/corpus FD/name/full stamp and exact tree entry roster.
+        Same-size writes changing mtime/ctime are rejected. Metadata-invisible
+        byte changes are not claimed detectable without a new full observation.
+        """
+        import managed_outputs as outputs
+        try:
+            self._poll_deadline(record, journal, reserve=reserve, total_limit=total_limit)
+            journal.check(record)
+            rows, actual = self.inventory.checked_usage()
+            self._scope_after_inventory(rows)
+            need(record.get("identity") == outputs.identity(self.output)
+                 and outputs._read(self.catalog / (record["key"] + ".json")) == record,
+                 "same bound original producer before budget poll")
+            own = tree_size(self.output, allow_disappearing=True)
+            error = (outputs.OutputBudgetError("managed output byte budget exceeded; evidence retained")
+                     if own > reserve or actual > total_limit else None)
+            final_rows = self.inventory._checked_rows()
+            need(final_rows == rows, "catalog rows changed during same-view budget poll")
+            self._scope_after_inventory(final_rows)
+            need(record.get("identity") == outputs.identity(self.output)
+                 and outputs._read(self.catalog / (record["key"] + ".json")) == record,
+                 "original producer changed after budget poll")
+            journal.check(record)
+            self._poll_deadline(record, journal, reserve=reserve, total_limit=total_limit)
+            self.inventory.held.tick()
+            self._held.tick()
+            return error
+        except BaseException:
+            self.inventory.failed = True
+            raise
+
     def checked_budget(self, record, journal, *, reserve, total_limit):
         """Seal and charge one original journal, then fully validate before return.
 
@@ -810,6 +878,13 @@ class FreshOutputView(legacy.CurrentExclusionSession):
                  "original producer changed after journal publication")
             self.inventory.held.tick()
             self._held.tick()
+            self._budget_binding = (journal, copy.deepcopy(record), reserve, total_limit,
+                self.guard, self.inventory,
+                (self._hard_until, self.until, self.inventory.until, self._held.until,
+                 self.inventory.held.until, self.inventory.history.held.until),
+                (journal.fd, journal.directory, journal.size, journal.entries, journal.head, tuple(journal.stamp)),
+                (self.inventory.selection, self.inventory.selection._configuration_digest,
+                 self.inventory.selection.original_hard_until))
             self._sealed = True
             return budget_error
         except BaseException:
