@@ -1611,3 +1611,46 @@ inputs를 완료했다. 공식 Rust whole106/212와 같은 first12 raw의 subset
 성공, 새 관측 소스의 검사, 실제 archive/UCI 인수와 각각 구분한다. archive 준비의
 caller deadline 실패는 원 자식 종료와 함께 보존하며 실제 제품 실행 성공으로
 표시하지 않는다.
+
+## 31차 체크포인트: 이전 복구와 후속 owner 재발의 분리
+
+Windows 재시작 뒤 이전 owner의 정식 복구가 완료된 기록과, 같은 boot에서 후속
+실패 실행이 만든 새 owner를 분리했다. 이전 복구의 `owner_absent=true`를 새 owner의
+종료 증거로 사용하지 않는다. 후속 실행은 기능 결과 decoder가 실패한 뒤 원
+supervisor의 최종 종료 인수까지 도달하지 못했다. 원 Job의 하위 종료 관측은 남아
+있지만 현재 reader가 요구하는 정확한 owner의 원 closure와 같지 않다. 원 실패,
+출력 예약과 물리 완료 unknown을 보존하며 추가 재부팅 요청으로 반복하지 않는다.
+
+Linux의 별도 원 owner는 기존 `recover_build`와 명시적 output-preservation 선택을
+그대로 사용해 실제 복구했다. 같은 host의 이후 boot를 확인하고 124개 catalog 행,
+보수적 사용량 2,776,424,639 bytes, 원 owner에 연결된 active 출력 0개를 현재 gate에서
+관측했다. 복구기는 원 슬롯의 재생성 cache/tmp를 정리하고 owner를 해제했다. 별도
+읽기 전용 재검사에서도 owner 부재, 슬롯 complete, cache/tmp 부재와 maintenance의
+복구 완료를 확인했다. 새 owner·closure·transition을 발급하지 않았으며 역사 1~8,
+MAX8, 원 여섯 자료와 과거 physical unknown은 변경하지 않았다. Windows의 새 owner와
+출력 행도 이 작업 전후 raw SHA가 동일하다. 이는 운영 cache 복구이며 제품의 기능
+성공, 과거 GPU 완료 또는 현재 네 모드의 종단 인수를 발급하지 않는다.
+
+실패 경로 수정안과 실제 운영 적용을 구분한다. 원 actor의 기능 판정과 writer 종료를
+분리하는 수정, terminal 보고에서 stdout 전용 시각 한 필드만 투영하는 수정은 고정
+원문에 대한 순수 검사와 메모리 내 합성까지 수행했다. 기존 실행 namespace를 재사용해
+다시 실행하거나 현재 owner의 closure를 소급 작성하지 않았다. 새 실제 실행에는 원
+writer별 종료를 원 supervisor에서 수집할 새 source·namespace·출력 등록이 필요하다.
+
+현재 잔여 묶음은 다음과 같다. 기존 구현을 새 골격으로 다시 만드는 작업과 실제
+consumer 인수를 혼동하지 않는다.
+
+- 현재 source·binary·모델·runtime·입력의 영향 범위 대조와 원 실행 경계 등록.
+- archive-on의 실제 회수·복원·부모 관계·quota/I/O 실패와 최종 worker join.
+- CPU/Hybrid × PC/PCR 네 모드의 전체 UCI 순서와 제품 root/initial/finish 영수증.
+- 실제 counter→Repair→C/Fresh→NNUEC 설치 ACK→R 소비·같은 owner 재개와 정산.
+- N05의 실제 action/witness/cost 비교→publication→별도 ACK→strict reader.
+- 두 일반 teacher의 실제 P/C target과 외부 CPU_R의 반례·재검토 종단 소비.
+- 실제 dataset 이후 update0 parent/child IPC·end ACK·물리 drain 및 31개 항목 최종 감사.
+
+독립 CPU reference/RTX4050의 기존 106 cases·212 inputs 증거는 유지한다. 이후
+encoding/eval/runtime/contracts와 모델 소스가 같은 범위는 source diff로 확인했지만,
+변경된 search·NNUEC CPU·UCI 연결의 실제 실행 인수를 대신하지 않는다. storage 진단
+source `63a2737`의 CI run은 CPU Linux·Windows·bindings·PALS model 네 job 성공을
+관측했고 native bundle job은 아직 진행 중이다. 원 실행 SHA와 문서 후속 SHA, 실제
+GPU 자료와 현재 source 인수를 구분하며 학습·원격 성능/기력 비교·병합은 추가하지 않는다.
