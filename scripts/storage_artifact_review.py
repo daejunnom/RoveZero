@@ -239,37 +239,43 @@ def canonical_code(inputs, pin, archive_member, expected):
     inputs.check()
 
 
+def read_code_plan(inputs, plan_pin):
+    """Validate the existing closed plan; this issues no retirement authority."""
+    plan = decode(inputs.open(plan_pin, INVENTORY_CAP).read(INVENTORY_CAP + 1))
+    fields(plan, ("schema", "catalog", "key", "record_sha256", "artifact", "archive_member", "code", "research"))
+    need(plan["schema"] == PLAN_SCHEMA and type(plan["catalog"]) is str
+         and Path(plan["catalog"]).is_absolute() and type(plan["key"]) is str
+         and HEX.fullmatch(plan["key"]) is not None and type(plan["record_sha256"]) is str
+         and HEX.fullmatch(plan["record_sha256"]) is not None, "exact registered catalog/output required")
+    no_secret(plan["catalog"])
+    catalog = checked(Path(plan["catalog"]))
+    need(catalog.is_dir() and (catalog / "catalog.lock").is_file(), "existing original catalog gate required")
+    code = plan["code"]
+    need(type(code) is list and 1 <= len(code) <= 32, "bounded explicit code list required")
+    expected = {}
+    paths = set()
+    for row in code:
+        fields(row, ("relative", "tar_member", "bytes", "sha256"))
+        relative = member_name(row["relative"])
+        name = PurePosixPath(relative)
+        need(len(name.parts) == 2 and name.parts[0] in ("selected4", "private-elf")
+             and name.name in CODE_NAMES and relative not in paths, "only explicit product code-cache leaves allowed")
+        raw_pin({"path": str(Path(os.path.abspath(relative))), "bytes": row["bytes"], "sha256": row["sha256"]}, ELF_CAP)
+        canonical = member_name(row["tar_member"])
+        need(canonical not in expected, "canonical ELF alias")
+        expected[canonical] = row
+        paths.add(relative)
+    need(sum(row["bytes"] for row in code) <= ELF_PAYLOAD_CAP, "aggregate ELF budget exceeded")
+    archive_member = member_name(plan["archive_member"])
+    raw_pin(plan["research"], RESEARCH_CAP)
+    raw_pin(plan["artifact"], ARCHIVE_CAP)
+    return plan, catalog, code, expected, archive_member
+
+
 def audit_code_cache(plan_pin, *, seconds=300):
     """Only audit. Even a matching report cannot authorize unlink or lease recovery."""
     with Inputs(seconds) as inputs:
-        plan = decode(inputs.open(plan_pin, INVENTORY_CAP).read(INVENTORY_CAP + 1))
-        fields(plan, ("schema", "catalog", "key", "record_sha256", "artifact", "archive_member", "code", "research"))
-        need(plan["schema"] == PLAN_SCHEMA and type(plan["catalog"]) is str
-             and Path(plan["catalog"]).is_absolute() and type(plan["key"]) is str
-             and HEX.fullmatch(plan["key"]) is not None and type(plan["record_sha256"]) is str
-             and HEX.fullmatch(plan["record_sha256"]) is not None, "exact registered catalog/output required")
-        no_secret(plan["catalog"])
-        catalog = checked(Path(plan["catalog"]))
-        need(catalog.is_dir() and (catalog / "catalog.lock").is_file(), "existing original catalog gate required")
-        code = plan["code"]
-        need(type(code) is list and 1 <= len(code) <= 32, "bounded explicit code list required")
-        expected = {}
-        paths = set()
-        for row in code:
-            fields(row, ("relative", "tar_member", "bytes", "sha256"))
-            relative = member_name(row["relative"])
-            name = PurePosixPath(relative)
-            need(len(name.parts) == 2 and name.parts[0] in ("selected4", "private-elf")
-                 and name.name in CODE_NAMES and relative not in paths, "only explicit product code-cache leaves allowed")
-            raw_pin({"path": str(Path(os.path.abspath(relative))), "bytes": row["bytes"], "sha256": row["sha256"]}, ELF_CAP)
-            canonical = member_name(row["tar_member"])
-            need(canonical not in expected, "canonical ELF alias")
-            expected[canonical] = row
-            paths.add(relative)
-        need(sum(row["bytes"] for row in code) <= ELF_PAYLOAD_CAP, "aggregate ELF budget exceeded")
-        archive_member = member_name(plan["archive_member"])
-        raw_pin(plan["research"], RESEARCH_CAP)
-        raw_pin(plan["artifact"], ARCHIVE_CAP)
+        plan, catalog, code, expected, archive_member = read_code_plan(inputs, plan_pin)
         with CatalogGuard(catalog / "catalog.lock") as guard:
             _refuse_custody_registry(catalog)  # Existing special custody must use its original validator.
             rows = _catalog_rows(catalog)

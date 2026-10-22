@@ -39,6 +39,27 @@ def inventory(roots):
             "whole_C_drive_or_VHD_physical_usage": "unknown", "deletion_performed": False}
 
 
+def report_failure(error):
+    # The durable journal is authoritative for the observed deletion prefix;
+    # stdout remains empty on failure and no diagnostic can replace it.
+    try:
+        partial = getattr(error, "code_cache_retirement", None)
+        if type(partial) is dict:
+            raw = json.dumps(partial, ensure_ascii=True, sort_keys=True, allow_nan=False)
+            if len(raw.encode("utf-8")) <= 32 << 10:
+                print("code_cache_retirement_partial=" + raw, file=sys.stderr)
+    except BaseException:
+        pass
+    try:
+        detail = str(error)[:4096]
+    except BaseException:
+        detail = type(error).__name__
+    try:
+        print(f"storage_maintenance_error={detail}; unknown artifacts and leases preserved", file=sys.stderr)
+    except BaseException:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="operation", required=True)
@@ -61,6 +82,11 @@ def main():
     code.add_argument("--plan-bytes", type=int, required=True)
     code.add_argument("--plan-sha256", required=True)
     code.add_argument("--seconds", type=int, default=300)
+    retire = commands.add_parser("retire-code-cache", help="explicit Linux-only retirement of verified duplicate ELF leaves")
+    retire.add_argument("--plan", type=Path, required=True)
+    retire.add_argument("--plan-bytes", type=int, required=True)
+    retire.add_argument("--plan-sha256", required=True)
+    retire.add_argument("--seconds", type=int, default=300)
     args = parser.parse_args()
     if args.operation == "inventory":
         result = inventory(args.root)
@@ -72,10 +98,14 @@ def main():
         from storage_artifact_review import verify_research
         result = verify_research({"path": str(args.archive), "bytes": args.archive_bytes,
                                   "sha256": args.archive_sha256}, seconds=args.seconds)
-    else:
+    elif args.operation == "audit-code-cache":
         from storage_artifact_review import audit_code_cache
         result = audit_code_cache({"path": str(args.plan), "bytes": args.plan_bytes,
                                    "sha256": args.plan_sha256}, seconds=args.seconds)
+    else:
+        from storage_code_retirement import retire_code_cache
+        result = retire_code_cache({"path": str(args.plan), "bytes": args.plan_bytes,
+                                    "sha256": args.plan_sha256}, seconds=args.seconds)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 
@@ -84,5 +114,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (OSError, ValueError, KeyError, StorageError, zipfile.BadZipFile, tarfile.TarError, EOFError, zlib.error) as error:
-        print(f"storage_maintenance_error={error}; unknown artifacts and leases preserved", file=sys.stderr)
+        report_failure(error)
         raise SystemExit(125)

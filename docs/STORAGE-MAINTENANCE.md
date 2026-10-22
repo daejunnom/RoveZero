@@ -161,6 +161,28 @@ TAR의 정확한 member를 구분한다. basename만 같은 파일을 같은 자
 기존 interrupted-unbound custody registry가 있으면 자동 채택하지 않고 즉시 거부한다.
 따라서 현재 특수 custody 자료의 destructive apply는 이 명령에 자동 연결하지 않았다.
 
+`retire-code-cache`는 같은 닫힌 plan을 받아 **Linux의 종료된 일반 관리 출력에 한해**
+중복 ELF 정리를 명시적으로 실행한다. 이전 audit 결과를 권한으로 재사용하지 않고,
+원 catalog gate와 행·marker·owner 종료 조건, 연구 ZIP, 공식 archive의 같은 byte/hash,
+후보 inode와 현재 프로세스 참조를 실행 시 다시 검사한다. Windows 및 특수 custody,
+active/interrupted/완료 불명 출력은 이 경로로 회복하거나 삭제하지 않는다.
+
+```sh
+python -I -S -B scripts/storage_maintenance.py retire-code-cache --plan <absolute-plan-json> --plan-bytes <exact-bytes> --plan-sha256 <original-sha256> --seconds 300
+```
+
+공식 archive와 연구 자료는 대상 출력 밖에 보존하며, 전체 검증과 사전 검사를 통과한
+뒤에만 원 출력의 예약 안에 정리 journal을 남긴다. 삭제할 각 leaf의 held FD·이름·inode를
+마지막에 확인하고 디렉터리 FD를 통해 삭제한다. 행·marker·예약량·보존 기간은 변경하지
+않는다. 중간 오류에서는 journal과 이미 수행한 삭제를 보존하고 후속 삭제를 중단한다.
+이름·크기만 같은 ELF, 다른 byte의 strip본, 모델·runtime·입력·원시 결과는 대상이 아니다.
+
+프로세스 조사는 해당 Linux PID/mount 문맥에서의 유한한 관측이다. 접근 거부나 해석할
+수 없는 상태를 미사용으로 처리하지 않으며, 외부 프로세스의 향후 접근까지 막는 전역
+권한으로 표현하지 않는다. 삭제한 논리 byte 수와 실제 디스크 공간 반환은 구분한다.
+물리 회수량과 VHD 반환량은 별도 관측 없이는 `unknown`이며, 이 명령은 WSL 종료나
+가상 디스크 압축을 실행하지 않는다.
+
 입력 수·압축 해제량과 요청한 1~600초의 내부 관측 창을 제한한다. OS I/O 중단까지의
 hard timeout과 자식 트리 종료가 필요하면 기존 `run_managed.py` 감독 아래 실행한다.
 새 예약을 늘리거나 카탈로그를 수정하지 않고, 보존 결과의 18GiB·14일 검토 정책,
