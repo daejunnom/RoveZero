@@ -650,10 +650,21 @@ class CatalogView:
     def close(self, primary=None):
         if not self.closed:
             self.closed = True
-            try:
-                self.history.close(primary)
-            finally:
-                self.held.close(primary)
+            first = primary
+            for stage, owner in (("history", self.history), ("held inputs", self.held)):
+                try:
+                    owner.close(first)
+                except BaseException as error:
+                    if first is None:
+                        first = error
+                    elif error is not first:
+                        try:
+                            first.add_note("catalog view " + stage + " close also failed ("
+                                           + type(error).__name__[:128] + ")")
+                        except BaseException:
+                            pass  # Preserve the first error even if its note method fails.
+            if primary is None and first is not None:
+                raise first
 
 
 def _new_catalog_view(catalog, selection, guard, *, hard_until):

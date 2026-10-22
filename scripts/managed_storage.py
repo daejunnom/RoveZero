@@ -170,22 +170,58 @@ def write_record(path: Path, value: dict) -> None:
     encoded = (json.dumps(value, sort_keys=True) + "\n").encode()
     if len(encoded) > 8192:
         raise StorageError("ownership record exceeds bound")
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-        temporary = Path(stream.name)
-        stream.write(encoded)
-        stream.flush()
-        os.fsync(stream.fileno())
-    try:
-        os.replace(temporary, path)
-        if os.name == "posix":
-            directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-                                | getattr(os, "O_NOFOLLOW", 0))
+    temporary = None
+    first = None
+
+    def remember(error, stage):
+        nonlocal first
+        if first is None:
+            first = error
+        elif error is not first:
             try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+                first.add_note("ownership record " + stage + " also failed ("
+                               + type(error).__name__[:128] + ")")
+            except BaseException:
+                pass  # Diagnostics must not replace the first error or stop cleanup.
+
+    try:
+        stream = tempfile.NamedTemporaryFile(dir=path.parent, delete=False)
+        try:
+            temporary = Path(stream.name)
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        except BaseException as error:
+            remember(error, "stream")
+        finally:
+            try:
+                stream.close()
+            except BaseException as error:
+                remember(error, "stream close")
+        if first is None:
+            os.replace(temporary, path)
+            if os.name == "posix":
+                directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                                    | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    os.fsync(directory)
+                except BaseException as error:
+                    remember(error, "directory fsync")
+                finally:
+                    try:
+                        os.close(directory)
+                    except BaseException as error:
+                        remember(error, "directory close")
+    except BaseException as error:
+        remember(error, "publication")
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except BaseException as error:
+                remember(error, "temporary unlink")
+    if first is not None:
+        raise first
 
 
 def _record_stamp(info, *, creation_time=False):
