@@ -1651,6 +1651,33 @@ consumer 인수를 혼동하지 않는다.
 독립 CPU reference/RTX4050의 기존 106 cases·212 inputs 증거는 유지한다. 이후
 encoding/eval/runtime/contracts와 모델 소스가 같은 범위는 source diff로 확인했지만,
 변경된 search·NNUEC CPU·UCI 연결의 실제 실행 인수를 대신하지 않는다. storage 진단
-source `63a2737`의 CI run은 CPU Linux·Windows·bindings·PALS model 네 job 성공을
-관측했고 native bundle job은 아직 진행 중이다. 원 실행 SHA와 문서 후속 SHA, 실제
+source `63a2737`의 CI run `39762641687`은 CPU Linux·Windows·bindings·PALS model과
+native bundle 다섯 job의 성공을 확인했다. native bundle은 2026-10-22 11:46:26 UTC에
+완료됐다. 원 실행 SHA와 문서 후속 SHA, 실제
 GPU 자료와 현재 source 인수를 구분하며 학습·원격 성능/기력 비교·병합은 추가하지 않는다.
+
+## 32차 체크포인트: 구버전 실행 파일 정리와 상한 유지
+
+관리 등록 밖의 명시한 중복 ELF 네 개와 구버전 원본 네 개를 별도 유지보수 경로로
+정리했다. 중복은 보존본과 전체 bytes/hash가 같았고, 구버전은 원 source·도구·locked
+빌드 명령·파일 pin·원 보고서 pin과 보존 파생본을 요약했다. 실제 catalog/build guard,
+현재 owner 부재, 등록 범위와의 경로·물리 좌표 비중첩, held FD와 현재 보이는 Linux
+프로세스의 사용 여부를 확인한 뒤 journal을 fsync하고 명시한 leaf만 제거했다.
+
+Main의 Linux focused 검사 17개가 통과했다. Windows에서는 입력을 열기 전 미지원
+거절 검사 한 개가 통과했고 Linux 전용 16개는 skip이므로 Windows 실제 정리 인수로
+해석하지 않는다. 독립 소스 감사와 실제 audit/apply 결과를 각각 보존했다. 기존
+catalog 행·owner·예약·과거 물리 완료 unknown을 바꾸지 않았으며 새 owner/lease도
+만들지 않았다. 결과와 journal은 해시 대조 뒤 Windows 보고서 경로에 회수했다.
+
+논리 제거량은 1,201,195,120 bytes이고 동일한 기존 tree-size 구현으로 확인한 검증
+ROOT는 19,119,594,054에서 17,918,398,934 bytes로 감소했다. 물리 공간 반환·VHD
+압축·제품 성능 개선은 주장하지 않는다. 정리 후 기존 18GiB 안에 여유가 있어
+24GiB 확장은 적용하지 않았다. 이후에도 부족한 경우에만 별도 등록으로 6GiB를
+추가할 수 있고 24GiB를 최종 상한으로 한다. catalog 18GiB와 build 8/12GiB·4 slots는
+별도 제한으로 유지한다. 선택용 확장 경로의 소스 준비는 실제 실행 인수가 아니다.
+
+기존 18GiB 프로필에서 source `b5671299` N05 기능 검증을 새 namespace로 재개했다.
+source·등록·원 입력 핀 검사와 capture 설정 검사, 제품 실행·writer 종료·strict 결과는
+별도로 판정한다. 이 실행을 이후 `63a2737` 전체 제품 인수나 성능 비교로 재표시하지
+않으며, 실행 중이라는 사실만으로 남은 31개 항목을 완료로 처리하지 않는다.
