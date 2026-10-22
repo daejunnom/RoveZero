@@ -1721,7 +1721,29 @@ Linux 167개 통과, Windows 93개 통과·Linux 전용 74개 skip이다. 첫 Li
 경로를 갱신했다. 이 초안 보관이나 code image 생성은 제품 실행·종료 권한이 아니다.
 
 새 N05 실행의 등록 입력 79개, 180,247,837 bytes를 owner 생성 전에 대조했다.
-새 namespace와 18GiB 프로필로 후속 검증을 등록했으며 결과·원 감독 종료·strict
-소비는 별도로 인수한다. 24GiB 확장은 적용하지 않았다. PR의 `63a2737` 다섯 CI 성공,
-이 tooling 변경의 로컬 검사, 이전 GPU 자료 및 현재 제품 인수를 계속 구분한다.
-31개 필수 항목의 잔여 범위는 축소하지 않으며 학습·원격 성능/기력 비교·병합은 없다.
+새 namespace와 18GiB 프로필의 후속 실행은 원 관측 만료 없이 metadata 보존과
+원 감독 정리를 마쳤다. Root의 일반 자식 종료·FD close 및 manager finish가 확인됐고
+해당 Linux owner는 남지 않았다. 그러나 제품 admission 전 입력 검증기가 등록된
+Python source를 JSON/log report 제한으로 검사해 `FreshRawPin`에서 실패했다.
+원 unit exit 2와 capture 도구 exit 0은 별개이며 N05나 물리 완료 성공으로 해석하지
+않는다. 실패한 출력은 `retained`로 보존했고 physical unknown도 유지한다.
+
+## 34차 체크포인트: owner 없는 실제 metadata 소비 재검사
+
+입력 소비자의 후속 source007은 원 origin011이 고정한 context와 package-validator
+두 source의 basename·bytes·hash·직접 report 경로에만 Python source를 허용한다.
+두 JSON config와 일반 report의 기존 suffix·크기·비밀 경로 검사는 유지한다.
+그 뒤 원 namespace·FD·CLI·source image·기한 조인도 바꾸지 않는다. 기존 실행에
+사용한 source006과 Source11 그래프는 덮어쓰지 않았다.
+
+Main의 집중 검사 9개와 독립 소스 감사를 마쳤다. 별도의 읽기 전용 실제 재생에서는
+원 base.Originals를 그대로 사용하고, 독립 pin의 원 config001에서 기대 source image를
+얻었다. 원 source006의 같은 오류를 재현한 뒤 source007이 실제 원 FD 19개를 소비하고
+해당 metadata 검증을 통과했다. FD close 오류·금지 연산 시도는 없고 Linux owner도
+전후 모두 없었다. 이 재생은 파일 작성·자식 실행·네트워크·신경망 import를 거부했다.
+metadata 소비 통과를 원 실패 실행의 성공이나 제품·NNUEC·N05 인수로 바꾸지 않는다.
+
+24GiB 확장은 적용하지 않았다. PR의 `63a2737` 다섯 CI 성공, 이 tooling 변경의 로컬
+검사, 이전 GPU 자료 및 현재 제품 인수를 계속 구분한다. 후속 실제 실행에는 새 source
+pin과 namespace가 필요하다. 31개 필수 항목의 잔여 범위는 축소하지 않으며 학습·원격
+성능/기력 비교·병합은 없다.
