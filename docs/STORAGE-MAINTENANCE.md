@@ -340,3 +340,29 @@ closure/owner-dead 검증을 모두 유지한다. 이후 실제 output gate에�
 현재 정책 소스와 회수본도 cache cleanup 범위 밖에 있어야 한다. 한 번의 30초 관측이
 만료되면 갱신하지 않고 실패한다. 이 경로는 기존 재생성 cache/scratch의 복구만
 허용하며 과거 source 권한·실행 owner·물리 완료·출력 삭제 권한을 발급하지 않는다.
+
+## 보존 관측과 별개의 중단 deferred 행 복구
+
+`storage_preserved_output_recovery.inspect_preserved_output_recovery(...)`는 기본적으로
+읽기 전용 검사다. 명시적인 `recover_preserved_output(..., apply=True)`만 지정한
+deferred catalog 행 하나를 `interrupted_retained`로 바꿀 수 있다. 기본
+`recover_output`의 동작이나 registry 거절 조건을 변경하지 않는 별도 유지보수 접점이다.
+
+원 build owner와 대상 행의 정확한 raw digest, 각각의 독립 원문 보존 복사본, 실제
+canonical build/catalog gate, root/slot 및 출력 디렉터리의 FD·identity·private mode를
+확인한다. 두 원 lifetime은 각각 같은 host의 실제 재부팅으로 종료가 입증되어야 한다.
+PID 부재나 나중의 현재 관측만으로 이를 대신하지 않는다. 원 outer binding이 있으면
+원 owner/root/scope/source를 대조한다. 원 binding이 `None`이면 이를 유지하고 별개의
+source·PID·lifetime을 보존하며, build와 row의 관계가 입증됐다고 표시하지 않는다.
+
+같은 typed Source7의 현재 관측으로 여섯 corpus와 원 history를 검증한다. 선택된 행과
+history에 속한 key, 보존 자료·소스·독립 회수본과 겹치는 경로 또는 물리 alias는 복구
+대상에서 제외한다. 원 30초 관측과 호출자의 유한 deadline을 갱신하지 않는다. 관측
+만료나 입력 변경은 publication 전에 거절하며 실제 write 이후의 실패는 부분 상태로
+보존한다. 실패 뒤 자동 재시도·rollback·가짜 closure 발급은 하지 않는다.
+
+수정 범위는 정확한 행의 기존 복구 필드뿐이다. 원 실패·tree 종료 여부·physical
+unknown, 다른 catalog 행, marker·custody·history·build owner·slot·cache는 보존한다.
+디렉터리 identity 확인은 원 생성 프로세스의 증명이 아니며 정상 실행 성공·GPU 완료를
+뜻하지 않는다. 후속 build cache 회복은 기존 `recover_build`를 별도로 호출해 그 시점의
+원 gate를 다시 검사한다. 만료된 관측이나 이 접점의 반환 JSON을 후속 권한으로 쓰지 않는다.
