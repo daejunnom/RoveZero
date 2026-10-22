@@ -88,6 +88,27 @@ owner가 없어졌다면 그 복구는 끝난 것이며, 후속 실행이 만든
 확인하여 interrupted-retained로 옮긴다. 이 명령은 결과나 GPU 입력을 삭제하지
 않는다. 생성 중이던 deferred 경로의 identity가 확정되지 않았다면 계속 거부한다.
 
+## 보존한 원 종료 관측의 재생
+
+`storage_original_termination.verify_original_termination()`은 지원하는 원 run003b의
+네 actor 소스와 다섯 원시 관측을 `PinnedBytes`로 받는 순수 검사다. 호출자가 독립적으로
+보존한 원문 pin을 사용해야 한다. 임의로 대체한 생산자에 대해 호출자가 새로 만든
+hash가 맞는다는 사실만으로 그 생산자를 신뢰하지 않는다. 파일·명령·승인 callback을
+입력으로 받거나 원 actor를 실행하지 않는다.
+
+원 소스 역할과 product/build/control 구분, raw schema, parent·출력·admission·등록의
+교차 연결, 원 MainPID/birth/boot와 pidfd/cgroup의 관측을 검사한다. 결과가 실패하거나
+ACK·finish가 없었던 사실은 그대로 보존한다. loaded unit의 누락된 결과 필드를 실패로
+채우거나, GC 이후 미관측 metadata를 성공으로 바꾸지 않는다. 공개 결과에는 원 owner
+token과 실패 상세를 내보내지 않는다.
+
+반환값은 정적 관측이며 live recovery capability가 아니다. Windows Job/PG 종료는
+원 생산자의 보고 범위, Linux pidfd/cgroup은 원 관측 재생 범위로 표시한다. 현재 owner
+사망, 현재 같은 host의 Linux 재부팅, 원 owner.json과 source registry 원문은 이 API가
+확인하지 않는다. 따라서 이 검사 통과로 `closure.json`을 소급 작성하거나 원 owner·
+출력 리스를 종료할 수 없다. 기존 복구 gate와 실제 운영 복구의 추가 인수는 별도다.
+순수 반례 검사와 보존 원문 재생은 실제 프로세스·GPU 완료의 재실행 증거가 아니다.
+
 ## 자원 획득 전 검사와 실제 실행의 분리
 
 owner는 실행 중의 소유권과 불명확한 종료를 보호하는 기록이다. 모든 작업에서
