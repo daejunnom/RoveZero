@@ -28,6 +28,15 @@ import storage_maintenance as maintenance
 import test_storage_artifact_review as original_fixture
 
 
+# Complete /proc namespace visibility is a prerequisite for these integration
+# cases. Preserve the product's rootless EACCES refusal; a CI skip cannot reuse
+# or replace the separate actual privileged integration result.
+privileged_linux_census = unittest.skipUnless(
+    sys.platform == "linux" and getattr(os, "geteuid", lambda: -1)() == 0,
+    "privileged Linux integration requires complete current /proc census; a skip is not acceptance",
+)
+
+
 @unittest.skipUnless(sys.platform == "linux", "code retirement requires Linux custody/census")
 class CodeRetirementTests(unittest.TestCase):
     # Reuse the actual bounded producer/OutputLease setup without inheriting or
@@ -61,6 +70,7 @@ class CodeRetirementTests(unittest.TestCase):
         self.assertEqual(self.code.read_bytes(), raw)
         self.assert_preserved(before)
 
+    @privileged_linux_census
     def test_exact_canonical_elf_retired_and_unique_evidence_preserved(self):
         before, expected_bytes = self.keepers(), self.code.stat().st_size
         result = self.retire()
@@ -102,11 +112,13 @@ class CodeRetirementTests(unittest.TestCase):
         with patch.object(retirement, "_process_census", side_effect=StorageError("fixture census unknown")):
             self.assert_refused("fixture census unknown")
 
+    @privileged_linux_census
     def test_actual_held_candidate_fd_is_in_use_and_preserved(self):
         with self.code.open("rb") as held:
             self.assertEqual(held.read(4), b"\x7fELF")
             self.assert_refused("census|in.use|open.*FD|referenc")
 
+    @privileged_linux_census
     def test_actual_mmap_with_original_fd_closed_is_rejected_by_maps_reference(self):
         # Python 3.12's mmap object retains a duplicate FD. Use the actual libc
         # mapping so the census must find /proc/maps after the sole FD closes.
@@ -234,16 +246,19 @@ class CodeRetirementTests(unittest.TestCase):
         self.assert_preserved(before)
         return caught.exception
 
+    @privileged_linux_census
     def test_partial_unlink_preserves_actual_retired_prefix_and_surviving_candidate(self):
         failure = self.partial_unlink_failure()
         partial = failure.code_cache_retirement
         self.assertEqual(original_fixture.pin(Path(partial["journal"]["path"])), partial["journal"])
 
+    @privileged_linux_census
     def test_failure_journal_error_cannot_overwrite_original_partial_unlink_failure(self):
         failure = self.partial_unlink_failure(fail_failure_journal=True)
         notes = "\n".join(getattr(failure, "__notes__", ()))
         self.assertRegex(notes, "journal|fsync")
 
+    @privileged_linux_census
     def test_parent_directory_fsync_failure_preserves_returned_unlink_prefix_and_first_error(self):
         second = self.add_second_candidate()
         before = self.keepers()
@@ -332,10 +347,12 @@ class CodeRetirementTests(unittest.TestCase):
                     self.assertEqual(closed.exception.errno, errno.EBADF)
         self.assert_preserved(before)
 
+    @privileged_linux_census
     def test_journal_write_failure_prevents_the_first_unlink(self):
         with patch.object(retirement._Journal, "append", side_effect=StorageError("fixture intent journal write failure")):
             self.assert_refused("fixture intent journal write failure")
 
+    @privileged_linux_census
     def test_exact_duplicate_attempt_is_refused_after_durable_intent_and_failed_unlink(self):
         selected = original_fixture.dump(self.plan_path, self.plan)
         before, raw = self.keepers(), self.code.read_bytes()
@@ -356,6 +373,7 @@ class CodeRetirementTests(unittest.TestCase):
         self.assertEqual(self.code.read_bytes(), raw)
         self.assert_preserved(before)
 
+    @privileged_linux_census
     def test_full_original_reservation_cannot_be_expanded_for_a_retirement_journal(self):
         remaining = self.record["reserved_bytes"] - tree_size(self.output)
         self.assertGreater(remaining, 0)
