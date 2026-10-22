@@ -9,7 +9,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from managed_storage import (ManagedBuild, StorageError, _record_stamp, checked,
@@ -132,6 +132,179 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(json.loads(lines[1]), original_errors[0].managed_output_identity_observation)
         self.assertEqual(record.read_bytes(), raw)
         self.assertEqual(payload.read_bytes(), b"original retained evidence")
+
+    def test_run_managed_closes_original_owner_for_every_pre_dispatch_failure(self):
+        import run_managed
+        for phase in ("environment", "sample_output_budget"):
+            for error_type in (StorageError, OSError, RuntimeError, KeyboardInterrupt):
+                with self.subTest(phase=phase, error_type=error_type.__name__):
+                    original = error_type("original pre-dispatch " + phase)
+                    manager = SimpleNamespace(acquire=Mock(), environment=Mock(return_value={}),
+                        sample_output_budget=Mock(), finish=Mock(return_value={}),
+                        root=self.root, source=self.source, total_limit=12 << 30)
+                    getattr(manager, phase).side_effect = original
+                    preservation = object()
+                    with patch.object(run_managed, "ManagedBuild", return_value=manager), \
+                         patch.object(run_managed, "canonical_root", return_value=self.root), \
+                         patch.object(run_managed.shutil, "which", return_value=sys.executable), \
+                         patch.object(run_managed, "run_group") as dispatch, \
+                         patch.object(run_managed, "_emit_storage_failure_observation") as observed, \
+                         patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
+                         patch.object(sys, "stderr", io.StringIO()):
+                        if error_type is KeyboardInterrupt:
+                            with self.assertRaises(KeyboardInterrupt) as caught:
+                                run_managed.main(output_preservation=preservation)
+                            self.assertIs(caught.exception, original)
+                            observed.assert_not_called()
+                        else:
+                            self.assertEqual(run_managed.main(output_preservation=preservation), 125)
+                            observed.assert_called_once_with(original)
+                    manager.acquire.assert_called_once_with()
+                    manager.finish.assert_called_once_with(exit_code=125, tree_gone=True)
+                    dispatch.assert_not_called()
+                    if phase == "environment":
+                        manager.sample_output_budget.assert_not_called()
+                    else:
+                        manager.sample_output_budget.assert_called_once_with()
+                    self.assertEqual(original.args, ("original pre-dispatch " + phase,))
+
+    def test_run_managed_pre_dispatch_error_releases_only_real_fixture_owner(self):
+        import run_managed
+        actual = ManagedBuild(self.root, self.source)
+        original = OSError("actual fixture environment failed before dispatch")
+        original_owner = {}
+
+        def fail_environment():
+            original_owner.update(actual._identity())
+            raise original
+
+        with patch.object(run_managed, "ManagedBuild", return_value=actual), \
+             patch.object(run_managed, "canonical_root", return_value=self.root), \
+             patch.object(run_managed.shutil, "which", return_value=sys.executable), \
+             patch.object(actual, "environment", side_effect=fail_environment) as environment, \
+             patch.object(run_managed, "run_group", side_effect=AssertionError("fixture child dispatch forbidden")) as dispatch, \
+             patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
+             patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(run_managed.main(), 125)
+        environment.assert_called_once_with()
+        dispatch.assert_not_called()
+        self.assertTrue(actual.finished)
+        self.assertFalse(actual.lock.exists())
+        self.assertFalse(actual.scratch.exists())
+        record = read_record(actual.slot / "record.json")
+        self.assertEqual(record["state"], "complete")
+        self.assertGreater(record["finished_ns"], 0)
+        self.assertEqual({key: value for key, value in record.items()
+                          if key not in ("state", "finished_ns")}, original_owner)
+        self.assertEqual(read_record(self.root / "closure.json"),
+                         {"schema": original_owner["schema"], "owner": original_owner, "tree_gone": True})
+        self.assertEqual(self.model.read_bytes(), b"retained-original")
+        self.assertEqual({path.name for path in self.output_catalog.iterdir()}, {"catalog.lock"})
+
+    def test_run_managed_pre_dispatch_cleanup_preserves_first_error_and_cleanup_note(self):
+        import run_managed
+        for error_type in (OSError, KeyboardInterrupt):
+            for cleanup_type in (RuntimeError, KeyboardInterrupt):
+                with self.subTest(error_type=error_type.__name__, cleanup_type=cleanup_type.__name__):
+                    original = error_type("first environment failure")
+                    cleanup = cleanup_type("independent original-manager finish failure")
+                    manager = SimpleNamespace(acquire=Mock(), environment=Mock(side_effect=original),
+                        finish=Mock(side_effect=cleanup), root=self.root, source=self.source,
+                        total_limit=12 << 30)
+                    error_stream = io.StringIO()
+                    with patch.object(run_managed, "ManagedBuild", return_value=manager), \
+                         patch.object(run_managed, "canonical_root", return_value=self.root), \
+                         patch.object(run_managed.shutil, "which", return_value=sys.executable), \
+                         patch.object(run_managed, "run_group") as dispatch, \
+                         patch.object(run_managed, "_emit_storage_failure_observation") as observed, \
+                         patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
+                         patch.object(sys, "stderr", error_stream):
+                        if error_type is KeyboardInterrupt:
+                            with self.assertRaises(KeyboardInterrupt) as caught:
+                                run_managed.main()
+                            self.assertIs(caught.exception, original)
+                        else:
+                            self.assertEqual(run_managed.main(), 125)
+                            observed.assert_called_once_with(original)
+                    dispatch.assert_not_called()
+                    manager.finish.assert_called_once_with(exit_code=125, tree_gone=True)
+                    self.assertEqual(original.args, ("first environment failure",))
+                    self.assertEqual(original.__notes__, [
+                        "pre-dispatch original manager cleanup failed: " + cleanup_type.__name__
+                        + ": independent original-manager finish failure"])
+                    lines = error_stream.getvalue().splitlines()
+                    diagnostic = [line for line in lines if line.startswith("managed_storage_cleanup_error=")]
+                    self.assertEqual(len(diagnostic), 1)
+                    self.assertLessEqual(len(diagnostic[0].encode("utf-8")) + 1, 16 << 10)
+                    self.assertEqual(json.loads(diagnostic[0].split("=", 1)[1]), {
+                        "stage": "pre_dispatch_original_manager_finish", "type": cleanup_type.__name__,
+                        "detail": "independent original-manager finish failure"})
+
+    def test_run_managed_cleanup_diagnostic_closed_pipe_preserves_original_failure(self):
+        import run_managed
+        for error_type in (OSError, KeyboardInterrupt):
+            with self.subTest(error_type=error_type.__name__):
+                original = error_type("first pre-dispatch failure with closed stderr")
+                cleanup = RuntimeError("cleanup failed with closed stderr")
+                manager = SimpleNamespace(acquire=Mock(), environment=Mock(side_effect=original),
+                    finish=Mock(side_effect=cleanup), root=self.root, source=self.source, total_limit=12 << 30)
+                closed_stream = io.StringIO()
+                closed_stream.close()
+                with patch.object(run_managed, "ManagedBuild", return_value=manager), \
+                     patch.object(run_managed, "canonical_root", return_value=self.root), \
+                     patch.object(run_managed.shutil, "which", return_value=sys.executable), \
+                     patch.object(run_managed, "run_group") as dispatch, \
+                     patch.object(run_managed, "_emit_storage_failure_observation") as observed, \
+                     patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
+                     patch.object(sys, "stderr", closed_stream):
+                    if error_type is KeyboardInterrupt:
+                        with self.assertRaises(KeyboardInterrupt) as caught:
+                            run_managed.main()
+                        self.assertIs(caught.exception, original)
+                        observed.assert_not_called()
+                    else:
+                        self.assertEqual(run_managed.main(), 125)
+                        observed.assert_called_once_with(original)
+                dispatch.assert_not_called()
+                manager.finish.assert_called_once_with(exit_code=125, tree_gone=True)
+                self.assertEqual(original.args, ("first pre-dispatch failure with closed stderr",))
+                self.assertEqual(original.__notes__, [
+                    "pre-dispatch original manager cleanup failed: RuntimeError: cleanup failed with closed stderr"])
+
+    def test_cleanup_diagnostic_has_one_bounded_line_for_long_non_ascii_detail(self):
+        import run_managed
+        error_stream = io.StringIO()
+        with patch.object(sys, "stderr", error_stream):
+            run_managed._emit_storage_cleanup_failure(RuntimeError("\U0001f642" * 10000))
+        lines = error_stream.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertLessEqual(len(lines[0].encode("utf-8")) + 1, 16 << 10)
+        self.assertEqual(json.loads(lines[0].split("=", 1)[1])["detail"], "\U0001f642" * 1024)
+
+    def test_run_managed_does_not_synthesize_no_child_finish_after_dispatch_exception(self):
+        import run_managed
+        for error_type in (StorageError, OSError, RuntimeError, KeyboardInterrupt):
+            with self.subTest(error_type=error_type.__name__):
+                original = error_type("ambiguous dispatched supervisor failure")
+                manager = SimpleNamespace(acquire=Mock(), environment=Mock(return_value={}),
+                    sample_output_budget=Mock(), finish=Mock(), root=self.root,
+                    source=self.source, total_limit=12 << 30)
+                with patch.object(run_managed, "ManagedBuild", return_value=manager), \
+                     patch.object(run_managed, "canonical_root", return_value=self.root), \
+                     patch.object(run_managed.shutil, "which", return_value=sys.executable), \
+                     patch.object(run_managed, "run_group", side_effect=original) as dispatch, \
+                     patch.object(sys, "argv", ["run_managed.py", "--", sys.executable]), \
+                     patch.object(sys, "stderr", io.StringIO()):
+                    if error_type is KeyboardInterrupt:
+                        with self.assertRaises(KeyboardInterrupt) as caught:
+                            run_managed.main(output_preservation=object())
+                        self.assertIs(caught.exception, original)
+                    else:
+                        self.assertEqual(run_managed.main(output_preservation=object()), 125)
+                dispatch.assert_called_once()
+                manager.finish.assert_not_called()
+                manager.sample_output_budget.assert_called_once_with()
+                self.assertEqual(original.args, ("ambiguous dispatched supervisor failure",))
 
     def test_storage_observation_write_failure_does_not_replace_original_error(self):
         import run_managed

@@ -28,6 +28,22 @@ def _emit_storage_failure_observation(error):
         pass
 
 
+def _emit_storage_cleanup_failure(error):
+    """One bounded diagnostic; an unavailable pipe never replaces the first error."""
+    try:
+        # ensure_ascii can use twelve bytes per non-BMP character.
+        observation = {"stage": "pre_dispatch_original_manager_finish",
+                       "type": type(error).__name__[:128], "detail": str(error)[:1024]}
+        raw = "managed_storage_cleanup_error=" + json.dumps(
+            observation, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        if len(raw.encode("utf-8")) + 1 <= 16 << 10:
+            print(raw, file=sys.stderr)
+    except BaseException:
+        # The operation already failed. Diagnostic encoding/writing cannot
+        # replace its original exception, including KeyboardInterrupt.
+        pass
+
+
 def main(*, output_preservation=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parent.parent)
@@ -52,8 +68,15 @@ def main(*, output_preservation=None) -> int:
             environment = manager.environment()
             if output_preservation is not None:
                 manager.sample_output_budget()  # Must succeed before any payload child is launched.
-        except StorageError:
-            manager.finish(exit_code=125, tree_gone=True)  # No child was launched.
+        except BaseException as error:
+            # This try ends before run_group: no payload child was dispatched.
+            # Keep the first failure if original-owner cleanup also fails.
+            try:
+                manager.finish(exit_code=125, tree_gone=True)
+            except BaseException as cleanup_error:
+                error.add_note("pre-dispatch original manager cleanup failed: "
+                               + type(cleanup_error).__name__ + ": " + str(cleanup_error)[:2048])
+                _emit_storage_cleanup_failure(cleanup_error)
             raise
 
         def check_budget():
@@ -79,7 +102,12 @@ def main(*, output_preservation=None) -> int:
             _emit_storage_failure_observation(budget_failure)
         return code
     except (StorageError, OSError, RuntimeError) as exc:
-        print(f"managed_storage_error={exc}; uncertain artifacts/leases are preserved", file=sys.stderr)
+        try:
+            print(f"managed_storage_error={exc}; uncertain artifacts/leases are preserved", file=sys.stderr)
+        except BaseException:
+            # A closed diagnostic pipe must not turn the original failure into
+            # an unrelated write exception or interrupt.
+            pass
         if budget_failure is not None and budget_failure is not exc:
             _emit_storage_failure_observation(budget_failure)
         _emit_storage_failure_observation(exc)
