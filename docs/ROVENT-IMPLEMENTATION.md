@@ -1695,3 +1695,33 @@ append/fsync/readback 후의 전체 exact 검증을 유지한다. 기본 `observ
 Main의 관련 세 suite는 Linux 127개 통과, Windows 76개 통과·Linux 전용 51개 skip이다.
 독립 소스 감사에서도 해당 수명/실패 경계의 결함은 발견되지 않았다. 기존 실패 실행의
 P나 owner에 소급 적용하지 않았으며, 새 source closure 등록과 실제 재검증은 남아 있다.
+
+## 33차 체크포인트: 독립 원문 보존과 Linux 운영 복구
+
+후속 N05가 남긴 build owner와 deferred 출력은 원문을 각각 독립 보관한 뒤
+같은 host의 실제 이후 boot를 각 기록에 대해 확인했다. 출력의 원 outer binding은
+`None`이었고 source·PID·birth도 build와 달랐다. 두 기록의 관계나 원 생성 프로세스를
+나중에 발명하지 않고, 원 gate와 source7 보존 관측을 독립 적용했다. 읽기 전용
+검사 뒤 지정한 출력 행 하나만 `interrupted_retained`로 바꿨다. 이후 기존
+`recover_build`가 원 슬롯의 재생성 cache/tmp를 회수하고 해당 Linux owner를 제거했다.
+추가 재부팅 요청·실행, 가짜 closure·owner 발급, 여섯 자료와 history tip의 변경은 없다.
+출력의 원 실패·물리 완료 unknown과 Windows의 별도 owner/출력은 보존한다.
+
+독립 감사에서 metadata writer와 관측 close의 후속 정리 오류가 최초 오류를 덮는
+두 경로를 찾아 보완했다. 기존 게시 순서·8192B 상한·guard·quota는 유지하고,
+최초 예외 객체와 후속 close/unlink 오류를 구분한다. Main의 다섯 focused suite는
+Linux 167개 통과, Windows 93개 통과·Linux 전용 74개 skip이다. 첫 Linux 실행의
+거절 메시지 기대값 오류는 실제 inode 교체 거절을 유지한 채 검사 문구만 수정했고
+재검사했다. fixture 성공과 실제 원 행 audit/apply·build 복구는 별도 근거다.
+
+관리 tooling은 `49c0a2f`로 보존했고 제품 source는 기존 등록의 `b5671299`를 유지한다.
+새 root-owned code image의 아홉 파일 모두 해당 tooling Git blob과 대조했다. 기존
+제품·원 NNUEC 생성의 역사적 source9 증거와 현재 관리 코드 입력을 구분한다.
+미사용 Source10 실행 초안 17개는 압축본과 모든 원문 hash를 보존한 뒤 같은 미게시
+경로를 갱신했다. 이 초안 보관이나 code image 생성은 제품 실행·종료 권한이 아니다.
+
+새 N05 실행의 등록 입력 79개, 180,247,837 bytes를 owner 생성 전에 대조했다.
+새 namespace와 18GiB 프로필로 후속 검증을 등록했으며 결과·원 감독 종료·strict
+소비는 별도로 인수한다. 24GiB 확장은 적용하지 않았다. PR의 `63a2737` 다섯 CI 성공,
+이 tooling 변경의 로컬 검사, 이전 GPU 자료 및 현재 제품 인수를 계속 구분한다.
+31개 필수 항목의 잔여 범위는 축소하지 않으며 학습·원격 성능/기력 비교·병합은 없다.
