@@ -656,8 +656,8 @@ class CatalogView:
                 self.held.close(primary)
 
 
-def observe_catalog(catalog, selection, guard, *, hard_until):
-    """New explicit policy; it never calls/weakens the default `_catalog_rows`."""
+def _new_catalog_view(catalog, selection, guard, *, hard_until):
+    """Build the held inputs; the synchronous caller must validate before return."""
     catalog = checked(Path(catalog))
     need(type(selection) is UnattributedSelection, "typed source7 selection required")
     need(Path(guard.path) == catalog / "catalog.lock", "same original catalog gate required")
@@ -669,15 +669,24 @@ def observe_catalog(catalog, selection, guard, *, hard_until):
         history = transitions._history(historical, catalog, rows, selection.tips, guard)
         need(bool(history.details) and all(item["generation"] > 0 for item in history.details.values()),
              "existing registered completed history required; not a new generation")
-        view = CatalogView(_TOKEN, catalog, selection, guard, held, history, details, archives)
-        view.usage(rows)
-        return view
+        return CatalogView(_TOKEN, catalog, selection, guard, held, history, details, archives), rows
     except BaseException as error:
         try:
             if historical is not None:
                 historical.close(error)
         finally:
             held.close(error)
+        raise
+
+
+def observe_catalog(catalog, selection, guard, *, hard_until):
+    """New explicit policy; it never calls/weakens the default `_catalog_rows`."""
+    view, rows = _new_catalog_view(catalog, selection, guard, hard_until=hard_until)
+    try:
+        view.usage(rows)
+        return view
+    except BaseException as error:
+        view.close(error)
         raise
 
 
@@ -719,6 +728,82 @@ class FreshOutputView(legacy.CurrentExclusionSession):
         self.check()
         self._scope(rows)
         return self.inventory.usage(rows)
+
+    def _scope_after_inventory(self, rows):
+        """Only within a synchronous call that just checked this exact inventory."""
+        need(not self._closed and not self.inventory.failed
+             and self.guard is self.inventory.guard and self.catalog == self.inventory.catalog,
+             "same open original-gate observation required")
+        self.inventory.held.tick()
+        self._held.tick()
+        self.guard.assert_held()
+        need(lifetime() == self.now, "new producer lifetime changed")
+        need(custody._did(os.fstat(self._parent_fd)) == self._parent_identity
+             == custody._did(checked(self.output.parent).lstat()), "private new-output parent changed")
+        need(custody._mounts(self._held, self.output.parent, self.output, self._parent_identity[0]) == self._mounts,
+             "new-output current mount changed")
+        for protected in (self.catalog, custody.registry_path(self.catalog), self.source):
+            need(not (self.output.is_relative_to(protected) or protected.is_relative_to(self.output)),
+                 "new output overlaps preserved control/source scope")
+        for _, row, target in rows:
+            if target == self.output:
+                need(self._producer_token is not None
+                     and legacy._owner_fields(row, self.output, self.source, self.now) == self._producer_token,
+                     "existing output is not this new original producer")
+            else:
+                need(not (self.output.is_relative_to(target) or target.is_relative_to(self.output)),
+                     "new output overlaps preserved output/ancestor/descendant")
+        current = self.output.lstat() if self.output.exists() else None
+        if current is not None:
+            need((current.st_dev, current.st_ino) not in
+                 {tuple(item["current_observed_identity"][:2]) for item in self.inventory.details.values()},
+                 "new output aliases unattributed corpus")
+        self.guard.assert_held()
+        self.inventory.held.tick()
+        self._held.tick()
+
+    def checked_budget(self, record, journal, *, reserve, total_limit):
+        """Seal and charge one original journal, then fully validate before return.
+
+        No checked rows or charge escape this call as reusable permission. The
+        same guard, held FDs and original 30s/hard deadline cover both full checks.
+        """
+        import managed_outputs as outputs
+        need(not self._sealed and type(journal) is legacy._EvidenceJournal
+             and journal.output == self.output,
+             "original existing journal and one fresh observation required")
+        self.bind_producer(record)
+        try:
+            rows, _ = self.inventory.checked_usage()
+            self._scope_after_inventory(rows)
+            need(record.get("identity") == outputs.identity(self.output)
+                 and outputs._read(self.catalog / (record["key"] + ".json")) == record,
+                 "same bound new original producer required before publication")
+            document = self.inventory.selection_document()
+            document.update(new_output_key=record["key"], new_output=str(self.output),
+                            new_producer_token=record["token"], current_lifetime=dict(self.now),
+                            original_until_monotonic=self.inventory.until,
+                            old_source6_proof_reinterpreted=False)
+            journal.append(record, document, tick=self.inventory.held.tick)
+            # The same-gate rows still identify this producer. Journal growth is
+            # charged before the final exact check, never discounted or refunded.
+            actual = self.inventory._usage_after_check(rows)
+            own = tree_size(self.output, allow_disappearing=True)
+            budget_error = (outputs.OutputBudgetError("managed output byte budget exceeded; evidence retained")
+                            if own > reserve or actual > total_limit else None)
+            final_rows = self.inventory._checked_rows()
+            need(final_rows == rows, "catalog rows changed during synchronous budget observation")
+            self._scope_after_inventory(final_rows)
+            need(record.get("identity") == outputs.identity(self.output)
+                 and outputs._read(self.catalog / (record["key"] + ".json")) == record,
+                 "original producer changed after journal publication")
+            self.inventory.held.tick()
+            self._held.tick()
+            self._sealed = True
+            return budget_error
+        except BaseException:
+            self.inventory.failed = True
+            raise
 
     def create_journal(self, record):
         import managed_outputs as outputs
@@ -768,6 +853,24 @@ def observe_fresh_output(catalog, selection, guard, *, output, source, producer_
         result = FreshOutputView(_TOKEN, view, output, source, producer_record)
         result.check()
         return result
+    except BaseException as error:
+        view.close(error)
+        raise
+
+
+def observe_fresh_output_budget(catalog, selection, guard, *, output, source,
+                               producer_record, journal, reserve, total_limit):
+    """One new bounded observation for an already journal-bound original producer."""
+    output, source = checked(Path(output)), checked(Path(source))
+    need(producer_record is not None and type(journal) is legacy._EvidenceJournal,
+         "original producer and existing owner-held journal required")
+    need(type(selection) is UnattributedSelection and selection._bound_deadline is not None,
+         "original caller hard deadline was not bound")
+    view, _ = _new_catalog_view(catalog, selection, guard, hard_until=selection.original_hard_until)
+    try:
+        result = FreshOutputView(_TOKEN, view, output, source, producer_record)
+        error = result.checked_budget(producer_record, journal, reserve=reserve, total_limit=total_limit)
+        return result, error
     except BaseException as error:
         view.close(error)
         raise

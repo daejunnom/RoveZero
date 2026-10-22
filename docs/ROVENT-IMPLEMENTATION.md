@@ -1677,7 +1677,21 @@ ROOT는 19,119,594,054에서 17,918,398,934 bytes로 감소했다. 물리 공간
 추가할 수 있고 24GiB를 최종 상한으로 한다. catalog 18GiB와 build 8/12GiB·4 slots는
 별도 제한으로 유지한다. 선택용 확장 경로의 소스 준비는 실제 실행 인수가 아니다.
 
-기존 18GiB 프로필에서 source `b5671299` N05 기능 검증을 새 namespace로 재개했다.
-source·등록·원 입력 핀 검사와 capture 설정 검사, 제품 실행·writer 종료·strict 결과는
-별도로 판정한다. 이 실행을 이후 `63a2737` 전체 제품 인수나 성능 비교로 재표시하지
-않으며, 실행 중이라는 사실만으로 남은 31개 항목을 완료로 처리하지 않는다.
+기존 18GiB 프로필에서 source `b5671299` N05 기능 검증을 새 namespace로 재개했지만,
+제품 admission 전에 Source7의 단일 30초 관측이 만료돼 중단됐다. 원 Root work/cleanup
+기한은 올바르게 전달됐고, 선택 4 ELF와 후속 예약을 포함한 초기 최소 예산도 통과했다.
+같은 관측 안에서 inventory 전체 검증을 반복하는 소비 경로를 후속 수정 대상으로
+좁혔다. 정확한 최초 실패 하위 호출은 원 결과에 traceback이 없어 unknown이다.
+원 일반 자식 tree와 FD 종료는 보고됐지만 preservation 오류로 P finish가 거절되어
+새 Linux owner와 원 출력은 보존됐다. 이를 소급 closure나 제품 성공으로 채우지 않는다.
+실제 제품 신경망·N05 strict 인수·성능 증거는 모두 미완료다. 이 실행을 이후
+`63a2737` 전체 제품 인수로 재표시하거나 남은 31개 항목을 완료로 처리하지 않는다.
+
+후속 소스에서는 이미 원 journal을 보유한 Source7 producer의 한 budget 호출 안에서
+rows·charge·scope의 중복 검증만 합쳤다. 같은 guard·held FD·원 until에서 처음과
+append/fsync/readback 후의 전체 exact 검증을 유지한다. 기본 `observe_catalog`의
+원 rows/usage 흐름과 일반·legacy 분기는 보존했다. 부분 append·최종 FD 교체·expiry의
+첫 오류는 이후 budget/finish 전에 고정하며, 새로운 관측으로 오류를 지우지 않는다.
+Main의 관련 세 suite는 Linux 127개 통과, Windows 76개 통과·Linux 전용 51개 skip이다.
+독립 소스 감사에서도 해당 수명/실패 경계의 결함은 발견되지 않았다. 기존 실패 실행의
+P나 owner에 소급 적용하지 않았으며, 새 source closure 등록과 실제 재검증은 남아 있다.

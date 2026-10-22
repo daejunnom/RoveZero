@@ -257,6 +257,131 @@ class UnattributedInventoryTests(unittest.TestCase):
             self.assertTrue((self.catalog / (owner.key + ".json")).is_file())
             self.assertFalse((owner.output / "payload.txt").exists())
 
+    def _journal_bound_owner(self, name):
+        owner = outputs.OutputLease(self.root / name, self.source, catalog=self.catalog,
+            reserve=1 << 18, unattributed_preservation=self.selection()).acquire()
+        self.addCleanup(owner.guard.release)
+        self.addCleanup(owner._close_quarantine_view)
+        self.addCleanup(owner._close_preservation_journal)
+        return owner
+
+    def _assert_poison_blocks_budget_and_finish(self, owner, primary, original_row):
+        journal = owner.output / ".rovezero-preservation-session.jsonl"
+        preserved = journal.read_bytes()
+        with patch.object(policy, "observe_fresh_output_budget",
+                          side_effect=AssertionError("failed observation must not be retried")):
+            for action in (owner.check_budget,
+                           lambda: owner.finish(status="must_not_finish", tree_gone=True)):
+                with self.assertRaisesRegex(StorageError, "preservation evidence failed") as caught:
+                    action()
+                self.assertIs(caught.exception.__cause__, primary)
+                self.assertIs(owner._preservation_error, primary)
+        self.assertEqual((self.catalog / (owner.key + ".json")).read_bytes(), original_row)
+        self.assertEqual(journal.read_bytes(), preserved)
+        self.assertEqual(owner.record["state"], "active")
+        owner.guard.assert_held()
+
+    def test_synchronous_budget_uses_two_full_checks_and_one_original_journal_append(self):
+        with self._history_patches():
+            owner = self._journal_bound_owner("bounded-budget")
+            journal = owner._preservation_journal
+            original_fd, entries = journal.fd, journal.entries
+            hard_until = owner.unattributed_preservation.original_hard_until
+            calls = []
+            original = policy.CatalogView._checked_rows
+            def checked(view):
+                calls.append((id(view), view.until, view.held.until, view.history.held.until))
+                return original(view)
+            with patch.object(policy.CatalogView, "_checked_rows", new=checked):
+                owner.check_budget()
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0], calls[1])
+            self.assertIs(owner._preservation_journal, journal)
+            self.assertEqual(journal.fd, original_fd)
+            self.assertEqual(journal.entries, entries + 1)
+            self.assertEqual(owner.unattributed_preservation.maximum_seconds, 30)
+            self.assertEqual(owner.unattributed_preservation.original_hard_until, hard_until)
+            self.assertLessEqual(calls[0][1], hard_until)
+            owner.finish(status="unit_storage_only", tree_gone=True)
+
+    def test_synchronous_budget_final_source_fd_replacement_is_sticky_before_finish(self):
+        with self._history_patches():
+            owner = self._journal_bound_owner("final-fd-budget")
+            original_row = (self.catalog / (owner.key + ".json")).read_bytes()
+            journal = owner.output / ".rovezero-preservation-session.jsonl"
+            before = journal.stat().st_size
+            original = policy.CatalogView._checked_rows
+            calls = []
+            def checked(view):
+                calls.append(view)
+                if len(calls) == 2:
+                    source = self.source_paths["guard"]
+                    fd = next(fd for fd, _, pin in view.held.blobs if pin["path"] == str(source))
+                    replacement = self.root / "same-source-bytes"
+                    replacement.write_bytes(source.read_bytes())
+                    other = os.open(replacement, os.O_RDONLY)
+                    try:
+                        os.dup2(other, fd)
+                    finally:
+                        os.close(other)
+                return original(view)
+            with patch.object(policy.CatalogView, "_checked_rows", new=checked):
+                with self.assertRaises(StorageError) as caught:
+                    owner.check_budget()
+            self.assertEqual(len(calls), 2)
+            self.assertGreater(journal.stat().st_size, before)
+            self.assertIs(owner._preservation_error, caught.exception)
+            self._assert_poison_blocks_budget_and_finish(owner, caught.exception, original_row)
+
+    def test_synchronous_budget_expiry_after_journal_readback_keeps_first_error(self):
+        with self._history_patches():
+            owner = self._journal_bound_owner("expired-budget")
+            original_row = (self.catalog / (owner.key + ".json")).read_bytes()
+            journal = owner._preservation_journal
+            entries = journal.entries
+            original_append = journal.append
+            clock = None
+            def appended(record, value, *, tick):
+                nonlocal clock
+                result = original_append(record, value, tick=tick)
+                clock = patch.object(policy.time, "monotonic", return_value=value["original_until_monotonic"])
+                clock.start()
+                return result
+            try:
+                with patch.object(journal, "append", new=appended):
+                    with self.assertRaisesRegex(StorageError, "expired") as caught:
+                        owner.check_budget()
+            finally:
+                if clock is not None:
+                    clock.stop()
+            self.assertEqual(journal.entries, entries + 1)
+            self.assertFalse(journal.failed)  # Append completed; its later observation was not acknowledged.
+            self.assertIs(owner._preservation_error, caught.exception)
+            self._assert_poison_blocks_budget_and_finish(owner, caught.exception, original_row)
+
+    def test_synchronous_budget_partial_append_preserves_bytes_and_original_error(self):
+        with self._history_patches():
+            owner = self._journal_bound_owner("partial-budget")
+            original_row = (self.catalog / (owner.key + ".json")).read_bytes()
+            journal = owner._preservation_journal
+            before = (owner.output / journal.name).read_bytes()
+            primary = OSError("injected partial budget journal write")
+            original_write = os.write
+            def partial(fd, raw):
+                self.assertEqual(fd, journal.fd)
+                original_write(fd, raw[:17])
+                raise primary
+            with patch.object(policy.legacy.os, "write", side_effect=partial):
+                with self.assertRaises(OSError) as caught:
+                    owner.check_budget()
+            self.assertIs(caught.exception, primary)
+            self.assertIs(owner._preservation_error, primary)
+            self.assertTrue(journal.failed)
+            actual = (owner.output / journal.name).read_bytes()
+            self.assertEqual(actual[:len(before)], before)
+            self.assertEqual(len(actual), len(before) + 17)
+            self._assert_poison_blocks_budget_and_finish(owner, primary, original_row)
+
     def test_outer_readonly_sample_does_not_acquire_producer_gate(self):
         with self._history_patches():
             manager = ManagedBuild(self.root / "build", self.source, purpose="storage-validation",

@@ -492,6 +492,20 @@ class OutputLease:
             self._check_quarantine_view()  # A late error keeps written metadata; no payload permission.
 
     def check_budget(self):
+        if self.unattributed_preservation is None:
+            return self._check_budget_current()
+        if self._preservation_error is not None:
+            raise StorageError("preservation evidence failed; no further payload permission") from self._preservation_error
+        try:
+            return self._check_budget_current()
+        except OutputBudgetError:
+            raise  # Existing known budget failure finalization remains distinct.
+        except BaseException as error:
+            if self._preservation_error is None:
+                self._preservation_error = error
+            raise
+
+    def _check_budget_current(self):
         self.guard.assert_held()
         self._check_created_directory()
         if self.record is None:
@@ -499,6 +513,21 @@ class OutputLease:
         if (_read(self.catalog / (self.key + ".json")) != self.record
                 or (not self.deferred and _read(self.output / ".rovezero-output.json") != self.record)):
             raise StorageError("output owner changed; preserve all records")
+        if self.unattributed_preservation is not None and self._preservation_journal is not None:
+            from managed_output_unattributed_preservation import observe_fresh_output_budget
+            previous, self._quarantine_view = self._quarantine_view, None
+            try:
+                self._quarantine_view, error = observe_fresh_output_budget(self.catalog,
+                    self.unattributed_preservation, self.guard, output=self.output, source=self.source,
+                    producer_record=self.record, journal=self._preservation_journal,
+                    reserve=self.reserve, total_limit=self.total_limit)
+                self._check_created_directory()
+                if error is not None:
+                    raise error
+            finally:
+                if previous is not None:
+                    previous.close(sys.exc_info()[1])
+            return
         rows = self._rows()
         self._seal_preservation_session()
         actual = self._output_usage(rows, allow_disappearing=True)
