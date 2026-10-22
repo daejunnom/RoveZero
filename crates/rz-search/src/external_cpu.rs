@@ -1828,15 +1828,30 @@ mod process {
     }
 
     fn proc_identity(pid: i32) -> Result<Option<ProcIdentity>, CheckerError> {
-        let file = match File::open(format!("/proc/{pid}/stat")) {
+        read_proc_identity(File::open(format!("/proc/{pid}/stat")))
+    }
+
+    fn proc_stat_disappeared(failure: &std::io::Error) -> bool {
+        failure.kind() == ErrorKind::NotFound || failure.raw_os_error() == Some(nix::libc::ESRCH)
+    }
+
+    fn read_proc_identity<R: Read>(
+        source: std::io::Result<R>,
+    ) -> Result<Option<ProcIdentity>, CheckerError> {
+        let file = match source {
             Ok(file) => file,
-            Err(failure) if failure.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(failure) if proc_stat_disappeared(&failure) => return Ok(None),
             Err(_) => return Err(error("ownership", "proc_stat_unavailable")),
         };
         let mut bytes = Vec::new();
-        file.take(4097)
-            .read_to_end(&mut bytes)
-            .map_err(|_| error("ownership", "proc_stat_read"))?;
+        match file.take(4097).read_to_end(&mut bytes) {
+            Ok(_) => {}
+            // A task can exit after its stat FD was opened during the bounded
+            // group scan. Never parse bytes from a failed partial read. Leader
+            // callers still reject None as a missing/disappeared owned leader.
+            Err(failure) if proc_stat_disappeared(&failure) => return Ok(None),
+            Err(_) => return Err(error("ownership", "proc_stat_read")),
+        }
         if bytes.len() > 4096 {
             return Err(error("ownership", "proc_stat_budget"));
         }
@@ -2423,6 +2438,115 @@ mod process {
                 // The ProcessLease drops as unconfirmed and keeps its original
                 // singleton/group gate occupied. No reservation is refunded.
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod proc_identity_tests {
+        use super::*;
+        use std::io::Cursor;
+
+        fn stat_bytes() -> Vec<u8> {
+            let mut fields = ["0"; 20];
+            fields[0] = "S";
+            fields[2] = "41";
+            fields[19] = "9001";
+            format!("123 (proc fixture) {}\n", fields.join(" ")).into_bytes()
+        }
+
+        struct ReadThenError {
+            bytes: Cursor<Vec<u8>>,
+            errno: i32,
+        }
+        impl Read for ReadThenError {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.bytes.read(buffer)?;
+                if count != 0 {
+                    Ok(count)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(self.errno))
+                }
+            }
+        }
+
+        #[test]
+        fn vanished_proc_stat_open_or_read_returns_no_identity() {
+            for errno in [nix::libc::ENOENT, nix::libc::ESRCH] {
+                let opened: std::io::Result<Cursor<Vec<u8>>> =
+                    Err(std::io::Error::from_raw_os_error(errno));
+                assert!(read_proc_identity(opened).unwrap().is_none());
+                let reader = ReadThenError {
+                    bytes: Cursor::new(Vec::new()),
+                    errno,
+                };
+                assert!(read_proc_identity(Ok(reader)).unwrap().is_none());
+            }
+        }
+
+        #[test]
+        fn vanished_proc_stat_discards_even_parseable_partial_bytes() {
+            for errno in [nix::libc::ENOENT, nix::libc::ESRCH] {
+                let reader = ReadThenError {
+                    bytes: Cursor::new(stat_bytes()),
+                    errno,
+                };
+                assert!(read_proc_identity(Ok(reader)).unwrap().is_none());
+            }
+        }
+
+        #[test]
+        fn proc_stat_permission_and_io_errors_remain_failures() {
+            for errno in [nix::libc::EACCES, nix::libc::EIO] {
+                let opened: std::io::Result<Cursor<Vec<u8>>> =
+                    Err(std::io::Error::from_raw_os_error(errno));
+                assert_eq!(
+                    read_proc_identity(opened).err(),
+                    Some(error("ownership", "proc_stat_unavailable"))
+                );
+                for bytes in [Vec::new(), stat_bytes()] {
+                    let reader = ReadThenError {
+                        bytes: Cursor::new(bytes),
+                        errno,
+                    };
+                    assert_eq!(
+                        read_proc_identity(Ok(reader)).err(),
+                        Some(error("ownership", "proc_stat_read"))
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn proc_stat_encoding_and_format_errors_remain_failures() {
+            for (bytes, code) in [
+                (vec![0xff], "proc_stat_encoding"),
+                (b"missing stat delimiter".to_vec(), "proc_stat_format"),
+                (b"123 (fixture) S 1 invalid".to_vec(), "proc_group"),
+                (b"123 (fixture) S 1 41".to_vec(), "proc_start"),
+            ] {
+                assert_eq!(
+                    read_proc_identity(Ok(Cursor::new(bytes))).err(),
+                    Some(error("ownership", code))
+                );
+            }
+        }
+
+        #[test]
+        fn proc_stat_keeps_4096_byte_parse_and_bounded_overflow() {
+            let mut bytes = stat_bytes();
+            bytes.resize(4096, b' ');
+            let identity = read_proc_identity(Ok(Cursor::new(bytes.clone())))
+                .unwrap()
+                .unwrap();
+            assert_eq!(identity.group, 41);
+            assert_eq!(identity.start, 9001);
+            bytes.resize(8192, b' ');
+            let mut reader = Cursor::new(bytes);
+            assert_eq!(
+                read_proc_identity(Ok(&mut reader)).err(),
+                Some(error("ownership", "proc_stat_budget"))
+            );
+            assert_eq!(reader.position(), 4097);
         }
     }
 }
