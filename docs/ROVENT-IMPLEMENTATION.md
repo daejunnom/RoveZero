@@ -1818,3 +1818,54 @@ compiled source 등록은 별도 인수이며, 이 archive 확인으로 이를 �
 기존 Windows owner와 원시 실패 자료·여섯 보존 행·history는 그대로 유지한다.
 다음 단계는 새 관리 source image와 실행 입력 등록, 최신 제품 등록, 실제 연결 인수다.
 31개 필수 항목·학습 제외 범위와 기존 미측정·physical unknown의 의미는 바꾸지 않는다.
+
+## 37차 체크포인트: 준비 계층 통합과 source12 등록 사전검사
+
+사용자가 검토안의 1·2단계를 승인하고, 새 source image와 실행 입력 등록 사전검사까지
+범위를 지정했다. 제품 Rules·탐색·runtime, 필수 검증, 프로세스 감독·취소·종료 자동화와
+저장소 owner/lease/catalog/history/quota 규약은 변경하지 않았다. 소스 담당 두 명은
+구현·교차 감사만 수행했고, AST/import·검사·WSL 명령은 Main이 순차 실행했다.
+
+준비 소스의 새 successor는 같은 invocation의 실제 `Originals`·원 held FD·검증 bytes를
+명시적 `SourcePack`으로 전달한다. 첫 source inventory와 파일 검사를 한 순회로 모으되
+독립 package 검증과 마지막 공식 inventory를 유지한다. 실제 origin 준비 객체와
+publication/commands를 직접 반환하여 순수 준비의 재실행과 retained 목록 사후 검색을
+줄인다. 저장 JSON으로 live 준비 객체를 대신하거나 실행 간 전역 cache를 만들지 않는다.
+
+`lock_validates_manifest_v1`은 명시적 opt-in이다. 기존 validate/lock 기본 경로는
+유지하며 새 등록 `/2`는 실제 lock의 manifest 검증·종료·EOF·정리 관측을 요구한다.
+별도 validate는 `None`이고 실행한 것처럼 영수증을 만들지 않는다. generator/preparer는
+하나의 실제 준비 자식과 같은 120초·1GiB read budget을 사용한다. 두 산출물의 실제
+파일 관측과 한 process의 종료 관측을 구분하고 기존 125초+정리 5초 감독은 유지한다.
+이 변경의 실제 시간·메모리·자식 수 감소는 아직 계측하지 않았다.
+
+Main은 1단계 fixture의 Linux 18개 통과·ctime 미관측 1개 skip, Windows 9개 통과·
+Linux 전용 10개 skip을 확인했다. 2단계 fixture는 Linux 21개 통과, Windows 20개
+통과·Linux 전용 1개 skip이다. 최초 loader 검사는 같은 길이 덮어쓰기에서 실패하여
+source 전용 stat 9축 비교를 추가했다. 이후 같은 tick에서 mtime/ctime이 모두 같게
+관측된 fixture 실패도 보존했다. 최종 합성 검사는 mtime 변화가 실제 관측됨을 먼저
+확인한다. metadata에 드러나지 않는 변조까지 검출했다고 주장하지 않는다.
+
+독립 감사에서 Root의 두 load 경로, typed `Unresolved`, Bridge context와 Strict의
+downstream pin 연결을 보완했다. 최종 source12 graph와 등록 config004에 해당 연결을
+반영했다. control image의 원 소스는 `8cba4c9`이고 제품 실행 입력은 기존 등록된
+`b5671299`다. 최신 PR `63a2737`의 제품 등록·인수와 분리하며 이를 소급 대체하지 않는다.
+Source12는 root 소유 입력 복사본과 terminal manifest만 만든다. 제품 실행이나 저장소
+수명 권한을 발급하지 않는다. source9 raw 합계는 255,703B이고 정책 source7은
+237,936B다. 전용 source 입력 cache 두 부모의 합계는 7 leaves·1,842,224B로 기존
+8 leaves·8MiB 상한 안이다. 추가 6GiB나 최종 24GiB 확장은 적용하지 않았다.
+
+Main의 최종 owner 없는 사전검사는 등록 입력 106개·194,452,777B의 실제 raw hash,
+source image·Root·outer·capture pin, 닫힌 option/role 목록과 네 거부 사례를 확인했다.
+공통/Prefix의 역할 목록을 무조건 같다고 가정했던 첫 검사 실패를 보존하고 실제
+adapter alias 계약으로 재검사했다. 최종 검사는 검증한 소스 bytes를 그대로 compile하고
+실제 SourcePack의 원 FD 전달도 확인했다. write·자식·네트워크·NN provider import를
+거부했으며 유일한 출력은 새 사전검사 보고서다. 원 FD close 오류는 없고 검사 후 해당
+Linux build owner와 활성 N05 서비스는 없었다. 기존 Windows owner는 변경하지 않았다.
+
+원자료는 논리 보고서 루트의 `source12-image-registration-Main-20261023-001.json`과
+`source12-execution-input-preflight-Main-20261023-003.json`, 단계별 fixture 로그에 둔다.
+등록된 원래 시계·자원·검증·실패 의미는 유지한다. 실제 CI prepared 객체의
+prepare→stage→consume, lock/통합 준비 자식의 실제 발주, cohort·strict ACK·update0 IPC는
+아직 실행하지 않았다. 이후 최신 제품 등록, 네 모드·archive-on·상호 검토·자료/IPC의
+실제 종단 인수와 31항목 최종 감사가 남는다. 신경망·대국·학습·성능 비교·병합은 없다.
