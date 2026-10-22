@@ -68,6 +68,9 @@ def main():
     build = commands.add_parser("recover-build")
     build.add_argument("--root", type=Path, required=True)
     build.add_argument("--owner-sha256", required=True)
+    inspect = commands.add_parser("inspect-build-recovery", help="read-only exact-owner recovery gate diagnosis; no recovery or new lease")
+    inspect.add_argument("--root", type=Path, required=True)
+    inspect.add_argument("--owner-sha256")
     output = commands.add_parser("recover-output")
     output.add_argument("--catalog", type=Path, required=True)
     output.add_argument("--key", required=True)
@@ -92,6 +95,9 @@ def main():
         result = inventory(args.root)
     elif args.operation == "recover-build":
         result = recover_build(args.root, args.owner_sha256)
+    elif args.operation == "inspect-build-recovery":
+        from storage_recovery_status import inspect_build_recovery
+        result = inspect_build_recovery(args.root, args.owner_sha256)
     elif args.operation == "recover-output":
         result = recover_output(args.catalog, args.key, args.record_sha256)
     elif args.operation == "verify-research":

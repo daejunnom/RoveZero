@@ -72,6 +72,18 @@ hash와 parse는 같은 held FD 바이트에서 얻고 commit 직전 다시 대�
 gate가 바뀌거나 기록이 불명확하면 보존한다. 구형 v1 owner에는 위 근거가 없으므로
 새 복구 명령이 임의로 권한을 만들어 주지 않는다. 별도 원 트리 조사 대상으로 남긴다.
 
+복구 요청 전에는 `inspect-build-recovery`로 현재 owner raw SHA256·원 boot·현재
+boot·원 프로세스 생성 시점과 기존 초기 복구 gate를 읽기 전용으로 대조한다.
+이 명령은 owner·lease·lock·closure를 만들거나 바꾸지 않고 slot payload와 출력
+catalog도 읽지 않는다. 초기 gate 일치는 실제 복구 완료나 출력 종료의 증거가 아니다.
+뒤의 slot·catalog·보존 자료 검사는 기존 복구기가 별도로 수행한다.
+
+재시작 후에는 이전에 복구한 owner의 SHA와 현재 owner의 SHA를 구별한다. 원
+owner가 없어졌다면 그 복구는 끝난 것이며, 후속 실행이 만든 새 owner를 같은
+실패로 보고 다시 재시작을 요구하지 않는다. 새 owner가 남았으면 해당 실행의
+실패·종료 경로를 먼저 조사한다. 기존 reader가 받지 못하는 종료 자료는 형식과
+범위의 미지원으로 기록하며, 그것만으로 추가 재부팅이 필요하다고 결론 내리지 않는다.
+
 `recover-output`은 같은 host의 재부팅, 원 catalog record의 SHA·경로·inode를
 확인하여 interrupted-retained로 옮긴다. 이 명령은 결과나 GPU 입력을 삭제하지
 않는다. 생성 중이던 deferred 경로의 identity가 확정되지 않았다면 계속 거부한다.
@@ -100,6 +112,13 @@ acquire 전에 검사한다. 현재 `run_managed.py`에서 acquire 이후 환경
 close 실패를 재호출 성공으로 덮지 않고, 소유권이나 종료가 불명확하면 기록을 남긴다.
 새 카탈로그·다른 purpose로 옮겨 중단 owner의 차단을 우회하지 않는다.
 
+기능 결과의 성공 조건과 저장소 writer의 종료 조건을 분리한다. 원래 감독자가
+오류 코드로 끝난 작업도 모든 소유 process·FD·cross-OS writer의 종료를 실제로
+확인했다면 실패 상태로 마감할 수 있어야 한다. 반대로 결과 decoder·인수 ACK가
+실패했다는 이유만으로 하위 kernel 종료 관측을 없던 것으로 만들지 않는다.
+원 기록을 보존하고 기능 인수와 자원 종료 각각의 검사·미확인 범위를 남긴다.
+이 구분 자체가 기존 기록의 소급 closure 발급이나 recovery gate 우회를 허용하지는 않는다.
+
 재부팅 없이 가능한 복구는 원 종료 근거에 따라 다르다. `recover-build`는 정확한
 원 closure와 owner 사망 증거가 있으면 같은 boot에서도 가능하지만, 현재
 `recover-output`의 중단 기록 복구는 실제 재부팅을 요구한다. 정상 실행의 원
@@ -114,6 +133,7 @@ supervisor가 출력을 마감하는 경로는 이 중단 복구와 구분한다
 ```powershell
 python scripts/run_managed.py --purpose startup-caller -- cargo build --locked -p rz-uci
 python scripts/storage_maintenance.py inventory --root "$env:APPDATA/RoveZero/build" --root "$env:APPDATA/RoveZero/reports" --root "$env:APPDATA/RoveZero/runs"
+python scripts/storage_maintenance.py inspect-build-recovery --root "$env:APPDATA/RoveZero/build/managed-v1" --owner-sha256 <previously-observed-owner-sha256>
 python scripts/storage_maintenance.py recover-build --root "$env:APPDATA/RoveZero/build/managed-v1" --owner-sha256 <original-owner-sha256>
 ```
 
