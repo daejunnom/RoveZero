@@ -2101,3 +2101,65 @@ unit·provider·제품·신경망·optimizer는 실행하지 않았다. 사전�
 `n05-010-preflight-closeout-Main-20261023-001.json`이다. 후속 실제 N05 소비·lock/통합 자식·
 strict ACK·update0 IPC, 최신 제품 등록·NNUEC proof, 네 모드·archive-on·상호 검토·4050·
 31항목 인수는 남아 있다. 실제 학습·성능 비교·대국·병합은 수행하지 않았다.
+
+## 44차 체크포인트: 명세010 실패 보존·종료 FD 수정·Source17 사전검사
+
+43차 이후 실제로 발주한 명세010은 다섯 metadata CLI가 모두 exit0·reap·EOF·process-group
+종료를 확인했다. 이후 `current_N05_extra2_metadata` 단계에서
+`unattributed-preservation: original finite observation expired`로 실패했다. 이는 원3600초
+작업 창과 다른 최대30초 저장소 관측의 만료다. 자식들의 기록된 실행시간 합계 약0.328초는
+부모의 context·inventory·복사·재해시 비용을 포함하지 않으며 성능 개선 근거가 아니다.
+어느 부모 구간이 관측 시간을 소비했는지는 추가 계측 전까지 미확정으로 남긴다.
+
+원 Root의 ordinary tree와 FD 종료 관측은 보존했지만 P 출력 최종화는 거절됐고, 원 Outer는
+cleanup 오류 때문에 manager.finish를 호출하지 않았다. 현재 build owner·active P 행·이전
+다른 owner의 closure와 실패 자료는 원문 pin 그대로 남는다. P의 outer_supervisor는 None이라
+build 감독의 출력 최종화에 자동 결합하지 않는다. 이후 boot가 달라진 사실도 관측했지만
+그 사실만으로 복구·종료·물리 완료를 인정하지 않았다. 강제 unlink·가짜 closure·재부팅·
+과거 deadline 연장·기존 선택6/history1~8 변경은 수행하지 않았다.
+
+관리 소스 `5f71098`의 OutputLease.finish는 최초 budget 검사와 record 준비도 기존
+release finally 안에 둔다. sticky 보존 오류가 발생하면 원 오류와 active 행·쓰기 불변을
+유지하면서 journal·directory·view FD와 guard를 해제한다. 원 OutputBudgetError와 late error
+우선순위, 실패 상태·물리 완료 분리는 유지한다. 기존 실행에 새 finish를 소급 호출하지 않는다.
+Main의 네 focused CPU suite는 Windows 실제86개 통과·78개 skip, Linux164개 통과·skip0이다.
+첫 Windows001 및 Linux002의 옛 fixture 기대/use-after-finish 실패는 보존했고, fixture를 실제
+terminal FD 수명에 맞춘003에서 모두 통과했다. 모든 검사 자식은 exit0·tree_gone true다.
+fresh 관측의 초기 계수를 합치는 별도 E 후보는 두 오류 우선순위 반례를 확인해 미적용한다.
+
+후속 Root017/Outer016 템플릿은 actual native attempt와 별도의 runtime process scope를
+명시한다. 정확한 pre-native 저장소 실패와 모든 metadata 프로세스 종료가 입증된 경우에만
+살아 있는 원 manager의 기존 finish를 호출하도록 ordinary 종료와 저장소 실패를 분리한다.
+실패 code2·원 cleanup 오류·물리 unknown과 기존 finish의 최종 guard를 보존하며, 과거010의
+owner를 재구성하거나 소급 종료하지 않는다. 합성14개가 양쪽 OS에서 통과했지만 실제 원
+manager의 finish·closure 게시·실패 보존 인수와 구분한다. Root018/Outer017에는 이 명시
+템플릿에서 상수만 변경한 source를 연결했다.
+
+Source17은 관리 소스9개262,080B로 기존256KiB 상한을 유지한다. 실제 Git blob과 root-owned
+manifest·복사본을 검증하여 config008을 등록했다. 비활성 Source15의 정확한11개 원문은
+ZIP·연구 요약·독립 readback을 먼저 확인한 뒤 그 leaf만 회수했다. Source16과 원 owner·
+closure·P 행은 보존했다. 준비 후 통합 입력 cache는8 leaves·2,142,982B이며8 leaves/8MiB와
+출력18GiB를 유지한다. 추가6GiB를 사용하거나 가상 디스크 물리 반환을 주장하지 않는다.
+
+새 명세011은 context부터 Capture까지 새16개·공유0개로 등록했다. 제품b567과 최신 PR
+exact63, 관리 소스5f71098을 구분하고 caller016/adapter002·selected6·tip8·자원·시계를
+유지한다. Main의 읽기 전용 사전검사는 실제111개·194,510,916B와 결정적 재생성 결과의
+원문 pin을 확인했다. 일곱 음성 사례를 거부했고 다섯 SourcePack은 같은 원 FD·객체·검증
+bytes를 재사용했다. compile 추가 FD와 닫기 오류는0이다. 원 owner·closure·P 행 불변과
+unit011 미발주도 마지막 실제 읽기로 확인했다. 입력 등록은 실행 권한이 아니다.
+
+exact63은 별도의 깨끗한 checkout을 준비했고, 기존 다른 checkout을 변경하지 않았다.
+target63과 실행 tooling을 분리한 producer·NNUEC owned-stage 연결의 합성26개가 양쪽 OS에서
+통과했다. 실제 latest63 package·현재 tooling의 원 FD proof·native 등록은 아직 미완료다.
+이 CPU/source 근거를 N05 종단·네 모드·accepted C→NNUEC ACK→same-owner resume·
+archive-on 장기 reclaim/load·4050 GPU·31항목 최종 인수로 승격하지 않는다.
+
+근거는 논리 보고서 루트의 `output-finish-release-focused-{Windows,Linux}-Main-20261023-003.json`,
+`n05-pre-native-finalization-focused-{Windows,Linux}-Main-20261023-001.json`,
+`n05-010-current-owner-boundary-readonly-Main-20261023-001.json`,
+`source17-image-registration-Main-20261023-001.json`,
+`source17-preventive-profile-graph-registration-Main-20261023-001.json`,
+`source17-execution-input-preflight-Main-20261023-001.json`과
+`source17-preflight-closeout-Main-20261023-001.json`이다. 이번 체크포인트는 새 image의 실행
+입력 등록 사전검사까지다. 새 운영 owner·unit011·provider·신경망·optimizer는 실행하지 않았고
+원 owner 정규 복구·관측 만료 원인 분리·제품 종단 인수는 계속 남아 있다.
