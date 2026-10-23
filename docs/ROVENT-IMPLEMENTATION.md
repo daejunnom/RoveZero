@@ -2055,3 +2055,49 @@ maintenance recovered를 함께 확인했다. flag만으로 완료를 판정하�
 accepted C→NNUEC ACK→same-owner resume의 사건 생산 경로를 확인했다. 기존 null/unknown을
 성공으로 바꾸는 제품 수정은 하지 않는다. 현재 source의 실제 원 receipt·settled slice·
 Collection scalar capture를 결합하는 후속 인수와 로컬4050·31항목 감사가 계속 남는다.
+
+## 43차 체크포인트: metadata profile 수정과 명세010 사전검사
+
+42차에서 발주한 명세009는 실제 metadata 게시 단계에서 `original complete mode metadata
+triples required`로 실패했다. 새 caller는 명시적 `lock_validates_manifest_v1`에 따라
+startup·lock pair를 준비했지만 adapter가 legacy startup·validate·lock triple만 요구했고,
+caller도 선택한 profile을 실제 binder에 전달하지 않았다. native·신경망·metadata 자식 실행
+전의 통합 오류다. 원 실패·Root·감독·로그·출력은 보존하며 N05 성공으로 처리하지 않는다.
+
+실제 종료는 정상 관리 경로로 완료했다. 독립 읽기는 원 자식 종료, canonical owner와
+정확히 일치하는 closure, build owner와 tmp의 부재, complete slot을 확인했다. 관리형
+cargo-target은 재생성 캐시로 남고 P 출력은 원 catalog와 일치하는 retained 상태다.
+새 M lease는 없으며 오류·원 출력의 물리 완료 unknown을 유지한다. 추가 재부팅이나
+강제 owner 제거가 필요하지 않았다.
+
+후속 adapter002는 기본 legacy triple을 그대로 유지하고 명시적 profile에서만 mode별
+정확한 startup·lock pair를 허용한다. 누락·혼합·추가 validate와 미지원 profile을 거부한다.
+caller016/017은 같은 profile 인수를 실제 binder에 전달한다. 기존 regular intake의
+SOURCE_PINS·원 run 감독·owner·argv·자원·시간 조건은 유지하고 ZIP intake만 실제 adapter002
+pin으로 연결한다. production binder CPU fixture14개와 CI63 선언 검사11개가 Linux에서
+통과했다. Windows도 두 suite가 exit0·tree_gone true로 종료했으며 POSIX 전용 사례는 skip이다.
+이 fixture는 실제 운영 owner·FD 기반 등록·native 실행의 인수를 대신하지 않는다.
+
+새 명세010은 source16 이미지를 재사용하여 새14개·공유2개·전체16개의 닫힌 실행 연결을
+등록했다. 제품 `b5671299`·관리 소스 `c2a9db9`·selected6·history1~8·자원·시계·기존 실패를
+보존한다. 공유 context/extra2를 다시 생성하거나 새 runtime source image를 만들지 않았다.
+
+Main의 읽기 전용 preflight002가 실제108개·194,484,565B를 확인하고 통과했다. 일곱 음성
+사례를 모두 거부했고 다섯 SourcePack은 같은 원 FD·객체·검증 bytes를 전달했다. compile의
+추가 FD와 닫기 오류는 0이다. 최초 preflight001은 검사기가 graph006에 없는 반환 필드명을
+요구해 실패했다. 원 소스·실패 영수증을 보존하고 실제 공유/생성 역할 집합·분리·raw pin과
+기존 이미지 재사용 필드를 확인하는002로 수정했다. 부재한 필드를 성공값으로 합성하지 않았다.
+
+마지막 별도 closeout은 실제 owner·tmp 부재와 마지막 closure 불변을 확인했다. 명세010의
+unit·provider·제품·신경망·optimizer는 실행하지 않았다. 사전검사는 해당 시점의 입력 검증이며
+실제 실행 시점의 live gate·원 FD·owner 검사를 대체하거나 실행 권한을 발급하지 않는다.
+현재 PR #27의 exact63과 기존 제품 b567의 등록·인수도 계속 구분한다.
+
+근거는 논리 보고서 루트의 `rovent-n05-b567-sf-20261023-009-N05-outer-result.json`,
+`n05-009-actual-closure-readback-Main-20261023-003.json`,
+`metadata-profile-ci63-focused-{Linux,Windows}-Main-20261023-001.json`,
+`source16-metadata-profile-graph-registration-Main-20261023-001.json`,
+`n05-010-execution-input-preflight-Main-20261023-002.json`과
+`n05-010-preflight-closeout-Main-20261023-001.json`이다. 후속 실제 N05 소비·lock/통합 자식·
+strict ACK·update0 IPC, 최신 제품 등록·NNUEC proof, 네 모드·archive-on·상호 검토·4050·
+31항목 인수는 남아 있다. 실제 학습·성능 비교·대국·병합은 수행하지 않았다.
