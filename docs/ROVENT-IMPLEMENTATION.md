@@ -1956,3 +1956,43 @@ CPU0/1이다. 원 운영 catalog·owner·GPU를 사용하는 검사는 아니다
 실행 입력 사전검사와 별개 소스다. 실제 복구 재시도·성능·메모리 효과와 채택은 미측정이다.
 논리 보고서 루트의 `initial-accounting-focused-Linux-Main-20261023-002.json`,
 `initial-accounting-focused-Windows-Main-20261023-002.json`과 같은 식별의 로그를 보존했다.
+
+## 40차 체크포인트: source15 입력 인수와 빈 캐시 복구의 소스 분기
+
+관리 소스 `d43484c`의 source15와 중첩 실행 명세008을 새로 등록했다. 원 source13은
+실제 비활성 확인 후 원문11개를 독립 ZIP과 요약으로 검증 보존하고 정확한 leaf만 회수했다.
+source15 등록 후 cache는 8 leaves·2,136,786B이며 기존 8 leaves·8MiB 상한을 유지한다.
+source9는 261,531B다. 제품 `b5671299`·선택6·history1~8·원 owner와 closure를 바꾸지 않았다.
+
+새 그래프는 새16개·공유0개의 닫힌 연결이며 Main 사전검사가 실제 입력107개·
+194,493,872B와 일곱 음성 사례를 확인했다. 다섯 SourcePack은 같은 원 FD와 bytes를
+전달했고 compile 추가 FD와 close 오류는 없었다. 원문 입력 등록 성공이며 unit008·
+provider·제품·owner·lease를 실행한 결과는 아니다. 이후 source15 읽기 전용 관측은
+실제127행과 사용량3,116,966,631B를 확인하고 view·gate를 닫았다. 원 owner raw hash는
+같으며 실제 복구 완료·물리 완료·성능 개선으로 해석하지 않는다.
+
+후속 `recover_build` E 후보는 typed 보존 경로에서 tmp·cargo-target 모두 lstat의
+FileNotFoundError로 확인될 때만 삭제 없는 분기를 사용한다. 원 root·slot·owner 검증과
+마지막 실제 보존 검사를 유지하고, 그 뒤 캐시 재등장·조회 거부 시 owner와 자료를 남겨
+실패한다. 하나라도 존재하거나 기본 None이면 원 삭제·검사 순서다. 이 변경으로 관측 기한·
+권한·quota를 바꾸지 않으며 maintenance의 recovered flag만으로 완료를 인정하지 않는다.
+
+Main이 세 CPU fixture suite에서 Linux 131개 통과·4개 skip, Windows 104개 통과·
+31개 skip을 확인했다. Linux 전용 복구16개에는 삭제 없는 경로, 기본 경로, 어느 한 캐시의
+존재, 최종 재등장, 최초·최종 조회 거부와 owner 변경 사례가 포함된다. 여섯 실제 검사
+자식은 exit0·tree_gone true·supervisor 오류 없음으로 끝났다. 원 운영 복구는 실행하지
+않았다. source9의 새 실제 합계는 262,101B로 기존 256KiB 안이며 source16 등록 대상이다.
+
+별도 NNUEC successor는 원 b567 readback과 현재 CI63 consumer를 다른 kind로 분리한다.
+기존 Fresh 경로를 보존하고 원 terminal·compiled6·source18·모델 경계5·weights·provenance·
+startup 연결을 요구하며 마지막 native 상태는 pending이다. 합성 CPU 검사19개가 양쪽 OS에서
+통과했다. 첫 Windows 검사의 세 fixture 경로 오류와 원 로그는 보존하고 후속002에서
+PurePosixPath로 수정했다. 실제 FD 기반 양성 proof·최신 제품 등록·native startup 인수와
+미래 Root 전체 연결은 남아 있다. 현재 source15 실행 그래프에는 연결하지 않았다.
+
+근거는 논리 보고서 루트의 `source15-execution-input-preflight-Main-20261023-001.json`,
+`source15-custody-readonly-observation-Main-20261023-001.json`,
+`empty-cache-recovery-focused-{Linux,Windows}-Main-20261023-001.json`과
+`nnuec-original-reuse-focused-{Linux,Windows}-Main-20261023-002.json`이다.
+실제 복구·N05 종단·네 모드·archive-on·상호 검토·4050·31항목 인수는 남아 있다.
+새 학습·성능 비교·대국·병합은 수행하지 않았다.

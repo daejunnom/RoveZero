@@ -62,6 +62,13 @@ class UnattributedBuildRecoveryTests(unittest.TestCase):
         self.assertTrue(self.scratch_file.exists())
         self.assertTrue(self.target_file.exists())
 
+    def absent_cache_fixture(self):
+        self.interrupted_fixture()
+        self.scratch_file.unlink()
+        self.old.scratch.rmdir()
+        self.target_file.unlink()
+        self.old.target.rmdir()
+
     def test_research_and_build_recovery_domains_remain_distinct(self):
         self.assertEqual(policy.RECOVERY_SCHEMA, "rovezero.unattributed-research-recovery.v1")
         self.assertEqual(policy.BUILD_RECOVERY_SCHEMA, "rovezero.unattributed-build-cache-recovery.v1")
@@ -97,6 +104,131 @@ class UnattributedBuildRecoveryTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), raw)
         for item in self.items:
             self.assertTrue(Path(item["research_archive"]["path"]).is_file())
+
+    def test_typed_absent_cache_has_no_delete_and_keeps_constructor_and_final_checks(self):
+        self.absent_cache_fixture()
+        actual_check, calls = policy._RecoveryCatalogHold.check, []
+        def checked(hold):
+            calls.append(hold)
+            return actual_check(hold)
+        with patch.object(storage, "remove_tree", side_effect=AssertionError("absent cache must not be deleted")), \
+             patch.object(policy._RecoveryCatalogHold, "check", checked):
+            audit = self.recover(self.selection())
+        self.assertEqual(len(calls), 2)
+        self.assertIs(calls[0], calls[1])
+        self.assertTrue(audit["regenerable_cache_removed"])
+        self.assertFalse(self.owner_path.exists())
+
+    def test_default_none_absent_cache_still_uses_both_original_cleanup_calls(self):
+        self.absent_cache_fixture()
+        original_remove = storage.remove_tree
+        with patch.object(storage, "reboot_proves_dead", return_value=False), \
+             patch.object(storage, "owner_proven_dead", return_value=True), \
+             patch.object(outputs, "finalize_supervised_outputs") as finalizer, \
+             patch.object(storage, "remove_tree", wraps=original_remove) as removed, \
+             patch.object(policy, "recovery_catalog_exclusion", side_effect=AssertionError("default must not opt in")):
+            storage.recover_build(self.old.root, self.owner_sha)
+        finalizer.assert_called_once_with(self.old.root, self.owner)
+        self.assertEqual([call.args for call in removed.call_args_list],
+                         [(self.old.scratch, self.old.slot), (self.old.target, self.old.slot)])
+        self.assertFalse(self.owner_path.exists())
+
+    def test_either_present_cache_keeps_original_delete_and_check_order(self):
+        for remaining in ("scratch", "target"):
+            with self.subTest(remaining=remaining):
+                self.interrupted_fixture()
+                absent = self.old.target if remaining == "scratch" else self.old.scratch
+                (self.target_file if remaining == "scratch" else self.scratch_file).unlink()
+                absent.rmdir()
+                actual_check, actual_remove, events = policy._RecoveryCatalogHold.check, storage.remove_tree, []
+                def checked(hold):
+                    events.append("check")
+                    return actual_check(hold)
+                def removed(path, parent):
+                    events.append(path.name)
+                    return actual_remove(path, parent)
+                with patch.object(policy._RecoveryCatalogHold, "check", checked), \
+                     patch.object(storage, "remove_tree", side_effect=removed):
+                    self.recover(self.selection())
+                self.assertEqual(events, ["check", "check", self.old.scratch.name, "check",
+                                          self.old.target.name, "check", "check"])
+                self.assertFalse(self.owner_path.exists())
+
+    def test_absent_cache_reappearing_after_final_preservation_check_keeps_owner_and_data(self):
+        for name in ("scratch", "target"):
+            with self.subTest(cache=name):
+                self.absent_cache_fixture()
+                actual_check, calls = policy._RecoveryCatalogHold.check, []
+                target = getattr(self.old, name)
+                def checked(hold):
+                    result = actual_check(hold)
+                    calls.append(hold)
+                    if len(calls) == 2:
+                        target.mkdir()
+                        (target / "unexpected.txt").write_text("must preserve", encoding="utf-8")
+                    return result
+                with patch.object(policy._RecoveryCatalogHold, "check", checked), \
+                     patch.object(storage, "remove_tree", side_effect=AssertionError("no deletion on empty path")):
+                    with self.assertRaisesRegex(storage.StorageError, "cache reappeared"):
+                        self.recover(self.selection())
+                self.assertEqual(self.owner_path.read_bytes(), self.owner_raw)
+                self.assertEqual((target / "unexpected.txt").read_text(encoding="utf-8"), "must preserve")
+                # Leave the failed owner as evidence; use a disjoint fixture
+                # root on the next subtest instead of force-recovering it.
+                self.root = self.root / ("next-" + name)
+                self.root.mkdir()
+
+    def test_cache_absence_probe_propagates_permission_error_and_preserves_owner(self):
+        self.absent_cache_fixture()
+        actual_lstat = Path.lstat
+        primary = PermissionError("injected cache lstat denial")
+        def lstat(path, *args, **kwargs):
+            if path == self.old.scratch:
+                raise primary
+            return actual_lstat(path, *args, **kwargs)
+        with patch.object(Path, "lstat", new=lstat), \
+             patch.object(storage, "remove_tree", side_effect=AssertionError("denied absence is not empty")):
+            with self.assertRaises(PermissionError) as caught:
+                self.recover(self.selection())
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(self.owner_path.read_bytes(), self.owner_raw)
+
+    def test_empty_cache_final_probe_denial_keeps_owner(self):
+        self.absent_cache_fixture()
+        actual_check, actual_lstat, calls = policy._RecoveryCatalogHold.check, Path.lstat, []
+        primary = PermissionError("injected final cache lstat denial")
+        def checked(hold):
+            result = actual_check(hold)
+            calls.append(hold)
+            return result
+        def lstat(path, *args, **kwargs):
+            if len(calls) == 2 and path == self.old.target:
+                raise primary
+            return actual_lstat(path, *args, **kwargs)
+        with patch.object(policy._RecoveryCatalogHold, "check", checked), \
+             patch.object(Path, "lstat", new=lstat), \
+             patch.object(storage, "remove_tree", side_effect=AssertionError("final denial must not delete")):
+            with self.assertRaises(PermissionError) as caught:
+                self.recover(self.selection())
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(self.owner_path.read_bytes(), self.owner_raw)
+
+    def test_empty_cache_owner_change_after_constructor_still_blocks_record_completion(self):
+        self.absent_cache_fixture()
+        record = self.old.slot / "record.json"
+        before = record.read_bytes()
+        actual_check = policy._RecoveryCatalogHold.check
+        def changed(hold):
+            result = actual_check(hold)
+            storage.write_record(self.owner_path, {**self.owner, "token": "f" * 32})
+            return result
+        with patch.object(policy._RecoveryCatalogHold, "check", changed), \
+             patch.object(storage, "remove_tree", side_effect=AssertionError("no deletion on empty path")):
+            with self.assertRaisesRegex(storage.StorageError, "recovery custody changed"):
+                self.recover(self.selection())
+        self.assertTrue(self.owner_path.exists())
+        self.assertNotEqual(self.owner_path.read_bytes(), self.owner_raw)
+        self.assertEqual(record.read_bytes(), before)
 
     def test_selected_active_old_owner_output_blocks_recovery_without_finalizing_it(self):
         self.interrupted_fixture()

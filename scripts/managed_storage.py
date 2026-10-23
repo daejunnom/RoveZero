@@ -567,16 +567,26 @@ def recover_build(root: Path, owner_sha256: str, *, output_preservation=None) ->
         def complete_original_recovery(preservation_check=None):
             # None executes the original cache-recovery operations/checks in
             # their original order. Extra checks belong only to the opt-in.
-            if preservation_check is not None:
-                preservation_check()
-            verify_recovery()
-            remove_tree(manager.scratch, manager.slot)
-            if preservation_check is not None:
-                preservation_check()
-            verify_recovery()
-            remove_tree(manager.target, manager.slot)
-            if preservation_check is not None:
-                preservation_check()
+            def absent(path):
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    return True
+                return False
+            empty = preservation_check is not None and absent(manager.scratch) and absent(manager.target)
+            if empty:
+                verify_recovery()
+            else:
+                if preservation_check is not None:
+                    preservation_check()
+                verify_recovery()
+                remove_tree(manager.scratch, manager.slot)
+                if preservation_check is not None:
+                    preservation_check()
+                verify_recovery()
+                remove_tree(manager.target, manager.slot)
+                if preservation_check is not None:
+                    preservation_check()
             record = {**matches[0][1], "state": "complete", "finished_ns": time.time_ns()}
             write_record(manager.slot / "record.json", record)
             audit.update(recovered=True, regenerable_cache_removed=True, temporary_removed=True)
@@ -586,6 +596,8 @@ def recover_build(root: Path, owner_sha256: str, *, output_preservation=None) ->
                 raise StorageError("recovery owner changed; preserve lock")
             if preservation_check is not None:
                 preservation_check()  # Both actual gates/FDs still held immediately before unlink.
+            if empty and not (absent(manager.scratch) and absent(manager.target)):
+                raise StorageError("recovery cache reappeared; preserve owner")
             (root / "owner.json").unlink()
             return audit
         if output_preservation is None:
