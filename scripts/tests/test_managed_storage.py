@@ -625,6 +625,40 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(StorageError):
             ManagedBuild(self.source / "target", self.source)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX absolute-path normalization")
+    def test_checked_posix_retains_normalized_names_without_a_second_physical_walk(self):
+        inputs = (self.source, Path(os.path.relpath(self.source)), self.source / "missing" / "result",
+                  self.source / ".." / "source" / "." / "result",
+                  Path("//" + str(self.source).lstrip("/")) / "result")
+        expected = [(value, Path(os.path.realpath(value))) for value in inputs]
+        with patch("managed_storage.os.path.realpath", side_effect=AssertionError("duplicate POSIX walk")):
+            for value, normalized in expected:
+                with self.subTest(value=value):
+                    self.assertEqual(checked(value), normalized)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX link rejection precedes normalization")
+    def test_checked_posix_rejects_leaf_and_ancestor_links_before_any_second_walk(self):
+        linked = self.base / "linked-source"
+        linked.symlink_to(self.source, target_is_directory=True)
+        with patch("managed_storage.os.path.realpath", side_effect=AssertionError("link followed")):
+            for value in (linked, linked / "missing-result"):
+                with self.subTest(value=value), self.assertRaises(StorageError):
+                    checked(value)
+        self.assertEqual(self.model.read_bytes(), b"retained-original")
+
+    def test_checked_preserves_non_missing_metadata_errors(self):
+        with patch("managed_storage.Path.lstat", side_effect=PermissionError("metadata unavailable")):
+            with self.assertRaises(PermissionError):
+                checked(self.source / "result")
+
+    @unittest.skipUnless(os.name == "nt", "Windows physical alias canonicalization")
+    def test_checked_windows_keeps_physical_alias_canonicalization(self):
+        target = self.source / "missing-result"
+        canonical = str(self.source / "canonical-result")
+        with patch("managed_storage.os.path.realpath", return_value=canonical) as normalize:
+            self.assertEqual(checked(target), Path(canonical))
+        normalize.assert_called_once_with(Path(os.path.abspath(target)))
+
     def test_internal_venv_link_is_removed_without_traversal(self):
         owner = self.acquire()
         (owner.scratch / "lib").mkdir()

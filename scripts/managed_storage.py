@@ -39,6 +39,14 @@ def checked(path: Path) -> Path:
             continue
         if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
             raise StorageError("managed path contains a symlink or junction")
+    if os.name == "posix":
+        # abspath already removed dot segments, and every existing component
+        # above was checked without following links. POSIX realpath repeats
+        # that walk; it cannot canonicalize hard links or mount/inode aliases.
+        # Retain realpath's collapse of exactly two leading slashes as well.
+        # This is not an atomic custody capability: callers still need their
+        # existing held-FD, directory, mount and identity checks at use time.
+        return Path("/" + str(path).lstrip("/")) if path.anchor == "//" else path
     # Windows AppContainer aliases can name the same inode without a reparse
     # attribute. Normalize their physical path before containment comparisons.
     return Path(os.path.realpath(path))
