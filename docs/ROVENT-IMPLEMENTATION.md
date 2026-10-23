@@ -1869,3 +1869,60 @@ Linux build owner와 활성 N05 서비스는 없었다. 기존 Windows owner는 
 prepare→stage→consume, lock/통합 준비 자식의 실제 발주, cohort·strict ACK·update0 IPC는
 아직 실행하지 않았다. 이후 최신 제품 등록, 네 모드·archive-on·상호 검토·자료/IPC의
 실제 종단 인수와 31항목 최종 감사가 남는다. 신경망·대국·학습·성능 비교·병합은 없다.
+
+## 38차 체크포인트: source14와 중첩 실행 입력 사전검사
+
+관리 소스 `b5a9140`으로 source14를 등록했다. POSIX의 `checked()`는 절대 경로의
+모든 기존 구성 요소를 lstat로 검사한 결과를 반환하여 같은 realpath 보행을 줄인다.
+credential·symlink 거부, Windows의 물리 경로 정규화와 실제 사용 시의 FD·identity·
+mount 검사는 유지한다. Main이 관련 Linux 115개와 Windows 34개 통과를 확인했으며,
+각 플랫폼 전용 skip은 별도로 남겼다. 이 검사와 이후 관측 시간은 성능 채택 근거가 아니다.
+
+source14의 원 소스9개 합계는 256,459B, 정책 source7은 238,692B다. 입력 cache는
+8 leaves·2,131,166B로 기존 8 leaves·8MiB를 유지한다. 이전 source10은 실제 비활성
+확인과 원문11개의 독립 ZIP·요약 검증 후 회수했다. 첫 회수는 두 파일 삭제 후 directory
+anchor 검사로 중단됐고, 실패 영수증을 보존한 후속 회수에서 정확한 나머지 아홉 파일만
+검증·제거했다. 연구 ZIP과 실패 자료는 남아 있으며 물리 디스크 반환을 주장하지 않는다.
+제품·원 owner·closure·선택한 여섯 행·history1~8과 기존 MAX8을 바꾸지 않았다.
+
+최초 실행 입력 검사는 자산 준비기 내부의 context003 이름과 실제 context004의
+불일치를 거절했다. 후속 namespace007은 새 staging014와 Common·Prefix·Root·
+Outer·Capture·두 config만 생성한다. 정상 context와 일곱 N05 부품은 같은 실제 파일을
+재사용한다. 새8개·공유8개의 전체 연결을 확인하며 역사 builder·context·Fresh 입력을
+현재 실행의 새 부품으로 재명명하지 않는다.
+
+Main의 최종 읽기 전용 사전검사는 실제 원문107개·194,479,682B와 닫힌 역할·인수·
+hash를 확인했다. 기존 네 거부 사례에 stale nested context·역할 누락·추가의 세 사례를
+더해 모두 거절했다. 다섯 SourcePack의 실제 원 FD·검증 bytes·객체를 전달했고 compile에
+추가 FD를 만들지 않았으며 close 오류는 없었다. 등록 제품은 여전히 `b5671299`, 관리
+이미지는 `b5a9140`이다. provider·자식·owner·lease·제품 실행·optimizer update는 없다.
+명세 등록은 실제 실행·수명 권한이나 종단 인수가 아니다.
+
+별도 기존 N05 실패의 정규 복구는 두 번 모두 원 30초 관측 기한에서 중단됐다.
+첫 복구가 재생성 cargo-target·tmp와 slot 상태를 처리한 뒤 마지막 owner 해제 전
+실패한 사실을 보존한다. 마지막 읽기 검사에서는 두 디렉터리가 없고 slot은 complete이나,
+원 owner와 closure의 raw hash는 동일하며 owner는 남아 있다. maintenance의 recovered는
+false이고 복구 완료로 처리하지 않는다. 강제 삭제·새 owner·과거 출력 최종화·관측 기한
+연장이나 같은 복구의 무변경 재시도는 하지 않았다.
+
+읽기 전용 cProfile은 같은 초기 관측에서 historical usage의 tree_size 126회와 현재
+view의 120회가 존재함을 확인했다. 함수 시간은 중첩되고 profiler·Windows 마운트 경합의
+영향이 있으므로 합산·성능 자료로 사용하지 않는다. 초기 회계를 합성하는 후속 E 후보는
+별도 source 변경으로 검토하며 source14를 소급 교체하지 않는다. 기존 최종 fresh 검사와
+30초·18GiB·오류·수명 조건은 계속 인수 대상이다.
+
+최신 제품 `63a2737`의 원 CI build 영수증도 독립 회수했다. NNUEC 재사용 계약의
+cpu_search·cpu_worker·model_encoding·model_reference·model_export·nn_runtime 여섯
+compiled component는 기존 b567 등록과 일치한다. 이전 원문 검사에서 NNUEC 소스18개와
+모델 경계5개도 같았다. 가중치·provenance·시작 조건의 실제 조인은 남아 있고 최신 제품
+등록·NNUEC 재사용·신경망 인수는 아직 완료가 아니다. CI bundle에 nnuec_numeric_probe가
+없다는 사실을 새 실행 증거로 바꾸지 않는다.
+
+논리 보고서 루트의 `source14-execution-graph-registration-Main-20261023-002.json`,
+`source14-execution-input-preflight-Main-20261023-003.json`,
+`n05-005-post-recovery-readback-Main-20261023-003.json`과
+`ci63-nnuec-reuse-component-boundary-Main-20261023-001.json`에 근거를 보존했다.
+이전 readback002의 target basename 오기는 후속003에서 실제 cargo-target으로 검사했으며
+원002는 수정하지 않았다. 실제 prepare→stage→consume·lock/통합 자식·cohort·strict ACK·
+update0 IPC, 최신 제품과 네 모드·archive-on·상호 검토·4050 검증·31항목 최종 인수는
+남아 있다. 실제 학습·원격 비학습 비교·대국 성과·PR 병합은 실행하지 않았다.
