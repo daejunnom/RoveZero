@@ -1996,3 +1996,38 @@ PurePosixPath로 수정했다. 실제 FD 기반 양성 proof·최신 제품 등�
 `nnuec-original-reuse-focused-{Linux,Windows}-Main-20261023-002.json`이다.
 실제 복구·N05 종단·네 모드·archive-on·상호 검토·4050·31항목 인수는 남아 있다.
 새 학습·성능 비교·대국·병합은 수행하지 않았다.
+
+## 41차 체크포인트: source16·명세009 실행 입력 사전검사 완료
+
+40차의 빈 캐시 분기를 포함한 관리 소스 `c2a9db9`를 source16으로 등록했다. 원문9개
+262,101B로 256KiB 상한을 지키며 정책 source7·감독 source2의 실제 Git blob을 확인했다.
+제품은 `b5671299`를 유지한다. source16 manifest·config007과 새 중첩 명세009를 독립
+등록했으며 원 source15/unit008은 수정하지 않았다. 새 그래프16개·공유0개의 상수·raw pin과
+context→staging→metadata→producer→binding→dispatcher→strict→Root→Capture 연결을 확인했다.
+
+Main의 Linux private mount 문맥 사전검사는 실제107개·194,488,338B를 확인하고 통과했다.
+추가·누락 필드, 중복 옵션, 미지원 profile 및 stale·누락·추가 중첩 역할의 일곱 사례를
+거부했다. 다섯 SourcePack은 원 FD·원 객체·검증 bytes를 전달했고 compile 추가 FD와
+close 오류는 0이다. `lock_validates_manifest_v1`과 `shared_clock_generator_preparer_v1`의
+등록을 확인했으나 실제 lock/통합 자식·product IPC·NN·unit009는 실행하지 않았다.
+
+이미지 slot 확보는 비활성 source14의 정확한11개 원문을 ZIP·요약으로 검증 보존한 뒤
+그 leaf만 회수했다. 첫 읽기 전용 준비의 hash 역할·start metadata 크기 불일치는 새
+식별의 소스에서 실제 관측값으로 수정했고 삭제 전 단계에서 거절된 원 소스도 보존했다.
+회수 성공 영수증은 삭제11개·보호 원문 불변을 확인한다. source16 준비 후 cache는
+8 leaves·2,142,428B로 기존 8 leaves·8MiB를 유지한다. 추가6GiB는 적용하지 않았고
+가상 디스크나 물리 공간 반환을 주장하지 않는다.
+
+마지막 실제 FD 읽기는 원 build owner476B와 closure545B의 기존 raw hash를 확인했다.
+운영 복구는 아직 완료되지 않았으며 원 실행 실패·물리 완료 unknown·선택6·history1~8을
+그대로 보존한다. 새 운영 owner/lease와 신경망·학습·GPU·성능 비교 실행은 없다.
+이 체크포인트는 사용자가 요청한 새 source image의 실행 입력 등록 사전검사까지의 완료다.
+기존 원 owner 정규 복구와 N05 종단, 최신 제품 NNUEC의 실제 FD proof·전체 소비자 연결,
+네 모드·archive-on·상호 검토·4050·31항목 최종 인수는 계속 남아 있다.
+
+근거는 논리 보고서 루트의 `source16-image-registration-Main-20261023-001.json`,
+`source16-execution-graph-registration-Main-20261023-001.json`,
+`source16-execution-input-preflight-Main-20261023-001.json`과
+`source16-preflight-closeout-Main-20261023-001.json`이다. 등록된 관리 SHA와 이후
+문서만 추가한 공유 SHA를 구분하며 CPU fixture 성공을 실제 운영 복구·GPU 인수로
+승격하지 않는다.
