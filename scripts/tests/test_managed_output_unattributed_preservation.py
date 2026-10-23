@@ -66,6 +66,92 @@ class LogicalArchiveMemberTests(unittest.TestCase):
                 os.chdir(previous)
 
 
+class InitialAccountingCompositionTests(unittest.TestCase):
+    """Closed object/ledger fixtures; no actual catalog or custody authority."""
+    def binding(self, consumer=None):
+        catalog = Path(os.path.abspath("fixture-initial-catalog"))
+        guard = types.SimpleNamespace(path=catalog / "catalog.lock", assert_held=Mock())
+        held, rows = object(), []
+        history = object.__new__(policy.transitions.TransitionValidation)
+        history.catalog, history.guard, history.held = catalog, guard, held
+        observer = policy.transitions._InitialUsage(catalog, rows, guard, held, consumer or Mock())
+        return observer, history, catalog, rows, guard, held
+
+    def test_initial_binding_rejects_replacement_rows_catalog_guard_and_held_lifetime(self):
+        for changed in ("rows", "catalog", "guard", "held", "history"):
+            with self.subTest(changed=changed):
+                observer, history, catalog, rows, guard, held = self.binding()
+                args = [history, catalog, rows, guard, held]
+                replacements = {"rows": (2, list(rows)), "catalog": (1, catalog / "other"),
+                    "guard": (3, types.SimpleNamespace(path=guard.path, assert_held=Mock())), "held": (4, object()),
+                    "history": (0, types.SimpleNamespace(catalog=catalog, guard=guard, held=held))}
+                index, value = replacements[changed]
+                args[index] = value
+                with self.assertRaises(StorageError):
+                    observer.consume(*args)
+                self.assertFalse(observer.consumed)
+
+    def test_success_and_failure_consume_same_history_once(self):
+        for error in (None, StorageError("original initial accounting failure")):
+            with self.subTest(error=error):
+                consumer = Mock(side_effect=error)
+                observer, history, catalog, rows, guard, held = self.binding(consumer)
+                if error is None:
+                    observer.consume(history, catalog, rows, guard, held)
+                else:
+                    with self.assertRaises(StorageError) as caught:
+                        observer.consume(history, catalog, rows, guard, held)
+                    self.assertIs(caught.exception, error)
+                self.assertTrue(observer.consumed)
+                self.assertIs(observer.history, history)
+                self.assertIsNone(observer.consumer)
+                self.assertIs(history._initial_usage_consumed, True)
+                with self.assertRaisesRegex(StorageError, "already consumed"):
+                    observer.consume(history, catalog, rows, guard, held)
+                other = policy.transitions._InitialUsage(catalog, rows, guard, held, Mock())
+                with self.assertRaisesRegex(StorageError, "already consumed"):
+                    other.consume(history, catalog, rows, guard, held)
+                consumer.assert_called_once_with(history, rows)
+
+    def ledger(self, *, selected_charge=1, archive_charge=0, registry_bytes=0):
+        view = object.__new__(policy.CatalogView)
+        selected = Path(os.path.abspath("fixture-initial-selected"))
+        view.held = types.SimpleNamespace(trees=[])
+        tree = object.__new__(policy._Tree)
+        tree.target, tree.held, tree.payload, tree.identity = selected, view.held, 1, [2, 3]
+        view.held.trees.append(tree)
+        view.details = {"selected": {"output": str(selected), "charge_bytes": selected_charge,
+            "observed_bytes": 1, "current_observed_identity": [2, 3]}}
+        view.history = types.SimpleNamespace(records=(), registry_bytes=registry_bytes)
+        view.archive_charge, view.selection_document = archive_charge, lambda: {}
+        rows = [(Path("selected.json"), {"key": "selected", "reserved_bytes": selected_charge}, selected)]
+        return view, rows
+
+    def test_legacy_total_failure_precedes_outer_total_failure_with_original_error(self):
+        view, rows = self.ledger()
+        for index in range(2):
+            rows.append((Path(str(index) + ".json"), {"key": str(index), "state": "retained",
+                "reserved_bytes": 10 * GiB}, Path(os.path.abspath("fixture-current-" + str(index)))))
+        with patch.object(policy, "tree_size", return_value=10 * GiB) as measured:
+            with self.assertRaisesRegex(StorageError, "^custody charges and registry exceed 18GiB$"):
+                view._usage_after_check(rows, _initial_usage=policy._TOKEN)
+        self.assertEqual(measured.call_count, 2)
+
+    def test_outer_reservation_and_archive_failure_keeps_its_original_error(self):
+        view, rows = self.ledger(selected_charge=18 * GiB, archive_charge=1)
+        with patch.object(policy, "tree_size", side_effect=AssertionError("held selected tree must be reused")):
+            with self.assertRaisesRegex(StorageError, "^unattributed-preservation: conservative .*exceed18GiB$"):
+                view._usage_after_check(rows, _initial_usage=policy._TOKEN)
+
+    def test_legacy_row_reservation_error_precedes_both_total_checks(self):
+        view, rows = self.ledger(selected_charge=18 * GiB, archive_charge=1)
+        rows.append((Path("current.json"), {"key": "current", "state": "active", "reserved_bytes": 1},
+                     Path(os.path.abspath("fixture-over-reservation"))))
+        with patch.object(policy, "tree_size", return_value=2):
+            with self.assertRaisesRegex(StorageError, "^managed output exceeds reservation$"):
+                view._usage_after_check(rows, _initial_usage=policy._TOKEN)
+
+
 @unittest.skipUnless(sys.platform == "linux", "requires actual Linux FD/mount observations")
 class UnattributedInventoryTests(unittest.TestCase):
     def setUp(self):
@@ -250,12 +336,18 @@ class UnattributedInventoryTests(unittest.TestCase):
         with self.assertRaisesRegex(StorageError, "exceed18GiB"):
             view.usage(rows)
 
-    def _mock_history(self, held, catalog, rows, tips, guard):
+    def _mock_history(self, held, catalog, rows, tips, guard, *, _initial_usage=None):
         # Explicit unit-only historical seam. This is NOT old chain validation,
         # reboot/physical completion or a real source7 product acceptance claim.
-        return types.SimpleNamespace(held=held, keys=frozenset(), records=(), registry={},
-            registry_bytes=0, observed=(), details={"unit-only": {"generation": 8}},
-            check=lambda: (held.check(), guard.assert_held()), close=held.close)
+        history = policy.transitions.TransitionValidation(held, catalog, guard, {}, {}, 0,
+            (), (), {"unit-only": {"generation": 8}}, None)
+        history.check = lambda: (held.check(), guard.assert_held())
+        if _initial_usage is not None:
+            _initial_usage.consume(history, catalog, rows, guard, held)
+        else:
+            history.usage(rows)
+        history.check()
+        return history
 
     def _history_patches(self):
         from contextlib import ExitStack
@@ -265,6 +357,54 @@ class UnattributedInventoryTests(unittest.TestCase):
             return_value={role: self.source_paths[role] for role in policy.legacy.SOURCE_ROLES}))
         stack.enter_context(patch.object(policy.transitions, "_layout", return_value=({}, 0, {})))
         return stack
+
+    def _current_row(self, name, *, state="retained", reserve=1 << 20):
+        target = self.root / name
+        target.mkdir()
+        key = hashlib.sha256(os.path.normcase(str(target)).encode()).hexdigest()
+        row = {**self.rows[0], "key": key, "output": str(target),
+               "identity": outputs.identity(target), "state": state,
+               "reserved_bytes": reserve}
+        raw = (json.dumps(row, sort_keys=True) + "\n").encode()
+        (self.catalog / (key + ".json")).write_bytes(raw)
+        (target / ".rovezero-output.json").write_bytes(raw)
+        return target
+
+    def test_initial_composition_measures_unselected_once_and_final_boundary_is_fresh(self):
+        target = self._current_row("one-current-row")
+        calls = []
+        original = policy.tree_size
+        def measured(path, **options):
+            calls.append(Path(path))
+            return original(path, **options)
+        with self._history_patches(), policy.custody.original_custody_gate(self.catalog) as guard, \
+                patch.object(policy, "tree_size", side_effect=measured):
+            selection = self.selection()
+            view = policy.observe_catalog(self.catalog, selection, guard,
+                                          hard_until=selection.original_hard_until)
+            try:
+                self.assertEqual(calls, [target])
+                # A later cleanup boundary always remeasures the current tree;
+                # no amount from initial composition survives as permission.
+                view.checked_usage()
+                self.assertEqual(calls, [target, target])
+            finally:
+                view.close(sys.exc_info()[1])
+
+    def test_initial_composition_rechecks_selected_actual_tree_after_shared_measurement(self):
+        target = self._current_row("mutation-trigger")
+        original = policy.tree_size
+        def measured(path, **options):
+            amount = original(path, **options)
+            (self.targets[0] / "result.txt").write_bytes(b"changed after initial current-tree measurement")
+            return amount
+        with self._history_patches(), policy.custody.original_custody_gate(self.catalog) as guard, \
+                patch.object(policy, "tree_size", side_effect=measured):
+            selection = self.selection()
+            with self.assertRaisesRegex(StorageError, "changed"):
+                policy.observe_catalog(self.catalog, selection, guard,
+                                       hard_until=selection.original_hard_until)
+        self.assertTrue(target.is_dir())  # This observation owns no cleanup authority.
 
     def test_new_output_journal_and_old_rows_unchanged_with_explicit_mocked_history(self):
         original = {Path(item["catalog"]["path"]): Path(item["catalog"]["path"]).read_bytes()

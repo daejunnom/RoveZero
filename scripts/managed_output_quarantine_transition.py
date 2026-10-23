@@ -325,7 +325,34 @@ class TransitionValidation(v1.QuarantineValidation):
         self.guard.assert_held()
 
 
-def _history(held, catalog, rows, tip_pins, guard, allow_partial=None):
+class _InitialUsage:
+    """One-shot same-object initial accounting; no cached amount or authority."""
+    def __init__(self, catalog, rows, guard, held, consumer):
+        _need(isinstance(catalog, Path) and type(rows) is list and callable(consumer),
+              "exact initial accounting objects required")
+        _need(Path(guard.path) == catalog / "catalog.lock", "original initial accounting gate required")
+        guard.assert_held()
+        self.catalog, self.rows, self.guard, self.held = catalog, rows, guard, held
+        self.consumer, self.consumed, self.history = consumer, False, None
+
+    def consume(self, history, catalog, rows, guard, held):
+        _need(type(self) is _InitialUsage and not self.consumed,
+              "initial accounting already consumed; no replay")
+        _need(type(history) is TransitionValidation and catalog == self.catalog
+              and rows is self.rows and guard is self.guard and held is self.held
+              and history.catalog == catalog and history.guard is guard and history.held is held,
+              "initial accounting requires the same actual history/rows/gate/lifetime")
+        _need(not hasattr(history, "_initial_usage_consumed"),
+              "initial history accounting already consumed; no second observer")
+        self.guard.assert_held()
+        self.consumed, self.history = True, history
+        history._initial_usage_consumed = True  # A boolean avoids a history/view cycle.
+        consumer, self.consumer = self.consumer, None
+        consumer(history, rows)
+        self.guard.assert_held()
+
+
+def _history(held, catalog, rows, tip_pins, guard, allow_partial=None, *, _initial_usage=None):
     catalog = checked(Path(catalog))
     _need(Path(guard.path) == catalog / "catalog.lock", "original shared catalog gate required")
     guard.assert_held()
@@ -431,7 +458,11 @@ def _history(held, catalog, rows, tip_pins, guard, allow_partial=None):
             "tip": previous, "tip_pin": previous_pin, "generation": last_generation,
             "source_pins": source_pins, "tree": tree, "observation": observation, "charge": charge}
     result = TransitionValidation(held, catalog, guard, now, registry, total, records, observations, details, allow_partial)
-    result.usage(rows)
+    if _initial_usage is None:
+        result.usage(rows)
+    else:
+        _need(type(_initial_usage) is _InitialUsage, "typed private initial accounting required")
+        _initial_usage.consume(result, catalog, rows, guard, held)
     result.check()
     return result
 

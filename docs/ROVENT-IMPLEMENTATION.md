@@ -1926,3 +1926,33 @@ compiled component는 기존 b567 등록과 일치한다. 이전 원문 검사�
 원002는 수정하지 않았다. 실제 prepare→stage→consume·lock/통합 자식·cohort·strict ACK·
 update0 IPC, 최신 제품과 네 모드·archive-on·상호 검토·4050 검증·31항목 최종 인수는
 남아 있다. 실제 학습·원격 비학습 비교·대국 성과·PR 병합은 실행하지 않았다.
+
+## 39차 체크포인트: 초기 회계 결합의 소스 검사
+
+38차에서 확인한 중복 순회의 후속 E 후보를 별도로 구현했다. 기존 `_history`의
+기본 None 경로는 usage→check를 유지하고, 명시적 `observe_catalog`의 초기 경계만
+같은 실제 rows·catalog·guard·held·history를 소유한 private one-shot으로 연결한다.
+성공·실패 후 재소비와 다른 observer의 중복 소비를 거부한다. callback은 호출 전에
+객체에서 해제하고 history에는 bool만 남겨 view와 강한 순환 참조를 만들지 않는다.
+
+초기 공통120개 트리는 한 번 새로 측정하여 역사·현재 회계의 두 total을 계산한다.
+selected6은 원 FD·전체 roster가 있는 실제 `_Tree`의 payload를 쓰며 전후 full
+held.check가 변경을 검사한다. 기존 역사 reservation·총량 오류를 먼저 보존하고
+현재 reservation·archive 총량 오류를 다음에 검사한다. 이후 checked_usage와
+복구의 최종 경계는 매번 새로 측정한다. 다른 경계의 amount cache·관측 갱신·새 권한은 없다.
+
+Main은 AST·원문 pin·source9 합계를 확인한 뒤 관련 다섯 CPU fixture suite를 순차
+실행했다. Linux는 141개 통과했고 Windows는 46개 통과·Linux 전용95개 skip이다.
+열 개 실제 검사 자식은 모두 exit0·tree_gone true·supervisor failure 없음으로 끝났고
+검사 전후 세 소스와 supervisor의 hash가 같았다. Linux fixture의 실제 affinity는
+CPU0/1이다. 원 운영 catalog·owner·GPU를 사용하는 검사는 아니다.
+
+첫 Windows 검사의 일곱 예외는 fixture의 Mock assertion 이름 보호에서 발생했다.
+명시적인 assert_held 속성을 가진 fixture로 수정하고 원 실패 로그·영수증을 보존한 뒤
+새 식별로 위 검사를 수행했다. 운영 owner를 만든 실패가 아니며 재시작을 요구하지 않았다.
+
+새 source9 합계는 261,531B로 원 256KiB 상한 안이다. 정책 source7과 기존 30초·
+18GiB·수명·폐기 조건을 유지한다. 새 코드는 아직 source14에 등록되지 않았고, source14의
+실행 입력 사전검사와 별개 소스다. 실제 복구 재시도·성능·메모리 효과와 채택은 미측정이다.
+논리 보고서 루트의 `initial-accounting-focused-Linux-Main-20261023-002.json`,
+`initial-accounting-focused-Windows-Main-20261023-002.json`과 같은 식별의 로그를 보존했다.

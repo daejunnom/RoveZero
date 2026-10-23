@@ -622,9 +622,25 @@ class CatalogView:
         rows = self._checked_rows()
         return rows, self._usage_after_check(rows)
 
-    def _usage_after_check(self, rows):
+    def _usage_after_check(self, rows, *, _initial_usage=None):
+        initial = _initial_usage is not None
+        need(not initial or _initial_usage is _TOKEN, "private initial accounting only")
         charges = {record.key: record.charge_bytes for record in self.history.records}
         need(not set(charges) & set(self.details), "distinct history and unattributed classification required")
+        legacy_total, observed = self.history.registry_bytes, {}
+        if initial:
+            custody._need(set(charges) <= {row["key"] for _, row, _ in rows},
+                          "quarantined original row disappeared")
+            trees = {tree.target: tree for tree in self.held.trees
+                     if type(tree) is _Tree and tree.held is self.held}
+            need(set(trees) == {Path(item["output"]) for item in self.details.values()},
+                 "same complete held corpus objects required")
+            for key, item in self.details.items():
+                tree = trees[Path(item["output"])]
+                need(tree.payload == item["observed_bytes"]
+                     and list(tree.identity) == item["current_observed_identity"],
+                     "initial byte count must belong to the same held tree")
+                observed[key] = tree.payload
         charges.update({key: value["charge_bytes"] for key, value in self.details.items()})
         total = self.history.registry_bytes + self.archive_charge
         # Persisted proposal/selection metadata is conservative additional charge.
@@ -632,17 +648,40 @@ class CatalogView:
         for _, row, target in rows:
             if row["key"] in charges:
                 total += charges[row["key"]]
-            elif row.get("state") == "active":
-                # Reserve the original maximum, not a transient small live sample.
-                amount = tree_size(target, allow_disappearing=True)
-                need(amount <= row["reserved_bytes"], "current producer exceeds reservation")
-                total += row["reserved_bytes"]
+                if initial:
+                    amount = observed.get(row["key"], charges[row["key"]])
+                    if row["key"] in observed:
+                        custody._need(amount <= row["reserved_bytes"], "managed output exceeds reservation")
+                    legacy_total += amount
             else:
                 amount = tree_size(target, allow_disappearing=True)
-                need(amount <= row["reserved_bytes"], "retained producer exceeds reservation")
-                total += amount
+                if initial:
+                    custody._need(amount <= row["reserved_bytes"], "managed output exceeds reservation")
+                    legacy_total += amount
+                active = row.get("state") == "active"
+                need(amount <= row["reserved_bytes"], "current producer exceeds reservation" if active
+                     else "retained producer exceeds reservation")
+                total += row["reserved_bytes"] if active else amount
+        if initial:
+            custody._need(legacy_total <= 18 * GiB, "custody charges and registry exceed 18GiB")
         need(total <= 18 * GiB, "conservative corpus/archives/registry/new reservations exceed18GiB")
         return total
+
+    def _initial_checked_usage(self, token, rows):
+        """Compose both initial ledgers at their same admission boundary only."""
+        need(token is _TOKEN, "private same-observation initial accounting required")
+        try:
+            current = self._checked_rows()
+            need(current == rows, "catalog rows changed during initial accounting")
+            total = self._usage_after_check(current, _initial_usage=_TOKEN)
+            # Selected payload reuse requires its actual FDs/roster on both ends.
+            self.held.check()
+            self.guard.assert_held()
+            self.held.tick()
+            return total
+        except BaseException:
+            self.failed = True
+            raise
 
     def selection_document(self):
         return {"schema": SCHEMA, "policy": POLICY, "rows": copy.deepcopy(self.details),
@@ -672,20 +711,36 @@ class CatalogView:
                 raise first
 
 
-def _new_catalog_view(catalog, selection, guard, *, hard_until):
+def _new_catalog_view(catalog, selection, guard, *, hard_until, compose_initial_usage=False):
     """Build the held inputs; the synchronous caller must validate before return."""
     catalog = checked(Path(catalog))
     need(type(selection) is UnattributedSelection, "typed source7 selection required")
+    need(type(compose_initial_usage) is bool, "explicit initial accounting mode required")
     need(Path(guard.path) == catalog / "catalog.lock", "same original catalog gate required")
     guard.assert_held()
     held, historical = _Held(selection.maximum_seconds, hard_until), None
     try:
         rows, details, archives = _inventory(held, catalog, selection)
         historical = custody._Held(min(selection.maximum_seconds, held.until - time.monotonic()))
-        history = transitions._history(historical, catalog, rows, selection.tips, guard)
+        if compose_initial_usage:
+            composed = []
+            def initial_usage(history, current_rows):
+                need(current_rows is rows and not composed, "one same-row composition required")
+                view = CatalogView(_TOKEN, catalog, selection, guard, held, history, details, archives)
+                view._initial_checked_usage(_TOKEN, current_rows)
+                composed.append(view)
+            observer = transitions._InitialUsage(catalog, rows, guard, historical, initial_usage)
+            history = transitions._history(historical, catalog, rows, selection.tips, guard,
+                                           _initial_usage=observer)
+            need(observer.consumed and observer.history is history and len(composed) == 1
+                 and composed[0].history is history, "actual returned history must be consumed once")
+            view = composed[0]
+        else:
+            history = transitions._history(historical, catalog, rows, selection.tips, guard)
+            view = CatalogView(_TOKEN, catalog, selection, guard, held, history, details, archives)
         need(bool(history.details) and all(item["generation"] > 0 for item in history.details.values()),
              "existing registered completed history required; not a new generation")
-        return CatalogView(_TOKEN, catalog, selection, guard, held, history, details, archives), rows
+        return view, rows
     except BaseException as error:
         try:
             if historical is not None:
@@ -697,13 +752,9 @@ def _new_catalog_view(catalog, selection, guard, *, hard_until):
 
 def observe_catalog(catalog, selection, guard, *, hard_until):
     """New explicit policy; it never calls/weakens the default `_catalog_rows`."""
-    view, rows = _new_catalog_view(catalog, selection, guard, hard_until=hard_until)
-    try:
-        view.usage(rows)
-        return view
-    except BaseException as error:
-        view.close(error)
-        raise
+    view, _ = _new_catalog_view(catalog, selection, guard, hard_until=hard_until,
+                                compose_initial_usage=True)
+    return view  # Both initial ledgers and the original history.check completed.
 
 
 class FreshOutputView(legacy.CurrentExclusionSession):
