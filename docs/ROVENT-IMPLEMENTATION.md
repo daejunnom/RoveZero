@@ -2031,3 +2031,27 @@ close 오류는 0이다. `lock_validates_manifest_v1`과 `shared_clock_generator
 `source16-preflight-closeout-Main-20261023-001.json`이다. 등록된 관리 SHA와 이후
 문서만 추가한 공유 SHA를 구분하며 CPU fixture 성공을 실제 운영 복구·GPU 인수로
 승격하지 않는다.
+
+## 42차 체크포인트: 원 N05 build owner의 정규 복구
+
+Main이 source16의 실제9개 raw pin과 config007을 확인한 뒤 기존 `recover_build`를
+한 번 호출했다. 기존30초 관측·종료·root·slot·원 owner·선택6·history1~8 검사를 유지한
+정규 경로가 반환했고, 별도 실제 FD 읽기가 owner 부재·tmp/cargo-target 부재·slot complete와
+maintenance recovered를 함께 확인했다. flag만으로 완료를 판정하지 않았다. 추가 재부팅·
+강제 unlink·가짜 종료·관측 기한 갱신·quota 증가는 없었다.
+
+원 owner476B와 closure545B, 원 실패 자료는 먼저 별도 증거 디렉터리에 원문 보존했다.
+원 실행은 계속 FAILED_OR_UNKNOWN_PRESERVED이며 과거 출력 최종화·선택 행 수정·과거
+관측의 권한 재발급·물리 완료 승격은 없다. root의 원 closure hash도 그대로다. 이 결과는
+원 build owner의 정규 회복이며 원 N05 제품 실행 성공이나 성능 채택 근거가 아니다.
+
+근거는 논리 보고서 루트의 `n05-005-source16-recovery-controller-Main-20261023-001.json`,
+`n05-005-original-recovery-evidence-005/recovery-observation.json`과
+`n05-005-source16-post-recovery-readback-Main-20261023-001.json`이다. 이어 등록된 명세009를
+원 유한 감독·CPU2·memory.high6GiB/max12GiB로 발주했다. 실제 Root의 초기 준비 예산 검사가
+통과한 단계이며 N05 prepare/stage/소비·strict ACK·update0 IPC·drain 인수는 아직 진행 중이다.
+
+별도 exact63 소스 감사에서는 archive-off 기본값과 명시적인 archive-on 수명, 네 모드 UCI와
+accepted C→NNUEC ACK→same-owner resume의 사건 생산 경로를 확인했다. 기존 null/unknown을
+성공으로 바꾸는 제품 수정은 하지 않는다. 현재 source의 실제 원 receipt·settled slice·
+Collection scalar capture를 결합하는 후속 인수와 로컬4050·31항목 감사가 계속 남는다.
