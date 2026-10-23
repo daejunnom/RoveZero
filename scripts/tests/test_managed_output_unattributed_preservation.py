@@ -34,6 +34,38 @@ def rawpin(path):
     return {"path": str(path), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
 
 
+class LogicalArchiveMemberTests(unittest.TestCase):
+    def test_logical_members_keep_credential_and_plain_path_rejections_without_filesystem_lookup(self):
+        invalid = ("", ".", "..", "/absolute", "a/../b", "a/./b", "a//b", "./a", "a/",
+                   "C:member", "a\\b", "a\x00b", "a" * 513,
+                   ".env", "corpus/.env.local", "corpus/credentials/result", "service-account.json",
+                   "corpus/id_rsa", "id_ed25519")
+        with patch.object(policy, "checked", side_effect=AssertionError("logical member touched filesystem")):
+            self.assertEqual(policy._member("corpus/results/game.pgn"), "corpus/results/game.pgn")
+            for name in invalid:
+                with self.subTest(name=name), self.assertRaises(StorageError):
+                    policy._member(name)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires an actual private cwd symlink")
+    def test_logical_member_does_not_follow_unrelated_cwd_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clean, linked, outside = (root / name for name in ("clean", "linked", "outside"))
+            for path in (clean, linked, outside):
+                path.mkdir()
+            (clean / "corpus").mkdir()
+            (linked / "corpus").symlink_to(outside, target_is_directory=True)
+            previous = Path.cwd()
+            try:
+                for cwd in (clean, linked):
+                    os.chdir(cwd)
+                    with self.subTest(cwd=cwd.name), patch.object(policy, "checked",
+                            side_effect=AssertionError("logical member touched cwd")):
+                        self.assertEqual(policy._member("corpus/result.txt"), "corpus/result.txt")
+            finally:
+                os.chdir(previous)
+
+
 @unittest.skipUnless(sys.platform == "linux", "requires actual Linux FD/mount observations")
 class UnattributedInventoryTests(unittest.TestCase):
     def setUp(self):
@@ -176,6 +208,12 @@ class UnattributedInventoryTests(unittest.TestCase):
 
     def test_corpus_symlink_is_rejected(self):
         (self.targets[0] / "external").symlink_to(self.source)
+        with self.assertRaises(StorageError):
+            self.inventory()
+
+    def test_logical_member_acceptance_does_not_admit_an_actual_corpus_symlink(self):
+        self.assertEqual(policy._member("external/result.txt"), "external/result.txt")
+        (self.targets[0] / "external").symlink_to(self.source, target_is_directory=True)
         with self.assertRaises(StorageError):
             self.inventory()
 

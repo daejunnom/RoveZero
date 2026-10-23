@@ -24,7 +24,9 @@ import zipfile
 import managed_output_preservation_session as legacy
 import managed_output_quarantine as custody
 import managed_output_quarantine_transition as transitions
-from managed_storage import GiB, StorageError, checked, read_record_snapshot, tree_size, write_record
+from managed_storage import (
+    GiB, StorageError, checked, read_record_snapshot, reject_credential_names, tree_size, write_record,
+)
 from storage_guard import CatalogGuard, lifetime
 
 SCHEMA = "rovezero.unattributed-output-preservation.v1"
@@ -354,12 +356,15 @@ class _Tree:
 
 
 def _member(name):
-    need(type(name) is str and 0 < len(name) <= 512 and "\\" not in name and ":" not in name,
+    need(type(name) is str and 0 < len(name) <= 512 and "\\" not in name and ":" not in name
+         and "\x00" not in name,
          "bounded plain archive member required")
     path = PurePosixPath(name)
     need(name not in (".", "..") and not path.is_absolute() and path.as_posix() == name
          and all(part not in (".", "..") for part in path.parts), "archive member escapes or normalizes")
-    checked(Path(name))  # Credential-name guard, no member extraction.
+    # ZIP members are logical names, not paths beneath the observer's cwd.
+    # Actual corpus files keep their separate checked/held-FD validation.
+    reject_credential_names(Path(name))
     return name
 
 
