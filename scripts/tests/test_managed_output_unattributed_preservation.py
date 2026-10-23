@@ -66,6 +66,86 @@ class LogicalArchiveMemberTests(unittest.TestCase):
                 os.chdir(previous)
 
 
+class OutputFinishReleaseTests(unittest.TestCase):
+    """No lease/FD/filesystem: execute finish with explicit release observers."""
+    def owner(self):
+        owner = object.__new__(outputs.OutputLease)
+        owner.record = {"state": "active", "token": "original-fixture-token"}
+        owner.deferred, owner.unattributed_preservation, owner._preservation_error = False, None, None
+        owner._write, events = Mock(), []
+        for name in ("_close_preservation_journal", "_close_created_directory", "_close_quarantine_view", "_release_guard"):
+            setattr(owner, name, Mock(side_effect=lambda primary=None, stage=name: events.append((stage, primary))))
+        return owner, events
+
+    def test_sticky_initial_failure_releases_all_descriptors_without_terminal_record(self):
+        owner, events = self.owner()
+        original = owner.record
+        primary = StorageError("original preservation observation expired")
+        owner.unattributed_preservation, owner._preservation_error = object(), primary
+        with self.assertRaisesRegex(StorageError, "preservation evidence failed") as caught:
+            owner.finish(status="must_not_finish", tree_gone=True)
+        self.assertIs(caught.exception.__cause__, primary)
+        self.assertIs(owner._preservation_error, primary)
+        self.assertIs(owner.record, original)
+        self.assertEqual(owner.record["state"], "active")
+        owner._write.assert_not_called()
+        self.assertEqual([name for name, _ in events], ["_close_preservation_journal", "_close_created_directory",
+            "_close_quarantine_view", "_release_guard"])
+        self.assertTrue(all(error is caught.exception for _, error in events))
+
+    def test_record_preparation_failure_also_releases_descriptors_with_original_error(self):
+        owner, events = self.owner()
+        original = owner.record
+        owner.check_budget = Mock(return_value=None)
+        primary = RuntimeError("original status conversion failed")
+        class Status:
+            def __str__(self):
+                raise primary
+        with self.assertRaises(RuntimeError) as caught:
+            owner.finish(status=Status(), tree_gone=True)
+        self.assertIs(caught.exception, primary)
+        self.assertIs(owner.record, original)
+        owner._write.assert_not_called()
+        self.assertEqual(len(events), 4)
+        self.assertTrue(all(error is primary for _, error in events))
+
+    def test_sticky_initial_failure_keeps_primary_when_guard_release_also_fails(self):
+        owner, events = self.owner()
+        primary = StorageError("original preservation observation expired")
+        owner.unattributed_preservation, owner._preservation_error = object(), primary
+        owner.quarantine_receipts = owner.quarantine_transition_receipts = None
+        owner._preservation_enabled = True
+        owner.guard = types.SimpleNamespace(release=Mock(side_effect=OSError("secondary guard close")))
+        owner._release_guard = outputs.OutputLease._release_guard.__get__(owner, outputs.OutputLease)
+        with self.assertRaisesRegex(StorageError, "preservation evidence failed") as caught:
+            owner.finish(status="must_not_finish", tree_gone=True)
+        self.assertIs(caught.exception.__cause__, primary)
+        self.assertIs(owner._preservation_error, primary)
+        self.assertEqual(owner.record["state"], "active")
+        self.assertEqual(len(events), 3)
+        owner.guard.release.assert_called_once_with()
+        self.assertTrue(any("gate release also failed" in note for note in caught.exception.__notes__))
+
+    def test_known_budget_failure_keeps_terminal_metadata_and_late_error_precedence(self):
+        for late in (None, outputs.OutputBudgetError("known late metadata budget failure")):
+            with self.subTest(late=late):
+                owner, events = self.owner()
+                first = outputs.OutputBudgetError("known initial budget failure")
+                owner.check_budget = Mock(side_effect=(first, late))
+                expected = late or first
+                with self.assertRaises(outputs.OutputBudgetError) as caught:
+                    owner.finish(status="failed-run", tree_gone=True)
+                self.assertIs(caught.exception, expected)
+                self.assertIsNone(owner._preservation_error)
+                self.assertEqual(owner.record["state"], "retained")
+                self.assertEqual(owner.record["status"], "failed_output_budget")
+                self.assertEqual(owner.record["budget_error"], str(expected))
+                self.assertEqual(owner.record["physical_completion"], "not_inferred_from_output_lifecycle")
+                self.assertEqual(owner._write.call_count, 2 if late else 1)
+                self.assertEqual(len(events), 4)
+                self.assertTrue(all(error is expected for _, error in events))
+
+
 class InitialAccountingCompositionTests(unittest.TestCase):
     """Closed object/ledger fixtures; no actual catalog or custody authority."""
     def binding(self, consumer=None):
@@ -457,7 +537,9 @@ class UnattributedInventoryTests(unittest.TestCase):
         self.assertEqual((self.catalog / (owner.key + ".json")).read_bytes(), original_row)
         self.assertEqual(journal.read_bytes(), preserved)
         self.assertEqual(owner.record["state"], "active")
-        owner.guard.assert_held()
+        self.assertIsNone(owner._preservation_journal)
+        self.assertIsNone(owner._quarantine_view)
+        self.assertIsNone(owner.guard.stream)
 
     def test_synchronous_budget_uses_two_full_checks_and_one_original_journal_append(self):
         with self._history_patches():

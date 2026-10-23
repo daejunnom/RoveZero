@@ -579,21 +579,20 @@ class OutputLease:
         self._check_quarantine_view()
 
     def finish(self, *, status, tree_gone):
-        # No file cleanup is implied by this method. In particular OS exit is
-        # never promoted to a provider's physical completion fence.
+        # Descriptor release only; OS exit is never a provider completion fence.
         error = None
         try:
-            self.check_budget()
-        except OutputBudgetError as exc:
-            error = exc
-        self.record = {**self.record, "state": "retained" if tree_gone is True else "active",
-                       "status": "failed_output_budget" if error else str(status), "producer_status": str(status),
-                       "tree_gone": tree_gone, "finished_ns": time.time_ns(),
-                       "budget_error": str(error) if error else None,
-                       "physical_completion": "not_inferred_from_output_lifecycle"}
-        if self.deferred and self._created_directory is None and self.output.exists():
-            self.record["identity"] = identity(self.output)
-        try:
+            try:
+                self.check_budget()
+            except OutputBudgetError as exc:
+                error = exc
+            self.record = {**self.record, "state": "retained" if tree_gone is True else "active",
+                           "status": "failed_output_budget" if error else str(status), "producer_status": str(status),
+                           "tree_gone": tree_gone, "finished_ns": time.time_ns(),
+                           "budget_error": str(error) if error else None,
+                           "physical_completion": "not_inferred_from_output_lifecycle"}
+            if self.deferred and self._created_directory is None and self.output.exists():
+                self.record["identity"] = identity(self.output)
             self._write()
             try:
                 self.check_budget()  # Terminal metadata itself consumes bytes.

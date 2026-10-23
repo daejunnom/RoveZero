@@ -56,7 +56,7 @@ class SealedBudgetPollTests(unittest.TestCase):
         if self._testMethodName != "test_acquisition_without_budget_binding_uses_one_full_observation_first":
             self.owner.check_budget()
 
-    def _reject_sticky(self, change):
+    def _reject_sticky(self, change, restore_before_finish=None):
         owner = self.owner
         row = (owner.catalog / (owner.key + ".json")).read_bytes()
         journal = owner._preservation_journal
@@ -70,6 +70,8 @@ class SealedBudgetPollTests(unittest.TestCase):
         self.assertNotIsInstance(caught.exception, AssertionError)
         self.assertIs(owner._preservation_error, caught.exception)
         self.assertEqual(journal.entries, entries)
+        if restore_before_finish is not None:
+            restore_before_finish()  # Terminal release closes the actual owned descriptors.
         self.fixture._assert_poison_blocks_budget_and_finish(owner, caught.exception, row)
         return caught.exception
 
@@ -216,7 +218,8 @@ class SealedBudgetPollTests(unittest.TestCase):
         journal = self.owner._preservation_journal
         other = copy.copy(journal)
         try:
-            self._reject_sticky(lambda: setattr(self.owner, "_preservation_journal", other))
+            self._reject_sticky(lambda: setattr(self.owner, "_preservation_journal", other),
+                restore_before_finish=lambda: setattr(self.owner, "_preservation_journal", journal))
         finally:
             self.owner._preservation_journal = journal
 
@@ -224,16 +227,19 @@ class SealedBudgetPollTests(unittest.TestCase):
         journal = self.owner._preservation_journal
         original, duplicate = journal.fd, os.dup(journal.fd)
         try:
-            self._reject_sticky(lambda: setattr(journal, "fd", duplicate))
+            self._reject_sticky(lambda: setattr(journal, "fd", duplicate),
+                               restore_before_finish=lambda: setattr(journal, "fd", original))
         finally:
-            journal.fd = original
+            if journal.fd is not None:
+                journal.fd = original
             os.close(duplicate)
 
     def test_journal_stamp_mutation_cannot_mutate_the_sealed_snapshot(self):
         journal = self.owner._preservation_journal
-        before = self.owner._quarantine_view._budget_binding[7][-1]
+        view = self.owner._quarantine_view
+        before = view._budget_binding[7][-1]
         self._reject_sticky(lambda: setattr(journal, "stamp", (*journal.stamp[:-1], journal.stamp[-1] + 1)))
-        self.assertEqual(self.owner._quarantine_view._budget_binding[7][-1], before)
+        self.assertEqual(view._budget_binding[7][-1], before)
 
     def test_view_deadline_change_is_rejected(self):
         view = self.owner._quarantine_view

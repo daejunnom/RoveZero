@@ -419,13 +419,19 @@ class CreatedDirectoryBindingTests(unittest.TestCase):
 
     def assert_sticky_failure(self, primary):
         self.assertIs(self.owner._directory_binding_error, primary)
-        count = self.writes
+        count, releases = self.writes, self.gate.release.call_count
         with self.assertRaises(StorageError) as blocked:
             self.owner.finish(status="completed", tree_gone=True)
         self.assertIs(blocked.exception.__cause__, primary)
+        self.assertIs(self.owner._directory_binding_error, primary)
         self.assertEqual(self.writes, count)
         self.assertEqual(self.disk["state"], "active")
-        self.assertFalse(self.gate.release.called)
+        self.assertEqual(self.owner.record["state"], "active")
+        self.assertEqual(self.gate.release.call_count, releases + 1)
+        cap = self.owner._created_directory
+        if cap is not None:
+            self.assertIsNone(cap.fd)
+            self.assertIsNone(cap.parent_fd)
 
     def test_seal_precedes_payload_and_only_identity_changes(self):
         original = copy.deepcopy(self.disk)
@@ -477,15 +483,23 @@ class CreatedDirectoryBindingTests(unittest.TestCase):
         self.owner.create_deferred_directory()
         original = copy.deepcopy(self.disk)
         self.named_child = self.info(99)
-        for action in (self.owner.check_budget, lambda: self.owner.finish(status="completed", tree_gone=True)):
-            with self.assertRaisesRegex(StorageError, "directory changed"):
-                action()
+        with self.assertRaisesRegex(StorageError, "directory changed"):
+            self.owner.check_budget()
         self.assertEqual(self.disk, original)
         self.named_child = self.fd_info[102]
         self.named_parent = self.info(98)
         with self.assertRaisesRegex(StorageError, "parent changed"):
             self.owner.check_budget()
         self.assertEqual(self.disk, original)
+        # finish releases descriptors even when it refuses the terminal write;
+        # inspect both replacement faults before that last operation.
+        self.named_parent, self.named_child = self.parent_info, self.info(99)
+        with self.assertRaisesRegex(StorageError, "directory changed"):
+            self.owner.finish(status="completed", tree_gone=True)
+        self.assertEqual(self.disk, original)
+        self.assertIsNone(self.owner._created_directory.fd)
+        self.assertIsNone(self.owner._created_directory.parent_fd)
+        self.gate.release.assert_called_once()
 
     def test_parent_fstat_failure_keeps_fd_owned_and_close_preserves_primary(self):
         primary = OSError("parent fstat failed")
@@ -751,15 +765,23 @@ class CreatedDirectoryLinuxFilesystemTests(unittest.TestCase):
                 message = "parent changed" if replace_parent else "directory changed"
                 with self.assertRaisesRegex(StorageError, message):
                     owner.check_budget()
-                with self.assertRaisesRegex(StorageError, message):
-                    owner.finish(status="must_not_finish", tree_gone=True)
-                self.assertEqual(pin(row_path), original_pin)
-                self.assertEqual(json.loads(row_path.read_text())["state"], "active")
                 opened = os.fstat(owner._created_directory.fd)
                 self.assertEqual([opened.st_dev, opened.st_ino], original_identity)
                 self.assertEqual((original_path / "original.txt").read_bytes(), b"keep original")
                 self.assertEqual((owner.output / "replacement.txt").read_bytes(), b"keep replacement")
-                # Cleanup closes only these original FDs/gate; it never calls finish.
+                binding_error = owner._directory_binding_error
+                with self.assertRaisesRegex(StorageError, message):
+                    owner.finish(status="must_not_finish", tree_gone=True)
+                self.assertEqual(pin(row_path), original_pin)
+                self.assertEqual(json.loads(row_path.read_text())["state"], "active")
+                self.assertEqual(owner.record["state"], "active")
+                self.assertIs(owner._directory_binding_error, binding_error)
+                self.assertIsNone(owner._created_directory.fd)
+                self.assertIsNone(owner._created_directory.parent_fd)
+                self.assertIsNone(owner.guard.stream)
+                self.assertEqual((original_path / "original.txt").read_bytes(), b"keep original")
+                self.assertEqual((owner.output / "replacement.txt").read_bytes(), b"keep replacement")
+                # A refused finish releases descriptors without adopting either path.
 
     def test_real_same_boot_recovery_rejects_bound_active_row(self):
         owner, _, row_path = self.lease("same-boot")
