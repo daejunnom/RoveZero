@@ -23,6 +23,7 @@ import time
 SCHEMA = "rovent.control-input-snapshot/1"
 PROFILE = "systemd-private-tmp-file-bind-before-observer-v1"
 RECEIPT_SCHEMA = "rovent.control-input-snapshot-setup/1"
+RECEIPT_OWNER_POLICY = "same-held-declared-report-parent-uid-gid-v1"
 LIMIT = 16 << 20
 FILE_LIMIT = 1 << 20
 FILE_COUNT = 128
@@ -324,6 +325,24 @@ def require_receipt_parent(path, parent):
     need(type(parent) is ParentChain and parent.path == PurePosixPath(path).parent,
         "receipt must use its own exact held parent capability")
     parent.recheck()
+
+
+def receipt_owner_observation(path, parent, parent_info, receipt_info):
+    """Report storage only; Source9/17 and private tmpfs ownership are separate."""
+    require_receipt_parent(path, parent)
+    need(stat.S_ISDIR(parent_info.st_mode) and parent_identity(parent_info) == parent.rows[-1][3],
+        "same originally held declared report parent required")
+    owner = (parent_info.st_uid, parent_info.st_gid)
+    need(all(type(value) is int and value >= 0 for value in owner)
+        and stat.S_ISREG(receipt_info.st_mode) and receipt_info.st_nlink == 1
+        and (receipt_info.st_uid, receipt_info.st_gid) == owner,
+        "receipt UID/GID must match its actual held declared report parent")
+    return {"policy": RECEIPT_OWNER_POLICY, "declared_parent": str(parent.path),
+        "held_parent_identity": list(parent_identity(parent_info)), "parent_uid_gid": list(owner),
+        "receipt_uid_gid": [receipt_info.st_uid, receipt_info.st_gid],
+        "receipt_mode": format(stat.S_IMODE(receipt_info.st_mode), "04o"),
+        "receipt_device_inode": [receipt_info.st_dev, receipt_info.st_ino],
+        "arbitrary_owner_fallback_permitted": False, "private_image_owner_policy_changed": False}
 
 
 class NativeOps:
@@ -676,6 +695,8 @@ def prepare_snapshot(plan, ops):
 
 def write_receipt(path, body, *, parent, previous=None):
     """Own new report only; an exec failure may update this same owned receipt."""
+    need(type(body) is dict and "receipt_storage_owner" not in body,
+        "actual receipt owner observation cannot be supplied by the caller")
     raw = (json.dumps(body, ensure_ascii=False, allow_nan=False, sort_keys=True) + "\n").encode("utf-8")
     need(len(raw) <= FILE_LIMIT, "bounded setup receipt required")
     require_receipt_parent(path, parent)
@@ -686,10 +707,14 @@ def write_receipt(path, body, *, parent, previous=None):
     primary = None
     try:
         before = os.fstat(fd)
-        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_uid == before.st_gid == 0
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
             and stamp(before) == stamp(os.stat(name, dir_fd=parent.fd, follow_symlinks=False)),
             "own setup receipt FD/name required")
-        require_receipt_parent(path, parent)
+        ownership = receipt_owner_observation(path, parent, os.fstat(parent.fd), before)
+        stored = dict(body)
+        stored["receipt_storage_owner"] = ownership
+        raw = (json.dumps(stored, ensure_ascii=False, allow_nan=False, sort_keys=True) + "\n").encode("utf-8")
+        need(len(raw) <= FILE_LIMIT, "bounded setup receipt including actual owner evidence required")
         if previous is not None:
             need(stamp(before) == previous[0] and os.pread(fd, before.st_size + 1, 0) == previous[1],
                 "only this wrapper's unchanged new receipt may be updated")
@@ -704,7 +729,8 @@ def write_receipt(path, body, *, parent, previous=None):
         need(os.pread(fd, len(raw) + 1, 0) == raw and stamp(after) == stamp(os.stat(name,
             dir_fd=parent.fd, follow_symlinks=False)),
             "own setup receipt readback changed")
-        require_receipt_parent(path, parent)
+        need(receipt_owner_observation(path, parent, os.fstat(parent.fd), after) == ownership,
+            "held report parent or receipt ownership changed during write")
         os.fsync(parent.fd)
         return stamp(after), raw
     except BaseException as error:

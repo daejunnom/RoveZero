@@ -253,6 +253,7 @@ class IsolationTests(unittest.TestCase):
     def test_actual_private_tmp_geometry_is_required_not_a_boolean_claim(self):
         self.assertTrue(self.proof()["propagation_private"])
         for change in ({"cap_effective": 0}, {"uid": 1000}, {"current_namespace": "mnt:[1]"},
+                {"tmp_info": SimpleNamespace(st_mode=stat.S_IFDIR | 0o1777, st_uid=1000, st_gid=1000)},
                 {"rows": subject.mount_rows("10 1 0:1 / / rw - ext4 /dev/fake rw\n")},
                 {"rows": subject.mount_rows("11 1 0:1 /tmp/systemd-private-unit/tmp /tmp rw shared:2 - ext4 /dev/fake rw\n")}):
             with self.subTest(change=change):
@@ -302,6 +303,63 @@ class ParentCustodyTests(unittest.TestCase):
         try:
             with self.assertRaises(subject.SnapshotError):
                 parent.recheck()
+        finally:
+            self.assertEqual([], parent.close())
+
+
+class ReceiptOwnerTests(unittest.TestCase):
+    def parent(self, uid=1000, gid=1000):
+        calls = FakeDirectoryCalls()
+        calls.nodes["/reports/unit"].st_uid = uid
+        calls.nodes["/reports/unit"].st_gid = gid
+        calls.nodes["/reports/unit"].st_mode = stat.S_IFDIR | 0o777
+        return subject.ParentChain("/reports/unit", calls), calls
+
+    @staticmethod
+    def receipt(uid=1000, gid=1000):
+        return SimpleNamespace(st_dev=1, st_ino=500, st_mode=stat.S_IFREG | 0o777,
+            st_nlink=1, st_uid=uid, st_gid=gid)
+
+    def test_windows_receipt_matches_held_parent_owner_and_records_actual_mode(self):
+        parent, calls = self.parent()
+        try:
+            observed = subject.receipt_owner_observation("/reports/unit/new.json", parent,
+                calls.fstat(parent.fd), self.receipt())
+            self.assertEqual(subject.RECEIPT_OWNER_POLICY, observed["policy"])
+            self.assertEqual([1000, 1000], observed["parent_uid_gid"])
+            self.assertEqual([1000, 1000], observed["receipt_uid_gid"])
+            self.assertEqual("0777", observed["receipt_mode"])
+            self.assertFalse(observed["arbitrary_owner_fallback_permitted"])
+            self.assertFalse(observed["private_image_owner_policy_changed"])
+        finally:
+            self.assertEqual([], parent.close())
+
+    def test_root_or_other_owner_is_not_an_alternative_to_the_held_parent_owner(self):
+        parent, calls = self.parent()
+        try:
+            for uid, gid in ((0, 0), (1001, 1000), (1000, 1001)):
+                with self.subTest(uid=uid, gid=gid):
+                    with self.assertRaises(subject.SnapshotError):
+                        subject.receipt_owner_observation("/reports/unit/new.json", parent,
+                            calls.fstat(parent.fd), self.receipt(uid, gid))
+            calls.nodes["/reports/unit"].st_uid = 1001
+            with self.assertRaises(subject.SnapshotError):
+                subject.receipt_owner_observation("/reports/unit/new.json", parent,
+                    calls.fstat(parent.fd), self.receipt(1001, 1000))
+        finally:
+            self.assertEqual([], parent.close())
+
+    def test_root_parent_still_requires_its_exact_owner_and_single_regular_receipt(self):
+        parent, calls = self.parent(0, 0)
+        try:
+            self.assertEqual([0, 0], subject.receipt_owner_observation("/reports/unit/new.json", parent,
+                calls.fstat(parent.fd), self.receipt(0, 0))["receipt_uid_gid"])
+            for changed in (self.receipt(), self.receipt(0, 0)):
+                if changed.st_uid == 0:
+                    changed.st_nlink = 2
+                with self.assertRaises(subject.SnapshotError):
+                    subject.receipt_owner_observation("/reports/unit/new.json", parent,
+                        calls.fstat(parent.fd), changed)
         finally:
             self.assertEqual([], parent.close())
 
