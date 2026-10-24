@@ -1,0 +1,627 @@
+//! 원 loaded native source와 실제 Frontier 부착을 함께 보존하는 수집 권한.
+//! 이 파일은 wire DTO가 아니며 JSON/복사한 receipt에서 권한을 복원하지 않는다.
+use super::*;
+use rz_contracts::{Deadline, Digest};
+use rz_position::contracts::ContractState;
+use rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace;
+use rz_search::pals::rovent_engine::RootMoveDomain;
+use rz_search::pals::rovent_frontier::RoventFrontier;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+use serde_json::{Value, json};
+use std::sync::Arc;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+use std::sync::OnceLock;
+
+pub const ROVENT_COLLECTION_NATIVE_ORIGIN: &str = "rz-rovent-collection-native-origin/1";
+pub const ROVENT_COLLECTION_ROOT_ADMISSION: &str = "rz-rovent-collection-root-admission/1";
+pub const ROVENT_COLLECTION_EXTERNAL_ROOT_ADMISSION: &str = "rz-rovent-collection-root-admission/2";
+pub const ROVENT_COLLECTION_PROFILED_EXTERNAL_SOURCE: &str =
+    "rz-rovent-collection-profiled-external-source/1";
+
+fn reject(message: impl Into<String>) -> AdaptiveCollectionError {
+    AdaptiveCollectionError::new(
+        AdaptiveCollectionStage::Accepted,
+        "RoventRootAdmission",
+        message,
+    )
+}
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+fn text_sha(value: Digest) -> String {
+    value.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+struct LoadedOrigin {
+    // Retains the original pinned source descriptors without copying weights.
+    _source_custody: Arc<dyn Send + Sync>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    sources: Arc<crate::rovent_bootstrap::RoventPinnedNativeSources>,
+    process_epoch: u64,
+    mode: rz_contracts::rovent::ExecutionMode,
+    input_lock: Digest,
+    namespace: AdaptiveModelNamespace,
+    product_lifetime: Option<Arc<RoventNativeProductLifetime>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    raw: Value,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    raw_sha256: String,
+}
+
+/// Current product provenance only. No JSON, public constructor or copied
+/// process/source hash can manufacture a new native-service lifetime.
+/// The actual PreparedNative issuer is a separate registration boundary.
+pub struct RoventNativeProductLifetime {
+    _private: (),
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    first_root: OnceLock<Arc<crate::rovent_root_admission::RoventRootAdmission>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    sources: std::sync::Weak<crate::rovent_bootstrap::RoventPinnedNativeSources>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    clock: rz_runtime::contracts::ContractSystemClock,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    namespace: AdaptiveModelNamespace,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    _original_verifier: rz_search::pals::coordinator::NativeAcceptanceVerifier,
+}
+impl RoventNativeProductLifetime {
+    /// Only the successful bootstrap calls this after consuming the actual
+    /// Ready event. The worker-issued verifier and ready clock are required;
+    /// snapshot metadata alone cannot create this lifetime.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn from_ready<Q: crate::pals_adaptive::NativeQuestionProjection>(
+        snapshot: &crate::rovent_bootstrap::RoventNativeStartupSnapshot,
+        sources: &Arc<crate::rovent_bootstrap::RoventPinnedNativeSources>,
+        actual_service: &crate::rovent_bootstrap::RoventNativeService<Q>,
+    ) -> Result<Arc<Self>, AdaptiveCollectionError> {
+        use rz_runtime::contracts::ContractClock;
+        let clock = actual_service
+            .ready_clock()
+            .ok_or_else(|| reject("original native service has not reached Ready"))?;
+        let verifier = actual_service
+            .native_acceptance_verifier()
+            .ok_or_else(|| reject("original native service has no worker-issued verifier"))?;
+        if clock.domain().0.0 != snapshot.process_epoch
+            || snapshot.input_lock != sources.lock_digest()
+            || snapshot.physical_workers_created != 1
+            || snapshot.neural_service_executed
+        {
+            return Err(reject("original Ready service/snapshot/source differs"));
+        }
+        let namespace = snapshot
+            .model_namespace()
+            .map_err(|error| reject(error.to_string()))?;
+        Ok(Arc::new(Self {
+            _private: (),
+            first_root: OnceLock::new(),
+            sources: Arc::downgrade(sources),
+            clock,
+            namespace,
+            _original_verifier: verifier,
+        }))
+    }
+    pub fn same_product(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+/// 발급은 PreparedRoventNative의 원 성공 owner에서만 가능하다.
+/// public constructor·Deserialize·wire에서의 복원은 제공하지 않는다.
+#[derive(Clone)]
+pub struct RoventNativeCollectionOrigin {
+    original: Arc<LoadedOrigin>,
+}
+impl RoventNativeCollectionOrigin {
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn from_loaded_with_lifetime(
+        snapshot: &crate::rovent_bootstrap::RoventNativeStartupSnapshot,
+        sources: Arc<crate::rovent_bootstrap::RoventPinnedNativeSources>,
+        lifetime: Arc<RoventNativeProductLifetime>,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        use rz_runtime::contracts::ContractClock;
+        if !lifetime.sources.ptr_eq(&Arc::downgrade(&sources))
+            || lifetime.clock.domain().0.0 != snapshot.process_epoch
+            || lifetime.namespace
+                != snapshot
+                    .model_namespace()
+                    .map_err(|error| reject(error.to_string()))?
+        {
+            return Err(reject(
+                "original native lifetime differs from loaded source",
+            ));
+        }
+        let mut origin = Self::from_loaded(snapshot, sources)?;
+        Arc::get_mut(&mut origin.original)
+            .expect("new original loaded owner")
+            .product_lifetime = Some(lifetime);
+        Ok(origin)
+    }
+    pub fn product_lifetime(&self) -> Option<&Arc<RoventNativeProductLifetime>> {
+        self.original.product_lifetime.as_ref()
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn from_loaded(
+        snapshot: &crate::rovent_bootstrap::RoventNativeStartupSnapshot,
+        sources: Arc<crate::rovent_bootstrap::RoventPinnedNativeSources>,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        let lock = sources.lock();
+        let manifest = &lock.manifest;
+        let pc = &manifest.engine.pc;
+        if manifest.purpose != rz_experiments::RoventPurpose::Collection
+            || pc.proposer.diagnostic
+            || pc.critic.diagnostic
+            || pc.validator.is_some()
+            || snapshot.validator_loaded
+            || snapshot.process_epoch == 0
+            || snapshot.input_lock != sources.lock_digest()
+            || snapshot.mode != manifest.engine.mode
+            || snapshot.weights.0 != sources.weights_digest()
+            || text_sha(snapshot.export_manifest) != sources.export_digest_text()
+            || snapshot.neural_service_executed
+        {
+            return Err(reject(
+                "loaded source is not the original nondiagnostic Rovent collection startup",
+            ));
+        }
+        let namespace = snapshot
+            .model_namespace()
+            .map_err(|error| reject(error.to_string()))?;
+        let source_sha256 = rz_experiments::rovent_source_aggregate_sha256(
+            &manifest.engine.source_commit,
+            &manifest.engine.source_components,
+        )
+        .map_err(|error| reject(error.to_string()))?;
+        let raw = json!({
+            "schema":ROVENT_COLLECTION_NATIVE_ORIGIN,
+            "purpose":"collection",
+            "process_epoch":snapshot.process_epoch,
+            "mode":format!("{:?}",snapshot.mode),
+            "input_lock_sha256":text_sha(snapshot.input_lock),
+            "source_commit":manifest.engine.source_commit,
+            "source_components":manifest.engine.source_components,
+            "source_sha256":source_sha256,
+            "weights_sha256":text_sha(snapshot.weights),
+            "export_manifest_sha256":text_sha(snapshot.export_manifest),
+            "backend_sha256":text_sha(snapshot.backend),
+            "runtime_library_sha256":text_sha(snapshot.runtime_library),
+            "runtime_bundle_sha256":snapshot.runtime_bundle.map(text_sha),
+            "native_configuration_sha256":text_sha(snapshot.native_configuration),
+            "model_semantics":pc.proposer.semantics,
+            "model_semantics_sha256":text_sha(Digest(rz_eval::pals_model::PalsModelProfile::VirtualReviewV1.registered_semantics_sha256())),
+            "encoding":pc.proposer.encoding,
+            "encoding_sha256":text_sha(Digest({use sha2::Digest as _; sha2::Sha256::digest(rz_eval::pals_model::virtual_review::ENCODING.as_bytes()).into()})),
+            "encoding_registry_sha256":text_sha(Digest(rz_eval::pals_model::virtual_review::registered_encoding_sha256())),
+            "model_implementation_sha256":pc.proposer.implementation_sha256,
+            "representation_model_domain":"loaded_checkpoint_sha256",
+            "teacher_profiles":manifest.engine.teachers,
+            "frozen_epoch":1,
+            "runtime_sha256_domain":"loaded_runtime_library_file_sha256",
+            "runtime_sha256":text_sha(snapshot.runtime_library),
+        });
+        let raw_sha256 =
+            rz_experiments::pals_data_v3::generation_digest(ROVENT_COLLECTION_NATIVE_ORIGIN, &raw)
+                .map_err(|error| reject(error.to_string()))?;
+        let process_epoch = snapshot.process_epoch;
+        let mode = snapshot.mode;
+        let input_lock = snapshot.input_lock;
+        Ok(Self {
+            original: Arc::new(LoadedOrigin {
+                _source_custody: Arc::clone(&sources) as Arc<dyn Send + Sync>,
+                sources,
+                process_epoch,
+                mode,
+                input_lock,
+                namespace,
+                product_lifetime: None,
+                raw,
+                raw_sha256,
+            }),
+        })
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn raw_receipt(&self) -> &Value {
+        &self.original.raw
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn raw_sha256(&self) -> &str {
+        &self.original.raw_sha256
+    }
+    /// Original immutable parsed lock, retained by the actual loaded source.
+    /// Serializing this snapshot preserves meaning, not original whitespace.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn original_input_lock(&self) -> &rz_experiments::RoventInputLock {
+        self.original.sources.lock()
+    }
+    /// Same retained source allocation, not matching declarations or hashes.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn matches_loaded_nnuec(
+        &self,
+        source: &crate::rovent_bootstrap::nnuec_source::LoadedRoventNnuecSource,
+    ) -> bool {
+        source.matches_sources(&self.original.sources)
+            && source.input_lock_digest() == self.original.input_lock
+    }
+    /// Original metadata bytes only; neither this read nor historical replay
+    /// grants runtime, native, physical or training execution authority.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn runtime_bundle_publication_bytes(
+        &self,
+    ) -> Result<Option<(rz_experiments::ArtifactRef, Vec<u8>)>, AdaptiveCollectionError> {
+        let original = self
+            .original
+            .sources
+            .runtime_bundle_publication_bytes()
+            .map_err(|error| reject(error.to_string()))?;
+        match &original {
+            Some((_, bytes)) => {
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| reject("original bundle metadata is not UTF-8"))?;
+                let spec = rz_eval::runtime_pin::CudaRuntimeBundleSpec::from_json(text)
+                    .map_err(|error| reject(error.to_string()))?;
+                let digest = text_sha(Digest(
+                    spec.digest().map_err(|error| reject(error.to_string()))?,
+                ));
+                if self.original.raw["runtime_bundle_sha256"] != digest {
+                    return Err(reject(
+                        "original bundle file bytes do not join loaded binary-codec digest",
+                    ));
+                }
+            }
+            None if !self.original.raw["runtime_bundle_sha256"].is_null() => {
+                return Err(reject(
+                    "loaded CUDA bundle lacks original retained metadata bytes",
+                ));
+            }
+            None => {}
+        }
+        Ok(original)
+    }
+    pub(crate) fn verify_profile(
+        &self,
+        mode: rz_contracts::rovent::ExecutionMode,
+        input_lock: Digest,
+        namespace: &AdaptiveModelNamespace,
+    ) -> Result<(), AdaptiveCollectionError> {
+        if self.original.mode != mode
+            || self.original.input_lock != input_lock
+            || &self.original.namespace != namespace
+        {
+            return Err(reject(
+                "collection profile differs from the original loaded source identity",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 원 attach 성공 제어흐름에서 발급하는 root-scoped 권한이다. 원 Rules와
+/// 제한된 root move domain을 Arc로 보존하므로 복사한 digest는 이를 대신하지 못한다.
+#[derive(Clone)]
+pub struct RoventCollectionRootAdmission {
+    original: RoventNativeCollectionOrigin,
+    authority: SearchAuthority,
+    deadline: Deadline,
+    rules: Arc<ContractState>,
+    root_moves: Arc<RootMoveDomain>,
+    root_state: rz_contracts::StateIdentity,
+    root_budget: Digest,
+    selective_policy: Digest,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    root_admission: Arc<crate::rovent_root_admission::RoventRootAdmission>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    external_source: Option<crate::rovent_external_launch::RoventAdmittedExternalRootSource>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    raw: Arc<Value>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    raw_sha256: Arc<str>,
+}
+impl RoventCollectionRootAdmission {
+    /// Absent current lifetime evidence stays unknown. This does not infer
+    /// fresh cache state from a first-looking authority or an epoch number.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn is_first_product_root(&self) -> bool {
+        self.original
+            .original
+            .product_lifetime
+            .as_ref()
+            .is_some_and(|lifetime| {
+                lifetime
+                    .first_root
+                    .get()
+                    .is_some_and(|root| Arc::ptr_eq(root, &self.root_admission))
+            })
+    }
+    /// Call only immediately after the actual port's attach_rovent_frontier
+    /// has checked independent Rules/Store/namespace/root-domain/ledger owners.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn from_attached_frontier(
+        original: &RoventNativeCollectionOrigin,
+        frontier: &RoventFrontier,
+        input_lock: Digest,
+        root_budget: Digest,
+        selective_policy: Digest,
+        root_admission: Arc<crate::rovent_root_admission::RoventRootAdmission>,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        let registration = frontier.registration();
+        if registration.mode.has_native_r() != registration.native_ledger.is_some()
+            || frontier.external_source().is_some()
+        {
+            return Err(reject(
+                "own collection frontier requires the original native ledger assembly",
+            ));
+        }
+        Self::from_attached_scope(
+            original,
+            frontier,
+            input_lock,
+            root_budget,
+            selective_policy,
+            root_admission,
+            None,
+        )
+    }
+    /// 실제 owner가 같은 lock/live RootAdmission과 결합한 외부 source만 받는다.
+    /// 외부 reported work는 native/common node credit으로 바꾸지 않는다.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_attached_external_frontier(
+        original: &RoventNativeCollectionOrigin,
+        frontier: &RoventFrontier,
+        input_lock: Digest,
+        root_budget: Digest,
+        selective_policy: Digest,
+        root_admission: Arc<crate::rovent_root_admission::RoventRootAdmission>,
+        source: &crate::rovent_external_launch::RoventAdmittedExternalRootSource,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        let registration = frontier.registration();
+        source
+            .validate_current()
+            .map_err(|error| reject(error.to_string()))?;
+        let actual = source.worker_source();
+        let raw = source.collection_evidence();
+        let Some(rz_experiments::RoventResearcher::External { profile }) =
+            &original.original_input_lock().manifest.engine.researcher
+        else {
+            return Err(reject(
+                "external collection root has no original external researcher pin",
+            ));
+        };
+        if !registration.mode.has_native_r()
+            || registration.native_ledger.is_some()
+            || !Arc::ptr_eq(source.root_admission(), &root_admission)
+            || !frontier
+                .external_source()
+                .is_some_and(|registered| registered.same_source(actual))
+            || actual.authority() != registration.authority
+            || actual.clock().domain != root_admission.runtime_clock().domain()
+            || actual.clock().origin != root_admission.runtime_clock().origin()
+            || raw["schema"] != ROVENT_COLLECTION_PROFILED_EXTERNAL_SOURCE
+            || raw["startup_input_lock_sha256"] != text_sha(input_lock)
+            || raw["profile_file_sha256"] != profile.profile.sha256
+            || raw["profile_file_bytes"].as_u64() != Some(profile.profile.bytes)
+            || raw["profile_canonical_sha256"] != profile.canonical_sha256
+            || raw["profile_capability_sha256"] != profile.capability_sha256
+            || raw["binary"]
+                != serde_json::to_value(&profile.binary)
+                    .map_err(|error| reject(error.to_string()))?
+            || raw["purpose"] != "research_checker"
+        {
+            return Err(reject(
+                "external collection original worker/source/root/lock differs",
+            ));
+        }
+        Self::from_attached_scope(
+            original,
+            frontier,
+            input_lock,
+            root_budget,
+            selective_policy,
+            root_admission,
+            Some(source),
+        )
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    #[allow(clippy::too_many_arguments)]
+    fn from_attached_scope(
+        original: &RoventNativeCollectionOrigin,
+        frontier: &RoventFrontier,
+        input_lock: Digest,
+        root_budget: Digest,
+        selective_policy: Digest,
+        root_admission: Arc<crate::rovent_root_admission::RoventRootAdmission>,
+        external: Option<&crate::rovent_external_launch::RoventAdmittedExternalRootSource>,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        let registration = frontier.registration();
+        let root_state = registration.root_rules.snapshot().identity();
+        let loaded = &original.original;
+        if input_lock != loaded.input_lock
+            || registration.mode != loaded.mode
+            || registration.authority.epoch.0 != loaded.process_epoch
+            || registration.root_budget != root_budget
+            || registration.selective_policy != selective_policy
+            || registration.model_namespace.as_ref() != &loaded.namespace
+            || registration.root_rules.snapshot().identity()
+                != registration.root_moves.root_identity()
+            || !root_admission
+                .original_context()
+                .accepts()
+                .map_err(|error| reject(error.to_string()))?
+            || root_admission.startup_lock_digest() != input_lock
+            || root_admission.authority() != registration.authority
+            || root_admission.root_budget_digest() != root_budget
+            || root_admission.hard_deadline() != registration.original_deadline
+            || root_admission.goal() != registration.goal
+            || root_admission.requested_nodes() != registration.nodes
+            || root_admission.state_and_history_digest() != root_state.semantic
+            || root_admission.root_snapshot().revision() != root_state.revision.0
+            || !root_admission
+                .root_snapshot()
+                .same_state(registration.root_rules.rules().snapshot())
+            || root_admission.allowed_root_moves().as_ref()
+                != registration.root_moves.allowed().as_ref()
+        {
+            return Err(reject(
+                "actual attached frontier differs from original loaded collection scope",
+            ));
+        }
+        root_admission
+            .descriptor()
+            .verify_against(original.original_input_lock())
+            .map_err(|error| reject(error.to_string()))?;
+        let domain = if external.is_some() {
+            ROVENT_COLLECTION_EXTERNAL_ROOT_ADMISSION
+        } else {
+            ROVENT_COLLECTION_ROOT_ADMISSION
+        };
+        let mut raw = json!({
+            "schema":domain,
+            "native_origin":original.raw_receipt(),
+            "native_origin_sha256":original.raw_sha256(),
+            "process_epoch":registration.authority.epoch.0,
+            "game_generation":registration.authority.game.0,
+            "root_generation":registration.authority.root.0,
+            "implementation_sha256":text_sha(registration.authority.implementation),
+            "deadline_clock":registration.original_deadline.clock.0.0,
+            "deadline_tick":registration.original_deadline.at.0,
+            "root_budget_sha256":text_sha(root_budget),
+            "selective_policy_sha256":text_sha(selective_policy),
+            "root_state":{"owner":root_state.owner.0,
+                "revision":root_state.revision.0,"semantic":text_sha(root_state.semantic)},
+            "store_root_state":registration.root_state.0,
+            "root_moves":registration.root_moves.allowed().iter().map(|movement|movement.to_string()).collect::<Vec<_>>(),
+            "depth_plies":registration.goal.depth_plies.map(|value|value.get()),
+            "mate_moves":registration.goal.mate_moves.map(|value|value.get()),
+            "requested_nodes":registration.nodes,
+            "root_descriptor":root_admission.descriptor(),
+            "root_descriptor_sha256":text_sha(root_admission.digest()),
+        });
+        if let Some(source) = external {
+            raw["external_source"] = source.collection_evidence().clone();
+            raw["external_source_sha256"] = json!(
+                rz_experiments::pals_data_v3::generation_digest(
+                    ROVENT_COLLECTION_PROFILED_EXTERNAL_SOURCE,
+                    source.collection_evidence()
+                )
+                .map_err(|error| reject(error.to_string()))?
+            );
+        }
+        let raw_sha256 = rz_experiments::pals_data_v3::generation_digest(domain, &raw)
+            .map_err(|error| reject(error.to_string()))?;
+        if let Some(lifetime) = &loaded.product_lifetime {
+            // Only actual successful attach can observe this root. A second
+            // root leaves the original first Arc unchanged and is not fresh.
+            let _ = lifetime.first_root.set(Arc::clone(&root_admission));
+        }
+        Ok(Self {
+            original: original.clone(),
+            authority: registration.authority,
+            deadline: registration.original_deadline,
+            rules: Arc::clone(&registration.root_rules),
+            root_moves: Arc::clone(&registration.root_moves),
+            root_state,
+            root_budget,
+            selective_policy,
+            root_admission,
+            external_source: external.cloned(),
+            raw: Arc::new(raw),
+            raw_sha256: raw_sha256.into(),
+        })
+    }
+    #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+    pub(crate) fn from_attached_frontier(
+        _: &RoventNativeCollectionOrigin,
+        _: &RoventFrontier,
+        _: Digest,
+        _: Digest,
+        _: Digest,
+    ) -> Result<Self, AdaptiveCollectionError> {
+        Err(AdaptiveCollectionError::new(
+            AdaptiveCollectionStage::Accepted,
+            "RoventCollectionUnsupported",
+            "actual native collection requires pals-adaptive and onnx-cpu",
+        ))
+    }
+    pub fn authority(&self) -> SearchAuthority {
+        self.authority
+    }
+    pub fn validates_registration(
+        &self,
+        authority: SearchAuthority,
+        mode: rz_contracts::rovent::ExecutionMode,
+        root_budget: Digest,
+        deadline: Deadline,
+    ) -> bool {
+        self.authority == authority
+            && self.original.original.mode == mode
+            && self.root_budget == root_budget
+            && self.deadline == deadline
+    }
+    pub fn selective_policy(&self) -> Digest {
+        self.selective_policy
+    }
+    pub fn rules(&self) -> &Arc<ContractState> {
+        &self.rules
+    }
+    pub fn root_moves(&self) -> &Arc<RootMoveDomain> {
+        &self.root_moves
+    }
+    pub fn native_origin(&self) -> &RoventNativeCollectionOrigin {
+        &self.original
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn root_admission(&self) -> &Arc<crate::rovent_root_admission::RoventRootAdmission> {
+        &self.root_admission
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn external_source(
+        &self,
+    ) -> Option<&crate::rovent_external_launch::RoventAdmittedExternalRootSource> {
+        self.external_source.as_ref()
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn raw_receipt(&self) -> &Value {
+        &self.raw
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn raw_sha256(&self) -> &str {
+        &self.raw_sha256
+    }
+    pub fn validate_ticket(
+        &self,
+        ticket: &RoleTicketEnvelope,
+    ) -> Result<(), AdaptiveCollectionError> {
+        if ticket.authority != self.authority
+            || ticket.original_deadline != self.deadline
+            || ticket.view.root_state != self.root_state
+            || ticket.role == Role::Validator
+        {
+            return Err(reject(
+                "native ticket is outside the original admitted Rovent P/C root",
+            ));
+        }
+        Ok(())
+    }
+    pub fn validate_output(
+        &self,
+        ticket: &RoleTicketEnvelope,
+        output: &rz_contracts::pals::RoleOutput,
+    ) -> Result<(), AdaptiveCollectionError> {
+        self.validate_ticket(ticket)?;
+        let namespace = &self.original.original.namespace;
+        namespace
+            .verify(ticket, output, Some(namespace.value_identity()))
+            .map_err(|error| reject(error.to_string()))
+    }
+    pub(super) fn validate_ranking(
+        &self,
+        ranking: &ProposerRankingPublished,
+    ) -> Result<(), AdaptiveCollectionError> {
+        self.validate_ticket(&ranking.source().ticket)?;
+        if ranking.source().ticket.role != Role::Proposer
+            || !std::ptr::eq(ranking.rules(), self.rules.as_ref())
+        {
+            return Err(reject(
+                "initial P publication is not from the original admitted Rules owner",
+            ));
+        }
+        Ok(())
+    }
+}

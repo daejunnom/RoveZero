@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a bounded same-HEAD validation bundle; never run a neural workload.
 
-CPU compilation and four explicit static metadata getters only. Cargo ELF
+CPU compilation and explicit static metadata getters only. Cargo ELF
 FD/copy custody and component framing follow the reviewed report payload;
 process-tree custody reuses managed_process.run_group. No Cloud entry, model,
 runtime DSO, weight, credential discovery, cache adoption, or retry is present.
@@ -34,8 +34,13 @@ from managed_storage import checked, tree_size
 ROOT_CAP = 12 << 30
 ARTIFACT_CAP = 512 << 20
 ELF_CAP = 256 << 20
+ELF_PAYLOAD_CAP = 768 << 20
 LOG_CAP = 8 << 20
 SOURCE_CAP = 128 << 20
+# Release compilation can exhaust the old 45-minute window after several
+# feature profiles have already completed. Keep an explicit finite build-only
+# ceiling; the requested window is recorded in the original resource receipt.
+MAX_BUILD_SECONDS = 10800
 SINGLETONS = {'Cargo.toml', 'Cargo.lock', 'LICENSE', 'rust-toolchain.toml',
               'experiments/model-research/pals/pyproject.toml',
               'experiments/baselines/fastchess-clock-ponder-v2.patch'}
@@ -50,17 +55,46 @@ SPECS = (
     ('rz-eval', 'example', 'virtual_review_numeric_capture', 'onnx,contracts'),
     ('rz-uci', 'bin', 'rz-pals-adaptive', 'pals-adaptive,onnx-cuda'),
     ('rz-uci', 'example', 'pals_rules_descriptor', 'pals-adaptive,onnx-cuda'),
+    ('rz-uci', 'bin', 'rz-rovent', 'pals-adaptive,onnx-cuda'),
+    ('rz-arena', 'bin', 'rz-rovent-trainer', 'pals-collection-onnx,native-cuda'),
+    ('rz-arena', 'bin', 'rz-rovent-native', 'pals-collection-onnx,native-cuda,native-validation-diagnostics'),
+    ('rz-arena', 'bin', 'rz-rovent-collect', 'pals-collection-onnx,native-cuda'),
+    ('rz-arena', 'bin', 'rz-rovent-utility-trainer', 'pals-collection-onnx,native-cuda'),
+    ('rz-uci', 'example', 'rovent_startup_metadata', 'pals-adaptive,onnx-cuda'),
+    ('rz-experiments', 'bin', 'rz-experiments', 'pals-content-admission'),
     ('rz-uci', 'example', 'pals_continuation_diagnostic', 'pals-adaptive-diagnostics'),
 )
 WARM = ('rz-uci', 'example', 'virtual_review_warm_numeric_capture',
         'pals-adaptive,onnx-cpu,experimental-io-binding')
 # This standalone example calls the CUDA-enabled eval backend directly. Its
 # required features do not certify the separate engine/native_bootstrap path.
+FUNCTIONAL_SPECS = (
+    ('rz-arena', 'bin', 'rz-rovent-native', 'pals-collection-onnx,native-cuda,native-validation-diagnostics'),
+    ('rz-arena', 'bin', 'rz-rovent-collect', 'pals-collection-onnx,native-cuda'),
+    ('rz-arena', 'bin', 'rz-rovent-utility-trainer', 'pals-collection-onnx,native-cuda'),
+    ('rz-uci', 'example', 'rovent_startup_metadata', 'pals-adaptive,onnx-cuda'),
+    ('rz-eval', 'example', 'virtual_review_numeric_capture', 'onnx,contracts'),
+    ('rz-experiments', 'bin', 'rz-experiments', 'pals-content-admission'),
+)
 
 
 def require(value, code):
     if not value:
         raise RuntimeError(code)
+
+
+def validate_functional_specs(specs):
+    # This only closes the existing producer's declared 13/optional-Warm 14
+    # targets. It grants no artifact, local ABI, provider or runtime admission.
+    require(type(specs) is tuple and len(specs) in (13, 14)
+            and all(type(row) is tuple and len(row) == 4
+                    and all(type(part) is str for part in row) for row in specs),
+            'ClosedFunctionalBundleSpecShape')
+    by_name = {row[2]: row for row in specs}
+    require(len(by_name) == len(specs), 'DuplicateBundleTarget')
+    require(all(by_name.get(row[2]) == row for row in FUNCTIONAL_SPECS),
+            'RequiredSixFunctionalTargetsKindsAndFeatures')
+    require(specs == SPECS or specs == SPECS + (WARM,), 'ClosedFunctionalBundleSpecRoster')
 
 
 def strict_json(raw):
@@ -74,9 +108,19 @@ def strict_json(raw):
                       parse_constant=lambda _: (_ for _ in ()).throw(RuntimeError('NonfiniteJson')))
 
 
-def identity(meta):
+def identity(meta, *, creation_time=False):
+    # CPython 3.12+ Windows path stat reports creation time in st_ctime,
+    # while fstat reports ChangeTime. Only FD-versus-path comparisons use
+    # their common birthtime; FD-versus-FD checks retain ChangeTime.
+    timestamp = getattr(meta, 'st_birthtime_ns', meta.st_ctime_ns) if creation_time else meta.st_ctime_ns
     return (meta.st_dev, meta.st_ino, meta.st_mode, meta.st_nlink,
-            meta.st_size, meta.st_mtime_ns, meta.st_ctime_ns)
+            meta.st_size, meta.st_mtime_ns, timestamp)
+
+
+def same_file_identity(before, after, named):
+    return (identity(before) == identity(after)
+            and identity(before, creation_time=os.name == 'nt')
+            == identity(named, creation_time=os.name == 'nt'))
 
 
 def pinned_file(path, maximum=SOURCE_CAP, cargo=False, allow_empty=False):
@@ -93,7 +137,7 @@ def pinned_file(path, maximum=SOURCE_CAP, cargo=False, allow_empty=False):
         while raw := stream.read(65536):
             digest.update(raw)
             blob.update(raw)
-        require(identity(before) == identity(os.fstat(fd)) == identity(path.lstat()), 'ArtifactIdentityChanged')
+        require(same_file_identity(before, os.fstat(fd), path.lstat()), 'ArtifactIdentityChanged')
         stream.seek(0)
         return stream, {'bytes': before.st_size, 'sha256': digest.hexdigest()}, before, blob.hexdigest()
     except BaseException:
@@ -124,7 +168,7 @@ def copy_cargo_elf(source, destination, check_budget):
                 count += len(raw)
             target.flush()
             os.fsync(target.fileno())
-        require(identity(before) == identity(os.fstat(stream.fileno())) == identity(source.lstat()), 'CargoOriginalElfChanged')
+        require(same_file_identity(before, os.fstat(stream.fileno()), source.lstat()), 'CargoOriginalElfChanged')
     destination.chmod(0o700)
     actual = file_pin(destination, ELF_CAP)
     require(actual == expected == {'bytes': count, 'sha256': digest.hexdigest()}
@@ -243,6 +287,27 @@ def validate_registry(value):
             'StaticRegistryGetterOutput')
 
 
+def validate_rovent_build_metadata(value, expected_head, components):
+    """Observe compile metadata only; neither load nor admit a native runtime."""
+    fields = {'domain', 'source_commit', 'source_components', 'target_os', 'target_arch',
+              'onnx_cpu_compiled', 'onnx_cuda_compiled', 'native_runtime_loaded',
+              'native_model_loaded', 'neural_execution_observed'}
+    require(type(value) is dict and set(value) == fields
+            and value['domain'] == 'rz-rovent-build-capabilities/1'
+            and value['source_commit'] == expected_head
+            and value['target_os'] == 'linux' and value['target_arch'] == 'x86_64'
+            and value['onnx_cpu_compiled'] is True and value['onnx_cuda_compiled'] is True
+            and all(value[name] is False for name in (
+                'native_runtime_loaded', 'native_model_loaded', 'neural_execution_observed')),
+            'StaticRoventBuildMetadata')
+    observed = value['source_components']
+    private = {'rovent_bootstrap', 'rovent_process_boundary'}
+    require(type(observed) is dict and set(observed) == set(components) | private
+            and all(observed[name] == digest for name, digest in components.items())
+            and all(type(observed[name]) is str and re.fullmatch('[a-f0-9]{64}', observed[name])
+                    for name in private), 'StaticRoventRegisteredSourceMismatch')
+
+
 def stream_child(argv):
     """Drain both pipes but save at most 8MiB each; remain in the owned group.
 
@@ -281,6 +346,31 @@ def stream_child(argv):
         selector.close()
 
 
+def cleanup_compiler_outputs(root, artifact, receipt):
+    """Retire only this fresh build's regenerable folders after custody closes."""
+    from managed_storage import remove_tree, write_record
+    require(receipt['status'] == 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED'
+            and all(row.get('original_tree_cleanup_verified') is True for row in receipt['commands'])
+            and file_pin(artifact / 'native-validation-binaries.tar.gz', ARTIFACT_CAP) == receipt['binary_bundle'],
+            'VerifiedBundleAndTreeClosureBeforeCleanup')
+    names = ('target-native', 'target-warm', 'target-diagnostic', 'cargo-home', 'tmp', 'private-elf')
+    # No model, source, original external asset or failure evidence is listed.
+    for name in names:
+        tree_size(root / name)
+    journal = {'schema': 'rovezero.ci-compile-cleanup.v1',
+               'scope': 'fresh_ci_compile_only', 'bundle_pin': receipt['binary_bundle'],
+               'planned_direct_children': list(names), 'removed': [], 'complete': False}
+    write_record(artifact / 'compile-cleanup.json', journal)
+    for name in names:
+        if (root / name).exists():
+            remove_tree(root / name, root)
+        journal['removed'].append(name)
+        write_record(artifact / 'compile-cleanup.json', journal)
+    journal['complete'] = True
+    write_record(artifact / 'compile-cleanup.json', journal)
+    return journal
+
+
 class Build:
     def __init__(self, root, source, seconds):
         self.root, self.source = root, source
@@ -305,6 +395,21 @@ class Build:
             'CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL', 'RUSTUP_TOOLCHAIN', 'RZ_PALS_SOURCE_COMMIT')}
         row['cargo_target_dir'] = env.get('CARGO_TARGET_DIR')
         self.commands.append(row)
+        started = time.monotonic()
+
+        def observe(event, **values):
+            # Progress is best effort; command and process-tree receipts decide admission.
+            try:
+                print(json.dumps({
+                    'event': event, 'label': label,
+                    'elapsed_seconds': round(time.monotonic() - started, 3),
+                    'stdout_log': str(out), 'stderr_log': str(err), **values,
+                }, sort_keys=True, allow_nan=False), file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass
+
+        observe('native_bundle_command_start', status='starting', argv=argv,
+                cargo_target_dir=row['cargo_target_dir'])
 
         def check():
             self.budget()
@@ -333,17 +438,50 @@ class Build:
                 os.fsync(stdout.fileno())
                 os.fsync(stderr.fileno())
         row.update(exit_code=code, original_tree_cleanup_verified=gone, supervisor_error=failure)
+        observe('native_bundle_command_terminal',
+                status='process_and_tree_closed' if code == 0 and gone is True and failure is None
+                else 'command_or_original_tree_failed',
+                exit_code=code, original_tree_cleanup_verified=gone,
+                supervisor_error=None if failure is None else str(failure)[:2048])
         require(code == 0 and gone is True and failure is None, 'CommandOrOriginalTreeClosureFailed:' + label)
         check()
         stream, row['stdout_pin'], before, _ = pinned_file(out, LOG_CAP)
         with stream:
             raw = stream.read()
-            require(identity(before) == identity(os.fstat(stream.fileno())) == identity(out.lstat()), 'CommandStdoutFDChanged')
+            require(same_file_identity(before, os.fstat(stream.fileno()), out.lstat()), 'CommandStdoutFDChanged')
         # Empty stderr is ordinary; stdout-consuming commands are nonempty.
         row['stderr_bytes'] = err.stat().st_size
         stream, row['stderr_pin'], _, _ = pinned_file(err, LOG_CAP, allow_empty=True)
         stream.close()
         return raw
+
+
+def selected_elf_payload(binaries):
+    sizes = [row['pin']['bytes'] for row in binaries.values()]
+    require(sizes and all(type(size) is int and 0 < size <= ELF_CAP for size in sizes)
+            and sum(sizes) <= ELF_PAYLOAD_CAP, 'SelectedELF768MiBPayloadBudget')
+    return sum(sizes)
+
+
+class BoundedArchiveWriter:
+    """Bound compressed bytes separately from the verified ELF payload."""
+    def __init__(self, stream, maximum):
+        require(type(maximum) is int and maximum > 0, 'PositiveCompressedArchiveBudget')
+        self.stream, self.maximum, self.written = stream, maximum, 0
+        self.name = stream.name
+
+    def write(self, data):
+        require(self.written + len(data) <= self.maximum, 'CompressedArchiveBudget')
+        written = self.stream.write(data)
+        require(written == len(data), 'CompressedArchiveShortWrite')
+        self.written += written
+        return written
+
+    def flush(self):
+        self.stream.flush()
+
+    def tell(self):
+        return self.written
 
 
 def write_json(path, value):
@@ -358,7 +496,7 @@ def write_json(path, value):
 def run(source, root, expected_head, seconds):
     require(sys.platform == 'linux' and platform.machine() in ('x86_64', 'AMD64')
             and re.fullmatch('[a-f0-9]{40}', expected_head)
-            and 1 <= seconds <= 2700, 'LinuxFiniteBuildProfile')
+            and 1 <= seconds <= MAX_BUILD_SECONDS, 'LinuxFiniteBuildProfile')
     source, root = checked(source), checked(root)
     runner_temp = checked(Path(os.environ['RUNNER_TEMP']))
     require(root.is_relative_to(runner_temp / 'RoveZero') and not root.is_relative_to(source)
@@ -384,7 +522,8 @@ def run(source, root, expected_head, seconds):
                'source_commit': expected_head, 'commands': build.commands,
                'resource': {'cpu_affinity_actual': affinity, 'build_jobs': 2, 'seconds': seconds,
                             'child_affinity_guard': 'isolated_wrapper_exact_readback_before_exec',
-                            'managed_bytes_cap': ROOT_CAP, 'artifact_bytes_cap': ARTIFACT_CAP},
+                            'managed_bytes_cap': ROOT_CAP, 'artifact_bytes_cap': ARTIFACT_CAP,
+                            'uncompressed_elf_payload_bytes_cap': ELF_PAYLOAD_CAP},
                'neural_execution': False, 'gpu_execution': False, 'training_execution': False,
                'optimizer_updates': 0, 'mapped_image': None, 'numerical_or_runtime_acceptance': None,
                'host': {'machine': platform.machine(), 'libc_observed': platform.libc_ver(),
@@ -423,10 +562,12 @@ def run(source, root, expected_head, seconds):
         require(metadata['workspace_root'] == str(source), 'ActualCargoWorkspace')
         manifest = tomllib.loads((source / 'crates/rz-uci/Cargo.toml').read_text())
         warm, receipt['warm_status'] = warm_spec(manifest, {r['path'] for r in rows})
-        for spec in SPECS + ((warm,) if warm else ()):
+        selected_specs = SPECS + ((warm,) if warm else ())
+        validate_functional_specs(selected_specs)
+        for spec in selected_specs:
             package, kind, name, features = spec
-            slot = 'target-warm' if spec == warm else ('target-diagnostic' if name == 'pals_continuation_diagnostic' else 'target-native')
-            env['CARGO_TARGET_DIR'] = str(root / slot)
+            # Reuse Cargo's fingerprinted dependencies, retaining separate invocations
+            # and exact feature admission. Copy each target privately before the next build.
             argv = [tools['cargo'], 'build', '--locked', '--release', '--no-default-features',
                     '-p', package, '--features', features, '--' + kind, name, '--message-format=json-render-diagnostics']
             output, compiled = cargo_artifact(build.command('build-' + name, argv, env), metadata, source,
@@ -444,6 +585,14 @@ def run(source, root, expected_head, seconds):
         compiled = strict_json(build.command('compiled-source-inventory', [str(private / 'rz-pals-adaptive'), '--source-inventory'], env))
         require(compiled == {'domain': 'rz-pals-compiled-source-registration-v5/1', 'source_commit': expected_head,
                              'components': components, 'neural_execution': False, 'training_execution': False}, 'CompiledInventorySourceMismatch')
+        rovent = strict_json(build.command('rovent-build-metadata', [str(private / 'rz-rovent'), '--build-capabilities-json'], env))
+        validate_rovent_build_metadata(rovent, expected_head, components)
+        receipt['rovent_build_binding'] = {
+            'ELF': receipt['binaries']['rz-rovent']['pin'],
+            'metadata': rovent,
+            'registered_components_independently_matched': True,
+            'private_component_digests': 'observed_only_not_independently_recomputed',
+            'scope': 'same_actual_ELF_compile_metadata_no_runtime_model_or_execution_authority'}
         native = strict_json(build.command('native-source-pins', [str(private / 'virtual_review_numeric_capture'), '--source-pins'], env))
         require(native == {name: components[name] for name in CORE5}, 'NativeCore5SourceMismatch')
         registry = strict_json(build.command('static-model-registry', [str(private / 'virtual_review_numeric_capture'), '--model-registry'], env))
@@ -482,7 +631,7 @@ def run(source, root, expected_head, seconds):
         require(rules.get('rules_input_semantic_sha256') == semantic.hexdigest()
                 and rules.get('rules_encoder_source_sha256') == encoder.hexdigest(), 'StaticRulesDescriptorSourceFraming')
         require(source_inventory(source, tree) == (rows, controls)
-                and identity(lock_meta) == identity(os.fstat(lock.fileno())) == identity((source / 'Cargo.lock').lstat())
+                and same_file_identity(lock_meta, os.fstat(lock.fileno()), (source / 'Cargo.lock').lstat())
                 and file_pin(source / 'Cargo.lock') == lock_pin, 'SourceOrLockChangedDuringBuild')
         require(build.command('git-head-final', [tools['git'], 'rev-parse', 'HEAD'], env).decode().strip() == expected_head,
                 'HeadChangedDuringBuild')
@@ -499,15 +648,17 @@ def run(source, root, expected_head, seconds):
             shutil.copyfileobj(lock, target, 65536)
             target.flush()
             os.fsync(target.fileno())
-        require(identity(lock_meta) == identity(os.fstat(lock.fileno())) == identity((source / 'Cargo.lock').lstat()),
+        require(same_file_identity(lock_meta, os.fstat(lock.fileno()), (source / 'Cargo.lock').lstat()),
                 'BundledLockOriginalFDChanged')
         require(file_pin(artifact / 'Cargo.lock') == lock_pin, 'BundledLockPin')
         members = sorted(receipt['binaries'])
-        total = sum(receipt['binaries'][name]['pin']['bytes'] for name in members)
-        require(total + (16 << 20) <= ARTIFACT_CAP, 'SelectedELF512MiBBundleBudget')
+        total = selected_elf_payload(receipt['binaries'])
         build.budget(total)
         bundle = artifact / 'native-validation-binaries.tar.gz'
-        with bundle.open('xb') as raw, tarfile.open(fileobj=raw, mode='w:gz', format=tarfile.USTAR_FORMAT) as archive:
+        compressed_cap = ARTIFACT_CAP - tree_size(artifact) - (16 << 20)
+        require(compressed_cap > 0, 'CompressedArchiveMetadataReserve')
+        with bundle.open('xb') as raw, tarfile.open(fileobj=BoundedArchiveWriter(raw, compressed_cap),
+                                                  mode='w:gz', format=tarfile.USTAR_FORMAT) as archive:
             for name in members:
                 stream, actual, before, _ = pinned_file(private / name, ELF_CAP)
                 with stream:
@@ -515,7 +666,7 @@ def run(source, root, expected_head, seconds):
                     info = tarfile.TarInfo('bin/' + name)
                     info.size, info.mode = actual['bytes'], 0o700
                     archive.addfile(info, stream)
-                    require(identity(before) == identity(os.fstat(stream.fileno())) == identity((private / name).lstat()), 'BundleMemberFDChanged')
+                    require(same_file_identity(before, os.fstat(stream.fileno()), (private / name).lstat()), 'BundleMemberFDChanged')
         receipt.update(status='SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED',
                        source_files=len(rows), component_count=len(components), source_components=components,
                        Cargo_lock_before_after=lock_pin, Cargo_lock_same_fd_stable=True,
@@ -539,13 +690,24 @@ def run(source, root, expected_head, seconds):
                         shutil.copyfileobj(stream, target, 65536)
                         target.flush()
                         os.fsync(target.fileno())
-                        require(identity(before) == identity(os.fstat(stream.fileno())) == identity(path.lstat()), 'ClosedCommandLogFDChanged')
+                        require(same_file_identity(before, os.fstat(stream.fileno()), path.lstat()), 'ClosedCommandLogFDChanged')
                 except (OSError, RuntimeError) as error:
                     receipt['status'] = 'FAILED_NOT_ADMITTED'
                     receipt['log_preservation_error'] = {'type': type(error).__name__, 'message': str(error)[:512]}
                     break
+        if receipt['status'] == 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED':
+            receipt['regenerable_cleanup'] = {'journal': 'compile-cleanup.json',
+                'acceptance': 'terminal journal is required separately from build success'}
         write_json(artifact / 'build-receipt.json', receipt)
         require(tree_size(artifact) <= ARTIFACT_CAP, 'Artifact512MiBCap')
+        if receipt['status'] == 'SAME_HEAD_RELEASE_ELFS_AND_STATIC_SOURCE_METADATA_VERIFIED':
+            try:
+                cleanup_compiler_outputs(root, artifact, receipt)
+            except (OSError, RuntimeError) as error:
+                receipt['status'] = 'FAILED_NOT_ADMITTED'
+                receipt['cleanup_error'] = {'type': type(error).__name__, 'message': str(error)[:512]}
+                write_json(artifact / 'cleanup-failure.json', {
+                    'status': receipt['status'], 'cleanup_error': receipt['cleanup_error']})
         if os.environ.get('GITHUB_OUTPUT'):
             with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
                 output.write('artifact_ready=true\n')

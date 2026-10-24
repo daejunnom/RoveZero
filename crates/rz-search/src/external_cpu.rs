@@ -23,9 +23,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub mod adaptive;
+pub mod collection_teacher;
+pub mod process_scope;
+mod profiled_researcher;
+pub mod profiled_worker;
+pub mod profiles;
 pub mod worker;
 
 pub use adaptive::*;
+pub use profiled_researcher::ProfiledResearcherAdmission;
+pub use profiled_worker::*;
+pub use profiles::*;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use tests::FIXTURE_LOCK as EXTERNAL_FIXTURE_LOCK;
 
 pub const EXTERNAL_UCI_CHECKER_VERSION: &str = "rz-external-uci-checker/0.1";
 pub const EXTERNAL_UCI_SCORE_SEMANTICS: &str = "uci-native-cp-or-signed-mate-moves;root-side-to-move;reported-bounds;selectivity-unknown;no-cp-wdl-calibration;no-rules-proof";
@@ -42,6 +52,8 @@ pub struct ExternalLaunchPin {
     directory: Arc<File>,
     #[cfg(not(target_os = "linux"))]
     _unsupported: (),
+    #[cfg(target_os = "linux")]
+    collection_process_permit: Option<process_scope::CollectionProcessPermit>,
 }
 
 impl ExternalLaunchPin {
@@ -65,7 +77,26 @@ impl ExternalLaunchPin {
         Ok(Self {
             executable: Arc::new(executable),
             directory: Arc::new(directory),
+            collection_process_permit: None,
         })
+    }
+    /// Only the Collection worker can attach its exact registered member.
+    /// Public legacy pinned checkers remain on the original singleton gate.
+    pub(crate) fn with_collection_permit(
+        self,
+        permit: process_scope::CollectionProcessPermit,
+    ) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let mut pin = self;
+            pin.collection_process_permit = Some(permit);
+            pin
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = permit;
+            self
+        }
     }
 }
 
@@ -534,9 +565,49 @@ pub struct ExternalUciCpuChecker {
     startup_multipv: Option<u16>,
     last_requested_multipv: Option<u16>,
     launch_pin: Option<ExternalLaunchPin>,
+    engine_profile: Option<(ExternalEngineProfile, ExternalEnginePurpose)>,
+    last_issued_constraint: Option<ExternalGoConstraint>,
+    last_issued_go: Option<String>,
 }
 
 impl ExternalUciCpuChecker {
+    /// Engine/purpose admission for new profiles. Legacy `create` remains the
+    /// unchanged compatibility path; an arena declaration cannot start this
+    /// research checker or inherit its root/combined-limit capabilities.
+    pub fn create_profiled(
+        config: ExternalCpuConfig,
+        profile: ExternalEngineProfile,
+        purpose: ExternalEnginePurpose,
+    ) -> Result<Self, CheckerError> {
+        if purpose == ExternalEnginePurpose::ArenaOpponent {
+            return Err(CheckerError::Unsupported(
+                "arena opponent must use the arena process owner",
+            ));
+        }
+        profile.validate_identity(
+            purpose,
+            &config.identity,
+            config.expected_uci_name.as_deref().unwrap_or_default(),
+        )?;
+        let mut checker = Self::create(config)?;
+        checker.engine_profile = Some((profile, purpose));
+        checker.conditions = format!(
+            "{};score:{};profile:{profile:?};purpose:{purpose:?};depth-cap:{};prefix-cap:{};resume:unsupported;root-searchmoves:{};combined-go:{};explicit-query-constraints;task-wall:includes-stop-and-ready;single-active;game:ucinewgame+ready;output-cap:{};line-cap:{};task-ms:{};stop-ms:{};shutdown-ms:{}",
+            EXTERNAL_UCI_CHECKER_VERSION,
+            EXTERNAL_UCI_SCORE_SEMANTICS,
+            checker.config.max_depth,
+            checker.config.max_prefix_plies,
+            profile.capabilities().searchmoves,
+            profile.capabilities().combined_depth_nodes_movetime,
+            checker.config.max_output_bytes,
+            checker.config.max_line_bytes,
+            checker.config.max_task_wall_time.as_millis(),
+            checker.config.stop_grace.as_millis(),
+            checker.config.shutdown_grace.as_millis(),
+        );
+        Ok(checker)
+    }
+
     /// Create an unstarted owner so failed startup evidence remains available.
     /// The caller must use `start` and inspect `last_attempt` on failure.
     pub fn create(config: ExternalCpuConfig) -> Result<Self, CheckerError> {
@@ -574,6 +645,9 @@ impl ExternalUciCpuChecker {
             startup_multipv: None,
             last_requested_multipv: None,
             launch_pin: None,
+            engine_profile: None,
+            last_issued_constraint: None,
+            last_issued_go: None,
         })
     }
 
@@ -862,7 +936,71 @@ impl ExternalUciCpuChecker {
         limits: CpuLimits,
         cancel: &AtomicBool,
     ) -> Result<CheckerReport, CheckerError> {
-        self.run_with_control(position, roots, limits, cancel, None)
+        self.last_attempt = None;
+        let constraint = ExternalGoConstraint::Combined {
+            depth: limits.max_depth,
+            reported_nodes: limits.max_nodes,
+        };
+        if let Some((profile, _)) = self.engine_profile {
+            profile.require_query(constraint, roots.is_some())?;
+        }
+        self.run_with_control(position, roots, limits, cancel, None, constraint, true)
+    }
+
+    /// New explicit-constraint path for full-legal-root single-limit engines.
+    /// It reuses the same physical owner, stop/bestmove/readiness barrier and
+    /// elapsed provenance; absent limits are not filled with fictitious caps.
+    pub fn analyze_profiled(
+        &mut self,
+        position: &Position,
+        roots: Option<&[BoardMove]>,
+        requested: ExternalGoConstraint,
+        hard_deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<ProfiledExternalReport, CheckerError> {
+        self.last_attempt = None;
+        let (profile, purpose) = self.engine_profile.ok_or(CheckerError::Invalid(
+            "explicit external query requires an admitted engine profile",
+        ))?;
+        profile.require_query(requested, roots.is_some())?;
+        if requested
+            .requested_depth()
+            .is_some_and(|depth| depth > self.config.max_depth)
+        {
+            return Err(CheckerError::Invalid(
+                "external requested depth exceeds profile cap",
+            ));
+        }
+        let limits = CpuLimits {
+            max_depth: requested.requested_depth().unwrap_or(0),
+            max_nodes: requested.requested_nodes().unwrap_or(0),
+            deadline: Some(hard_deadline),
+        };
+        let CheckerReport::ExternalUci(raw) =
+            self.run_with_control(position, roots, limits, cancel, None, requested, false)?
+        else {
+            return Err(error("analysis", "foreign_report_type"));
+        };
+        let issued = self.last_issued_constraint.ok_or(CheckerError::Invalid(
+            "external query completed without issued constraint evidence",
+        ))?;
+        let issued_go = self.last_issued_go.take().ok_or(CheckerError::Invalid(
+            "external query completed without issued command evidence",
+        ))?;
+        Ok(ProfiledExternalReport {
+            profile,
+            purpose,
+            requested,
+            issued,
+            issued_go,
+            reported_node_overshoot: requested
+                .requested_nodes()
+                .is_some_and(|limit| raw.work.nodes.is_some_and(|nodes| nodes > limit)),
+            raw,
+            strict_native_nodes: None,
+            option_application_observed: None,
+            readiness_barrier_completed: true,
+        })
     }
 
     /// The synchronous checker is owned by a private external worker. The
@@ -877,6 +1015,16 @@ impl ExternalUciCpuChecker {
         control: &dyn ExternalControl,
         policy: ExternalSlicePolicy,
     ) -> Result<ExternalCooperativeReport, CheckerError> {
+        self.last_attempt = None;
+        if let Some((profile, _)) = self.engine_profile {
+            profile.require_query(
+                ExternalGoConstraint::Combined {
+                    depth: limits.max_depth,
+                    reported_nodes: policy.requested_reported_nodes,
+                },
+                roots.is_some(),
+            )?;
+        }
         let candidates = roots.map_or_else(
             || position.ordered_legal_moves().moves().len(),
             <[BoardMove]>::len,
@@ -905,8 +1053,18 @@ impl ExternalUciCpuChecker {
         self.cooperative_opinions.clear();
         self.stop_control = None;
         self.go_issue = ExternalGoIssue::NotIssued;
-        let CheckerReport::ExternalUci(report) =
-            self.run_with_control(position, roots, limits, cancel, Some((control, policy)))?
+        let CheckerReport::ExternalUci(report) = self.run_with_control(
+            position,
+            roots,
+            limits,
+            cancel,
+            Some((control, policy)),
+            ExternalGoConstraint::Combined {
+                depth: limits.max_depth,
+                reported_nodes: limits.max_nodes,
+            },
+            false,
+        )?
         else {
             return Err(error("analysis", "foreign_report_type"));
         };
@@ -951,6 +1109,7 @@ impl ExternalUciCpuChecker {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_with_control(
         &mut self,
         position: &Position,
@@ -958,16 +1117,21 @@ impl ExternalUciCpuChecker {
         limits: CpuLimits,
         cancel: &AtomicBool,
         cooperative: Option<(&dyn ExternalControl, ExternalSlicePolicy)>,
+        constraint: ExternalGoConstraint,
+        enforce_reported_node_cap: bool,
     ) -> Result<CheckerReport, CheckerError> {
         self.last_attempt = None;
         self.go_issue = ExternalGoIssue::NotIssued;
+        self.last_issued_constraint = None;
+        self.last_issued_go = None;
         let start = Instant::now();
         if self.failed || self.active {
             return Err(error("analysis", "checker_not_available"));
         }
-        if limits.max_depth == 0
-            || limits.max_depth > self.config.max_depth
-            || limits.max_nodes == 0
+        if constraint
+            .requested_depth()
+            .is_some_and(|depth| depth == 0 || depth > self.config.max_depth)
+            || constraint.requested_nodes() == Some(0)
         {
             return Err(CheckerError::Invalid("external requested depth/nodes"));
         }
@@ -1052,6 +1216,8 @@ impl ExternalUciCpuChecker {
             &command,
             &mut report,
             cooperative,
+            constraint,
+            enforce_reported_node_cap,
         );
         self.capture(&mut report, start);
         if let Err(failure) = result {
@@ -1106,6 +1272,8 @@ impl ExternalUciCpuChecker {
         position_command: &str,
         report: &mut ExternalCheckerReport,
         cooperative: Option<(&dyn ExternalControl, ExternalSlicePolicy)>,
+        constraint: ExternalGoConstraint,
+        enforce_reported_node_cap: bool,
     ) -> Result<(), CheckerError> {
         budget.analysis_millis(Instant::now())?;
         let requested_width = cooperative.map(|(_, policy)| policy.multipv).or_else(|| {
@@ -1153,10 +1321,7 @@ impl ExternalUciCpuChecker {
             budget
         };
         let remaining_ms = budget.analysis_millis(ready_at)?;
-        let mut go = format!(
-            "go depth {} nodes {} movetime {}",
-            limits.max_depth, limits.max_nodes, remaining_ms
-        );
+        let (mut go, issued) = constraint.command(remaining_ms);
         if let Some(mask) = roots {
             go.push_str(" searchmoves");
             for mv in mask {
@@ -1165,6 +1330,10 @@ impl ExternalUciCpuChecker {
             }
         }
         self.go_issue = ExternalGoIssue::Unknown;
+        self.last_issued_constraint = Some(issued);
+        if self.engine_profile.is_some() {
+            self.last_issued_go = Some(go.clone());
+        }
         self.owner()?.send(&go, budget.analysis_deadline)?;
         self.go_issue = ExternalGoIssue::Issued;
         self.active = true;
@@ -1255,7 +1424,7 @@ impl ExternalUciCpuChecker {
                     }
                     report.work.nodes = Some(nodes);
                     self.capture(report, start);
-                    if cooperative.is_none() && nodes > limits.max_nodes {
+                    if enforce_reported_node_cap && nodes > limits.max_nodes {
                         return Err(error("analysis", "reported_node_budget_exceeded"));
                     }
                 }
@@ -1467,17 +1636,29 @@ impl CpuChecker for ExternalUciCpuChecker {
         Ok(())
     }
     fn capabilities(&self) -> CheckerCapabilities {
+        let root_moves = self
+            .engine_profile
+            .is_none_or(|(profile, _)| profile.capabilities().searchmoves);
         CheckerCapabilities {
             max_depth: self.config.max_depth,
             max_prefix_plies: self.config.max_prefix_plies,
-            max_root_moves: 256,
-            root_moves: true,
+            max_root_moves: if root_moves { 256 } else { 0 },
+            root_moves,
             divergence: true,
             resume: false,
             selective_search: None,
         }
     }
     fn preflight_task(&self, limits: CpuLimits) -> Result<(), CheckerError> {
+        if let Some((profile, _)) = self.engine_profile {
+            profile.require_query(
+                ExternalGoConstraint::Combined {
+                    depth: limits.max_depth,
+                    reported_nodes: limits.max_nodes,
+                },
+                false,
+            )?;
+        }
         if self.failed || self.active {
             return Err(error("analysis", "checker_not_available"));
         }
@@ -1599,11 +1780,6 @@ mod process {
     use std::os::unix::process::CommandExt;
     use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
-    // A quarantined owner keeps this slot occupied. Repeated failed creation
-    // cannot accumulate arbitrarily many child groups or retained handles.
-    static PROCESS_SLOT: AtomicBool = AtomicBool::new(false);
-    static QUARANTINE_PRESENT: AtomicBool = AtomicBool::new(false);
-
     pub(super) struct OwnedProcess {
         child: Option<Child>,
         stdin: Option<ChildStdin>,
@@ -1625,6 +1801,7 @@ mod process {
         lines: VecDeque<String>,
         state: CheckerShutdown,
         shutdown_grace: Duration,
+        process_slot: process_scope::ProcessLease,
     }
 
     pub(super) struct SpawnFailure {
@@ -1651,15 +1828,30 @@ mod process {
     }
 
     fn proc_identity(pid: i32) -> Result<Option<ProcIdentity>, CheckerError> {
-        let file = match File::open(format!("/proc/{pid}/stat")) {
+        read_proc_identity(File::open(format!("/proc/{pid}/stat")))
+    }
+
+    fn proc_stat_disappeared(failure: &std::io::Error) -> bool {
+        failure.kind() == ErrorKind::NotFound || failure.raw_os_error() == Some(nix::libc::ESRCH)
+    }
+
+    fn read_proc_identity<R: Read>(
+        source: std::io::Result<R>,
+    ) -> Result<Option<ProcIdentity>, CheckerError> {
+        let file = match source {
             Ok(file) => file,
-            Err(failure) if failure.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(failure) if proc_stat_disappeared(&failure) => return Ok(None),
             Err(_) => return Err(error("ownership", "proc_stat_unavailable")),
         };
         let mut bytes = Vec::new();
-        file.take(4097)
-            .read_to_end(&mut bytes)
-            .map_err(|_| error("ownership", "proc_stat_read"))?;
+        match file.take(4097).read_to_end(&mut bytes) {
+            Ok(_) => {}
+            // A task can exit after its stat FD was opened during the bounded
+            // group scan. Never parse bytes from a failed partial read. Leader
+            // callers still reject None as a missing/disappeared owned leader.
+            Err(failure) if proc_stat_disappeared(&failure) => return Ok(None),
+            Err(_) => return Err(error("ownership", "proc_stat_read")),
+        }
         if bytes.len() > 4096 {
             return Err(error("ownership", "proc_stat_budget"));
         }
@@ -1713,23 +1905,28 @@ mod process {
             cancel: &AtomicBool,
             launch_pin: Option<&ExternalLaunchPin>,
         ) -> Result<Self, Box<SpawnFailure>> {
-            if PROCESS_SLOT
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return Err(Box::new(SpawnFailure {
-                    error: error("spawn", "process_slot_unavailable"),
-                    process: empty_shutdown(),
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                }));
-            }
+            let mut process_slot = Some(
+                process_scope::ProcessLease::acquire(
+                    launch_pin.and_then(|pin| pin.collection_process_permit.as_ref()),
+                )
+                .map_err(|error| {
+                    Box::new(SpawnFailure {
+                        error,
+                        process: empty_shutdown(),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    })
+                })?,
+            );
             let mut failure_evidence = None;
-            let result =
-                Self::spawn_owned(config, deadline, cancel, launch_pin, &mut failure_evidence);
-            if result.is_err() && !QUARANTINE_PRESENT.load(Ordering::Acquire) {
-                PROCESS_SLOT.store(false, Ordering::Release);
-            }
+            let result = Self::spawn_owned(
+                config,
+                deadline,
+                cancel,
+                launch_pin,
+                &mut failure_evidence,
+                &mut process_slot,
+            );
             result.map_err(|failure| {
                 Box::new(failure_evidence.unwrap_or_else(|| {
                     let mut process = empty_shutdown();
@@ -1749,6 +1946,7 @@ mod process {
             cancel: &AtomicBool,
             launch_pin: Option<&ExternalLaunchPin>,
             failure_evidence: &mut Option<SpawnFailure>,
+            process_slot: &mut Option<process_scope::ProcessLease>,
         ) -> Result<Self, CheckerError> {
             use std::os::unix::fs::FileExt;
             let program = match launch_pin {
@@ -1849,9 +2047,16 @@ mod process {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .process_group(0);
+            // Before spawn, dropping this reservation means NotStarted. After
+            // spawn it is immediately installed in the original OS owner.
+            let mut process_slot = process_slot
+                .take()
+                .expect("reserved process slot before spawn");
+            process_slot.ensure_spawn_allowed()?;
             let mut child = command
                 .spawn()
                 .map_err(|_| error("spawn", "native_spawn"))?;
+            process_slot.mark_started();
             // Linux kernel PIDs fit signed pid_t. Install the owned child before
             // any fallible setup and retain optional pipes even on setup error.
             let pid = Pid::from_raw(child.id() as i32);
@@ -1881,6 +2086,7 @@ mod process {
                 lines: VecDeque::new(),
                 state: empty_shutdown(),
                 shutdown_grace: config.shutdown_grace,
+                process_slot,
             };
             let setup = (|| {
                 let identity = proc_identity(pid.as_raw())?
@@ -2198,7 +2404,7 @@ mod process {
                         self.authority = false;
                         self.state.cleanup_complete = true;
                         self.state.quarantined = false;
-                        PROCESS_SLOT.store(false, Ordering::Release);
+                        self.process_slot.complete_physical();
                         return Ok(self.state);
                     }
                 }
@@ -2229,9 +2435,118 @@ mod process {
                 if let Some(child) = self.child.take() {
                     std::mem::forget(child);
                 }
-                QUARANTINE_PRESENT.store(true, Ordering::Release);
-                PROCESS_SLOT.store(true, Ordering::Release);
+                // The ProcessLease drops as unconfirmed and keeps its original
+                // singleton/group gate occupied. No reservation is refunded.
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod proc_identity_tests {
+        use super::*;
+        use std::io::Cursor;
+
+        fn stat_bytes() -> Vec<u8> {
+            let mut fields = ["0"; 20];
+            fields[0] = "S";
+            fields[2] = "41";
+            fields[19] = "9001";
+            format!("123 (proc fixture) {}\n", fields.join(" ")).into_bytes()
+        }
+
+        struct ReadThenError {
+            bytes: Cursor<Vec<u8>>,
+            errno: i32,
+        }
+        impl Read for ReadThenError {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.bytes.read(buffer)?;
+                if count != 0 {
+                    Ok(count)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(self.errno))
+                }
+            }
+        }
+
+        #[test]
+        fn vanished_proc_stat_open_or_read_returns_no_identity() {
+            for errno in [nix::libc::ENOENT, nix::libc::ESRCH] {
+                let opened: std::io::Result<Cursor<Vec<u8>>> =
+                    Err(std::io::Error::from_raw_os_error(errno));
+                assert!(read_proc_identity(opened).unwrap().is_none());
+                let reader = ReadThenError {
+                    bytes: Cursor::new(Vec::new()),
+                    errno,
+                };
+                assert!(read_proc_identity(Ok(reader)).unwrap().is_none());
+            }
+        }
+
+        #[test]
+        fn vanished_proc_stat_discards_even_parseable_partial_bytes() {
+            for errno in [nix::libc::ENOENT, nix::libc::ESRCH] {
+                let reader = ReadThenError {
+                    bytes: Cursor::new(stat_bytes()),
+                    errno,
+                };
+                assert!(read_proc_identity(Ok(reader)).unwrap().is_none());
+            }
+        }
+
+        #[test]
+        fn proc_stat_permission_and_io_errors_remain_failures() {
+            for errno in [nix::libc::EACCES, nix::libc::EIO] {
+                let opened: std::io::Result<Cursor<Vec<u8>>> =
+                    Err(std::io::Error::from_raw_os_error(errno));
+                assert_eq!(
+                    read_proc_identity(opened).err(),
+                    Some(error("ownership", "proc_stat_unavailable"))
+                );
+                for bytes in [Vec::new(), stat_bytes()] {
+                    let reader = ReadThenError {
+                        bytes: Cursor::new(bytes),
+                        errno,
+                    };
+                    assert_eq!(
+                        read_proc_identity(Ok(reader)).err(),
+                        Some(error("ownership", "proc_stat_read"))
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn proc_stat_encoding_and_format_errors_remain_failures() {
+            for (bytes, code) in [
+                (vec![0xff], "proc_stat_encoding"),
+                (b"missing stat delimiter".to_vec(), "proc_stat_format"),
+                (b"123 (fixture) S 1 invalid".to_vec(), "proc_group"),
+                (b"123 (fixture) S 1 41".to_vec(), "proc_start"),
+            ] {
+                assert_eq!(
+                    read_proc_identity(Ok(Cursor::new(bytes))).err(),
+                    Some(error("ownership", code))
+                );
+            }
+        }
+
+        #[test]
+        fn proc_stat_keeps_4096_byte_parse_and_bounded_overflow() {
+            let mut bytes = stat_bytes();
+            bytes.resize(4096, b' ');
+            let identity = read_proc_identity(Ok(Cursor::new(bytes.clone())))
+                .unwrap()
+                .unwrap();
+            assert_eq!(identity.group, 41);
+            assert_eq!(identity.start, 9001);
+            bytes.resize(8192, b' ');
+            let mut reader = Cursor::new(bytes);
+            assert_eq!(
+                read_proc_identity(Ok(&mut reader)).err(),
+                Some(error("ownership", "proc_stat_budget"))
+            );
+            assert_eq!(reader.position(), 4097);
         }
     }
 }
@@ -2379,7 +2694,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(target_os = "linux")]
     fn fixture_mode(name: &str) -> bool {
@@ -2426,12 +2741,12 @@ mod tests {
                     .iter()
                     .position(|word| *word == "depth")
                     .map(|at| words[at + 1])
-                    .unwrap();
+                    .unwrap_or("2");
                 let requested: u64 = words
                     .iter()
                     .position(|word| *word == "nodes")
                     .map(|at| words[at + 1].parse().unwrap())
-                    .unwrap();
+                    .unwrap_or(10);
                 let best = words
                     .iter()
                     .position(|word| *word == "searchmoves")
@@ -3392,7 +3707,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn fixture_config(mode: &str) -> ExternalCpuConfig {
+    pub(super) fn fixture_config(mode: &str) -> ExternalCpuConfig {
         let program = std::env::current_exe().unwrap();
         let arguments = vec![
             "--exact".into(),

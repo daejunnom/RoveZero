@@ -8,11 +8,11 @@ output directory outside the checkout. GPU validation is a different stage.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import os
 import re
-import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -20,7 +20,8 @@ import tempfile
 import time
 
 sys.dont_write_bytecode = True
-from managed_storage import checked
+from managed_storage import checked, StorageError
+from managed_outputs import OutputLease, canonical_catalog, publish_runtime
 
 
 def run(command, *, cwd, environment, seconds=300):
@@ -66,7 +67,8 @@ def main():
         parser.error("private verifier binary requires lowercase SHA-256")
     source = Path(__file__).resolve().parent.parent
     output = checked(args.output)
-    runtime_store = checked(args.runtime_store) if args.runtime_store else None
+    runtime_store = checked(args.runtime_store or
+                            canonical_catalog().parent.parent / "cache" / "pals-cpu-runtime")
     rules_profile = checked(args.rules_profile_json) if args.rules_profile_json else None
     dataset_run = checked(args.dataset_run) if args.dataset_run else None
     verifier_binary = checked(args.verifier_cpu_binary) if args.verifier_cpu_binary else None
@@ -83,7 +85,7 @@ def main():
     scratch = os.environ.get("TMPDIR")
     if not scratch or os.environ.get("CARGO_TARGET_DIR") is None:
         parser.error("run through scripts/run_managed.py with managed scratch")
-    output.mkdir(parents=True, exist_ok=False)
+    output_lease = OutputLease(output, source, outer_supervised=True).acquire()
     receipt = {"schema": "rovezero.pals-cpu-model-validation.v1", "status": "running",
                "training_executed": False, "training_steps": 0,
                "provider": "cpu", "gpu_validation": "not_run", "stages": {}}
@@ -126,7 +128,9 @@ def main():
     environment.update({"PYTHONDONTWRITEBYTECODE": "1", "PIP_NO_CACHE_DIR": "1",
                         "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2"})
     try:
-        with tempfile.TemporaryDirectory(prefix="pals-validation-", dir=scratch) as temporary:
+        # A command timeout does not prove all descendants exited. Only the
+        # outer managed supervisor may retire this scratch after tree closure.
+        with nullcontext(tempfile.mkdtemp(prefix="pals-validation-", dir=scratch)) as temporary:
             venv = Path(temporary) / "venv"
             run([sys.executable, "-m", "venv", "--copies", str(venv)],
                 cwd=source, environment=environment)
@@ -231,20 +235,11 @@ def main():
                 "import onnxruntime,pathlib; p=pathlib.Path(onnxruntime.__file__).parent/'capi'; "
                 "print(next(p.glob('libonnxruntime.so.1.22.0')))"],
                 cwd=source, env=environment, text=True).strip()
-            runtime_sha256 = hashlib.sha256(Path(runtime_path).read_bytes()).hexdigest()
-            runtime_dir = (runtime_store / runtime_sha256) if runtime_store else output / "native-runtime"
-            runtime_dir = checked(runtime_dir)
-            runtime_dir.mkdir(parents=True, exist_ok=runtime_store is not None)
-            runtime_asset = checked(runtime_dir / "libonnxruntime.so.1.22.0")
-            if runtime_asset.exists():
-                if hashlib.sha256(runtime_asset.read_bytes()).hexdigest() != runtime_sha256:
-                    raise OSError("immutable CPU runtime store digest mismatch")
-            else:
-                # Exclusive create prevents replacing an already registered runtime.
-                with open(runtime_path, "rb") as origin, runtime_asset.open("xb") as destination:
-                    shutil.copyfileobj(origin, destination, 1024 * 1024)
+            output_lease.check_budget()
+            runtime_asset, runtime_sha256 = publish_runtime(Path(runtime_path), runtime_store)
             receipt["runtime"] = {"path": str(runtime_asset), "sha256": runtime_sha256,
-                                  "bytes": runtime_asset.stat().st_size}
+                                  "bytes": runtime_asset.stat().st_size,
+                                  "storage": "external_shared_content_addressed_store"}
             if any(hashlib.sha256((source / relative).read_bytes()).hexdigest() != digest
                    for relative, digest in receipt["source_files"].items()):
                 raise OSError("validation source changed during the registered run")
@@ -257,8 +252,17 @@ def main():
         raise
     finally:
         receipt["total_seconds"] = time.monotonic() - started
+        storage_error = None
+        try:
+            output_lease.finish(status=receipt["status"], tree_gone="outer_managed_supervisor_only")
+        except (StorageError, OSError) as error:
+            storage_error = error
+            receipt.update(status="failed", storage_lifecycle_error={
+                "type": type(error).__name__, "message": str(error)})
         (output / "validation.json").write_text(
             json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        if storage_error is not None and sys.exc_info()[0] is None:
+            raise storage_error
 
 
 if __name__ == "__main__":

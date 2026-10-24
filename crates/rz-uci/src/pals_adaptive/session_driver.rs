@@ -6,12 +6,39 @@
 mod checker_metadata;
 pub use checker_metadata::*;
 mod completion_observation;
+mod idle_physical_close;
+#[cfg(feature = "pals-adaptive")]
+mod initial_stop;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod profiled_retirement;
+mod root_admission;
+mod rovent;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod rovent_external;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod storage;
 use completion_observation::CompletionJournal;
 pub use completion_observation::{
     AdaptiveCompletionDiagnostic, AdaptiveCompletionFailure, AdaptiveCompletionObservation,
     AdaptiveCompletionReasonCounts, AdaptiveCompletionReturn,
 };
+#[cfg(feature = "pals-adaptive")]
+use initial_stop::RoventPcrIdleCustody;
+#[cfg(feature = "pals-adaptive")]
+pub use initial_stop::{ROVENT_PCR_INITIAL_DOMAIN, RoventPcrInitialReceipt};
+#[cfg(feature = "pals-adaptive")]
+use root_admission::RoventPcrRootPolicy;
+use root_admission::{RoventPcrRootAdmission, RoventPcrRootSource};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use rovent::ROVENT_PROFILED_EXTERNAL_ROOT_DOMAIN;
+pub use rovent::{ROVENT_NATIVE_ROOT_DOMAIN, RoventNativeRootReceipt, RoventPcrSessionProfile};
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub use rovent_external::{
+    RoventExternalSessionAdmissionRejection, RoventExternalSessionSource,
+    RoventExternalSessionSources, RoventExternalSourcePreparationRejection,
+};
 
+use super::AdaptiveSearchDriver as _;
 use super::{
     AdaptiveCollectionDispatchObserver, AdaptiveExecutionLimits, AdaptiveExecutionManager,
     AdaptiveExternalTeacherObserver, AdaptiveManagerAdmissionRejection, AdaptiveManagerError,
@@ -61,6 +88,18 @@ type AdmissionRejection<B> = AdaptiveManagerAdmissionRejection<
     B,
     AdaptivePortDriver<AdaptivePortModel>,
 >;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+type ProfiledAdmissionRejection<B> = super::ProfiledExternalManagerAdmissionRejection<
+    AdaptivePortQuestion,
+    B,
+    AdaptivePortDriver<AdaptivePortModel>,
+>;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+type SessionExternalRootSource<'a> =
+    Option<&'a crate::rovent_external_launch::RoventAdmittedExternalRootSource>;
+#[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+type SessionExternalRootSource<'a> =
+    Option<&'a rz_search::external_cpu::ProfiledExternalRootSource>;
 
 /// Runs on the actual UCI search owner after a real root fence and before the
 /// manager is dismantled. Collection can seal actual turns/action outcomes.
@@ -75,6 +114,27 @@ pub type AdaptiveRootAdmissionObserver<B> =
 /// rather than inferred by a collection caller from elapsed time or counters.
 pub type AdaptiveCompletedRootObserver<B> = Arc<
     dyn Fn(&mut SessionManager<B>, PalsCompletion) -> Result<(), AdaptiveManagerError>
+        + Send
+        + Sync,
+>;
+/// Receives the original root-local utility action after actual physical closure.
+pub type AdaptiveUtilityRouteCompletionObserver = Arc<
+    dyn Fn(&Arc<super::CompletedUtilityRouteAction>) -> Result<(), AdaptiveManagerError>
+        + Send
+        + Sync,
+>;
+/// Receives the original cohort trial after same-owner physical retirement.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub type AdaptiveUtilityTrialRetirementObserver = Arc<
+    dyn Fn(&Arc<super::UtilityTrialPhysicalRetirement>) -> Result<(), AdaptiveManagerError>
+        + Send
+        + Sync,
+>;
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+pub type AdaptiveUtilityInterventionTrialRetirementObserver = Arc<
+    dyn Fn(
+            &Arc<super::UtilityInterventionTrialPhysicalRetirement>,
+        ) -> Result<(), AdaptiveManagerError>
         + Send
         + Sync,
 >;
@@ -100,7 +160,23 @@ where
 {
     pub root_admission: Option<AdaptiveRootAdmissionObserver<B>>,
     pub root_closure: Option<AdaptiveCompletedRootObserver<B>>,
+    /// Historical N05 output from the same original ticket/input lineage.
+    /// Only the Session's actual same-actor engine/cache ACK boundary issues
+    /// this cap; an earlier root_closure callback cannot mint whole cost.
+    /// The Session retains the original Arc on callback error or unwinding.
+    pub utility_route_completed: Option<AdaptiveUtilityRouteCompletionObserver>,
+    /// Cohort physical retirement is issued only from the original trial
+    /// admission and the same actually retired researcher owner. It cannot be
+    /// supplied by relabeling a historical root-local Completed action.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub utility_trial_retired: Option<AdaptiveUtilityTrialRetirementObserver>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub utility_intervention_trial_retired:
+        Option<AdaptiveUtilityInterventionTrialRetirementObserver>,
     pub external_teacher: Option<AdaptiveExternalTeacherObserver>,
+    /// Nonblocking outer-session pump. It does not run inside a native/CPU
+    /// worker and cannot change the manager's original execution authority.
+    pub cooperative: Option<Arc<dyn Fn() -> Result<(), AdaptiveManagerError> + Send + Sync>>,
 }
 impl<B> Default for AdaptiveSessionCollectionHooks<B>
 where
@@ -111,7 +187,13 @@ where
         Self {
             root_admission: None,
             root_closure: None,
+            utility_route_completed: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            utility_trial_retired: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            utility_intervention_trial_retired: None,
             external_teacher: None,
+            cooperative: None,
         }
     }
 }
@@ -178,13 +260,107 @@ where
 struct IdleOwners<B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>> {
     native: TicketedNativeService<ReviewView, AdaptivePortQuestion, B>,
     engine: Option<Box<PalsEngine<AdaptivePortModel>>>,
+    // A legacy Engine-only transfer must not reinterpret or discard an Idle
+    // owner. Retained/pending failure states keep this original value intact.
+    unexpected_archive_owner: Option<Box<ArchiveOwner<AdaptivePortModel>>>,
     cpu: Vec<PersistentCpuOwner>,
     external: Option<ExternalManagerWorker>,
+    researcher_source: SessionResearcherSource,
     continuation: Option<AdaptiveSequenceContinuation>,
     native_finished: Option<bool>,
     native_joined: bool,
     external_finished: Option<CheckerShutdown>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    profiled_retirement:
+        Option<rz_search::pals::engine::adaptive_port::ProfiledExternalRootRetirement>,
+    #[cfg(feature = "pals-adaptive")]
+    rovent_idle_custody: RoventPcrIdleCustody,
 }
+struct RestoredSemanticOwner {
+    port: AdaptiveEnginePort<AdaptivePortModel>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    retirement: Option<rz_search::pals::engine::adaptive_port::ProfiledExternalRootRetirement>,
+}
+
+/// The old public source entry always installs Legacy. Only the separate
+/// pinned external-R constructor can install the move-only profiled source.
+enum SessionResearcherSource {
+    Legacy,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    ProfiledExternal(Box<RoventExternalSessionSource>),
+}
+#[derive(Clone, Copy)]
+enum SessionResearcherClass {
+    Legacy,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    ProfiledExternal,
+}
+impl SessionResearcherSource {
+    fn is_profiled_external(&self) -> bool {
+        match self {
+            Self::Legacy => false,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            Self::ProfiledExternal(_) => true,
+        }
+    }
+}
+
+/// Whole-root evidence keeps the actual source kind. External reported work
+/// never becomes a successful zero-charge native CPU shutdown receipt.
+#[derive(Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one bounded original root receipt is retained inline without copying physical owners"
+)]
+enum SessionRootFence {
+    Native(AdaptiveShutdownReceipt),
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    Profiled(super::ProfiledExternalShutdownReceipt),
+}
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one transient unique owner moves into the manager without cloning its custody or allocating a second worker"
+)]
+enum SessionManagerSource {
+    Legacy,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    Profiled(super::ProfiledExternalManagerSource),
+}
+
+enum SessionManagerRejection<B>
+where
+    B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
+    B::Output: ProposerRankingOutput,
+{
+    Legacy(Box<AdmissionRejection<B>>),
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    Profiled(Box<ProfiledAdmissionRejection<B>>),
+}
+impl SessionRootFence {
+    fn permits_root_reuse(&self) -> bool {
+        match self {
+            Self::Native(receipt) => receipt.permits_root_reuse(),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            Self::Profiled(receipt) => receipt.permits_root_reuse(),
+        }
+    }
+    fn permits_archive_close(&self) -> bool {
+        match self {
+            Self::Native(receipt) => receipt.permits_archive_close(),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            Self::Profiled(receipt) => receipt.permits_archive_close(),
+        }
+    }
+    #[cfg(feature = "pals-adaptive")]
+    fn idle_custody(&self) -> RoventPcrIdleCustody {
+        match self {
+            Self::Native(receipt) => RoventPcrIdleCustody::RetiredRoot(receipt.clone()),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            Self::Profiled(receipt) => RoventPcrIdleCustody::RetiredProfiledRoot(receipt.clone()),
+        }
+    }
+}
+
 // Retained process owners stay on the heap while failure/root transitions move
 // the state. Empty variants must not reserve every possible engine payload on
 // the caller's stack, and a failed transition keeps the same exclusive owner.
@@ -195,6 +371,8 @@ where
     Idle(Box<IdleOwners<B>>),
     Manager(Box<SessionManager<B>>),
     AdmissionRejected(Box<AdmissionRejection<B>>),
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    ProfiledAdmissionRejected(Box<ProfiledAdmissionRejection<B>>),
     PortRejected {
         owners: Box<IdleOwners<B>>,
         driver: AdaptivePortDriver<AdaptivePortModel>,
@@ -219,6 +397,21 @@ where
         owners: Box<IdleOwners<B>>,
         worker: ArchiveWorker<AdaptivePortModel>,
     },
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    ProfiledRetirementPending {
+        owners: Box<IdleOwners<B>>,
+        worker: ArchiveWorker<AdaptivePortModel>,
+        transfer: ArchiveTransfer,
+        authority: SearchAuthority,
+    },
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    ProfiledRetirementRetained {
+        owners: Box<IdleOwners<B>>,
+        worker: ArchiveWorker<AdaptivePortModel>,
+        payload: Box<
+            rz_search::pals::engine::adaptive_port::archive_worker::PersistProfiledRetirementWork,
+        >,
+    },
     Closed(AdaptiveSessionProcessReceipt),
     // Exists only under the exclusive mutex while moving owners; never a
     // reusable state. Poison/panic is a failed ownership boundary.
@@ -235,6 +428,8 @@ pub struct AdaptiveSessionProcessReceipt {
     external_shutdown: Option<CheckerShutdown>,
     store_archive_closed: bool,
     latest_root: Option<AdaptiveShutdownReceipt>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    latest_profiled_root: Option<super::ProfiledExternalShutdownReceipt>,
 }
 impl AdaptiveSessionProcessReceipt {
     pub fn epoch(&self) -> ProcessEpoch {
@@ -258,6 +453,10 @@ impl AdaptiveSessionProcessReceipt {
     pub fn latest_root(&self) -> Option<&AdaptiveShutdownReceipt> {
         self.latest_root.as_ref()
     }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn latest_profiled_root(&self) -> Option<&super::ProfiledExternalShutdownReceipt> {
+        self.latest_profiled_root.as_ref()
+    }
     pub fn permits_archive_close(&self) -> bool {
         self.native_owner_joined
             && self.native_physical_shutdown_confirmed
@@ -268,6 +467,18 @@ impl AdaptiveSessionProcessReceipt {
                 .latest_root
                 .as_ref()
                 .is_none_or(AdaptiveShutdownReceipt::permits_root_reuse)
+            && {
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                {
+                    self.latest_profiled_root.as_ref().is_none_or(
+                        super::ProfiledExternalShutdownReceipt::permits_semantic_closure,
+                    )
+                }
+                #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+                {
+                    true
+                }
+            }
     }
     pub fn permits_process_close(&self) -> bool {
         self.permits_archive_close() && self.store_archive_closed
@@ -288,6 +499,43 @@ pub struct AdaptiveSessionRetention {
     pub native_pending: usize,
     pub archive_owner_pending: bool,
 }
+/// Read-only projection of one retained owner. No decoder or constructor can
+/// turn these observations back into a worker, source, fence or live authority.
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+#[derive(Clone, Debug)]
+pub(crate) struct AdaptiveRetainedSessionObservation {
+    pub stage: &'static str,
+    pub authority: Option<SearchAuthority>,
+    pub next_authority: Option<SearchAuthority>,
+    pub manager_phase: Option<&'static str>,
+    pub manager_first_retained_failure: Option<SearchSessionFailure>,
+    pub manager_retained_failure_count: Option<usize>,
+    pub archive_operation: Option<&'static str>,
+    pub archive_quarantine_reason: Option<SearchSessionFailure>,
+    pub native_physical: Option<AdaptiveShutdownReceipt>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub profiled_physical: Option<super::ProfiledExternalShutdownReceipt>,
+    pub physical_read_failure: Option<SearchSessionFailure>,
+}
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+impl AdaptiveRetainedSessionObservation {
+    fn new(stage: &'static str) -> Self {
+        Self {
+            stage,
+            authority: None,
+            next_authority: None,
+            manager_phase: None,
+            manager_first_retained_failure: None,
+            manager_retained_failure_count: None,
+            archive_operation: None,
+            archive_quarantine_reason: None,
+            native_physical: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            profiled_physical: None,
+            physical_read_failure: None,
+        }
+    }
+}
 struct PendingOutput {
     authority: SearchAuthority,
     report: Option<BoardMove>,
@@ -302,12 +550,15 @@ where
     options: AdaptiveSessionOptions,
     limits: AdaptiveExecutionLimits,
     explicit_native_limits: bool,
+    researcher_class: SessionResearcherClass,
     clock: ProcessClock,
     issuer: AdaptiveRulesOwnerIssuer,
     registration: PalsCheckerRegistration,
     checker_metadata: AdaptiveCheckerMetadata,
     external_metadata_bound: AtomicBool,
     state: Mutex<SessionState<B>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    storage: Mutex<Option<storage::EngineStorageSlot>>,
     work: ProcessWorkJournal,
     completion: Mutex<CompletionJournal>,
     reset_requests: AtomicU64,
@@ -318,6 +569,23 @@ where
     #[cfg(feature = "pals-adaptive-diagnostics")]
     continuation_diagnostic: std::sync::OnceLock<super::ContinuationDiagnostic>,
     latest_root: Mutex<Option<AdaptiveShutdownReceipt>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    latest_profiled_root: Mutex<Option<super::ProfiledExternalShutdownReceipt>>,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    profiled_retirement_sink: Mutex<
+        Option<
+            rz_search::pals::engine::adaptive_port::profiled_retirement_archive::RegisteredProfiledRetirementSink,
+        >,
+    >,
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    profiled_retirement_commits: Mutex<VecDeque<serde_json::Value>>,
+    rovent: Option<RoventPcrSessionProfile>,
+    #[cfg(feature = "pals-adaptive")]
+    rovent_root_policy: Option<RoventPcrRootPolicy>,
+    rovent_collection_origin: Option<super::RoventNativeCollectionOrigin>,
+    latest_rovent_root: Mutex<Option<Arc<RoventNativeRootReceipt>>>,
+    #[cfg(feature = "pals-adaptive")]
+    latest_rovent_initial: Mutex<Option<Arc<RoventPcrInitialReceipt>>>,
     archive_receipts: Mutex<VecDeque<ArchiveWorkReceipt>>,
     pending_output: Mutex<Option<PendingOutput>>,
     accepted_outputs: Mutex<VecDeque<AdaptiveUciOutputObservation>>,
@@ -328,6 +596,303 @@ where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    fn root_shutdown_receipt(
+        &self,
+        manager: &SessionManager<B>,
+    ) -> Result<SessionRootFence, AdaptiveManagerError> {
+        match self.researcher_class {
+            SessionResearcherClass::Legacy => {
+                manager.shutdown_receipt().map(SessionRootFence::Native)
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionResearcherClass::ProfiledExternal => manager
+                .profiled_shutdown_receipt()
+                .map(SessionRootFence::Profiled),
+        }
+    }
+
+    fn run_session_root_observed(
+        &self,
+        manager: &mut SessionManager<B>,
+        until: Instant,
+        canceled: &AtomicBool,
+        observer: &mut dyn FnMut(&mut SessionManager<B>) -> Result<(), AdaptiveManagerError>,
+    ) -> Result<SessionRootFence, AdaptiveManagerError> {
+        match self.researcher_class {
+            SessionResearcherClass::Legacy => manager
+                .run_root_until_observed(until, canceled, observer)
+                .map(SessionRootFence::Native),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionResearcherClass::ProfiledExternal => manager
+                .run_profiled_root_until_observed(until, canceled, observer)
+                .map(SessionRootFence::Profiled),
+        }
+    }
+
+    fn run_session_process_close(
+        &self,
+        manager: &mut SessionManager<B>,
+        until: Instant,
+    ) -> Result<SessionRootFence, AdaptiveManagerError> {
+        match self.researcher_class {
+            SessionResearcherClass::Legacy => manager
+                .run_until(until, &AtomicBool::new(false))
+                .map(SessionRootFence::Native),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionResearcherClass::ProfiledExternal => manager
+                .run_profiled_until(until, &AtomicBool::new(false))
+                .map(SessionRootFence::Profiled),
+        }
+    }
+
+    fn researcher_limit_observation(&self, manager: &SessionManager<B>) -> Option<bool> {
+        match self.researcher_class {
+            SessionResearcherClass::Legacy => Some(manager.cpu_node_limit_reached()),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionResearcherClass::ProfiledExternal => {
+                manager.profiled_reported_node_limit_reached()
+            }
+        }
+    }
+
+    fn attach_rovent_profile(
+        &self,
+        profile: &RoventPcrSessionProfile,
+        manager: &mut SessionManager<B>,
+        context: &SearchSessionContext,
+        admission: &RoventPcrRootAdmission,
+        _external_source: SessionExternalRootSource<'_>,
+    ) -> Result<(), AdaptiveManagerError> {
+        match self.researcher_class {
+            SessionResearcherClass::Legacy => profile.attach(
+                manager,
+                context,
+                &self.clock,
+                self.rovent_collection_origin.as_ref(),
+                admission,
+            ),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionResearcherClass::ProfiledExternal => profile.attach_profiled_external(
+                manager,
+                context,
+                &self.clock,
+                self.rovent_collection_origin.as_ref(),
+                admission,
+                _external_source.ok_or(AdaptiveManagerError::Invalid(
+                    "actual external root source is absent",
+                ))?,
+            ),
+        }
+    }
+
+    fn admit_session_manager(
+        &self,
+        registration: AdaptiveManagerRegistration,
+        sources: AdaptiveManagerSources<
+            AdaptivePortQuestion,
+            B,
+            AdaptivePortDriver<AdaptivePortModel>,
+        >,
+        researcher: SessionManagerSource,
+        continuation: Option<AdaptiveSequenceContinuation>,
+    ) -> Result<Box<SessionManager<B>>, SessionManagerRejection<B>> {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let SessionManagerSource::Profiled(external) = researcher {
+            return SessionManager::new_profiled_external_retaining(
+                registration,
+                self.clock.runtime_clock(),
+                self.limits,
+                sources,
+                external,
+                continuation,
+            )
+            .map(|facade| Box::new(facade.into_session_manager()))
+            .map_err(|rejected| SessionManagerRejection::Profiled(Box::new(rejected)));
+        }
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        let SessionManagerSource::Legacy = researcher;
+        let admitted = match (continuation, self.explicit_native_limits) {
+            (Some(continuation), true) => SessionManager::new_continued_retaining_with_limits(
+                registration,
+                self.clock.runtime_clock(),
+                self.limits,
+                sources,
+                continuation,
+            ),
+            (None, true) => SessionManager::new_retaining_with_limits(
+                registration,
+                self.clock.runtime_clock(),
+                self.limits,
+                sources,
+            ),
+            (Some(continuation), false) => SessionManager::new_continued_retaining(
+                registration,
+                self.clock.runtime_clock(),
+                sources,
+                continuation,
+            ),
+            (None, false) => {
+                SessionManager::new_retaining(registration, self.clock.runtime_clock(), sources)
+            }
+        };
+        admitted
+            .map(Box::new)
+            .map_err(|rejected| SessionManagerRejection::Legacy(Box::new(rejected)))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn return_manager_owners(
+        &self,
+        manager: Box<SessionManager<B>>,
+        state: &mut SessionState<B>,
+        process_closed: bool,
+    ) -> Result<
+        (
+            Box<IdleOwners<B>>,
+            AdaptivePortDriver<AdaptivePortModel>,
+            SessionRootFence,
+        ),
+        SearchSessionFailure,
+    > {
+        match self.researcher_class {
+            SessionResearcherClass::Legacy => {
+                let parts = if process_closed {
+                    manager.into_process_parts()
+                } else {
+                    manager.into_persistent_parts()
+                };
+                let parts = match parts {
+                    Ok(parts) => parts,
+                    Err(rejected) => {
+                        *state = SessionState::Manager(Box::new(rejected.manager));
+                        return Err(SearchSessionFailure::physical_completion_unknown());
+                    }
+                };
+                let (native, cpu, external, driver, continuation, receipt) =
+                    parts.into_components();
+                let native_finished =
+                    process_closed.then_some(receipt.native_physical_shutdown_confirmed);
+                let native_joined = receipt.native_owner_joined;
+                let fence = SessionRootFence::Native(receipt);
+                Ok((
+                    Box::new(IdleOwners {
+                        native,
+                        cpu,
+                        external,
+                        researcher_source: SessionResearcherSource::Legacy,
+                        engine: None,
+                        unexpected_archive_owner: None,
+                        continuation: Some(continuation),
+                        native_finished,
+                        native_joined,
+                        external_finished: None,
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        profiled_retirement: None,
+                        #[cfg(feature = "pals-adaptive")]
+                        rovent_idle_custody: fence.idle_custody(),
+                    }),
+                    driver,
+                    fence,
+                ))
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionResearcherClass::ProfiledExternal => {
+                let parts = if process_closed {
+                    manager.into_profiled_process_parts()
+                } else {
+                    manager.into_profiled_persistent_parts()
+                };
+                let parts = match parts {
+                    Ok(parts) => parts,
+                    Err(rejected) => {
+                        *state = SessionState::Manager(Box::new(rejected.manager));
+                        return Err(SearchSessionFailure::physical_completion_unknown());
+                    }
+                };
+                let (native, external, driver, continuation, receipt) = parts.into_components();
+                let external = RoventExternalSessionSource::from_manager(
+                    external,
+                    self.checker_metadata.clone(),
+                );
+                let external_finished = external.shutdown_receipt();
+                let native_finished =
+                    process_closed.then_some(receipt.native_physical_shutdown_confirmed());
+                let native_joined = receipt.native_process_joined();
+                let fence = SessionRootFence::Profiled(receipt);
+                Ok((
+                    Box::new(IdleOwners {
+                        native,
+                        cpu: Vec::new(),
+                        external: None,
+                        researcher_source: SessionResearcherSource::ProfiledExternal(Box::new(
+                            external,
+                        )),
+                        engine: None,
+                        unexpected_archive_owner: None,
+                        continuation: Some(continuation),
+                        native_finished,
+                        native_joined,
+                        external_finished,
+                        profiled_retirement: None,
+                        rovent_idle_custody: fence.idle_custody(),
+                    }),
+                    driver,
+                    fence,
+                ))
+            }
+        }
+    }
+
+    // A failed fence/adoption returns the same driver and its Port/Store/archive
+    // custody intact; recovery must not depend on a new failure allocation.
+    #[allow(clippy::result_large_err)]
+    fn restore_semantic_owner(
+        &self,
+        driver: AdaptivePortDriver<AdaptivePortModel>,
+        fence: &SessionRootFence,
+    ) -> Result<RestoredSemanticOwner, (AdaptivePortDriver<AdaptivePortModel>, AdaptiveManagerError)>
+    {
+        match fence {
+            SessionRootFence::Native(receipt) => {
+                driver.into_port(receipt).map(|port| RestoredSemanticOwner {
+                    port,
+                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                    retirement: None,
+                })
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionRootFence::Profiled(receipt) => {
+                driver
+                    .into_profiled_port(receipt)
+                    .map(|(port, retirement)| RestoredSemanticOwner {
+                        port,
+                        retirement: Some(retirement),
+                    })
+            }
+        }
+    }
+
+    fn record_root_fence(&self, fence: &SessionRootFence) -> Result<(), SearchSessionFailure> {
+        match fence {
+            SessionRootFence::Native(receipt) => {
+                *self
+                    .latest_root
+                    .lock()
+                    .map_err(|_| failure("AdaptiveRootReceipt", "receipt mutex poisoned"))? =
+                    Some(receipt.clone());
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionRootFence::Profiled(receipt) => {
+                *self
+                    .latest_profiled_root
+                    .lock()
+                    .map_err(|_| failure("ProfiledRootReceipt", "receipt mutex poisoned"))? =
+                    Some(receipt.clone());
+            }
+        }
+        Ok(())
+    }
+
     #[allow(
         clippy::result_large_err,
         reason = "admission rejection returns the original native, CPU and Store owners without a failure-path allocation"
@@ -431,6 +996,53 @@ where
         collection_hooks: AdaptiveSessionCollectionHooks<B>,
         explicit_native_limits: bool,
     ) -> Result<Self, AdaptiveSessionAdmissionRejection<B>> {
+        Self::admit_with_researcher_source(
+            options,
+            limits,
+            sources,
+            clock,
+            issuer,
+            registration,
+            dispatch_observer,
+            closure_observer,
+            collection_hooks,
+            explicit_native_limits,
+            SessionResearcherSource::Legacy,
+        )
+        .map_err(|(rejected, source)| {
+            debug_assert!(!source.is_profiled_external());
+            rejected
+        })
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
+    fn admit_with_researcher_source(
+        options: AdaptiveSessionOptions,
+        limits: AdaptiveExecutionLimits,
+        sources: AdaptiveSessionSources<B>,
+        clock: ProcessClock,
+        issuer: AdaptiveRulesOwnerIssuer,
+        registration: PalsCheckerRegistration,
+        dispatch_observer: Option<AdaptiveCollectionDispatchObserver>,
+        closure_observer: Option<AdaptiveRootClosureObserver<B>>,
+        collection_hooks: AdaptiveSessionCollectionHooks<B>,
+        explicit_native_limits: bool,
+        researcher_source: SessionResearcherSource,
+    ) -> Result<
+        Self,
+        (
+            AdaptiveSessionAdmissionRejection<B>,
+            SessionResearcherSource,
+        ),
+    > {
+        let profiled_external = researcher_source.is_profiled_external();
+        let researcher_class = match &researcher_source {
+            SessionResearcherSource::Legacy => SessionResearcherClass::Legacy,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionResearcherSource::ProfiledExternal(_) => {
+                SessionResearcherClass::ProfiledExternal
+            }
+        };
         let checked = (|| {
             options.validate()?;
             limits
@@ -445,8 +1057,13 @@ where
                     "actual native channel differs from the declared resource limits",
                 ));
             }
-            if sources.cpu.len() != usize::from(options.controller.max_workers)
-                || ![1, 2, 4].contains(&sources.cpu.len())
+            let worker_shape = if profiled_external {
+                sources.cpu.is_empty() && sources.external.is_none()
+            } else {
+                sources.cpu.len() == usize::from(options.controller.max_workers)
+                    && [1, 2, 4].contains(&sources.cpu.len())
+            };
+            if !worker_shape
                 || sources.engine.checker_identity() != &registration.identity
                 || sources.engine.model_identity() != registration.role_model
                 || sources.engine.review_policy().is_none()
@@ -543,6 +1160,7 @@ where
             }
             if matches!(registration.identity, CheckerIdentity::ExternalUci(_))
                 && sources.external.is_none()
+                && !profiled_external
             {
                 return Err(failure(
                     "AdaptiveExternalNamespace",
@@ -552,7 +1170,10 @@ where
             Ok(())
         })();
         if let Err(failure) = checked {
-            return Err(AdaptiveSessionAdmissionRejection { failure, sources });
+            return Err((
+                AdaptiveSessionAdmissionRejection { failure, sources },
+                researcher_source,
+            ));
         }
         let resolver = PalsResolverIdentity::from_semantics(
             registration.resolver_version,
@@ -574,10 +1195,16 @@ where
                 match ProcessWorkJournal::new_pals_with_search_policy(resolver, identity) {
                     Ok(work) => work,
                     Err(error) => {
-                        return Err(AdaptiveSessionAdmissionRejection {
-                            failure: SearchSessionFailure::debug("AdaptiveSearchPolicy", &error),
-                            sources,
-                        });
+                        return Err((
+                            AdaptiveSessionAdmissionRejection {
+                                failure: SearchSessionFailure::debug(
+                                    "AdaptiveSearchPolicy",
+                                    &error,
+                                ),
+                                sources,
+                            },
+                            researcher_source,
+                        ));
                     }
                 }
             }
@@ -598,6 +1225,7 @@ where
             options,
             limits,
             explicit_native_limits,
+            researcher_class,
             clock,
             issuer,
             registration,
@@ -606,13 +1234,21 @@ where
             state: Mutex::new(SessionState::Idle(Box::new(IdleOwners {
                 native,
                 engine: Some(Box::new(engine)),
+                unexpected_archive_owner: None,
                 cpu,
                 external,
+                researcher_source,
                 continuation: None,
                 native_finished: None,
                 native_joined: false,
                 external_finished: None,
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                profiled_retirement: None,
+                #[cfg(feature = "pals-adaptive")]
+                rovent_idle_custody: RoventPcrIdleCustody::StartupReady,
             }))),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            storage: Mutex::new(None),
             work,
             reset_requests: AtomicU64::new(0),
             closed: AtomicBool::new(false),
@@ -622,6 +1258,19 @@ where
             #[cfg(feature = "pals-adaptive-diagnostics")]
             continuation_diagnostic: std::sync::OnceLock::new(),
             latest_root: Mutex::new(None),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            latest_profiled_root: Mutex::new(None),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            profiled_retirement_sink: Mutex::new(None),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            profiled_retirement_commits: Mutex::new(VecDeque::with_capacity(64)),
+            rovent: None,
+            #[cfg(feature = "pals-adaptive")]
+            rovent_root_policy: None,
+            rovent_collection_origin: None,
+            latest_rovent_root: Mutex::new(None),
+            #[cfg(feature = "pals-adaptive")]
+            latest_rovent_initial: Mutex::new(None),
             archive_receipts: Mutex::new(VecDeque::with_capacity(64)),
             pending_output: Mutex::new(None),
             accepted_outputs: Mutex::new(VecDeque::with_capacity(64)),
@@ -720,6 +1369,20 @@ where
                 "AdaptiveResourceOwnerUnavailable",
                 "admission closed",
             ));
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let SessionResearcherSource::ProfiledExternal(source) = &owners.researcher_source {
+            return source
+                .running_owner()
+                .map(|owner| {
+                    owner
+                        .verified_startup()
+                        .map(|startup| startup.map(|startup| startup.process_identity()))
+                        .map_err(|error| {
+                            SearchSessionFailure::debug("RoventExternalResourceSource", &error)
+                        })
+                })
+                .unwrap_or(Ok(None));
         }
         let Some(external) = &owners.external else {
             return Ok(None);
@@ -831,7 +1494,7 @@ where
             retained_cpu_engines: owners.cpu.len(),
             retained_cpu_workers: workers,
             native_pending: owners.native.occupancy(),
-            archive_owner_pending: archive,
+            archive_owner_pending: archive || owners.unexpected_archive_owner.is_some(),
         };
         Ok(match &*state {
             SessionState::Idle(owners) => snapshot("idle", owners, 0, false),
@@ -846,6 +1509,14 @@ where
                 stage: "admission_rejected",
                 retained_cpu_engines: 0,
                 retained_cpu_workers: rejected.sources.own_workers.len(),
+                native_pending: rejected.sources.native.occupancy(),
+                archive_owner_pending: rejected.sources.driver.port().is_none(),
+            },
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledAdmissionRejected(rejected) => AdaptiveSessionRetention {
+                stage: "profiled_admission_rejected",
+                retained_cpu_engines: 0,
+                retained_cpu_workers: 0,
                 native_pending: rejected.sources.native.occupancy(),
                 archive_owner_pending: rejected.sources.driver.port().is_none(),
             },
@@ -882,6 +1553,24 @@ where
             SessionState::ArchiveJoinedPending { owners, worker } => {
                 snapshot("archive_join_pending", owners, 0, worker.is_busy())
             }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledRetirementPending { owners, worker, .. } => {
+                snapshot("profiled_retirement_pending", owners, 0, worker.is_busy())
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledRetirementRetained {
+                owners,
+                worker,
+                payload,
+            } => {
+                let _retained = payload.retirement();
+                snapshot(
+                    "profiled_retirement_return_rejected",
+                    owners,
+                    0,
+                    worker.is_busy(),
+                )
+            }
             SessionState::Closed(_) => AdaptiveSessionRetention {
                 stage: "process_closed",
                 retained_cpu_engines: 0,
@@ -898,11 +1587,122 @@ where
             },
         })
     }
+    /// Only the explicitly enabled product diagnostic calls this after run
+    /// returns. Never wait behind a live owner, reopen an asset, poll a worker,
+    /// consume an event, acknowledge a fence or alter its failure/custody.
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub(crate) fn retained_session_observation(
+        &self,
+    ) -> Result<AdaptiveRetainedSessionObservation, ContractError> {
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|_| poisoned("retained diagnostic owner unavailable or busy"))?;
+        let stage = match &*state {
+            SessionState::Idle(_) => "idle",
+            SessionState::Manager(_) => "manager_retained",
+            SessionState::AdmissionRejected(_) => "admission_rejected",
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledAdmissionRejected(_) => "profiled_admission_rejected",
+            SessionState::PortRejected { .. } => "port_rejected",
+            SessionState::SpawnRejected { .. } => "cpu_spawn_rejected",
+            SessionState::ArchivePending { .. } => "archive_pending",
+            SessionState::ArchiveQuarantined { .. } => "archive_quarantined",
+            SessionState::ArchiveJoinedPending { .. } => "archive_join_pending",
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledRetirementPending { .. } => "profiled_retirement_pending",
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledRetirementRetained { .. } => {
+                "profiled_retirement_return_rejected"
+            }
+            SessionState::Closed(_) => "process_closed",
+            SessionState::Moving => "owner_transfer_unknown",
+        };
+        let mut observed = AdaptiveRetainedSessionObservation::new(stage);
+        match &*state {
+            SessionState::Manager(manager) => {
+                observed.authority = manager.driver().port().map(|port| port.authority());
+                observed.manager_phase = Some(match manager.phase() {
+                    ManagerPhase::Running => "running",
+                    ManagerPhase::Draining => "draining",
+                    ManagerPhase::Quarantined => "quarantined",
+                    ManagerPhase::Finished => "finished",
+                });
+                observed.manager_retained_failure_count = Some(manager.failures().count());
+                observed.manager_first_retained_failure = manager
+                    .failures()
+                    .next()
+                    .map(|cause| retained_cause("RetainedManagerEarliestFailure", cause));
+                match self.root_shutdown_receipt(manager) {
+                    Ok(SessionRootFence::Native(receipt)) => {
+                        observed.authority = Some(receipt.authority);
+                        observed.native_physical = Some(receipt);
+                    }
+                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                    Ok(SessionRootFence::Profiled(receipt)) => {
+                        observed.authority = Some(receipt.authority());
+                        observed.profiled_physical = Some(receipt);
+                    }
+                    Err(cause) => {
+                        observed.physical_read_failure =
+                            Some(retained_cause("RetainedPhysicalReceiptRead", &cause))
+                    }
+                }
+            }
+            SessionState::ArchiveQuarantined { quarantine, .. } => {
+                use rz_search::pals::engine::adaptive_port::archive_worker::ArchiveOperationKind;
+                observed.authority = Some(quarantine.receipt.authority);
+                observed.next_authority = quarantine.receipt.next_authority;
+                observed.archive_operation = Some(match quarantine.receipt.operation {
+                    ArchiveOperationKind::PrepareRoot => "prepare_root",
+                    ArchiveOperationKind::LoadRoot => "load_root",
+                    ArchiveOperationKind::RestoreRootIfArchived => "restore_root_if_archived",
+                    ArchiveOperationKind::FinishIdleGame => "finish_idle_game",
+                    ArchiveOperationKind::ReclaimHot => "reclaim_hot",
+                    ArchiveOperationKind::PrepareForeign => "prepare_foreign",
+                    ArchiveOperationKind::NewGame => "new_game",
+                    ArchiveOperationKind::PrepareProfiledForeign => "prepare_profiled_foreign",
+                    ArchiveOperationKind::PersistProfiledRetirement => {
+                        "persist_profiled_retirement"
+                    }
+                });
+                observed.archive_quarantine_reason =
+                    Some(retained_archive_cause(&quarantine.reason));
+            }
+            SessionState::ArchivePending { authority, .. } => observed.authority = Some(*authority),
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledRetirementPending { authority, .. } => {
+                observed.authority = Some(*authority)
+            }
+            SessionState::AdmissionRejected(rejected) => {
+                observed.manager_first_retained_failure =
+                    Some(retained_cause("RetainedManagerAdmission", &rejected.error))
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionState::ProfiledAdmissionRejected(rejected) => {
+                observed.manager_first_retained_failure = Some(retained_cause(
+                    "RetainedProfiledManagerAdmission",
+                    &rejected.error,
+                ))
+            }
+            _ => {}
+        }
+        Ok(observed)
+    }
     pub fn latest_root_receipt(&self) -> Result<Option<AdaptiveShutdownReceipt>, ContractError> {
         self.latest_root
             .lock()
             .map(|r| r.clone())
             .map_err(|_| poisoned("adaptive root receipt"))
+    }
+    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+    pub fn latest_profiled_root_receipt(
+        &self,
+    ) -> Result<Option<super::ProfiledExternalShutdownReceipt>, ContractError> {
+        self.latest_profiled_root
+            .lock()
+            .map(|receipt| receipt.clone())
+            .map_err(|_| poisoned("profiled root receipt owner poisoned"))
     }
     pub fn uci_output_observations(
         &self,
@@ -956,8 +1756,14 @@ where
             Err(rejected) => {
                 let error =
                     SearchSessionFailure::debug("AdaptiveArchiveAdmission", &rejected.error);
-                if let ArchiveOwner::Engine(engine) = rejected.owner {
-                    owners.engine = Some(Box::new(engine));
+                match rejected.owner {
+                    ArchiveOwner::Engine(engine) => owners.engine = Some(Box::new(engine)),
+                    owner @ (ArchiveOwner::Port(_) | ArchiveOwner::Idle(_)) => {
+                        owners.unexpected_archive_owner = Some(Box::new(owner));
+                        worker.request_shutdown();
+                        *state = SessionState::ArchiveJoinedPending { owners, worker };
+                        return Err(error.unknown_if_unclosed());
+                    }
                 }
                 owners = join_archive_lifecycle(state, owners, worker, context.shutdown_deadline)?;
                 *state = SessionState::Idle(owners);
@@ -991,10 +1797,19 @@ where
                     }
                     Ok((owner, _)) => {
                         // Submission was Engine-only; retain any invalid owner.
-                        let ArchiveOwner::Port(port) = owner else {
-                            unreachable!()
-                        };
-                        owners.engine = Some(Box::new(port.into_engine()));
+                        match legacy_archive_engine(owner) {
+                            Ok(engine) => owners.engine = Some(engine),
+                            Err(owner) => {
+                                owners.unexpected_archive_owner = Some(owner);
+                                worker.request_shutdown();
+                                *state = SessionState::ArchiveJoinedPending { owners, worker };
+                                return Err(failure(
+                                    "AdaptiveArchiveReturn",
+                                    "returned Idle owner cannot replace the legacy Engine",
+                                )
+                                .unknown_if_unclosed());
+                            }
+                        }
                         owners = join_archive_lifecycle(
                             state,
                             owners,
@@ -1042,8 +1857,9 @@ where
         observation: &mut AttemptObservation,
         semantic_completion: &mut Option<PalsCompletion>,
     ) -> Result<SearchSessionReport, SearchSessionFailure> {
-        if context.control.max_simulations == 0
-            || context.control.max_simulations > self.options.max_cpu_nodes
+        if self.rovent.is_none()
+            && (context.control.max_simulations == 0
+                || context.control.max_simulations > self.options.max_cpu_nodes)
         {
             return Err(failure(
                 "AdaptiveCpuCredit",
@@ -1063,10 +1879,15 @@ where
                 "closed or mismatched UCI process authority",
             ));
         }
+        let rovent_root_legal = self.rovent_root_legal(position, context)?;
+        let root_source = self.prepare_rovent_go(position, context)?;
         let mut state = loop {
             match self.state.try_lock() {
                 Ok(state) => break state,
-                Err(TryLockError::WouldBlock) if context.accepts().unwrap_or(false) => {
+                Err(TryLockError::WouldBlock)
+                    if Instant::now() < context.shutdown_deadline
+                        && (root_source.is_some() || context.accepts().unwrap_or(false)) =>
+                {
                     std::thread::sleep(Duration::from_millis(1))
                 }
                 Err(TryLockError::WouldBlock) => {
@@ -1083,6 +1904,39 @@ where
         if self.closed.load(Ordering::Acquire) {
             return Err(SearchSessionFailure::physical_completion_unknown());
         }
+        // Resolve the final source gate only while borrowing the actual idle
+        // owner. Initially stopped product roots leave reset/game/Store/credit
+        // unchanged and return no live capability or root-dependent work.
+        let root_admission = match root_source {
+            None => None,
+            Some(RoventPcrRootSource::Legacy(budget)) => Some(RoventPcrRootAdmission {
+                budget,
+                #[cfg(feature = "pals-adaptive")]
+                original: None,
+            }),
+            #[cfg(feature = "pals-adaptive")]
+            Some(RoventPcrRootSource::Original(source)) => {
+                use crate::rovent_root_admission::source_seal::InitialAdmissionOutcome;
+                match source
+                    .into_initial()
+                    .map_err(|error| SearchSessionFailure::debug("RoventRootAdmission", &error))?
+                {
+                    InitialAdmissionOutcome::Admitted(original) => {
+                        let original = Arc::new(original);
+                        Some(RoventPcrRootAdmission {
+                            budget: original.root_budget_digest(),
+                            original: Some(original),
+                        })
+                    }
+                    InitialAdmissionOutcome::StoppedInitial(stopped) => {
+                        let SessionState::Idle(owners) = &*state else {
+                            return Err(SearchSessionFailure::physical_completion_unknown());
+                        };
+                        return self.finish_rovent_initial(owners, context, stopped);
+                    }
+                }
+            }
+        };
         let mut initial_game = InitialGameFailureGuard {
             closed: &self.closed,
             armed: false,
@@ -1094,6 +1948,14 @@ where
                 return Err(SearchSessionFailure::physical_completion_unknown());
             }
         };
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if owners.profiled_retirement.is_some() {
+            *state = SessionState::Idle(owners);
+            return Err(failure(
+                "RoventExternalEvidencePending",
+                "the original retired external packet/Store evidence still requires handoff",
+            ));
+        }
         if !context.accepts().unwrap_or(false) {
             *state = SessionState::Idle(owners);
             return Err(failure(
@@ -1101,7 +1963,25 @@ where
                 "root revoked before actual admission",
             ));
         }
-        let root_legal = position.legal_moves();
+        let root_legal = rovent_root_legal.unwrap_or_else(|| position.legal_moves());
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let SessionResearcherSource::ProfiledExternal(source) = &mut owners.researcher_source {
+            let original = root_admission
+                .as_ref()
+                .and_then(|admission| admission.original.clone());
+            let Some(original) = original else {
+                *state = SessionState::Idle(owners);
+                return Err(failure(
+                    "RoventExternalRoot",
+                    "external R requires the original per-go capability",
+                ));
+            };
+            if let Err(error) = source.prepare_actual_root(original, &self.clock) {
+                self.closed.store(true, Ordering::Release);
+                *state = SessionState::Idle(owners);
+                return Err(error.unknown_if_unclosed());
+            }
+        }
         match self.pending_output.lock() {
             Ok(mut output) => {
                 *output = Some(PendingOutput {
@@ -1127,7 +2007,25 @@ where
                 return Err(SearchSessionFailure::debug("AdaptiveRootNamespace", &error));
             }
         };
-        if game != context.authority.game {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let storage_prepared = match self.prepare_engine_storage(
+            &mut owners,
+            root_admission.as_ref(),
+            game != context.authority.game,
+            position,
+            context,
+            &mut initial_game.armed,
+        ) {
+            Ok(selected) => selected,
+            Err(error) => {
+                self.closed.store(true, Ordering::Release);
+                *state = SessionState::Idle(owners);
+                return Err(error.unknown_if_unclosed());
+            }
+        };
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        let storage_prepared = false;
+        if !storage_prepared && game != context.authority.game {
             if let Err(error) = self.reset_actual_cpu(&mut owners, context, &mut initial_game.armed)
             {
                 // A failed reset may have changed an actual external game or
@@ -1157,11 +2055,12 @@ where
                 }
             };
         }
-        if owners
-            .engine
-            .as_ref()
-            .expect("Search owner")
-            .archive_enabled()
+        if !storage_prepared
+            && owners
+                .engine
+                .as_ref()
+                .expect("Search owner")
+                .archive_enabled()
         {
             owners = self.archive_operation(
                 &mut state,
@@ -1196,7 +2095,11 @@ where
         let limits = PalsLimits {
             deadline: context.control.deadline,
             max_rounds: self.options.max_rounds,
-            max_cpu_nodes: context.control.max_simulations,
+            max_cpu_nodes: if self.rovent.is_some() {
+                self.options.max_cpu_nodes
+            } else {
+                context.control.max_simulations
+            },
             cpu_depth: self.options.cpu_depth,
         };
         let port = match AdaptiveEnginePort::new_registered_retaining(
@@ -1288,11 +2191,93 @@ where
             token_budget: self.options.token_budget,
             policy: self.options.policy,
             first_request_sequence,
-            native_cpu_node_limit: context.control.max_simulations,
+            native_cpu_node_limit: match self.researcher_class {
+                SessionResearcherClass::Legacy => {
+                    if self.rovent.is_some() {
+                        self.options.max_cpu_nodes
+                    } else {
+                        context.control.max_simulations
+                    }
+                }
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                SessionResearcherClass::ProfiledExternal => 0,
+            },
             endpoints: self.options.endpoints,
             controller: self.options.controller,
             device_digest: self.options.device_digest,
             cpu_device_digest: self.options.cpu_device_digest,
+        };
+        let researcher = match std::mem::replace(
+            &mut owners.researcher_source,
+            SessionResearcherSource::Legacy,
+        ) {
+            SessionResearcherSource::Legacy => SessionManagerSource::Legacy,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            SessionResearcherSource::ProfiledExternal(source) => {
+                let Some(original) = root_admission
+                    .as_ref()
+                    .and_then(|admission| admission.original.clone())
+                else {
+                    owners.researcher_source = SessionResearcherSource::ProfiledExternal(source);
+                    *state = SessionState::PortRejected { owners, driver };
+                    return Err(failure(
+                        "RoventExternalManagerSource",
+                        "original root capability is missing",
+                    ));
+                };
+                match source.into_manager(original) {
+                    Ok(external) => SessionManagerSource::Profiled(external),
+                    Err((source, error)) => {
+                        owners.researcher_source =
+                            SessionResearcherSource::ProfiledExternal(Box::new(source));
+                        *state = SessionState::PortRejected { owners, driver };
+                        return Err(error.unknown_if_unclosed());
+                    }
+                }
+            }
+        };
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let external_joined = {
+            let captured = match &researcher {
+                SessionManagerSource::Legacy => Ok(None),
+                SessionManagerSource::Profiled(external) => {
+                    external.owner().frontier_root_source().and_then(|source| {
+                        source
+                            .map(Some)
+                            .ok_or(rz_search::cpu_checker::CheckerError::Invalid(
+                                "actual external source is pending",
+                            ))
+                    })
+                }
+            };
+            match captured {
+                Ok(source) => source,
+                Err(error) => {
+                    if let SessionManagerSource::Profiled(external) = researcher {
+                        owners.researcher_source = SessionResearcherSource::ProfiledExternal(
+                            Box::new(RoventExternalSessionSource::from_manager(
+                                external,
+                                self.checker_metadata.clone(),
+                            )),
+                        );
+                    }
+                    *state = SessionState::PortRejected { owners, driver };
+                    return Err(
+                        SearchSessionFailure::debug("RoventExternalJoinedSource", &error)
+                            .unknown_if_unclosed(),
+                    );
+                }
+            }
+        };
+        let external_source = {
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            {
+                external_joined.as_ref()
+            }
+            #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+            {
+                None
+            }
         };
         let sources = AdaptiveManagerSources {
             native: owners.native,
@@ -1300,41 +2285,56 @@ where
             external: owners.external,
             driver,
         };
-        let admitted = match (owners.continuation, self.explicit_native_limits) {
-            (Some(continuation), true) => SessionManager::new_continued_retaining_with_limits(
-                registration,
-                self.clock.runtime_clock(),
-                self.limits,
-                sources,
-                continuation,
-            ),
-            (None, true) => SessionManager::new_retaining_with_limits(
-                registration,
-                self.clock.runtime_clock(),
-                self.limits,
-                sources,
-            ),
-            (Some(continuation), false) => SessionManager::new_continued_retaining(
-                registration,
-                self.clock.runtime_clock(),
-                sources,
-                continuation,
-            ),
-            (None, false) => {
-                SessionManager::new_retaining(registration, self.clock.runtime_clock(), sources)
-            }
-        };
+        let admitted =
+            self.admit_session_manager(registration, sources, researcher, owners.continuation);
         let mut manager = match admitted {
-            Ok(manager) => Box::new(manager),
-            Err(rejected) => {
+            Ok(manager) => manager,
+            Err(SessionManagerRejection::Legacy(rejected)) => {
                 let error =
                     SearchSessionFailure::debug("AdaptiveManagerAdmission", &rejected.error);
-                *state = SessionState::AdmissionRejected(Box::new(rejected));
+                *state = SessionState::AdmissionRejected(rejected);
+                return Err(error);
+            }
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            Err(SessionManagerRejection::Profiled(rejected)) => {
+                let error = SearchSessionFailure::debug(
+                    "ProfiledExternalManagerAdmission",
+                    &rejected.error,
+                );
+                *state = SessionState::ProfiledAdmissionRejected(rejected);
                 return Err(error);
             }
         };
         *observation = AttemptObservation::PalsStarted;
         let admitted = catch_unwind(AssertUnwindSafe(|| {
+            if let Some(profile) = &self.rovent {
+                match self.researcher_class {
+                    SessionResearcherClass::Legacy => {
+                        manager.register_cleanup_deadline(context.shutdown_deadline)?
+                    }
+                    #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                    SessionResearcherClass::ProfiledExternal => {}
+                }
+                if manager.registered_cleanup_deadline() != Some(context.shutdown_deadline) {
+                    return Err(AdaptiveManagerError::Invalid(
+                        "Rovent original cleanup boundary differs",
+                    ));
+                }
+                if let Some(clock) = &context.effective_clock {
+                    manager.register_effective_clock(clock.clone())?;
+                }
+                self.attach_rovent_profile(
+                    profile,
+                    &mut manager,
+                    context,
+                    root_admission
+                        .as_ref()
+                        .ok_or(AdaptiveManagerError::Invalid(
+                            "Rovent root admission absent",
+                        ))?,
+                    external_source,
+                )?;
+            }
             #[cfg(feature = "pals-adaptive-diagnostics")]
             if let Some(diagnostic) = self.continuation_diagnostic.get() {
                 manager.install_continuation_diagnostic(diagnostic.clone());
@@ -1345,33 +2345,51 @@ where
             if let Some(observer) = &self.collection_hooks.root_admission {
                 observer(&mut manager)?;
             }
-            manager.driver_mut().prepare_root_rules()?;
-            if manager.driver().root_is_terminal()? {
-                manager.begin_root_quiesce(context.shutdown_deadline)?;
-                drain_root(&mut manager, context.shutdown_deadline)?;
-                manager.shutdown_receipt()
-            } else {
-                let close_at = context
-                    .control
-                    .soft_deadline
-                    .min(context.control.admission_deadline);
-                if Instant::now() >= close_at || !context.accepts().unwrap_or(false) {
+            if self.rovent.is_some() {
+                if !context.accepts()? {
                     manager.begin_root_quiesce(context.shutdown_deadline)?;
                     drain_root(&mut manager, context.shutdown_deadline)?;
-                    return manager.shutdown_receipt();
+                    return self.root_shutdown_receipt(&manager);
+                }
+                if let Err(error) = manager
+                    .driver_mut()
+                    .prepare_rovent_root_rules(self.clock.domain(), self.clock.now()?)
+                {
+                    if !self.rovent_controlled_scan_stop(&manager, &error)? {
+                        return Err(error);
+                    }
+                }
+            } else {
+                manager.driver_mut().prepare_root_rules()?;
+            }
+            if manager.driver().root_is_terminal()? || self.rovent_should_quiesce(&manager)? {
+                manager.begin_root_quiesce(context.shutdown_deadline)?;
+                drain_root(&mut manager, context.shutdown_deadline)?;
+                self.root_shutdown_receipt(&manager)
+            } else {
+                if context.soft_expired(Instant::now()) || !context.accepts().unwrap_or(false) {
+                    manager.begin_root_quiesce(context.shutdown_deadline)?;
+                    drain_root(&mut manager, context.shutdown_deadline)?;
+                    return self.root_shutdown_receipt(&manager);
                 }
                 let input = manager.driver_mut().root_input()?;
                 manager.prepare_root_ranking(input)?;
                 let mut last_published = None;
                 let mut last_semantic_snapshot = None;
-                manager.run_root_until_observed(
+                self.run_session_root_observed(
+                    &mut manager,
                     context.shutdown_deadline,
                     &context.control.cancellation,
                     &mut |manager| {
                         if manager.phase() == ManagerPhase::Running
-                            && (Instant::now() >= close_at || !context.accepts().unwrap_or(false))
+                            && (context.soft_expired(Instant::now())
+                                || !context.accepts().unwrap_or(false)
+                                || self.rovent_should_quiesce(manager)?)
                         {
                             manager.begin_root_quiesce(context.shutdown_deadline)?;
+                        }
+                        if let Some(pump) = &self.collection_hooks.cooperative {
+                            pump()?;
                         }
                         let current = manager.driver().port().map(|port| port.counters());
                         if context.accepts().unwrap_or(false)
@@ -1413,6 +2431,7 @@ where
                 let _ = manager.begin_root_quiesce(context.shutdown_deadline);
                 let _ = drain_root(&mut manager, context.shutdown_deadline);
             }));
+            let _ = self.observe_rovent_root(&manager, context, root_admission.as_ref());
             // Even cleanup panic retains the whole actual manager before any
             // caller-visible failure; a local owner must not unwind and drop.
             #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -1426,7 +2445,7 @@ where
                 SearchSessionFailure::debug("AdaptiveRootExecution", &error).unknown_if_unclosed()
             );
         }
-        let receipt = match manager.shutdown_receipt() {
+        let receipt = match self.root_shutdown_receipt(&manager) {
             Ok(receipt) => receipt,
             Err(_) => {
                 *state = SessionState::Manager(manager);
@@ -1437,6 +2456,7 @@ where
             // Preserve the first original failure before retaining the complete
             // manager. Its cause does not confirm a fence or relax quarantine.
             let failure = failed_root_closure(manager.failures().next());
+            let _ = self.observe_rovent_root(&manager, context, root_admission.as_ref());
             *state = SessionState::Manager(manager);
             return Err(failure);
         }
@@ -1446,6 +2466,16 @@ where
                 .driver()
                 .copy_role_consumption_diagnostic(diagnostic, true);
         }
+        let publication_capacity = match manager.driver().rovent_publication_capacity_closed() {
+            Ok(closed) => closed,
+            Err(error) => {
+                *state = SessionState::Manager(manager);
+                return Err(SearchSessionFailure::debug(
+                    "RoventCapacityObservation",
+                    &error,
+                ));
+            }
+        };
         let completion = if context.cancellation.is_canceled()
             || context.control.cancellation.load(Ordering::Acquire)
         {
@@ -1454,7 +2484,9 @@ where
             PalsCompletion::Deadline
         } else if manager.driver().root_is_terminal().unwrap_or(false) {
             PalsCompletion::Terminal
-        } else if manager.cpu_node_limit_reached() {
+        } else if publication_capacity {
+            PalsCompletion::Capacity
+        } else if matches!(self.researcher_limit_observation(&manager), Some(true)) {
             PalsCompletion::CpuNodeLimit
         } else if manager.role_call_limit_reached() {
             PalsCompletion::RoleCallLimit
@@ -1497,41 +2529,73 @@ where
                 }
             };
         let retained_failure = manager.failures().next().cloned();
-        let parts = match manager.into_persistent_parts() {
-            Ok(parts) => parts,
-            Err(rejected) => {
-                *state = SessionState::Manager(Box::new(rejected.manager));
-                return Err(SearchSessionFailure::physical_completion_unknown());
+        let rovent_receipt =
+            match self.observe_rovent_root(&manager, context, root_admission.as_ref()) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    *state = SessionState::Manager(manager);
+                    return Err(error.unknown_if_unclosed());
+                }
+            };
+        if self.rovent.is_some() {
+            match manager.driver_mut().retire_rovent_frontier() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    *state = SessionState::Manager(manager);
+                    return Err(failure(
+                        "RoventFrontierRetirement",
+                        "actual Rovent frontier is missing",
+                    )
+                    .unknown_if_unclosed());
+                }
+                Err(error) => {
+                    *state = SessionState::Manager(manager);
+                    return Err(
+                        SearchSessionFailure::debug("RoventFrontierRetirement", &error)
+                            .unknown_if_unclosed(),
+                    );
+                }
             }
-        };
-        let (native, cpu, external, driver, continuation, receipt) = parts.into_components();
-        let mut owners = Box::new(IdleOwners {
-            native,
-            cpu,
-            external,
-            engine: None,
-            continuation: Some(continuation),
-            native_finished: None,
-            native_joined: false,
-            external_finished: None,
-        });
-        match driver.into_port(&receipt) {
-            Ok(port) => owners.engine = Some(Box::new(port.into_engine())),
+        }
+        let (mut owners, driver, receipt) =
+            self.return_manager_owners(manager, &mut state, false)?;
+        match self.restore_semantic_owner(driver, &receipt) {
+            Ok(restored) => {
+                #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                {
+                    owners.profiled_retirement = restored
+                        .retirement
+                        .filter(|retirement| retirement.retained_questions() != 0);
+                }
+                owners.engine = Some(Box::new(restored.port.into_engine()));
+            }
             Err((driver, _)) => {
                 *state = SessionState::PortRejected { owners, driver };
                 return Err(SearchSessionFailure::physical_completion_unknown());
             }
         }
+        if let Err(error) = self.record_root_fence(&receipt) {
+            *state = SessionState::Idle(owners);
+            return Err(error.unknown_if_unclosed());
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let owners =
+            self.persist_profiled_retirement(&mut state, owners, context.shutdown_deadline)?;
         *state = SessionState::Idle(owners);
-        *self
-            .latest_root
-            .lock()
-            .map_err(|_| failure("AdaptiveRootReceipt", "receipt mutex poisoned"))? = Some(receipt);
         collection.map_err(|e| SearchSessionFailure::debug("AdaptiveCollectionClosure", &e))?;
         if let Some(error) = retained_failure {
             return Err(SearchSessionFailure::debug("AdaptiveRootFailure", &error));
         }
         let result = semantic.map_err(|e| SearchSessionFailure::debug("AdaptiveRootResult", &e))?;
+        if result
+            .best_move
+            .is_some_and(|movement| !root_legal.contains(&movement))
+        {
+            return Err(failure(
+                "RoventRootRestriction",
+                "actual result escaped its original legal root domain",
+            ));
+        }
         if result.resolver_version != self.registration.resolver_version {
             return Err(failure(
                 "AdaptiveResolverChanged",
@@ -1553,9 +2617,18 @@ where
             }
         }
         initial_game.armed = false;
+        let mate_strategy = rovent_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.frontier.as_ref())
+            .and_then(|frontier| frontier.mate_strategy.clone())
+            .filter(|strategy| result.best_move == Some(strategy.best_move()));
         Ok(SearchSessionReport {
+            mate_strategy,
             best_move: result.best_move,
-            work: pals_work(result.counters),
+            work: match rovent_receipt {
+                Some(receipt) => receipt.work()?,
+                None => pals_work(result.counters),
+            },
         })
     }
 
@@ -1582,6 +2655,22 @@ where
     }
 
     fn bind_actual_external(&self, owners: &IdleOwners<B>) -> Result<(), SearchSessionFailure> {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let SessionResearcherSource::ProfiledExternal(source) = &owners.researcher_source {
+            let owner = source
+                .running_owner()
+                .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
+            return self
+                .checker_metadata
+                .bind_profiled_external_owner(
+                    owner,
+                    self.clock.epoch(),
+                    self.options.implementation,
+                )
+                .map_err(|error| {
+                    SearchSessionFailure::debug("RoventProfiledMetadataOwner", &error)
+                });
+        }
         if !matches!(self.registration.identity, CheckerIdentity::ExternalUci(_))
             || self.external_metadata_bound.load(Ordering::Acquire)
         {
@@ -1612,6 +2701,23 @@ where
         context: &SearchSessionContext,
         initial_game_bound: &mut bool,
     ) -> Result<(), SearchSessionFailure> {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if let SessionResearcherSource::ProfiledExternal(source) = &owners.researcher_source {
+            let owner = source
+                .running_owner()
+                .ok_or_else(SearchSessionFailure::physical_completion_unknown)?;
+            let proof = owner.worker().current_reset_proof().ok_or_else(|| {
+                failure(
+                    "RoventProfiledReset",
+                    "actual new-game reset proof is missing",
+                )
+            })?;
+            self.checker_metadata
+                .arm_profiled_external_reset(owner, &proof, context.control.deadline)
+                .map_err(|error| SearchSessionFailure::debug("RoventProfiledReset", &error))?;
+            *initial_game_bound = proof.is_initial();
+            return Ok(());
+        }
         if let Some(external) = &owners.external {
             if !external
                 .worker
@@ -1719,50 +2825,26 @@ where
             return Ok(receipt.clone());
         }
         let retained = std::mem::replace(&mut *state, SessionState::Moving);
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let retained = self.finish_retained_profiled_io(&mut state, retained, until)?;
         let retained = match retained {
             SessionState::Manager(mut manager) => {
                 let root_reusable = manager.phase() == ManagerPhase::Finished
-                    && manager
-                        .shutdown_receipt()
+                    && self
+                        .root_shutdown_receipt(&manager)
                         .is_ok_and(|r| r.permits_root_reuse());
                 if !root_reusable {
                     let finish = catch_unwind(AssertUnwindSafe(|| {
                         manager.begin_shutdown(until)?;
-                        manager.run_until(until, &AtomicBool::new(false))
+                        self.run_session_process_close(&mut manager, until)
                     }));
                     if !matches!(finish, Ok(Ok(ref receipt)) if receipt.permits_archive_close()) {
                         *state = SessionState::Manager(manager);
                         return Err(SearchSessionFailure::physical_completion_unknown());
                     }
                 }
-                let parts = if root_reusable {
-                    manager.into_persistent_parts()
-                } else {
-                    manager.into_process_parts()
-                };
-                let parts = match parts {
-                    Ok(parts) => parts,
-                    Err(rejected) => {
-                        *state = SessionState::Manager(Box::new(rejected.manager));
-                        return Err(SearchSessionFailure::physical_completion_unknown());
-                    }
-                };
-                let (native, cpu, external, driver, continuation, receipt) =
-                    parts.into_components();
-                let mut owners = Box::new(IdleOwners {
-                    native,
-                    cpu,
-                    external,
-                    engine: None,
-                    continuation: Some(continuation),
-                    native_finished: if root_reusable {
-                        None
-                    } else {
-                        Some(receipt.native_physical_shutdown_confirmed)
-                    },
-                    native_joined: receipt.native_owner_joined,
-                    external_finished: None,
-                });
+                let (mut owners, driver, receipt) =
+                    self.return_manager_owners(manager, &mut state, !root_reusable)?;
                 if !root_reusable {
                     if let Some(external) = &owners.external {
                         match external.worker.shutdown_snapshot() {
@@ -1774,12 +2856,24 @@ where
                         }
                     }
                 }
-                match driver.into_port(&receipt) {
-                    Ok(port) => owners.engine = Some(Box::new(port.into_engine())),
+                match self.restore_semantic_owner(driver, &receipt) {
+                    Ok(restored) => {
+                        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+                        {
+                            owners.profiled_retirement = restored
+                                .retirement
+                                .filter(|retirement| retirement.retained_questions() != 0);
+                        }
+                        owners.engine = Some(Box::new(restored.port.into_engine()));
+                    }
                     Err((driver, _)) => {
                         *state = SessionState::PortRejected { owners, driver };
                         return Err(SearchSessionFailure::physical_completion_unknown());
                     }
+                }
+                if let Err(error) = self.record_root_fence(&receipt) {
+                    *state = SessionState::Idle(owners);
+                    return Err(error.unknown_if_unclosed());
                 }
                 SessionState::Idle(owners)
             }
@@ -1792,70 +2886,38 @@ where
                 return Err(SearchSessionFailure::physical_completion_unknown());
             }
         };
-        owners.native.begin_shutdown(until);
-        if let Some(external) = &owners.external {
-            external.worker.request_shutdown(until);
+        if let Err(error) = self.finish_idle_physical_owners(&mut owners, until) {
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            let error = self.abort_engine_storage(error, &owners, until);
+            *state = SessionState::Idle(owners);
+            return Err(error);
         }
-        loop {
-            let version = owners.native.signal().version();
-            while let Some(event) = owners.native.poll() {
-                match event {
-                    TicketNativeEvent::Finished {
-                        physical_shutdown_confirmed,
-                    } => owners.native_finished = Some(physical_shutdown_confirmed),
-                    TicketNativeEvent::Ready { .. } | TicketNativeEvent::RootQuiesced(_) => {}
-                    _ => {
-                        *state = SessionState::Idle(owners);
-                        return Err(SearchSessionFailure::physical_completion_unknown());
-                    }
-                }
-            }
-            if !owners.native_joined {
-                match owners.native.try_join() {
-                    Ok(joined) => owners.native_joined = joined,
-                    Err(_) => {
-                        *state = SessionState::Idle(owners);
-                        return Err(SearchSessionFailure::physical_completion_unknown());
-                    }
-                }
-            }
-            if owners.external_finished.is_none() {
-                if let Some(external) = &mut owners.external {
-                    if let Some(result) = external.worker.try_join() {
-                        match result {
-                            Ok(receipt) => owners.external_finished = Some(receipt),
-                            Err(_) => {
-                                *state = SessionState::Idle(owners);
-                                return Err(SearchSessionFailure::physical_completion_unknown());
-                            }
-                        }
-                    }
-                }
-            }
-            let external_complete = owners.external.is_none()
-                || owners
-                    .external_finished
-                    .is_some_and(|r| r.cleanup_complete && !r.quarantined && !r.ownership_lost);
-            if owners.native_joined && owners.native_finished == Some(true) && external_complete {
-                break;
-            }
-            if Instant::now() >= until || owners.native_finished == Some(false) {
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let mut owners = self.persist_profiled_retirement(&mut state, owners, until)?;
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let storage_finished = match self.finish_engine_storage(&mut owners, until) {
+            Ok(result) => result,
+            Err(error) => {
                 *state = SessionState::Idle(owners);
-                return Err(SearchSessionFailure::physical_completion_unknown());
+                return Err(error.unknown_if_unclosed());
             }
-            owners
-                .native
-                .signal()
-                .wait_changed(version, Duration::from_millis(1));
-        }
-        let engine = owners.engine.as_mut().expect("quiescent Search owner");
-        let last_authority = engine.last_adaptive_authority();
-        let closed = match catch_unwind(AssertUnwindSafe(|| engine.finish_followup_owners(until))) {
-            Ok(Ok(snapshot)) => snapshot
-                .archive
-                .as_ref()
-                .is_ok_and(|archive| archive.as_ref().is_none_or(|a| a.admission_closed)),
-            _ => false,
+        };
+        #[cfg(not(all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+        let storage_finished: Option<Option<SearchAuthority>> = None;
+        let (last_authority, closed) = match storage_finished {
+            Some(last_authority) => (last_authority, true),
+            None => {
+                let engine = owners.engine.as_mut().expect("quiescent Search owner");
+                let last_authority = engine.last_adaptive_authority();
+                let closed =
+                    match catch_unwind(AssertUnwindSafe(|| engine.finish_followup_owners(until))) {
+                        Ok(Ok(snapshot)) => snapshot.archive.as_ref().is_ok_and(|archive| {
+                            archive.as_ref().is_none_or(|a| a.admission_closed)
+                        }),
+                        _ => false,
+                    };
+                (last_authority, closed)
+            }
         };
         if !closed {
             *state = SessionState::Idle(owners);
@@ -1868,6 +2930,17 @@ where
                 return Err(SearchSessionFailure::physical_completion_unknown());
             }
         };
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        let latest_profiled_root = match self.latest_profiled_root.lock() {
+            Ok(receipt) => receipt.clone(),
+            Err(_) => {
+                *state = SessionState::Idle(owners);
+                return Err(failure(
+                    "ProfiledProcessReceipt",
+                    "root receipt mutex poisoned",
+                ));
+            }
+        };
         let receipt = AdaptiveSessionProcessReceipt {
             epoch: self.clock.epoch(),
             last_authority,
@@ -1876,6 +2949,8 @@ where
             external_shutdown: owners.external_finished,
             store_archive_closed: closed,
             latest_root,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            latest_profiled_root,
         };
         if !receipt.permits_process_close() {
             *state = SessionState::Idle(owners);
@@ -1891,8 +2966,66 @@ where
     B: TicketNativeBackend<ReviewView, AdaptivePortQuestion>,
     B::Output: ProposerRankingOutput,
 {
+    fn supports_ponder_clock(&self) -> bool {
+        #[cfg(feature = "pals-adaptive")]
+        {
+            self.rovent_root_policy.is_some()
+        }
+        #[cfg(not(feature = "pals-adaptive"))]
+        {
+            false
+        }
+    }
     fn kind(&self) -> SearchKind {
-        SearchKind::Pals
+        if self.rovent.is_some() {
+            SearchKind::Rovent
+        } else {
+            SearchKind::Pals
+        }
+    }
+    fn node_budget_semantics(&self) -> crate::bridge::NodeBudgetSemantics {
+        if self.rovent.is_some() {
+            crate::bridge::NodeBudgetSemantics::RoventPositionVisits
+        } else {
+            crate::bridge::NodeBudgetSemantics::LegacySimulations
+        }
+    }
+    fn validate_go(
+        &self,
+        position: &Position,
+        go: &crate::parser::GoLimits,
+    ) -> Result<(), ContractError> {
+        #[cfg(feature = "pals-adaptive")]
+        if let Some(registered) = &self.rovent_root_policy {
+            let profile = self
+                .rovent
+                .as_ref()
+                .ok_or_else(|| poisoned("Rovent startup profile absent"))?;
+            crate::rovent_root_admission::preadmission::validate_go(
+                position,
+                go,
+                &registered.lock,
+                registered.policy,
+                profile.maximum_goal_plies,
+            )
+            .map_err(|error| {
+                ContractError::new(ErrorCode::InvalidInput, Stage::Admission, error.detail)
+            })?;
+        }
+        #[cfg(not(feature = "pals-adaptive"))]
+        let _ = (position, go);
+        Ok(())
+    }
+    fn search_goal_capability(&self) -> Option<std::num::NonZeroU16> {
+        self.rovent
+            .as_ref()
+            .map(|profile| profile.maximum_goal_plies)
+    }
+    fn finish_session(
+        &self,
+        until: Instant,
+    ) -> Result<Option<crate::search_driver::DriverPhysicalCompletion>, SearchSessionFailure> {
+        self.finish_rovent_session(until)
     }
     fn implementation(&self) -> Digest {
         self.options.implementation
@@ -1901,10 +3034,14 @@ where
         self.options.identity.clone()
     }
     fn work_receipt(&self) -> Result<Option<ProcessSearchWorkReceipt>, ContractError> {
-        self.work.snapshot().map(Some)
+        if self.rovent.is_some() {
+            Ok(None)
+        } else {
+            self.work.snapshot().map(Some)
+        }
     }
     fn pals_checker_registration(&self) -> Option<PalsCheckerRegistration> {
-        Some(self.registration.clone())
+        self.rovent.is_none().then(|| self.registration.clone())
     }
     fn checker_started(&self) -> Option<bool> {
         match self.state.try_lock() {
@@ -2032,12 +3169,15 @@ where
         context: &SearchSessionContext,
         progress: &mut dyn FnMut(BoardMove),
     ) -> Result<SearchSessionReport, SearchSessionFailure> {
-        if let Err(error) = self.work.begin() {
-            let failure = SearchSessionFailure::debug("AdaptiveWorkJournal", &error);
-            if let Ok(mut journal) = self.completion.lock() {
-                journal.record(context.authority, None, Err(&failure));
+        let legacy_journal = self.rovent.is_none();
+        if legacy_journal {
+            if let Err(error) = self.work.begin() {
+                let failure = SearchSessionFailure::debug("AdaptiveWorkJournal", &error);
+                if let Ok(mut journal) = self.completion.lock() {
+                    journal.record(context.authority, None, Err(&failure));
+                }
+                return Err(failure);
             }
-            return Err(failure);
         }
         let mut observation = AttemptObservation::NoWork;
         let mut semantic_completion = None;
@@ -2048,7 +3188,11 @@ where
             &mut observation,
             &mut semantic_completion,
         );
-        let recorded = self.work.finish(context, &result, observation);
+        let recorded = if legacy_journal {
+            self.work.finish(context, &result, observation)
+        } else {
+            Ok(())
+        };
         let returned = match (result, recorded) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(SearchSessionFailure::debug("AdaptiveWorkJournal", &error)),
@@ -2078,7 +3222,8 @@ where
             .get_mut()
             .unwrap_or_else(|poison| poison.into_inner());
         let retained = std::mem::replace(state, SessionState::Moving);
-        if matches!(retained, SessionState::Closed(_)) {
+        let physically_closed = matches!(retained, SessionState::Closed(_));
+        if physically_closed {
             drop(retained);
         } else {
             // At most one complete process owner per driver is retained. This
@@ -2086,6 +3231,16 @@ where
             // particular, dropping an Arc must not detach the native service
             // or block while dropping live CPU workers and free their Store.
             let _quarantined_owner: &'static mut SessionState<B> = Box::leak(Box::new(retained));
+        }
+        #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+        if !physically_closed {
+            let storage = self
+                .storage
+                .get_mut()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(original) = storage.take() {
+                std::mem::forget(original);
+            }
         }
     }
 }
@@ -2095,6 +3250,28 @@ impl SearchSessionFailure {
         self.physical_completion = crate::search_driver::DriverPhysicalCompletion::Unknown;
         self
     }
+}
+// Debug formatting uses the existing bounded 512-byte writer, not an
+// unbounded format! allocation. The original truncation suffix is retained;
+// the JSON observation applies its own 512-byte field limit separately.
+// A cause projection never certifies completion.
+#[cfg(any(test, all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+fn retained_cause(code: &'static str, cause: &dyn std::fmt::Debug) -> SearchSessionFailure {
+    SearchSessionFailure::debug(code, cause).unknown_if_unclosed()
+}
+#[cfg(any(test, all(feature = "pals-adaptive", feature = "onnx-cpu")))]
+fn retained_archive_cause(
+    cause: &rz_search::pals::engine::adaptive_port::archive_worker::ArchiveQuarantineReason,
+) -> SearchSessionFailure {
+    use rz_search::pals::engine::adaptive_port::archive_worker::ArchiveQuarantineReason;
+    let code = match cause {
+        ArchiveQuarantineReason::Operation(_) => "ArchiveQuarantineOperation",
+        ArchiveQuarantineReason::Panic => "ArchiveQuarantinePanic",
+        ArchiveQuarantineReason::Canceled => "ArchiveQuarantineCanceled",
+        ArchiveQuarantineReason::Deadline => "ArchiveQuarantineDeadline",
+        ArchiveQuarantineReason::InvalidReturn(_) => "ArchiveQuarantineInvalidReturn",
+    };
+    retained_cause(code, cause)
 }
 fn failed_root_closure(first: Option<&AdaptiveManagerError>) -> SearchSessionFailure {
     first.map_or_else(SearchSessionFailure::physical_completion_unknown, |cause| {
@@ -2129,6 +3306,12 @@ where
     B::Output: ProposerRankingOutput,
 {
     worker.request_shutdown();
+    if owners.unexpected_archive_owner.is_some() {
+        // Joining the I/O worker cannot turn a retained owner-kind failure
+        // into an idle legacy Engine or a successful process-close receipt.
+        *state = SessionState::ArchiveJoinedPending { owners, worker };
+        return Err(SearchSessionFailure::physical_completion_unknown());
+    }
     loop {
         match worker.try_join() {
             Ok(Some(receipt))
@@ -2142,6 +3325,16 @@ where
                 return Err(SearchSessionFailure::physical_completion_unknown());
             }
         }
+    }
+}
+
+fn legacy_archive_engine(
+    owner: ArchiveOwner<AdaptivePortModel>,
+) -> Result<Box<PalsEngine<AdaptivePortModel>>, Box<ArchiveOwner<AdaptivePortModel>>> {
+    match owner {
+        ArchiveOwner::Engine(engine) => Ok(Box::new(engine)),
+        ArchiveOwner::Port(port) => Ok(Box::new(port.into_engine())),
+        owner @ ArchiveOwner::Idle(_) => Err(Box::new(owner)),
     }
 }
 fn owned_declarations_match(
@@ -2227,6 +3420,64 @@ mod tests {
         }
     }
     #[test]
+    fn unexpected_idle_archive_return_retains_original_pc_owner_and_store() {
+        use rz_contracts::PrecisionProfile;
+        use rz_search::pals::engine::adaptive_port::AdaptiveModelNamespace;
+        use rz_search::pals::engine::{PalsSemanticConfig, PcSemanticOwner};
+        use rz_search::pals::review_context::{ReviewIndexLimits, ReviewSelectionPolicy};
+        use rz_search::pals::value::{MODEL_WDL_VALUE_SEMANTICS, ModelValueIdentity};
+
+        let value = ModelValueIdentity {
+            semantics: MODEL_WDL_VALUE_SEMANTICS.into(),
+            model: "unexpected-idle-owner-fixture".into(),
+            encoding: "metadata-only-test".into(),
+            precision: "fp32".into(),
+            model_epoch: [9; 32],
+        };
+        let namespace = AdaptiveModelNamespace::new(
+            value.clone(),
+            Digest([9; 32]),
+            Digest([10; 32]),
+            PrecisionProfile::Fp32,
+            1,
+        )
+        .unwrap();
+        let model =
+            AdaptivePortModel::new_with_namespace(value.model.clone(), Some(value), namespace)
+                .unwrap();
+        let owner = Box::new(
+            PcSemanticOwner::new_selected(
+                PalsSemanticConfig {
+                    max_nodes: 257,
+                    max_records: 4,
+                    ..Default::default()
+                },
+                model,
+                ReviewSelectionPolicy::default(),
+                ReviewIndexLimits::default(),
+            )
+            .unwrap(),
+        );
+        let original_owner = std::ptr::from_ref(owner.as_ref());
+        let original_store = owner.stores().read_owner();
+        let idle = owner
+            .into_idle_archive()
+            .unwrap_or_else(|_| panic!("fresh original owner must be logically idle"));
+        let retained = match legacy_archive_engine(ArchiveOwner::Idle(idle)) {
+            Ok(_) => panic!("Idle cannot become a legacy Engine or Port"),
+            Err(retained) => retained,
+        };
+        let ArchiveOwner::Idle(idle) = *retained else {
+            panic!("the unexpected original owner kind must remain Idle")
+        };
+        assert!(original_store.matches(idle.stores()));
+        let restored = idle
+            .into_pc()
+            .unwrap_or_else(|_| panic!("the original PC owner kind must be preserved"));
+        assert_eq!(std::ptr::from_ref(restored.as_ref()), original_owner);
+        assert!(original_store.matches(restored.stores()));
+    }
+    #[test]
     fn uci_output_checks_exact_root_and_separates_report_from_legal_fallback() {
         let legal = Position::startpos().legal_moves();
         let pending = PendingOutput {
@@ -2242,6 +3493,42 @@ mod tests {
         assert!(validate_output(&pending, authority(7), "0000", false).is_err());
     }
     #[test]
+    fn retained_manager_cause_is_bounded_and_cannot_confirm_physical_completion() {
+        let cause = AdaptiveManagerError::Semantic("원인".repeat(1024));
+        let observed = retained_cause("RetainedManagerEarliestFailure", &cause);
+        assert_eq!(observed.code, "RetainedManagerEarliestFailure");
+        assert!(observed.detail.starts_with("Semantic("));
+        assert!(observed.detail.len() <= 512 + " [cause truncated]".len());
+        assert!(observed.detail.ends_with(" [cause truncated]"));
+        assert_eq!(
+            observed.physical_completion,
+            crate::search_driver::DriverPhysicalCompletion::Unknown
+        );
+        assert!(matches!(cause, AdaptiveManagerError::Semantic(ref value) if value.len() > 512));
+    }
+    #[test]
+    fn archive_cause_keeps_operation_failure_distinct_from_deadline_and_cancel() {
+        use rz_search::pals::engine::adaptive_port::archive_worker::ArchiveQuarantineReason;
+        let operation =
+            ArchiveQuarantineReason::Operation(rz_search::pals::engine::PalsError::Capacity);
+        let observed = retained_archive_cause(&operation);
+        assert_eq!(observed.code, "ArchiveQuarantineOperation");
+        assert!(observed.detail.contains("Capacity"));
+        assert_eq!(
+            retained_archive_cause(&ArchiveQuarantineReason::Deadline).code,
+            "ArchiveQuarantineDeadline"
+        );
+        assert_eq!(
+            retained_archive_cause(&ArchiveQuarantineReason::Canceled).code,
+            "ArchiveQuarantineCanceled"
+        );
+        assert_eq!(
+            observed.physical_completion,
+            crate::search_driver::DriverPhysicalCompletion::Unknown
+        );
+        assert!(matches!(operation, ArchiveQuarantineReason::Operation(_)));
+    }
+    #[test]
     fn process_receipt_requires_join_and_physical_finish_independently() {
         let mut receipt = AdaptiveSessionProcessReceipt {
             epoch: ProcessEpoch(3),
@@ -2251,6 +3538,8 @@ mod tests {
             external_shutdown: None,
             store_archive_closed: true,
             latest_root: None,
+            #[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+            latest_profiled_root: None,
         };
         assert!(!receipt.permits_process_close());
         receipt.native_owner_joined = true;

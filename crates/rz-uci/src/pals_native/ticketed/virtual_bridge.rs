@@ -162,6 +162,16 @@ impl NativeVirtualReviewTicketBackend {
         clock: ContractSystemClock,
         drain_limit: Duration,
     ) -> Result<Self, RoleFailure> {
+        Self::new_with_collection_observer(backend, clock, drain_limit, None)
+    }
+    /// Install the optional observer at original worker construction, before
+    /// Ready or any request. Failure retains the same startup ownership rules.
+    pub fn new_with_collection_observer(
+        backend: PalsVirtualReviewOnnxBackend,
+        clock: ContractSystemClock,
+        drain_limit: Duration,
+        observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+    ) -> Result<Self, RoleFailure> {
         if drain_limit.is_zero()
             || backend.rules_input_semantic_digest() != pals_virtual_rules_semantic_digest()
         {
@@ -206,7 +216,7 @@ impl NativeVirtualReviewTicketBackend {
             accepted_warm_profile_window: None,
             evidence: None,
             completed_tickets: BTreeMap::new(),
-            observer: None,
+            observer,
         })
     }
     pub fn set_collection_observer(
@@ -797,6 +807,17 @@ fn encode_view(
 pub fn exact_review_anchor(position: &Position) -> Result<ReviewAnchorInput, RoleFailure> {
     pals_native::virtual_encoding::exact_review_anchor_input(position).map_err(role_failure)
 }
+/// Pure original key/mask calculation with unchanged bytes. It creates only a
+/// RepresentationKey, never a ticket, worker, permit, physical or training cap.
+pub fn virtual_review_representation_for_input(
+    input: &PalsVirtualReviewInput,
+    identity: &ReviewExecutionIdentity,
+    endpoint_history: [u8; 32],
+    revision: u64,
+) -> Result<RepresentationKey, RoleFailure> {
+    representation(input, identity, endpoint_history, revision)
+}
+
 fn representation(
     input: &PalsVirtualReviewInput,
     identity: &ReviewExecutionIdentity,

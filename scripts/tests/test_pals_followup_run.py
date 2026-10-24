@@ -378,7 +378,7 @@ class DriverLookupTests(unittest.TestCase):
                      hashlib.sha256(files[name]).hexdigest()]
         return argv
 
-    def execute(self, argv, probe, clock):
+    def execute(self, argv, probe, clock, lifecycle_error=None):
         with (mock.patch.object(sys, "argv", argv),
               mock.patch.object(wrapper.sys, "platform", "linux"),
               mock.patch.object(wrapper, "observe_resources", return_value={}),
@@ -386,9 +386,21 @@ class DriverLookupTests(unittest.TestCase):
               mock.patch.object(wrapper, "check_colab_driver_lookup", return_value=probe) as lookup,
               mock.patch.object(wrapper.time, "monotonic", side_effect=clock),
               mock.patch.object(wrapper, "run_group", return_value=(0, True, None)) as native,
+              mock.patch.object(wrapper, "OutputLease") as lifecycle,
               contextlib.redirect_stdout(io.StringIO())):
+            lifecycle.return_value.acquire.return_value.finish.side_effect = lifecycle_error
             code = wrapper.main()
         return code, json.loads(self.receipt.read_text()), lookup, native
+
+    def test_final_lifecycle_failure_is_not_recorded_as_completed_native_success(self):
+        code, receipt, _, native = self.execute(self.model_argv(provider="cpu"), None,
+            [0, 2, 3], RuntimeError("synthetic final output quota failure"))
+        native.assert_called_once()
+        self.assertEqual(code, 125)
+        self.assertEqual(receipt['status'], 'failed_output_lifecycle')
+        self.assertEqual(receipt['producer_exit_code'], 0)
+        self.assertEqual(receipt['exit_code'], 125)
+        self.assertIn('quota', receipt['storage_lifecycle_error']['message'])
 
     def test_failed_probe_blocks_model_even_after_whole_window_expires(self):
         code, receipt, lookup, native = self.execute(self.model_argv(),

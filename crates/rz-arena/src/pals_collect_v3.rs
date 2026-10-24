@@ -21,6 +21,9 @@ pub use collection_pgn::*;
 #[cfg(feature = "pals-collection")]
 mod capture;
 #[cfg(feature = "pals-collection")]
+pub(crate) use capture::capture_submitted_review_common_fields;
+pub(crate) use capture::generation_transposition_sha256;
+#[cfg(feature = "pals-collection")]
 pub use capture::*;
 #[cfg(feature = "pals-collection")]
 mod action_driver;

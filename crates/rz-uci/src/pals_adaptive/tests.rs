@@ -3,6 +3,17 @@
 //! semantic scope ends as explicit Unknown after checked worker evidence.
 #[path = "fixed_trace_tests.rs"]
 mod fixed_trace;
+#[path = "nnuec_owner_tests.rs"]
+#[cfg(all(feature = "pals-adaptive", feature = "onnx-cpu"))]
+mod nnuec_owner;
+#[path = "reciprocal_tests.rs"]
+mod reciprocal;
+#[path = "reserved_replay_tests.rs"]
+mod reserved_replay;
+#[path = "role_only_tests.rs"]
+mod role_only;
+#[path = "role_only_goal_tests.rs"]
+mod role_only_goal;
 
 use super::*;
 use crate::pals_adaptive::{
@@ -55,6 +66,17 @@ struct NativeFacts {
     started: Mutex<Vec<RoleTicketEnvelope>>,
     accepted: Mutex<Vec<RoleTicketEnvelope>>,
     child_gate: AtomicBool,
+    /// Fixture-only scheduling barrier for a queued first acceptance ACK:
+    /// let its run finish, then hold the second run on the native owner.
+    block_after_first_run: AtomicBool,
+    release_first_run: AtomicBool,
+    /// The queued-Accept race must observe real cancellation of run two,
+    /// rather than a fixture timeout that happened to free the native owner.
+    hold_second_until_cancel: AtomicBool,
+    second_run_observed_cancel: AtomicBool,
+    reject_acceptance: AtomicBool,
+    prepared: std::sync::atomic::AtomicU64,
+    quiesce_called: AtomicBool,
     finish_called: AtomicBool,
     factories: std::sync::atomic::AtomicU64,
 }
@@ -94,6 +116,7 @@ impl<Q: Clone + Send + Sync + 'static> TicketNativeBackend<ReviewView, Q> for Na
             record_revision: 0,
             role: question.role,
         };
+        self.facts.prepared.fetch_add(1, Ordering::Release);
         Ok((key, key))
     }
     fn prepared_host_bytes(&self, _: &Self::Prepared) -> u64 {
@@ -106,15 +129,41 @@ impl<Q: Clone + Send + Sync + 'static> TicketNativeBackend<ReviewView, Q> for Na
         _: &Self::Prepared,
         canceled: &AtomicBool,
     ) -> TicketPhysicalResult<Self::Output> {
-        self.facts.started.lock().unwrap().push(*ticket);
-        let until = Instant::now() + Duration::from_secs(2);
-        while !question.view.query().prefix.is_empty()
-            && !self.facts.child_gate.load(Ordering::Acquire)
+        let started_number = {
+            let mut started = self.facts.started.lock().unwrap();
+            started.push(*ticket);
+            started.len()
+        };
+        let hold_second_until_cancel =
+            started_number > 1 && self.facts.hold_second_until_cancel.load(Ordering::Acquire);
+        let until = Instant::now()
+            + if hold_second_until_cancel {
+                WINDOW
+            } else {
+                Duration::from_secs(2)
+            };
+        let block_after_first = self.facts.block_after_first_run.load(Ordering::Acquire);
+        let blocked_run =
+            !question.view.query().prefix.is_empty() && (!block_after_first || started_number > 1);
+        while (block_after_first
+            && started_number == 1
+            && !self.facts.release_first_run.load(Ordering::Acquire))
+            || (blocked_run && !self.facts.child_gate.load(Ordering::Acquire))
         {
-            if canceled.load(Ordering::Acquire) || Instant::now() >= until {
+            let actual_cancel = canceled.load(Ordering::Acquire);
+            if actual_cancel || Instant::now() >= until {
+                if hold_second_until_cancel && actual_cancel {
+                    self.facts
+                        .second_run_observed_cancel
+                        .store(true, Ordering::Release);
+                }
                 return TicketPhysicalResult {
                     physical: PhysicalRoleCompletion::Confirmed,
-                    output: Err(RoleFailure::Canceled),
+                    output: Err(if hold_second_until_cancel && !actual_cancel {
+                        RoleFailure::Expired
+                    } else {
+                        RoleFailure::Canceled
+                    }),
                 };
             }
             thread::sleep(Duration::from_millis(1));
@@ -191,6 +240,7 @@ impl<Q: Clone + Send + Sync + 'static> TicketNativeBackend<ReviewView, Q> for Na
             || output.authority != ticket.authority
             || output.key != ticket.representation
             || ticket.view.view_digest.0 != question.view.seal_digest()
+            || self.facts.reject_acceptance.load(Ordering::Acquire)
         {
             return Err(RoleFailure::InvalidOutput);
         }
@@ -207,6 +257,7 @@ impl<Q: Clone + Send + Sync + 'static> TicketNativeBackend<ReviewView, Q> for Na
     fn quiesce(&mut self, _: Instant) -> bool {
         // This authored CPU backend has no pending physical buffers after
         // service.run returns. It is not GPU completion evidence.
+        self.facts.quiesce_called.store(true, Ordering::Release);
         self.finish_ok
     }
 }
@@ -215,6 +266,8 @@ impl<Q: Clone + Send + Sync + 'static> TicketNativeBackend<ReviewView, Q> for Na
 enum FixtureScope {
     TwoIndependentRoles,
     OwnCpuResume,
+    OwnCpuReciprocal,
+    PeerAllDirections,
 }
 struct DriverFixture {
     authority: SearchAuthority,
@@ -234,6 +287,16 @@ struct DriverFixture {
     #[cfg(feature = "pals-adaptive-diagnostics")]
     fail_publish_closed_once: bool,
     raw_cpu_receipts: Vec<ExecutionId>,
+    reciprocal_questions: BTreeMap<u64, rz_contracts::rovent::QuestionEnvelope>,
+    reciprocal_waits: Vec<ExecutionId>,
+    reciprocal_replies: usize,
+    peer_sources: Vec<(Role, rz_contracts::rovent::SearchRecipient)>,
+    peer_opinions: usize,
+    peer_cpu_answers: usize,
+    peer_repeat_question: bool,
+    replay_frontier: Option<rz_search::pals::rovent_frontier::RoventFrontier>,
+    block_replay_while_reserved: bool,
+    blocked_replays: usize,
 }
 impl DriverFixture {
     fn input(
@@ -246,23 +309,57 @@ impl DriverFixture {
             rz_position::PositionLimits::default(),
         )
         .unwrap();
-        let prefix = first.into_iter().collect::<Vec<_>>();
+        let divergence = matches!(self.scope, FixtureScope::PeerAllDirections)
+            && stage == RefinementStage::CriticDivergence;
+        let prefix = if divergence {
+            Vec::new()
+        } else {
+            first.into_iter().collect::<Vec<_>>()
+        };
+        let proposal = if divergence {
+            let first = first.expect("actual first move for divergence fixture");
+            let mut branch = endpoint.clone();
+            branch.make_move(first).unwrap();
+            let mut proposal = vec![first];
+            let additional = if self.peer_repeat_question { 1 } else { 3 };
+            for _ in 0..additional {
+                let movement = branch.legal_moves()[0];
+                branch.make_move(movement).unwrap();
+                proposal.push(movement);
+            }
+            proposal
+        } else {
+            Vec::new()
+        };
+        let divergences: Vec<usize> = if divergence {
+            vec![if self.peer_repeat_question { 1 } else { 3 }]
+        } else {
+            Vec::new()
+        };
         for movement in &prefix {
             endpoint.make_move(*movement).unwrap();
         }
-        let legal = endpoint.legal_moves();
+        let legal = if divergence {
+            Vec::new()
+        } else {
+            endpoint.legal_moves()
+        };
         let view = Arc::new(
             self.index
                 .select(
                     &self.stores,
                     self.state,
                     ReviewQuerySequences {
-                        purpose: RoleQueryPurpose::ProposePolicy,
+                        purpose: if divergence {
+                            RoleQueryPurpose::DivergencePolicy
+                        } else {
+                            RoleQueryPurpose::ProposePolicy
+                        },
                         prefix: &prefix,
-                        proposal: &[],
+                        proposal: &proposal,
                         counterexample: None,
                         legal: &legal,
-                        divergences: &[],
+                        divergences: &divergences,
                     },
                     ReviewSelectionPolicy::default(),
                 )
@@ -293,6 +390,177 @@ impl DriverFixture {
     }
 }
 impl AdaptiveSearchDriver<u64> for DriverFixture {
+    fn frontier_native_capacity(
+        &mut self,
+        requested: u64,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<Option<u64>, AdaptiveManagerError> {
+        self.replay_frontier
+            .as_mut()
+            .map(|frontier| frontier.native_capacity(requested, clock, now))
+            .transpose()
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn frontier_native_reserve(
+        &mut self,
+        job: &CpuJobEnvelope,
+        grant: SliceGrant,
+        clock: ClockDomain,
+        now: MonotonicTick,
+    ) -> Result<Option<NativeReservation>, AdaptiveManagerError> {
+        self.replay_frontier
+            .as_mut()
+            .map(|frontier| frontier.reserve_native(job, grant, clock, now))
+            .transpose()
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn frontier_native_settled(
+        &mut self,
+        reservation: &NativeReservation,
+        report: &CpuSliceReport,
+        accepted: &SettledCpuSlice,
+    ) -> Result<NativeCloseReason, AdaptiveManagerError> {
+        self.replay_frontier
+            .as_mut()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "fixture native frontier absent",
+            ))?
+            .settle_native(reservation, report, accepted)
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn frontier_native_released(
+        &mut self,
+        reservation: &NativeReservation,
+        accepted: &ReleasedCpuReservation,
+    ) -> Result<NativeCloseReason, AdaptiveManagerError> {
+        self.replay_frontier
+            .as_mut()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "fixture native frontier absent",
+            ))?
+            .release_unqueued(reservation, accepted)
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn frontier_native_unknown(
+        &mut self,
+        reservation: &NativeReservation,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.replay_frontier
+            .as_mut()
+            .ok_or(AdaptiveManagerError::Invalid(
+                "fixture native frontier absent",
+            ))?
+            .native_usage_unknown(reservation)
+            .map_err(AdaptiveManagerError::Frontier)
+    }
+    fn accept_accepted_role_source(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, u64>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+    ) -> Result<(), AdaptiveManagerError> {
+        assert!(accepted.validates_output(output));
+        self.validate_role(work, accepted.ticket(), output)
+    }
+    fn discard_accepted_role_reciprocal(
+        &mut self,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.reciprocal_questions.remove(&id.sequence);
+        Ok(())
+    }
+    fn prepare_accepted_role_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, u64>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+        mode: rz_contracts::rovent::ExecutionMode,
+        budget: Digest,
+        recipient: rz_contracts::rovent::SearchRecipient,
+    ) -> Result<Option<AdaptivePeerQuestion<u64>>, AdaptiveManagerError> {
+        self.fixture_prepare_peer(work, accepted, output, id, mode, budget, recipient)
+            .map(Some)
+    }
+    fn consume_accepted_role_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, u64>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        _: Option<TicketExecutionEvidence>,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        self.validate_role(work, accepted.ticket(), output)?;
+        assert!(accepted.validates_output(output));
+        self.peer_opinions += 1;
+        Ok(accepted.output_digest())
+    }
+    fn consume_reciprocal_cpu(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, u64>,
+        report: &CpuSliceReport,
+    ) -> Result<Digest, AdaptiveManagerError> {
+        assert!(report.terminal && !report.continuation_retained);
+        assert_eq!(
+            report.result.as_ref().unwrap().report.completion,
+            CpuCompletion::DepthLimit
+        );
+        self.peer_cpu_answers += 1;
+        Ok(Digest([87; 32]))
+    }
+    fn discard_cpu_reciprocal(
+        &mut self,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+    ) -> Result<(), AdaptiveManagerError> {
+        self.reciprocal_questions.remove(&id.sequence);
+        Ok(())
+    }
+    fn reciprocal_parent(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, u64>,
+        job: &rz_contracts::pals_adaptive::CpuJobEnvelope,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+        mode: rz_contracts::rovent::ExecutionMode,
+        root_budget: Digest,
+    ) -> Result<rz_contracts::rovent::QuestionEnvelope, AdaptiveManagerError> {
+        self.fixture_reciprocal_parent(work, job, id, mode, root_budget)
+    }
+    fn prepare_cpu_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, u64>,
+        request: &rz_search::cpu::CpuReciprocalRequest,
+        id: rz_contracts::rovent::ReciprocalQuestionId,
+        mode: rz_contracts::rovent::ExecutionMode,
+        root_budget: Digest,
+    ) -> Result<AdaptiveReciprocalQuestion<u64>, AdaptiveManagerError> {
+        self.fixture_prepare_reciprocal(work, request, id, mode, root_budget)
+    }
+    fn cpu_reciprocal_wait(
+        &mut self,
+        _: &CoordinatorWork<ReviewView, u64>,
+        report: &CpuSliceReport,
+    ) -> Result<(), AdaptiveManagerError> {
+        assert_eq!(
+            report.result.as_ref().unwrap().report.completion,
+            CpuCompletion::AwaitReciprocal
+        );
+        assert!(!self.reciprocal_waits.contains(&report.grant.execution));
+        self.reciprocal_waits.push(report.grant.execution);
+        Ok(())
+    }
+    fn consume_cpu_reciprocal(
+        &mut self,
+        work: &CoordinatorWork<ReviewView, u64>,
+        accepted: &rz_search::pals::coordinator::AcceptedRoleStep,
+        output: &RoleOutput,
+        _: Option<TicketExecutionEvidence>,
+        requests: &[(
+            rz_search::cpu::CpuReciprocalRequest,
+            rz_contracts::rovent::ReciprocalQuestionId,
+        )],
+    ) -> Result<Vec<rz_search::cpu::CpuReciprocalReply>, AdaptiveManagerError> {
+        self.fixture_consume_reciprocal(work, accepted, output, requests)
+    }
     fn root_rules(&self) -> Arc<ContractState> {
         Arc::clone(&self.rules)
     }
@@ -313,7 +581,9 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
         );
         let width = match self.scope {
             FixtureScope::TwoIndependentRoles => 2,
-            FixtureScope::OwnCpuResume => 1,
+            FixtureScope::OwnCpuResume
+            | FixtureScope::OwnCpuReciprocal
+            | FixtureScope::PeerAllDirections => 1,
         };
         ranking
             .ranked_candidates()
@@ -325,7 +595,14 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
                     first_move: *movement,
                     input: self.input(RefinementStage::ProposalContinuation, Some(first)),
                     budget: FrameBudget {
-                        role_submissions_remaining: 4,
+                        role_submissions_remaining: if matches!(
+                            self.scope,
+                            FixtureScope::PeerAllDirections
+                        ) {
+                            12
+                        } else {
+                            4
+                        },
                         original_cpu_credit: TOTAL_NODES,
                         original_store_byte_limit: 1 << 20,
                     },
@@ -352,11 +629,14 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
                 "fixture original question/view",
             ));
         }
-        let RolePayload::Proposal {
-            candidate_logits, ..
-        } = &output.payload
-        else {
-            return Err(AdaptiveManagerError::Invalid("fixture proposer head"));
+        let candidate_logits = match &output.payload {
+            RolePayload::Proposal {
+                candidate_logits, ..
+            } if ticket.role == Role::Proposer => candidate_logits,
+            RolePayload::Counterexample {
+                candidate_logits, ..
+            } if ticket.role == Role::Critic => candidate_logits,
+            _ => return Err(AdaptiveManagerError::Invalid("fixture role head")),
         };
         if candidate_logits.len() != work.input.view.query().legal.len()
             || candidate_logits.iter().any(|v| !v.is_finite())
@@ -373,6 +653,15 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
         _: Option<TicketExecutionEvidence>,
     ) -> Result<CheckedStep<u64>, AdaptiveManagerError> {
         self.validate_role(work, ticket, output)?;
+        if self.block_replay_while_reserved
+            && self
+                .replay_frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.snapshot().work.reserved_native_nodes != 0)
+        {
+            self.blocked_replays += 1;
+            return Err(AdaptiveManagerError::Frontier(FrontierError::NodesReserved));
+        }
         if self.fail_role_once {
             self.fail_role_once = false;
             return Err(AdaptiveManagerError::Semantic(
@@ -390,10 +679,21 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
             FixtureScope::TwoIndependentRoles => FrameTransition::Unknown {
                 reason: "authored integration fixture ends after actual role acceptance",
             },
-            FixtureScope::OwnCpuResume => {
+            FixtureScope::OwnCpuResume | FixtureScope::OwnCpuReciprocal => {
                 let mut input = work.input.clone();
                 input.stage = RefinementStage::CpuValidation;
                 FrameTransition::Continue(input)
+            }
+            FixtureScope::PeerAllDirections => {
+                if ticket.role == Role::Proposer {
+                    let mut input = work.input.clone();
+                    input.stage = RefinementStage::CpuValidation;
+                    FrameTransition::Continue(input)
+                } else {
+                    FrameTransition::Unknown {
+                        reason: "authored peer fixture ends after original C source commits",
+                    }
+                }
             }
         };
         Ok(CheckedStep {
@@ -409,7 +709,7 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
         work: &CoordinatorWork<ReviewView, u64>,
         _: &[CpuWorkerProfile],
         _: Option<&ExternalCpuConfig>,
-        _: CpuEndpointSelection,
+        _: CpuEndpoint,
         physical_budget_exhausted: bool,
     ) -> Result<CpuQuestion, AdaptiveManagerError> {
         if physical_budget_exhausted {
@@ -446,18 +746,34 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
     ) -> Result<CheckedStep<u64>, AdaptiveManagerError> {
         assert!(report.terminal && !report.continuation_retained);
         let actual = &report.result.as_ref().unwrap().report;
-        let expected = &self.expected_cpu[&work.original_first_move.bits()];
         assert_eq!(actual.completion, CpuCompletion::DepthLimit);
-        assert_eq!(actual.completed_depth, expected.completed_depth);
-        assert_eq!(actual.score, expected.score);
-        assert_eq!(actual.pv, expected.pv);
-        assert_eq!(report.cumulative_nodes, expected.nodes);
+        if matches!(
+            self.scope,
+            FixtureScope::OwnCpuReciprocal | FixtureScope::PeerAllDirections
+        ) {
+            assert_eq!(actual.completed_depth, 2);
+            assert!(report.cumulative_nodes > 0);
+            assert!(!self.reciprocal_waits.is_empty());
+            assert!(self.reciprocal_replies > 0);
+        } else {
+            let expected = &self.expected_cpu[&work.original_first_move.bits()];
+            assert_eq!(actual.completed_depth, expected.completed_depth);
+            assert_eq!(actual.score, expected.score);
+            assert_eq!(actual.pv, expected.pv);
+            assert_eq!(report.cumulative_nodes, expected.nodes);
+        }
         self.actual_cpu.push(report.clone());
+        let transition = if matches!(self.scope, FixtureScope::PeerAllDirections) {
+            let first = BoardMove::try_from(work.original_first_move.decode().unwrap()).unwrap();
+            FrameTransition::Continue(self.input(RefinementStage::CriticDivergence, Some(first)))
+        } else {
+            FrameTransition::Unknown {
+                reason: "authored integration fixture ends after actual private CPU completion",
+            }
+        };
         Ok(CheckedStep {
             evidence: Digest([42; 32]),
-            transition: FrameTransition::Unknown {
-                reason: "authored integration fixture ends after actual private CPU completion",
-            },
+            transition,
             fresh_pair: None,
             rules_pair: None,
             queued_recheck: None,
@@ -504,8 +820,11 @@ impl AdaptiveSearchDriver<u64> for DriverFixture {
         ticket: &RoleTicketEnvelope,
         view: &Arc<ReviewView>,
     ) -> Result<(), AdaptiveManagerError> {
-        assert!(self.consumed.iter().all(|old| old.id != ticket.id));
         assert_eq!(ticket.view.view_digest.0, view.seal_digest());
+        if let Some(original) = self.consumed.iter().find(|old| old.id == ticket.id) {
+            assert_eq!(original, ticket);
+            return Ok(());
+        }
         self.index.consume(view, &self.stores).unwrap();
         self.consumed.push(*ticket);
         Ok(())
@@ -634,6 +953,16 @@ fn fixture_with_registered_role_limit(
         #[cfg(feature = "pals-adaptive-diagnostics")]
         fail_publish_closed_once: false,
         raw_cpu_receipts: Vec::new(),
+        reciprocal_questions: BTreeMap::new(),
+        reciprocal_waits: Vec::new(),
+        reciprocal_replies: 0,
+        peer_sources: Vec::new(),
+        peer_opinions: 0,
+        peer_cpu_answers: 0,
+        peer_repeat_question: false,
+        replay_frontier: None,
+        block_replay_while_reserved: false,
+        blocked_replays: 0,
     };
     let root_input = driver.input(RefinementStage::ProposerRanking, None);
     let facts = Arc::new(NativeFacts::default());
@@ -949,6 +1278,210 @@ fn shutdown(manager: &mut Manager, until: Instant) -> AdaptiveShutdownReceipt {
         receipt.native_owner_joined && receipt.own_cpu_joined == 1
     });
     manager.shutdown_receipt().unwrap()
+}
+
+/// Wait for an actual owner event without manufacturing a Retired packet or
+/// copying its linear permit. All earlier actual events are processed once.
+fn take_original_native_retirement(
+    manager: &mut Manager,
+    until: Instant,
+) -> TicketNativeEvent<RoleOutput> {
+    loop {
+        assert!(
+            Instant::now() < until,
+            "original native retirement fixture timeout"
+        );
+        if let Some(event) = manager.native.poll() {
+            if matches!(&event, TicketNativeEvent::Retired { .. }) {
+                return event;
+            }
+            manager.native_event(event).unwrap();
+        } else {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+#[test]
+fn copied_publication_capacity_error_without_original_controller_remains_failure() {
+    for cause in [
+        FrontierError::PublicRecordCapacity,
+        FrontierError::PublicReviewIndexCapacity,
+        FrontierError::Capacity("another original bounded resource"),
+    ] {
+        let (mut manager, _, _, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+        manager
+            .frontier_boundary_or_failure(AdaptiveManagerError::Frontier(cause))
+            .unwrap();
+        assert_eq!(manager.failures().count(), 1);
+        assert_eq!(manager.phase(), ManagerPhase::Running);
+        assert!(manager.shutdown_until.is_none());
+        let receipt = shutdown(&mut manager, until);
+        // This helper joins the process owner; it does not quiesce an owner
+        // for another root. Physical closure must not erase logical failure.
+        assert!(receipt.permits_archive_close());
+        assert!(!receipt.permits_root_reuse());
+        assert_eq!(manager.failures().count(), 1);
+        assert_eq!(receipt.counters.accepted_nn_inputs, 0);
+        assert_eq!(receipt.counters.consumed_role_outputs, 0);
+    }
+}
+
+#[test]
+fn pcr_keeps_actual_canceled_published_head_accept_until_original_fence() {
+    for process_shutdown in [false, true] {
+        let (mut manager, facts, root, until) =
+            fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+        facts.block_after_first_run.store(true, Ordering::Release);
+        facts
+            .hold_second_until_cancel
+            .store(true, Ordering::Release);
+        // Two actual native questions let the second run occupy the owner
+        // while the manager queues the first original P-ranking Accept.
+        // They are transport/custody fixtures, not invented search evidence.
+        let first = root.view.query().legal[0];
+        manager
+            .prepare_role(None, root, RolePurpose::RootRanking)
+            .unwrap();
+        let child = manager
+            .driver_mut()
+            .input(RefinementStage::ProposalContinuation, Some(first));
+        manager
+            .prepare_role(None, child, RolePurpose::RoventRefinement)
+            .unwrap();
+        pump(&mut manager, until, |manager| {
+            manager.shutdown_receipt().unwrap().pending_tickets == 2
+        });
+        facts.release_first_run.store(true, Ordering::Release);
+        while facts.started.lock().unwrap().len() < 2 {
+            assert!(
+                Instant::now() < until,
+                "second actual native run did not start"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        manager.tick().unwrap();
+        let ticket = manager
+            .roles
+            .iter()
+            .find(|binding| binding.purpose == RolePurpose::RootRanking)
+            .and_then(|binding| binding.ticket)
+            .expect("original P-ranking ticket");
+        let binding = manager
+            .roles
+            .iter()
+            .find(|binding| binding.ticket == Some(ticket))
+            .unwrap();
+        assert!(binding.ack_dispatched && binding.ack_accepted == Some(true));
+        assert!(binding.service_completed && !binding.native_acceptance_recorded);
+        assert!(manager.driver().consumed.is_empty());
+        assert!(facts.accepted.lock().unwrap().is_empty());
+        let cleanup_until = Instant::now() + WINDOW;
+        if process_shutdown {
+            manager.begin_shutdown(cleanup_until).unwrap();
+        } else {
+            manager.begin_root_quiesce(cleanup_until).unwrap();
+        }
+        let original = take_original_native_retirement(&mut manager, cleanup_until);
+        assert!(facts.second_run_observed_cancel.load(Ordering::Acquire));
+        assert!(matches!(&original, TicketNativeEvent::Retired {
+            ticket: actual, accepted: false, result: Err(RoleFailure::Canceled),
+            rejected_permit: Some(_), native_receipt: None,
+        } if *actual == ticket));
+        manager.native_event(original).unwrap();
+        let binding = manager
+            .roles
+            .iter()
+            .find(|binding| binding.ticket == Some(ticket))
+            .unwrap();
+        assert_eq!(binding.revoked_acceptance, Some(RoleFailure::Canceled));
+        assert!(binding.delivered.is_some());
+        assert!(!binding.native_acceptance_recorded && !binding.consumption_recorded);
+        assert_eq!(manager.retained_native_permits.len(), 1);
+        assert_eq!(manager.registry.occupancy(), 2);
+        assert!(manager.native_root_fence.is_none());
+        pump(&mut manager, cleanup_until, |manager| {
+            manager.phase() == ManagerPhase::Finished
+        });
+        let receipt = manager.shutdown_receipt().unwrap();
+        assert!(receipt.permits_semantic_closure(), "{receipt:?}");
+        assert!(
+            manager.failures().next().is_none(),
+            "{:?}",
+            manager.failures().collect::<Vec<_>>()
+        );
+        assert_eq!(receipt.counters.accepted_nn_inputs, 0);
+        assert_eq!(receipt.counters.consumed_role_outputs, 0);
+        assert_eq!(receipt.pending_tickets, 0);
+        assert!(manager.driver().consumed.is_empty());
+        assert!(facts.accepted.lock().unwrap().is_empty());
+        assert!(manager.roles.is_empty() && manager.retained_native_permits.is_empty());
+        assert_eq!(manager.driver().stores.review_pin_count().unwrap(), 0);
+        if !receipt.native_owner_joined {
+            manager.native.begin_shutdown(cleanup_until);
+            while !manager.native.try_join().unwrap() {
+                assert!(Instant::now() < cleanup_until);
+                manager.native.poll();
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+#[test]
+fn pcr_drain_does_not_hide_actual_non_cancel_published_head_rejection() {
+    let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    facts.reject_acceptance.store(true, Ordering::Release);
+    manager.prepare_root_ranking(root).unwrap();
+    pump(&mut manager, until, |manager| {
+        manager.roles.iter().any(|binding| binding.ack_dispatched)
+    });
+    // Capture the actual failed owner ACK before close, then consume that
+    // same event once during Draining. All other cancellation/permit guards
+    // hold; InvalidOutput must still remain a failure rather than cleanup.
+    let original = take_original_native_retirement(&mut manager, until);
+    assert!(matches!(
+        &original,
+        TicketNativeEvent::Retired {
+            accepted: false,
+            result: Err(RoleFailure::InvalidOutput),
+            rejected_permit: Some(_),
+            native_receipt: None,
+            ..
+        }
+    ));
+    let cleanup_until = Instant::now() + WINDOW;
+    manager.begin_root_quiesce(cleanup_until).unwrap();
+    let error = manager.native_event(original).unwrap_err();
+    assert!(matches!(&error, AdaptiveManagerError::Semantic(message)
+        if message == "native retirement: InvalidOutput"));
+    assert!(
+        manager
+            .roles
+            .iter()
+            .all(|binding| binding.revoked_acceptance.is_none())
+    );
+    assert_eq!(manager.retained_native_permits.len(), 1);
+    manager.record_failure(error);
+    pump(&mut manager, cleanup_until, |manager| {
+        manager.phase() == ManagerPhase::Finished
+    });
+    let receipt = manager.shutdown_receipt().unwrap();
+    assert!(receipt.permits_root_reuse(), "{receipt:?}");
+    assert!(manager.failures().any(|error| matches!(error,
+        AdaptiveManagerError::Semantic(message) if message == "native retirement: InvalidOutput")));
+    assert_eq!(receipt.counters.accepted_nn_inputs, 0);
+    assert_eq!(receipt.counters.consumed_role_outputs, 0);
+    assert!(manager.driver().consumed.is_empty());
+    assert!(facts.accepted.lock().unwrap().is_empty());
+    assert!(manager.roles.is_empty() && manager.retained_native_permits.is_empty());
+    assert_eq!(manager.driver().stores.review_pin_count().unwrap(), 0);
+    manager.native.begin_shutdown(cleanup_until);
+    while !manager.native.try_join().unwrap() {
+        assert!(Instant::now() < cleanup_until);
+        manager.native.poll();
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 type ActualPortManager = AdaptiveExecutionManager<
@@ -1616,6 +2149,181 @@ fn next_view_failure_preserves_actual_original_role_consumption() {
 }
 
 #[test]
+fn original_prepared_echo_after_cancel_retirement_never_recancels_or_admits() {
+    let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    let preparation = manager.prepare_root_ranking(root).unwrap();
+    // Receive the actual owner event without letting the manager admit a
+    // RequestId. This is an original queued Prepared, not a fabricated seal.
+    let prepared = loop {
+        let version = manager.native.signal().version();
+        if let Some(event) = manager.native.poll() {
+            match event {
+                TicketNativeEvent::Prepared(prepared) => break prepared,
+                other => manager.native_event(other).unwrap(),
+            }
+        } else {
+            assert!(Instant::now() < until, "actual Prepared did not arrive");
+            manager
+                .native
+                .signal()
+                .wait_changed(version, Duration::from_millis(10));
+        }
+    };
+    assert_eq!(prepared.preparation, preparation);
+    assert_eq!(facts.prepared.load(Ordering::Acquire), 1);
+    assert_eq!(manager.native.occupancy(), 1);
+    assert_eq!(manager.roles.len(), 1);
+    assert!(manager.roles[0].ticket.is_none());
+    let original_view = Arc::downgrade(&manager.roles[0].input.view);
+    // Hold the actual owner after a scan that saw this still-open Prepared.
+    // Closing now fixes the race where cancellation and quiesce arrive in the
+    // same iteration after the ordinary unsubmitted-retirement scan.
+    assert!(matches!(
+        manager.native.pause_after_cancellation_scan_for_test(
+            PreparationId(preparation.0 + 1_000_000),
+            until
+        ),
+        Err(TicketServiceError::UnknownPreparation)
+    ));
+    let (scan_entered, release_scan) = manager
+        .native
+        .pause_after_cancellation_scan_for_test(preparation, until)
+        .unwrap();
+    scan_entered
+        .recv_timeout(until.saturating_duration_since(Instant::now()))
+        .expect("original owner did not reach the one-shot cancellation-scan gate");
+    assert!(matches!(
+        manager
+            .native
+            .pause_after_cancellation_scan_for_test(preparation, until),
+        Err(TicketServiceError::Duplicate)
+    ));
+    assert_eq!(manager.native.occupancy(), 1);
+    assert!(!facts.quiesce_called.load(Ordering::Acquire));
+    manager.begin_root_quiesce(until).unwrap();
+    assert!(manager.roles[0].cancellation_requested);
+    release_scan.send(()).unwrap();
+    // Do not pump manager events: let its real successful cancel and the
+    // original worker retire the unticketed preparation first. The queued
+    // PreparationFailed/RootQuiesced remain for their one original delivery.
+    while !facts.quiesce_called.load(Ordering::Acquire) || manager.native.occupancy() != 0 {
+        let version = manager.native.signal().version();
+        assert!(
+            Instant::now() < until,
+            "original cancel/quiesce did not finish"
+        );
+        manager
+            .native
+            .signal()
+            .wait_changed(version, Duration::from_millis(10));
+    }
+    assert!(original_view.upgrade().is_some());
+    assert_eq!(manager.counters().canceled_preparations, 0);
+    // A proved cancel for this original binding must not permit another ID
+    // or an altered immutable echo to take the same normal closing path.
+    let mut foreign = prepared;
+    foreign.preparation = PreparationId(preparation.0 + 1_000_000);
+    assert!(matches!(
+        manager.native_event(TicketNativeEvent::Prepared(foreign)),
+        Err(AdaptiveManagerError::Invalid(_))
+    ));
+    let mut altered = prepared;
+    altered.question = Digest([77; 32]);
+    assert!(matches!(
+        manager.native_event(TicketNativeEvent::Prepared(altered)),
+        Err(AdaptiveManagerError::Invalid(_))
+    ));
+    assert_eq!(manager.counters().canceled_preparations, 0);
+    manager
+        .native_event(TicketNativeEvent::Prepared(prepared))
+        .unwrap();
+    assert_eq!(manager.counters().canceled_preparations, 1);
+    // An exact duplicate is still a protocol error, not another normal cancel
+    // or permission to charge the same prepared input twice.
+    assert!(matches!(
+        manager.native_event(TicketNativeEvent::Prepared(prepared)),
+        Err(AdaptiveManagerError::Invalid(_))
+    ));
+    assert_eq!(manager.counters().canceled_preparations, 1);
+    let mut failed = false;
+    let mut fenced = false;
+    while !failed || !fenced {
+        let version = manager.native.signal().version();
+        if let Some(event) = manager.native.poll() {
+            match &event {
+                TicketNativeEvent::PreparationFailed {
+                    preparation: actual,
+                    failure,
+                } => {
+                    assert_eq!(*actual, preparation);
+                    assert_eq!(*failure, RoleFailure::Canceled);
+                    assert!(!failed, "original preparation retired more than once");
+                    failed = true;
+                }
+                TicketNativeEvent::RootQuiesced(fence) => {
+                    assert!(
+                        failed,
+                        "original preparation terminal must precede root fence"
+                    );
+                    assert!(!fenced, "original root fenced more than once");
+                    assert!(facts.quiesce_called.load(Ordering::Acquire));
+                    assert_eq!(fence.authority(), manager.registration.authority);
+                    assert!(fence.permits_reuse());
+                    fenced = true;
+                }
+                _ => panic!("unsubmitted original preparation produced an unexpected event"),
+            }
+            manager.native_event(event).unwrap();
+        } else {
+            assert!(
+                Instant::now() < until,
+                "original terminal/fence did not arrive: failed={failed}; fenced={fenced}; quiesce_called={}; occupancy={}; owner_fence={:?}",
+                facts.quiesce_called.load(Ordering::Acquire),
+                manager.native.occupancy(),
+                manager.native.root_fence()
+            );
+            manager
+                .native
+                .signal()
+                .wait_changed(version, Duration::from_millis(10));
+        }
+    }
+    pump(&mut manager, until, |manager| {
+        manager.phase() == ManagerPhase::Finished
+    });
+    assert!(manager.failures().next().is_none());
+    assert!(manager.roles.is_empty());
+    assert!(original_view.upgrade().is_none());
+    assert!(
+        manager.native.poll().is_none(),
+        "original terminal delivered once"
+    );
+    assert_eq!(manager.role_call_budget_usage(), (0, 0));
+    assert_eq!(manager.counters().submitted_role_tickets, 0);
+    assert_eq!(manager.counters().physical_role_completions, 0);
+    assert_eq!(manager.counters().consumed_role_outputs, 0);
+    assert_eq!(manager.native_cpu_usage().unwrap(), (0, 0));
+    assert!(facts.started.lock().unwrap().is_empty());
+    assert!(facts.accepted.lock().unwrap().is_empty());
+    assert!(manager.shutdown_receipt().unwrap().permits_root_reuse());
+    let parts = match manager.into_persistent_parts() {
+        Ok(parts) => parts,
+        Err(rejected) => panic!("original canceled root owner recovery: {}", rejected.error),
+    };
+    let (mut native, _, _, _, _, _) = parts.into_components();
+    native.begin_shutdown(until);
+    while !native.try_join().unwrap() {
+        while native.poll().is_some() {}
+        assert!(
+            Instant::now() < until,
+            "original native process owner did not join"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(facts.finish_called.load(Ordering::Acquire));
+}
+
+#[test]
 fn changed_tick_observer_can_close_root_before_late_child_consumption() {
     let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
     assert!(manager.root_observation_snapshot().is_err());
@@ -1651,6 +2359,62 @@ fn changed_tick_observer_can_close_root_before_late_child_consumption() {
     while !native.try_join().unwrap() {
         while native.poll().is_some() {}
         assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(facts.finish_called.load(Ordering::Acquire));
+}
+
+#[test]
+fn cooperative_collection_failure_drains_active_native_before_retained_semantic_error() {
+    let (mut manager, facts, root, until) = fixture(FixtureScope::TwoIndependentRoles, true, 4096);
+    // Hold the actual first authored physical run until its same-owner cancel.
+    // Merely having a submitted ticket is not evidence of an active run.
+    facts.block_after_first_run.store(true, Ordering::Release);
+    manager.prepare_root_ranking(root).unwrap();
+    pump(&mut manager, until, |_| {
+        facts.started.lock().unwrap().len() == 1
+    });
+    assert!(facts.accepted.lock().unwrap().is_empty());
+    let original = AdaptiveCollectionError::new(
+        AdaptiveCollectionStage::Settled,
+        "FixtureCollectionCaller",
+        "original cooperative failure while physical role is active",
+    );
+    manager
+        .record_collection_caller_failure(original.clone(), until)
+        .unwrap();
+    assert_eq!(manager.phase(), ManagerPhase::Draining);
+    assert!(!manager.shutdown_receipt().unwrap().permits_root_reuse());
+    // Uses the existing original deadline and real cancel/Retired/root fence,
+    // rather than clearing the active run or inventing a completed output.
+    let receipt = manager.run_until(until, &AtomicBool::new(false)).unwrap();
+    assert!(receipt.permits_root_reuse());
+    assert_eq!(manager.phase(), ManagerPhase::Finished);
+    assert_eq!(receipt.native_cpu_reserved, 0);
+    assert_eq!(receipt.pending_tickets, 0);
+    assert_eq!(manager.counters().consumed_role_outputs, 0);
+    assert!(facts.accepted.lock().unwrap().is_empty());
+    assert!(facts.quiesce_called.load(Ordering::Acquire));
+    assert!(!facts.finish_called.load(Ordering::Acquire));
+    assert!(matches!(
+        manager.failures().next(),
+        Some(AdaptiveManagerError::Collection(error)) if error == &original
+    ));
+    // A physical reuse receipt never erases the retained semantic failure.
+    // Finish the original process owner explicitly; no native thread is left
+    // active merely because this fixture's root fence was successful.
+    let parts = match manager.into_persistent_parts() {
+        Ok(parts) => parts,
+        Err(rejected) => panic!("failed Collection root owner recovery: {}", rejected.error),
+    };
+    let (mut native, _, _, _, _, _) = parts.into_components();
+    native.begin_shutdown(until);
+    while !native.try_join().unwrap() {
+        while native.poll().is_some() {}
+        assert!(
+            Instant::now() < until,
+            "original physical process finish timed out"
+        );
         thread::sleep(Duration::from_millis(1));
     }
     assert!(facts.finish_called.load(Ordering::Acquire));
@@ -1765,14 +2529,14 @@ mod adaptive_partial_feedback {
             work: &CoordinatorWork<ReviewView, u64>,
             profiles: &[CpuWorkerProfile],
             external: Option<&ExternalCpuConfig>,
-            selection: CpuEndpointSelection,
+            endpoint: CpuEndpoint,
             physical_budget_exhausted: bool,
         ) -> Result<CpuQuestion, AdaptiveManagerError> {
             self.inner.cpu_question(
                 work,
                 profiles,
                 external,
-                selection,
+                endpoint,
                 physical_budget_exhausted,
             )
         }
@@ -1948,6 +2712,16 @@ mod adaptive_partial_feedback {
                 #[cfg(feature = "pals-adaptive-diagnostics")]
                 fail_publish_closed_once: false,
                 raw_cpu_receipts: Vec::new(),
+                reciprocal_questions: BTreeMap::new(),
+                reciprocal_waits: Vec::new(),
+                reciprocal_replies: 0,
+                peer_sources: Vec::new(),
+                peer_opinions: 0,
+                peer_cpu_answers: 0,
+                peer_repeat_question: false,
+                replay_frontier: None,
+                block_replay_while_reserved: false,
+                blocked_replays: 0,
             },
             admissions: Vec::new(),
             partial_commits: Vec::new(),

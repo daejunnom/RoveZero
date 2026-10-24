@@ -14,6 +14,11 @@ name = "rz-pals-adaptive"
 path = "src/bin/pals-adaptive.rs"
 required-features = ["pals-adaptive", "onnx-cpu"]
 
+[[bin]]
+name = "rz-rovent"
+path = "src/bin/rovent.rs"
+required-features = ["pals-adaptive", "onnx-cpu"]
+
 [[example]]
 name = "search_probe"
 required-features = ["onnx-cpu"]
@@ -37,6 +42,10 @@ required-features = ["pals-adaptive-diagnostics"]
 [[example]]
 name = "virtual_review_warm_numeric_capture"
 required-features = ["pals-adaptive", "onnx-cpu", "experimental-io-binding"]
+
+[[example]]
+name = "rovent_external_probe"
+required-features = ["pals-adaptive"]
 
 [features]
 experimental-batch = ["rz-search/experimental-batch", "rz-eval/experimental-batch"]
