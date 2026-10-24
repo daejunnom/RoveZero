@@ -118,16 +118,28 @@ fn original_report<'a>(
     result.map_err(|_| "initial_stop_original_report_failed")
 }
 
+// Borrow the same driver/lifecycle scope for this projection only. This
+// descriptor owns no source, report, clock or live admission capability.
+struct InitialStopScope<'a> {
+    context: &'a SearchSessionContext,
+    lock: &'a rz_experiments::RoventInputLock,
+    selected_mode: ExecutionMode,
+    lifecycle_sequence: u64,
+}
+
 fn from_source(
     source: &StoppedInitial,
     report: &SearchSessionReport,
-    context: &SearchSessionContext,
-    lock: &rz_experiments::RoventInputLock,
-    selected_mode: ExecutionMode,
+    scope: InitialStopScope<'_>,
     receipt_domain: &'static str,
     previous_clean_root: Option<PreviousRootObservation>,
-    lifecycle_sequence: u64,
 ) -> Result<InitialStopSourceObservation, &'static str> {
+    let InitialStopScope {
+        context,
+        lock,
+        selected_mode,
+        lifecycle_sequence,
+    } = scope;
     let expected_domain = match selected_mode {
         ExecutionMode::CpuPc | ExecutionMode::HybridPc => {
             super::super::super::pc_session::ROVENT_PC_INITIAL_DOMAIN
@@ -228,12 +240,14 @@ pub(super) fn project(
             from_source(
                 receipt.source(),
                 report,
-                context,
-                lock,
-                product.sources.lock().manifest.engine.mode,
+                InitialStopScope {
+                    context,
+                    lock,
+                    selected_mode: product.sources.lock().manifest.engine.mode,
+                    lifecycle_sequence: sequence,
+                },
                 receipt.domain(),
                 previous,
-                sequence,
             )
         }
         ActualProductDriver::Nnuec(driver) => {
@@ -262,12 +276,14 @@ pub(super) fn project(
             from_source(
                 receipt.source(),
                 report,
-                context,
-                lock,
-                product.sources.lock().manifest.engine.mode,
+                InitialStopScope {
+                    context,
+                    lock,
+                    selected_mode: product.sources.lock().manifest.engine.mode,
+                    lifecycle_sequence: sequence,
+                },
                 receipt.domain(),
                 previous,
-                sequence,
             )
         }
         ActualProductDriver::Pcr(_) => Err("initial_stop_original_receipt_family_unsupported"),
@@ -460,12 +476,14 @@ mod tests {
         from_source(
             &source,
             &report(&source),
-            &context,
-            &lock,
-            ExecutionMode::CpuPc,
+            InitialStopScope {
+                context: &context,
+                lock: &lock,
+                selected_mode: ExecutionMode::CpuPc,
+                lifecycle_sequence: 1,
+            },
             super::super::super::super::pc_session::ROVENT_PC_INITIAL_DOMAIN,
             None,
-            1,
         )
         .unwrap()
     }
@@ -481,12 +499,14 @@ mod tests {
             let row = from_source(
                 &source,
                 &report(&source),
-                &context,
-                &lock,
-                ExecutionMode::CpuPc,
+                InitialStopScope {
+                    context: &context,
+                    lock: &lock,
+                    selected_mode: ExecutionMode::CpuPc,
+                    lifecycle_sequence: 2,
+                },
                 super::super::super::super::pc_session::ROVENT_PC_INITIAL_DOMAIN,
                 None,
-                2,
             )
             .unwrap();
             assert_eq!(row.stop_reason, reason(source.stop_reason()));
@@ -512,12 +532,14 @@ mod tests {
             from_source(
                 &source,
                 &report,
-                &context,
-                &lock,
-                ExecutionMode::CpuPc,
+                InitialStopScope {
+                    context: &context,
+                    lock: &lock,
+                    selected_mode: ExecutionMode::CpuPc,
+                    lifecycle_sequence: 1,
+                },
                 "rz-rovent-nnuec-native-root/1",
                 None,
-                1
             )
             .is_err()
         );
@@ -526,12 +548,14 @@ mod tests {
             from_source(
                 &source,
                 &report,
-                &context,
-                &lock,
-                ExecutionMode::CpuPc,
+                InitialStopScope {
+                    context: &context,
+                    lock: &lock,
+                    selected_mode: ExecutionMode::CpuPc,
+                    lifecycle_sequence: 1,
+                },
                 super::super::super::super::pc_session::ROVENT_PC_INITIAL_DOMAIN,
                 None,
-                1
             )
             .is_err()
         );
@@ -560,12 +584,14 @@ mod tests {
             from_source(
                 &source,
                 &value,
-                &context,
-                &lock,
-                ExecutionMode::CpuPc,
+                InitialStopScope {
+                    context: &context,
+                    lock: &lock,
+                    selected_mode: ExecutionMode::CpuPc,
+                    lifecycle_sequence: 1,
+                },
                 domain,
                 None,
-                1
             )
             .is_err()
         );
@@ -579,12 +605,14 @@ mod tests {
             from_source(
                 &source,
                 &value,
-                &context,
-                &lock,
-                ExecutionMode::CpuPc,
+                InitialStopScope {
+                    context: &context,
+                    lock: &lock,
+                    selected_mode: ExecutionMode::CpuPc,
+                    lifecycle_sequence: 1,
+                },
                 domain,
                 Some(previous),
-                1
             )
             .is_err()
         );
@@ -593,12 +621,14 @@ mod tests {
             from_source(
                 &source,
                 &value,
-                &context,
-                &lock,
-                ExecutionMode::CpuPc,
+                InitialStopScope {
+                    context: &context,
+                    lock: &lock,
+                    selected_mode: ExecutionMode::CpuPc,
+                    lifecycle_sequence: 1,
+                },
                 domain,
                 None,
-                1
             )
             .is_err()
         );
