@@ -485,6 +485,35 @@ fn contention_and_poison_are_sticky_incomplete_without_wait_or_panic() {
 }
 
 #[test]
+fn query_contention_loses_no_event_and_poison_is_still_sticky() {
+    let (trace, ticket, _, events) = fixture();
+    for event in events {
+        trace.push(event);
+    }
+    let before = trace.receipt();
+    assert_eq!(before["status"], "Observed");
+    let held = trace.0.state.lock().expect("test holds diagnostic state");
+    assert!(!trace.has_open_ort_run(&ticket));
+    assert!(!trace.0.incomplete.load(Ordering::Acquire));
+    drop(held);
+    assert_eq!(trace.receipt(), before);
+
+    let (poisoned, ticket, _, events) = fixture();
+    for event in events {
+        poisoned.push(event);
+    }
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        let _held = poisoned.0.state.lock().expect("test poisons query state");
+        panic!("synthetic query lock poison");
+    }));
+    assert!(panic.is_err());
+    assert!(!poisoned.0.incomplete.load(Ordering::Acquire));
+    assert!(!poisoned.has_open_ort_run(&ticket));
+    assert!(poisoned.0.incomplete.load(Ordering::Acquire));
+    assert_eq!(poisoned.receipt()["status"], "TraceIncomplete");
+}
+
+#[test]
 fn native_primary_error_and_unreturned_scope_are_preserved() {
     // 원 Result를 그대로 반환하는 실제 삽입 형태의 작은 합성 함수다.
     // 오류의 kind/stage/detail/native 진단을 trace 결과로 덮지 않는다.

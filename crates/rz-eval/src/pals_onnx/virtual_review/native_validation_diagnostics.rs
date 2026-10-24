@@ -6,7 +6,7 @@ use rz_contracts::{Digest, ExecutionId};
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, TryLockError,
 };
 use std::time::Instant;
 
@@ -166,17 +166,22 @@ impl GpuLifecycleTrace {
         })
     }
     pub fn has_open_ort_run(&self, ticket: &RoleTicketEnvelope) -> bool {
-        let mut open = false;
-        self.update(|state| {
-            open = state.events.iter().any(|event| match *event {
+        match self.0.state.try_lock() {
+            Ok(state) => state.events.iter().any(|event| match *event {
                 Event::Enter(t, e, g, at) if t == *ticket => !state.events.iter().any(|end| {
                     matches!(*end,
                     Event::Return(t2,e2,g2,at2,_,_) if t2==t && e2==e && g2==g && at2==at)
                 }),
                 _ => false,
-            });
-        });
-        open
+            }),
+            // A read-side miss loses no event. Retry observation on a later
+            // tick without poisoning an otherwise complete diagnostic trace.
+            Err(TryLockError::WouldBlock) => false,
+            Err(TryLockError::Poisoned(_)) => {
+                self.0.incomplete.store(true, Ordering::Release);
+                false
+            }
+        }
     }
     pub fn backend_completed(
         &self,
