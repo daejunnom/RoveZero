@@ -150,6 +150,10 @@ pub struct NativeVirtualReviewTicketBackend {
     evidence: Option<(RequestId, TicketExecutionEvidence)>,
     completed_tickets: BTreeMap<RequestId, RoleTicketEnvelope>,
     observer: Option<Box<dyn VirtualReviewCollectionObserver>>,
+    #[cfg(feature = "native-validation-diagnostics")]
+    validation_trace: Option<
+        rz_eval::pals_onnx::virtual_review::native_validation_diagnostics::GpuLifecycleTrace,
+    >,
 }
 pub type VirtualReviewRoleTicketService =
     TicketedNativeService<ReviewView, NativeTicketQuestion, NativeVirtualReviewTicketBackend>;
@@ -194,6 +198,8 @@ impl NativeVirtualReviewTicketBackend {
         let virtual_cuda_placement_required = backend.virtual_cuda_placement_required();
         let game = backend.game_generation();
         let applied_session_settings = backend.applied_session_settings();
+        #[cfg(feature = "native-validation-diagnostics")]
+        let validation_trace = backend.gpu_lifecycle_validation_trace();
         Ok(Self {
             worker: backend.into_worker().map_err(backend_failure)?,
             applied_session_settings: Some(applied_session_settings),
@@ -216,6 +222,8 @@ impl NativeVirtualReviewTicketBackend {
             accepted_warm_profile_window: None,
             evidence: None,
             completed_tickets: BTreeMap::new(),
+            #[cfg(feature = "native-validation-diagnostics")]
+            validation_trace,
             observer,
         })
     }
@@ -479,17 +487,31 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                 .checked_add(1)
                 .ok_or(RoleFailure::InvalidOutput)?;
             let execution = ExecutionId::new(self.clock.domain().0, self.execution_sequence);
-            let result = self.execute_command(
-                VirtualReviewNativeCommand::EvaluateTicket {
-                    ticket: *ticket,
-                    invocation: VirtualReviewInvocation {
-                        input: prepared.input.clone(),
-                        identity: prepared.identity.clone(),
-                        request_history: prepared.representation.history.0,
-                    },
-                },
-                until,
-            )?;
+            let invocation = VirtualReviewInvocation {
+                input: prepared.input.clone(),
+                identity: prepared.identity.clone(),
+                request_history: prepared.representation.history.0,
+            };
+            let command = VirtualReviewNativeCommand::EvaluateTicket {
+                ticket: *ticket,
+                invocation,
+            };
+            #[cfg(feature = "native-validation-diagnostics")]
+            let command = if self.validation_trace.is_some() {
+                match command {
+                    VirtualReviewNativeCommand::EvaluateTicket { ticket, invocation } => {
+                        VirtualReviewNativeCommand::EvaluateTicketForValidation {
+                            ticket,
+                            execution,
+                            invocation,
+                        }
+                    }
+                    _ => unreachable!("original ticket command"),
+                }
+            } else {
+                command
+            };
+            let result = self.execute_command(command, until)?;
             let VirtualReviewNativeResult::TicketEvaluationWithEvidence {
                 outcome,
                 actual_completed_nn_inputs_delta,
@@ -545,6 +567,26 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
         } else {
             PhysicalRoleCompletion::Confirmed
         };
+        #[cfg(feature = "native-validation-diagnostics")]
+        if let Some(trace) = &self.validation_trace {
+            if let Some((id, evidence)) = self.evidence {
+                if id == ticket.id {
+                    if let Some(execution) = evidence.execution {
+                        trace.backend_completed(
+                            *ticket,
+                            execution,
+                            completed_invocation.map(|value| value.invocation_key),
+                            completed_invocation.and_then(|value| value.accepted_seed_digest),
+                            completed_invocation.is_some_and(|value| value.physical_fresh),
+                            evidence.completed_nn_inputs,
+                            evidence.measurement_complete
+                                && physical == PhysicalRoleCompletion::Confirmed
+                                && result.is_ok(),
+                        );
+                    }
+                }
+            }
+        }
         let mut result = result;
         if observer_submitted && let Some(observer) = &mut self.observer {
             let evidence = self
@@ -730,9 +772,17 @@ impl TicketNativeBackend<ReviewView, NativeTicketQuestion> for NativeVirtualRevi
                         until,
                     ) {
                         Ok(VirtualReviewNativeResult::VirtualCudaPlacementVerified(witness)) => {
-                            self.observer
+                            let accepted = self
+                                .observer
                                 .as_mut()
-                                .is_none_or(|observer| observer.runtime_audited(&witness).is_ok())
+                                .is_none_or(|observer| observer.runtime_audited(&witness).is_ok());
+                            #[cfg(feature = "native-validation-diagnostics")]
+                            if accepted {
+                                if let Some(trace) = &self.validation_trace {
+                                    trace.actual_placement_verified();
+                                }
+                            }
+                            accepted
                         }
                         _ => false,
                     };
@@ -1074,6 +1124,8 @@ mod tests {
             accepted_warm_profile_window: None,
             evidence: None,
             completed_tickets: BTreeMap::new(),
+            #[cfg(feature = "native-validation-diagnostics")]
+            validation_trace: None,
             observer: None,
         }
     }

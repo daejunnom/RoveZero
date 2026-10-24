@@ -404,8 +404,15 @@ fn root_position(plan: &Plan) -> Result<Position> {
     }
     Ok(root)
 }
+#[cfg(feature = "native-validation-diagnostics")]
+#[path = "virtual_review_warm_numeric_capture/gpu_inflight_validation.rs"]
+pub mod gpu_inflight_validation;
+
 fn validate_plan(plan: &Plan) -> Result<()> {
-    if plan.domain != DOMAIN || plan.game_moves.len() > 4096 || plan.groups.len() != 12 {
+    validate_plan_domain(plan, DOMAIN)
+}
+fn validate_plan_domain(plan: &Plan, domain: &str) -> Result<()> {
+    if plan.domain != domain || plan.game_moves.len() > 4096 || plan.groups.len() != 12 {
         return Err(
             "separate bounded V3 Warm plan with exactly twelve P/C bucket groups required".into(),
         );
@@ -440,9 +447,16 @@ fn validate_plan(plan: &Plan) -> Result<()> {
 }
 
 fn load(config: &Config, profiles: &Path) -> Result<PalsVirtualReviewOnnxBackend> {
+    load_kind(config, profiles, VirtualReviewArtifactKind::ApproxWarm)
+}
+fn load_kind(
+    config: &Config,
+    profiles: &Path,
+    kind: VirtualReviewArtifactKind,
+) -> Result<PalsVirtualReviewOnnxBackend> {
     let mut selected = PalsOnnxConfig::cpu();
     selected.intra_threads = 1;
-    selected.cache_public_memory = true;
+    selected.cache_public_memory = kind == VirtualReviewArtifactKind::ApproxWarm;
     selected.cudnn_conv_search = match config.cudnn_conv_search.as_str() {
         "legacy_implicit_exhaustive" => PalsCuDnnConvSearch::LegacyImplicitExhaustive,
         "experimental_default" => PalsCuDnnConvSearch::ExperimentalDefault,
@@ -527,24 +541,44 @@ fn load(config: &Config, profiles: &Path) -> Result<PalsVirtualReviewOnnxBackend
         return Err("actual ORT pin differs".into());
     }
     selected.validate_execution_selection(runtime.native_loading_profile(), policy.is_some())?;
-    let backend = match policy {
-        Some(policy) => PalsVirtualReviewOnnxBackend::load_warm_with_cuda_control_policy(
+    let backend = match (policy, kind) {
+        (Some(policy), VirtualReviewArtifactKind::Fresh) => {
+            PalsVirtualReviewOnnxBackend::load_with_cuda_control_policy(
+                &config.export_manifest,
+                &config.export_manifest_sha256,
+                runtime,
+                selected,
+                policy,
+                profiles,
+            )?
+        }
+        (None, VirtualReviewArtifactKind::Fresh) => PalsVirtualReviewOnnxBackend::load(
             &config.export_manifest,
             &config.export_manifest_sha256,
             runtime,
             selected,
-            policy,
-            profiles,
         )?,
-        None => PalsVirtualReviewOnnxBackend::load_approx_warm(
-            &config.export_manifest,
-            &config.export_manifest_sha256,
-            runtime,
-            selected,
-        )?,
+        (Some(policy), VirtualReviewArtifactKind::ApproxWarm) => {
+            PalsVirtualReviewOnnxBackend::load_warm_with_cuda_control_policy(
+                &config.export_manifest,
+                &config.export_manifest_sha256,
+                runtime,
+                selected,
+                policy,
+                profiles,
+            )?
+        }
+        (None, VirtualReviewArtifactKind::ApproxWarm) => {
+            PalsVirtualReviewOnnxBackend::load_approx_warm(
+                &config.export_manifest,
+                &config.export_manifest_sha256,
+                runtime,
+                selected,
+            )?
+        }
     };
     if backend.validator_present()
-        || !backend.approximate_warm_capable()
+        || backend.approximate_warm_capable() != (kind == VirtualReviewArtifactKind::ApproxWarm)
         || hex(backend.model_epoch()) != config.checkpoint_sha256
     {
         return Err("actual V-free Warm owner/checkpoint differs".into());

@@ -326,6 +326,10 @@ struct CancellationScanTestState {
     pending: Option<CancellationScanTestGate>,
 }
 struct Shared {
+    #[cfg(feature = "native-validation-diagnostics")]
+    validation_trace: std::sync::OnceLock<
+        rz_eval::pals_onnx::virtual_review::native_validation_diagnostics::GpuLifecycleTrace,
+    >,
     controls: Mutex<BTreeMap<PreparationId, PreparationControl>>,
     pending_capacity: usize,
     command_capacity: usize,
@@ -437,6 +441,8 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         let (acknowledgements, ack_receiver) = mpsc::sync_channel(pending_capacity);
         let (event_sender, events) = mpsc::sync_channel(EVENTS);
         let shared = Arc::new(Shared {
+            #[cfg(feature = "native-validation-diagnostics")]
+            validation_trace: std::sync::OnceLock::new(),
             controls: Mutex::new(BTreeMap::new()),
             pending_capacity,
             command_capacity,
@@ -499,6 +505,27 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         self.shared.command_capacity
     }
 
+    /// Explicit validation only, before the first actual preparation.
+    #[cfg(feature = "native-validation-diagnostics")]
+    pub fn enable_gpu_lifecycle_validation(
+        &mut self,
+        trace: rz_eval::pals_onnx::virtual_review::native_validation_diagnostics::GpuLifecycleTrace,
+    ) -> Result<(), TicketServiceError> {
+        if self.next_preparation != 1
+            || !self
+                .shared
+                .controls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
+            return Err(TicketServiceError::Duplicate);
+        }
+        self.shared
+            .validation_trace
+            .set(trace)
+            .map_err(|_| TicketServiceError::Duplicate)
+    }
     // Failed admission returns the exact immutable question/view ownership;
     // no extra allocation or early drop is introduced at this boundary.
     #[allow(clippy::result_large_err)]
@@ -609,6 +636,10 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         }
         drop(controls);
         self.shared.signal.notify();
+        #[cfg(feature = "native-validation-diagnostics")]
+        if let Some(trace) = self.shared.validation_trace.get() {
+            trace.admitted(preparation.0, ticket, admitted_at);
+        }
         Ok(admitted_at)
     }
     pub fn cancel(&self, preparation: PreparationId) -> Result<(), TicketServiceError> {
@@ -620,7 +651,20 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         let canceled = controls
             .get(&preparation)
             .ok_or(TicketServiceError::UnknownPreparation)?;
+        #[cfg(feature = "native-validation-diagnostics")]
+        let validation_before = Instant::now();
+        #[cfg(feature = "native-validation-diagnostics")]
+        let validation_first = !canceled.canceled.load(Ordering::Acquire);
         canceled.canceled.store(true, Ordering::Release);
+        #[cfg(feature = "native-validation-diagnostics")]
+        if let Some(trace) = self.shared.validation_trace.get() {
+            trace.cancel_flag_store(
+                preparation.0,
+                validation_before,
+                Instant::now(),
+                validation_first,
+            );
+        }
         self.shared.signal.notify();
         Ok(())
     }
@@ -761,6 +805,29 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
     pub fn poll(&self) -> Option<TicketNativeEvent<B::Output>> {
         let event = self.events.try_recv().ok()?;
         self.shared.pending_reports.fetch_sub(1, Ordering::AcqRel);
+        #[cfg(feature = "native-validation-diagnostics")]
+        if let Some(trace) = self.shared.validation_trace.get() {
+            match &event {
+                TicketNativeEvent::Completed { completion, .. } => trace.logical_completed(
+                    completion.ticket,
+                    completion.physical == PhysicalRoleCompletion::Confirmed,
+                    matches!(&completion.result, Err(RoleFailure::Canceled)),
+                ),
+                TicketNativeEvent::Retired {
+                    ticket,
+                    accepted,
+                    result,
+                    ..
+                } => trace.retired(*ticket, *accepted, result.is_ok()),
+                TicketNativeEvent::RootQuiesced(fence) => {
+                    trace.root_fence(fence.authority(), fence.permits_reuse())
+                }
+                TicketNativeEvent::Finished {
+                    physical_shutdown_confirmed,
+                } => trace.finished(*physical_shutdown_confirmed),
+                _ => {}
+            }
+        }
         Some(event)
     }
     pub fn completion_signal(&self) -> CompletionSignal {
@@ -927,6 +994,10 @@ impl<V: Send + Sync + 'static, Q: Send + 'static, B: TicketNativeBackend<V, Q>>
         }
         if let Some(thread) = self.thread.take() {
             thread.join().map_err(|_| TicketServiceError::WorkerGone)?;
+            #[cfg(feature = "native-validation-diagnostics")]
+            if let Some(trace) = self.shared.validation_trace.get() {
+                trace.joined();
+            }
         }
         Ok(true)
     }

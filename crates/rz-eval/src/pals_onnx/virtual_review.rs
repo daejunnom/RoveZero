@@ -13,6 +13,8 @@ use sha2::{Digest as _, Sha256};
 mod binding;
 mod legacy_manifest;
 mod manifest;
+#[cfg(feature = "native-validation-diagnostics")]
+pub mod native_validation_diagnostics;
 mod owned_sources;
 pub use legacy_manifest::{
     validate_pals_legacy_export_manifest, LegacyPalsExportManifestSummary, LegacyPalsGraphPin,
@@ -281,6 +283,12 @@ pub enum VirtualReviewNativeCommand {
         ticket: RoleTicketEnvelope,
         invocation: VirtualReviewInvocation,
     },
+    #[cfg(feature = "native-validation-diagnostics")]
+    EvaluateTicketForValidation {
+        ticket: RoleTicketEnvelope,
+        execution: rz_contracts::ExecutionId,
+        invocation: VirtualReviewInvocation,
+    },
     AcceptTicket {
         ticket: RoleTicketEnvelope,
         invocation: VirtualReviewInvocation,
@@ -498,6 +506,8 @@ pub struct PalsVirtualReviewOnnxBackend {
     // A CUDA unknown-completion path must retain this Arc, not just tensors.
     sources: Option<Arc<dyn VirtualReviewOwnedSources>>,
     initialization: Arc<[PalsGraphPlacement]>,
+    #[cfg(feature = "native-validation-diagnostics")]
+    validation_trace: Option<native_validation_diagnostics::GpuLifecycleTrace>,
 }
 impl PalsVirtualReviewOnnxBackend {
     pub fn load(
@@ -948,7 +958,43 @@ impl PalsVirtualReviewOnnxBackend {
             warm,
             seeds,
             sources: Some(sources),
+            #[cfg(feature = "native-validation-diagnostics")]
+            validation_trace: None,
         })
+    }
+    /// Explicit diagnostic admission only; cannot change normal model/runtime policy.
+    #[cfg(feature = "native-validation-diagnostics")]
+    pub fn enable_gpu_lifecycle_validation(
+        &mut self,
+        trace: native_validation_diagnostics::GpuLifecycleTrace,
+    ) -> Result<(), BackendError> {
+        if self.validation_trace.is_some()
+            || self.warm
+            || self.validator_present()
+            || self.config.cache_public_memory
+            || !matches!(self.config.provider, Provider::Cuda { .. })
+            || !self.virtual_cuda_placement_required()
+            || self.stats.admitted_role_requests != 0
+            || self.stats.completed_nn_inputs != 0
+        {
+            return Err(BackendError::new(crate::error::FailureKind::InvalidInput,
+                crate::error::FailureStage::Admission,
+                "unused V-free Fresh CUDA owner with public cache off required for explicit validation"));
+        }
+        trace.bind_actual_cuda_owner(
+            self.model_epoch(),
+            self.backend_digest(),
+            self.manifest_digest(),
+            self.runtime_binary_digest(),
+        );
+        self.validation_trace = Some(trace);
+        Ok(())
+    }
+    #[cfg(feature = "native-validation-diagnostics")]
+    pub fn gpu_lifecycle_validation_trace(
+        &self,
+    ) -> Option<native_validation_diagnostics::GpuLifecycleTrace> {
+        self.validation_trace.clone()
     }
     pub fn model_epoch(&self) -> [u8; 32] {
         self.epoch
@@ -1424,7 +1470,16 @@ impl PalsVirtualReviewOnnxBackend {
             self.stats.public_nn_runs_attempted =
                 self.stats.public_nn_runs_attempted.saturating_add(1);
             let a = self.active.as_ref().expect("input owned");
+            #[cfg(feature = "native-validation-diagnostics")]
+            let validation_run = self
+                .validation_trace
+                .as_ref()
+                .and_then(|trace| trace.enter_ort(native_validation_diagnostics::RunGraph::Public));
             let result=self.public.as_mut().expect("public").run(ort::inputs!["anchor_board"=>&a.anchor_board,"anchor_metadata"=>&a.anchor_metadata,"anchor_mask"=>&a.anchor_mask,"records"=>&a.records,"record_anchor"=>&a.record_anchor,"record_line_tokens"=>&a.record_line_tokens,"record_line_mask"=>&a.record_line_mask,"record_mask"=>&a.record_mask]);
+            #[cfg(feature = "native-validation-diagnostics")]
+            if let Some(span) = validation_run {
+                span.returned(result.is_ok());
+            }
             let outputs = match result {
                 Ok(o) => o,
                 Err(e) => {
@@ -1512,12 +1567,21 @@ impl PalsVirtualReviewOnnxBackend {
             );
         }
         self.stats.role_nn_runs_attempted = self.stats.role_nn_runs_attempted.saturating_add(1);
+        #[cfg(feature = "native-validation-diagnostics")]
+        let validation_run = self
+            .validation_trace
+            .as_ref()
+            .and_then(|trace| trace.enter_ort(native_validation_diagnostics::RunGraph::Private));
         let session = if input.role == PalsRole::Validator {
             self.validator.as_mut().expect("V admitted")
         } else {
             self.shared_pc.as_mut().expect("P/C")
         };
         let result = session.run(values);
+        #[cfg(feature = "native-validation-diagnostics")]
+        if let Some(span) = validation_run {
+            span.returned(result.is_ok());
+        }
         let outputs = match result {
             Ok(o) => o,
             Err(e) => {
@@ -1605,6 +1669,36 @@ impl PalsVirtualReviewOnnxBackend {
                     .run(&invocation.input, &invocation.identity)
                     .map(VirtualReviewNativeResult::Evaluation),
                 VirtualReviewNativeCommand::EvaluateTicket { ticket, invocation } => {
+                    let before = self.stats.clone();
+                    let outcome = self.run_for_ticket(ticket, invocation);
+                    let evidence = PalsNNInputEvidence::between(
+                        &before,
+                        &self.stats,
+                        self.quarantine.is_none(),
+                    );
+                    let owner_accounting = VirtualReviewTicketOwnerAccounting::between(
+                        &before,
+                        &self.stats,
+                        invocation.input.role,
+                        self.quarantine.is_none(),
+                    );
+                    Ok(VirtualReviewNativeResult::TicketEvaluationWithEvidence {
+                        outcome,
+                        actual_completed_nn_inputs_delta: evidence.actual_completed_nn_inputs_delta,
+                        complete: evidence.complete,
+                        owner_accounting,
+                    })
+                }
+                #[cfg(feature = "native-validation-diagnostics")]
+                VirtualReviewNativeCommand::EvaluateTicketForValidation {
+                    ticket,
+                    execution,
+                    invocation,
+                } => {
+                    let _validation_ticket = self
+                        .validation_trace
+                        .as_ref()
+                        .map(|trace| trace.enter_ticket(*ticket, *execution));
                     let before = self.stats.clone();
                     let outcome = self.run_for_ticket(ticket, invocation);
                     let evidence = PalsNNInputEvidence::between(
