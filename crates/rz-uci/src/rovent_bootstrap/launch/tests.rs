@@ -21,6 +21,7 @@ fn product_arguments_require_one_explicit_closed_selection_and_policy() {
     assert_eq!(args.external_r_sources, None);
     assert!(!args.startup_diagnostics);
     assert!(!args.lifecycle_diagnostics);
+    assert!(!args.initial_stop_source_diagnostics);
     assert!(args.storage.is_none());
     let mut lifecycle = arguments();
     lifecycle.push("--lifecycle-diagnostics=stderr-v1".into());
@@ -71,6 +72,8 @@ fn product_arguments_reject_unregistered_paths_and_unbounded_controls() {
         "--startup-diagnostics=stdout-v1",
         "--lifecycle-diagnostics=true",
         "--lifecycle-diagnostics=stdout-v1",
+        "--initial-stop-source-diagnostics=true",
+        "--initial-stop-source-diagnostics=stdout-v1",
     ] {
         let mut args = arguments();
         let key = bad.split_once('=').unwrap().0;
@@ -78,6 +81,25 @@ fn product_arguments_reject_unregistered_paths_and_unbounded_controls() {
         args.push(bad.into());
         assert!(Arguments::parse(&args).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn initial_stop_source_diagnostics_require_the_explicit_lifecycle_stream() {
+    let mut selected = arguments();
+    selected.push("--initial-stop-source-diagnostics=stderr-v1".into());
+    assert!(Arguments::parse(&selected).is_err());
+    selected.push("--lifecycle-diagnostics=stderr-v1".into());
+    let parsed = Arguments::parse(&selected).unwrap();
+    assert!(parsed.initial_stop_source_diagnostics && parsed.lifecycle_diagnostics);
+    // Dependency validation is independent of CLI option order.
+    selected.swap(5, 6);
+    assert!(
+        Arguments::parse(&selected)
+            .unwrap()
+            .initial_stop_source_diagnostics
+    );
+    selected.push("--initial-stop-source-diagnostics=stderr-v1".into());
+    assert!(Arguments::parse(&selected).is_err());
 }
 
 #[test]

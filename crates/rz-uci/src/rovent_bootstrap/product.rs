@@ -786,6 +786,17 @@ impl RoventNativeProductDriver {
         observation
     }
 
+    /// Add source-only initial-stop evidence to the already selected lifecycle
+    /// stream. This does not enable lifecycle output or issue a live permit.
+    pub(crate) fn enable_initial_stop_source_stderr_diagnostics(&self) -> Result<(), &'static str> {
+        let diagnostics = self
+            .lifecycle_diagnostics
+            .as_ref()
+            .ok_or("initial-stop source diagnostics require lifecycle diagnostics")?;
+        diagnostics.enable_initial_stop_source();
+        Ok(())
+    }
+
     fn actual(&self) -> &dyn SearchSessionDriver {
         match self.inner.as_ref() {
             ActualProductDriver::Pc(driver) | ActualProductDriver::PcNnuec(driver) => driver,
@@ -854,7 +865,7 @@ impl SearchSessionDriver for RoventNativeProductDriver {
     ) -> Result<SearchSessionReport, SearchSessionFailure> {
         let result = self.actual().run(position, context, progress);
         if let Some(diagnostics) = &self.lifecycle_diagnostics {
-            diagnostics.observe_root(self, context, result.as_ref().err());
+            diagnostics.observe_root(self, context, result.as_ref());
             diagnostics.observe_storage(self, Some(context.authority));
             #[cfg(feature = "pals-adaptive-diagnostics")]
             {

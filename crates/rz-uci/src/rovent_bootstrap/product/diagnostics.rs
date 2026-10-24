@@ -6,7 +6,9 @@ use crate::pals_adaptive::{
     AdaptiveManagerCounters, AdaptiveShutdownReceipt, RoleOnlyShutdownReceipt,
 };
 use crate::rovent_root_admission::RoventRootAdmission;
-use crate::search_driver::{DriverPhysicalCompletion, SearchSessionContext, SearchSessionFailure};
+use crate::search_driver::{
+    DriverPhysicalCompletion, SearchSessionContext, SearchSessionFailure, SearchSessionReport,
+};
 use rz_contracts::Digest;
 use rz_contracts::pals::SearchAuthority;
 use rz_contracts::rovent::ExecutionMode;
@@ -21,6 +23,7 @@ use std::sync::{
 
 pub const ROVENT_LIFECYCLE_DIAGNOSTIC_DOMAIN: &str = "rz-rovent-product-lifecycle-observation/1";
 pub const ROVENT_STORAGE_DIAGNOSTIC_DOMAIN: &str = "rz-rovent-storage-maintenance-observation/1";
+mod initial_stop;
 #[cfg(feature = "pals-adaptive-diagnostics")]
 mod nnuec;
 #[cfg(feature = "pals-adaptive-diagnostics")]
@@ -415,6 +418,7 @@ pub struct RoventProductLifecycleObservation {
 #[derive(Default)]
 struct State {
     root_runs: u64,
+    initial_stop_rows: u64,
     root_run_errors: u64,
     root_rows: u64,
     bytes: usize,
@@ -445,11 +449,15 @@ pub struct RoventLifecycleDiagnostics {
     state: Arc<Mutex<State>>,
     poisoned: Arc<AtomicBool>,
     physical_close: Arc<AtomicBool>,
+    initial_stop_source: Arc<AtomicBool>,
     lock: Digest,
     implementation: Digest,
     mode: ExecutionMode,
 }
 impl RoventLifecycleDiagnostics {
+    pub(super) fn enable_initial_stop_source(&self) {
+        self.initial_stop_source.store(true, Ordering::Release);
+    }
     /// This separate Serialize-only domain never changes the established
     /// lifecycle row shape, result, source authority or physical fence.
     pub(super) fn observe_storage(
@@ -666,6 +674,7 @@ impl RoventLifecycleDiagnostics {
             state: Arc::new(Mutex::new(State::default())),
             poisoned: Arc::new(AtomicBool::new(false)),
             physical_close,
+            initial_stop_source: Arc::new(AtomicBool::new(false)),
             lock,
             implementation,
             mode,
@@ -684,8 +693,9 @@ impl RoventLifecycleDiagnostics {
         &self,
         product: &RoventNativeProductDriver,
         context: &SearchSessionContext,
-        failure: Option<&SearchSessionFailure>,
+        result: Result<&SearchSessionReport, &SearchSessionFailure>,
     ) {
+        let failure = result.as_ref().err().copied();
         let (mut source_status, root) = project_root(product, context);
         let initial = project_initial(product, context);
         let retained = project_retained_session(product, "after_run");
@@ -736,6 +746,23 @@ impl RoventLifecycleDiagnostics {
         row.scope_incomplete |= state.scope_incomplete;
         row.diagnostic_failure = state.first_issue;
         state.latest = Some(row);
+        if self.initial_stop_source.load(Ordering::Acquire)
+            && source_status == "original_initial_stop"
+        {
+            let companion = initial_stop::project(product, context, result, state.root_runs);
+            let written = companion
+                .and_then(|row| initial_stop::write(&mut io::stderr().lock(), &row, &mut state));
+            if let Err(cause) = written {
+                state.first_issue.get_or_insert(cause);
+                state.scope_incomplete = true;
+                let issue = state.first_issue;
+                if let Some(latest) = &mut state.latest {
+                    latest.diagnostics_complete = false;
+                    latest.scope_incomplete = true;
+                    latest.diagnostic_failure = issue;
+                }
+            }
+        }
     }
     pub(super) fn observe_finish(
         &self,

@@ -101,6 +101,7 @@ struct Arguments {
     root_policy: RoventRootAdmissionPolicy,
     startup_diagnostics: bool,
     lifecycle_diagnostics: bool,
+    initial_stop_source_diagnostics: bool,
     storage: Option<StorageArguments>,
 }
 
@@ -128,6 +129,7 @@ impl Arguments {
         let mut root_policy = None;
         let mut startup_diagnostics = None;
         let mut lifecycle_diagnostics = None;
+        let mut initial_stop_source_diagnostics = None;
         let mut storage_profile = None;
         let mut storage_sha256 = None;
         let mut storage_bytes = None;
@@ -208,6 +210,19 @@ impl Arguments {
                         }
                     });
                 }
+                "--initial-stop-source-diagnostics"
+                    if initial_stop_source_diagnostics.is_none() =>
+                {
+                    initial_stop_source_diagnostics = Some(match value {
+                        "stderr-v1" => true,
+                        _ => {
+                            return Err(error(
+                                "Arguments",
+                                "unknown explicit initial-stop source diagnostic selection",
+                            ));
+                        }
+                    });
+                }
                 "--root-policy" if root_policy.is_none() => {
                     root_policy = Some(match value {
                         "exact-registered" => RoventRootAdmissionPolicy::ExactRegistered,
@@ -254,6 +269,12 @@ impl Arguments {
                 ));
             }
         };
+        if initial_stop_source_diagnostics == Some(true) && lifecycle_diagnostics != Some(true) {
+            return Err(error(
+                "Arguments",
+                "initial-stop source diagnostics require --lifecycle-diagnostics=stderr-v1",
+            ));
+        }
         Ok(Self {
             input_lock: input_lock.ok_or_else(|| error("Arguments", "--input-lock is required"))?,
             native_assets: native_assets
@@ -268,6 +289,7 @@ impl Arguments {
                 .ok_or_else(|| error("Arguments", "--root-policy is required"))?,
             startup_diagnostics: startup_diagnostics.unwrap_or(false),
             lifecycle_diagnostics: lifecycle_diagnostics.unwrap_or(false),
+            initial_stop_source_diagnostics: initial_stop_source_diagnostics.unwrap_or(false),
             storage,
         })
     }
@@ -1008,6 +1030,11 @@ fn run_inner<'a>(
     let lifecycle_diagnostics = arguments
         .lifecycle_diagnostics
         .then(|| driver.enable_lifecycle_stderr_diagnostics());
+    if arguments.initial_stop_source_diagnostics {
+        driver
+            .enable_initial_stop_source_stderr_diagnostics()
+            .map_err(|cause| error("Arguments", cause))?;
+    }
     let mut settings = EngineSettings {
         shutdown_limit: Duration::from_millis(lock.manifest.cleanup_max_ms),
         ..EngineSettings::default()

@@ -579,6 +579,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/rovent_bootstrap/process_boundary.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/product.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/product/diagnostics.rs"),
+            source!("crates/rz-uci/src/rovent_bootstrap/product/diagnostics/initial_stop.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/product/diagnostics/nnuec.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/product/diagnostics/nnuec_cpu_slices.rs"),
             source!(
@@ -703,6 +704,7 @@ pub const SOURCE_COMPONENT_FILES_V5: &[(&str, &[EmbeddedSourceFile])] = &[
             source!("crates/rz-uci/src/rovent_bootstrap/pinned/nnuec.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/product.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/product/diagnostics.rs"),
+            source!("crates/rz-uci/src/rovent_bootstrap/product/diagnostics/initial_stop.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/product/diagnostics/nnuec.rs"),
             source!("crates/rz-uci/src/rovent_bootstrap/product/diagnostics/nnuec_cpu_slices.rs"),
             source!(
